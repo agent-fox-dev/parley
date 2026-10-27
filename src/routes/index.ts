@@ -11,6 +11,7 @@ import { orgRoutes } from './orgs.js';
 import { boundTokenRoutes } from './bound_tokens.js';
 import { sandboxRoutes } from './sandboxes.js';
 import { secretRoutes } from './secrets.js';
+import { varRoutes } from './vars.js';
 import { workspaceRoutes } from './workspaces.js';
 import { tokenPermissionRoutes } from './token_permissions.js';
 import { tokenRoutes } from './tokens.js';
@@ -68,6 +69,11 @@ export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
       store: config.store,
       clock: config.clock,
       ...(config.secretCipher === undefined ? {} : { cipher: config.secretCipher }),
+    }),
+    ...varRoutes({
+      mountPoint: config.mountPoint,
+      store: config.store,
+      clock: config.clock,
     }),
     ...boundTokenRoutes({
       mountPoint: config.mountPoint,
