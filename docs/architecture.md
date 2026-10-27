@@ -39,7 +39,9 @@ request → entry point (src/index.ts)
 | `src/routes/server.ts` | The four routes served at the server root: liveness, readiness, version and metrics.                                                       |
 
 A module's tests sit beside it as `*.test.ts` and are named for the
-behaviour they check.
+behaviour they check. Unit and integration suites are hermetic and run in
+`make check`; a `*.smoke.test.ts` needs a running deployment and runs in
+`make check-release`.
 
 ## Two platform targets
 

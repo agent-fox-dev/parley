@@ -12,7 +12,7 @@
     "build": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:integration": "vitest run --passWithNoTests --mode integration",
+    "test:smoke": "vitest run --config vitest.smoke.config.ts --passWithNoTests",
     "fmt": "prettier --write .",
     "fmt:check": "prettier --check .",
     "vet": "tsc --noEmit",

@@ -1,4 +1,6 @@
+import { HttpError, errorResponse } from '../http/errors.js';
 import type { RouteDefinition } from '../http/router.js';
+import type { RelationalStore } from '../platform/index.js';
 
 /**
  * The four routes served at the server root, outside the mount point. Their
@@ -13,6 +15,8 @@ export interface ServerRouteConfig {
   mountPoint: string;
   buildTime: string;
   commit: string;
+  /** Queried by the readiness probe, and by nothing else here. */
+  store?: RelationalStore;
 }
 
 /**
@@ -42,8 +46,18 @@ export function serverRoutes(config: ServerRouteConfig): RouteDefinition[] {
   return [
     // Liveness answers from the process alone and reads no store.
     { path: '/healthz', handler: () => json({ status: 'ok' }) },
-    // Readiness answers from the relational store once there is one to query.
-    { path: '/readyz', handler: () => json({ status: 'ready' }) },
+    {
+      path: '/readyz',
+      handler: async () => {
+        try {
+          await config.store?.ping();
+        } catch {
+          // The reason belongs in the log, not in a probe's answer.
+          return errorResponse(new HttpError(503, 'the service is not ready'));
+        }
+        return json({ status: 'ready' });
+      },
+    },
     {
       path: '/version',
       handler: () =>

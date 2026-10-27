@@ -70,8 +70,9 @@ Liveness: the process is up. Answers without reading any store.
 
 Readiness: the service can serve.
 
-**Response:** `200 OK` with `{"status": "ready"}`; `503` with the error
-envelope once a relational store is wired and does not answer.
+**Response:** `200 OK` with `{"status": "ready"}` when the relational store
+answers; `503` with the error envelope when it does not. The reason goes to
+the log, not to the probe's answer.
 
 ### GET /version
 

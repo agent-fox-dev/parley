@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import type { Context } from 'hono';
 import { DEFAULT_MAX_BODY_BYTES, DEFAULT_MOUNT_POINT } from '../config.js';
+import type { RelationalStore } from '../platform/index.js';
 import { serverRoutes } from '../routes/server.js';
 import { HttpError, errorResponse } from './errors.js';
 
@@ -29,6 +30,8 @@ export interface AppOptions {
   routes?: RouteDefinition[];
   /** The largest request body accepted. Defaults to DEFAULT_MAX_BODY_BYTES. */
   maxBodyBytes?: number;
+  /** The store the readiness probe queries. */
+  store?: RelationalStore;
 }
 
 const consoleLog: LogSink = {
@@ -46,6 +49,7 @@ export function buildApp(options: AppOptions = {}): Hono {
       mountPoint,
       buildTime: options.buildTime ?? '',
       commit: options.commit ?? '',
+      ...(options.store === undefined ? {} : { store: options.store }),
     });
 
   const maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;

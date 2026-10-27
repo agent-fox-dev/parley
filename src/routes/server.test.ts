@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { buildApp } from '../http/router.js';
+import { SERVER_ROUTE_PATHS } from './server.js';
 
 const VERSION_KEYS = ['build_time', 'commit', 'mount_point', 'runtime_version'];
 
@@ -65,5 +66,43 @@ describe('the version route', () => {
     const response = await version();
 
     expect(response.headers.get('cache-control')).toMatch(/\bpublic\b/);
+  });
+});
+
+describe('the liveness probe', () => {
+  it('answers ok without touching any store', async () => {
+    const calls: string[] = [];
+    const store = {
+      ping: async () => {
+        calls.push('ping');
+        throw new Error('the store must not be called');
+      },
+    };
+
+    const response = await buildApp({ store }).request('/healthz');
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ status: 'ok' });
+    expect(calls).toEqual([]);
+  });
+});
+
+describe('the server routes and credentials', () => {
+  it.each(
+    SERVER_ROUTE_PATHS.flatMap((path) =>
+      [
+        ['no Authorization header', undefined],
+        ['a malformed Authorization header', 'Bearer nonsense'],
+      ].map(([name, header]) => [path, name, header] as const),
+    ),
+  )('answers %s with %s without demanding a credential', async (path, _name, header) => {
+    const app = buildApp({ store: { ping: async () => {} } });
+
+    const response = await app.request(
+      path,
+      header === undefined ? {} : { headers: { authorization: header } },
+    );
+
+    expect(response.status).not.toBe(401);
   });
 });

@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help build test test-integration fmt fmt-check vet lint check check-release tidy clean
+.PHONY: help build test test-smoke fmt fmt-check vet lint check check-release tidy clean
 
 NPM ?= npm
 
@@ -14,8 +14,8 @@ build: ## Type-check and bundle the worker
 test: ## Run the fast test suite
 	$(NPM) run test
 
-test-integration: ## Run the integration and smoke suites against a deployment
-	$(NPM) run test:integration
+test-smoke: ## Run the smoke suites against a running deployment
+	$(NPM) run test:smoke
 
 fmt: ## Format all source files in place
 	$(NPM) run fmt
@@ -31,7 +31,7 @@ lint: ## Lint the sources
 
 check: fmt-check vet lint test ## The fast gate: run before committing
 
-check-release: fmt-check vet lint test test-integration ## The full gate; run by a person, never by an agent
+check-release: fmt-check vet lint test test-smoke ## The full gate; run by a person, never by an agent
 
 tidy: ## Reconcile the dependency manifest and lockfile
 	$(NPM) install --package-lock-only

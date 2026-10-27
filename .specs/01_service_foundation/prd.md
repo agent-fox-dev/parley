@@ -4,7 +4,7 @@ spec_name: "service_foundation"
 title: "Serve the hub's request contract on two platform targets"
 status: "active"
 created_at: "2026-10-27T17:39:36Z"
-updated_at: "2026-10-27T19:42:29Z"
+updated_at: "2026-10-27T19:44:58Z"
 intent_hash: "3bcb6e59151fefb7855c7a834fa7224be0a4c7ff6b75e2a002d5cde0101a4786"
 schema_version: 2
 source: "docs/prd/01-port-af-hub-to-typescript-on-cloudflare.md"

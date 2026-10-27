@@ -15,5 +15,5 @@
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true
   },
-  "include": ["src/**/*.ts", "*.config.ts"]
+  "include": ["src/**/*.ts", "conformance/**/*.ts", "*.config.ts"]
 }
