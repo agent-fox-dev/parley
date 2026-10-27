@@ -8,8 +8,13 @@ import { workspaceScope } from '../platform/secrets.js';
 import type { Clock, RelationalStore } from '../platform/index.js';
 import { findOrg, findUser, isMember, orgsOfUser } from '../store/identity.js';
 import type { OrgRecord } from '../store/identity.js';
-import { type WorkspaceRecord, findWorkspace, insertWorkspace } from '../store/workspaces.js';
-import { hidesMissingScope, workspaceAccess } from '../workspace/access.js';
+import {
+  type WorkspaceRecord,
+  findWorkspace,
+  insertWorkspace,
+  listVisibleWorkspaces,
+} from '../store/workspaces.js';
+import { accessLevel, hidesMissingScope, workspaceAccess } from '../workspace/access.js';
 import { serialiseWorkspace } from '../workspace/serialise.js';
 import { checkedSettings } from '../workspace/settings.js';
 import { checkedCreate } from '../workspace/validate.js';
@@ -134,6 +139,39 @@ async function readWorkspace(c: Context, config: WorkspaceRouteConfig): Promise<
   );
 }
 
+/**
+ * The workspaces the caller may see. The access field of each is the level
+ * the one decision gives, so a list and a read never disagree.
+ */
+async function listWorkspaces(c: Context, config: WorkspaceRouteConfig): Promise<Response> {
+  const identity = identityOf(c);
+  const includeArchived = c.req.query('include_archived') === 'true';
+
+  const orgs =
+    identity?.userId === undefined ? [] : await orgsOfUser(config.store, identity.userId);
+  const workspaces = await listVisibleWorkspaces(config.store, {
+    ...(identity?.kind === 'admin_token' ? {} : { ownerId: identity?.userId ?? '' }),
+    orgIds: orgs.map((org) => org.id),
+    includeArchived,
+  });
+
+  const slugById = new Map(orgs.map((org) => [org.id, org.slug]));
+  const serialised = [];
+  for (const workspace of workspaces) {
+    const level = (await accessLevel(config.store, identity, workspace)) ?? 'member';
+    const known = workspace.org_id === null ? undefined : slugById.get(workspace.org_id);
+    const orgSlug =
+      known ??
+      (workspace.org_id === null
+        ? null
+        : ((await findOrg(config.store, workspace.org_id))?.slug ?? null));
+    serialised.push(
+      serialiseWorkspace(workspace, { access: level, orgSlug, externalUrl: config.externalUrl }),
+    );
+  }
+  return jsonResponse(serialised);
+}
+
 export function workspaceRoutes(config: WorkspaceRouteConfig): RouteDefinition[] {
   return [
     {
@@ -141,6 +179,12 @@ export function workspaceRoutes(config: WorkspaceRouteConfig): RouteDefinition[]
       methods: ['POST'],
       scope: 'workspaces:write',
       handler: async (c) => createWorkspace(c, config),
+    },
+    {
+      path: `${config.mountPoint}/workspaces`,
+      scope: 'workspaces:read',
+      hideScopeFailure: hidesMissingScope('GET', '/workspaces'),
+      handler: async (c) => listWorkspaces(c, config),
     },
     {
       path: `${config.mountPoint}/workspaces/:slug`,

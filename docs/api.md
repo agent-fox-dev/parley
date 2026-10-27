@@ -21,6 +21,7 @@ implemented; routes appear here as they are built.
 - [Organizations](#organizations)
 - [Administration](#administration)
 - [Workspace access](#workspace-access)
+- [Workspaces](#workspaces)
 - [Server Endpoints](#server-endpoints)
 
 ## Conventions
@@ -461,6 +462,82 @@ answer a token that lacks the scope with `404 workspace not found` instead
 of `403`, identical to the answer for a workspace that does not exist.
 Every other route, `POST /api/v1/workspaces` included, answers a missing
 scope with the ordinary `403`.
+
+## Workspaces
+
+A workspace is the service's record of one repository: the URL it came
+from, the settings that govern it, and who may read and change it.
+
+### The workspace object
+
+Every route that returns a workspace returns the same object: `slug`,
+`git_url`, `hub_url`, `branch`, `owner_id`, `org_id`, `org_slug`, `access`,
+`status`, `display_name`, `description`, `head_sha`, `clone_error`,
+`upstream_head_sha`, `last_sync_at`, `sync_error`, `workspace_mode`,
+`upstream_url`, `integration_branch`, `settings`, `created_at` and
+`updated_at`.
+
+`display_name` is never null or empty — it falls back to the slug — and
+`description` is never null. `hub_url` is the clone URL on this service's
+git server, and is `null` when `PARLEY_EXTERNAL_URL` is unset or the
+workspace has no organization. `access` describes the caller, not their
+scopes. `settings` carries the effective value of every setting, set or
+not.
+
+`status` is `pending` (the record exists, the repository has not been
+copied in), `cloning`, `ready`, `failed` or `archived`.
+
+### POST /api/v1/workspaces
+
+**Access:** an API key, or a token with `workspaces:write`. An admin token
+is refused `403`, because a workspace needs a real user as its owner.
+
+| Field                          | Required          | Constraints                                                                                                                                                                  |
+| ------------------------------ | ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `slug`                         | yes               | Globally unique; 3–64 characters; starts with a lowercase letter; ends with a lowercase letter or digit; lowercase letters, digits and hyphens only; no two hyphens in a row |
+| `git_url`                      | yes               | An https or ssh git URL                                                                                                                                                      |
+| `branch`                       | no                | Defaults to null, the repository's default branch                                                                                                                            |
+| `org_id`                       | no                | An organization id **or slug**; the owner must be a member. Omitted, the owner's own organization is used                                                                    |
+| `display_name`                 | no                | At most 128 characters; defaults to the slug                                                                                                                                 |
+| `description`                  | no                | At most 1024 characters; defaults to `""`                                                                                                                                    |
+| `workspace_mode`               | no                | `standard` (default) or `carry_patch`                                                                                                                                        |
+| `upstream_url`                 | for `carry_patch` | Required for `carry_patch`, refused for `standard`                                                                                                                           |
+| `integration_branch`           | no                | `carry_patch` only; defaults to `deploy`                                                                                                                                     |
+| `settings`                     | no                | The settings to set; the rest take their defaults                                                                                                                            |
+| `git_pat`                      | no                | Excludes the basic pair; needs an https `git_url`                                                                                                                            |
+| `git_username`, `git_password` | no                | Both or neither; exclude `git_pat`; need an https `git_url`                                                                                                                  |
+
+Credentials are stored as the workspace secrets `GIT_PAT`, or
+`GIT_USERNAME` and `GIT_PASSWORD`, sealed before they reach any store
+([ADR 4](adr/04-seal-secrets-with-aes-gcm-under-a-deployment-key.md)). No
+response carries them.
+
+**Response:** `201 Created` with the workspace, `status` `pending` and
+`access` `owner`.
+
+| Status | Condition                                                                                                                                                                                                                                  |
+| ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 400    | A malformed `slug` or `git_url`; a field too long; an invalid mode combination; a bad credential combination; an unknown setting or a value it cannot take; `org_id` names no organization; no `org_id` and the caller has no organization |
+| 403    | An admin token; a token without `workspaces:write`; the caller is not a member of the organization named                                                                                                                                   |
+| 409    | A workspace with that slug exists                                                                                                                                                                                                          |
+
+### GET /api/v1/workspaces
+
+**Access:** `workspaces:read`; a token without it gets the
+[anti-enumeration](#anti-enumeration) `404`.
+
+**Query:** `include_archived=true` adds archived workspaces.
+
+**Response:** `200 OK` with the caller's own workspaces and those of their
+organizations, **newest first, and by slug where two share an instant**. An
+admin token sees every workspace, each with `access: "admin"`.
+
+### GET /api/v1/workspaces/:slug
+
+**Access:** `workspaces:read` (a token without it gets `404`); read access.
+
+**Response:** `200 OK` with the workspace. A member sees field-for-field
+what the owner sees, differing only in `access`.
 
 ## Server Endpoints
 

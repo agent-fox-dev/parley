@@ -71,6 +71,38 @@ export async function findWorkspace(
   return rows[0] === undefined ? undefined : toWorkspace(rows[0]);
 }
 
+/**
+ * The workspaces a caller may see: their own and those of the
+ * organizations they belong to, newest first and by slug where two share
+ * an instant. An admin token passes no owner and sees them all.
+ */
+export async function listVisibleWorkspaces(
+  store: RelationalStore,
+  visibility: { ownerId?: string; orgIds?: readonly string[]; includeArchived: boolean },
+): Promise<WorkspaceRecord[]> {
+  const conditions: string[] = [];
+  const params: unknown[] = [];
+
+  if (visibility.ownerId !== undefined) {
+    const orgIds = visibility.orgIds ?? [];
+    const placeholders = orgIds.map(() => '?').join(', ');
+    conditions.push(
+      orgIds.length === 0 ? 'owner_id = ?' : `(owner_id = ? OR org_id IN (${placeholders}))`,
+    );
+    params.push(visibility.ownerId, ...orgIds);
+  }
+  if (!visibility.includeArchived) {
+    conditions.push("status != 'archived'");
+  }
+
+  const where = conditions.length === 0 ? '' : `WHERE ${conditions.join(' AND ')}`;
+  const rows = await store.all(
+    `SELECT * FROM workspaces ${where} ORDER BY created_at DESC, slug ASC`,
+    params,
+  );
+  return rows.map(toWorkspace);
+}
+
 export async function insertWorkspace(
   store: RelationalStore,
   workspace: WorkspaceRecord,

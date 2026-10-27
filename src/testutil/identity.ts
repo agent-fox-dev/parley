@@ -20,6 +20,7 @@ import {
   insertOrg,
   insertUser,
 } from '../store/identity.js';
+import { type WorkspaceRecord, insertWorkspace } from '../store/workspaces.js';
 import { migrate } from '../store/migrations/index.js';
 
 /** The instant every seeded record is dated from, so expiry is decidable. */
@@ -115,6 +116,37 @@ export async function seedPat(
   over: Partial<CredentialRecord> = {},
 ): Promise<SeededCredential> {
   return seedCredential(store, 'pat', user, { permissions: [...permissions], ...over });
+}
+
+/** A workspace row, for suites that need one without posting a create. */
+export async function seedWorkspace(
+  store: RelationalStore,
+  over: Partial<WorkspaceRecord> & { owner_id: string },
+): Promise<WorkspaceRecord> {
+  const slug = over.slug ?? unique('ws');
+  const workspace: WorkspaceRecord = {
+    slug,
+    git_url: 'https://github.com/u/r.git',
+    branch: null,
+    org_id: null,
+    status: 'pending',
+    display_name: slug,
+    description: '',
+    head_sha: null,
+    clone_error: null,
+    upstream_head_sha: null,
+    last_sync_at: null,
+    sync_error: null,
+    workspace_mode: 'standard',
+    upstream_url: null,
+    integration_branch: null,
+    settings: {},
+    created_at: SEED_NOW.toISOString(),
+    updated_at: SEED_NOW.toISOString(),
+    ...over,
+  };
+  await insertWorkspace(store, workspace);
+  return workspace;
 }
 
 export async function seedOrg(

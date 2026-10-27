@@ -1,6 +1,15 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { type Service, MOUNT, as, identityService, withJson } from '../testutil/app.js';
-import { seedApiKey, seedOrg, seedUser } from '../testutil/identity.js';
+import {
+  type Service,
+  ADMIN_TOKEN,
+  MOUNT,
+  as,
+  identityService,
+  withJson,
+} from '../testutil/app.js';
+import { SEED_NOW, seedApiKey, seedOrg, seedUser, seedWorkspace } from '../testutil/identity.js';
+import type { WorkspaceStatus } from '../store/workspaces.js';
+import { addMember } from '../store/identity.js';
 import { WORKSPACE_SETTINGS } from '../workspace/settings.js';
 import { workspaceScope } from '../platform/secrets.js';
 
@@ -160,5 +169,126 @@ describe('the credentials a create carries', () => {
     await held.app.request(`${MOUNT}/workspaces`, withJson('POST', create(), held.key));
 
     expect(await held.secrets.names(workspaceScope('my-project'))).toEqual([]);
+  });
+});
+
+async function populated() {
+  const held = await owner();
+  const { store } = held;
+  const stranger = await seedUser(store);
+  const theirOrg = await seedOrg(store, stranger);
+
+  const at = async (
+    iso: string,
+    slug: string,
+    ownerId: string,
+    orgId: string,
+    status: WorkspaceStatus = 'pending',
+  ) =>
+    seedWorkspace(store, {
+      slug,
+      owner_id: ownerId,
+      org_id: orgId,
+      status,
+      created_at: iso,
+      updated_at: iso,
+    });
+
+  // created_at descending, and slug ascending where two share an instant
+  await at('2026-01-03T00:00:00.000Z', 'newest', held.user.id, held.org.id);
+  await at('2026-01-01T00:00:00.000Z', 'beta', held.user.id, held.org.id);
+  await at('2026-01-01T00:00:00.000Z', 'alpha', held.user.id, held.org.id);
+  await at('2026-01-02T00:00:00.000Z', 'retired', held.user.id, held.org.id, 'archived');
+  await at('2026-01-04T00:00:00.000Z', 'someone-elses', stranger.id, theirOrg.id);
+
+  return held;
+}
+
+describe('the workspace list', () => {
+  it('shows the caller their own and omits other people’s', async () => {
+    const held = await populated();
+
+    const listed = (await (
+      await held.app.request(`${MOUNT}/workspaces`, as(held.key))
+    ).json()) as Array<{ slug: string }>;
+
+    expect(listed.map((w) => w.slug)).not.toContain('someone-elses');
+  });
+
+  it('orders newest first, and by slug where two share an instant', async () => {
+    const held = await populated();
+
+    const listed = (await (
+      await held.app.request(`${MOUNT}/workspaces`, as(held.key))
+    ).json()) as Array<{ slug: string }>;
+
+    expect(listed.map((w) => w.slug)).toEqual(['newest', 'alpha', 'beta']);
+  });
+
+  it('leaves archived workspaces out until they are asked for', async () => {
+    const held = await populated();
+
+    const without = (await (
+      await held.app.request(`${MOUNT}/workspaces`, as(held.key))
+    ).json()) as Array<{ slug: string }>;
+    const withArchived = (await (
+      await held.app.request(`${MOUNT}/workspaces?include_archived=true`, as(held.key))
+    ).json()) as Array<{ slug: string }>;
+
+    expect(without.map((w) => w.slug)).not.toContain('retired');
+    expect(withArchived.map((w) => w.slug)).toEqual(['newest', 'retired', 'alpha', 'beta']);
+  });
+
+  it('shows an admin token every workspace, as admin', async () => {
+    const held = await populated();
+
+    const listed = (await (
+      await held.app.request(`${MOUNT}/workspaces`, as(ADMIN_TOKEN))
+    ).json()) as Array<{ slug: string; access: string }>;
+
+    expect(listed.map((w) => w.slug)).toContain('someone-elses');
+    expect(listed.every((w) => w.access === 'admin')).toBe(true);
+  });
+
+  it('shows a member their organization’s workspaces as member', async () => {
+    const held = await populated();
+    const member = await seedUser(held.store);
+    await addMember(held.store, {
+      org_id: held.org.id,
+      user_id: member.id,
+      role: 'member',
+      created_at: SEED_NOW.toISOString(),
+    });
+    const memberKey = (await seedApiKey(held.store, member)).presented;
+
+    const listed = (await (
+      await held.app.request(`${MOUNT}/workspaces`, as(memberKey))
+    ).json()) as Array<{ slug: string; access: string }>;
+
+    expect(listed.map((w) => w.slug)).toEqual(['newest', 'alpha', 'beta']);
+    expect(listed.every((w) => w.access === 'member')).toBe(true);
+  });
+
+  it('gives a member the owner’s object, differing only in access', async () => {
+    const held = await owner();
+    const member = await seedUser(held.store);
+    await addMember(held.store, {
+      org_id: held.org.id,
+      user_id: member.id,
+      role: 'member',
+      created_at: SEED_NOW.toISOString(),
+    });
+    const memberKey = (await seedApiKey(held.store, member)).presented;
+    await held.app.request(`${MOUNT}/workspaces`, withJson('POST', create(), held.key));
+
+    const byOwner = (await (
+      await held.app.request(`${MOUNT}/workspaces`, as(held.key))
+    ).json()) as Array<Record<string, unknown>>;
+    const byMember = (await (
+      await held.app.request(`${MOUNT}/workspaces`, as(memberKey))
+    ).json()) as Array<Record<string, unknown>>;
+
+    expect({ ...byMember[0], access: null }).toEqual({ ...byOwner[0], access: null });
+    expect(byMember[0]?.['access']).toBe('member');
   });
 });
