@@ -539,6 +539,57 @@ admin token sees every workspace, each with `access: "admin"`.
 **Response:** `200 OK` with the workspace. A member sees field-for-field
 what the owner sees, differing only in `access`.
 
+### PATCH /api/v1/workspaces/:slug
+
+Change a workspace's mutable fields. Only the fields the body names change.
+
+**Access:** `workspaces:write` (a token without it gets `404`); write
+access.
+
+| Field          | `null` means                                                                          |
+| -------------- | ------------------------------------------------------------------------------------- |
+| `display_name` | back to the slug                                                                      |
+| `description`  | back to `""`                                                                          |
+| `org_id`       | remove the organization                                                               |
+| `settings`     | a key given as `null` returns to its default; `"settings": null` resets every setting |
+
+`slug`, `git_url`, `branch`, `owner_id`, `workspace_mode`, `upstream_url`
+and `integration_branch` are immutable and refused, as is the retired
+`sync_mode` — use the `sync_enabled` setting.
+
+**Response:** `200 OK` with the updated workspace.
+
+| Status | Condition                                                                                                                                                                   |
+| ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 400    | An empty body; the workspace is archived; a field too long; an immutable field or `sync_mode`; an unknown setting or a value it cannot take; `org_id` names no organization |
+| 403    | The workspace's **owner** is not a member of the organization named                                                                                                         |
+
+The access check runs first, so a member's update of an archived workspace
+is `403`, not `400`.
+
+### Workspace settings
+
+Twelve switches, each with a default. Every workspace object carries the
+effective value of all of them; a write that names an unknown key, or a
+value a key cannot take, is `400` naming the key and, for a list, the
+values it accepts, and changes nothing — not even the valid keys in the
+same body.
+
+| Setting                           | Values                                   | Default     |
+| --------------------------------- | ---------------------------------------- | ----------- |
+| `rebuild_strategy`                | `rebase`, `merge`                        | `rebase`    |
+| `rebuild_fail_mode`               | `fail_fast`, `continue`                  | `fail_fast` |
+| `auto_rebuild_after_sync`         | boolean                                  | `true`      |
+| `auto_rebuild_after_push`         | boolean                                  | `true`      |
+| `patch_branch_source`             | `hub`, `origin`                          | `hub`       |
+| `patch_divergence_policy`         | `replace`, `report`                      | `replace`   |
+| `push_patches_to_origin`          | boolean                                  | `false`     |
+| `rebuild_push_integration_branch` | boolean                                  | `false`     |
+| `squash_merge_detection`          | `ancestry_only`, `content_based`, `both` | `both`      |
+| `forge_api_url`                   | string                                   | `""`        |
+| `upstream_forge_api_url`          | string                                   | `""`        |
+| `sync_enabled`                    | boolean                                  | `true`      |
+
 ## Server Endpoints
 
 These four routes are served at the server root, outside the mount point,

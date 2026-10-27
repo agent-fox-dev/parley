@@ -137,3 +137,32 @@ export async function insertWorkspace(
 }
 
 export { toWorkspace };
+
+/** The columns a workspace update may change. */
+export interface WorkspaceChanges {
+  display_name?: string;
+  description?: string;
+  org_id?: string | null;
+  status?: WorkspaceStatus;
+  settings?: Record<string, unknown>;
+}
+
+export async function updateWorkspace(
+  store: RelationalStore,
+  slug: string,
+  changes: WorkspaceChanges,
+  at: string,
+): Promise<void> {
+  const assignments: string[] = [];
+  const params: unknown[] = [];
+  for (const [column, value] of Object.entries(changes)) {
+    if (value === undefined) {
+      continue;
+    }
+    assignments.push(`${column} = ?`);
+    params.push(column === 'settings' ? JSON.stringify(value) : value);
+  }
+  assignments.push('updated_at = ?');
+  params.push(at, slug);
+  await store.run(`UPDATE workspaces SET ${assignments.join(', ')} WHERE slug = ?`, params);
+}

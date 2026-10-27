@@ -292,3 +292,137 @@ describe('the workspace list', () => {
     expect(byMember[0]?.['access']).toBe('member');
   });
 });
+
+async function updatable() {
+  const held = await owner();
+  await held.app.request(`${MOUNT}/workspaces`, withJson('POST', create(), held.key));
+  return held;
+}
+
+const read = async (held: Awaited<ReturnType<typeof owner>>) =>
+  (await (await held.app.request(`${MOUNT}/workspaces/my-project`, as(held.key))).json()) as Record<
+    string,
+    unknown
+  >;
+
+const patch = async (held: Awaited<ReturnType<typeof owner>>, body: unknown) =>
+  held.app.request(`${MOUNT}/workspaces/my-project`, withJson('PATCH', body, held.key));
+
+describe('updating a workspace', () => {
+  it('changes the field it names and leaves every other alone', async () => {
+    const held = await updatable();
+    const before = await read(held);
+
+    const response = await patch(held, { display_name: 'Renamed' });
+    const after = await read(held);
+
+    expect(response.status).toBe(200);
+    expect(after['display_name']).toBe('Renamed');
+    expect({ ...after, display_name: null, updated_at: null }).toEqual({
+      ...before,
+      display_name: null,
+      updated_at: null,
+    });
+  });
+
+  it('returns a field given as null to its default', async () => {
+    const held = await updatable();
+
+    await patch(held, { display_name: 'Renamed', description: 'a description' });
+    await patch(held, { description: null });
+    const withoutDescription = await read(held);
+    await patch(held, { display_name: null });
+    const withoutName = await read(held);
+
+    expect(withoutDescription['description']).toBe('');
+    expect(withoutDescription['display_name']).toBe('Renamed');
+    expect(withoutName['display_name']).toBe('my-project');
+  });
+
+  it('returns every setting to its default when the settings object is null', async () => {
+    const held = await updatable();
+    await patch(held, { settings: { rebuild_strategy: 'merge', sync_enabled: false } });
+
+    const response = await patch(held, { settings: null });
+    const settings = ((await response.json()) as { settings: Record<string, unknown> }).settings;
+
+    expect(response.status).toBe(200);
+    expect(settings['rebuild_strategy']).toBe('rebase');
+    expect(settings['sync_enabled']).toBe(true);
+  });
+
+  it('sets, resets and keeps settings in one call', async () => {
+    const held = await updatable();
+    await patch(held, { settings: { sync_enabled: false, patch_branch_source: 'origin' } });
+
+    const response = await patch(held, {
+      settings: { rebuild_strategy: 'merge', sync_enabled: null },
+    });
+    const settings = ((await response.json()) as { settings: Record<string, unknown> }).settings;
+
+    expect(settings['rebuild_strategy']).toBe('merge');
+    expect(settings['sync_enabled']).toBe(true);
+    expect(settings['patch_branch_source']).toBe('origin');
+  });
+
+  it('moves the workspace to another organization its owner belongs to', async () => {
+    const held = await updatable();
+    const second = await seedOrg(held.store, held.user);
+
+    const response = await patch(held, { org_id: second.slug });
+
+    expect(response.status).toBe(200);
+    expect(((await response.json()) as { org_id: string }).org_id).toBe(second.id);
+  });
+});
+
+describe('an update the service refuses', () => {
+  it.each([
+    ['an empty body', {}],
+    ['a 129-character display_name', { display_name: 'x'.repeat(129) }],
+    ['a 1025-character description', { description: 'y'.repeat(1025) }],
+    ['the immutable slug', { slug: 'renamed-project' }],
+    ['the immutable git_url', { git_url: 'https://github.com/other/repo.git' }],
+    ['the immutable branch', { branch: 'trunk' }],
+    ['the immutable owner_id', { owner_id: 'somebody-else' }],
+    ['the immutable workspace_mode', { workspace_mode: 'carry_patch' }],
+    ['the immutable upstream_url', { upstream_url: 'https://up.test/r.git' }],
+    ['the immutable integration_branch', { integration_branch: 'deploy' }],
+    ['the retired sync_mode', { sync_mode: 'manual' }],
+    ['an org_id naming nothing', { org_id: 'no-such-org' }],
+    ['an unknown setting', { settings: { invented_switch: true } }],
+    ['a setting value outside its list', { settings: { rebuild_strategy: 'squash' } }],
+  ])('answers 400 for %s and changes nothing', async (_name, body) => {
+    const held = await updatable();
+    const before = await read(held);
+
+    const response = await patch(held, body);
+
+    expect(response.status).toBe(400);
+    expect(await read(held)).toEqual(before);
+  });
+
+  it('answers 400 on an archived workspace, after the access check has passed', async () => {
+    const held = await updatable();
+    await held.store.run('UPDATE workspaces SET status = ? WHERE slug = ?', [
+      'archived',
+      'my-project',
+    ]);
+
+    const response = await patch(held, { display_name: 'Renamed' });
+
+    expect(response.status).toBe(400);
+  });
+
+  it("answers 403 for an organization the workspace's owner does not belong to", async () => {
+    const held = await updatable();
+    const stranger = await seedUser(held.store);
+    const theirs = await seedOrg(held.store, stranger);
+    const before = await read(held);
+
+    const response = await patch(held, { org_id: theirs.id });
+
+    expect(response.status).toBe(403);
+    expect(await read(held)).toEqual(before);
+  });
+});

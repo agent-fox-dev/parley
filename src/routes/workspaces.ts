@@ -10,9 +10,11 @@ import { findOrg, findUser, isMember, orgsOfUser } from '../store/identity.js';
 import type { OrgRecord } from '../store/identity.js';
 import {
   type WorkspaceRecord,
+  type WorkspaceChanges,
   findWorkspace,
   insertWorkspace,
   listVisibleWorkspaces,
+  updateWorkspace,
 } from '../store/workspaces.js';
 import { accessLevel, hidesMissingScope, workspaceAccess } from '../workspace/access.js';
 import { serialiseWorkspace } from '../workspace/serialise.js';
@@ -172,6 +174,103 @@ async function listWorkspaces(c: Context, config: WorkspaceRouteConfig): Promise
   return jsonResponse(serialised);
 }
 
+/** The fields a workspace is created with and never changes afterwards. */
+const IMMUTABLE = [
+  'slug',
+  'git_url',
+  'branch',
+  'owner_id',
+  'workspace_mode',
+  'upstream_url',
+  'integration_branch',
+];
+
+const MAX_DISPLAY_NAME = 128;
+const MAX_DESCRIPTION = 1024;
+
+/** A text field an update may change, or the default it returns to. */
+function changedText(
+  body: Record<string, unknown>,
+  field: string,
+  limit: number,
+  fallback: string,
+): string | undefined {
+  if (!(field in body)) {
+    return undefined;
+  }
+  const value = body[field];
+  if (value === null) {
+    return fallback;
+  }
+  if (typeof value !== 'string' || value.length > limit) {
+    throw new HttpError(400, `${field} must be a string of at most ${limit} characters`);
+  }
+  return value;
+}
+
+async function changeWorkspace(c: Context, config: WorkspaceRouteConfig): Promise<Response> {
+  const { workspace, level } = await workspaceAccess(c, config.store, 'write');
+  // Access first, then the status: a member writing to an archived
+  // workspace has already been refused by the line above.
+  if (workspace.status === 'archived') {
+    throw new HttpError(400, 'this workspace is archived; reactivate it first');
+  }
+
+  const body = await readJsonObject(c);
+  if (Object.keys(body).length === 0) {
+    throw new HttpError(400, 'name at least one field to change');
+  }
+  for (const field of IMMUTABLE) {
+    if (field in body) {
+      throw new HttpError(400, `${field} cannot be changed`);
+    }
+  }
+  if ('sync_mode' in body) {
+    throw new HttpError(400, 'sync_mode was retired; use the sync_enabled setting');
+  }
+
+  const changes: WorkspaceChanges = {};
+  const displayName = changedText(body, 'display_name', MAX_DISPLAY_NAME, workspace.slug);
+  if (displayName !== undefined) {
+    changes.display_name = displayName;
+  }
+  const description = changedText(body, 'description', MAX_DESCRIPTION, '');
+  if (description !== undefined) {
+    changes.description = description;
+  }
+  if ('settings' in body) {
+    changes.settings = checkedSettings(body['settings'], workspace.settings);
+  }
+
+  let orgSlug: string | null = null;
+  if ('org_id' in body) {
+    if (body['org_id'] === null) {
+      changes.org_id = null;
+    } else {
+      // The organization is the owner's to belong to, whoever is asking.
+      const org = await owningOrg(config.store, workspace.owner_id, String(body['org_id']));
+      changes.org_id = org.id;
+      orgSlug = org.slug;
+    }
+  }
+
+  await updateWorkspace(config.store, workspace.slug, changes, config.clock.now().toISOString());
+
+  const updated = await findWorkspace(config.store, workspace.slug);
+  const org =
+    updated?.org_id === null || updated?.org_id === undefined
+      ? undefined
+      : await findOrg(config.store, updated.org_id);
+
+  return jsonResponse(
+    serialiseWorkspace(updated ?? workspace, {
+      access: level,
+      orgSlug: org?.slug ?? orgSlug,
+      externalUrl: config.externalUrl,
+    }),
+  );
+}
+
 export function workspaceRoutes(config: WorkspaceRouteConfig): RouteDefinition[] {
   return [
     {
@@ -191,6 +290,13 @@ export function workspaceRoutes(config: WorkspaceRouteConfig): RouteDefinition[]
       scope: 'workspaces:read',
       hideScopeFailure: hidesMissingScope('GET', '/workspaces/:slug'),
       handler: async (c) => readWorkspace(c, config),
+    },
+    {
+      path: `${config.mountPoint}/workspaces/:slug`,
+      methods: ['PATCH'],
+      scope: 'workspaces:write',
+      hideScopeFailure: hidesMissingScope('PATCH', '/workspaces/:slug'),
+      handler: async (c) => changeWorkspace(c, config),
     },
   ];
 }
