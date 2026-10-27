@@ -322,6 +322,31 @@ else.**
 | 400    | The token is already revoked             |
 | 404    | No such token, or it is not the caller's |
 
+### PUT / PATCH / DELETE /api/v1/user/tokens/:token_id/permissions
+
+Change a token's scopes: `PUT` replaces the set, `PATCH` adds to it,
+`DELETE` removes from it.
+
+**Access:** `tokens:write`. A token may add only scopes it holds itself;
+removing needs no such check.
+
+**Request:** `{"permissions": ["workspaces:read"]}`. `permissions` must be
+present and not null.
+
+**Response:** `200 OK` with the token's metadata after the change.
+Removing a scope the token does not hold succeeds and changes nothing.
+
+**`PUT` with an empty array** removes every permission **and revokes the
+token**: the answer carries `"permissions": []` with `revoked_at` set, and
+the token is refused `401` from the next request on. `PATCH` and `DELETE`
+refuse an empty array.
+
+| Status | Condition                                                                                                                          |
+| ------ | ---------------------------------------------------------------------------------------------------------------------------------- |
+| 400    | `permissions` absent or null; an empty array on `PATCH` or `DELETE`; a retired or unregistered scope; the token is already revoked |
+| 403    | A token adding a scope it does not hold                                                                                            |
+| 404    | No such token, or it is not the caller's                                                                                           |
+
 ## Server Endpoints
 
 These four routes are served at the server root, outside the mount point,

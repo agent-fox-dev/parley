@@ -231,6 +231,24 @@ export async function rotateSecret(
   ]);
 }
 
+/**
+ * The scopes a token holds from now on. Passing a revocation instant with
+ * an empty set is how a token is emptied and retired at once.
+ */
+export async function setPermissions(
+  store: RelationalStore,
+  id: string,
+  permissions: readonly string[],
+  revokedAt: string | null,
+): Promise<void> {
+  await store.run(
+    revokedAt === null
+      ? 'UPDATE credentials SET permissions = ? WHERE id = ?'
+      : 'UPDATE credentials SET permissions = ?, revoked_at = ? WHERE id = ?',
+    revokedAt === null ? [permissions.join(' '), id] : [permissions.join(' '), revokedAt, id],
+  );
+}
+
 export async function revokeCredential(
   store: RelationalStore,
   id: string,
