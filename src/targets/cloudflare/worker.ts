@@ -54,6 +54,7 @@ export default {
           clock: platform.clock,
           metrics: platform.metrics,
           providers: configuredProviders(platform.config),
+          locks: platform.locks,
         }),
         auth: {
           store: platform.store,

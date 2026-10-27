@@ -4,6 +4,7 @@ import { inMemoryMetrics } from '../platform/local/metrics.js';
 import type { RelationalStore } from '../platform/index.js';
 import { serviceRoutes } from '../routes/index.js';
 import { deploymentKey, sealedSecrets } from '../secrets/store.js';
+import { storeLocks } from '../platform/store_lock.js';
 import type { SecretStore } from '../platform/secrets.js';
 import { freshStore, seedClock } from './identity.js';
 import { providerIdentity, stubDirectory } from './oauth.js';
@@ -43,6 +44,7 @@ export async function identityService(extra: RouteDefinition[] = []): Promise<Se
         providers: stubDirectory({ codes: { 'a-code': providerIdentity() } }),
         secrets,
         externalUrl: EXTERNAL_URL,
+        locks: storeLocks(seeded.store, clock),
       }),
       ...extra,
     ],

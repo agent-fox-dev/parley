@@ -591,6 +591,54 @@ same body.
 | `upstream_forge_api_url`          | string                                   | `""`        |
 | `sync_enabled`                    | boolean                                  | `true`      |
 
+### POST /api/v1/workspaces/:slug/archive
+
+Archive a workspace. An archived workspace keeps its records and can be
+reactivated; writes to it are refused.
+
+**Access:** `workspaces:write` (a token without it gets `404`); write
+access. Archiving takes the [workspace lock](#the-workspace-lock).
+
+**Response:** `200 OK` with the workspace, `status` `archived`. Bound
+tokens are left alone and keep working.
+
+| Status               | Condition                                    |
+| -------------------- | -------------------------------------------- |
+| 400                  | The workspace is already archived            |
+| 409                  | The workspace is `cloning`                   |
+| 409 `workspace_busy` | Another operation holds the workspace's lock |
+
+### POST /api/v1/workspaces/:slug/reactivate
+
+**Access:** `workspaces:write` (a token without it gets `404`); write
+access.
+
+**Response:** `200 OK` with the workspace, `status` `pending`. `409` when
+the workspace is not archived.
+
+### DELETE /api/v1/workspaces/:slug
+
+Delete an archived workspace for good.
+
+**Access:** `workspaces:write` (a token without it gets `404`); write
+access.
+
+**Behaviour:** in one transaction, every live token bound to the workspace
+is revoked, every binding removed, the workspace's secrets deleted and the
+record itself removed. A failure part way leaves all of them as they were,
+so tokens are never revoked for a workspace that is still there.
+
+**Response:** `204 No Content`. `409` when the workspace is not archived.
+
+### The workspace lock
+
+The operations that work on a workspace's repository take turns. A request
+that finds another running answers `409` with `error_type:
+workspace_busy` **at once**, without waiting, and can be retried. The lock
+is shared by every instance of the service, and an instance that stops
+without releasing one holds it no longer than its lease
+([ADR 5](adr/05-hold-the-workspace-lock-as-a-lease-in-the-store.md)).
+
 ## Workspace-bound tokens
 
 A personal access token can be tied to exactly one workspace when it is

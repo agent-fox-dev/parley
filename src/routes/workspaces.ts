@@ -1,11 +1,11 @@
 import type { Context } from 'hono';
 import { identityOf } from '../auth/middleware.js';
 import { HttpError } from '../http/errors.js';
-import { jsonResponse, readJsonObject } from '../http/json.js';
+import { emptyResponse, jsonResponse, readJsonObject } from '../http/json.js';
 import type { RouteDefinition } from '../http/router.js';
 import type { SecretStore } from '../platform/secrets.js';
 import { workspaceScope } from '../platform/secrets.js';
-import type { Clock, RelationalStore } from '../platform/index.js';
+import type { Clock, Locks, RelationalStore } from '../platform/index.js';
 import { findOrg, findUser, isMember, orgsOfUser } from '../store/identity.js';
 import type { OrgRecord } from '../store/identity.js';
 import {
@@ -17,6 +17,11 @@ import {
   updateWorkspace,
 } from '../store/workspaces.js';
 import { accessLevel, hidesMissingScope, workspaceAccess } from '../workspace/access.js';
+import {
+  archiveWorkspace,
+  deleteWorkspaceAndTokens,
+  reactivateWorkspace,
+} from '../workspace/lifecycle.js';
 import { serialiseWorkspace } from '../workspace/serialise.js';
 import { checkedSettings } from '../workspace/settings.js';
 import { checkedCreate } from '../workspace/validate.js';
@@ -28,6 +33,7 @@ export interface WorkspaceRouteConfig {
   /** Absent where the deployment configured no key to seal secrets with. */
   secrets?: SecretStore;
   externalUrl?: string;
+  locks: Locks;
 }
 
 /**
@@ -276,6 +282,26 @@ async function changeWorkspace(c: Context, config: WorkspaceRouteConfig): Promis
   );
 }
 
+/** Answers with the workspace as it stands after a change to its status. */
+async function answerWithWorkspace(
+  config: WorkspaceRouteConfig,
+  slug: string,
+  access: 'admin' | 'owner' | 'member',
+): Promise<Response> {
+  const updated = await findWorkspace(config.store, slug);
+  if (updated === undefined) {
+    throw new HttpError(404, 'workspace not found');
+  }
+  const org = updated.org_id === null ? undefined : await findOrg(config.store, updated.org_id);
+  return jsonResponse(
+    serialiseWorkspace(updated, {
+      access,
+      orgSlug: org?.slug ?? null,
+      externalUrl: config.externalUrl,
+    }),
+  );
+}
+
 export function workspaceRoutes(config: WorkspaceRouteConfig): RouteDefinition[] {
   return [
     {
@@ -302,6 +328,39 @@ export function workspaceRoutes(config: WorkspaceRouteConfig): RouteDefinition[]
       scope: 'workspaces:write',
       hideScopeFailure: hidesMissingScope('PATCH', '/workspaces/:slug'),
       handler: async (c) => changeWorkspace(c, config),
+    },
+    {
+      path: `${config.mountPoint}/workspaces/:slug/archive`,
+      methods: ['POST'],
+      scope: 'workspaces:write',
+      hideScopeFailure: hidesMissingScope('POST', '/workspaces/:slug/archive'),
+      handler: async (c) => {
+        const { workspace, level } = await workspaceAccess(c, config.store, 'write');
+        await archiveWorkspace(config.store, config.locks, config.clock, workspace);
+        return answerWithWorkspace(config, workspace.slug, level);
+      },
+    },
+    {
+      path: `${config.mountPoint}/workspaces/:slug/reactivate`,
+      methods: ['POST'],
+      scope: 'workspaces:write',
+      hideScopeFailure: hidesMissingScope('POST', '/workspaces/:slug/reactivate'),
+      handler: async (c) => {
+        const { workspace, level } = await workspaceAccess(c, config.store, 'write');
+        await reactivateWorkspace(config.store, config.clock, workspace);
+        return answerWithWorkspace(config, workspace.slug, level);
+      },
+    },
+    {
+      path: `${config.mountPoint}/workspaces/:slug`,
+      methods: ['DELETE'],
+      scope: 'workspaces:write',
+      hideScopeFailure: hidesMissingScope('DELETE', '/workspaces/:slug'),
+      handler: async (c) => {
+        const { workspace } = await workspaceAccess(c, config.store, 'write');
+        await deleteWorkspaceAndTokens(config.store, config.clock, workspace);
+        return emptyResponse(204);
+      },
     },
   ];
 }
