@@ -6,6 +6,8 @@ import { noStore } from '../../platform/store.js';
 import { systemClock } from '../../platform/local/clock.js';
 import { inMemoryMetrics } from '../../platform/local/metrics.js';
 import { maxBodyBytesFrom, type Platform } from '../../platform/index.js';
+import { configuredProviders } from '../../auth/oauth.js';
+import { serviceRoutes } from '../../routes/index.js';
 import { migrate } from '../../store/migrations/index.js';
 
 export interface Env {
@@ -45,6 +47,15 @@ export default {
         ...maxBodyBytesFrom(platform.config),
         buildTime: platform.config.get('PARLEY_BUILD_TIME') ?? '',
         commit: platform.config.get('PARLEY_COMMIT') ?? '',
+        routes: serviceRoutes({
+          mountPoint: mountPoint ?? DEFAULT_MOUNT_POINT,
+          buildTime: platform.config.get('PARLEY_BUILD_TIME') ?? '',
+          commit: platform.config.get('PARLEY_COMMIT') ?? '',
+          store: platform.store,
+          clock: platform.clock,
+          metrics: platform.metrics,
+          providers: configuredProviders(platform.config),
+        }),
         auth: {
           store: platform.store,
           clock: platform.clock,

@@ -14,6 +14,7 @@ implemented; routes appear here as they are built.
 - [Authentication](#authentication)
 - [Permission Scopes](#permission-scopes)
 - [Error Response Schema](#error-response-schema)
+- [Signing in](#signing-in)
 - [Server Endpoints](#server-endpoints)
 
 ## Conventions
@@ -124,6 +125,81 @@ contract lists one for that condition and **absent** — not null — otherwise.
 An unhandled failure is answered `500` with the message exactly
 `internal server error`. No part of the underlying failure reaches the
 response body; it goes to the log.
+
+## Signing in
+
+OAuth is the only source of an API key; there is no password login. Both
+routes are public.
+
+### GET /api/v1/auth/providers
+
+The OAuth providers this deployment is configured with, and where to send a
+person to authorise. Cached publicly (`Cache-Control: public, max-age=300`).
+
+**Response:** `200 OK`
+
+```json
+[{ "name": "github", "authorize_url": "https://github.com/login/oauth/authorize?client_id=..." }]
+```
+
+A deployment that configured no provider answers `200` with an empty array:
+sign-in is unavailable, every other route still works.
+
+### POST /api/v1/auth/callback
+
+Exchange a provider's authorization code for the user and a new API key.
+
+**Request:**
+
+| Field          | Required | Type    | Description                                                         |
+| -------------- | -------- | ------- | ------------------------------------------------------------------- |
+| `provider`     | yes      | string  | A provider from the list above                                      |
+| `code`         | yes      | string  | The provider's authorization code                                   |
+| `redirect_uri` | no       | string  | Must be on the provider's allowlist, where it has one               |
+| `expires`      | no       | integer | Key lifetime in days: `0` (never), `30`, `60` or `90`. Default `90` |
+
+**Behaviour.** The user is created or found, **every** API key that user
+already holds is revoked, and one new key is issued — the revocation and the
+issue in a single transaction, so a failure leaves neither half done.
+Automation holding an older key of the same user stops working after a
+sign-in; this is the hub's behaviour and Parley reproduces it. A user
+signing in for the first time also gets a personal organization, owned by
+them.
+
+**Response:** `200 OK`. **The key is returned here and by no other route.**
+
+```json
+{
+  "user": {
+    "id": "uuid-string",
+    "username": "alice",
+    "email": "alice@example.com",
+    "full_name": "Alice Example",
+    "status": "active",
+    "role": "user",
+    "provider": "github",
+    "provider_id": "12345",
+    "created_at": "2026-03-01T12:00:00Z",
+    "updated_at": "2026-03-01T12:00:00Z"
+  },
+  "api_key": {
+    "key": "af_<key_id>_<secret>",
+    "key_id": "<key_id>",
+    "expires_at": "2026-05-30T12:00:00Z"
+  }
+}
+```
+
+`expires_at` is `null` for a key issued with `expires` of `0`.
+
+**Errors.** None of them creates a user, issues a key or revokes one.
+
+| Status | Condition                                                                                                                                                                 |
+| ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 400    | A body that is not a JSON object; `provider` or `code` missing; an unconfigured provider; a `redirect_uri` outside the allowlist; an `expires` other than 0, 30, 60 or 90 |
+| 401    | The authorization code is invalid or expired                                                                                                                              |
+| 403    | The user is blocked                                                                                                                                                       |
+| 409    | The username belongs to another provider identity                                                                                                                         |
 
 ## Server Endpoints
 

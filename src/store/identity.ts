@@ -114,6 +114,26 @@ export async function findCredential(
   return rows[0] === undefined ? undefined : toCredential(rows[0]);
 }
 
+export async function findUserByProviderIdentity(
+  store: RelationalStore,
+  provider: string,
+  providerId: string,
+): Promise<UserRecord | undefined> {
+  const rows = await store.all('SELECT * FROM users WHERE provider = ? AND provider_id = ?', [
+    provider,
+    providerId,
+  ]);
+  return rows[0] === undefined ? undefined : toUser(rows[0]);
+}
+
+export async function findUserByUsername(
+  store: RelationalStore,
+  username: string,
+): Promise<UserRecord | undefined> {
+  const rows = await store.all('SELECT * FROM users WHERE username = ?', [username]);
+  return rows[0] === undefined ? undefined : toUser(rows[0]);
+}
+
 export async function insertUser(store: RelationalStore, user: UserRecord): Promise<void> {
   await store.run(
     `INSERT INTO users (id, username, email, full_name, status, role, provider, provider_id, created_at, updated_at)
@@ -170,6 +190,38 @@ export async function addMember(
     `INSERT OR REPLACE INTO org_members (org_id, user_id, role, created_at) VALUES (?, ?, ?, ?)`,
     [member.org_id, member.user_id, member.role, member.created_at],
   );
+}
+
+/**
+ * Retires every API key the user holds and issues the one given, so that a
+ * sign-in never leaves two live keys or, on a failure, none.
+ */
+export async function replaceApiKeys(
+  store: RelationalStore,
+  issued: CredentialRecord,
+  at: string,
+): Promise<void> {
+  await store.batch([
+    {
+      sql: 'UPDATE credentials SET revoked_at = ? WHERE user_id = ? AND kind = ? AND revoked_at IS NULL',
+      params: [at, issued.user_id, 'api_key'],
+    },
+    {
+      sql: `INSERT INTO credentials (id, kind, user_id, name, secret_hash, permissions, created_at, expires_at, revoked_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      params: [
+        issued.id,
+        issued.kind,
+        issued.user_id,
+        issued.name,
+        issued.secret_hash,
+        issued.permissions.join(' '),
+        issued.created_at,
+        issued.expires_at,
+        issued.revoked_at,
+      ],
+    },
+  ]);
 }
 
 /** The organizations a user belongs to, read on every workspace decision. */

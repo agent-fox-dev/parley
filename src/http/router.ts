@@ -153,6 +153,11 @@ export function buildApp(options: AppOptions = {}): Hono {
   app.notFound(() => errorResponse(new HttpError(404, 'not found')));
 
   app.onError((err) => {
+    // A route that refused the request said what to answer; anything else
+    // is a failure nobody expected, and its detail goes to the log alone.
+    if (err instanceof HttpError) {
+      return errorResponse(err);
+    }
     log.error('unhandled failure while answering a request', err);
     return errorResponse(new HttpError(500, 'internal server error'));
   });

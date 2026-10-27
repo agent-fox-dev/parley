@@ -23,6 +23,21 @@ Neither `PARLEY_BUILD_TIME` nor `PARLEY_COMMIT` affects behaviour; a
 deployment that sets neither answers `GET /version` successfully with both
 as the empty string.
 
+## Signing in
+
+Sign-in is configured per provider. GitHub is the only one implemented.
+Where the client id or the client secret is unset, the provider list is
+empty and `POST /api/v1/auth/callback` refuses every provider name.
+
+| Variable                            | Default  | Description                                                                                 |
+| ----------------------------------- | -------- | ------------------------------------------------------------------------------------------- |
+| `PARLEY_OAUTH_GITHUB_CLIENT_ID`     | unset    | The OAuth application's client id. Appears in the `authorize_url` the provider list serves. |
+| `PARLEY_OAUTH_GITHUB_CLIENT_SECRET` | unset    | The OAuth application's client secret, sent only to the provider's token endpoint.          |
+| `PARLEY_OAUTH_GITHUB_REDIRECT_URIS` | unset    | Comma-separated redirect URIs a callback may name. Unset allows any.                        |
+| `PARLEY_OAUTH_GITHUB_AUTHORIZE_URL` | GitHub's | Where a person is sent to authorise. Set it to point at a stub while testing.               |
+| `PARLEY_OAUTH_GITHUB_TOKEN_URL`     | GitHub's | Where a code is exchanged for an access token.                                              |
+| `PARLEY_OAUTH_GITHUB_PROFILE_URL`   | GitHub's | Where the signed-in person's profile is read.                                               |
+
 ## Limits
 
 | Setting              | Default         | Description                                                                                                                                 |
