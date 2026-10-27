@@ -1,0 +1,640 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/test_spec.v2.json",
+  "spec_id": "07",
+  "spec_name": "git_server",
+  "schema_version": 2,
+  "tests": [
+    {
+      "id": "TS-07-1",
+      "kind": "integration",
+      "verifies": [
+        "07-REQ-1.1"
+      ],
+      "title": "A repository is served at the organization and workspace path",
+      "given": [
+        "a ready workspace in an organization and a valid owner credential"
+      ],
+      "when": "a git client clones the external URL followed by /git/<org>/<slug>.git",
+      "then": [
+        "the clone succeeds",
+        "the cloned refs match the workspace's repository",
+        "the path is built from the workspace's organization slug and its own slug"
+      ],
+      "pseudocode": "in the git server integration test file: assert git_clone(url, cred).refs == store_refs(ws)"
+    },
+    {
+      "id": "TS-07-2",
+      "kind": "unit",
+      "verifies": [
+        "07-REQ-1.2"
+      ],
+      "title": "A path without .git or with the wrong organization is not found",
+      "given": [
+        "a ready workspace in an organization"
+      ],
+      "when": "git requests are made without the .git suffix, with another organization's slug, and for a slug naming no workspace",
+      "then": [
+        "each answers a pkt-line 404 ERR repository not found",
+        "the three answers are identical"
+      ],
+      "pseudocode": "in the git server test file, table over the three paths asserting an identical pkt-line 404"
+    },
+    {
+      "id": "TS-07-3",
+      "kind": "integration",
+      "verifies": [
+        "07-REQ-1.3"
+      ],
+      "title": "hub_url is the address actually served",
+      "given": [
+        "a ready workspace with an organization, one without, and a service with and without an external URL"
+      ],
+      "when": "each workspace is read and its hub_url cloned where it is not null",
+      "then": [
+        "a non-null hub_url clones successfully",
+        "a workspace with no organization reports null and is served at no git URL",
+        "a service with no external URL reports null"
+      ],
+      "pseudocode": "in the git server integration test file: u = read(ws).hub_url; assert (u is None) or git_clone(u).ok"
+    },
+    {
+      "id": "TS-07-4",
+      "kind": "unit",
+      "verifies": [
+        "07-REQ-2.1"
+      ],
+      "title": "The Basic password is the credential and the username is ignored",
+      "given": [
+        "an API key, a PAT with git scopes and an admin token"
+      ],
+      "when": "a fetch is made with each credential as the Basic password, under several different usernames including an empty one",
+      "then": [
+        "each credential is accepted whatever the username",
+        "all three kinds are admitted on a route their access allows"
+      ],
+      "pseudocode": "in the git auth test file, table over (credential, username) asserting admission"
+    },
+    {
+      "id": "TS-07-5",
+      "kind": "unit",
+      "verifies": [
+        "07-REQ-2.2"
+      ],
+      "title": "A missing, invalid or blocked credential is refused alike",
+      "given": [
+        "no credential, a malformed one, a revoked one and a live one whose user is blocked"
+      ],
+      "when": "a fetch is attempted with each",
+      "then": [
+        "each answers 401 with a pkt-line error",
+        "the message does not say which condition applied"
+      ],
+      "pseudocode": "in the git auth test file, table over the four cases asserting an identical 401 pkt-line"
+    },
+    {
+      "id": "TS-07-6",
+      "kind": "unit",
+      "verifies": [
+        "07-REQ-2.3"
+      ],
+      "title": "Every git refusal is well-formed pkt-line",
+      "given": [
+        "refusals for no credential, a member's push, a stranger, a bad service parameter and a failed lookup"
+      ],
+      "when": "each is produced",
+      "then": [
+        "each body parses as pkt-line",
+        "no body is a JSON error envelope",
+        "a real git client prints each message"
+      ],
+      "pseudocode": "in the git auth test file, table over the refusals asserting parse_pktline(body) succeeds and body does not start with '{'"
+    },
+    {
+      "id": "TS-07-7",
+      "kind": "unit",
+      "verifies": [
+        "07-REQ-2.4"
+      ],
+      "title": "A store token is neither accepted from nor disclosed to a client",
+      "given": [
+        "a repo-scoped store token minted for a relay"
+      ],
+      "when": "it is offered as the Basic password, and a successful fetch and a refused push are inspected",
+      "then": [
+        "the offered store token is refused like any unknown credential",
+        "no response body or header of either request contains a store token"
+      ],
+      "pseudocode": "in the git auth test file: assert fetch(basic=storeToken).status == 401; assert STORE_TOKEN not in response.text and not in headers"
+    },
+    {
+      "id": "TS-07-8",
+      "kind": "integration",
+      "verifies": [
+        "07-REQ-3.1"
+      ],
+      "title": "Owner, admin token and member all fetch; owner and admin token also push",
+      "given": [
+        "a ready workspace, its owner, an admin token and a member of its organization"
+      ],
+      "when": "each fetches, and the owner and the admin token each push a branch",
+      "then": [
+        "all three fetches return the same pack",
+        "both pushes are applied",
+        "the member's fetch result is identical to the owner's"
+      ],
+      "pseudocode": "in the git access integration test file: assert pack(owner) == pack(member) == pack(admin); assert push(owner).ok and push(admin).ok"
+    },
+    {
+      "id": "TS-07-9",
+      "kind": "unit",
+      "verifies": [
+        "07-REQ-3.2"
+      ],
+      "title": "A member's push and receive advertisement are refused",
+      "given": [
+        "a member of the workspace's organization, holding a PAT with git:write"
+      ],
+      "when": "the member requests the receive-service advertisement and then pushes",
+      "then": [
+        "both answer a pkt-line 403 ERR org members have read-only access to this workspace",
+        "the repository is unchanged",
+        "the PAT's git:write does not help"
+      ],
+      "pseudocode": "in the git access test file: assert advert(member, 'git-receive-pack').pkt == MEMBER_MSG and push(member).pkt == MEMBER_MSG"
+    },
+    {
+      "id": "TS-07-10",
+      "kind": "unit",
+      "verifies": [
+        "07-REQ-3.3"
+      ],
+      "title": "A stranger and a foreign bound token are told the repository is not found",
+      "given": [
+        "a stranger, a token bound to another workspace, an existing workspace, an archived one and a slug naming nothing"
+      ],
+      "when": "each makes a fetch and a push against each workspace",
+      "then": [
+        "every answer is a pkt-line 404 ERR repository not found",
+        "the answers are identical across the three workspace cases"
+      ],
+      "pseudocode": "in the git access test file, table over (caller, workspace, operation) asserting an identical 404"
+    },
+    {
+      "id": "TS-07-11",
+      "kind": "unit",
+      "verifies": [
+        "07-REQ-3.4"
+      ],
+      "title": "The git checks run in the documented order",
+      "given": [
+        "a workspace whose repository is not ready, a member holding a PAT without git scopes, and a mismatched organization in the URL"
+      ],
+      "when": "each combination is requested",
+      "then": [
+        "the organization mismatch answers repository not found before readiness is considered",
+        "the unready repository answers ERR repository not available before access",
+        "a member's push is refused as a member before the PAT's scopes are considered"
+      ],
+      "pseudocode": "in the git access test file, table over (urlOrg, repoReady, caller, patScopes, expectedMessage)"
+    },
+    {
+      "id": "TS-07-12",
+      "kind": "unit",
+      "verifies": [
+        "07-REQ-3.5"
+      ],
+      "title": "A failed access lookup refuses the git request",
+      "given": [
+        "a store whose membership lookup raises"
+      ],
+      "when": "the owner, a member and a stranger each fetch and push",
+      "then": [
+        "every request answers a pkt-line 500",
+        "no pack is served and no ref is updated"
+      ],
+      "pseudocode": "in the git access test file: with lookup raising, assert every request's pkt-line is a 500 and refs() unchanged"
+    },
+    {
+      "id": "TS-07-13",
+      "kind": "unit",
+      "verifies": [
+        "07-REQ-3.6"
+      ],
+      "title": "The git scopes gate fetch and push",
+      "given": [
+        "PATs holding git:read alone, git:write alone, and neither"
+      ],
+      "when": "each fetches and pushes",
+      "then": [
+        "git:read fetches and is refused a push",
+        "git:write fetches and pushes",
+        "the PAT with neither is refused both with a pkt-line 403"
+      ],
+      "pseudocode": "in the git access test file, table over (scopes, operation, expected)"
+    },
+    {
+      "id": "TS-07-14",
+      "kind": "integration",
+      "verifies": [
+        "07-REQ-4.1"
+      ],
+      "title": "The ref advertisement is served for both services",
+      "given": [
+        "a ready workspace and a credential with write access"
+      ],
+      "when": "the advertisement is requested for the upload and the receive service",
+      "then": [
+        "each answers 200 with Content-Type application/x-<service>-advertisement",
+        "a real git client parses each body",
+        "the advertised refs match the repository's"
+      ],
+      "pseudocode": "in the git server integration test file, table over the two services asserting status, content type and parseability"
+    },
+    {
+      "id": "TS-07-15",
+      "kind": "unit",
+      "verifies": [
+        "07-REQ-4.2"
+      ],
+      "title": "A missing or invalid service parameter is refused",
+      "given": [
+        "a ready workspace and a valid credential"
+      ],
+      "when": "the advertisement is requested with no service, an empty service and an unknown service",
+      "then": [
+        "each answers a pkt-line 403 ERR invalid or missing service parameter"
+      ],
+      "pseudocode": "in the git server test file, table over the three cases"
+    },
+    {
+      "id": "TS-07-16",
+      "kind": "integration",
+      "verifies": [
+        "07-REQ-4.3"
+      ],
+      "title": "An incremental fetch transfers only what the client lacks",
+      "given": [
+        "a repository with substantial history, and a client that has cloned it"
+      ],
+      "when": "one commit is added and the client fetches again",
+      "then": [
+        "the second fetch transfers far fewer bytes than the clone",
+        "the client ends with the same refs as a fresh clone would give",
+        "the negotiation exchanged have and want lines"
+      ],
+      "pseudocode": "in the git server integration test file: b1 = clone_bytes(); add_commit(); b2 = fetch_bytes(); assert b2 < b1 / 10 and refs(client) == refs(store)"
+    },
+    {
+      "id": "TS-07-17",
+      "kind": "integration",
+      "verifies": [
+        "07-REQ-4.4"
+      ],
+      "title": "Both protocol versions and a gzip body are served",
+      "given": [
+        "a ready workspace"
+      ],
+      "when": "a client clones asking for protocol v2, another asking for v0, and one sends a gzip-encoded request body",
+      "then": [
+        "all three succeed",
+        "the resulting refs are identical in each case"
+      ],
+      "pseudocode": "in the git server integration test file, table over (protocolVersion, contentEncoding) asserting a successful clone"
+    },
+    {
+      "id": "TS-07-18",
+      "kind": "integration",
+      "verifies": [
+        "07-REQ-5.1"
+      ],
+      "title": "An accepted push is applied and reported",
+      "given": [
+        "a ready workspace and a caller with write access"
+      ],
+      "when": "a new branch, an update to an existing branch and a tag are pushed",
+      "then": [
+        "the response is 200 with Content-Type application/x-git-receive-pack-result",
+        "each ref is reported ok",
+        "each ref is readable at its new value afterwards"
+      ],
+      "pseudocode": "in the git push integration test file: r = push(refs); assert all(s == 'ok' for s in r.perRef.values()) and store_refs() == expected"
+    },
+    {
+      "id": "TS-07-19",
+      "kind": "integration",
+      "verifies": [
+        "07-REQ-5.2"
+      ],
+      "title": "Exactly the refs reported ok are the refs that changed",
+      "given": [
+        "a workspace and a push mixing refs that will be accepted and refs that will be refused"
+      ],
+      "when": "the push is made and the repository's refs are compared before and after",
+      "then": [
+        "the set of refs whose value changed equals the set reported ok",
+        "no ref reported ng changed",
+        "no ref absent from the report changed"
+      ],
+      "pseudocode": "in the git push integration test file: before = refs(); r = push(mixed); assert changed(before, refs()) == {k for k,v in r.perRef.items() if v == 'ok'}"
+    },
+    {
+      "id": "TS-07-20",
+      "kind": "unit",
+      "verifies": [
+        "07-REQ-5.3"
+      ],
+      "title": "A push refused outright changes nothing",
+      "given": [
+        "a workspace with a known ref list"
+      ],
+      "when": "a push is refused for a missing credential, for a member, for a stranger and for a missing git scope",
+      "then": [
+        "every ref holds its previous value after each refusal",
+        "no object reached the store"
+      ],
+      "pseudocode": "in the git push test file, table over the refusals asserting refs() == before and store.writes == 0"
+    },
+    {
+      "id": "TS-07-21",
+      "kind": "integration",
+      "verifies": [
+        "07-REQ-6.1"
+      ],
+      "title": "A patch branch is refused when it is synced from the fork",
+      "given": [
+        "a carry_patch workspace with patch_branch_source origin and push_patches_to_origin false, and a registered patch branch"
+      ],
+      "when": "an update and then a deletion of that branch are pushed",
+      "then": [
+        "the update is reported ng with \"branch is synced from origin; push to <git_url> instead\"",
+        "the deletion is reported ng with the delete-on-the-fork message",
+        "the git_url in the message carries no userinfo",
+        "the ref keeps its old value"
+      ],
+      "pseudocode": "in the push control integration test file: assert ng_message(push(update)) startswith 'branch is synced from origin; push to'"
+    },
+    {
+      "id": "TS-07-22",
+      "kind": "integration",
+      "verifies": [
+        "07-REQ-6.2"
+      ],
+      "title": "A patch branch is forwarded to the fork and accepted only if the fork accepts",
+      "given": [
+        "a carry_patch workspace with patch_branch_source origin and push_patches_to_origin true, a fork that accepts one branch and refuses another, and a workspace with no usable fork credential"
+      ],
+      "when": "updates are pushed for each case, and a deletion is pushed",
+      "then": [
+        "the accepted branch is reported ok and holds its new value",
+        "the refused branch is reported ng with \"origin rejected push: <error>\" and keeps its old value",
+        "the workspace with no credential is reported ng naming the failure to resolve credentials",
+        "the deletion is refused as under the previous setting",
+        "the forward was not forced"
+      ],
+      "pseudocode": "in the push control integration test file, table over the four cases asserting the per-ref report and the fork's received request"
+    },
+    {
+      "id": "TS-07-23",
+      "kind": "integration",
+      "verifies": [
+        "07-REQ-6.3"
+      ],
+      "title": "A patch branch is accepted and then mirrored, and a failed mirror does not fail the push",
+      "given": [
+        "a carry_patch workspace with patch_branch_source hub and push_patches_to_origin true, and a fork that accepts, then one that refuses"
+      ],
+      "when": "an update of a registered patch branch is pushed against each",
+      "then": [
+        "both are reported ok and hold the new value",
+        "the fork that accepts received a forced push",
+        "the failed mirror leaves the push successful"
+      ],
+      "pseudocode": "in the push control integration test file: assert push(update).perRef[ref] == 'ok' in both cases and fork.received.forced is True"
+    },
+    {
+      "id": "TS-07-24",
+      "kind": "integration",
+      "verifies": [
+        "07-REQ-6.4"
+      ],
+      "title": "Ordinary updates are accepted with no push control",
+      "given": [
+        "a carry_patch workspace with patch_branch_source hub and push_patches_to_origin false, a standard workspace, and a carry_patch workspace receiving a branch that is not a registered patch"
+      ],
+      "when": "an update is pushed in each case",
+      "then": [
+        "each is reported ok and holds the new value",
+        "no request was made to the fork in any of them"
+      ],
+      "pseudocode": "in the push control integration test file, table over the three cases asserting ok and fork.requests == 0"
+    },
+    {
+      "id": "TS-07-25",
+      "kind": "integration",
+      "verifies": [
+        "07-REQ-6.5"
+      ],
+      "title": "Push control decides each ref of one push independently",
+      "given": [
+        "a carry_patch workspace with patch_branch_source origin and push_patches_to_origin false"
+      ],
+      "when": "one push carries a registered patch branch, an ordinary branch and a tag",
+      "then": [
+        "the ordinary branch and the tag are reported ok and hold their new values",
+        "the patch branch is reported ng",
+        "the outcome of one ref did not change the outcome of another"
+      ],
+      "pseudocode": "in the push control integration test file: r = push([patch, ordinary, tag]); assert r.perRef == {'patch':'ng','ordinary':'ok','tag':'ok'}"
+    },
+    {
+      "id": "TS-07-26",
+      "kind": "integration",
+      "verifies": [
+        "07-REQ-7.1"
+      ],
+      "title": "A push to the protected namespace is rejected per ref while the push itself succeeds",
+      "given": [
+        "a workspace holding a ref under refs/hub/replaced/"
+      ],
+      "when": "a push carries a create, an update and a delete of refs under that namespace, alongside an ordinary branch",
+      "then": [
+        "the push reports unpack ok",
+        "each protected ref is reported ng with the fixed message",
+        "each protected ref keeps its old value or stays absent",
+        "the ordinary branch is applied"
+      ],
+      "pseudocode": "in the protected namespace integration test file: r = push(mixed); assert r.unpack == 'ok' and all(v.startswith('ng') for v in protected) and r.perRef['ordinary'] == 'ok'"
+    },
+    {
+      "id": "TS-07-27",
+      "kind": "unit",
+      "verifies": [
+        "07-REQ-7.2"
+      ],
+      "title": "The protection holds for every workspace and every credential",
+      "given": [
+        "a standard workspace and a carry_patch workspace",
+        "an API key, a PAT with git:write and an admin token"
+      ],
+      "when": "a push to the protected namespace is attempted in each combination",
+      "then": [
+        "every attempt is refused with the same message",
+        "no credential, the admin token included, can write the namespace"
+      ],
+      "pseudocode": "in the protected namespace test file, table over (workspaceMode, credential) asserting an identical ng message"
+    },
+    {
+      "id": "TS-07-28",
+      "kind": "integration",
+      "verifies": [
+        "07-REQ-7.3"
+      ],
+      "title": "Replaced refs are readable where the store accepts the namespace",
+      "given": [
+        "a workspace with a ref under refs/hub/replaced/, against a store that accepts the namespace and one that does not"
+      ],
+      "when": "the refs are listed remotely and the ref is fetched",
+      "then": [
+        "where the store accepts the namespace the ref is listed and fetched successfully",
+        "where it does not, the read is unavailable and the push refusal still holds",
+        "the behaviour follows the store's capability report rather than a guess"
+      ],
+      "pseudocode": "in the protected namespace integration test file, table over the two store capabilities asserting the read outcome and the unchanged push refusal"
+    },
+    {
+      "id": "TS-07-29",
+      "kind": "integration",
+      "verifies": [
+        "07-REQ-8.1"
+      ],
+      "title": "head_sha is refreshed after every push",
+      "given": [
+        "a ready workspace"
+      ],
+      "when": "a push that is fully accepted, one partly refused and one whose every ref is refused are each made",
+      "then": [
+        "after each, the workspace's head_sha equals the repository's HEAD",
+        "the refresh happens even when no ref was accepted"
+      ],
+      "pseudocode": "in the git push integration test file, table over the three pushes asserting read(ws).head_sha == store_head(ws)"
+    },
+    {
+      "id": "TS-07-30",
+      "kind": "unit",
+      "verifies": [
+        "07-REQ-8.2"
+      ],
+      "title": "A refused ref has no effect beyond the head_sha refresh",
+      "given": [
+        "a carry_patch workspace with push control refusing a patch branch, and a recording fork"
+      ],
+      "when": "a push carrying only that refused ref is made",
+      "then": [
+        "no forward and no mirror request reached the fork",
+        "no field of the workspace record changed except head_sha",
+        "the ref keeps its old value"
+      ],
+      "pseudocode": "in the git push test file: before = record(ws); push(refused); assert fork.requests == 0 and diff(record(ws), before) <= {'head_sha'}"
+    },
+    {
+      "id": "TS-07-31",
+      "kind": "smoke",
+      "verifies": [
+        "07-PATH-1"
+      ],
+      "title": "An agent clones and pushes against a running deployment with a real git client",
+      "given": [
+        "a running deployment, a ready workspace and the afc credential helper configured"
+      ],
+      "when": "git clone, a commit and git push are run against the workspace's hub_url",
+      "then": [
+        "the clone succeeds and the working tree matches the repository",
+        "the push is accepted and the branch is readable afterwards",
+        "the workspace's head_sha is refreshed"
+      ],
+      "pseudocode": "in the git server smoke test file: run('git clone', hub_url); commit(); run('git push'); assert branch in remote_refs() and read(ws).head_sha == tip",
+      "real_components": [
+        "running deployment",
+        "git server routes",
+        "access decision",
+        "repository store",
+        "real git client"
+      ]
+    },
+    {
+      "id": "TS-07-32",
+      "kind": "smoke",
+      "verifies": [
+        "07-PATH-2"
+      ],
+      "title": "A member clones and is refused a push, against a running deployment",
+      "given": [
+        "a running deployment, a workspace and a member of its organization with their own credential"
+      ],
+      "when": "the member runs git clone and then git push",
+      "then": [
+        "the clone succeeds and yields the same refs as the owner's clone",
+        "the push fails and git prints the member message",
+        "the repository is unchanged"
+      ],
+      "pseudocode": "in the git server smoke test file: assert clone(member).ok; r = push(member); assert 'read-only access' in r.stderr",
+      "real_components": [
+        "running deployment",
+        "git server routes",
+        "access decision",
+        "repository store",
+        "real git client"
+      ]
+    },
+    {
+      "id": "TS-07-33",
+      "kind": "smoke",
+      "verifies": [
+        "07-PATH-3"
+      ],
+      "title": "One push, two refs, two outcomes against a running deployment",
+      "given": [
+        "a running deployment and a carry_patch workspace with patch_branch_source origin and push_patches_to_origin false"
+      ],
+      "when": "a real git client pushes a registered patch branch and an ordinary branch in one invocation",
+      "then": [
+        "git reports the ordinary branch accepted and the patch branch rejected",
+        "the rejection message names where to push instead",
+        "the ordinary branch is readable afterwards and the patch branch is unchanged"
+      ],
+      "pseudocode": "in the git server smoke test file: r = run('git push origin patch ordinary'); assert 'rejected' in r.stderr and ordinary in remote_refs()",
+      "real_components": [
+        "running deployment",
+        "git server routes",
+        "push control",
+        "repository store",
+        "real git client"
+      ]
+    },
+    {
+      "id": "TS-07-34",
+      "kind": "smoke",
+      "verifies": [
+        "07-PATH-4"
+      ],
+      "title": "A push to the protected namespace is rejected while the rest lands",
+      "given": [
+        "a running deployment and a workspace whose owner holds a live credential"
+      ],
+      "when": "a real git client pushes a ref under refs/hub/replaced/ together with an ordinary branch",
+      "then": [
+        "git reports the protected ref rejected with the hub's message",
+        "git reports the ordinary branch accepted",
+        "the protected ref still holds its old value"
+      ],
+      "pseudocode": "in the git server smoke test file: r = run('git push origin HEAD:refs/hub/replaced/x HEAD:ordinary'); assert 'maintained by the hub' in r.stderr",
+      "real_components": [
+        "running deployment",
+        "git server routes",
+        "protected namespace",
+        "repository store",
+        "real git client"
+      ]
+    }
+  ]
+}

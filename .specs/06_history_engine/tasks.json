@@ -1,0 +1,295 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v2.json",
+  "spec_id": "06",
+  "spec_name": "history_engine",
+  "schema_version": 2,
+  "test_commands": {
+    "all_tests": "make test",
+    "linter": "make lint"
+  },
+  "dependencies": [
+    {
+      "spec": "01",
+      "reason": "follows its platform interface pattern and runs inside the units of platform work it defines"
+    },
+    {
+      "spec": "05",
+      "reason": "reads and writes every object and ref through its repository store, and respects the capability report it establishes"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "kind": "implement",
+      "title": "Stand the engine on isomorphic-git with a store-backed adapter",
+      "criteria": [
+        "06-REQ-8"
+      ],
+      "tests": [
+        "TS-06-28",
+        "TS-06-29"
+      ],
+      "steps": [
+        "Verify isomorphic-git against its installed types: which operations exist, what a storage adapter must implement, how objects are read and written, and how it behaves on memory at the sizes this package states. Record the findings and correct this package's requirements and the source PRD's Verified External API where the documentation was wrong",
+        "Add this task's behaviours to the engine integration test file, and confirm they fail",
+        "Implement a storage adapter that backs isomorphic-git with the repository store of package 05, with no filesystem and no IndexedDB",
+        "Define the history engine's interface: three-way merge, rebase, merge, and the recording, replay, listing and forgetting of resolutions",
+        "Confirm the engine works against both repository store implementations and reaches neither store API directly",
+        "Confirm every operation runs in an environment with no git executable on the path and starts no external process"
+      ],
+      "touches": [
+        "src/history/engine.ts",
+        "src/history/adapter.ts",
+        "src/history/engine.integration.test.ts",
+        "package.json",
+        "docs/adr/"
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 2,
+      "kind": "implement",
+      "title": "Compute the three-way merge",
+      "criteria": [
+        "06-REQ-1"
+      ],
+      "tests": [
+        "TS-06-1",
+        "TS-06-2",
+        "TS-06-3",
+        "TS-06-4",
+        "TS-06-5"
+      ],
+      "steps": [
+        "Add this task's behaviours to the three-way merge and merge differential test files, and confirm they fail",
+        "Implement the merge: a path changed on one side only takes that side's content and mode, and identical changes on both sides merge cleanly",
+        "Report a conflict naming the path when both sides change the same region differently, or when one deletes what the other changed, and produce no tree",
+        "Handle renames, mode changes, deletions, additions and binary files as git does, comparing each shape against the real git binary",
+        "Confirm by a generative test that a clean merge does not depend on the order of its two sides"
+      ],
+      "touches": [
+        "src/history/merge3.ts",
+        "src/history/merge3.test.ts",
+        "src/history/merge.differential.test.ts"
+      ],
+      "depends_on": [
+        1
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 3,
+      "kind": "implement",
+      "title": "Rebase a branch onto a base",
+      "criteria": [
+        "06-REQ-2"
+      ],
+      "tests": [
+        "TS-06-6",
+        "TS-06-7",
+        "TS-06-8",
+        "TS-06-9"
+      ],
+      "steps": [
+        "Add this task's behaviours to the rebase and rebase differential test files, and confirm they fail",
+        "Implement the rebase: copy each of the branch's own commits onto the base, in order, three-way merging each change",
+        "Keep each copied commit's author and message and give it a new committer and new parents",
+        "Handle a commit whose changes the base already has exactly as the real git binary does, verified by comparison",
+        "Stop at a conflicting commit, report the conflicting paths and the commit reached, apply no later commit, and leave the refs unchanged"
+      ],
+      "touches": [
+        "src/history/rebase.ts",
+        "src/history/rebase.test.ts",
+        "src/history/rebase.differential.test.ts"
+      ],
+      "depends_on": [
+        2
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 4,
+      "kind": "implement",
+      "title": "Merge a branch with a merge commit",
+      "criteria": [
+        "06-REQ-3"
+      ],
+      "tests": [
+        "TS-06-10",
+        "TS-06-11",
+        "TS-06-12"
+      ],
+      "steps": [
+        "Add this task's behaviours to the merge strategy and merge differential test files, and confirm they fail",
+        "Find the merge base of the two heads, including the criss-cross case",
+        "Produce one merge commit whose parents are the base's head and then the branch's head, and whose tree is the three-way merge of base, branch and merge base",
+        "Verify the merge commit's tree against the real git binary for both the simple and the criss-cross case",
+        "Produce no commit and report the conflicting paths when the merge conflicts"
+      ],
+      "touches": [
+        "src/history/merge_commit.ts",
+        "src/history/merge_commit.test.ts",
+        "src/history/merge.differential.test.ts"
+      ],
+      "depends_on": [
+        2
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 5,
+      "kind": "implement",
+      "title": "Report conflicts and identify them stably",
+      "criteria": [
+        "06-REQ-4"
+      ],
+      "tests": [
+        "TS-06-13",
+        "TS-06-14",
+        "TS-06-15"
+      ],
+      "steps": [
+        "Add this task's behaviours to the conflict identity, conflict differential and engine integration test files, and confirm they fail",
+        "Report every conflicting path and no cleanly merged path, verified against the real git binary",
+        "Compute a conflict identity from the conflict's content, stable across occurrences and restarts and distinct between different conflicts",
+        "Make every conflicting operation leave the repository exactly as it was, with no written object reachable from any ref"
+      ],
+      "touches": [
+        "src/history/conflict.ts",
+        "src/history/conflict.test.ts",
+        "src/history/conflict.differential.test.ts"
+      ],
+      "depends_on": [
+        3,
+        4
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 6,
+      "kind": "implement",
+      "title": "Record, replay, list and forget resolutions",
+      "criteria": [
+        "06-REQ-5"
+      ],
+      "tests": [
+        "TS-06-16",
+        "TS-06-17",
+        "TS-06-18",
+        "TS-06-19",
+        "TS-06-20"
+      ],
+      "steps": [
+        "Add this task's behaviours to the recorded resolutions test files, and confirm they fail",
+        "Store a resolution against its conflict identity in the deployment's own store, so it outlives the process that recorded it",
+        "Apply a recorded resolution when the same conflict arises again and continue the operation, producing the result the resolution would have produced by hand",
+        "List resolutions with identity, path where known, recorded time and whether a resolution will be replayed",
+        "Forget a resolution by identity, and by path while that path is in conflict, reporting that nothing was removed when a path is not in conflict"
+      ],
+      "touches": [
+        "src/history/resolutions.ts",
+        "src/history/resolutions.test.ts",
+        "src/history/resolutions.integration.test.ts",
+        "src/store/migrations/"
+      ],
+      "depends_on": [
+        5
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 7,
+      "kind": "implement",
+      "title": "Prove the engine against the real git binary",
+      "criteria": [
+        "06-REQ-6"
+      ],
+      "tests": [
+        "TS-06-21",
+        "TS-06-22",
+        "TS-06-23"
+      ],
+      "steps": [
+        "Add this task's behaviours to the corpus generator's test file and the differential suite, and confirm they fail",
+        "Write the corpus generator: at least 200 cases covering linear and branching history, renames, binary files, mode changes, empty commits, merge commits in the source, conflicting and clean patches, and a stack of at least 20 patches",
+        "Run each case through the engine and through the real git binary and compare the resulting tree, each commit's parents, the commit order and the conflicting paths",
+        "Fail the run on any difference, reporting the case that differed and how",
+        "Skip the suite with a message naming the missing dependency when no git binary is available, so the fast check still runs offline",
+        "Wire the suite into make check, as the source PRD's decision D12 requires"
+      ],
+      "touches": [
+        "src/history/corpus.ts",
+        "src/history/corpus.test.ts",
+        "src/history/differential.test.ts",
+        "Makefile"
+      ],
+      "depends_on": [
+        6
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 8,
+      "kind": "implement",
+      "title": "Work at the stated sizes and continue across units of work",
+      "criteria": [
+        "06-REQ-7"
+      ],
+      "tests": [
+        "TS-06-24",
+        "TS-06-25",
+        "TS-06-26",
+        "TS-06-27"
+      ],
+      "steps": [
+        "Add this task's behaviours to the engine limits and engine integration test files, and confirm they fail or skip with a named reason when a fixture cannot be built",
+        "Apply a stack of 50 patches onto a repository of 500 MB of packed objects and confirm the result matches the real git binary's",
+        "Fail an operation exceeding the patch count, repository size, changed-file count or diff size with a reason naming the limit, rather than stalling or being killed",
+        "Continue an operation that cannot finish in one unit of platform work in another, producing the same result as one that fits in a single unit",
+        "Leave the repository unchanged when an operation fails or is abandoned part way",
+        "Measure where the real ceilings lie and correct the figures in this package and in the source PRD's decision D17 if they differ"
+      ],
+      "touches": [
+        "src/history/limits.ts",
+        "src/history/limits.test.ts",
+        "src/history/engine.integration.test.ts",
+        "docs/adr/"
+      ],
+      "depends_on": [
+        6
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 9,
+      "kind": "integration",
+      "title": "Verify the engine end to end against a real store and a real git",
+      "tests": [
+        "TS-06-30",
+        "TS-06-31",
+        "TS-06-32"
+      ],
+      "steps": [
+        "Add the three smoke tests and confirm each passes, or skips with a message naming the missing store or git binary",
+        "Trace 06-PATH-1: the rebase reads commits, trees and blobs through the repository store, writes new objects back through it and updates the ref. Confirm no object access bypasses the store and no step is served by a stub",
+        "Trace 06-PATH-2: the conflict identity is computed from content, the resolution is written to the deployment's store, and a restarted process reads it back and replays it",
+        "Trace 06-PATH-3: the differential suite drives the real engine and the real git binary over a generated corpus and compares them",
+        "For every criterion carrying a contract, confirm a caller in production code consumes the producer's result and not only a test: the three-way merge is called by both the rebase and the merge strategy, the conflict identity by the resolution store, and the limits by every entry point",
+        "Confirm the engine's public interface is the one packages 09 and 10 will drive, and that nothing in it assumes a filesystem, a subprocess or a long-running process",
+        "Grep src/history/ and the files every task's touches lists for TODO, FIXME and the project's not-implemented marker, and remove any that remain"
+      ],
+      "touches": [
+        "src/history/engine.smoke.test.ts"
+      ],
+      "depends_on": [
+        7,
+        8
+      ],
+      "done_when": [
+        "`make check` passes with no network access, and reports the differential suite as skipped when no git binary is present",
+        "the differential suite compares at least 200 cases with no mismatch when a git binary is present"
+      ],
+      "state": "pending"
+    }
+  ]
+}

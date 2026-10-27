@@ -1,0 +1,366 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v2.json",
+  "spec_id": "06",
+  "spec_name": "history_engine",
+  "schema_version": 2,
+  "introduction": "The history engine computes in TypeScript what the hub computed by running git: three-way merges, rebases, merge commits and the replay of recorded conflict resolutions. It has no routes; its callers are the rebuild and merge packages. Its correctness criterion is equality with the real git binary, proved over a generated corpus.",
+  "glossary": {
+    "conflict identity": "A stable value the engine computes from a conflict's content, used to recognise the same conflict when it arises again and to key its recorded resolution. It need not equal git's rerere hash.",
+    "differential suite": "The test suite that runs each case of a generated corpus through the engine and through the real git binary and fails on any difference in tree, parents, commit order or conflicting paths.",
+    "history engine": "The module that applies one branch to another and reports the result, reading and writing objects through the repository store and running no external program.",
+    "recorded resolution": "A resolution stored against a conflict identity, applied automatically when that conflict arises again.",
+    "three-way merge": "Combining two sides of a change against their common base, taking a one-sided change as it stands and reporting a conflict where both sides changed the same region differently.",
+    "unit of platform work": "One invocation the platform will run to completion, bounded by its CPU, memory and wall-clock limits. Work too large for one continues in another."
+  },
+  "requirements": [
+    {
+      "id": "06-REQ-1",
+      "title": "Three-way merge",
+      "rationale": "Every other operation here is built on it, so a flaw in the merge is a flaw in rebases, merge commits and replayed resolutions alike.",
+      "criteria": [
+        {
+          "id": "06-REQ-1.1",
+          "pattern": "ubiquitous",
+          "system": "history engine",
+          "action": "for a path changed on only one side of a base, take that side's content into the merged tree",
+          "contract": "the merged tree's entry for that path equals the changed side's entry, in content and in mode"
+        },
+        {
+          "id": "06-REQ-1.2",
+          "pattern": "ubiquitous",
+          "system": "history engine",
+          "action": "merge identical changes made on both sides without reporting a conflict",
+          "contract": "the merged tree's entry equals the entry both sides produced, and the result carries no conflict"
+        },
+        {
+          "id": "06-REQ-1.3",
+          "pattern": "unwanted",
+          "condition": "both sides change the same region of one path differently",
+          "system": "history engine",
+          "action": "report a conflict naming that path and produce no merged tree",
+          "contract": "the result is a conflict whose path list contains that path; no tree object is written"
+        },
+        {
+          "id": "06-REQ-1.4",
+          "pattern": "ubiquitous",
+          "system": "history engine",
+          "action": "treat renames, mode changes, deletions, additions and binary files as the real git binary treats them",
+          "contract": "for each of those shapes the merged tree, or the conflict, matches what git produces from the same base and sides"
+        },
+        {
+          "id": "06-REQ-1.5",
+          "pattern": "ubiquitous",
+          "system": "history engine",
+          "action": "produce the same merged tree whichever of the two sides is given first, for any input that merges cleanly",
+          "contract": "swapping the two sides yields an identical tree object id for every non-conflicting case"
+        }
+      ]
+    },
+    {
+      "id": "06-REQ-2",
+      "title": "Rebase",
+      "rationale": "This is how a patch stack is applied, so an extra, missing or reordered commit changes what a deployment ships.",
+      "criteria": [
+        {
+          "id": "06-REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "a branch is rebased onto a base",
+          "system": "history engine",
+          "action": "copy each of the branch's own commits onto the base, in their original order",
+          "contract": "the resulting history holds one commit per original commit of the branch, in the same order, each with the base's history behind it"
+        },
+        {
+          "id": "06-REQ-2.2",
+          "pattern": "ubiquitous",
+          "system": "history engine",
+          "action": "keep each copied commit's author and message, and give it a new committer and new parents",
+          "contract": "for each copied commit the author and message equal the original's, the parent is the previously copied commit or the base, and the commit id differs from the original's"
+        },
+        {
+          "id": "06-REQ-2.3",
+          "pattern": "ubiquitous",
+          "system": "history engine",
+          "action": "handle a commit whose changes are already present in the base as the real git binary handles it",
+          "contract": "for a branch containing such a commit, the resulting history is identical to the one git produces from the same inputs"
+        },
+        {
+          "id": "06-REQ-2.4",
+          "pattern": "unwanted",
+          "condition": "copying one of the branch's commits conflicts",
+          "system": "history engine",
+          "action": "stop at that commit, report the conflicting paths, and apply none of the branch's later commits",
+          "contract": "the result is a conflict naming the paths and the commit it stopped at; no later commit of the branch appears in any written object; the repository is unchanged"
+        }
+      ]
+    },
+    {
+      "id": "06-REQ-3",
+      "title": "Merge strategy",
+      "rationale": "The alternative rebuild strategy, chosen per workspace or per job, and wrong parentage here makes the integration branch's history unreadable.",
+      "criteria": [
+        {
+          "id": "06-REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "a branch is merged into a base",
+          "system": "history engine",
+          "action": "produce one merge commit whose parents are the base and the branch",
+          "contract": "the resulting commit has exactly two parents, the first the base's head and the second the branch's head"
+        },
+        {
+          "id": "06-REQ-3.2",
+          "pattern": "ubiquitous",
+          "system": "history engine",
+          "action": "set the merge commit's tree to the three-way merge of the base, the branch and their merge base",
+          "contract": "the merge commit's tree object id equals the one git produces for the same merge"
+        },
+        {
+          "id": "06-REQ-3.3",
+          "pattern": "unwanted",
+          "condition": "the merge conflicts",
+          "system": "history engine",
+          "action": "produce no commit and report the conflicting paths",
+          "contract": "no commit or tree object is written; the result names every conflicting path"
+        }
+      ]
+    },
+    {
+      "id": "06-REQ-4",
+      "title": "Conflicts",
+      "rationale": "A conflict is reported to a user and recorded for replay, so its path list and its identity are both part of the contract.",
+      "criteria": [
+        {
+          "id": "06-REQ-4.1",
+          "pattern": "ubiquitous",
+          "system": "history engine",
+          "action": "report every path that conflicted and no path that merged cleanly",
+          "contract": "the reported path set equals the set git reports for the same inputs"
+        },
+        {
+          "id": "06-REQ-4.2",
+          "pattern": "ubiquitous",
+          "system": "history engine",
+          "action": "compute a conflict's identity from its content, so that the same conflict arising again yields the same identity",
+          "contract": "two occurrences of the same conflict yield equal identities; two different conflicts yield different identities; the identity is unchanged across restarts"
+        },
+        {
+          "id": "06-REQ-4.3",
+          "pattern": "unwanted",
+          "condition": "an operation ends in a conflict",
+          "system": "history engine",
+          "action": "leave the repository exactly as it was before the operation began",
+          "contract": "the ref list and every ref's target are unchanged, and no object written during the attempt is reachable from any ref"
+        }
+      ]
+    },
+    {
+      "id": "06-REQ-5",
+      "title": "Recorded resolutions",
+      "rationale": "Replaying a resolution is what makes a repeated rebuild of a long patch stack survivable; without it every rebuild stops at the same conflict.",
+      "criteria": [
+        {
+          "id": "06-REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "a conflict is resolved",
+          "system": "history engine",
+          "action": "record the resolution against that conflict's identity",
+          "contract": "the resolution is afterwards listed for that identity with resolved true"
+        },
+        {
+          "id": "06-REQ-5.2",
+          "pattern": "complex_event",
+          "condition": "an operation reaches a conflict",
+          "guard": "a resolution is recorded for that conflict's identity",
+          "system": "history engine",
+          "action": "apply the recorded resolution and continue the operation",
+          "contract": "the operation completes without reporting that conflict, and its result equals the result of the same operation with the resolution applied by hand"
+        },
+        {
+          "id": "06-REQ-5.3",
+          "pattern": "ubiquitous",
+          "system": "history engine",
+          "action": "keep a recorded resolution beyond the invocation and the process that recorded it",
+          "contract": "a resolution recorded before a restart is applied to the same conflict after it"
+        },
+        {
+          "id": "06-REQ-5.4",
+          "pattern": "event_driven",
+          "condition": "the recorded resolutions of a repository are listed",
+          "system": "history engine",
+          "action": "report each with its identity, the path where it is known, when it was recorded, and whether a resolution is recorded or only the conflict has been seen",
+          "contract": "every entry carries an identity and a recorded time; path is present where the engine knows it and absent otherwise; resolved is true only when a resolution will be replayed"
+        },
+        {
+          "id": "06-REQ-5.5",
+          "pattern": "event_driven",
+          "condition": "a resolution is forgotten by identity, or by path while that path is in conflict",
+          "system": "history engine",
+          "action": "remove it, so the conflict is reported again next time",
+          "contract": "the entry is gone from the listing and the next occurrence of that conflict is reported rather than replayed; forgetting by a path that is not in conflict removes nothing and says so"
+        }
+      ]
+    },
+    {
+      "id": "06-REQ-6",
+      "title": "Equivalence with the real git binary",
+      "rationale": "This engine stands in for git; near-enough is a silently wrong history, and only a comparison against git can show the difference.",
+      "criteria": [
+        {
+          "id": "06-REQ-6.1",
+          "pattern": "ubiquitous",
+          "system": "history engine",
+          "action": "for any case the differential corpus holds, produce the history the real git binary produces from the same inputs with the same strategy",
+          "contract": "the resulting tree object id, each commit's parent list and the order of the commits are identical to git's for every case"
+        },
+        {
+          "id": "06-REQ-6.2",
+          "pattern": "ubiquitous",
+          "system": "history engine",
+          "action": "for any corpus case that conflicts, report the same conflicting paths the real git binary reports",
+          "contract": "the two path sets are equal, and a case that conflicts for one and not the other is a failure"
+        },
+        {
+          "id": "06-REQ-6.3",
+          "pattern": "ubiquitous",
+          "system": "differential suite",
+          "action": "cover at least 200 generated histories spanning linear and branching history, renames, binary files, mode changes, empty commits, merge commits in the source, conflicting and clean patches, and a stack of at least 20 patches",
+          "contract": "the corpus holds at least 200 cases and at least one of each named shape, and every case runs through both implementations"
+        }
+      ]
+    },
+    {
+      "id": "06-REQ-7",
+      "title": "Size and progress",
+      "rationale": "Worker CPU and memory bound the work, and an operation that stalls or is killed half way is worse than one that refuses.",
+      "criteria": [
+        {
+          "id": "06-REQ-7.1",
+          "pattern": "ubiquitous",
+          "system": "history engine",
+          "action": "apply a stack of at least 50 patches onto a repository of at most 500 MB of packed objects, with at most 1000 changed files and 10 MB of diff per patch",
+          "contract": "the operation completes and its result matches git's for the same inputs"
+        },
+        {
+          "id": "06-REQ-7.2",
+          "pattern": "unwanted",
+          "condition": "an operation exceeds the stated patch count, repository size, changed-file count or diff size",
+          "system": "history engine",
+          "action": "fail with a reason naming the limit exceeded rather than stalling",
+          "contract": "the failure names which limit was exceeded; the operation does not run past the platform's limits and is not killed"
+        },
+        {
+          "id": "06-REQ-7.3",
+          "pattern": "event_driven",
+          "condition": "an operation cannot finish within one unit of platform work",
+          "system": "history engine",
+          "action": "continue it in another and carry it to completion",
+          "contract": "an operation spanning several units completes with the same result as one that fits in a single unit"
+        },
+        {
+          "id": "06-REQ-7.4",
+          "pattern": "unwanted",
+          "condition": "an operation fails or is abandoned part way",
+          "system": "history engine",
+          "action": "leave the repository as it was before it began",
+          "contract": "the ref list and every ref's target are unchanged, and no partial result is reachable from any ref"
+        }
+      ]
+    },
+    {
+      "id": "06-REQ-8",
+      "title": "The engine as a module",
+      "rationale": "Two packages will drive it, and the deployment has no git binary to fall back on if it quietly depends on one.",
+      "criteria": [
+        {
+          "id": "06-REQ-8.1",
+          "pattern": "ubiquitous",
+          "system": "history engine",
+          "action": "read and write objects and refs only through the repository store interface",
+          "contract": "the engine's operations succeed against both implementations of the repository store, with no direct use of either"
+        },
+        {
+          "id": "06-REQ-8.2",
+          "pattern": "ubiquitous",
+          "system": "history engine",
+          "action": "run where no git binary is present",
+          "contract": "every operation of the engine succeeds in an environment with no git executable on the path"
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "06-PATH-1",
+      "title": "A branch is rebased in a real repository and the result is readable",
+      "steps": [
+        {
+          "actor": "calling package",
+          "action": "asks the history engine to rebase a branch onto a base in a workspace's repository"
+        },
+        {
+          "actor": "history engine",
+          "action": "reads the commits, trees and blobs it needs through the repository store"
+        },
+        {
+          "actor": "history engine",
+          "action": "copies each of the branch's commits onto the base, three-way merging each change"
+        },
+        {
+          "actor": "repository store",
+          "action": "stores the new objects and the updated ref"
+        },
+        {
+          "actor": "calling package",
+          "action": "reads the new head and finds the expected commits, in order, with the base's history behind them"
+        }
+      ]
+    },
+    {
+      "id": "06-PATH-2",
+      "title": "A conflict is resolved once and replayed after a restart",
+      "steps": [
+        {
+          "actor": "calling package",
+          "action": "applies a patch that conflicts and receives the conflicting paths and the conflict's identity"
+        },
+        {
+          "actor": "calling package",
+          "action": "resolves the conflict and records the resolution against that identity"
+        },
+        {
+          "actor": "Parley service",
+          "action": "restarts, losing every in-memory state"
+        },
+        {
+          "actor": "calling package",
+          "action": "applies the same patch onto the same base again"
+        },
+        {
+          "actor": "history engine",
+          "action": "recognises the conflict, applies the recorded resolution and completes without reporting a conflict"
+        }
+      ]
+    },
+    {
+      "id": "06-PATH-3",
+      "title": "The generated corpus agrees with the real git binary",
+      "steps": [
+        {
+          "actor": "differential suite",
+          "action": "generates a corpus of at least 200 histories covering the named shapes"
+        },
+        {
+          "actor": "history engine",
+          "action": "runs each case and reports its resulting history or its conflicting paths"
+        },
+        {
+          "actor": "real git binary",
+          "action": "runs the same case on the same inputs"
+        },
+        {
+          "actor": "differential suite",
+          "action": "compares the tree, the parents, the commit order and the conflicting paths and fails on any difference"
+        }
+      ]
+    }
+  ]
+}

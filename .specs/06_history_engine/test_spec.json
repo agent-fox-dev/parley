@@ -1,0 +1,588 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/test_spec.v2.json",
+  "spec_id": "06",
+  "spec_name": "history_engine",
+  "schema_version": 2,
+  "tests": [
+    {
+      "id": "TS-06-1",
+      "kind": "unit",
+      "verifies": [
+        "06-REQ-1.1"
+      ],
+      "title": "A change made on one side only is taken as it stands",
+      "given": [
+        "a base tree and two sides, where one side changes a file, adds a file and deletes a file and the other changes nothing"
+      ],
+      "when": "the three-way merge is computed",
+      "then": [
+        "the merged tree carries the changed file's new content and mode",
+        "the added file is present and the deleted file absent",
+        "no conflict is reported"
+      ],
+      "pseudocode": "in the three-way merge test file: t = merge(base, ours, theirs); assert entry(t, 'a') == entry(ours, 'a') and 'new' in t and 'gone' not in t"
+    },
+    {
+      "id": "TS-06-2",
+      "kind": "unit",
+      "verifies": [
+        "06-REQ-1.2"
+      ],
+      "title": "Identical changes on both sides merge cleanly",
+      "given": [
+        "a base tree and two sides that make byte-identical changes to the same file, and identical additions and deletions"
+      ],
+      "when": "the three-way merge is computed",
+      "then": [
+        "the merged tree carries that content",
+        "no conflict is reported"
+      ],
+      "pseudocode": "in the three-way merge test file: assert merge(base, s, s).tree == s.tree and no conflict"
+    },
+    {
+      "id": "TS-06-3",
+      "kind": "unit",
+      "verifies": [
+        "06-REQ-1.3"
+      ],
+      "title": "Differing changes to one region conflict and write nothing",
+      "given": [
+        "a base tree and two sides that change the same lines of one file differently, and a case where one side deletes a file the other changed"
+      ],
+      "when": "the three-way merge is computed for each",
+      "then": [
+        "each reports a conflict naming the path",
+        "no tree object is produced",
+        "a second file both sides left alone is not named"
+      ],
+      "pseudocode": "in the three-way merge test file, table over the conflicting shapes asserting conflict.paths == [p] and no tree"
+    },
+    {
+      "id": "TS-06-4",
+      "kind": "integration",
+      "verifies": [
+        "06-REQ-1.4"
+      ],
+      "title": "Renames, modes, deletions, additions and binary files behave as git does",
+      "given": [
+        "for each shape, a base and two sides built identically for the engine and for a real git repository"
+      ],
+      "when": "the merge is computed by the engine and by the real git binary",
+      "then": [
+        "for each shape, the merged tree or the conflict matches git's",
+        "binary files are not line-merged by either",
+        "a mode change on one side alone survives the merge"
+      ],
+      "pseudocode": "in the merge differential test file, table over the five shapes comparing engine and git results"
+    },
+    {
+      "id": "TS-06-5",
+      "kind": "property",
+      "verifies": [
+        "06-REQ-1.5"
+      ],
+      "title": "A clean merge does not depend on the order of its sides",
+      "given": [
+        "the three-way merge over generated base and side trees"
+      ],
+      "when": "for generated inputs that merge cleanly, the merge is computed with the sides in both orders",
+      "then": [
+        "both orders produce the same tree object id",
+        "neither order reports a conflict where the other does not"
+      ],
+      "pseudocode": "in the three-way merge test file, a generative test: assert merge(b, x, y).tree == merge(b, y, x).tree for clean cases"
+    },
+    {
+      "id": "TS-06-6",
+      "kind": "unit",
+      "verifies": [
+        "06-REQ-2.1"
+      ],
+      "title": "A rebase copies every commit of the branch, in order, onto the base",
+      "given": [
+        "a base with two commits and a branch with three of its own commits"
+      ],
+      "when": "the branch is rebased onto the base",
+      "then": [
+        "the resulting history holds exactly three new commits",
+        "their order matches the branch's original order",
+        "the base's two commits are behind them"
+      ],
+      "pseudocode": "in the rebase test file: h = rebase(branch, base); assert [c.message for c in own(h)] == [c.message for c in own(branch)]"
+    },
+    {
+      "id": "TS-06-7",
+      "kind": "unit",
+      "verifies": [
+        "06-REQ-2.2"
+      ],
+      "title": "A copied commit keeps its author and message and takes new parents",
+      "given": [
+        "a branch whose commits have distinct authors, messages and timestamps"
+      ],
+      "when": "it is rebased onto a base",
+      "then": [
+        "each copied commit's author and message equal the original's",
+        "each copied commit's parent is the previous copy, or the base for the first",
+        "each copied commit's id differs from the original's"
+      ],
+      "pseudocode": "in the rebase test file: for orig, copy in zip(branch, result): assert copy.author == orig.author and copy.message == orig.message and copy.id != orig.id"
+    },
+    {
+      "id": "TS-06-8",
+      "kind": "integration",
+      "verifies": [
+        "06-REQ-2.3"
+      ],
+      "title": "A commit already present in the base is handled as git handles it",
+      "given": [
+        "a branch containing a commit whose changes the base already has, built identically for the engine and for a real git repository"
+      ],
+      "when": "the rebase is run by the engine and by the real git binary",
+      "then": [
+        "the two resulting histories are identical in tree, parents and commit count",
+        "whatever git does with the empty commit, the engine does the same"
+      ],
+      "pseudocode": "in the rebase differential test file: assert history(engine_rebase()) == history(git_rebase())"
+    },
+    {
+      "id": "TS-06-9",
+      "kind": "unit",
+      "verifies": [
+        "06-REQ-2.4"
+      ],
+      "title": "A rebase conflict stops at that commit and applies none after it",
+      "given": [
+        "a branch of three commits whose second conflicts with the base"
+      ],
+      "when": "the branch is rebased onto the base",
+      "then": [
+        "the result is a conflict naming the paths and the commit it stopped at",
+        "no object from the third commit is reachable from any ref",
+        "the repository's refs are unchanged"
+      ],
+      "pseudocode": "in the rebase test file: r = rebase(branch, base); assert r.conflict.at == branch[1].id and refs() == before"
+    },
+    {
+      "id": "TS-06-10",
+      "kind": "unit",
+      "verifies": [
+        "06-REQ-3.1"
+      ],
+      "title": "A merge produces one commit with two parents in the right order",
+      "given": [
+        "a base and a branch that diverge from a common ancestor and do not conflict"
+      ],
+      "when": "the branch is merged into the base",
+      "then": [
+        "exactly one new commit is produced",
+        "its parents are the base's head first and the branch's head second"
+      ],
+      "pseudocode": "in the merge strategy test file: c = merge_commit(base, branch); assert c.parents == [base.head, branch.head]"
+    },
+    {
+      "id": "TS-06-11",
+      "kind": "integration",
+      "verifies": [
+        "06-REQ-3.2"
+      ],
+      "title": "The merge commit's tree equals git's",
+      "given": [
+        "base and branch histories built identically for the engine and for a real git repository, including a case with a criss-cross merge base"
+      ],
+      "when": "the merge is computed by the engine and by the real git binary",
+      "then": [
+        "the two merge commits have the same tree object id",
+        "that holds for the criss-cross case as well as the simple one"
+      ],
+      "pseudocode": "in the merge differential test file: assert engine_merge().tree == git_merge().tree"
+    },
+    {
+      "id": "TS-06-12",
+      "kind": "unit",
+      "verifies": [
+        "06-REQ-3.3"
+      ],
+      "title": "A conflicting merge produces no commit",
+      "given": [
+        "a base and a branch that change the same region differently"
+      ],
+      "when": "the merge is attempted",
+      "then": [
+        "no commit or tree object is written",
+        "the conflict names every conflicting path",
+        "the repository's refs are unchanged"
+      ],
+      "pseudocode": "in the merge strategy test file: r = merge_commit(base, branch); assert r.conflict and objects_written() == 0"
+    },
+    {
+      "id": "TS-06-13",
+      "kind": "integration",
+      "verifies": [
+        "06-REQ-4.1"
+      ],
+      "title": "The conflicting path set equals git's",
+      "given": [
+        "cases with one conflicting path, several conflicting paths, and conflicting paths alongside cleanly merged ones, built identically for both implementations"
+      ],
+      "when": "each is run by the engine and by the real git binary",
+      "then": [
+        "the two path sets are equal for every case",
+        "no cleanly merged path appears in either set"
+      ],
+      "pseudocode": "in the conflict differential test file: assert set(engine.conflicts) == set(git.conflicts)"
+    },
+    {
+      "id": "TS-06-14",
+      "kind": "unit",
+      "verifies": [
+        "06-REQ-4.2"
+      ],
+      "title": "A conflict's identity is stable across occurrences and distinct between conflicts",
+      "given": [
+        "one conflict reproduced twice from the same content, and two conflicts differing only in one side's content"
+      ],
+      "when": "the identity is computed for each, before and after a restart of the process",
+      "then": [
+        "the two occurrences of the same conflict yield equal identities",
+        "the two different conflicts yield different identities",
+        "the identity is unchanged after the restart"
+      ],
+      "pseudocode": "in the conflict identity test file: assert id(c1) == id(c1prime) and id(c1) != id(c2)"
+    },
+    {
+      "id": "TS-06-15",
+      "kind": "integration",
+      "verifies": [
+        "06-REQ-4.3"
+      ],
+      "title": "A conflicting operation leaves the repository untouched",
+      "given": [
+        "a repository with a known ref list, and a rebase and a merge that each conflict"
+      ],
+      "when": "each operation is run to its conflict",
+      "then": [
+        "the ref list and every ref's target are unchanged afterwards",
+        "no object written during the attempt is reachable from any ref"
+      ],
+      "pseudocode": "in the engine integration test file: before = refs(); run_conflicting(); assert refs() == before and unreachable(written)"
+    },
+    {
+      "id": "TS-06-16",
+      "kind": "unit",
+      "verifies": [
+        "06-REQ-5.1"
+      ],
+      "title": "Resolving a conflict records the resolution against its identity",
+      "given": [
+        "a conflict and a resolution for it"
+      ],
+      "when": "the resolution is recorded and the resolutions are listed",
+      "then": [
+        "an entry exists for that identity",
+        "its resolved flag is true"
+      ],
+      "pseudocode": "in the recorded resolutions test file: record(id, res); assert entry(id).resolved is True"
+    },
+    {
+      "id": "TS-06-17",
+      "kind": "integration",
+      "verifies": [
+        "06-REQ-5.2"
+      ],
+      "title": "A recorded resolution is replayed and the operation continues",
+      "given": [
+        "a patch that conflicts with a base, and the resolution recorded for that conflict"
+      ],
+      "when": "the same patch is applied to the same base again",
+      "then": [
+        "no conflict is reported",
+        "the operation completes",
+        "its result equals the result of applying the resolution by hand"
+      ],
+      "pseudocode": "in the recorded resolutions integration test file: record(id, res); r = apply(patch, base); assert not r.conflict and r.tree == manual.tree"
+    },
+    {
+      "id": "TS-06-18",
+      "kind": "integration",
+      "verifies": [
+        "06-REQ-5.3"
+      ],
+      "title": "A recorded resolution outlives the process that recorded it",
+      "given": [
+        "a resolution recorded for a conflict"
+      ],
+      "when": "every component but the store is restarted and the same conflict is reached again",
+      "then": [
+        "the resolution is applied",
+        "the operation completes without reporting the conflict"
+      ],
+      "pseudocode": "in the recorded resolutions integration test file: record(); restart(); assert not apply().conflict"
+    },
+    {
+      "id": "TS-06-19",
+      "kind": "unit",
+      "verifies": [
+        "06-REQ-5.4"
+      ],
+      "title": "Resolutions are listed with their identity, path, time and resolved flag",
+      "given": [
+        "one conflict that has been seen but not resolved, one resolved while its path was known, and one resolved from an earlier run with no known path"
+      ],
+      "when": "the resolutions are listed",
+      "then": [
+        "each entry carries an identity and a recorded time",
+        "resolved is true only for the two with a resolution",
+        "path is present where it is known and absent otherwise"
+      ],
+      "pseudocode": "in the recorded resolutions test file: entries = list(); assert [e.resolved for e in entries] == [False, True, True] and entries[2].path is None"
+    },
+    {
+      "id": "TS-06-20",
+      "kind": "unit",
+      "verifies": [
+        "06-REQ-5.5"
+      ],
+      "title": "A resolution is forgotten by identity, or by path while in conflict",
+      "given": [
+        "two recorded resolutions, one for a path currently in conflict"
+      ],
+      "when": "one is forgotten by identity, the other by path, and a third forget names a path that is not in conflict",
+      "then": [
+        "each forgotten entry is gone from the listing and its conflict is reported again next time",
+        "the forget naming a path that is not in conflict removes nothing and says so"
+      ],
+      "pseudocode": "in the recorded resolutions test file: forget_by_id(a); forget_by_path(b); assert a not in list() and b not in list(); assert forget_by_path(c).removed == 0"
+    },
+    {
+      "id": "TS-06-21",
+      "kind": "property",
+      "verifies": [
+        "06-REQ-6.1"
+      ],
+      "title": "Over the generated corpus the engine's history equals git's",
+      "given": [
+        "the generated corpus and a real git binary"
+      ],
+      "when": "each case is run through the engine and through git with the same strategy",
+      "then": [
+        "the resulting tree object id is identical for every case",
+        "each commit's parent list is identical",
+        "the commit order is identical",
+        "a case that differs in any of the three fails the run"
+      ],
+      "pseudocode": "in the differential suite: for case in corpus: e = engine.run(case); g = git.run(case); assert (e.tree, e.parents, e.order) == (g.tree, g.parents, g.order)"
+    },
+    {
+      "id": "TS-06-22",
+      "kind": "property",
+      "verifies": [
+        "06-REQ-6.2"
+      ],
+      "title": "Over the generated corpus the engine's conflicts equal git's",
+      "given": [
+        "the generated corpus and a real git binary"
+      ],
+      "when": "each case is run through both",
+      "then": [
+        "a case conflicts for the engine exactly when it conflicts for git",
+        "for every conflicting case the two path sets are equal"
+      ],
+      "pseudocode": "in the differential suite: assert bool(e.conflict) == bool(g.conflict) and set(e.paths) == set(g.paths)"
+    },
+    {
+      "id": "TS-06-23",
+      "kind": "unit",
+      "verifies": [
+        "06-REQ-6.3"
+      ],
+      "title": "The corpus covers the named shapes at the stated size",
+      "given": [
+        "the corpus generator"
+      ],
+      "when": "a corpus is generated and its cases are classified",
+      "then": [
+        "the corpus holds at least 200 cases",
+        "at least one case exists for each of linear history, branching history, renames, binary files, mode changes, empty commits, merge commits in the source, conflicting patches and clean patches",
+        "at least one case applies a stack of 20 or more patches"
+      ],
+      "pseudocode": "in the corpus generator's test file: c = generate(); assert len(c) >= 200 and SHAPES <= {case.shape for case in c} and max(case.stackSize) >= 20"
+    },
+    {
+      "id": "TS-06-24",
+      "kind": "integration",
+      "verifies": [
+        "06-REQ-7.1"
+      ],
+      "title": "A fifty-patch stack applies at the stated repository size",
+      "given": [
+        "a repository of 500 MB of packed objects and a stack of 50 patches, each within 1000 changed files and 10 MB of diff"
+      ],
+      "when": "the stack is applied",
+      "then": [
+        "the operation completes",
+        "the resulting history matches git's for the same inputs"
+      ],
+      "pseudocode": "in the engine size integration test file, skipping with a named reason when the fixture cannot be built: assert apply_stack(50).completed and matches_git()"
+    },
+    {
+      "id": "TS-06-25",
+      "kind": "unit",
+      "verifies": [
+        "06-REQ-7.2"
+      ],
+      "title": "An operation past a stated limit fails and names it",
+      "given": [
+        "inputs exceeding the patch count, the repository size, the changed-file count and the diff size in turn"
+      ],
+      "when": "each operation is attempted",
+      "then": [
+        "each fails rather than stalling",
+        "each failure names which limit was exceeded",
+        "no operation runs past the platform's limits or is killed"
+      ],
+      "pseudocode": "in the engine limits test file, table over the four limits asserting the failure and the named limit"
+    },
+    {
+      "id": "TS-06-26",
+      "kind": "integration",
+      "verifies": [
+        "06-REQ-7.3"
+      ],
+      "title": "An operation too large for one unit of work continues in another",
+      "given": [
+        "a stack whose application cannot finish within one unit of platform work"
+      ],
+      "when": "it is applied to completion",
+      "then": [
+        "the operation completes",
+        "it was continued at least once rather than restarted",
+        "its result equals the result of the same operation run within one unit"
+      ],
+      "pseudocode": "in the engine integration test file: r = apply_large(); assert r.completed and r.continuations >= 1 and r.tree == reference.tree"
+    },
+    {
+      "id": "TS-06-27",
+      "kind": "integration",
+      "verifies": [
+        "06-REQ-7.4"
+      ],
+      "title": "An abandoned operation leaves the repository unchanged",
+      "given": [
+        "a repository with a known ref list and a long operation"
+      ],
+      "when": "the operation is abandoned part way, and separately fails part way",
+      "then": [
+        "the ref list and every ref's target are unchanged in both cases",
+        "no partial result is reachable from any ref"
+      ],
+      "pseudocode": "in the engine integration test file: before = refs(); abandon(op); assert refs() == before"
+    },
+    {
+      "id": "TS-06-28",
+      "kind": "integration",
+      "verifies": [
+        "06-REQ-8.1"
+      ],
+      "title": "The engine works against both repository store implementations",
+      "given": [
+        "the engine and both implementations of the repository store"
+      ],
+      "when": "a rebase, a merge and a replayed resolution are run against each",
+      "then": [
+        "every operation succeeds against both",
+        "the results are identical",
+        "the engine reaches no store API directly"
+      ],
+      "pseudocode": "in the engine integration test file: for store in [artifacts(), local()]: assert rebase(store).tree == expected"
+    },
+    {
+      "id": "TS-06-29",
+      "kind": "integration",
+      "verifies": [
+        "06-REQ-8.2"
+      ],
+      "title": "The engine runs with no git binary on the path",
+      "given": [
+        "an environment with no git executable"
+      ],
+      "when": "a three-way merge, a rebase, a merge commit and a replayed resolution are run",
+      "then": [
+        "every operation succeeds",
+        "no operation attempts to start an external process"
+      ],
+      "pseudocode": "in the engine integration test file, with PATH stripped of git: assert all operations succeed"
+    },
+    {
+      "id": "TS-06-30",
+      "kind": "smoke",
+      "verifies": [
+        "06-PATH-1"
+      ],
+      "title": "A branch is rebased in a real repository and the new head reads back",
+      "given": [
+        "a real repository store holding a workspace repository with a base and a branch"
+      ],
+      "when": "the engine rebases the branch onto the base and the new head is read back through the store",
+      "then": [
+        "the new head carries the branch's commits in order with the base's history behind them",
+        "the objects were read and written through the repository store",
+        "the operation ran with no git binary present"
+      ],
+      "pseudocode": "in the engine smoke test file: head = engine.rebase(ws, branch, base); assert history(store.read(head)) == expected",
+      "real_components": [
+        "history engine",
+        "repository store",
+        "real repository"
+      ]
+    },
+    {
+      "id": "TS-06-31",
+      "kind": "smoke",
+      "verifies": [
+        "06-PATH-2"
+      ],
+      "title": "A resolution recorded before a restart is replayed after it",
+      "given": [
+        "a real repository store, a patch that conflicts with a base, and the resolution recorded for that conflict"
+      ],
+      "when": "every component but the store is restarted and the patch is applied to the same base again",
+      "then": [
+        "the engine recognises the conflict by its identity",
+        "the recorded resolution is applied",
+        "the operation completes without reporting a conflict"
+      ],
+      "pseudocode": "in the engine smoke test file: record(); restart(); r = engine.apply(patch, base); assert not r.conflict",
+      "real_components": [
+        "history engine",
+        "repository store",
+        "resolution store",
+        "real repository"
+      ]
+    },
+    {
+      "id": "TS-06-32",
+      "kind": "smoke",
+      "verifies": [
+        "06-PATH-3"
+      ],
+      "title": "The whole corpus agrees with the real git binary",
+      "given": [
+        "a generated corpus of at least 200 cases and a real git binary"
+      ],
+      "when": "the differential suite runs every case through both implementations",
+      "then": [
+        "every case agrees in tree, parents, commit order and conflicting paths",
+        "the suite reports the number of cases it compared",
+        "the suite skips with a named reason when no git binary is available"
+      ],
+      "pseudocode": "in the differential suite's entry point: report = run_corpus(); assert report.mismatches == 0 and report.compared >= 200",
+      "real_components": [
+        "differential suite",
+        "history engine",
+        "repository store",
+        "real git binary"
+      ]
+    }
+  ]
+}
