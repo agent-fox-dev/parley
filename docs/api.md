@@ -100,3 +100,15 @@ supplied neither.
 Operational metrics in the Prometheus text format, for a scraper.
 
 **Response:** `200 OK`, `Content-Type: text/plain; version=0.0.4`.
+
+Every metric the hub's reference names is exposed with the type and the
+label names that reference gives it. A metric this service has no source
+for yet is exposed with the value `0` rather than omitted, so a scraper's
+queries do not start failing the day it gains one.
+
+`afhub_http_requests_total` counts every answered request by `method`,
+`path` and `status`, and `afhub_http_request_duration_seconds` observes its
+latency in the documented buckets. The `path` label is the **route
+template** the request matched, never the requested URI; every request that
+matched no route is counted under one fixed value, so no caller can grow the
+label set.

@@ -1,6 +1,7 @@
 import { HttpError, errorResponse } from '../http/errors.js';
 import type { RouteDefinition } from '../http/router.js';
-import type { RelationalStore } from '../platform/index.js';
+import { renderExposition } from '../metrics/exposition.js';
+import type { MetricsSink, RelationalStore } from '../platform/index.js';
 
 /**
  * The four routes served at the server root, outside the mount point. Their
@@ -17,6 +18,8 @@ export interface ServerRouteConfig {
   commit: string;
   /** Queried by the readiness probe, and by nothing else here. */
   store?: RelationalStore;
+  /** Read by the metrics route to render the exposition. */
+  metrics?: MetricsSink;
 }
 
 /**
@@ -74,7 +77,10 @@ export function serverRoutes(config: ServerRouteConfig): RouteDefinition[] {
     {
       path: '/metrics',
       handler: () =>
-        new Response('', { status: 200, headers: { 'content-type': PROMETHEUS_CONTENT_TYPE } }),
+        new Response(renderExposition(config.metrics?.snapshot() ?? []), {
+          status: 200,
+          headers: { 'content-type': PROMETHEUS_CONTENT_TYPE },
+        }),
     },
   ];
 }

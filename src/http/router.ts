@@ -1,7 +1,10 @@
 import { Hono } from 'hono';
 import type { Context } from 'hono';
 import { DEFAULT_MAX_BODY_BYTES, DEFAULT_MOUNT_POINT } from '../config.js';
-import type { RelationalStore } from '../platform/index.js';
+import type { Clock, MetricsSink, RelationalStore } from '../platform/index.js';
+import { elapsedSeconds, recordRequest } from '../metrics/http.js';
+import { systemClock } from '../platform/local/clock.js';
+import { inMemoryMetrics } from '../platform/local/metrics.js';
 import { serverRoutes } from '../routes/server.js';
 import { HttpError, errorResponse } from './errors.js';
 
@@ -32,6 +35,10 @@ export interface AppOptions {
   maxBodyBytes?: number;
   /** The store the readiness probe queries. */
   store?: RelationalStore;
+  /** Where measurements are recorded. Defaults to an in-memory sink. */
+  metrics?: MetricsSink;
+  /** Read to time a request. Defaults to the host's own clock. */
+  clock?: Clock;
 }
 
 const consoleLog: LogSink = {
@@ -43,6 +50,10 @@ const consoleLog: LogSink = {
 export function buildApp(options: AppOptions = {}): Hono {
   const mountPoint = options.mountPoint ?? DEFAULT_MOUNT_POINT;
   const log = options.log ?? consoleLog;
+  const maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
+  const metrics = options.metrics ?? inMemoryMetrics();
+  const clock = options.clock ?? systemClock();
+
   const routes =
     options.routes ??
     serverRoutes({
@@ -50,11 +61,22 @@ export function buildApp(options: AppOptions = {}): Hono {
       buildTime: options.buildTime ?? '',
       commit: options.commit ?? '',
       ...(options.store === undefined ? {} : { store: options.store }),
+      metrics,
     });
 
-  const maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
-
   const app = new Hono();
+
+  // Outermost, so every answer is counted, refusals and failures included.
+  app.use('*', async (c, next) => {
+    const startedAt = clock.now();
+    await next();
+    recordRequest(metrics, {
+      method: c.req.method,
+      routeTemplate: c.req.routePath === '/*' ? undefined : c.req.routePath,
+      status: c.res.status,
+      seconds: elapsedSeconds(clock, startedAt),
+    });
+  });
 
   // Ahead of every route, so an over-sized body never reaches a handler.
   app.use('*', async (c, next) => {
