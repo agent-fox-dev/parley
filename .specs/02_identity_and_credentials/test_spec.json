@@ -1,0 +1,738 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/test_spec.v2.json",
+  "spec_id": "02",
+  "spec_name": "identity_and_credentials",
+  "schema_version": 2,
+  "tests": [
+    {
+      "id": "TS-02-1",
+      "kind": "unit",
+      "verifies": [
+        "02-REQ-1.1",
+        "02-REQ-1.2"
+      ],
+      "title": "A missing or unacceptable credential is refused 401 with one message",
+      "given": [
+        "a protected route with a recording handler",
+        "a live API key, a revoked key, an expired key and an unknown string"
+      ],
+      "when": "the route is requested with no header, an empty Bearer, a malformed string, the unknown string, the revoked key and the expired key",
+      "then": [
+        "each answers 401 with message \"authentication required\"",
+        "no message says which condition applied",
+        "the handler is not invoked for any of them"
+      ],
+      "pseudocode": "in the authentication middleware's test file, table over the six credentials: r = get(app, '/api/v1/protected', cred); assert r.status == 401 and r.json.error.message == 'authentication required' and handler.calls == 0"
+    },
+    {
+      "id": "TS-02-2",
+      "kind": "unit",
+      "verifies": [
+        "02-REQ-1.3"
+      ],
+      "title": "An accepted credential is identified by kind, with its user where it has one",
+      "given": [
+        "a live API key, a live PAT and the deployment's admin token",
+        "a route that records the identity it was given"
+      ],
+      "when": "the route is requested with each credential",
+      "then": [
+        "the API key yields kind api_key and the owning user id",
+        "the PAT yields kind pat and the owning user id",
+        "the admin token yields kind admin_token and no user id"
+      ],
+      "pseudocode": "in the authentication middleware's test file, table over the three credentials: get(app, '/api/v1/whoami', cred); assert recorded.kind == expectedKind and recorded.userId == expectedUser"
+    },
+    {
+      "id": "TS-02-3",
+      "kind": "integration",
+      "verifies": [
+        "02-REQ-1.4"
+      ],
+      "title": "A blocked user's credential stops working without being revoked, and works again after unblocking",
+      "given": [
+        "a user holding a live API key and a live PAT, against the real store"
+      ],
+      "when": "the user is blocked, both credentials are used, the user is unblocked, and both are used again",
+      "then": [
+        "both are refused 401 while the user is blocked",
+        "neither credential's revoked_at was set",
+        "both are accepted again after the unblock"
+      ],
+      "pseudocode": "in the authentication integration test file: block(user); assert call(key).status == 401 and call(pat).status == 401; assert store.key(key).revoked_at is None; unblock(user); assert call(key).status == 200"
+    },
+    {
+      "id": "TS-02-4",
+      "kind": "unit",
+      "verifies": [
+        "02-REQ-1.5"
+      ],
+      "title": "No credential secret reaches a log record or a response body",
+      "given": [
+        "a recording log sink",
+        "a credential with a distinctive secret portion"
+      ],
+      "when": "a successful request, a refused request and a request that raises an unhandled failure are made with that credential",
+      "then": [
+        "no log record contains the credential string or its secret portion",
+        "no response body contains either",
+        "the log records do contain the request's method and route template, so the scrubbing is of the secret and not of logging generally"
+      ],
+      "pseudocode": "in the authentication middleware's test file: for scenario in [ok, refused, boom]: run(scenario, cred='af_k1_SENTINEL9f3a'); assert 'SENTINEL9f3a' not in sink.text and 'SENTINEL9f3a' not in body"
+    },
+    {
+      "id": "TS-02-5",
+      "kind": "unit",
+      "verifies": [
+        "02-REQ-1.6"
+      ],
+      "title": "The public routes are served without a credential",
+      "given": [
+        "a service with the default configuration"
+      ],
+      "when": "the four server routes, GET /api/v1/auth/providers, POST /api/v1/auth/callback and the webhook ingress path are requested with no Authorization header",
+      "then": [
+        "none answers 401",
+        "each answers the status its own route defines"
+      ],
+      "pseudocode": "in the authentication middleware's test file, table over the public routes: assert request(route, noAuth).status != 401"
+    },
+    {
+      "id": "TS-02-6",
+      "kind": "unit",
+      "verifies": [
+        "02-REQ-2.1",
+        "02-REQ-2.2"
+      ],
+      "title": "API keys and admin tokens hold every scope, and write implies read but not the reverse",
+      "given": [
+        "an API key, an admin token, a PAT holding only workspaces:write and a PAT holding only workspaces:read"
+      ],
+      "when": "a route needing workspaces:read and a route needing workspaces:write are called with each credential",
+      "then": [
+        "the API key and the admin token are admitted to both routes",
+        "the write-only PAT is admitted to both routes",
+        "the read-only PAT is admitted to the read route and refused the write route"
+      ],
+      "pseudocode": "in the scope checker's test file, table over (credential, routeScope, expectAdmitted)"
+    },
+    {
+      "id": "TS-02-7",
+      "kind": "unit",
+      "verifies": [
+        "02-REQ-2.3"
+      ],
+      "title": "A PAT without the route's scope is refused 403 with no error_type",
+      "given": [
+        "a PAT holding a scope unrelated to the route under test"
+      ],
+      "when": "routes needing each of several different scopes are called with it",
+      "then": [
+        "each answers 403",
+        "no body carries an error_type key",
+        "the route handler is not invoked"
+      ],
+      "pseudocode": "in the scope checker's test file: r = call(route, pat); assert r.status == 403 and 'error_type' not in r.json.error and handler.calls == 0"
+    },
+    {
+      "id": "TS-02-8",
+      "kind": "unit",
+      "verifies": [
+        "02-REQ-2.4",
+        "02-REQ-2.5"
+      ],
+      "title": "The scope registry accepts exactly the registered names and refuses the retired ones",
+      "given": [
+        "the scope registry"
+      ],
+      "when": "a token is created naming each of the 24 hub scopes, each of apikit's 8, each of the eight retired names, and an invented name",
+      "then": [
+        "every registered name is accepted",
+        "each retired name is refused 400 with the name in the message",
+        "the invented name is refused 400",
+        "no token is created for any refused request"
+      ],
+      "pseudocode": "in the scope registry's test file, table over the name sets: r = create_token(perms=[name]); assert accepted ? r.status == 201 : (r.status == 400 and name in r.json.error.message)"
+    },
+    {
+      "id": "TS-02-9",
+      "kind": "unit",
+      "verifies": [
+        "02-REQ-3.1"
+      ],
+      "title": "The provider list is public and publicly cacheable",
+      "given": [
+        "a service configured with one OAuth provider"
+      ],
+      "when": "GET /api/v1/auth/providers is requested with no credential",
+      "then": [
+        "the response is 200 with an array of {name, authorize_url}",
+        "the Cache-Control header permits public caching for 300 seconds",
+        "the authorize URL carries the configured client id"
+      ],
+      "pseudocode": "in the auth routes' test file: r = get(app, '/api/v1/auth/providers'); assert r.status == 200 and r.json[0].name == 'github' and 'public' in r.headers['Cache-Control']"
+    },
+    {
+      "id": "TS-02-10",
+      "kind": "integration",
+      "verifies": [
+        "02-REQ-3.2",
+        "02-REQ-3.3"
+      ],
+      "title": "The callback issues a key, revokes the user's older keys and gives a new user a personal organization",
+      "given": [
+        "a stub OAuth provider that accepts one code",
+        "a user who already holds two live API keys, and a provider identity belonging to no user"
+      ],
+      "when": "the callback is posted for the existing user, and then for the unknown identity",
+      "then": [
+        "each call answers 200 with a user and an api_key whose key matches af_<key_id>_<secret>",
+        "both of the existing user's earlier keys are refused 401 afterwards and the new one is accepted",
+        "the new user has exactly one organization, owned by them",
+        "no other route returns the key string"
+      ],
+      "pseudocode": "in the auth routes' integration test file: r = post('/api/v1/auth/callback', {provider, code}); assert matches(r.json.api_key.key, r'^af_[^_]+_.+$'); for old in olds: assert call(old).status == 401; assert len(get('/api/v1/user/orgs', newKey).json) == 1"
+    },
+    {
+      "id": "TS-02-11",
+      "kind": "integration",
+      "verifies": [
+        "02-REQ-3.4"
+      ],
+      "title": "A refused sign-in creates no user, issues no key and revokes none",
+      "given": [
+        "a stub provider, a blocked user, an existing conflicting identity and a redirect allowlist"
+      ],
+      "when": "the callback is posted with an invalid code, an expired code, a redirect_uri outside the allowlist, the blocked user's identity, and the conflicting identity",
+      "then": [
+        "the statuses are 401, 401, 400, 403 and 409 respectively",
+        "the user table is unchanged after every call",
+        "no key is issued and no existing key is revoked"
+      ],
+      "pseudocode": "in the auth routes' integration test file, table over the five cases: before = snapshot(); r = post(callback, case); assert r.status == expected and snapshot() == before"
+    },
+    {
+      "id": "TS-02-12",
+      "kind": "unit",
+      "verifies": [
+        "02-REQ-3.5"
+      ],
+      "title": "The key lifetime accepts only 0, 30, 60 and 90 days",
+      "given": [
+        "a stub provider and a fixed clock"
+      ],
+      "when": "the callback is posted with expires of 0, 30, 60, 90, omitted, 45, -1 and a non-integer",
+      "then": [
+        "0 yields a key with a null expires_at",
+        "30, 60 and 90 yield expires_at that many days after now",
+        "an omitted value behaves as 90",
+        "45, -1 and the non-integer are refused 400 and issue no key"
+      ],
+      "pseudocode": "in the auth routes' test file, table over the expires values, asserting expires_at against the fixed clock"
+    },
+    {
+      "id": "TS-02-13",
+      "kind": "unit",
+      "verifies": [
+        "02-REQ-4.1",
+        "02-REQ-4.2",
+        "02-REQ-4.3"
+      ],
+      "title": "The profile is read, its display name changed, and a bad update refused",
+      "given": [
+        "a user with a profile"
+      ],
+      "when": "the profile is read, updated with a full_name, and then updated with no full_name, a null full_name and a body that is not an object",
+      "then": [
+        "the read answers 200 with the ten documented fields",
+        "the update answers 200 and only full_name changed",
+        "each bad update answers 400 and the stored profile is unchanged"
+      ],
+      "pseudocode": "in the user routes' test file: assert set(get('/api/v1/user').json) == DOCUMENTED_FIELDS; patch(full_name='X'); assert get().json.full_name == 'X' and other fields unchanged; table over bad bodies asserting 400"
+    },
+    {
+      "id": "TS-02-14",
+      "kind": "integration",
+      "verifies": [
+        "02-REQ-5.1"
+      ],
+      "title": "Keys are listed as metadata and a matching ETag answers 304",
+      "given": [
+        "a user holding one live key, one revoked key and one expired key"
+      ],
+      "when": "the key list is requested, and then requested again with the returned ETag",
+      "then": [
+        "the first answers 200 with one entry per key carrying key_id, created_at, expires_at and revoked_at",
+        "no entry carries a secret or a hash",
+        "the second answers 304 with no body"
+      ],
+      "pseudocode": "in the key routes' integration test file: r = get('/api/v1/user/keys'); assert all(set(e) == {'key_id','created_at','expires_at','revoked_at'} for e in r.json); r2 = get(headers={'If-None-Match': r.headers['ETag']}); assert r2.status == 304"
+    },
+    {
+      "id": "TS-02-15",
+      "kind": "integration",
+      "verifies": [
+        "02-REQ-5.2"
+      ],
+      "title": "Refreshing a key rotates its secret under the same identifier",
+      "given": [
+        "a user holding one live API key, and a fixed clock"
+      ],
+      "when": "the refresh route is called with that key",
+      "then": [
+        "the response is 200 with key, key_id and expires_at",
+        "key_id is unchanged and expires_at is recomputed from the key's lifetime",
+        "the previous secret is refused 401 and the new one is accepted"
+      ],
+      "pseudocode": "in the key routes' integration test file: r = post(f'/api/v1/user/keys/{kid}/refresh', key=old); assert r.json.key_id == kid and r.json.key != old; assert call(old).status == 401 and call(r.json.key).status == 200"
+    },
+    {
+      "id": "TS-02-16",
+      "kind": "unit",
+      "verifies": [
+        "02-REQ-5.3"
+      ],
+      "title": "A key refresh is refused for a PAT caller, a dead key and another user's key",
+      "given": [
+        "a PAT, a revoked key, an expired key and a key belonging to another user"
+      ],
+      "when": "the refresh route is called in each of those four ways",
+      "then": [
+        "the PAT caller is refused 401",
+        "the revoked and expired keys are refused 400",
+        "another user's key is refused 404",
+        "no secret is rotated in any case"
+      ],
+      "pseudocode": "in the key routes' test file, table over the four cases, asserting the status and that the stored secret hash is unchanged"
+    },
+    {
+      "id": "TS-02-17",
+      "kind": "integration",
+      "verifies": [
+        "02-REQ-5.4"
+      ],
+      "title": "A key is revoked, including the key the request is made with",
+      "given": [
+        "a user holding two live API keys"
+      ],
+      "when": "one key is revoked with the other, and then the remaining key is used to revoke itself",
+      "then": [
+        "each revoke answers 204",
+        "the self-revoking request completes rather than failing part way",
+        "both keys are refused 401 afterwards"
+      ],
+      "pseudocode": "in the key routes' integration test file: assert delete(f'/keys/{a}', key=b).status == 204; assert delete(f'/keys/{b}', key=b).status == 204; assert call(a).status == 401 and call(b).status == 401"
+    },
+    {
+      "id": "TS-02-18",
+      "kind": "unit",
+      "verifies": [
+        "02-REQ-5.5"
+      ],
+      "title": "An unknown key and another user's key are indistinguishable",
+      "given": [
+        "a key belonging to another user and an identifier belonging to no key"
+      ],
+      "when": "the read and delete key routes are called for each",
+      "then": [
+        "every call answers 404",
+        "the two cases produce the same status and the same message"
+      ],
+      "pseudocode": "in the key routes' test file: assert resp(foreign).status == resp(missing).status == 404 and resp(foreign).json == resp(missing).json"
+    },
+    {
+      "id": "TS-02-19",
+      "kind": "unit",
+      "verifies": [
+        "02-REQ-6.1"
+      ],
+      "title": "Tokens are listed with their permissions and no secret",
+      "given": [
+        "a user holding two tokens with different permission sets"
+      ],
+      "when": "the token list is requested",
+      "then": [
+        "the response is 200 with one entry per token",
+        "each entry carries token_id, name, permissions, expires_at, created_at and revoked_at",
+        "no entry carries a token string or a hash"
+      ],
+      "pseudocode": "in the token routes' test file: r = get('/api/v1/user/tokens'); assert all('token' not in e and 'hash' not in e for e in r.json)"
+    },
+    {
+      "id": "TS-02-20",
+      "kind": "integration",
+      "verifies": [
+        "02-REQ-6.2"
+      ],
+      "title": "A created token is returned once and authenticates on its scopes",
+      "given": [
+        "a user with an API key"
+      ],
+      "when": "a token is created with a name, one scope and expires 30, and the token list and token read routes are then called",
+      "then": [
+        "the create answers 201 with a token matching af_pat_<token_id>_<secret>",
+        "the token is accepted on a route needing its scope",
+        "neither the list nor the read route returns the token string"
+      ],
+      "pseudocode": "in the token routes' integration test file: r = post('/api/v1/user/tokens', body); assert matches(r.json.token, r'^af_pat_[^_]+_.+$'); assert call(scopedRoute, r.json.token).status == 200; assert 'token' not in get(f'/api/v1/user/tokens/{tid}').json"
+    },
+    {
+      "id": "TS-02-21",
+      "kind": "unit",
+      "verifies": [
+        "02-REQ-6.3"
+      ],
+      "title": "A PAT cannot grant a scope it does not hold, while an API key can",
+      "given": [
+        "a PAT holding workspaces:read and tokens:manage, and an API key"
+      ],
+      "when": "each is used to create a token granting workspaces:write",
+      "then": [
+        "the PAT's request is refused 403 and creates no token",
+        "the API key's request succeeds",
+        "a PAT granting only scopes it holds succeeds"
+      ],
+      "pseudocode": "in the token routes' test file, table over (caller, requestedScopes, expected)"
+    },
+    {
+      "id": "TS-02-22",
+      "kind": "integration",
+      "verifies": [
+        "02-REQ-6.4"
+      ],
+      "title": "Revoking a token answers with its metadata and stops it working",
+      "given": [
+        "a user holding one live token"
+      ],
+      "when": "the token is revoked and then used",
+      "then": [
+        "the revoke answers 200, not 204, with the token's metadata and revoked_at set",
+        "the token is refused 401 on its next use"
+      ],
+      "pseudocode": "in the token routes' integration test file: r = delete(f'/api/v1/user/tokens/{tid}'); assert r.status == 200 and r.json.revoked_at is not None; assert call(token).status == 401"
+    },
+    {
+      "id": "TS-02-23",
+      "kind": "unit",
+      "verifies": [
+        "02-REQ-6.5"
+      ],
+      "title": "Malformed token requests and dead or foreign tokens are refused",
+      "given": [
+        "a live token, a revoked token and a token of another user"
+      ],
+      "when": "tokens are created with no name, an over-long name, an empty permission list, a malformed permission list and a bad expires, and the revoked and foreign tokens are revoked",
+      "then": [
+        "each malformed create answers 400 and creates nothing",
+        "revoking the already-revoked token answers 400",
+        "the foreign token answers 404"
+      ],
+      "pseudocode": "in the token routes' test file, two tables: bad create bodies asserting 400 and no row written; revoke cases asserting 400 and 404"
+    },
+    {
+      "id": "TS-02-24",
+      "kind": "unit",
+      "verifies": [
+        "02-REQ-7.1"
+      ],
+      "title": "The three permission verbs replace, add and remove",
+      "given": [
+        "a token holding workspaces:read and patches:read"
+      ],
+      "when": "PUT sets [merges:read], PATCH adds [patches:write], DELETE removes [patches:read], and DELETE removes a scope the token does not hold",
+      "then": [
+        "each answers 200 with the token's metadata after the change",
+        "the resulting sets are the replacement, the union and the difference respectively",
+        "removing an absent scope leaves the set unchanged"
+      ],
+      "pseudocode": "in the token permission routes' test file, a sequence of calls asserting the permission set after each"
+    },
+    {
+      "id": "TS-02-25",
+      "kind": "integration",
+      "verifies": [
+        "02-REQ-7.2"
+      ],
+      "title": "Replacing a token's permissions with an empty list revokes it",
+      "given": [
+        "a live token holding two scopes"
+      ],
+      "when": "PUT is called on its permissions with an empty array, and the token is then used",
+      "then": [
+        "the response is 200 with an empty permissions list and revoked_at set",
+        "the token is refused 401 on its next use"
+      ],
+      "pseudocode": "in the token permission routes' integration test file: r = put(perms, []); assert r.json.permissions == [] and r.json.revoked_at is not None; assert call(token).status == 401"
+    },
+    {
+      "id": "TS-02-26",
+      "kind": "unit",
+      "verifies": [
+        "02-REQ-7.3"
+      ],
+      "title": "Empty, absent and revoked-token permission changes are refused",
+      "given": [
+        "a live token and a revoked token"
+      ],
+      "when": "PATCH and DELETE are called with an empty array, all three verbs are called with permissions absent and with permissions null, and all three are called on the revoked token",
+      "then": [
+        "each answers 400",
+        "the live token's permission set and revoked_at are unchanged after every call"
+      ],
+      "pseudocode": "in the token permission routes' test file, table over (verb, body, token) asserting 400 and an unchanged stored set"
+    },
+    {
+      "id": "TS-02-27",
+      "kind": "integration",
+      "verifies": [
+        "02-REQ-8.1"
+      ],
+      "title": "A user's organizations are listed, the personal one among them",
+      "given": [
+        "a user with a personal organization who is also a member of one other"
+      ],
+      "when": "GET /api/v1/user/orgs is requested",
+      "then": [
+        "the response is 200 with both organizations",
+        "each carries id, name, slug, url, owner_id, status, created_at and updated_at"
+      ],
+      "pseudocode": "in the org routes' integration test file: r = get('/api/v1/user/orgs'); assert {o.slug for o in r.json} == {personal.slug, other.slug}"
+    },
+    {
+      "id": "TS-02-28",
+      "kind": "integration",
+      "verifies": [
+        "02-REQ-8.2"
+      ],
+      "title": "An organization is read by id with ETag support",
+      "given": [
+        "an organization the caller is a member of, and an admin credential"
+      ],
+      "when": "GET /api/v1/orgs/:id is requested by the member and by the admin, then repeated with the returned ETag",
+      "then": [
+        "both callers get 200 with the organization",
+        "the repeat with a matching ETag answers 304 with no body"
+      ],
+      "pseudocode": "in the org routes' integration test file: r = get(f'/api/v1/orgs/{oid}'); assert r.status == 200; assert get(f'/api/v1/orgs/{oid}', ifNoneMatch=r.headers['ETag']).status == 304"
+    },
+    {
+      "id": "TS-02-29",
+      "kind": "unit",
+      "verifies": [
+        "02-REQ-8.3"
+      ],
+      "title": "A non-member is refused an organization and an unknown id is not found",
+      "given": [
+        "an organization the caller does not belong to, and an id belonging to no organization"
+      ],
+      "when": "GET /api/v1/orgs/:id is requested for each",
+      "then": [
+        "the non-member case answers 403",
+        "the unknown id answers 404"
+      ],
+      "pseudocode": "in the org routes' test file: assert get(other).status == 403 and get(missing).status == 404"
+    },
+    {
+      "id": "TS-02-30",
+      "kind": "unit",
+      "verifies": [
+        "02-REQ-9.1"
+      ],
+      "title": "Administration routes admit only an admin token or an admin-role key",
+      "given": [
+        "an admin token, an API key of an admin-role user, an API key of an ordinary user, and a PAT holding every registered scope"
+      ],
+      "when": "a representative route from each administration family is called with each credential, and once with no credential",
+      "then": [
+        "the admin token and the admin-role key are admitted",
+        "the ordinary key and the all-scope PAT are refused 403",
+        "the credential-less request is refused 401"
+      ],
+      "pseudocode": "in the admin routes' test file, table over (route, credential, expected)"
+    },
+    {
+      "id": "TS-02-31",
+      "kind": "integration",
+      "verifies": [
+        "02-REQ-9.2"
+      ],
+      "title": "An administrator manages users through their whole lifecycle",
+      "given": [
+        "an admin credential and an empty user table beyond the admin"
+      ],
+      "when": "a user is created, listed, read, read again with the returned ETag, updated and deleted, and a second create repeats the username",
+      "then": [
+        "the create answers 201 and the duplicate answers 409",
+        "list and read answer 200, and the conditional read answers 304",
+        "the update answers 200 with the new full_name and the delete answers 204",
+        "the deleted user no longer appears in the list"
+      ],
+      "pseudocode": "in the admin routes' integration test file, a sequence over POST/GET/PATCH/DELETE /api/v1/users"
+    },
+    {
+      "id": "TS-02-32",
+      "kind": "integration",
+      "verifies": [
+        "02-REQ-9.3"
+      ],
+      "title": "Promote, demote, block and unblock take effect and repeat safely",
+      "given": [
+        "an admin credential, a second admin, and an ordinary user holding a live key"
+      ],
+      "when": "the ordinary user is promoted, promoted again, demoted, blocked and then unblocked, with their key used after the block and after the unblock",
+      "then": [
+        "each call answers 200 and the second promote changes nothing",
+        "the user's role reflects each change",
+        "the key is refused 401 while blocked and accepted after the unblock"
+      ],
+      "pseudocode": "in the admin routes' integration test file, a sequence asserting the role and the key's behaviour after each step"
+    },
+    {
+      "id": "TS-02-33",
+      "kind": "unit",
+      "verifies": [
+        "02-REQ-9.4"
+      ],
+      "title": "The last active admin cannot be deleted or demoted",
+      "given": [
+        "a deployment with exactly one active admin, and one with two"
+      ],
+      "when": "that admin is demoted and deleted in the one-admin deployment, and one of the two is demoted in the other",
+      "then": [
+        "both calls in the one-admin deployment answer 409 and leave the user an active admin",
+        "the demote in the two-admin deployment succeeds"
+      ],
+      "pseudocode": "in the admin routes' test file, table over (adminCount, action, expected)"
+    },
+    {
+      "id": "TS-02-34",
+      "kind": "integration",
+      "verifies": [
+        "02-REQ-9.5"
+      ],
+      "title": "An administrator lists and revokes another user's credentials",
+      "given": [
+        "an admin credential and a user holding one API key and one token"
+      ],
+      "when": "that user's keys and tokens are listed, and each is revoked, and the user then makes a request with each",
+      "then": [
+        "each list answers 200 with entries carrying user_id and no secret",
+        "each revoke answers 204",
+        "both credentials are refused 401 afterwards"
+      ],
+      "pseudocode": "in the admin routes' integration test file: assert all('user_id' in e for e in list_keys(uid)); delete(key); assert call(key).status == 401"
+    },
+    {
+      "id": "TS-02-35",
+      "kind": "integration",
+      "verifies": [
+        "02-REQ-9.6"
+      ],
+      "title": "An administrator manages organizations through their whole lifecycle",
+      "given": [
+        "an admin credential"
+      ],
+      "when": "an organization is created, listed, updated, blocked, unblocked and deleted, and creates are repeated with a duplicate name, a duplicate slug and an invalid slug",
+      "then": [
+        "the create answers 201 and the lifecycle calls answer 200 or 204",
+        "the duplicate name and duplicate slug answer 409",
+        "the invalid slug answers 400 and creates nothing"
+      ],
+      "pseudocode": "in the admin routes' integration test file, a sequence over the organization routes plus a table of refused creates"
+    },
+    {
+      "id": "TS-02-36",
+      "kind": "integration",
+      "verifies": [
+        "02-REQ-9.7"
+      ],
+      "title": "An administrator adds and removes organization members",
+      "given": [
+        "an admin credential, an organization and two users"
+      ],
+      "when": "the members are listed, one user is added, the list is read again, that user is removed, and the list is read once more",
+      "then": [
+        "add answers 200 with a membership of org_id, user_id, username, email, role and created_at",
+        "the added user appears in the list and the removed user does not",
+        "remove answers 204"
+      ],
+      "pseudocode": "in the admin routes' integration test file: put(member); assert uid in ids(list_members()); delete(member); assert uid not in ids(list_members())"
+    },
+    {
+      "id": "TS-02-37",
+      "kind": "smoke",
+      "verifies": [
+        "02-PATH-1"
+      ],
+      "title": "A developer signs in end to end and their previous key stops working",
+      "given": [
+        "a running deployment with an OAuth provider configured against a stub authorization server",
+        "a user who already holds a live API key"
+      ],
+      "when": "the provider list is fetched, the stub provider issues a code, the code is posted to the callback, and the old key is then used",
+      "then": [
+        "the callback answers 200 with a user and a new API key",
+        "the new key authenticates a subsequent request",
+        "the previously held key is refused 401",
+        "the user has a personal organization"
+      ],
+      "pseudocode": "in the identity smoke test file, against a running deployment: providers = get('/api/v1/auth/providers'); code = stub.authorize(); r = post('/api/v1/auth/callback', {provider, code}); assert call(r.json.api_key.key).status == 200 and call(oldKey).status == 401",
+      "real_components": [
+        "running deployment",
+        "auth routes",
+        "credential store",
+        "relational store",
+        "stub OAuth provider"
+      ]
+    },
+    {
+      "id": "TS-02-38",
+      "kind": "smoke",
+      "verifies": [
+        "02-PATH-2"
+      ],
+      "title": "A minted token is admitted on its scope and refused outside it, against a running deployment",
+      "given": [
+        "a running deployment and a signed-in user with an API key"
+      ],
+      "when": "a token granting workspaces:read alone is created, then used on a route needing tokens:manage and on a route needing workspaces:read",
+      "then": [
+        "the create answers 201 and returns the token once",
+        "the route needing tokens:manage answers 403 with no error_type",
+        "the route needing workspaces:read admits the token"
+      ],
+      "pseudocode": "in the identity smoke test file: t = post('/api/v1/user/tokens', {name, permissions:['workspaces:read']}).json.token; assert call(tokensManageRoute, t).status == 403; assert call(workspacesReadRoute, t).status != 403",
+      "real_components": [
+        "running deployment",
+        "token routes",
+        "authentication middleware",
+        "scope checker",
+        "relational store"
+      ]
+    },
+    {
+      "id": "TS-02-39",
+      "kind": "smoke",
+      "verifies": [
+        "02-PATH-3"
+      ],
+      "title": "Blocking a user stops their live key against a running deployment, and unblocking restores it",
+      "given": [
+        "a running deployment, an administrator credential and a user holding a live API key"
+      ],
+      "when": "the user is blocked, the key is used, the user is unblocked, and the key is used again",
+      "then": [
+        "the key is refused 401 while the user is blocked",
+        "the key's revoked_at is still null in the administrator's listing",
+        "the key is admitted again after the unblock"
+      ],
+      "pseudocode": "in the identity smoke test file: post(f'/api/v1/users/{uid}/block', admin); assert call(key).status == 401; assert list_keys(uid, admin)[0].revoked_at is None; post(f'/api/v1/users/{uid}/unblock', admin); assert call(key).status == 200",
+      "real_components": [
+        "running deployment",
+        "admin routes",
+        "authentication middleware",
+        "relational store"
+      ]
+    }
+  ]
+}

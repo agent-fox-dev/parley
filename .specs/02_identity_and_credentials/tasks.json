@@ -1,0 +1,296 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v2.json",
+  "spec_id": "02",
+  "spec_name": "identity_and_credentials",
+  "schema_version": 2,
+  "test_commands": {
+    "all_tests": "make test",
+    "linter": "make lint"
+  },
+  "dependencies": [
+    {
+      "spec": "01",
+      "reason": "uses its router, error envelope, request conventions and platform interfaces, and is the first package to store data through its relational store"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "kind": "implement",
+      "title": "Authenticate every caller and check a token's scopes",
+      "criteria": [
+        "02-REQ-1",
+        "02-REQ-2"
+      ],
+      "tests": [
+        "TS-02-1",
+        "TS-02-2",
+        "TS-02-3",
+        "TS-02-4",
+        "TS-02-5",
+        "TS-02-6",
+        "TS-02-7",
+        "TS-02-8"
+      ],
+      "steps": [
+        "Add this task's behaviours to the authentication middleware's and the scope registry's test files, and confirm they fail",
+        "Define the user, credential and organization tables in the relational store, with a migration the second target runs too",
+        "Store a credential as a prefix and identifier in clear plus a hash of the secret, so a credential can be found without a table scan and no secret is recoverable from the store",
+        "Implement the authentication middleware: parse Authorization Bearer, recognise the api_key, pat and admin_token shapes, and refuse anything unknown, malformed, revoked or expired with 401 and the message \"authentication required\"",
+        "Refuse every credential of a blocked user with 401, without revoking the credential",
+        "Make the credential kind and the acting user available to the routes that run after the middleware",
+        "Exempt the public routes from the middleware: the four server routes, GET /api/v1/auth/providers, POST /api/v1/auth/callback and the forge webhook ingress",
+        "Scrub the Authorization header and every credential secret from log records",
+        "Declare the scope registry: the 24 hub scopes and apikit's 8, each write scope implying its read scope, and the eight retired names marked refused",
+        "Implement the scope check: admit API keys and admin tokens unconditionally, check PATs against their granted scopes with the implication applied, and refuse with 403 and no error_type"
+      ],
+      "touches": [
+        "src/auth/middleware.ts",
+        "src/auth/middleware.test.ts",
+        "src/auth/credentials.ts",
+        "src/auth/scopes.ts",
+        "src/auth/scopes.test.ts",
+        "src/store/migrations/",
+        "src/store/identity.ts"
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 2,
+      "kind": "implement",
+      "title": "Sign a user in through OAuth and issue their API key",
+      "criteria": [
+        "02-REQ-3"
+      ],
+      "tests": [
+        "TS-02-9",
+        "TS-02-10",
+        "TS-02-11",
+        "TS-02-12"
+      ],
+      "steps": [
+        "Add this task's behaviours to the auth routes' test files, and confirm they fail",
+        "Serve GET /api/v1/auth/providers publicly, listing each configured provider with its authorize URL, with a Cache-Control header permitting public caching for 300 seconds",
+        "Implement POST /api/v1/auth/callback: exchange the code with the provider, create or update the user, and give a user who is new a personal organization",
+        "In the same transaction as issuing the new key, revoke every existing API key of that user",
+        "Return the user and the new key together, in the af_<key_id>_<secret> form, and return the key from no other route",
+        "Refuse an invalid or expired code with 401, a redirect_uri outside the provider's allowlist with 400, a blocked user with 403 and a conflicting provider identity with 409, creating no user and issuing or revoking no key in any case",
+        "Accept an expires of 0, 30, 60 or 90 days, defaulting to 90, and refuse any other value with 400"
+      ],
+      "touches": [
+        "src/routes/auth.ts",
+        "src/routes/auth.test.ts",
+        "src/routes/auth.integration.test.ts",
+        "src/auth/oauth.ts",
+        "src/store/identity.ts"
+      ],
+      "depends_on": [
+        1
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 3,
+      "kind": "implement",
+      "title": "Serve the caller's profile and manage their API keys",
+      "criteria": [
+        "02-REQ-4",
+        "02-REQ-5"
+      ],
+      "tests": [
+        "TS-02-13",
+        "TS-02-14",
+        "TS-02-15",
+        "TS-02-16",
+        "TS-02-17",
+        "TS-02-18"
+      ],
+      "steps": [
+        "Add this task's behaviours to the user and key routes' test files, and confirm they fail",
+        "Serve GET /api/v1/user with the ten documented profile fields, and PATCH /api/v1/user changing full_name alone and refusing a missing, null or non-object body with 400",
+        "Serve GET /api/v1/user/keys as metadata only, with an ETag, answering 304 when a conditional request still matches",
+        "Implement the key refresh route: a new secret under the same key_id with the expiry recomputed, accepting an API key caller only, refusing a PAT with 401 and a revoked or expired key with 400",
+        "Implement key revocation, letting a key revoke itself and still completing the request",
+        "Answer a key that does not exist and a key of another user identically with 404"
+      ],
+      "touches": [
+        "src/routes/user.ts",
+        "src/routes/user.test.ts",
+        "src/routes/keys.ts",
+        "src/routes/keys.test.ts",
+        "src/routes/keys.integration.test.ts"
+      ],
+      "depends_on": [
+        1
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 4,
+      "kind": "implement",
+      "title": "Create, read and revoke personal access tokens",
+      "criteria": [
+        "02-REQ-6"
+      ],
+      "tests": [
+        "TS-02-19",
+        "TS-02-20",
+        "TS-02-21",
+        "TS-02-22",
+        "TS-02-23"
+      ],
+      "steps": [
+        "Add this task's behaviours to the token routes' test files, and confirm they fail",
+        "Serve the token list and the token read with permissions and no secret",
+        "Implement token creation in the af_pat_<token_id>_<secret> form, returning the token from this route alone",
+        "Refuse a PAT caller that asks to grant a scope it does not itself hold with 403, while allowing an API key to grant any registered scope",
+        "Answer token revocation with 200 and the token's metadata, not 204, and refuse an already-revoked token with 400",
+        "Refuse a bad body, a missing or over-long name, an empty or malformed permission list and a bad expires with 400, and a token of another user with 404"
+      ],
+      "touches": [
+        "src/routes/tokens.ts",
+        "src/routes/tokens.test.ts",
+        "src/routes/tokens.integration.test.ts"
+      ],
+      "depends_on": [
+        1
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 5,
+      "kind": "implement",
+      "title": "Change a token's permissions with the three verbs",
+      "criteria": [
+        "02-REQ-7"
+      ],
+      "tests": [
+        "TS-02-24",
+        "TS-02-25",
+        "TS-02-26"
+      ],
+      "steps": [
+        "Add this task's behaviours to the token permission routes' test files, and confirm they fail",
+        "Implement PUT as a replacement, PATCH as a union and DELETE as a difference over the token's permission set, each answering 200 with the token's metadata after the change",
+        "Treat removing a scope the token does not hold as a success that changes nothing",
+        "Make PUT with an empty array remove every permission and revoke the token",
+        "Refuse PATCH and DELETE with an empty array, any verb with permissions absent or null, and any verb on a revoked token, with 400 and no change",
+        "Apply the same grant rule as token creation: a PAT may add only scopes it holds"
+      ],
+      "touches": [
+        "src/routes/tokens.ts",
+        "src/routes/token_permissions.ts",
+        "src/routes/token_permissions.test.ts",
+        "src/routes/token_permissions.integration.test.ts"
+      ],
+      "depends_on": [
+        4
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 6,
+      "kind": "implement",
+      "title": "Read organizations and their membership",
+      "criteria": [
+        "02-REQ-8"
+      ],
+      "tests": [
+        "TS-02-27",
+        "TS-02-28",
+        "TS-02-29"
+      ],
+      "steps": [
+        "Add this task's behaviours to the organization routes' test files, and confirm they fail",
+        "Serve GET /api/v1/user/orgs with every organization the caller belongs to, including their personal one",
+        "Serve GET /api/v1/orgs/:id by organization id, for a member or an admin, with an ETag and a 304 on a matching conditional request",
+        "Refuse a caller who is not a member with 403 and an unknown id with 404",
+        "Expose a membership lookup the later packages' workspace access check will read on every request"
+      ],
+      "touches": [
+        "src/routes/orgs.ts",
+        "src/routes/orgs.test.ts",
+        "src/routes/orgs.integration.test.ts",
+        "src/store/identity.ts"
+      ],
+      "depends_on": [
+        1
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 7,
+      "kind": "implement",
+      "title": "Administer users, organizations and other users' credentials",
+      "criteria": [
+        "02-REQ-9"
+      ],
+      "tests": [
+        "TS-02-30",
+        "TS-02-31",
+        "TS-02-32",
+        "TS-02-33",
+        "TS-02-34",
+        "TS-02-35",
+        "TS-02-36"
+      ],
+      "steps": [
+        "Add this task's behaviours to the admin routes' test files, and confirm they fail",
+        "Admit an administration route only to an admin token or an API key of a user holding the admin role, refusing any other accepted credential with 403 and none with 401",
+        "Implement the user administration routes: create, list, read with ETag, update and delete, answering 409 for a duplicate username or provider identity",
+        "Implement promote, demote, block and unblock, making a repeat of the same change a success that alters nothing",
+        "Refuse a delete or a demote that would leave no active admin with 409",
+        "Implement listing and revoking any user's API keys and personal access tokens, with entries carrying user_id and no secret",
+        "Implement the organization administration routes: create, list, update, delete, block and unblock, answering 409 for a duplicate name or slug and 400 for an invalid slug",
+        "Implement listing, adding and removing organization members"
+      ],
+      "touches": [
+        "src/routes/admin_users.ts",
+        "src/routes/admin_users.test.ts",
+        "src/routes/admin_orgs.ts",
+        "src/routes/admin_orgs.test.ts",
+        "src/routes/admin.integration.test.ts"
+      ],
+      "depends_on": [
+        1,
+        3,
+        4,
+        6
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 8,
+      "kind": "integration",
+      "title": "Verify sign-in, scoping and blocking against a running deployment",
+      "tests": [
+        "TS-02-37",
+        "TS-02-38",
+        "TS-02-39"
+      ],
+      "steps": [
+        "Add the three smoke tests and confirm each passes against a running deployment, or skips with a message naming the missing deployment or stub provider",
+        "Trace 02-PATH-1 through the real code: the provider list, the stub provider's code, the callback's user creation, the personal organization, the revocation of the user's older keys and the issuing of the new one. Confirm no step is served by a stub inside the service",
+        "Trace 02-PATH-2: the token is created through the token route, stored as a hash, and read back by the authentication middleware and the scope checker on a later request. Confirm the scope decision is made from the stored token and not from the request",
+        "Trace 02-PATH-3: the block is written by the admin route and read by the authentication middleware on the next request, with no cached identity in between",
+        "For every criterion carrying a contract, confirm a caller in production code consumes the producer's result and not only a test: the scope registry is read by the middleware, the credential store by the authentication path, and the membership lookup is reachable by a route",
+        "Grep src/ and the files every task's touches lists for TODO, FIXME and the project's not-implemented marker, and remove any that remain",
+        "Add the identity conformance cases to the harness from package 01, so make check-release exercises these routes against a deployment"
+      ],
+      "touches": [
+        "src/routes/identity.smoke.test.ts",
+        "conformance/identity.ts"
+      ],
+      "depends_on": [
+        2,
+        5,
+        7
+      ],
+      "done_when": [
+        "`make check` passes with no network access and no deployment configured",
+        "afc login, afc user show, afc keys list and afc tokens list each succeed against a running deployment"
+      ],
+      "state": "pending"
+    }
+  ]
+}

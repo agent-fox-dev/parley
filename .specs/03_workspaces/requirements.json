@@ -1,0 +1,567 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v2.json",
+  "spec_id": "03",
+  "spec_name": "workspaces",
+  "schema_version": 2,
+  "introduction": "A workspace is the record of one repository the service holds: its identity, its settings, and the decision of who may read and change it. This package creates and retires workspaces, decides the three access levels in one place, confines workspace-bound tokens, and serialises the operations that touch a workspace's repository behind one lock.",
+  "glossary": {
+    "access level": "What a route needs of its caller towards a workspace: read, write or private. Read admits the owner, a member of the workspace's organization and an admin token; write admits the owner and an admin token; private admits the owner and an admin token, and answers a member as it answers a stranger.",
+    "anti-enumeration": "The rule that the six workspace CRUD routes answer a PAT lacking the scope with 404 rather than 403, so that no answer discloses whether a workspace exists.",
+    "member": "A user who belongs to the workspace's organization without owning the workspace. A member reads a workspace as its owner does and may change nothing.",
+    "workspace": "The service's record of one repository: the git URL it came from, the settings that govern it, and, for a carry_patch workspace, the upstream it follows.",
+    "workspace lock": "The mutual exclusion that serialises the operations working on one workspace's repository. A request that finds it held answers 409 workspace_busy at once rather than waiting.",
+    "workspace settings": "The twelve behaviour switches of a workspace, each with a default, returned in full with every workspace object and validated on every write.",
+    "workspace-bound token": "A personal access token tied to exactly one workspace when it was minted, which reaches that workspace under its scopes and nothing else."
+  },
+  "requirements": [
+    {
+      "id": "03-REQ-1",
+      "title": "Creating a workspace",
+      "rationale": "Every later package works on a workspace, so a record created with the wrong owner, organization or settings is wrong everywhere downstream.",
+      "criteria": [
+        {
+          "id": "03-REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "POST /api/v1/workspaces is called with a valid body by a user credential holding workspaces:write",
+          "system": "Parley service",
+          "action": "create the workspace owned by that user and answer with it",
+          "contract": "HTTP 201 with the full workspace object, status \"pending\", access \"owner\", display_name defaulting to the slug and description defaulting to the empty string"
+        },
+        {
+          "id": "03-REQ-1.2",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "accept a slug only when it is globally unique, 3 to 64 characters, starts with a lowercase letter, ends with a lowercase letter or digit, holds only lowercase letters, digits and hyphens, and has no two consecutive hyphens",
+          "contract": "a slug meeting every rule is accepted; one breaking any single rule is refused 400 and creates nothing"
+        },
+        {
+          "id": "03-REQ-1.3",
+          "pattern": "unwanted",
+          "condition": "the body has a missing or invalid slug or git_url, a display_name over 128 characters, a description over 1024 characters, or an invalid combination of workspace_mode, upstream_url and integration_branch",
+          "system": "Parley service",
+          "action": "refuse the request and create nothing",
+          "contract": "HTTP 400 in the error envelope naming the offending field; no workspace row and no secret is written"
+        },
+        {
+          "id": "03-REQ-1.4",
+          "pattern": "unwanted",
+          "condition": "the body carries git_pat together with git_username or git_password, only one half of the basic pair, an empty credential value, or any credential with a git_url that is not https",
+          "system": "Parley service",
+          "action": "refuse the request and create nothing",
+          "contract": "HTTP 400 in the error envelope; no workspace row and no secret is written"
+        },
+        {
+          "id": "03-REQ-1.5",
+          "pattern": "unwanted",
+          "condition": "org_id names no organization, or org_id is omitted and the caller has no personal organization, or the caller is not a member of the organization named",
+          "system": "Parley service",
+          "action": "refuse the request and create nothing",
+          "contract": "HTTP 400 for an unknown organization and for a caller with no personal organization, HTTP 403 for a caller who is not a member; no workspace row is written"
+        },
+        {
+          "id": "03-REQ-1.6",
+          "pattern": "unwanted",
+          "condition": "the caller is an admin token, or a personal access token without workspaces:write, or the slug already names a workspace",
+          "system": "Parley service",
+          "action": "refuse the request and create nothing",
+          "contract": "HTTP 403 for an admin token and for a PAT missing the scope, HTTP 409 for an existing slug; no workspace row is written"
+        },
+        {
+          "id": "03-REQ-1.7",
+          "pattern": "complex_event",
+          "condition": "a workspace is created",
+          "guard": "the body carried git_pat, or git_username and git_password",
+          "system": "Parley service",
+          "action": "store them as the workspace secrets GIT_PAT, or GIT_USERNAME and GIT_PASSWORD, encrypted before they reach any store",
+          "contract": "the secret names exist in the workspace's scope afterwards; the stored representation does not contain the plaintext value; no response field carries the value"
+        },
+        {
+          "id": "03-REQ-1.8",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "default the settings a create does not name to the documented default of each, and apply the ones it does name",
+          "contract": "the created workspace's settings object carries all twelve keys, those named at their given value and the rest at their default"
+        }
+      ]
+    },
+    {
+      "id": "03-REQ-2",
+      "title": "Reading and listing workspaces",
+      "rationale": "The list is how every client finds its workspaces, and the access field is how it knows what it may do with each.",
+      "criteria": [
+        {
+          "id": "03-REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "GET /api/v1/workspaces is requested",
+          "system": "Parley service",
+          "action": "return the caller's own workspaces and those of the organizations they belong to, newest first and by slug where created_at is equal, omitting archived ones unless include_archived is true",
+          "contract": "HTTP 200 with an array ordered by created_at descending then slug ascending; archived workspaces absent by default and present with include_archived=true"
+        },
+        {
+          "id": "03-REQ-2.2",
+          "pattern": "event_driven",
+          "condition": "GET /api/v1/workspaces/:slug is requested by a caller with read access",
+          "system": "Parley service",
+          "action": "return that workspace",
+          "contract": "HTTP 200 with the full workspace object"
+        },
+        {
+          "id": "03-REQ-2.3",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "return every workspace with the full response schema of the API reference, setting hub_url to null when the service has no external URL configured or the workspace has no organization",
+          "contract": "every workspace object carries the documented keys, display_name is never null or empty, description is never null, and hub_url is the git server URL or null"
+        },
+        {
+          "id": "03-REQ-2.4",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "set each workspace's access field from the caller: admin for an admin token, owner for its owner and member for a member of its organization, and show a member every other field as the owner sees it",
+          "contract": "an admin token's list carries access \"admin\" on every workspace; a member's read of a workspace carries access \"member\" and is otherwise field-for-field equal to the owner's read"
+        }
+      ]
+    },
+    {
+      "id": "03-REQ-3",
+      "title": "Updating a workspace",
+      "rationale": "A partial update that silently changes a field the caller did not name, or accepts an immutable one, corrupts a record every later package reads.",
+      "criteria": [
+        {
+          "id": "03-REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "PATCH /api/v1/workspaces/:slug is called with at least one of display_name, description, org_id and settings",
+          "system": "Parley service",
+          "action": "change only the fields the body names and answer with the updated workspace",
+          "contract": "HTTP 200 with the updated workspace; a field not in the body is unchanged; a field given as null returns to its default, display_name to the slug and description to the empty string"
+        },
+        {
+          "id": "03-REQ-3.2",
+          "pattern": "event_driven",
+          "condition": "PATCH is called with settings set to null",
+          "system": "Parley service",
+          "action": "return every setting to its default",
+          "contract": "HTTP 200 and the workspace's settings object carries all twelve keys at their documented defaults"
+        },
+        {
+          "id": "03-REQ-3.3",
+          "pattern": "unwanted",
+          "condition": "PATCH is called with an empty body, on an archived workspace, with an over-long field, with an immutable field or sync_mode, or with an org_id naming no organization",
+          "system": "Parley service",
+          "action": "refuse the request and change nothing",
+          "contract": "HTTP 400 in the error envelope; the stored workspace is unchanged. The immutable fields are slug, git_url, branch, owner_id, workspace_mode, upstream_url and integration_branch"
+        },
+        {
+          "id": "03-REQ-3.4",
+          "pattern": "unwanted",
+          "condition": "PATCH names an org_id the workspace's owner is not a member of",
+          "system": "Parley service",
+          "action": "refuse the request and change nothing",
+          "contract": "HTTP 403 in the error envelope; the workspace's org_id is unchanged"
+        }
+      ]
+    },
+    {
+      "id": "03-REQ-4",
+      "title": "Archiving, reactivating and deleting",
+      "rationale": "Retiring a workspace has to be reversible until it is not, and the irreversible step has to take the credentials bound to it with it.",
+      "criteria": [
+        {
+          "id": "03-REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "POST /api/v1/workspaces/:slug/archive is called on a workspace that is ready or failed and whose lock is free",
+          "system": "Parley service",
+          "action": "archive it",
+          "contract": "HTTP 200 with the workspace and status \"archived\"; the workspace's bound tokens are left alone"
+        },
+        {
+          "id": "03-REQ-4.2",
+          "pattern": "unwanted",
+          "condition": "archive is called on a workspace that is already archived, is cloning, or whose lock is held",
+          "system": "Parley service",
+          "action": "refuse the request and leave the status unchanged",
+          "contract": "HTTP 400 for an already-archived workspace; HTTP 409 with error_type workspace_busy for a held lock and HTTP 409 for a cloning workspace; the stored status is unchanged"
+        },
+        {
+          "id": "03-REQ-4.3",
+          "pattern": "event_driven",
+          "condition": "POST /api/v1/workspaces/:slug/reactivate is called on an archived workspace",
+          "system": "Parley service",
+          "action": "return it to pending",
+          "contract": "HTTP 200 with the workspace and status \"pending\""
+        },
+        {
+          "id": "03-REQ-4.4",
+          "pattern": "unwanted",
+          "condition": "reactivate is called on a workspace that is not archived",
+          "system": "Parley service",
+          "action": "refuse the request and leave the status unchanged",
+          "contract": "HTTP 409 in the error envelope; the stored status is unchanged"
+        },
+        {
+          "id": "03-REQ-4.5",
+          "pattern": "event_driven",
+          "condition": "DELETE /api/v1/workspaces/:slug is called on an archived workspace",
+          "system": "Parley service",
+          "action": "delete the workspace and, in the same transaction, revoke every live token bound to it and remove every binding",
+          "contract": "HTTP 204; the workspace is gone from the list; each formerly bound token is refused 401 from then on; either all of the deletion and the revocations happen or none of them does"
+        },
+        {
+          "id": "03-REQ-4.6",
+          "pattern": "unwanted",
+          "condition": "DELETE is called on a workspace that is not archived",
+          "system": "Parley service",
+          "action": "refuse the request and delete nothing",
+          "contract": "HTTP 409 in the error envelope; the workspace still exists and its bound tokens still work"
+        }
+      ]
+    },
+    {
+      "id": "03-REQ-5",
+      "title": "Workspace settings",
+      "rationale": "Later packages read these switches to decide how to sync, rebuild and push, so an unvalidated or missing key becomes a wrong behaviour far from here.",
+      "criteria": [
+        {
+          "id": "03-REQ-5.1",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "support the twelve settings of the API reference's settings table, each with the default that table gives it",
+          "contract": "a workspace created with no settings carries all twelve keys at their documented defaults, and each key accepts exactly the values the table lists"
+        },
+        {
+          "id": "03-REQ-5.2",
+          "pattern": "event_driven",
+          "condition": "a create or update names a setting",
+          "system": "Parley service",
+          "action": "take the given value, return the key to its default when the value is null, and keep a key the body does not name",
+          "contract": "after the write, the named key holds the given value, a key given as null holds its default, and an unnamed key holds whatever it held before"
+        },
+        {
+          "id": "03-REQ-5.3",
+          "pattern": "unwanted",
+          "condition": "a create or update names a setting key that does not exist, or gives a setting a value it cannot take",
+          "system": "Parley service",
+          "action": "refuse the whole request and change no setting",
+          "contract": "HTTP 400 in the error envelope naming the key and, for a bad value, the values it accepts; no setting of the workspace is changed"
+        },
+        {
+          "id": "03-REQ-5.4",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "return the effective value of every setting in every workspace object, whether or not it was ever set",
+          "contract": "the settings object of every workspace response has exactly the twelve documented keys"
+        }
+      ]
+    },
+    {
+      "id": "03-REQ-6",
+      "title": "Deciding access to a workspace",
+      "rationale": "This decision is repeated on every route of every later package; made in two places it will diverge, and a leak here discloses which workspaces exist.",
+      "criteria": [
+        {
+          "id": "03-REQ-6.1",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "decide the caller's access to a workspace in one place: admin for an admin token, owner for the workspace's owner, member for a user belonging to its organization, and none for anyone else",
+          "contract": "every route naming a workspace reaches the same decision function; the same caller and workspace yield the same level on every route"
+        },
+        {
+          "id": "03-REQ-6.2",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "read organization membership on every request rather than caching it with the credential",
+          "contract": "a user removed from the organization is refused on their next request, with no re-authentication and no restart in between"
+        },
+        {
+          "id": "03-REQ-6.3",
+          "pattern": "event_driven",
+          "condition": "a member of a workspace's organization calls a route needing read access",
+          "system": "Parley service",
+          "action": "answer as it answers the owner",
+          "contract": "the response status and body are those the owner receives, except that the workspace's access field reads \"member\""
+        },
+        {
+          "id": "03-REQ-6.4",
+          "pattern": "unwanted",
+          "condition": "a member of a workspace's organization calls a route needing write access",
+          "system": "Parley service",
+          "action": "refuse the request and change nothing",
+          "contract": "HTTP 403 with error_type \"forbidden\" and the message \"org members have read-only access to this workspace\"; nothing is written"
+        },
+        {
+          "id": "03-REQ-6.5",
+          "pattern": "unwanted",
+          "condition": "a member of a workspace's organization, or a caller with no access at all, reaches a route needing private access, or any route for a workspace that does not exist",
+          "system": "Parley service",
+          "action": "answer as though the workspace did not exist",
+          "contract": "HTTP 404 with the message \"workspace not found\"; the answer is identical for a member, a stranger and a slug that names nothing"
+        },
+        {
+          "id": "03-REQ-6.6",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "check the credential, then a personal access token's scope, then access, then the route's status and precondition checks, in that order",
+          "contract": "a member's write to an archived workspace answers 403 forbidden, not 400; a PAT lacking the scope gets the scope answer whatever its membership"
+        },
+        {
+          "id": "03-REQ-6.7",
+          "pattern": "unwanted",
+          "condition": "the access lookup itself fails",
+          "system": "Parley service",
+          "action": "refuse the request rather than granting any level",
+          "contract": "HTTP 500 in the error envelope; the route handler is not invoked and nothing is written"
+        }
+      ]
+    },
+    {
+      "id": "03-REQ-7",
+      "title": "Anti-enumeration on the workspace CRUD routes",
+      "rationale": "A 403 where a 404 belongs tells an unauthorised caller that a workspace exists, which is the one thing these routes must not reveal.",
+      "criteria": [
+        {
+          "id": "03-REQ-7.1",
+          "pattern": "unwanted",
+          "condition": "a personal access token lacking the required scope calls GET /api/v1/workspaces, or GET, PATCH or DELETE /api/v1/workspaces/:slug, or POST .../archive or .../reactivate",
+          "system": "Parley service",
+          "action": "answer as though the workspace did not exist",
+          "contract": "HTTP 404 with the message \"workspace not found\", identical to the answer for a slug that names nothing; never 403"
+        },
+        {
+          "id": "03-REQ-7.2",
+          "pattern": "unwanted",
+          "condition": "a personal access token lacking the required scope calls any workspace route outside that set, POST /api/v1/workspaces included",
+          "system": "Parley service",
+          "action": "refuse the request for the missing scope",
+          "contract": "HTTP 403 in the error envelope with no error_type key"
+        }
+      ]
+    },
+    {
+      "id": "03-REQ-8",
+      "title": "Workspace-bound tokens",
+      "rationale": "A bound token is what an agent is given, so a gap in its confinement is a credential reaching a repository it was never meant to see.",
+      "criteria": [
+        {
+          "id": "03-REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "POST /api/v1/workspaces/:slug/tokens is called by the workspace's owner with a valid token body",
+          "system": "Parley service",
+          "action": "create the token exactly as an unbound creation would and bind it to the workspace",
+          "contract": "HTTP 201 with Cache-Control no-store, carrying token, token_id, name, permissions, workspace, expires_at and created_at; the token string is returned by this route and no other; the token reaches the named workspace under its scopes"
+        },
+        {
+          "id": "03-REQ-8.2",
+          "pattern": "unwanted",
+          "condition": "the bound-token mint is called by a bound token, by an admin token, by a caller who is not the workspace's owner, or for an archived workspace",
+          "system": "Parley service",
+          "action": "refuse the request and bind nothing",
+          "contract": "HTTP 403 error_type token_bound for a bound caller, HTTP 403 for an admin token, HTTP 404 workspace not found for a member or a stranger, HTTP 400 for an archived workspace; no token is created and no binding is written"
+        },
+        {
+          "id": "03-REQ-8.3",
+          "pattern": "event_driven",
+          "condition": "GET /api/v1/workspaces/:slug/tokens is called by the workspace's owner or an admin token",
+          "system": "Parley service",
+          "action": "list the tokens bound to the workspace, revoked and expired ones included, ordered by creation time and then token id",
+          "contract": "HTTP 200 with entries of token_id, name, permissions, workspace, expires_at, revoked_at and created_at and no token string or hash; an empty array when there are none; the route works on an archived workspace; a binding whose token no longer exists is left out"
+        },
+        {
+          "id": "03-REQ-8.4",
+          "pattern": "unwanted",
+          "condition": "a token bound to one workspace reaches a route whose path names a different workspace",
+          "system": "Parley service",
+          "action": "answer as though that workspace did not exist, before any scope, existence or status check",
+          "contract": "HTTP 404 with the message \"workspace not found\"; the answer is the same whether the named workspace exists, is archived, or does not exist at all"
+        },
+        {
+          "id": "03-REQ-8.5",
+          "pattern": "unwanted",
+          "condition": "a bound token reaches a route it may not use at all",
+          "system": "Parley service",
+          "action": "refuse it as a bound token",
+          "contract": "HTTP 403 with error_type token_bound; on a hub route the message is \"this token is bound to workspace <slug>\", and on an identity route it is \"this token is bound to a workspace\" without naming it"
+        },
+        {
+          "id": "03-REQ-8.6",
+          "pattern": "event_driven",
+          "condition": "a sweep runs at start and every hour after",
+          "system": "Parley service",
+          "action": "revoke the live tokens of bindings whose workspace no longer exists and remove those bindings, remove bindings whose token no longer exists, and keep bindings of revoked or expired tokens whose workspace still exists",
+          "contract": "after a sweep, a token bound to a deleted workspace is refused 401; a binding of a revoked token of an existing workspace still appears in that workspace's token list"
+        },
+        {
+          "id": "03-REQ-8.7",
+          "pattern": "unwanted",
+          "condition": "a token's binding cannot be read",
+          "system": "Parley service",
+          "action": "refuse the request rather than treating the token as unbound",
+          "contract": "HTTP 500 in the error envelope; the route handler is not invoked and the token is not admitted to any workspace"
+        }
+      ]
+    },
+    {
+      "id": "03-REQ-9",
+      "title": "The workspace lock",
+      "rationale": "Later packages run repository operations concurrently; without one lock they corrupt a repository, and without an immediate refusal they queue behind each other invisibly.",
+      "criteria": [
+        {
+          "id": "03-REQ-9.1",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "serialise the operations that work on one workspace's repository, so that two of them never run at the same time for the same workspace",
+          "contract": "for any two concurrent lock-taking operations on one workspace, one runs to completion before the other starts; operations on different workspaces are unaffected"
+        },
+        {
+          "id": "03-REQ-9.2",
+          "pattern": "unwanted",
+          "condition": "a lock-taking request finds the workspace's lock already held",
+          "system": "Parley service",
+          "action": "refuse the request at once, without waiting for the lock",
+          "contract": "HTTP 409 with error_type workspace_busy, answered without blocking; the same request succeeds once the lock is free"
+        },
+        {
+          "id": "03-REQ-9.3",
+          "pattern": "event_driven",
+          "condition": "the component holding a workspace's lock stops without releasing it",
+          "system": "Parley service",
+          "action": "release the lock so the workspace is usable again",
+          "contract": "a lock-taking request on that workspace succeeds rather than answering 409 forever"
+        },
+        {
+          "id": "03-REQ-9.4",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "hold the lock across every component of the deployment rather than within one of them",
+          "contract": "two lock-taking requests served by different instances of the service are serialised as two served by one instance are"
+        }
+      ]
+    },
+    {
+      "id": "03-REQ-10",
+      "title": "Sandbox routes with no provider configured",
+      "rationale": "This deployment runs no sandboxes, and the reference defines exactly what such a hub answers, so afc's sandbox commands behave as documented rather than as a missing route.",
+      "criteria": [
+        {
+          "id": "03-REQ-10.1",
+          "pattern": "unwanted",
+          "condition": "an authenticated caller reaches any route under /api/v1/sandbox-profiles, /api/v1/workspaces/:slug/sandboxes or /api/v1/sandboxes",
+          "system": "Parley service",
+          "action": "answer that sandboxes are not enabled, before any scope check and before the workspace is looked up",
+          "contract": "HTTP 404 with error_type sandboxes_disabled and the message \"sandboxes are not enabled on this hub\"; the answer is the same for a PAT with no sandbox scope, for a slug that does not exist and for an archived workspace"
+        },
+        {
+          "id": "03-REQ-10.2",
+          "pattern": "unwanted",
+          "condition": "a caller with no credential reaches a sandbox route",
+          "system": "Parley service",
+          "action": "refuse it for the missing credential rather than for the missing provider",
+          "contract": "HTTP 401 with the message \"authentication required\", not the sandboxes_disabled answer"
+        },
+        {
+          "id": "03-REQ-10.3",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "register every sandbox path the API reference lists, so none of them falls through to the router's unmatched-path answer",
+          "contract": "each listed sandbox path answers with error_type sandboxes_disabled rather than a 404 with no error_type"
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "03-PATH-1",
+      "title": "An owner registers a workspace and reads it back",
+      "steps": [
+        {
+          "actor": "API client",
+          "action": "posts a slug, a git URL and a git_pat to POST /api/v1/workspaces"
+        },
+        {
+          "actor": "Parley service",
+          "action": "validates the body, resolves the owner's organization and encrypts the credential through the secret store"
+        },
+        {
+          "actor": "Parley service",
+          "action": "writes the workspace record with status pending and answers 201 with the full workspace object"
+        },
+        {
+          "actor": "API client",
+          "action": "reads GET /api/v1/workspaces/:slug and finds access owner and every setting at its effective value"
+        },
+        {
+          "actor": "API client",
+          "action": "reads GET /api/v1/workspaces and finds the new workspace in the list"
+        }
+      ]
+    },
+    {
+      "id": "03-PATH-2",
+      "title": "A member of the organization reads the workspace but cannot change it",
+      "steps": [
+        {
+          "actor": "organization member",
+          "action": "reads GET /api/v1/workspaces/:slug of a workspace they do not own"
+        },
+        {
+          "actor": "Parley service",
+          "action": "reads the organization membership, decides member access and answers with the owner's view and access member"
+        },
+        {
+          "actor": "organization member",
+          "action": "calls PATCH /api/v1/workspaces/:slug and is refused 403 forbidden"
+        },
+        {
+          "actor": "organization member",
+          "action": "calls GET /api/v1/workspaces/:slug/tokens and is refused 404 workspace not found"
+        }
+      ]
+    },
+    {
+      "id": "03-PATH-3",
+      "title": "A bound token reaches its own workspace and nothing else",
+      "steps": [
+        {
+          "actor": "API client",
+          "action": "mints a token bound to the workspace as its owner and receives it once"
+        },
+        {
+          "actor": "API client",
+          "action": "reads its own workspace with the bound token and is served"
+        },
+        {
+          "actor": "Parley service",
+          "action": "refuses the same token on another workspace's route with 404, before any scope, existence or status check"
+        },
+        {
+          "actor": "Parley service",
+          "action": "refuses the same token on POST /api/v1/workspaces with 403 and error_type token_bound"
+        }
+      ]
+    },
+    {
+      "id": "03-PATH-4",
+      "title": "A workspace is archived and then deleted, taking its bound tokens with it",
+      "steps": [
+        {
+          "actor": "API client",
+          "action": "archives the workspace and sees status archived"
+        },
+        {
+          "actor": "Parley service",
+          "action": "refuses a subsequent update of the archived workspace with 400"
+        },
+        {
+          "actor": "API client",
+          "action": "deletes the archived workspace"
+        },
+        {
+          "actor": "Parley service",
+          "action": "removes the workspace and revokes every live bound token in the same transaction, answering 204"
+        },
+        {
+          "actor": "API client",
+          "action": "uses the previously minted bound token and is refused 401"
+        }
+      ]
+    }
+  ]
+}

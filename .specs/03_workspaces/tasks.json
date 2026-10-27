@@ -1,0 +1,344 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v2.json",
+  "spec_id": "03",
+  "spec_name": "workspaces",
+  "schema_version": 2,
+  "test_commands": {
+    "all_tests": "make test",
+    "linter": "make lint"
+  },
+  "dependencies": [
+    {
+      "spec": "01",
+      "reason": "uses its router, error envelope, request conventions and platform interfaces, and adds the secret store and the per-workspace lock to that interface set"
+    },
+    {
+      "spec": "02",
+      "reason": "uses its credential identity, scope registry and check, token creation for the bound mint, and organization membership lookup for the access decision"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "kind": "implement",
+      "title": "Create a workspace and store its credentials",
+      "criteria": [
+        "03-REQ-1"
+      ],
+      "tests": [
+        "TS-03-1",
+        "TS-03-2",
+        "TS-03-3",
+        "TS-03-4",
+        "TS-03-5",
+        "TS-03-6",
+        "TS-03-7"
+      ],
+      "steps": [
+        "Add this task's behaviours to the workspace routes', the validation and the workspace secrets test files, and confirm they fail",
+        "Define the workspace and workspace-secret tables in the relational store, with a migration the second target runs too",
+        "Define the secret store platform interface — put, get and delete by scope and key — and encrypt every value with a deployment key before it reaches the store",
+        "Implement the slug rule: globally unique, 3 to 64 characters, starting with a lowercase letter, ending with a lowercase letter or digit, lowercase letters, digits and hyphens only, no consecutive hyphens",
+        "Implement POST /api/v1/workspaces: validate the body, resolve the owning organization from org_id or the caller's personal organization, and write the record with status pending",
+        "Refuse a malformed body, an over-long display_name or description, and an invalid workspace_mode, upstream_url and integration_branch combination with 400",
+        "Refuse git_pat together with either basic field, a half basic pair, an empty credential value and any credential with a non-https git_url with 400",
+        "Refuse an unknown organization and a caller with no personal organization with 400, a caller who is not a member with 403, an admin token with 403 and an existing slug with 409",
+        "Store the creation credentials as the workspace secrets GIT_PAT, or GIT_USERNAME and GIT_PASSWORD",
+        "Apply the settings the body names and default the rest, so the created workspace carries all twelve keys"
+      ],
+      "touches": [
+        "src/routes/workspaces.ts",
+        "src/routes/workspaces.test.ts",
+        "src/routes/workspaces.integration.test.ts",
+        "src/workspace/validate.ts",
+        "src/workspace/validate.test.ts",
+        "src/platform/secrets.ts",
+        "src/secrets/store.ts",
+        "src/secrets/store.integration.test.ts",
+        "src/store/migrations/"
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 2,
+      "kind": "implement",
+      "title": "Decide workspace access in one place and apply the anti-enumeration rule",
+      "criteria": [
+        "03-REQ-6",
+        "03-REQ-7"
+      ],
+      "tests": [
+        "TS-03-25",
+        "TS-03-26",
+        "TS-03-27",
+        "TS-03-28",
+        "TS-03-29",
+        "TS-03-30",
+        "TS-03-31",
+        "TS-03-32"
+      ],
+      "steps": [
+        "Add this task's behaviours to the access decision's test files, and confirm they fail",
+        "Implement one access decision: admin for an admin token, owner for the workspace's owner, member for a user in its organization, none for anyone else, reading membership on every request",
+        "Expose the three levels — read, write and private — so that every route naming a workspace declares which it needs and none decides for itself",
+        "Answer a member's read-level request as the owner's, differing only in the access field",
+        "Answer a member's write-level request 403 with error_type forbidden and the message \"org members have read-only access to this workspace\"",
+        "Answer a private-level request from a member or a stranger, and any request for a slug naming nothing, with an identical 404 \"workspace not found\"",
+        "Order the checks: credential, then a PAT's scope, then access, then the route's status and precondition checks",
+        "Answer 500 when the access lookup itself fails, never granting a level and never invoking the handler",
+        "Mark the six anti-enumeration routes so that a PAT lacking the scope gets the 404 rather than the 403, and leave every other route on the 403"
+      ],
+      "touches": [
+        "src/workspace/access.ts",
+        "src/workspace/access.test.ts",
+        "src/workspace/access.integration.test.ts",
+        "src/routes/workspaces.ts"
+      ],
+      "depends_on": [
+        1
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 3,
+      "kind": "implement",
+      "title": "Read and list workspaces with the full response schema",
+      "criteria": [
+        "03-REQ-2"
+      ],
+      "tests": [
+        "TS-03-8",
+        "TS-03-9",
+        "TS-03-10",
+        "TS-03-11"
+      ],
+      "steps": [
+        "Add this task's behaviours to the workspace routes' and the serialisation test files, and confirm they fail",
+        "Implement the workspace serialiser: every documented key and no others, display_name never null or empty, description never null",
+        "Compute hub_url from the service's external URL and the workspace's organization, and set it to null when either is absent",
+        "Set the access field from the access decision on every workspace the service returns",
+        "Implement GET /api/v1/workspaces/:slug for a caller with read access",
+        "Implement GET /api/v1/workspaces: the caller's own and their organizations' workspaces, ordered by created_at descending then slug ascending, with include_archived adding archived ones and an admin token seeing all"
+      ],
+      "touches": [
+        "src/routes/workspaces.ts",
+        "src/routes/workspaces.test.ts",
+        "src/workspace/serialise.ts",
+        "src/workspace/serialise.test.ts"
+      ],
+      "depends_on": [
+        2
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 4,
+      "kind": "implement",
+      "title": "Update a workspace and validate its settings",
+      "criteria": [
+        "03-REQ-3",
+        "03-REQ-5"
+      ],
+      "tests": [
+        "TS-03-12",
+        "TS-03-13",
+        "TS-03-14",
+        "TS-03-15",
+        "TS-03-22",
+        "TS-03-23",
+        "TS-03-24"
+      ],
+      "steps": [
+        "Add this task's behaviours to the workspace routes' and the settings test files, and confirm they fail",
+        "Declare the twelve settings in one table with their types, allowed values and defaults, transcribed from the API reference",
+        "Validate settings on every write, refusing an unknown key or an unacceptable value with 400 that names the key and, for an enum, the values it accepts, and changing nothing",
+        "Return the effective value of all twelve keys in every workspace object",
+        "Implement PATCH: change only the fields the body names, treat null as a reset to the default for display_name, description and org_id, and treat a null settings object as a reset of every setting",
+        "Refuse an empty body, an archived workspace, an over-long field, any immutable field and sync_mode with 400",
+        "Refuse an org_id naming no organization with 400 and one the owner does not belong to with 403"
+      ],
+      "touches": [
+        "src/routes/workspaces.ts",
+        "src/workspace/settings.ts",
+        "src/workspace/settings.test.ts",
+        "src/routes/workspaces.integration.test.ts"
+      ],
+      "depends_on": [
+        1,
+        2
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 5,
+      "kind": "implement",
+      "title": "Serialise repository operations behind a per-workspace lock",
+      "criteria": [
+        "03-REQ-9"
+      ],
+      "tests": [
+        "TS-03-40",
+        "TS-03-41",
+        "TS-03-42",
+        "TS-03-43"
+      ],
+      "steps": [
+        "Add this task's behaviours to the workspace lock's test files, and confirm they fail",
+        "Define the per-workspace lock as a platform interface, with a Cloudflare implementation and a non-Cloudflare one, and add its contract suite to the set package 01 established",
+        "Make the lock hold across every instance of the service, not within one process",
+        "Expose a take-or-refuse operation that never waits: a caller that finds the lock held learns so at once",
+        "Answer a request that cannot take the lock with 409 and error_type workspace_busy",
+        "Release a lock whose holder stopped without releasing it, so a workspace cannot be left permanently busy"
+      ],
+      "touches": [
+        "src/platform/lock.ts",
+        "src/platform/cloudflare/lock.ts",
+        "src/platform/local/lock.ts",
+        "src/workspace/lock.ts",
+        "src/workspace/lock.test.ts",
+        "src/workspace/lock.integration.test.ts"
+      ],
+      "depends_on": [
+        1
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 6,
+      "kind": "implement",
+      "title": "Mint, list and confine workspace-bound tokens",
+      "criteria": [
+        "03-REQ-8"
+      ],
+      "tests": [
+        "TS-03-33",
+        "TS-03-34",
+        "TS-03-35",
+        "TS-03-36",
+        "TS-03-37",
+        "TS-03-38",
+        "TS-03-39"
+      ],
+      "steps": [
+        "Add this task's behaviours to the bound token test files, and confirm they fail",
+        "Define the token binding table and write a binding in the same transaction as the token it binds, revoking the token if the binding cannot be written",
+        "Implement POST /api/v1/workspaces/:slug/tokens: create the token exactly as the unbound route does, bind it, and answer 201 with Cache-Control no-store",
+        "Refuse the mint for a bound caller with 403 token_bound, an admin token with 403, a non-owner with 404 and an archived workspace with 400",
+        "Implement GET /api/v1/workspaces/:slug/tokens: ordered by created_at then token_id, revoked and expired tokens included, bindings whose token is gone left out, no secret, working on an archived workspace",
+        "Refuse a bound token on any route naming another workspace with 404, before any scope, existence or status check",
+        "Refuse a bound token on a route no bound token may use with 403 token_bound, naming the workspace on a hub route and not naming it on an identity route",
+        "Answer 500 when a binding cannot be read, never admitting the token as unbound",
+        "Add the hourly sweep: revoke live tokens of bindings whose workspace is gone, remove bindings whose token is gone, keep bindings of dead tokens of existing workspaces"
+      ],
+      "touches": [
+        "src/routes/bound_tokens.ts",
+        "src/routes/bound_tokens.test.ts",
+        "src/routes/bound_tokens.integration.test.ts",
+        "src/auth/binding.ts",
+        "src/jobs/binding_sweep.ts"
+      ],
+      "depends_on": [
+        2
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 7,
+      "kind": "implement",
+      "title": "Archive, reactivate and delete a workspace",
+      "criteria": [
+        "03-REQ-4"
+      ],
+      "tests": [
+        "TS-03-16",
+        "TS-03-17",
+        "TS-03-18",
+        "TS-03-19",
+        "TS-03-20",
+        "TS-03-21"
+      ],
+      "steps": [
+        "Add this task's behaviours to the workspace lifecycle test files, and confirm they fail",
+        "Implement the archive route, taking the workspace lock and answering 409 workspace_busy when it is held",
+        "Refuse archiving an already-archived workspace with 400 and a cloning one with 409",
+        "Implement the reactivate route, moving an archived workspace to pending and refusing any other status with 409",
+        "Implement the delete route for an archived workspace, refusing any other status with 409",
+        "In one transaction with the delete, revoke every live bound token of the workspace and remove every binding, so a failure leaves the workspace and its tokens both intact"
+      ],
+      "touches": [
+        "src/routes/workspaces.ts",
+        "src/workspace/lifecycle.ts",
+        "src/workspace/lifecycle.test.ts",
+        "src/workspace/lifecycle.integration.test.ts"
+      ],
+      "depends_on": [
+        2,
+        5,
+        6
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 8,
+      "kind": "implement",
+      "title": "Serve the sandbox routes as disabled",
+      "criteria": [
+        "03-REQ-10"
+      ],
+      "tests": [
+        "TS-03-44",
+        "TS-03-45"
+      ],
+      "steps": [
+        "Add this task's behaviours to the sandbox routes' test file, and confirm they fail",
+        "Register every sandbox path the API reference lists, so none falls through to the router's unmatched-path answer",
+        "Answer each with 404, error_type sandboxes_disabled and the message \"sandboxes are not enabled on this hub\", before any scope check and before the workspace is looked up",
+        "Keep the credential check ahead of it, so an unauthenticated caller still gets 401"
+      ],
+      "touches": [
+        "src/routes/sandboxes.ts",
+        "src/routes/sandboxes.test.ts"
+      ],
+      "depends_on": [
+        2
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 9,
+      "kind": "integration",
+      "title": "Verify registration, membership, confinement and retirement against a running deployment",
+      "tests": [
+        "TS-03-46",
+        "TS-03-47",
+        "TS-03-48",
+        "TS-03-49"
+      ],
+      "steps": [
+        "Add the four smoke tests and confirm each passes against a running deployment, or skips with a message naming the missing deployment",
+        "Trace 03-PATH-1: the create route validates, resolves the organization through the membership lookup of package 02, writes the credential through the secret store and the record through the relational store, and the read serves it back from the store. Confirm no step is served by a stub",
+        "Trace 03-PATH-2: the member's read and refusals all reach the single access decision, and the membership it reads comes from the store on each request",
+        "Trace 03-PATH-3: the bound token is written by the mint route, read by the authentication path and enforced before the scope and existence checks on a later request",
+        "Trace 03-PATH-4: the archive takes the real lock, and the delete's token revocation and workspace removal share one transaction",
+        "For every criterion carrying a contract, confirm a caller in production code consumes the producer's result and not only a test: the access decision is called by every workspace route, the settings table by both create and update, the secret store by create, and the lock by archive",
+        "Grep src/ and the files every task's touches lists for TODO, FIXME and the project's not-implemented marker, and remove any that remain",
+        "Add the workspace conformance cases to the harness from package 01"
+      ],
+      "touches": [
+        "src/routes/workspaces.smoke.test.ts",
+        "conformance/workspaces.ts"
+      ],
+      "depends_on": [
+        3,
+        4,
+        7,
+        8
+      ],
+      "done_when": [
+        "`make check` passes with no network access and no deployment configured",
+        "afc workspace create, get, list, update, archive, reactivate and delete each behave as docs/prd/cli.md specifies against a running deployment"
+      ],
+      "state": "pending"
+    }
+  ]
+}

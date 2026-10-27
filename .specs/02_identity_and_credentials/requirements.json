@@ -1,0 +1,495 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v2.json",
+  "spec_id": "02",
+  "spec_name": "identity_and_credentials",
+  "schema_version": 2,
+  "introduction": "Identity and credentials are the gate every other Parley route sits behind: three credential kinds, a flat set of scopes, an OAuth sign-in that is the only source of an API key, and the user, key, token and organization routes the afc client already speaks to.",
+  "glossary": {
+    "API key": "A credential belonging to a user, issued only by the OAuth callback, acting with that user's full rights. Its string has the form af_<key_id>_<secret>.",
+    "admin token": "A deployment credential with access to every workspace and user and no user identity of its own, so it can own nothing.",
+    "personal access token": "A credential belonging to a user and limited to the scopes it was granted. Its string has the form af_pat_<token_id>_<secret>. Abbreviated PAT.",
+    "personal organization": "The organization created for a user at first sign-in, used as the default owner of workspaces they create without naming one.",
+    "retired scope name": "One of the eight scope names of earlier hub releases that a new token may no longer ask for: workspaces:create, workspaces:delete, workspaces:sync, secrets:list, secrets:manage, secrets:delete, vars:manage, vars:delete.",
+    "scope": "A named permission such as workspaces:read or secrets:write. API keys and admin tokens hold every hub scope implicitly; only PATs are checked against them."
+  },
+  "requirements": [
+    {
+      "id": "02-REQ-1",
+      "title": "Authenticating a caller",
+      "rationale": "Every other route in the service is gated on this one decision, so its refusals have to be exact and tell an attacker nothing.",
+      "criteria": [
+        {
+          "id": "02-REQ-1.1",
+          "pattern": "unwanted",
+          "condition": "a request to a route that is not public carries no Authorization Bearer credential",
+          "system": "Parley service",
+          "action": "refuse the request without running the route",
+          "contract": "HTTP 401 in the error envelope with message \"authentication required\"; the route handler is not invoked"
+        },
+        {
+          "id": "02-REQ-1.2",
+          "pattern": "unwanted",
+          "condition": "a request carries a credential that is unknown, malformed, revoked or expired",
+          "system": "Parley service",
+          "action": "refuse the request with the same answer as for no credential at all",
+          "contract": "HTTP 401 in the error envelope with message \"authentication required\"; the message does not say which of the four conditions applied"
+        },
+        {
+          "id": "02-REQ-1.3",
+          "pattern": "event_driven",
+          "condition": "a request carries a credential the service accepts",
+          "system": "Parley service",
+          "action": "identify it as an API key, a personal access token or an admin token and make that kind, and the acting user where there is one, available to the route",
+          "contract": "the route sees the credential kind and, for an API key or a PAT, the user id; for an admin token it sees no user id"
+        },
+        {
+          "id": "02-REQ-1.4",
+          "pattern": "state_driven",
+          "condition": "the user behind a credential is blocked",
+          "system": "Parley service",
+          "action": "refuse every request made with that credential, leaving the credential itself unrevoked",
+          "contract": "HTTP 401 in the error envelope while the user is blocked; the credential's revoked_at is still null; after the user is unblocked the same credential is accepted again"
+        },
+        {
+          "id": "02-REQ-1.5",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "keep every credential secret and every Authorization header out of log records and response bodies",
+          "contract": "for any request carrying a credential, no log record and no response body contains the credential string or its secret portion"
+        },
+        {
+          "id": "02-REQ-1.6",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "serve the public routes without a credential: the four server routes, GET /api/v1/auth/providers, POST /api/v1/auth/callback and the forge webhook ingress",
+          "contract": "each public route answers its normal status to a request with no Authorization header, never 401"
+        }
+      ]
+    },
+    {
+      "id": "02-REQ-2",
+      "title": "Permission scopes",
+      "rationale": "A scope set that drifts from the hub's lets an existing token do more or less than its holder was promised.",
+      "criteria": [
+        {
+          "id": "02-REQ-2.1",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "treat an API key and an admin token as holding every hub scope, and check only personal access tokens against the scopes they were granted",
+          "contract": "a route needing any hub scope admits an API key and an admin token without consulting a scope list"
+        },
+        {
+          "id": "02-REQ-2.2",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "for every hub resource, treat the write scope as granting the read scope, and never treat a read scope as granting a write scope",
+          "contract": "a PAT holding only <resource>:write is admitted to a route needing <resource>:read; a PAT holding only <resource>:read is refused a route needing <resource>:write"
+        },
+        {
+          "id": "02-REQ-2.3",
+          "pattern": "unwanted",
+          "condition": "a personal access token does not hold the scope a route needs",
+          "system": "Parley service",
+          "action": "refuse the request",
+          "contract": "HTTP 403 in the error envelope with no error_type key"
+        },
+        {
+          "id": "02-REQ-2.4",
+          "pattern": "unwanted",
+          "condition": "a token is created or amended with a retired scope name",
+          "system": "Parley service",
+          "action": "refuse the request and change no token",
+          "contract": "HTTP 400 in the error envelope naming the refused scope; no token is created or changed"
+        },
+        {
+          "id": "02-REQ-2.5",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "register exactly the 24 hub scopes of the API reference's scope table and apikit's 8, and refuse any name outside that set",
+          "contract": "a token creation naming a scope outside the registered set is 400, and each registered name is accepted"
+        }
+      ]
+    },
+    {
+      "id": "02-REQ-3",
+      "title": "Signing in",
+      "rationale": "OAuth is the only source of an API key, and its surprising side effect on the user's other keys is one existing automation already depends on.",
+      "criteria": [
+        {
+          "id": "02-REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "GET /api/v1/auth/providers is requested",
+          "system": "Parley service",
+          "action": "list each configured OAuth provider with its authorize URL, without requiring a credential",
+          "contract": "HTTP 200 with an array of {name, authorize_url}; a Cache-Control header permitting public caching for 300 seconds"
+        },
+        {
+          "id": "02-REQ-3.2",
+          "pattern": "event_driven",
+          "condition": "POST /api/v1/auth/callback is called with a configured provider and a valid authorization code",
+          "system": "Parley service",
+          "action": "create or update the user, revoke every existing API key of that user, issue one new API key, and return the user and the key together",
+          "contract": "HTTP 200 with body.user and body.api_key; body.api_key.key matches af_<key_id>_<secret>; every API key the user held before the call is thereafter refused 401; the new key is returned by this route and by no other"
+        },
+        {
+          "id": "02-REQ-3.3",
+          "pattern": "complex_event",
+          "condition": "POST /api/v1/auth/callback succeeds",
+          "guard": "the provider identity belongs to no existing user",
+          "system": "Parley service",
+          "action": "create the user and a personal organization owned by them",
+          "contract": "GET /api/v1/user/orgs with the new key lists exactly one organization, owned by the new user"
+        },
+        {
+          "id": "02-REQ-3.4",
+          "pattern": "unwanted",
+          "condition": "the authorization code is invalid or expired, the redirect_uri is outside the provider's allowlist, the user is blocked, or the provider identity conflicts with an existing user",
+          "system": "Parley service",
+          "action": "refuse the sign-in, creating no user and issuing no key",
+          "contract": "HTTP 401 for an invalid or expired code, 400 for a disallowed redirect_uri, 403 for a blocked user and 409 for a conflicting identity; in every case no user is created or updated and no key is issued or revoked"
+        },
+        {
+          "id": "02-REQ-3.5",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "accept an expires value of 0, 30, 60 or 90 days, defaulting to 90 when it is omitted, and refuse any other value",
+          "contract": "the issued key's expires_at is that many days ahead, or null for 0; any other value is 400 and issues no key"
+        }
+      ]
+    },
+    {
+      "id": "02-REQ-4",
+      "title": "The caller's profile",
+      "rationale": "The one route afc calls to confirm a credential works.",
+      "criteria": [
+        {
+          "id": "02-REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "GET /api/v1/user is requested with an accepted user credential",
+          "system": "Parley service",
+          "action": "return the caller's profile",
+          "contract": "HTTP 200 with id, username, email, full_name, status, role, provider, provider_id, created_at and updated_at"
+        },
+        {
+          "id": "02-REQ-4.2",
+          "pattern": "event_driven",
+          "condition": "PATCH /api/v1/user is called with a full_name",
+          "system": "Parley service",
+          "action": "change that field and leave every other field of the user unchanged",
+          "contract": "HTTP 200 with the updated profile; a subsequent GET returns the new full_name and the same id, username, email, role and provider"
+        },
+        {
+          "id": "02-REQ-4.3",
+          "pattern": "unwanted",
+          "condition": "PATCH /api/v1/user is called with no full_name, a null full_name or a body that is not a JSON object",
+          "system": "Parley service",
+          "action": "refuse the request and change nothing",
+          "contract": "HTTP 400 in the error envelope; the stored profile is unchanged"
+        }
+      ]
+    },
+    {
+      "id": "02-REQ-5",
+      "title": "API keys",
+      "rationale": "A key that cannot be listed, rotated or revoked is a credential nobody can retire.",
+      "criteria": [
+        {
+          "id": "02-REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "GET /api/v1/user/keys is requested",
+          "system": "Parley service",
+          "action": "list the caller's API keys as metadata only, and answer a conditional request whose ETag still matches without a body",
+          "contract": "HTTP 200 with an array of {key_id, created_at, expires_at, revoked_at} and an ETag header; no entry carries a secret or a hash; a repeat request carrying that ETag answers 304 with no body"
+        },
+        {
+          "id": "02-REQ-5.2",
+          "pattern": "event_driven",
+          "condition": "POST /api/v1/user/keys/:key_id/refresh is called with an API key for a key that is neither revoked nor expired",
+          "system": "Parley service",
+          "action": "issue a new secret under the same key_id and recompute the expiry from the key's lifetime",
+          "contract": "HTTP 200 with key, key_id and expires_at; key_id is unchanged; the previous secret is thereafter refused 401 and the new one accepted"
+        },
+        {
+          "id": "02-REQ-5.3",
+          "pattern": "unwanted",
+          "condition": "the key refresh route is called with a personal access token, for a revoked or expired key, or for a key that is not the caller's",
+          "system": "Parley service",
+          "action": "refuse the request and rotate nothing",
+          "contract": "HTTP 401 for a PAT caller, 400 for a revoked or expired key and 404 for a key that is not the caller's; the key's secret is unchanged in every case"
+        },
+        {
+          "id": "02-REQ-5.4",
+          "pattern": "event_driven",
+          "condition": "DELETE /api/v1/user/keys/:key_id is called for one of the caller's keys, including the key the request is authenticated with",
+          "system": "Parley service",
+          "action": "revoke that key and complete the request",
+          "contract": "HTTP 204; the request completes even when it revoked its own credential; the key is refused 401 from the next request on"
+        },
+        {
+          "id": "02-REQ-5.5",
+          "pattern": "unwanted",
+          "condition": "a key route names a key that does not exist or belongs to another user",
+          "system": "Parley service",
+          "action": "answer as though the key did not exist",
+          "contract": "HTTP 404 in the error envelope; the answer does not distinguish a key of another user from one that does not exist"
+        }
+      ]
+    },
+    {
+      "id": "02-REQ-6",
+      "title": "Personal access tokens",
+      "rationale": "PATs are how an agent gets a credential narrower than its owner's, so granting more than the grantor holds would be a privilege escalation.",
+      "criteria": [
+        {
+          "id": "02-REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "GET /api/v1/user/tokens is requested",
+          "system": "Parley service",
+          "action": "list the caller's tokens with their permissions and no secret",
+          "contract": "HTTP 200 with an array of {token_id, name, permissions, expires_at, created_at, revoked_at}; no entry carries a token string or a hash"
+        },
+        {
+          "id": "02-REQ-6.2",
+          "pattern": "event_driven",
+          "condition": "POST /api/v1/user/tokens is called with a name, a non-empty permission list and a valid expires",
+          "system": "Parley service",
+          "action": "create the token and return it once",
+          "contract": "HTTP 201 with token matching af_pat_<token_id>_<secret>; no later route returns that string; the token is accepted on a route needing one of its scopes"
+        },
+        {
+          "id": "02-REQ-6.3",
+          "pattern": "unwanted",
+          "condition": "a personal access token asks to grant a scope it does not itself hold",
+          "system": "Parley service",
+          "action": "refuse the request and create or change no token",
+          "contract": "HTTP 403 in the error envelope; no token is created or amended; an API key making the same request succeeds"
+        },
+        {
+          "id": "02-REQ-6.4",
+          "pattern": "event_driven",
+          "condition": "DELETE /api/v1/user/tokens/:token_id is called for a live token of the caller",
+          "system": "Parley service",
+          "action": "revoke it and return its metadata",
+          "contract": "HTTP 200 with the token's metadata and revoked_at set, not 204; the token is refused 401 from the next request on"
+        },
+        {
+          "id": "02-REQ-6.5",
+          "pattern": "unwanted",
+          "condition": "a token request has an invalid body, a missing or over-long name, an empty or malformed permission list, or an invalid expires, or names a token that is already revoked or is not the caller's",
+          "system": "Parley service",
+          "action": "refuse the request and create or change no token",
+          "contract": "HTTP 400 for a bad body, name, permission list or expires and for an already-revoked token; HTTP 404 for a token that is not the caller's; no token is created or changed"
+        }
+      ]
+    },
+    {
+      "id": "02-REQ-7",
+      "title": "Changing a token's permissions",
+      "rationale": "Three verbs over one list, one of which revokes the token, so getting the empty-list cases wrong either strands a token or deletes it by surprise.",
+      "criteria": [
+        {
+          "id": "02-REQ-7.1",
+          "pattern": "event_driven",
+          "condition": "PUT, PATCH or DELETE is called on a token's permissions with a non-empty list",
+          "system": "Parley service",
+          "action": "replace the token's set for PUT, add the named scopes for PATCH, and remove them for DELETE",
+          "contract": "HTTP 200 with the token's metadata after the change; the resulting permission set is the replacement, the union, or the difference respectively; removing a scope the token does not hold leaves the set unchanged"
+        },
+        {
+          "id": "02-REQ-7.2",
+          "pattern": "event_driven",
+          "condition": "PUT is called on a token's permissions with an empty array",
+          "system": "Parley service",
+          "action": "remove every permission and revoke the token",
+          "contract": "HTTP 200 with an empty permissions list and revoked_at set; the token is refused 401 from the next request on"
+        },
+        {
+          "id": "02-REQ-7.3",
+          "pattern": "unwanted",
+          "condition": "PATCH or DELETE is called on a token's permissions with an empty array, or any of the three is called with permissions absent or null, or for a revoked token",
+          "system": "Parley service",
+          "action": "refuse the request and change no permission",
+          "contract": "HTTP 400 in the error envelope; the token's permission set and revoked_at are unchanged"
+        }
+      ]
+    },
+    {
+      "id": "02-REQ-8",
+      "title": "Organizations",
+      "rationale": "Workspace membership is read from organizations on every request, so reading them has to work before any of that can.",
+      "criteria": [
+        {
+          "id": "02-REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "GET /api/v1/user/orgs is requested",
+          "system": "Parley service",
+          "action": "list the organizations the caller belongs to, the personal organization among them",
+          "contract": "HTTP 200 with an array of {id, name, slug, url, owner_id, status, created_at, updated_at}"
+        },
+        {
+          "id": "02-REQ-8.2",
+          "pattern": "complex_event",
+          "condition": "GET /api/v1/orgs/:id is requested with an organization id",
+          "guard": "the caller is a member of that organization or an admin",
+          "system": "Parley service",
+          "action": "return the organization, answering a conditional request whose ETag still matches without a body",
+          "contract": "HTTP 200 with the organization and an ETag header; a repeat request carrying that ETag answers 304 with no body"
+        },
+        {
+          "id": "02-REQ-8.3",
+          "pattern": "unwanted",
+          "condition": "GET /api/v1/orgs/:id names an organization the caller is not a member of, or one that does not exist",
+          "system": "Parley service",
+          "action": "refuse the request",
+          "contract": "HTTP 403 in the error envelope when the organization exists and the caller is not a member; HTTP 404 when it does not exist"
+        }
+      ]
+    },
+    {
+      "id": "02-REQ-9",
+      "title": "Administration",
+      "rationale": "An operator needs to create, block and retire users and organizations, and a deployment that can lose its last admin is one nobody can administer.",
+      "criteria": [
+        {
+          "id": "02-REQ-9.1",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "admit an administration route only to an admin token or an API key of a user holding the admin role",
+          "contract": "HTTP 401 with no credential and HTTP 403 for any other accepted credential, including a PAT holding every scope"
+        },
+        {
+          "id": "02-REQ-9.2",
+          "pattern": "event_driven",
+          "condition": "an administrator creates, lists, reads, updates or deletes a user",
+          "system": "Parley service",
+          "action": "apply the change and answer with the user or the list",
+          "contract": "HTTP 201 on create, 200 on list, read and update, 204 on delete; a create whose username or provider identity already exists is 409; a read supports ETag and answers 304 when it matches"
+        },
+        {
+          "id": "02-REQ-9.3",
+          "pattern": "event_driven",
+          "condition": "an administrator promotes, demotes, blocks or unblocks a user",
+          "system": "Parley service",
+          "action": "apply the role or status change, treating a repeat of the same change as a success",
+          "contract": "HTTP 200; promoting a user who is already an admin succeeds and changes nothing; after a block the user's keys are refused and after an unblock every key that is not revoked or expired is accepted again"
+        },
+        {
+          "id": "02-REQ-9.4",
+          "pattern": "unwanted",
+          "condition": "deleting or demoting a user would leave the deployment with no active admin",
+          "system": "Parley service",
+          "action": "refuse the request and leave the user's role and status unchanged",
+          "contract": "HTTP 409 in the error envelope; the user is still an active admin afterwards"
+        },
+        {
+          "id": "02-REQ-9.5",
+          "pattern": "event_driven",
+          "condition": "an administrator lists or revokes another user's API keys or personal access tokens",
+          "system": "Parley service",
+          "action": "answer with that user's credentials as metadata, or revoke the named one",
+          "contract": "HTTP 200 with entries carrying user_id and no secret; HTTP 204 on revoke, after which that credential is refused 401"
+        },
+        {
+          "id": "02-REQ-9.6",
+          "pattern": "event_driven",
+          "condition": "an administrator creates, lists, updates, deletes, blocks or unblocks an organization",
+          "system": "Parley service",
+          "action": "apply the change and answer with the organization or the list",
+          "contract": "HTTP 201 on create, 200 on list and update, 204 on delete; a duplicate name or slug is 409 and an invalid slug is 400"
+        },
+        {
+          "id": "02-REQ-9.7",
+          "pattern": "event_driven",
+          "condition": "an administrator lists, adds or removes an organization's members",
+          "system": "Parley service",
+          "action": "answer with the membership list, or apply the addition or removal",
+          "contract": "HTTP 200 with memberships of {org_id, user_id, username, email, role, created_at} on list and add, 204 on remove; a user added then removed no longer appears in the list"
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "02-PATH-1",
+      "title": "A developer signs in and receives an API key that supersedes their old ones",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "runs afc login, which requests the provider list from Parley"
+        },
+        {
+          "actor": "Parley service",
+          "action": "answers with the configured providers and their authorize URLs"
+        },
+        {
+          "actor": "OAuth provider",
+          "action": "authenticates the developer and returns an authorization code to afc"
+        },
+        {
+          "actor": "API client",
+          "action": "posts the code to POST /api/v1/auth/callback"
+        },
+        {
+          "actor": "Parley service",
+          "action": "creates the user and a personal organization, revokes every existing API key of the user, issues a new one and returns both"
+        },
+        {
+          "actor": "developer",
+          "action": "sees the new key stored, and finds a previously issued key now refused 401"
+        }
+      ]
+    },
+    {
+      "id": "02-PATH-2",
+      "title": "A scoped token is minted and refused on a route outside its scopes",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "creates a personal access token granting workspaces:read alone"
+        },
+        {
+          "actor": "Parley service",
+          "action": "stores the token's hash and returns the token string once"
+        },
+        {
+          "actor": "API client",
+          "action": "calls a route needing tokens:manage with that token"
+        },
+        {
+          "actor": "Parley service",
+          "action": "refuses with 403 after identifying the credential and finding the scope absent"
+        },
+        {
+          "actor": "API client",
+          "action": "calls a route needing workspaces:read with the same token and is admitted"
+        }
+      ]
+    },
+    {
+      "id": "02-PATH-3",
+      "title": "An administrator blocks a user and their unrevoked key stops working",
+      "steps": [
+        {
+          "actor": "administrator",
+          "action": "calls the block route for a user who holds a live API key"
+        },
+        {
+          "actor": "Parley service",
+          "action": "marks the user blocked without revoking any credential"
+        },
+        {
+          "actor": "API client",
+          "action": "makes its next request with that key and is refused 401"
+        },
+        {
+          "actor": "administrator",
+          "action": "calls the unblock route"
+        },
+        {
+          "actor": "API client",
+          "action": "makes the same request again with the same key and is admitted"
+        }
+      ]
+    }
+  ]
+}

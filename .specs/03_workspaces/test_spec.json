@@ -1,0 +1,926 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/test_spec.v2.json",
+  "spec_id": "03",
+  "spec_name": "workspaces",
+  "schema_version": 2,
+  "tests": [
+    {
+      "id": "TS-03-1",
+      "kind": "integration",
+      "verifies": [
+        "03-REQ-1.1",
+        "03-REQ-1.8"
+      ],
+      "title": "A valid create writes a pending workspace with every setting at its effective value",
+      "given": [
+        "a signed-in user with a personal organization",
+        "a body naming a slug, a git URL and two settings"
+      ],
+      "when": "POST /api/v1/workspaces is called and the workspace is then read back",
+      "then": [
+        "the create answers 201 with status pending and access owner",
+        "display_name defaults to the slug and description to the empty string",
+        "the settings object carries all twelve keys, the two named at their given values and the rest at their defaults",
+        "the read returns the same record"
+      ],
+      "pseudocode": "in the workspace routes' integration test file: r = post('/api/v1/workspaces', body); assert r.status == 201 and r.json.status == 'pending' and r.json.access == 'owner' and len(r.json.settings) == 12"
+    },
+    {
+      "id": "TS-03-2",
+      "kind": "unit",
+      "verifies": [
+        "03-REQ-1.2"
+      ],
+      "title": "The slug rules accept exactly the documented shapes",
+      "given": [
+        "a valid create body"
+      ],
+      "when": "the slug is set to a 3-character minimum, a 64-character maximum, one of 2 and one of 65 characters, one starting with a digit or a hyphen, one ending with a hyphen, one with an uppercase letter, one with an underscore, one with two consecutive hyphens, and one already in use",
+      "then": [
+        "the minimum, the maximum and an ordinary slug are accepted",
+        "every rule-breaking slug answers 400 and writes nothing",
+        "the slug already in use answers 409"
+      ],
+      "pseudocode": "in the workspace validation test file, table over the slug cases asserting the status and that no row was written for a refusal"
+    },
+    {
+      "id": "TS-03-3",
+      "kind": "unit",
+      "verifies": [
+        "03-REQ-1.3"
+      ],
+      "title": "A malformed create body is refused and writes nothing",
+      "given": [
+        "a valid create body to vary"
+      ],
+      "when": "slug or git_url is missing or malformed, display_name is 129 characters, description is 1025 characters, and workspace_mode, upstream_url and integration_branch are combined invalidly",
+      "then": [
+        "each answers 400 naming the offending field",
+        "no workspace row and no secret is written for any of them",
+        "a carry_patch body with an upstream_url is accepted"
+      ],
+      "pseudocode": "in the workspace validation test file, table over the malformed bodies asserting 400 and an unchanged store"
+    },
+    {
+      "id": "TS-03-4",
+      "kind": "unit",
+      "verifies": [
+        "03-REQ-1.4"
+      ],
+      "title": "Invalid credential flag combinations are refused",
+      "given": [
+        "a valid create body to vary"
+      ],
+      "when": "git_pat is given with git_username, git_username is given without git_password, a credential value is empty, and a credential is given with an ssh git_url",
+      "then": [
+        "each answers 400",
+        "no workspace row and no secret is written",
+        "git_pat alone with an https URL, and the full basic pair with an https URL, are both accepted"
+      ],
+      "pseudocode": "in the workspace validation test file, table over the credential combinations"
+    },
+    {
+      "id": "TS-03-5",
+      "kind": "integration",
+      "verifies": [
+        "03-REQ-1.5"
+      ],
+      "title": "The owning organization is resolved, or the create is refused",
+      "given": [
+        "a user with a personal organization, a user with none, and an organization the first user does not belong to"
+      ],
+      "when": "creates are made with no org_id, with an org_id naming nothing, with the foreign organization, and by the user with no personal organization and no org_id",
+      "then": [
+        "the create with no org_id uses the caller's personal organization",
+        "an org_id naming nothing answers 400",
+        "the foreign organization answers 403",
+        "the user with no personal organization answers 400"
+      ],
+      "pseudocode": "in the workspace routes' integration test file, table over the four cases asserting the status and the resulting org_id"
+    },
+    {
+      "id": "TS-03-6",
+      "kind": "unit",
+      "verifies": [
+        "03-REQ-1.6"
+      ],
+      "title": "An admin token, an unscoped PAT and a duplicate slug are refused",
+      "given": [
+        "an admin token, a PAT without workspaces:write, a PAT with it, and an existing workspace"
+      ],
+      "when": "each credential creates a workspace, and the scoped PAT then repeats an existing slug",
+      "then": [
+        "the admin token answers 403",
+        "the PAT without the scope answers 403, not 404",
+        "the duplicate slug answers 409",
+        "the scoped PAT's fresh slug succeeds"
+      ],
+      "pseudocode": "in the workspace routes' test file, table over (credential, slug, expected)"
+    },
+    {
+      "id": "TS-03-7",
+      "kind": "integration",
+      "verifies": [
+        "03-REQ-1.7"
+      ],
+      "title": "Creation credentials are stored as encrypted workspace secrets",
+      "given": [
+        "a create body carrying a distinctive git_pat, and a second carrying a distinctive basic pair"
+      ],
+      "when": "each workspace is created and the secret store's raw contents are inspected",
+      "then": [
+        "GIT_PAT exists in the first workspace's scope and GIT_USERNAME and GIT_PASSWORD in the second's",
+        "the raw stored bytes contain neither distinctive value",
+        "no field of either create response carries the value"
+      ],
+      "pseudocode": "in the workspace secrets integration test file: post(body with git_pat='SENTINEL9f3a'); assert 'GIT_PAT' in secret_names(ws); assert b'SENTINEL9f3a' not in raw_store_dump()"
+    },
+    {
+      "id": "TS-03-8",
+      "kind": "integration",
+      "verifies": [
+        "03-REQ-2.1"
+      ],
+      "title": "The workspace list is scoped, ordered and filtered by include_archived",
+      "given": [
+        "an owner with three workspaces, two created in the same instant, one of them archived, and one workspace of an unrelated user"
+      ],
+      "when": "the list is requested with and without include_archived",
+      "then": [
+        "the unrelated user's workspace never appears",
+        "the order is created_at descending, then slug ascending for the tie",
+        "the archived workspace is absent by default and present with include_archived=true"
+      ],
+      "pseudocode": "in the workspace routes' integration test file: assert [w.slug for w in get('/api/v1/workspaces').json] == expectedOrder; assert archived in slugs(get('?include_archived=true'))"
+    },
+    {
+      "id": "TS-03-9",
+      "kind": "unit",
+      "verifies": [
+        "03-REQ-2.2"
+      ],
+      "title": "One workspace is read by slug",
+      "given": [
+        "a workspace owned by the caller"
+      ],
+      "when": "GET /api/v1/workspaces/:slug is requested",
+      "then": [
+        "the response is 200 with the workspace",
+        "its slug matches the one requested"
+      ],
+      "pseudocode": "in the workspace routes' test file: r = get(f'/api/v1/workspaces/{slug}'); assert r.status == 200 and r.json.slug == slug"
+    },
+    {
+      "id": "TS-03-10",
+      "kind": "unit",
+      "verifies": [
+        "03-REQ-2.3"
+      ],
+      "title": "Every workspace object carries the full schema, with hub_url null where the reference says so",
+      "given": [
+        "a service with an external URL configured and one without",
+        "a workspace with an organization and one without"
+      ],
+      "when": "each workspace is read under each configuration",
+      "then": [
+        "every response carries the documented keys and no others",
+        "display_name is never null or empty and description is never null",
+        "hub_url is the git server URL only when an external URL is configured and the workspace has an organization, and null otherwise"
+      ],
+      "pseudocode": "in the workspace serialisation test file, table over (externalUrl, hasOrg, expectedHubUrl)"
+    },
+    {
+      "id": "TS-03-11",
+      "kind": "integration",
+      "verifies": [
+        "03-REQ-2.4"
+      ],
+      "title": "The access field describes the caller and a member sees the owner's view",
+      "given": [
+        "a workspace, its owner, a member of its organization and an admin token"
+      ],
+      "when": "each reads the workspace and the workspace list",
+      "then": [
+        "the owner sees access owner, the member access member and the admin token access admin",
+        "the member's object is field-for-field equal to the owner's except for access",
+        "the admin token's list carries every workspace"
+      ],
+      "pseudocode": "in the workspace access integration test file: o = read(owner); m = read(member); assert m.json == {**o.json, 'access': 'member'}"
+    },
+    {
+      "id": "TS-03-12",
+      "kind": "integration",
+      "verifies": [
+        "03-REQ-3.1"
+      ],
+      "title": "An update changes only the fields it names, and null restores a default",
+      "given": [
+        "a workspace with a display name, a description and a non-default setting"
+      ],
+      "when": "display_name alone is changed, then description is set to null, then display_name is set to null",
+      "then": [
+        "each call answers 200",
+        "a field the body did not name is unchanged after every call",
+        "a null display_name returns it to the slug and a null description to the empty string"
+      ],
+      "pseudocode": "in the workspace routes' integration test file, a sequence asserting each field after each call"
+    },
+    {
+      "id": "TS-03-13",
+      "kind": "unit",
+      "verifies": [
+        "03-REQ-3.2"
+      ],
+      "title": "Setting the settings object to null returns every setting to its default",
+      "given": [
+        "a workspace with four settings away from their defaults"
+      ],
+      "when": "PATCH is called with settings set to null",
+      "then": [
+        "the response is 200",
+        "all twelve keys read their documented defaults"
+      ],
+      "pseudocode": "in the workspace settings test file: r = patch({'settings': None}); assert r.json.settings == DEFAULTS"
+    },
+    {
+      "id": "TS-03-14",
+      "kind": "unit",
+      "verifies": [
+        "03-REQ-3.3"
+      ],
+      "title": "An empty, archived or immutable-field update is refused",
+      "given": [
+        "an active workspace and an archived one"
+      ],
+      "when": "PATCH is called with an empty body, on the archived workspace, with a 129-character display_name, with each immutable field, with sync_mode, and with an org_id naming nothing",
+      "then": [
+        "each answers 400",
+        "the stored workspace is unchanged after every call",
+        "the immutable fields refused are slug, git_url, branch, owner_id, workspace_mode, upstream_url and integration_branch"
+      ],
+      "pseudocode": "in the workspace routes' test file, table over the refused bodies asserting 400 and an unchanged record"
+    },
+    {
+      "id": "TS-03-15",
+      "kind": "unit",
+      "verifies": [
+        "03-REQ-3.4"
+      ],
+      "title": "Moving a workspace to an organization its owner does not belong to is refused",
+      "given": [
+        "a workspace and an organization its owner is not a member of"
+      ],
+      "when": "PATCH sets org_id to that organization",
+      "then": [
+        "the response is 403",
+        "the workspace's org_id is unchanged"
+      ],
+      "pseudocode": "in the workspace routes' test file: r = patch({'org_id': foreign}); assert r.status == 403 and read().json.org_id == before"
+    },
+    {
+      "id": "TS-03-16",
+      "kind": "integration",
+      "verifies": [
+        "03-REQ-4.1"
+      ],
+      "title": "A ready workspace is archived and its bound tokens survive",
+      "given": [
+        "a ready workspace with a free lock and one live bound token"
+      ],
+      "when": "the archive route is called",
+      "then": [
+        "the response is 200 with status archived",
+        "the bound token is still live afterwards",
+        "a read of the workspace still returns it"
+      ],
+      "pseudocode": "in the workspace lifecycle integration test file: assert post(archive).json.status == 'archived'; assert call(boundToken).status != 401"
+    },
+    {
+      "id": "TS-03-17",
+      "kind": "unit",
+      "verifies": [
+        "03-REQ-4.2"
+      ],
+      "title": "Archiving is refused for an archived, cloning or busy workspace",
+      "given": [
+        "an archived workspace, a cloning workspace and a ready workspace whose lock is held"
+      ],
+      "when": "the archive route is called for each",
+      "then": [
+        "the archived workspace answers 400",
+        "the cloning workspace answers 409",
+        "the busy workspace answers 409 with error_type workspace_busy",
+        "no status changes"
+      ],
+      "pseudocode": "in the workspace lifecycle test file, table over the three cases asserting status, error_type and an unchanged record"
+    },
+    {
+      "id": "TS-03-18",
+      "kind": "integration",
+      "verifies": [
+        "03-REQ-4.3"
+      ],
+      "title": "An archived workspace is reactivated to pending",
+      "given": [
+        "an archived workspace"
+      ],
+      "when": "the reactivate route is called",
+      "then": [
+        "the response is 200 with status pending",
+        "a subsequent read reports pending"
+      ],
+      "pseudocode": "in the workspace lifecycle integration test file: assert post(reactivate).json.status == 'pending'"
+    },
+    {
+      "id": "TS-03-19",
+      "kind": "unit",
+      "verifies": [
+        "03-REQ-4.4"
+      ],
+      "title": "Reactivating a workspace that is not archived is refused",
+      "given": [
+        "a ready workspace, a pending workspace and a failed workspace"
+      ],
+      "when": "the reactivate route is called for each",
+      "then": [
+        "each answers 409",
+        "no status changes"
+      ],
+      "pseudocode": "in the workspace lifecycle test file, table over the three statuses asserting 409"
+    },
+    {
+      "id": "TS-03-20",
+      "kind": "integration",
+      "verifies": [
+        "03-REQ-4.5"
+      ],
+      "title": "Deleting an archived workspace revokes its bound tokens in the same transaction",
+      "given": [
+        "an archived workspace with two live bound tokens and one already-revoked bound token"
+      ],
+      "when": "the delete route is called, and once more against a store that fails mid-transaction",
+      "then": [
+        "the successful delete answers 204 and the workspace is gone from the list",
+        "both live tokens are refused 401 afterwards",
+        "when the store fails mid-transaction the workspace still exists and the tokens still work, so the two effects never diverge"
+      ],
+      "pseudocode": "in the workspace lifecycle integration test file: delete(ws); assert call(t1).status == 401 and call(t2).status == 401; then with a failing store assert the workspace and tokens are both intact"
+    },
+    {
+      "id": "TS-03-21",
+      "kind": "unit",
+      "verifies": [
+        "03-REQ-4.6"
+      ],
+      "title": "Deleting a workspace that is not archived is refused",
+      "given": [
+        "a ready workspace with a live bound token"
+      ],
+      "when": "the delete route is called",
+      "then": [
+        "the response is 409",
+        "the workspace still exists",
+        "the bound token still works"
+      ],
+      "pseudocode": "in the workspace lifecycle test file: assert delete(ws).status == 409 and read(ws).status == 200"
+    },
+    {
+      "id": "TS-03-22",
+      "kind": "unit",
+      "verifies": [
+        "03-REQ-5.1",
+        "03-REQ-5.4"
+      ],
+      "title": "The twelve settings exist with their defaults and accept exactly their documented values",
+      "given": [
+        "a freshly created workspace"
+      ],
+      "when": "its settings are read, and each setting is set in turn to every value the reference lists for it",
+      "then": [
+        "the settings object has exactly the twelve documented keys",
+        "each key's initial value is its documented default",
+        "every listed value is accepted for its key"
+      ],
+      "pseudocode": "in the workspace settings test file, driven from a table of (key, default, allowedValues) transcribed from the reference"
+    },
+    {
+      "id": "TS-03-23",
+      "kind": "unit",
+      "verifies": [
+        "03-REQ-5.2"
+      ],
+      "title": "A setting is set, reset to its default, or kept",
+      "given": [
+        "a workspace with rebuild_strategy set to merge and sync_enabled set to false"
+      ],
+      "when": "an update names rebuild_strategy with a value, gives sync_enabled as null, and names no other setting",
+      "then": [
+        "rebuild_strategy holds the new value",
+        "sync_enabled holds its default",
+        "every setting the body did not name is unchanged"
+      ],
+      "pseudocode": "in the workspace settings test file: r = patch({'settings': {'rebuild_strategy': 'rebase', 'sync_enabled': None}}); assert r.json.settings matches the three expectations"
+    },
+    {
+      "id": "TS-03-24",
+      "kind": "unit",
+      "verifies": [
+        "03-REQ-5.3"
+      ],
+      "title": "An unknown setting key or an unacceptable value is refused",
+      "given": [
+        "a workspace with known settings"
+      ],
+      "when": "an update names a key that does not exist, gives an enum setting a value outside its list, and gives a boolean setting a string",
+      "then": [
+        "each answers 400 naming the key",
+        "a bad enum value's message names the values the key accepts",
+        "no setting of the workspace changes, including ones named in the same body that were valid"
+      ],
+      "pseudocode": "in the workspace settings test file, table over the bad settings bodies asserting 400 and an unchanged settings object"
+    },
+    {
+      "id": "TS-03-25",
+      "kind": "unit",
+      "verifies": [
+        "03-REQ-6.1"
+      ],
+      "title": "One decision function yields the same level for a caller on every route",
+      "given": [
+        "a workspace, its owner, a member, a stranger and an admin token"
+      ],
+      "when": "the access level is computed for each caller through the routes of each access level",
+      "then": [
+        "the owner is owner, the member is member, the admin token is admin and the stranger has none",
+        "the level for one caller and workspace is the same whichever route asked"
+      ],
+      "pseudocode": "in the access decision's test file, table over (caller, routeLevel) asserting one decision function's output"
+    },
+    {
+      "id": "TS-03-26",
+      "kind": "integration",
+      "verifies": [
+        "03-REQ-6.2"
+      ],
+      "title": "Membership is read on every request, so a removal takes effect at once",
+      "given": [
+        "a workspace and a member of its organization holding a live credential"
+      ],
+      "when": "the member reads the workspace, is removed from the organization, and reads it again with the same credential",
+      "then": [
+        "the first read succeeds",
+        "the second is refused 404",
+        "no re-authentication, token refresh or restart happened in between"
+      ],
+      "pseudocode": "in the access integration test file: assert read(member).status == 200; remove_member(); assert read(member).status == 404"
+    },
+    {
+      "id": "TS-03-27",
+      "kind": "integration",
+      "verifies": [
+        "03-REQ-6.3"
+      ],
+      "title": "A member's read-level answer equals the owner's",
+      "given": [
+        "a workspace, its owner and a member of its organization"
+      ],
+      "when": "both call each read-level workspace route",
+      "then": [
+        "the statuses are identical",
+        "the bodies are identical except for the access field"
+      ],
+      "pseudocode": "in the access integration test file, table over the read-level routes comparing the two responses"
+    },
+    {
+      "id": "TS-03-28",
+      "kind": "unit",
+      "verifies": [
+        "03-REQ-6.4"
+      ],
+      "title": "A member's write is refused with the documented message",
+      "given": [
+        "a workspace and a member of its organization"
+      ],
+      "when": "the member calls each write-level workspace route",
+      "then": [
+        "each answers 403 with error_type forbidden",
+        "each message is \"org members have read-only access to this workspace\"",
+        "nothing is written"
+      ],
+      "pseudocode": "in the access test file, table over the write-level routes asserting the status, error_type and message"
+    },
+    {
+      "id": "TS-03-29",
+      "kind": "unit",
+      "verifies": [
+        "03-REQ-6.5"
+      ],
+      "title": "A private route is indistinguishable from a workspace that does not exist",
+      "given": [
+        "a workspace, a member of its organization, a stranger, and a slug naming nothing"
+      ],
+      "when": "the member and the stranger call a private-level route, and anyone calls any route for the unknown slug",
+      "then": [
+        "every call answers 404 with the message \"workspace not found\"",
+        "the three responses are byte-for-byte identical"
+      ],
+      "pseudocode": "in the access test file: assert resp(member) == resp(stranger) == resp(unknownSlug) and status == 404"
+    },
+    {
+      "id": "TS-03-30",
+      "kind": "unit",
+      "verifies": [
+        "03-REQ-6.6"
+      ],
+      "title": "The checks run in the documented order",
+      "given": [
+        "an archived workspace, a member of its organization, and a PAT without the route's scope held by that member"
+      ],
+      "when": "the member writes to the archived workspace with a scoped credential, and then with the unscoped PAT",
+      "then": [
+        "the scoped member's write answers 403 forbidden, not the 400 the archived status would give",
+        "the unscoped PAT gets the scope answer whatever its membership",
+        "a request with no credential gets 401 before either"
+      ],
+      "pseudocode": "in the access test file, table over (credential, membership, workspaceStatus, expectedStatus, expectedErrorType)"
+    },
+    {
+      "id": "TS-03-31",
+      "kind": "unit",
+      "verifies": [
+        "03-REQ-6.7"
+      ],
+      "title": "A failed access lookup refuses rather than grants",
+      "given": [
+        "a store whose membership lookup raises",
+        "a recording route handler"
+      ],
+      "when": "the owner, a member and a stranger each call a read-level and a write-level route",
+      "then": [
+        "every call answers 500",
+        "the route handler is not invoked for any of them",
+        "no call is granted any access level"
+      ],
+      "pseudocode": "in the access test file: with store.membership raising, assert every call's status == 500 and handler.calls == 0"
+    },
+    {
+      "id": "TS-03-32",
+      "kind": "unit",
+      "verifies": [
+        "03-REQ-7.1",
+        "03-REQ-7.2"
+      ],
+      "title": "The six CRUD routes hide a missing scope behind 404, and every other route shows 403",
+      "given": [
+        "a workspace and a PAT holding no workspace scope"
+      ],
+      "when": "the PAT calls the workspace list, read, update and delete, the archive and reactivate routes, POST /api/v1/workspaces, and a representative non-CRUD workspace route",
+      "then": [
+        "the six CRUD routes answer 404 with the message \"workspace not found\"",
+        "that answer is identical to the one for a slug naming nothing",
+        "POST /api/v1/workspaces and the non-CRUD route answer 403 with no error_type"
+      ],
+      "pseudocode": "in the access test file, table over (route, expectedStatus) with the six anti-enumeration routes separated from the rest"
+    },
+    {
+      "id": "TS-03-33",
+      "kind": "integration",
+      "verifies": [
+        "03-REQ-8.1"
+      ],
+      "title": "An owner mints a bound token that reaches its workspace",
+      "given": [
+        "a workspace and its owner"
+      ],
+      "when": "the bound-token route is called with a name, two scopes and an expiry, and the returned token is then used on its own workspace",
+      "then": [
+        "the response is 201 with Cache-Control no-store, carrying the token, the workspace and the documented fields",
+        "the token is accepted on its own workspace under its scopes",
+        "no later route returns the token string"
+      ],
+      "pseudocode": "in the bound token integration test file: r = post(f'/api/v1/workspaces/{slug}/tokens', body); assert r.headers['Cache-Control'] == 'no-store' and r.json.workspace == slug; assert read(slug, r.json.token).status == 200"
+    },
+    {
+      "id": "TS-03-34",
+      "kind": "unit",
+      "verifies": [
+        "03-REQ-8.2"
+      ],
+      "title": "Only the owner may mint a bound token",
+      "given": [
+        "a workspace, its owner, a member, a stranger, an admin token, an existing bound token, and an archived workspace"
+      ],
+      "when": "each calls the bound-token mint route",
+      "then": [
+        "the bound caller answers 403 with error_type token_bound",
+        "the admin token answers 403",
+        "the member and the stranger answer 404",
+        "the archived workspace answers 400",
+        "no token is created and no binding is written in any refused case"
+      ],
+      "pseudocode": "in the bound token test file, table over (caller, workspaceStatus, expectedStatus, expectedErrorType)"
+    },
+    {
+      "id": "TS-03-35",
+      "kind": "integration",
+      "verifies": [
+        "03-REQ-8.3"
+      ],
+      "title": "A workspace's bound tokens are listed, dead ones included and secrets never",
+      "given": [
+        "an archived workspace with one live, one revoked and one expired bound token, plus a binding whose token has been deleted"
+      ],
+      "when": "the owner and an admin token each list the workspace's tokens",
+      "then": [
+        "the response is 200 with the live, revoked and expired tokens, ordered by created_at then token_id",
+        "the binding whose token is gone is left out",
+        "no entry carries a token string or a hash",
+        "the route works although the workspace is archived"
+      ],
+      "pseudocode": "in the bound token integration test file: r = get(f'/api/v1/workspaces/{slug}/tokens'); assert ids(r.json) == expectedOrder and all('token' not in e for e in r.json)"
+    },
+    {
+      "id": "TS-03-36",
+      "kind": "unit",
+      "verifies": [
+        "03-REQ-8.4"
+      ],
+      "title": "A bound token on another workspace's route is refused before any other check",
+      "given": [
+        "a token bound to workspace S, another workspace T, an archived workspace, and a slug naming nothing"
+      ],
+      "when": "the token calls routes naming T, the archived workspace and the unknown slug, including routes whose scope it does not hold",
+      "then": [
+        "every call answers 404 with the message \"workspace not found\"",
+        "the three answers are identical, so the existence and status of the named workspace are not disclosed",
+        "the answer is 404 even where a missing scope would otherwise give 403"
+      ],
+      "pseudocode": "in the bound token test file, table over the target workspaces and routes asserting an identical 404"
+    },
+    {
+      "id": "TS-03-37",
+      "kind": "unit",
+      "verifies": [
+        "03-REQ-8.5"
+      ],
+      "title": "A bound token is refused with the right message on each kind of route it may not use",
+      "given": [
+        "a token bound to workspace S"
+      ],
+      "when": "it calls POST /api/v1/workspaces, a user-scoped secrets route, GET /api/v1/sandboxes, an unmatched path under the mount point, and an identity route",
+      "then": [
+        "each answers 403 with error_type token_bound",
+        "the hub routes' message is \"this token is bound to workspace S\"",
+        "the identity route's message is \"this token is bound to a workspace\" and does not name it"
+      ],
+      "pseudocode": "in the bound token test file, table over (route, expectedMessage)"
+    },
+    {
+      "id": "TS-03-38",
+      "kind": "integration",
+      "verifies": [
+        "03-REQ-8.6"
+      ],
+      "title": "The sweep retires bindings whose workspace or token is gone and keeps the rest",
+      "given": [
+        "a binding whose workspace was removed outside the delete route, a binding whose token was deleted, and a binding of a revoked token whose workspace still exists"
+      ],
+      "when": "the sweep runs",
+      "then": [
+        "the token of the removed workspace is revoked and its binding gone",
+        "the binding whose token is gone is removed",
+        "the revoked token's binding of the existing workspace is kept and still appears in that workspace's token list"
+      ],
+      "pseudocode": "in the bound token integration test file: run_sweep(); assert call(orphanToken).status == 401 and binding(orphanToken) is None and binding(revokedButLive) is not None"
+    },
+    {
+      "id": "TS-03-39",
+      "kind": "unit",
+      "verifies": [
+        "03-REQ-8.7"
+      ],
+      "title": "An unreadable binding refuses the request rather than treating the token as unbound",
+      "given": [
+        "a store whose binding lookup raises, and a PAT that is in fact bound"
+      ],
+      "when": "that token calls its own workspace's route, another workspace's route and a route no bound token may use",
+      "then": [
+        "every call answers 500",
+        "no call is served as though the token were unbound",
+        "the route handler is not invoked"
+      ],
+      "pseudocode": "in the bound token test file: with store.binding raising, assert every call's status == 500 and handler.calls == 0"
+    },
+    {
+      "id": "TS-03-40",
+      "kind": "integration",
+      "verifies": [
+        "03-REQ-9.1"
+      ],
+      "title": "Two lock-taking operations on one workspace are serialised",
+      "given": [
+        "a workspace and two lock-taking operations that record their start and end instants",
+        "a second workspace"
+      ],
+      "when": "both operations are started concurrently on the first workspace, and then one on each workspace",
+      "then": [
+        "on one workspace the two intervals do not overlap",
+        "on two different workspaces the intervals may overlap",
+        "both operations complete"
+      ],
+      "pseudocode": "in the workspace lock integration test file: run concurrently and assert not overlapping(a, b) for one workspace, and allow overlap across workspaces"
+    },
+    {
+      "id": "TS-03-41",
+      "kind": "unit",
+      "verifies": [
+        "03-REQ-9.2"
+      ],
+      "title": "A busy workspace refuses at once rather than waiting",
+      "given": [
+        "a workspace whose lock is held by a long-running operation",
+        "a fixed clock to measure the wait"
+      ],
+      "when": "a second lock-taking request is made, and then repeated after the lock is released",
+      "then": [
+        "the second answers 409 with error_type workspace_busy",
+        "it answers without waiting for the lock to free",
+        "the repeat after release succeeds"
+      ],
+      "pseudocode": "in the workspace lock test file: hold(lock); t0 = now(); r = request(); assert r.status == 409 and r.json.error.error_type == 'workspace_busy' and now() - t0 < holdDuration; release(); assert request().status == 200"
+    },
+    {
+      "id": "TS-03-42",
+      "kind": "integration",
+      "verifies": [
+        "03-REQ-9.3"
+      ],
+      "title": "A lock whose holder stops is released",
+      "given": [
+        "a workspace whose lock is taken by a component that is then stopped without releasing it"
+      ],
+      "when": "a lock-taking request is made afterwards",
+      "then": [
+        "the request eventually succeeds rather than answering 409 indefinitely",
+        "the workspace is usable again without operator intervention"
+      ],
+      "pseudocode": "in the workspace lock integration test file: take(lock); kill(holder); assert eventually(lambda: request().status == 200)"
+    },
+    {
+      "id": "TS-03-43",
+      "kind": "integration",
+      "verifies": [
+        "03-REQ-9.4"
+      ],
+      "title": "The lock serialises across instances, not only within one",
+      "given": [
+        "two instances of the service sharing one platform, and one workspace"
+      ],
+      "when": "a lock-taking operation is started on the first instance and a second is requested on the other",
+      "then": [
+        "the second answers 409 with error_type workspace_busy while the first holds the lock",
+        "it succeeds once the first releases",
+        "the same holds with the two instances swapped"
+      ],
+      "pseudocode": "in the workspace lock integration test file, with two service instances over one store: assert instanceB.request().status == 409 while instanceA holds"
+    },
+    {
+      "id": "TS-03-44",
+      "kind": "unit",
+      "verifies": [
+        "03-REQ-10.1",
+        "03-REQ-10.3"
+      ],
+      "title": "Every sandbox route answers sandboxes_disabled before any other check",
+      "given": [
+        "an authenticated caller with no sandbox scope, a workspace, an archived workspace and a slug naming nothing"
+      ],
+      "when": "each sandbox path the reference lists is requested, against each of those workspaces",
+      "then": [
+        "every call answers 404 with error_type sandboxes_disabled and the message \"sandboxes are not enabled on this hub\"",
+        "the answer is the same for the missing scope, the archived workspace and the unknown slug",
+        "no sandbox path falls through to the router's unmatched-path 404, which carries no error_type"
+      ],
+      "pseudocode": "in the sandbox routes' test file, table over (path, workspace) asserting status, error_type and message"
+    },
+    {
+      "id": "TS-03-45",
+      "kind": "unit",
+      "verifies": [
+        "03-REQ-10.2"
+      ],
+      "title": "An unauthenticated sandbox request is refused for the credential, not the provider",
+      "given": [
+        "a service with no sandbox provider"
+      ],
+      "when": "each sandbox path is requested with no Authorization header",
+      "then": [
+        "each answers 401 with the message \"authentication required\"",
+        "no response carries error_type sandboxes_disabled"
+      ],
+      "pseudocode": "in the sandbox routes' test file, table over the paths asserting 401 and the absence of the sandboxes_disabled type"
+    },
+    {
+      "id": "TS-03-46",
+      "kind": "smoke",
+      "verifies": [
+        "03-PATH-1"
+      ],
+      "title": "An owner registers a workspace and reads it back against a running deployment",
+      "given": [
+        "a running deployment and a signed-in user with a personal organization"
+      ],
+      "when": "a workspace is created with a git URL and a git_pat, then read by slug and found in the list",
+      "then": [
+        "the create answers 201 with status pending and access owner",
+        "the read returns the same record with every setting at its effective value",
+        "the list contains it",
+        "the stored credential is not present in any response"
+      ],
+      "pseudocode": "in the workspace smoke test file, against a running deployment: r = post('/api/v1/workspaces', body); assert get(f'/api/v1/workspaces/{slug}').json.slug == slug and slug in slugs(get('/api/v1/workspaces'))",
+      "real_components": [
+        "running deployment",
+        "workspace routes",
+        "access decision",
+        "secret store",
+        "relational store"
+      ]
+    },
+    {
+      "id": "TS-03-47",
+      "kind": "smoke",
+      "verifies": [
+        "03-PATH-2"
+      ],
+      "title": "A member reads the workspace and is refused a write and a private route",
+      "given": [
+        "a running deployment, a workspace, and a second user who is a member of its organization"
+      ],
+      "when": "the member reads the workspace, attempts an update, and lists the workspace's bound tokens",
+      "then": [
+        "the read succeeds with access member and the owner's field values",
+        "the update answers 403 with error_type forbidden",
+        "the bound token list answers 404 workspace not found"
+      ],
+      "pseudocode": "in the workspace smoke test file: assert read(member).json.access == 'member'; assert patch(member).json.error.error_type == 'forbidden'; assert tokens(member).status == 404",
+      "real_components": [
+        "running deployment",
+        "workspace routes",
+        "access decision",
+        "organization membership lookup",
+        "relational store"
+      ]
+    },
+    {
+      "id": "TS-03-48",
+      "kind": "smoke",
+      "verifies": [
+        "03-PATH-3"
+      ],
+      "title": "A bound token reaches its own workspace and nothing else, against a running deployment",
+      "given": [
+        "a running deployment, two workspaces owned by the same user"
+      ],
+      "when": "a token bound to the first is minted and then used on the first workspace, on the second, and on POST /api/v1/workspaces",
+      "then": [
+        "the first workspace is served",
+        "the second answers 404 workspace not found",
+        "the create answers 403 with error_type token_bound and a message naming the bound workspace"
+      ],
+      "pseudocode": "in the workspace smoke test file: t = mint_bound(ws1); assert read(ws1, t).status == 200 and read(ws2, t).status == 404 and create(t).json.error.error_type == 'token_bound'",
+      "real_components": [
+        "running deployment",
+        "bound token routes",
+        "authentication middleware",
+        "access decision",
+        "relational store"
+      ]
+    },
+    {
+      "id": "TS-03-49",
+      "kind": "smoke",
+      "verifies": [
+        "03-PATH-4"
+      ],
+      "title": "A workspace is archived then deleted, and its bound token dies with it",
+      "given": [
+        "a running deployment, a ready workspace with a live bound token"
+      ],
+      "when": "the workspace is archived, an update is attempted, the workspace is deleted, and the bound token is used",
+      "then": [
+        "the archive answers 200 with status archived",
+        "the update answers 400",
+        "the delete answers 204 and the workspace is gone from the list",
+        "the bound token is refused 401"
+      ],
+      "pseudocode": "in the workspace smoke test file: post(archive); assert patch().status == 400; assert delete().status == 204; assert call(boundToken).status == 401",
+      "real_components": [
+        "running deployment",
+        "workspace routes",
+        "bound token store",
+        "workspace lock",
+        "relational store"
+      ]
+    }
+  ]
+}
