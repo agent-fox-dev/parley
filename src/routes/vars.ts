@@ -12,7 +12,8 @@ import {
   replaceEntry,
 } from '../entries/store.js';
 import { checkedEntries, checkedValue } from '../entries/validate.js';
-import type { AccessNeed } from '../workspace/access.js';
+import { type AccessNeed, workspaceAccess } from '../workspace/access.js';
+import { resolveVariables } from '../vars/resolve.js';
 
 export interface VarRouteConfig {
   mountPoint: string;
@@ -75,30 +76,46 @@ async function removeVar(c: Context, config: VarRouteConfig, family: ScopeFamily
   return emptyResponse(204);
 }
 
+/**
+ * The three tiers merged, at read access, so a member of the workspace's
+ * organization is answered what its owner is answered.
+ */
+async function resolvedVars(c: Context, config: VarRouteConfig) {
+  const { workspace } = await workspaceAccess(c, config.store, READING);
+  return jsonResponse(await resolveVariables(config.store, workspace));
+}
+
 export function varRoutes(config: VarRouteConfig): RouteDefinition[] {
-  return FAMILIES.flatMap(({ family, path }) => [
+  return [
     {
-      path: `${config.mountPoint}${path}`,
+      path: `${config.mountPoint}/workspaces/:slug/vars/resolved`,
       scope: 'vars:read',
-      handler: async (c: Context) => listVars(c, config, family),
+      handler: async (c: Context) => resolvedVars(c, config),
     },
-    {
-      path: `${config.mountPoint}${path}`,
-      methods: ['POST'],
-      scope: 'vars:write',
-      handler: async (c: Context) => createVars(c, config, family),
-    },
-    {
-      path: `${config.mountPoint}${path}/:key`,
-      methods: ['PATCH'],
-      scope: 'vars:write',
-      handler: async (c: Context) => replaceVar(c, config, family),
-    },
-    {
-      path: `${config.mountPoint}${path}/:key`,
-      methods: ['DELETE'],
-      scope: 'vars:write',
-      handler: async (c: Context) => removeVar(c, config, family),
-    },
-  ]);
+    ...FAMILIES.flatMap(({ family, path }) => [
+      {
+        path: `${config.mountPoint}${path}`,
+        scope: 'vars:read',
+        handler: async (c: Context) => listVars(c, config, family),
+      },
+      {
+        path: `${config.mountPoint}${path}`,
+        methods: ['POST'],
+        scope: 'vars:write',
+        handler: async (c: Context) => createVars(c, config, family),
+      },
+      {
+        path: `${config.mountPoint}${path}/:key`,
+        methods: ['PATCH'],
+        scope: 'vars:write',
+        handler: async (c: Context) => replaceVar(c, config, family),
+      },
+      {
+        path: `${config.mountPoint}${path}/:key`,
+        methods: ['DELETE'],
+        scope: 'vars:write',
+        handler: async (c: Context) => removeVar(c, config, family),
+      },
+    ]),
+  ];
 }

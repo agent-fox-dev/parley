@@ -4,7 +4,7 @@ spec_name: "secrets_and_variables"
 title: "Store secrets and variables for users, organizations and workspaces"
 status: "active"
 created_at: "2026-10-27T18:22:14Z"
-updated_at: "2026-10-27T22:15:12Z"
+updated_at: "2026-10-27T22:16:41Z"
 intent_hash: "474a2086118dae652aad7c56b20b1e1db22eb057d346237a642424e7ef98008c"
 schema_version: 2
 source: "docs/prd/01-port-af-hub-to-typescript-on-cloudflare.md"
