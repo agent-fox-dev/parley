@@ -48,3 +48,17 @@ that it can be provided by Cloudflare or by something else without the
 service changing. The application object takes its configuration and its
 route table as arguments rather than reading globals, which is what lets one
 test suite exercise both wirings.
+
+Four facilities are defined so far — the relational store, the clock, the
+configuration source and the metrics sink — each with one contract suite run
+against every implementation a deployment can be wired with. Which
+implementations those are, and why two of the four have one shared
+implementation rather than two, is
+[ADR 1](adr/01-define-the-platform-interfaces-and-their-implementations.md).
+
+| Interface            | On Cloudflare                                 | Off Cloudflare            |
+| -------------------- | --------------------------------------------- | ------------------------- |
+| relational store     | D1                                            | SQLite on the host's disk |
+| configuration source | the Worker's bindings                         | the process environment   |
+| clock                | the host's own clock, shared by both targets  |                           |
+| metrics sink         | an in-memory registry, shared by both targets |                           |
