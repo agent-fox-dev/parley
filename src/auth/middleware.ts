@@ -69,18 +69,23 @@ export function identityOf(c: Context): Identity | undefined {
 }
 
 /**
- * Refuses a personal access token that does not hold the scope. The kinds
- * that hold every scope are admitted without a list to consult.
+ * The answer for a personal access token that does not hold the scope, or
+ * undefined when the caller may proceed. The kinds that hold every scope
+ * are admitted without a list to consult.
+ *
+ * `hidden` is the anti-enumeration answer: the refusal is dressed as a
+ * workspace that does not exist, so the route discloses nothing.
  */
-export function requireScope(scope: string): MiddlewareHandler {
-  return async (c, next) => {
-    const identity = identityOf(c);
-    if (identity?.kind === 'pat' && !grantsScope(identity.permissions, scope)) {
-      return errorResponse(new HttpError(403, `this token does not hold ${scope}`));
-    }
-    await next();
+export function scopeRefusal(c: Context, scope: string, hidden = false): Response | undefined {
+  const identity = identityOf(c);
+  if (identity?.kind !== 'pat' || grantsScope(identity.permissions, scope)) {
     return undefined;
-  };
+  }
+  return errorResponse(
+    hidden
+      ? new HttpError(404, 'workspace not found')
+      : new HttpError(403, `this token does not hold ${scope}`),
+  );
 }
 
 async function identify(

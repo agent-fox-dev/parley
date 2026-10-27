@@ -20,6 +20,7 @@ implemented; routes appear here as they are built.
 - [Personal access tokens](#personal-access-tokens)
 - [Organizations](#organizations)
 - [Administration](#administration)
+- [Workspace access](#workspace-access)
 - [Server Endpoints](#server-endpoints)
 
 ## Conventions
@@ -423,6 +424,43 @@ A membership is `{org_id, user_id, username, email, role, created_at}`.
 
 `GET /api/v1/orgs/:id` is **not** an administration route: it is the
 member-facing read described under [Organizations](#organizations).
+
+## Workspace access
+
+Every route that names a workspace decides the caller's access the same
+way, in one place. An admin token has `admin`; the user behind an API key
+or a token is `owner` of a workspace they own and `member` of one belonging
+to an organization they are in; everybody else has none.
+
+**Membership is read on every request.** A user removed from the
+organization loses access with their next request, with no re-authentication
+and nothing to expire.
+
+Each route needs one of three levels:
+
+| Need    | Admitted                   | A member gets                                                                                            | Anybody else gets         |
+| ------- | -------------------------- | -------------------------------------------------------------------------------------------------------- | ------------------------- |
+| read    | owner, member, admin token | the owner's answer, differing only in `access`                                                           | `404 workspace not found` |
+| write   | owner, admin token         | `403` with `error_type: forbidden` and the message `org members have read-only access to this workspace` | `404 workspace not found` |
+| private | owner, admin token         | `404 workspace not found`                                                                                | `404 workspace not found` |
+
+The `404` is the same answer a slug naming nothing gets, byte for byte, so
+no refusal says whether a workspace exists.
+
+**The checks run in this order:** the credential, then a token's scope, then
+access, then the route's own status and precondition checks. A member
+writing to an archived workspace is therefore `403`, not the `400` the
+archived status would give. An access lookup that fails is `500`, never a
+grant, and the route's handler does not run.
+
+### Anti-enumeration
+
+Six routes — `GET /api/v1/workspaces`, `GET`, `PATCH` and `DELETE
+/api/v1/workspaces/:slug`, and `POST .../archive` and `.../reactivate` —
+answer a token that lacks the scope with `404 workspace not found` instead
+of `403`, identical to the answer for a workspace that does not exist.
+Every other route, `POST /api/v1/workspaces` included, answers a missing
+scope with the ordinary `403`.
 
 ## Server Endpoints
 

@@ -9,6 +9,7 @@ import type { Clock, RelationalStore } from '../platform/index.js';
 import { findOrg, findUser, isMember, orgsOfUser } from '../store/identity.js';
 import type { OrgRecord } from '../store/identity.js';
 import { type WorkspaceRecord, findWorkspace, insertWorkspace } from '../store/workspaces.js';
+import { hidesMissingScope, workspaceAccess } from '../workspace/access.js';
 import { serialiseWorkspace } from '../workspace/serialise.js';
 import { checkedSettings } from '../workspace/settings.js';
 import { checkedCreate } from '../workspace/validate.js';
@@ -119,22 +120,14 @@ async function createWorkspace(c: Context, config: WorkspaceRouteConfig): Promis
   );
 }
 
-/**
- * One workspace, for the caller who owns it. Widening this to the access
- * decision's three levels is what the access task does; until then a
- * caller who is not the owner is answered as though it did not exist.
- */
+/** One workspace, for any caller the access decision admits to read it. */
 async function readWorkspace(c: Context, config: WorkspaceRouteConfig): Promise<Response> {
-  const workspace = await findWorkspace(config.store, c.req.param('slug') ?? '');
-  const identity = identityOf(c);
-  if (workspace === undefined || workspace.owner_id !== identity?.userId) {
-    throw new HttpError(404, 'workspace not found');
-  }
+  const { workspace, level } = await workspaceAccess(c, config.store, 'read');
   const org = workspace.org_id === null ? undefined : await findOrg(config.store, workspace.org_id);
 
   return jsonResponse(
     serialiseWorkspace(workspace, {
-      access: 'owner',
+      access: level,
       orgSlug: org?.slug ?? null,
       externalUrl: config.externalUrl,
     }),
@@ -152,6 +145,7 @@ export function workspaceRoutes(config: WorkspaceRouteConfig): RouteDefinition[]
     {
       path: `${config.mountPoint}/workspaces/:slug`,
       scope: 'workspaces:read',
+      hideScopeFailure: hidesMissingScope('GET', '/workspaces/:slug'),
       handler: async (c) => readWorkspace(c, config),
     },
   ];
