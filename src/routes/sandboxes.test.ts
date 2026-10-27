@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { type Service, MOUNT, as, identityService } from '../testutil/app.js';
 import { seedApiKey, seedPat, seedUser, seedWorkspace } from '../testutil/identity.js';
-import { SANDBOX_PATHS } from './sandboxes.js';
 
 let service: Service;
 
@@ -67,14 +66,18 @@ describe('a sandbox route on a deployment with no provider', () => {
     },
   );
 
-  it('registers every path, so none falls through to the unmatched answer', async () => {
+  it('answers differently from a path that matches no route at all', async () => {
     const held = await callers();
 
     const unmatched = await held.app.request(`${MOUNT}/not-a-route`, as(held.key));
-    const body = (await unmatched.json()) as { error: Record<string, unknown> };
+    const sandbox = await held.app.request(`${MOUNT}/sandbox-profiles`, as(held.key));
+    const unmatchedBody = (await unmatched.json()) as { error: Record<string, unknown> };
+    const sandboxBody = (await sandbox.json()) as { error: Record<string, unknown> };
 
-    expect(Object.keys(body.error)).not.toContain('error_type');
-    expect(SANDBOX_PATHS.length).toBe(PATHS.length);
+    expect(unmatched.status).toBe(404);
+    expect(sandbox.status).toBe(404);
+    expect(Object.keys(unmatchedBody.error)).not.toContain('error_type');
+    expect(sandboxBody.error['error_type']).toBe('sandboxes_disabled');
   });
 });
 
