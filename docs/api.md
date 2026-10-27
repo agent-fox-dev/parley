@@ -20,6 +20,10 @@ implemented; routes appear here as they are built.
 - [Personal access tokens](#personal-access-tokens)
 - [Organizations](#organizations)
 - [Administration](#administration)
+- [Workspace access](#workspace-access)
+- [Workspaces](#workspaces)
+- [Workspace-bound tokens](#workspace-bound-tokens)
+- [Sandboxes](#sandboxes)
 - [Server Endpoints](#server-endpoints)
 
 ## Conventions
@@ -423,6 +427,302 @@ A membership is `{org_id, user_id, username, email, role, created_at}`.
 
 `GET /api/v1/orgs/:id` is **not** an administration route: it is the
 member-facing read described under [Organizations](#organizations).
+
+## Workspace access
+
+Every route that names a workspace decides the caller's access the same
+way, in one place. An admin token has `admin`; the user behind an API key
+or a token is `owner` of a workspace they own and `member` of one belonging
+to an organization they are in; everybody else has none.
+
+**Membership is read on every request.** A user removed from the
+organization loses access with their next request, with no re-authentication
+and nothing to expire.
+
+Each route needs one of three levels:
+
+| Need    | Admitted                   | A member gets                                                                                            | Anybody else gets         |
+| ------- | -------------------------- | -------------------------------------------------------------------------------------------------------- | ------------------------- |
+| read    | owner, member, admin token | the owner's answer, differing only in `access`                                                           | `404 workspace not found` |
+| write   | owner, admin token         | `403` with `error_type: forbidden` and the message `org members have read-only access to this workspace` | `404 workspace not found` |
+| private | owner, admin token         | `404 workspace not found`                                                                                | `404 workspace not found` |
+
+The `404` is the same answer a slug naming nothing gets, byte for byte, so
+no refusal says whether a workspace exists.
+
+**The checks run in this order:** the credential, then a token's scope, then
+access, then the route's own status and precondition checks. A member
+writing to an archived workspace is therefore `403`, not the `400` the
+archived status would give. An access lookup that fails is `500`, never a
+grant, and the route's handler does not run.
+
+### Anti-enumeration
+
+Six routes — `GET /api/v1/workspaces`, `GET`, `PATCH` and `DELETE
+/api/v1/workspaces/:slug`, and `POST .../archive` and `.../reactivate` —
+answer a token that lacks the scope with `404 workspace not found` instead
+of `403`, identical to the answer for a workspace that does not exist.
+Every other route, `POST /api/v1/workspaces` included, answers a missing
+scope with the ordinary `403`.
+
+## Workspaces
+
+A workspace is the service's record of one repository: the URL it came
+from, the settings that govern it, and who may read and change it.
+
+### The workspace object
+
+Every route that returns a workspace returns the same object: `slug`,
+`git_url`, `hub_url`, `branch`, `owner_id`, `org_id`, `org_slug`, `access`,
+`status`, `display_name`, `description`, `head_sha`, `clone_error`,
+`upstream_head_sha`, `last_sync_at`, `sync_error`, `workspace_mode`,
+`upstream_url`, `integration_branch`, `settings`, `created_at` and
+`updated_at`.
+
+`display_name` is never null or empty — it falls back to the slug — and
+`description` is never null. `hub_url` is the clone URL on this service's
+git server, and is `null` when `PARLEY_EXTERNAL_URL` is unset or the
+workspace has no organization. `access` describes the caller, not their
+scopes. `settings` carries the effective value of every setting, set or
+not.
+
+`status` is `pending` (the record exists, the repository has not been
+copied in), `cloning`, `ready`, `failed` or `archived`.
+
+### POST /api/v1/workspaces
+
+**Access:** an API key, or a token with `workspaces:write`. An admin token
+is refused `403`, because a workspace needs a real user as its owner.
+
+| Field                          | Required          | Constraints                                                                                                                                                                  |
+| ------------------------------ | ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `slug`                         | yes               | Globally unique; 3–64 characters; starts with a lowercase letter; ends with a lowercase letter or digit; lowercase letters, digits and hyphens only; no two hyphens in a row |
+| `git_url`                      | yes               | An https or ssh git URL                                                                                                                                                      |
+| `branch`                       | no                | Defaults to null, the repository's default branch                                                                                                                            |
+| `org_id`                       | no                | An organization id **or slug**; the owner must be a member. Omitted, the owner's own organization is used                                                                    |
+| `display_name`                 | no                | At most 128 characters; defaults to the slug                                                                                                                                 |
+| `description`                  | no                | At most 1024 characters; defaults to `""`                                                                                                                                    |
+| `workspace_mode`               | no                | `standard` (default) or `carry_patch`                                                                                                                                        |
+| `upstream_url`                 | for `carry_patch` | Required for `carry_patch`, refused for `standard`                                                                                                                           |
+| `integration_branch`           | no                | `carry_patch` only; defaults to `deploy`                                                                                                                                     |
+| `settings`                     | no                | The settings to set; the rest take their defaults                                                                                                                            |
+| `git_pat`                      | no                | Excludes the basic pair; needs an https `git_url`                                                                                                                            |
+| `git_username`, `git_password` | no                | Both or neither; exclude `git_pat`; need an https `git_url`                                                                                                                  |
+
+Credentials are stored as the workspace secrets `GIT_PAT`, or
+`GIT_USERNAME` and `GIT_PASSWORD`, sealed before they reach any store
+([ADR 4](adr/04-seal-secrets-with-aes-gcm-under-a-deployment-key.md)). No
+response carries them.
+
+**Response:** `201 Created` with the workspace, `status` `pending` and
+`access` `owner`.
+
+| Status | Condition                                                                                                                                                                                                                                  |
+| ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 400    | A malformed `slug` or `git_url`; a field too long; an invalid mode combination; a bad credential combination; an unknown setting or a value it cannot take; `org_id` names no organization; no `org_id` and the caller has no organization |
+| 403    | An admin token; a token without `workspaces:write`; the caller is not a member of the organization named                                                                                                                                   |
+| 409    | A workspace with that slug exists                                                                                                                                                                                                          |
+
+### GET /api/v1/workspaces
+
+**Access:** `workspaces:read`; a token without it gets the
+[anti-enumeration](#anti-enumeration) `404`.
+
+**Query:** `include_archived=true` adds archived workspaces.
+
+**Response:** `200 OK` with the caller's own workspaces and those of their
+organizations, **newest first, and by slug where two share an instant**. An
+admin token sees every workspace, each with `access: "admin"`.
+
+### GET /api/v1/workspaces/:slug
+
+**Access:** `workspaces:read` (a token without it gets `404`); read access.
+
+**Response:** `200 OK` with the workspace. A member sees field-for-field
+what the owner sees, differing only in `access`.
+
+### PATCH /api/v1/workspaces/:slug
+
+Change a workspace's mutable fields. Only the fields the body names change.
+
+**Access:** `workspaces:write` (a token without it gets `404`); write
+access.
+
+| Field          | `null` means                                                                          |
+| -------------- | ------------------------------------------------------------------------------------- |
+| `display_name` | back to the slug                                                                      |
+| `description`  | back to `""`                                                                          |
+| `org_id`       | remove the organization                                                               |
+| `settings`     | a key given as `null` returns to its default; `"settings": null` resets every setting |
+
+`slug`, `git_url`, `branch`, `owner_id`, `workspace_mode`, `upstream_url`
+and `integration_branch` are immutable and refused, as is the retired
+`sync_mode` — use the `sync_enabled` setting.
+
+**Response:** `200 OK` with the updated workspace.
+
+| Status | Condition                                                                                                                                                                   |
+| ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 400    | An empty body; the workspace is archived; a field too long; an immutable field or `sync_mode`; an unknown setting or a value it cannot take; `org_id` names no organization |
+| 403    | The workspace's **owner** is not a member of the organization named                                                                                                         |
+
+The access check runs first, so a member's update of an archived workspace
+is `403`, not `400`.
+
+### Workspace settings
+
+Twelve switches, each with a default. Every workspace object carries the
+effective value of all of them; a write that names an unknown key, or a
+value a key cannot take, is `400` naming the key and, for a list, the
+values it accepts, and changes nothing — not even the valid keys in the
+same body.
+
+| Setting                           | Values                                   | Default     |
+| --------------------------------- | ---------------------------------------- | ----------- |
+| `rebuild_strategy`                | `rebase`, `merge`                        | `rebase`    |
+| `rebuild_fail_mode`               | `fail_fast`, `continue`                  | `fail_fast` |
+| `auto_rebuild_after_sync`         | boolean                                  | `true`      |
+| `auto_rebuild_after_push`         | boolean                                  | `true`      |
+| `patch_branch_source`             | `hub`, `origin`                          | `hub`       |
+| `patch_divergence_policy`         | `replace`, `report`                      | `replace`   |
+| `push_patches_to_origin`          | boolean                                  | `false`     |
+| `rebuild_push_integration_branch` | boolean                                  | `false`     |
+| `squash_merge_detection`          | `ancestry_only`, `content_based`, `both` | `both`      |
+| `forge_api_url`                   | string                                   | `""`        |
+| `upstream_forge_api_url`          | string                                   | `""`        |
+| `sync_enabled`                    | boolean                                  | `true`      |
+
+### POST /api/v1/workspaces/:slug/archive
+
+Archive a workspace. An archived workspace keeps its records and can be
+reactivated; writes to it are refused.
+
+**Access:** `workspaces:write` (a token without it gets `404`); write
+access. Archiving takes the [workspace lock](#the-workspace-lock).
+
+**Response:** `200 OK` with the workspace, `status` `archived`. Bound
+tokens are left alone and keep working.
+
+| Status               | Condition                                    |
+| -------------------- | -------------------------------------------- |
+| 400                  | The workspace is already archived            |
+| 409                  | The workspace is `cloning`                   |
+| 409 `workspace_busy` | Another operation holds the workspace's lock |
+
+### POST /api/v1/workspaces/:slug/reactivate
+
+**Access:** `workspaces:write` (a token without it gets `404`); write
+access.
+
+**Response:** `200 OK` with the workspace, `status` `pending`. `409` when
+the workspace is not archived.
+
+### DELETE /api/v1/workspaces/:slug
+
+Delete an archived workspace for good.
+
+**Access:** `workspaces:write` (a token without it gets `404`); write
+access.
+
+**Behaviour:** in one transaction, every live token bound to the workspace
+is revoked, every binding removed, the workspace's secrets deleted and the
+record itself removed. A failure part way leaves all of them as they were,
+so tokens are never revoked for a workspace that is still there.
+
+**Response:** `204 No Content`. `409` when the workspace is not archived.
+
+### The workspace lock
+
+The operations that work on a workspace's repository take turns. A request
+that finds another running answers `409` with `error_type:
+workspace_busy` **at once**, without waiting, and can be retried. The lock
+is shared by every instance of the service, and an instance that stops
+without releasing one holds it no longer than its lease
+([ADR 5](adr/05-hold-the-workspace-lock-as-a-lease-in-the-store.md)).
+
+## Workspace-bound tokens
+
+A personal access token can be tied to exactly one workspace when it is
+minted. It then reaches that workspace under its scopes, with the answers
+an unbound token of the same user and scopes would get, and nothing else.
+
+### POST /api/v1/workspaces/:slug/tokens
+
+Mint a token bound to the workspace. The body, the validation, the expiry
+and the privilege rules are those of
+[`POST /api/v1/user/tokens`](#post-apiv1usertokens); the token is bound
+afterwards.
+
+**Access:** the workspace's **owner** only, with `tokens:manage`.
+
+**Response:** `201 Created`, `Cache-Control: no-store`, with the token's
+metadata, `workspace`, and `token` — the only response that carries it.
+
+**Errors**, in the order they are checked:
+
+| Status            | Condition                                                                                                    |
+| ----------------- | ------------------------------------------------------------------------------------------------------------ |
+| 401               | No credential                                                                                                |
+| 403 `token_bound` | The caller is itself a bound token                                                                           |
+| 403               | An admin token: a bound token needs a real user as its owner                                                 |
+| 404               | The workspace does not exist, or the caller is not its owner — a member of its organization is told this too |
+| 400               | The workspace is archived                                                                                    |
+| any               | The token creation's own answer, unchanged; nothing is bound                                                 |
+| 500               | The binding could not be written; the token is revoked                                                       |
+
+### GET /api/v1/workspaces/:slug/tokens
+
+List the tokens bound to the workspace, revoked and expired ones included,
+ordered by creation time then token id. Works on an archived workspace. A
+binding whose token no longer exists is left out. No entry carries a token
+or a hash.
+
+**Access:** the owner or an admin token, with `tokens:read`; a member gets
+`404`. A bound token is refused `403 token_bound`.
+
+### What a bound token may reach
+
+| Request by a token bound to `S`                                              | Answer                                                                                                      |
+| ---------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| Any route naming a workspace other than `S`                                  | `404 workspace not found`, **before** any scope, existence or status check                                  |
+| The same routes for `S`                                                      | The route's usual answer                                                                                    |
+| `GET /api/v1/workspaces`                                                     | At most `S`                                                                                                 |
+| `GET /api/v1/sandbox-profiles`                                               | As for an unbound token                                                                                     |
+| Any other route under the mount point, including one that matches nothing    | `403`, `error_type: token_bound`, message `this token is bound to workspace <S>`                            |
+| An identity route (`/user`, `/user/keys`, `/user/tokens`, `/users`, `/orgs`) | `403`, `error_type: token_bound`, message `this token is bound to a workspace` — the workspace is not named |
+
+The `404` for another workspace is the same answer an unknown slug gets, so
+a bound token learns nothing about what else exists.
+
+**A binding the service cannot read is `500`.** The token is never let
+through as though it were unbound.
+
+Deleting a workspace revokes its live bound tokens and removes their
+bindings in one transaction. At start and every hour after, a sweep
+revokes the live tokens of bindings whose workspace is gone and removes
+bindings whose token is gone; a binding of a revoked or expired token of a
+workspace that still exists is kept, so that workspace's token list still
+shows it.
+
+## Sandboxes
+
+This deployment lends no sandboxes. Every sandbox route is registered and
+answers `404` with `error_type: sandboxes_disabled` and the message
+`sandboxes are not enabled on this hub`, to every authenticated caller,
+**before** any scope is checked and before the workspace is looked up — so
+the answer is the same whether the workspace exists, is archived, or the
+caller's token lacks the scope.
+
+The paths are `GET /api/v1/sandbox-profiles`, `POST`, `GET`
+`/api/v1/workspaces/:slug/sandboxes`, `GET`, `DELETE`
+`/api/v1/workspaces/:slug/sandboxes/:id` and `GET /api/v1/sandboxes`.
+
+A caller with no credential is still refused `401` first: the missing
+credential is the earlier answer, and it carries no `error_type`.
+
+The routes are registered rather than left unrouted, because an unrouted
+path answers `404` with no `error_type`, which clients tell apart from a
+deployment that has sandboxes switched off.
 
 ## Server Endpoints
 

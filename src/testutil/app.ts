@@ -3,15 +3,22 @@ import type { RouteDefinition } from '../http/router.js';
 import { inMemoryMetrics } from '../platform/local/metrics.js';
 import type { RelationalStore } from '../platform/index.js';
 import { serviceRoutes } from '../routes/index.js';
+import { deploymentKey, sealedSecrets } from '../secrets/store.js';
+import { storeLocks } from '../platform/store_lock.js';
+import type { SecretStore } from '../platform/secrets.js';
 import { freshStore, seedClock } from './identity.js';
 import { providerIdentity, stubDirectory } from './oauth.js';
 
 export const MOUNT = '/api/v1';
 export const ADMIN_TOKEN = 'af_admin_deployment_secret';
+export const EXTERNAL_URL = 'https://parley.test';
+/** Thirty-two bytes, so the suites exercise the real sealing. */
+export const SECRET_KEY = 'c2VjcmV0LWtleS1vZi10aGlydHktdHdvLWJ5dGVzISE=';
 
 export interface Service {
   app: ReturnType<typeof buildApp>;
   store: RelationalStore;
+  secrets: SecretStore;
   dispose: () => void;
 }
 
@@ -23,6 +30,8 @@ export interface Service {
 export async function identityService(extra: RouteDefinition[] = []): Promise<Service> {
   const seeded = await freshStore();
   const clock = seedClock();
+  const key = await deploymentKey(SECRET_KEY);
+  const secrets = sealedSecrets(seeded.store, key as CryptoKey);
   const app = buildApp({
     routes: [
       ...serviceRoutes({
@@ -33,6 +42,9 @@ export async function identityService(extra: RouteDefinition[] = []): Promise<Se
         clock,
         metrics: inMemoryMetrics(),
         providers: stubDirectory({ codes: { 'a-code': providerIdentity() } }),
+        secrets,
+        externalUrl: EXTERNAL_URL,
+        locks: storeLocks(seeded.store, clock),
       }),
       ...extra,
     ],
@@ -41,7 +53,7 @@ export async function identityService(extra: RouteDefinition[] = []): Promise<Se
     auth: { store: seeded.store, clock, adminToken: ADMIN_TOKEN, mountPoint: MOUNT },
   });
 
-  return { app, store: seeded.store, dispose: seeded.dispose };
+  return { app, store: seeded.store, secrets, dispose: seeded.dispose };
 }
 
 /** A request as a client makes it: the credential in the usual header. */

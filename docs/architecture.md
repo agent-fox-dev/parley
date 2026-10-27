@@ -68,9 +68,11 @@ implementations those are, and why two of the four have one shared
 implementation rather than two, is
 [ADR 1](adr/01-define-the-platform-interfaces-and-their-implementations.md).
 
-| Interface            | On Cloudflare                                 | Off Cloudflare            |
-| -------------------- | --------------------------------------------- | ------------------------- |
-| relational store     | D1                                            | SQLite on the host's disk |
-| configuration source | the Worker's bindings                         | the process environment   |
-| clock                | the host's own clock, shared by both targets  |                           |
-| metrics sink         | an in-memory registry, shared by both targets |                           |
+| Interface            | On Cloudflare                                                                                                                       | Off Cloudflare            |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------- | ------------------------- |
+| relational store     | D1                                                                                                                                  | SQLite on the host's disk |
+| workspace lock       | a lease row in the relational store, shared by both targets ([ADR 5](adr/05-hold-the-workspace-lock-as-a-lease-in-the-store.md))    |                           |
+| secret store         | sealed values in the relational store, shared by both targets ([ADR 4](adr/04-seal-secrets-with-aes-gcm-under-a-deployment-key.md)) |                           |
+| configuration source | the Worker's bindings                                                                                                               | the process environment   |
+| clock                | the host's own clock, shared by both targets                                                                                        |                           |
+| metrics sink         | an in-memory registry, shared by both targets                                                                                       |                           |

@@ -12,12 +12,14 @@ setting is absent.
 
 Set as Worker variables, in `wrangler.toml` or by the deployment.
 
-| Variable             | Default   | Description                                                                                                                                                                                                     |
-| -------------------- | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `PARLEY_MOUNT_POINT` | `/api/v1` | The path prefix every versioned route is served under. The four [server endpoints](api.md#server-endpoints) are served at the server root whatever this is set to, and `GET /version` reports the value in use. |
-| `PARLEY_BUILD_TIME`  | `""`      | The build's timestamp, reported by `GET /version`. Empty where the deployment supplies none.                                                                                                                    |
-| `PARLEY_COMMIT`      | `""`      | The commit the build came from, reported by `GET /version`. Empty where the deployment supplies none.                                                                                                           |
-| `PARLEY_ADMIN_TOKEN` | unset     | The deployment's admin token. A caller presenting exactly this value is an admin token: every scope, access to every user, and no user identity of its own. Where it is unset, no admin token is accepted.      |
+| Variable              | Default   | Description                                                                                                                                                                                                                                                         |
+| --------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PARLEY_MOUNT_POINT`  | `/api/v1` | The path prefix every versioned route is served under. The four [server endpoints](api.md#server-endpoints) are served at the server root whatever this is set to, and `GET /version` reports the value in use.                                                     |
+| `PARLEY_BUILD_TIME`   | `""`      | The build's timestamp, reported by `GET /version`. Empty where the deployment supplies none.                                                                                                                                                                        |
+| `PARLEY_COMMIT`       | `""`      | The commit the build came from, reported by `GET /version`. Empty where the deployment supplies none.                                                                                                                                                               |
+| `PARLEY_ADMIN_TOKEN`  | unset     | The deployment's admin token. A caller presenting exactly this value is an admin token: every scope, access to every user, and no user identity of its own. Where it is unset, no admin token is accepted.                                                          |
+| `PARLEY_SECRET_KEY`   | unset     | Thirty-two bytes, base64, that every stored secret is sealed under ([ADR 4](adr/04-seal-secrets-with-aes-gcm-under-a-deployment-key.md)). Where it is unset the deployment has no secret store, and creating a workspace with repository credentials answers `500`. |
+| `PARLEY_EXTERNAL_URL` | unset     | The deployment's own base URL, used for the `hub_url` a workspace advertises. Where it is unset, `hub_url` is `null`.                                                                                                                                               |
 
 Neither `PARLEY_BUILD_TIME` nor `PARLEY_COMMIT` affects behaviour; a
 deployment that sets neither answers `GET /version` successfully with both

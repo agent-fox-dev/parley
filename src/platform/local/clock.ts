@@ -9,3 +9,17 @@ export function systemClock(): Clock {
 export function fixedClock(at: Date): Clock {
   return { now: () => new Date(at.getTime()) };
 }
+
+/**
+ * A clock a test moves itself, for behaviour that turns on time passing
+ * without a test having to wait for it.
+ */
+export function movableClock(start: Date): { clock: Clock; advance: (ms: number) => void } {
+  let at = start.getTime();
+  return {
+    clock: { now: () => new Date(at) },
+    advance: (ms: number) => {
+      at += ms;
+    },
+  };
+}

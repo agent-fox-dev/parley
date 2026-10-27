@@ -8,6 +8,8 @@ import { inMemoryMetrics } from '../../platform/local/metrics.js';
 import { maxBodyBytesFrom, type Platform } from '../../platform/index.js';
 import { configuredProviders } from '../../auth/oauth.js';
 import { serviceRoutes } from '../../routes/index.js';
+import { storeLocks } from '../../platform/store_lock.js';
+import { sweepBindings } from '../../store/bindings.js';
 import { migrate } from '../../store/migrations/index.js';
 
 export interface Env {
@@ -21,12 +23,9 @@ export interface Env {
 /** Assembles the platform a Worker is deployed with. */
 export function cloudflarePlatform(env: Env): Platform {
   const config = envConfig(env as unknown as Record<string, unknown>);
-  return {
-    store: env.DB === undefined ? noStore() : d1Store(env.DB),
-    clock: systemClock(),
-    config,
-    metrics: inMemoryMetrics(),
-  };
+  const store = env.DB === undefined ? noStore() : d1Store(env.DB);
+  const clock = systemClock();
+  return { store, clock, config, metrics: inMemoryMetrics(), locks: storeLocks(store, clock) };
 }
 
 // Built once per isolate: the metrics sink must outlive a single request.
@@ -55,6 +54,7 @@ export default {
           clock: platform.clock,
           metrics: platform.metrics,
           providers: configuredProviders(platform.config),
+          locks: platform.locks,
         }),
         auth: {
           store: platform.store,
@@ -68,5 +68,16 @@ export default {
     }
     await schema;
     return app.fetch(request, env, ctx);
+  },
+
+  /**
+   * The hourly sweep, run by a cron trigger. It retires the bindings that
+   * a workspace deletion or a token revocation left behind.
+   */
+  async scheduled(_event: ScheduledController, env: Env): Promise<void> {
+    const platform = cloudflarePlatform(env);
+    if (env.DB !== undefined) {
+      await sweepBindings(platform.store, platform.clock.now().toISOString());
+    }
   },
 };

@@ -7,6 +7,7 @@ import { SERVER_ROUTE_PATHS } from '../routes/server.js';
 import { envConfig } from './cloudflare/config.js';
 import { d1Store } from './cloudflare/store.js';
 import { systemClock } from './local/clock.js';
+import { storeLocks } from './store_lock.js';
 import { inMemoryMetrics } from './local/metrics.js';
 import { processConfig } from './local/config.js';
 import { sqliteStore } from './local/store.js';
@@ -53,6 +54,7 @@ function cloudflareWiring(): Wiring {
       clock: systemClock(),
       config: envConfig({ PARLEY_MOUNT_POINT: '/api/v1' }),
       metrics: inMemoryMetrics(),
+      locks: storeLocks(d1Store(db as never), systemClock()),
     },
     breakStore: () => {
       answering = false;
@@ -69,6 +71,7 @@ function localWiring(): Wiring {
       clock: systemClock(),
       config: processConfig({ PARLEY_MOUNT_POINT: '/api/v1' }),
       metrics: inMemoryMetrics(),
+      locks: storeLocks(sqliteStore(join(dir, 'parley.db')), systemClock()),
     },
     breakStore: () => {
       rmSync(dir, { recursive: true, force: true });

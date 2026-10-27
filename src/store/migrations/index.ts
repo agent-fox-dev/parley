@@ -62,6 +62,64 @@ export const MIGRATIONS: readonly Migration[] = [
        )`,
     ],
   },
+  {
+    name: '002_workspaces',
+    statements: [
+      `CREATE TABLE workspaces (
+         slug TEXT PRIMARY KEY,
+         git_url TEXT NOT NULL,
+         branch TEXT,
+         owner_id TEXT NOT NULL,
+         org_id TEXT,
+         status TEXT NOT NULL DEFAULT 'pending',
+         display_name TEXT NOT NULL DEFAULT '',
+         description TEXT NOT NULL DEFAULT '',
+         head_sha TEXT,
+         clone_error TEXT,
+         upstream_head_sha TEXT,
+         last_sync_at TEXT,
+         sync_error TEXT,
+         workspace_mode TEXT NOT NULL DEFAULT 'standard',
+         upstream_url TEXT,
+         integration_branch TEXT,
+         settings TEXT NOT NULL DEFAULT '{}',
+         created_at TEXT NOT NULL,
+         updated_at TEXT NOT NULL
+       )`,
+      'CREATE INDEX workspaces_by_owner ON workspaces (owner_id)',
+      'CREATE INDEX workspaces_by_org ON workspaces (org_id)',
+      `CREATE TABLE workspace_secrets (
+         scope TEXT NOT NULL,
+         key TEXT NOT NULL,
+         sealed TEXT NOT NULL,
+         created_at TEXT NOT NULL,
+         updated_at TEXT NOT NULL,
+         PRIMARY KEY (scope, key)
+       )`,
+    ],
+  },
+  {
+    name: '003_locks',
+    statements: [
+      `CREATE TABLE workspace_locks (
+         key TEXT PRIMARY KEY,
+         holder TEXT NOT NULL,
+         taken_at TEXT NOT NULL,
+         expires_at TEXT NOT NULL
+       )`,
+    ],
+  },
+  {
+    name: '004_token_bindings',
+    statements: [
+      `CREATE TABLE token_bindings (
+         token_id TEXT PRIMARY KEY,
+         workspace_slug TEXT NOT NULL,
+         created_at TEXT NOT NULL
+       )`,
+      'CREATE INDEX token_bindings_by_workspace ON token_bindings (workspace_slug)',
+    ],
+  },
 ];
 
 /**

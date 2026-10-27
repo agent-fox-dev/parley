@@ -3,6 +3,7 @@ import { HttpError, errorResponse } from '../http/errors.js';
 import type { LogSink } from '../http/router.js';
 import type { Clock, RelationalStore } from '../platform/index.js';
 import { SERVER_ROUTE_PATHS } from '../routes/server.js';
+import { bindingOf } from '../store/bindings.js';
 import { findCredential, findUser } from '../store/identity.js';
 import { bearerCredential, hashSecret, parseCredential, sameDigest } from './credentials.js';
 import type { CredentialKind } from './credentials.js';
@@ -16,6 +17,8 @@ export interface Identity {
   credentialId?: string;
   /** The scopes a token was granted. Empty for the kinds that hold them all. */
   permissions: readonly string[];
+  /** The workspace a bound token may reach, and no other. */
+  boundTo?: string;
 }
 
 export interface AuthOptions {
@@ -69,18 +72,23 @@ export function identityOf(c: Context): Identity | undefined {
 }
 
 /**
- * Refuses a personal access token that does not hold the scope. The kinds
- * that hold every scope are admitted without a list to consult.
+ * The answer for a personal access token that does not hold the scope, or
+ * undefined when the caller may proceed. The kinds that hold every scope
+ * are admitted without a list to consult.
+ *
+ * `hidden` is the anti-enumeration answer: the refusal is dressed as a
+ * workspace that does not exist, so the route discloses nothing.
  */
-export function requireScope(scope: string): MiddlewareHandler {
-  return async (c, next) => {
-    const identity = identityOf(c);
-    if (identity?.kind === 'pat' && !grantsScope(identity.permissions, scope)) {
-      return errorResponse(new HttpError(403, `this token does not hold ${scope}`));
-    }
-    await next();
+export function scopeRefusal(c: Context, scope: string, hidden = false): Response | undefined {
+  const identity = identityOf(c);
+  if (identity?.kind !== 'pat' || grantsScope(identity.permissions, scope)) {
     return undefined;
-  };
+  }
+  return errorResponse(
+    hidden
+      ? new HttpError(404, 'workspace not found')
+      : new HttpError(403, `this token does not hold ${scope}`),
+  );
 }
 
 async function identify(
@@ -121,11 +129,16 @@ async function identify(
     return undefined;
   }
 
+  // A binding that cannot be read must refuse the request, so this read is
+  // deliberately not guarded: its failure becomes the 500 it should be.
+  const boundTo = parsed.kind === 'pat' ? await bindingOf(options.store, credential.id) : undefined;
+
   return {
     kind: parsed.kind,
     userId: user.id,
     credentialId: credential.id,
     permissions: credential.permissions,
+    ...(boundTo === undefined ? {} : { boundTo }),
   };
 }
 

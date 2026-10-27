@@ -2,10 +2,13 @@ export type { Clock } from './clock.js';
 export type { ConfigSource } from './config.js';
 export type { CounterHandle, HistogramHandle, MetricsSink } from './metrics.js';
 export type { RelationalStore, Row, Statement } from './store.js';
+export type { LockHandle, Locks } from './lock.js';
+export type { SecretStore } from './secrets.js';
 
 import type { Clock } from './clock.js';
 import type { ConfigSource } from './config.js';
 import type { MetricsSink } from './metrics.js';
+import type { Locks } from './lock.js';
 import type { RelationalStore } from './store.js';
 
 /**
@@ -18,6 +21,7 @@ export interface Platform {
   clock: Clock;
   config: ConfigSource;
   metrics: MetricsSink;
+  locks: Locks;
 }
 
 /**

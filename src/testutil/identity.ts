@@ -20,6 +20,8 @@ import {
   insertOrg,
   insertUser,
 } from '../store/identity.js';
+import { type WorkspaceRecord, insertWorkspace } from '../store/workspaces.js';
+import { bindToken } from '../store/bindings.js';
 import { migrate } from '../store/migrations/index.js';
 
 /** The instant every seeded record is dated from, so expiry is decidable. */
@@ -115,6 +117,50 @@ export async function seedPat(
   over: Partial<CredentialRecord> = {},
 ): Promise<SeededCredential> {
   return seedCredential(store, 'pat', user, { permissions: [...permissions], ...over });
+}
+
+/** A workspace row, for suites that need one without posting a create. */
+export async function seedWorkspace(
+  store: RelationalStore,
+  over: Partial<WorkspaceRecord> & { owner_id: string },
+): Promise<WorkspaceRecord> {
+  const slug = over.slug ?? unique('ws');
+  const workspace: WorkspaceRecord = {
+    slug,
+    git_url: 'https://github.com/u/r.git',
+    branch: null,
+    org_id: null,
+    status: 'pending',
+    display_name: slug,
+    description: '',
+    head_sha: null,
+    clone_error: null,
+    upstream_head_sha: null,
+    last_sync_at: null,
+    sync_error: null,
+    workspace_mode: 'standard',
+    upstream_url: null,
+    integration_branch: null,
+    settings: {},
+    created_at: SEED_NOW.toISOString(),
+    updated_at: SEED_NOW.toISOString(),
+    ...over,
+  };
+  await insertWorkspace(store, workspace);
+  return workspace;
+}
+
+/** A token bound to one workspace, as the mint route would leave it. */
+export async function seedBoundToken(
+  store: RelationalStore,
+  user: UserRecord,
+  slug: string,
+  permissions: readonly string[],
+  over: Partial<CredentialRecord> = {},
+): Promise<SeededCredential> {
+  const seeded = await seedPat(store, user, permissions, over);
+  await bindToken(store, seeded.record.id, slug, SEED_NOW.toISOString());
+  return seeded;
 }
 
 export async function seedOrg(

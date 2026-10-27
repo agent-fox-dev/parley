@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import type { Context } from 'hono';
-import { type AuthOptions, authentication, requireScope } from '../auth/middleware.js';
+import { type AuthOptions, authentication, scopeRefusal } from '../auth/middleware.js';
+import { confinement } from '../auth/confinement.js';
 import { redactCredentials } from '../auth/credentials.js';
 import { DEFAULT_MAX_BODY_BYTES, DEFAULT_MOUNT_POINT } from '../config.js';
 import type { Clock, MetricsSink, RelationalStore } from '../platform/index.js';
@@ -26,6 +27,11 @@ export interface RouteDefinition {
   methods?: readonly string[];
   /** The scope a personal access token needs to reach this route. */
   scope?: string;
+  /**
+   * Whether a missing scope is answered as a workspace that does not
+   * exist, rather than as a refusal. The anti-enumeration routes set it.
+   */
+  hideScopeFailure?: boolean;
 }
 
 export interface AppOptions {
@@ -132,17 +138,22 @@ export function buildApp(options: AppOptions = {}): Hono {
 
   if (options.auth !== undefined) {
     app.use('*', authentication({ ...options.auth, log }));
-  }
-
-  for (const route of routes) {
-    if (route.scope !== undefined) {
-      app.use(route.path, requireScope(route.scope));
-    }
+    // Straight after the credential is known, so a bound token is confined
+    // before any scope, existence or status check runs.
+    app.use('*', confinement(options.auth.mountPoint));
   }
 
   for (const route of routes) {
     for (const method of route.methods ?? ['GET']) {
-      app.on(method, route.path, (c) => route.handler(c));
+      // The scope is checked per method, not per path: two routes can share
+      // a path, need different scopes and answer a missing one differently.
+      app.on(method, route.path, (c) => {
+        const refusal =
+          route.scope === undefined
+            ? undefined
+            : scopeRefusal(c, route.scope, route.hideScopeFailure === true);
+        return refusal ?? route.handler(c);
+      });
     }
   }
 
