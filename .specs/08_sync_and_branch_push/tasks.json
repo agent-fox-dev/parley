@@ -1,0 +1,260 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v2.json",
+  "spec_id": "08",
+  "spec_name": "sync_and_branch_push",
+  "schema_version": 2,
+  "test_commands": {
+    "all_tests": "make test",
+    "linter": "make lint"
+  },
+  "dependencies": [
+    {
+      "spec": "01",
+      "reason": "uses its router, error envelope and the execution model a long-running outbound request runs under"
+    },
+    {
+      "spec": "03",
+      "reason": "uses its workspace record, access decision, sync_enabled setting and workspace lock"
+    },
+    {
+      "spec": "05",
+      "reason": "uses its repository store, its copy-in for the reclone and its credential resolution for every remote operation"
+    },
+    {
+      "spec": "07",
+      "reason": "reuses its identification of a registered patch branch to decide which branches the push route will not send"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "kind": "implement",
+      "title": "Sync a standard workspace and record its outcome",
+      "criteria": [
+        "08-REQ-1"
+      ],
+      "tests": [
+        "TS-08-1",
+        "TS-08-2",
+        "TS-08-3",
+        "TS-08-4",
+        "TS-08-5",
+        "TS-08-6",
+        "TS-08-7"
+      ],
+      "steps": [
+        "Add this task's behaviours to the sync integration test file, and confirm they fail",
+        "Implement the sync route for a standard workspace: resolve the origin credential, fetch origin, and compare its head with the workspace's branch",
+        "Report up to date when the heads match and fast-forward the branch when origin's head descends from the local one, advancing head_sha and upstream_head_sha and setting last_sync_at",
+        "With reset_to_upstream, move the branch to origin's head whatever the ancestry and move both SHA fields with it",
+        "Refuse a diverged origin with 409 and record a sync_error naming reset_to_upstream as the recovery",
+        "Answer a failed fetch or an unresolvable credential with 502 and a cancelled sync with 504, recording a sync_error in each case that carries no credential",
+        "Clear sync_error on the next successful sync",
+        "Leave one documented branch point where package 09 will take over for a carry_patch workspace"
+      ],
+      "touches": [
+        "src/routes/sync.ts",
+        "src/sync/standard.ts",
+        "src/sync/standard.integration.test.ts"
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 2,
+      "kind": "implement",
+      "title": "Gate when a sync may run",
+      "criteria": [
+        "08-REQ-2"
+      ],
+      "tests": [
+        "TS-08-8",
+        "TS-08-9",
+        "TS-08-10"
+      ],
+      "steps": [
+        "Add this task's behaviours to the sync test files, and confirm they fail",
+        "Refuse a sync with 400 when the workspace is not ready or its sync_enabled setting is false, attempting no fetch",
+        "Take the workspace lock without waiting and answer 409 with error_type workspace_busy when it is held",
+        "Keep the workspace's status at ready throughout a sync, so a sync in progress is the lock and not a stored state"
+      ],
+      "touches": [
+        "src/routes/sync.ts",
+        "src/sync/preconditions.ts",
+        "src/sync/preconditions.test.ts",
+        "src/sync/standard.integration.test.ts"
+      ],
+      "depends_on": [
+        1
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 3,
+      "kind": "implement",
+      "title": "Reclone a workspace without losing its commits",
+      "criteria": [
+        "08-REQ-3"
+      ],
+      "tests": [
+        "TS-08-11",
+        "TS-08-12",
+        "TS-08-13",
+        "TS-08-14"
+      ],
+      "steps": [
+        "Add this task's behaviours to the reclone test files, and confirm they fail",
+        "Implement the reclone route: push what branches it can to origin with the stored credential, then discard the repository, clear sync_error and upstream_head_sha, and copy the repository again through package 05's copy-in",
+        "Answer 200 with status pending and let the status follow the new copy",
+        "Carry on when the push fails or no credential is usable, without surfacing that failure as the route's answer",
+        "Refuse an archived workspace with 400, a copy already under way with 409, and a held lock with 409 workspace_busy",
+        "Answer 500 when the repository cannot be discarded or the workspace cannot be updated, leaving both unchanged"
+      ],
+      "touches": [
+        "src/routes/reclone.ts",
+        "src/sync/reclone.ts",
+        "src/sync/reclone.test.ts",
+        "src/sync/reclone.integration.test.ts"
+      ],
+      "depends_on": [
+        2
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 4,
+      "kind": "implement",
+      "title": "Run the branch push's checks in their documented order",
+      "criteria": [
+        "08-REQ-4"
+      ],
+      "tests": [
+        "TS-08-15",
+        "TS-08-16",
+        "TS-08-17",
+        "TS-08-18",
+        "TS-08-19",
+        "TS-08-20",
+        "TS-08-21"
+      ],
+      "steps": [
+        "Add this task's behaviours to the branch push test file, and confirm they fail",
+        "Order the checks: the credential; a PAT's workspaces:write before the workspace is looked up; the workspace and write access; the body; the branch name; readiness; the branches this route will not push; the lock without waiting; then the forced-push protections",
+        "Take the branch name from one path segment and decode it exactly once",
+        "Refuse a name breaking git's rules or starting with a hyphen with 404 branch_not_found, naming the rule in a message beginning with the type",
+        "Refuse an unready workspace, a non-object body and a non-boolean force with 400, while accepting no body, an empty object and unknown fields as a push without force",
+        "Refuse a carry_patch workspace's integration branch, a registered patch that is not deleted, and the workspace's own branch with force, with their own error types and the same answer whether or not the lock is held",
+        "Refuse a held lock with 409 workspace_busy, and with force refuse the HEAD branch of a workspace with no branch set and a branch the repository lacks"
+      ],
+      "touches": [
+        "src/routes/branch_push.ts",
+        "src/push/checks.ts",
+        "src/push/checks.test.ts",
+        "src/push/branch_push.test.ts"
+      ],
+      "depends_on": [
+        1
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 5,
+      "kind": "implement",
+      "title": "Push the branch and answer with its result",
+      "criteria": [
+        "08-REQ-5"
+      ],
+      "tests": [
+        "TS-08-22",
+        "TS-08-23",
+        "TS-08-24",
+        "TS-08-25"
+      ],
+      "steps": [
+        "Add this task's behaviours to the branch push test files, and confirm they fail",
+        "Send exactly refs/heads/<name> to refs/heads/<name> on origin with the resolved credential, fast-forward only unless force was given",
+        "Answer with branch, the 40-character sha offered, remote origin, remote_url and result",
+        "Report up_to_date when origin already had the commit, forced when force was given and origin accepted an update, and pushed otherwise",
+        "Strip userinfo from remote_url and leave an scp-style address unchanged",
+        "Run the push to its end or its two-minute deadline even when the caller disconnects, and record its outcome as if the caller were there"
+      ],
+      "touches": [
+        "src/push/branch_push.ts",
+        "src/push/branch_push.test.ts",
+        "src/push/branch_push.integration.test.ts"
+      ],
+      "depends_on": [
+        4
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 6,
+      "kind": "implement",
+      "title": "Map every push failure to its documented answer",
+      "criteria": [
+        "08-REQ-6"
+      ],
+      "tests": [
+        "TS-08-26",
+        "TS-08-27",
+        "TS-08-28",
+        "TS-08-29",
+        "TS-08-30"
+      ],
+      "steps": [
+        "Add this task's behaviours to the branch push test files, and confirm they fail",
+        "Answer a non-fast-forward with 409 and a message that names origin's commit where its refs could be listed, ends with the instruction to push with force, or to sync for the workspace's own branch, and says so when origin refused even a forced update",
+        "Answer a repository origin does not have with 404 forge_not_found and a refused ref with 422 forge_rejected carrying origin's scrubbed reason",
+        "Answer 401 and 403 from origin with 502 forge_unauthenticated and forge_forbidden, a failed connection with 502 forge_unreachable, an unreadable answer with 502 forge_error, and the deadline with 504 forge_timeout",
+        "Say in the forge_unauthenticated message whether the workspace has no stored credential or which kind origin rejected, without naming the value",
+        "Begin the message of every answer carrying one of this route's own error types with that type and a colon and a space",
+        "Keep the credential, the userinfo of git_url and the underlying git error out of every answer of all three routes"
+      ],
+      "touches": [
+        "src/push/failures.ts",
+        "src/push/failures.test.ts",
+        "src/push/branch_push.integration.test.ts",
+        "src/sync/standard.ts"
+      ],
+      "depends_on": [
+        5
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 7,
+      "kind": "integration",
+      "title": "Verify both directions against a running deployment",
+      "tests": [
+        "TS-08-31",
+        "TS-08-32",
+        "TS-08-33",
+        "TS-08-34"
+      ],
+      "steps": [
+        "Add the four smoke tests and confirm each passes against a running deployment with a real remote and the real afc binary, or skips with a message naming what was missing",
+        "Trace 08-PATH-1: the sync takes package 03's lock, resolves the credential through package 05, fetches the real remote and writes the advanced branch into the repository store",
+        "Trace 08-PATH-2: the refusal writes sync_error through the workspace record and the recovery clears it, both on the real store",
+        "Trace 08-PATH-3: a branch pushed through the git server of package 07 is read from the repository store by the branch push route and sent to the real remote",
+        "Trace 08-PATH-4: the reclone pushes out, discards and re-copies through package 05's copy-in, reaching ready",
+        "For every criterion carrying a contract, confirm a caller in production code consumes the producer's result and not only a test: the credential resolution is called by the sync, the reclone and the push; the lock by all three; and the patch-branch identification of package 07 by the push's refusals",
+        "Grep src/sync/, src/push/ and the files every task's touches lists for TODO, FIXME and the project's not-implemented marker, and remove any that remain",
+        "Add the sync and branch push conformance cases to the harness from package 01"
+      ],
+      "touches": [
+        "src/sync/sync.smoke.test.ts",
+        "src/push/branch_push.smoke.test.ts",
+        "conformance/sync_push.ts"
+      ],
+      "depends_on": [
+        3,
+        6
+      ],
+      "done_when": [
+        "`make check` passes with no network access and no deployment configured",
+        "afc workspace sync, afc workspace reclone and afc workspace push behave as docs/prd/cli.md specifies against a running deployment, exit codes included"
+      ],
+      "state": "pending"
+    }
+  ]
+}

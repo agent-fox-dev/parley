@@ -1,0 +1,413 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v2.json",
+  "spec_id": "09",
+  "spec_name": "carry_patch",
+  "schema_version": 2,
+  "test_commands": {
+    "all_tests": "make test",
+    "linter": "make lint"
+  },
+  "dependencies": [
+    {
+      "spec": "03",
+      "reason": "uses its workspace record, its carry-patch settings, its access decision and its workspace lock"
+    },
+    {
+      "spec": "05",
+      "reason": "uses its repository store, its credential resolution and its capability report, which decides how a replaced patch tip is kept"
+    },
+    {
+      "spec": "06",
+      "reason": "applies every patch, detects every conflict and replays every recorded resolution through its history engine"
+    },
+    {
+      "spec": "07",
+      "reason": "turns the accepted patch-branch push of its receive path into a rebuild trigger"
+    },
+    {
+      "spec": "08",
+      "reason": "extends its sync route at the documented branch point for carry_patch workspaces"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "kind": "implement",
+      "title": "Add patches to the list, singly and in batches",
+      "criteria": [
+        "09-REQ-1"
+      ],
+      "tests": [
+        "TS-09-1",
+        "TS-09-2",
+        "TS-09-3",
+        "TS-09-4",
+        "TS-09-5",
+        "TS-09-6"
+      ],
+      "steps": [
+        "Add this task's behaviours to the patch routes' and patch list test files, and confirm they fail",
+        "Define the patch table with its position, status, origin fields and timestamps, with a migration the second target runs too",
+        "Implement the add: validate the branch name, the integration branch and the position, then resolve the branch locally, from the fork's fetched copy, or by fetching the fork under patch_branch_source origin, reporting which succeeded",
+        "Insert at the given position shifting the rest down, and append for a position past the end or an omitted one",
+        "Answer 200 with the existing patch for an if_not_exists hit and 409 without it",
+        "For a batch, check every element's syntax in array order before any branch lookup, then every branch before adding anything, refusing the whole batch on the first failure while leaving branches already created in place",
+        "Refuse a missing or empty branch name, the integration branch, a position below 1, a standard or archived workspace and an unresolvable branch with 400, prefixing a batch element's message with patch[i]",
+        "Refuse a duplicate branch and a branch repeated in a batch with 409, a held lock with 409 workspace_busy and a failed fork fetch with 502 origin_fetch_failed"
+      ],
+      "touches": [
+        "src/routes/patches.ts",
+        "src/routes/patches.test.ts",
+        "src/routes/patches.integration.test.ts",
+        "src/patch/list.ts",
+        "src/patch/list.test.ts",
+        "src/patch/resolve_branch.ts",
+        "src/store/migrations/"
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 2,
+      "kind": "implement",
+      "title": "Read and change patches, keeping the list contiguous",
+      "criteria": [
+        "09-REQ-2"
+      ],
+      "tests": [
+        "TS-09-7",
+        "TS-09-8",
+        "TS-09-9",
+        "TS-09-10",
+        "TS-09-11"
+      ],
+      "steps": [
+        "Add this task's behaviours to the patch routes' test files, and confirm they fail",
+        "List a workspace's patches in position order without deleted ones, answering an empty array for a standard workspace",
+        "Read one patch, a deleted one included, reporting the SHA of a replaced tip where one is kept and omitting it where the lookup fails, without failing the request",
+        "Update only the position, status, description and upstream pull request a body names, ignoring any branch_name",
+        "Refuse an invalid status, the status deleted, an out-of-range position with 400, an unknown patch with 404 and a deleted patch with 409",
+        "Keep the positions contiguous from 1 after every operation, proved by a generative test over sequences of operations"
+      ],
+      "touches": [
+        "src/routes/patches.ts",
+        "src/patch/list.ts",
+        "src/patch/list.test.ts",
+        "src/routes/patches.test.ts"
+      ],
+      "depends_on": [
+        1
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 3,
+      "kind": "implement",
+      "title": "Remove, restore and reorder patches",
+      "criteria": [
+        "09-REQ-3"
+      ],
+      "tests": [
+        "TS-09-12",
+        "TS-09-13",
+        "TS-09-14",
+        "TS-09-15"
+      ],
+      "steps": [
+        "Add this task's behaviours to the patch routes' test files, and confirm they fail",
+        "Remove a patch, close the positions, and discard any kept replaced tip on a best-effort basis that never changes the answer",
+        "Restore a deleted patch to the end of the list as active with its deleted time cleared",
+        "Reorder the whole list from a list of ids, setting positions in the order given",
+        "Refuse a reorder that is empty while patches exist, omits an id, repeats one or names a foreign patch with 400, and a restore of a patch that is not deleted with 400"
+      ],
+      "touches": [
+        "src/routes/patches.ts",
+        "src/patch/list.ts",
+        "src/routes/patches.test.ts",
+        "src/routes/patches.integration.test.ts"
+      ],
+      "depends_on": [
+        2
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 4,
+      "kind": "implement",
+      "title": "Run the rebuild job",
+      "criteria": [
+        "09-REQ-6"
+      ],
+      "tests": [
+        "TS-09-29",
+        "TS-09-30",
+        "TS-09-31",
+        "TS-09-32",
+        "TS-09-33",
+        "TS-09-34",
+        "TS-09-35",
+        "TS-09-36"
+      ],
+      "steps": [
+        "Add this task's behaviours to the rebuild test files, and confirm they fail",
+        "Define the rebuild job record with its status, strategy, per-patch results and integration heads, and run it through the platform's queue",
+        "Take the workspace lock, fetch the upstream head, record it and release the lock before applying any patch",
+        "Apply the patches in position order through the history engine, skipping merged_upstream, disabled, deleted and branch-missing patches with their reasons",
+        "Replay a recorded resolution on a conflict, then end the job under fail_fast or mark the patch conflict and continue under continue",
+        "Write each patch's result as it finishes, so a reader of a running job sees the results so far",
+        "Retake the lock at the end, set the integration branch, mark merged_upstream patches deleted, close the positions and record the new and previous integration heads",
+        "Force-push the integration branch to the fork when rebuild_push_integration_branch is true, letting a failure leave the job completed",
+        "Detect a patch tip or upstream head that moved during the run, keep the result built from the tips the job started with and queue exactly one follow-up rebuild submitted by the system"
+      ],
+      "touches": [
+        "src/rebuild/job.ts",
+        "src/rebuild/job.test.ts",
+        "src/rebuild/job.integration.test.ts",
+        "src/rebuild/apply.ts",
+        "src/jobs/rebuild.ts",
+        "src/store/migrations/"
+      ],
+      "depends_on": [
+        1
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 5,
+      "kind": "implement",
+      "title": "Serve the rebuild routes",
+      "criteria": [
+        "09-REQ-7"
+      ],
+      "tests": [
+        "TS-09-37",
+        "TS-09-38",
+        "TS-09-39",
+        "TS-09-40",
+        "TS-09-41",
+        "TS-09-42"
+      ],
+      "steps": [
+        "Add this task's behaviours to the rebuild routes' test files, and confirm they fail",
+        "Implement the submit: check the workspace is carry_patch and ready, that a patch is active or conflict and that no rebuild is queued or running, then queue the job and answer 202",
+        "Take the strategy and fail mode from the body where given and from the workspace's settings otherwise",
+        "Refuse with 400 workspace_mode_mismatch, 400 no_active_patches, 400 for an unready workspace or an invalid field, and 409 concurrent_rebuild",
+        "Implement the list and the read, answering 404 for an unknown job and for one of another workspace",
+        "Implement cancel for a queued job and requeue for a dead-lettered one, answering 409 for any other status and for a requeue while another rebuild is queued or running",
+        "Implement rollback to a completed job's previous integration head, answering 409 for a job with no previous head, 409 workspace_busy for a held lock and 500 for a failed reset",
+        "Implement the preview: try every patch that is not disabled or merged upstream in position order against the upstream head and the patches before it that would succeed, report would_succeed with a tree or would_conflict with its files, report a missing branch as would_succeed, write nothing, and answer 400 for a standard workspace"
+      ],
+      "touches": [
+        "src/routes/rebuilds.ts",
+        "src/routes/rebuilds.test.ts",
+        "src/routes/rebuilds.integration.test.ts",
+        "src/rebuild/preview.ts"
+      ],
+      "depends_on": [
+        4
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 6,
+      "kind": "implement",
+      "title": "Reset a patch branch to the fork",
+      "criteria": [
+        "09-REQ-4"
+      ],
+      "tests": [
+        "TS-09-16",
+        "TS-09-17",
+        "TS-09-18",
+        "TS-09-19",
+        "TS-09-20"
+      ],
+      "steps": [
+        "Add this task's behaviours to the reset-to-origin test files, and confirm they fail",
+        "Check the preconditions in order: not archived and carry_patch, ready, the patch exists, not the integration branch, and the status is active, conflict or disabled",
+        "Fetch the branch from the fork and move it by the first rule that applies: created, none, fast_forwarded or replaced",
+        "Keep the old tip where this deployment keeps replaced tips when the move discards commits, superseding an earlier backup, and report it as replaced_sha",
+        "Record the patch as in sync at the fork's tip under patch_branch_source origin",
+        "Queue a rebuild when the branch moved and the patch is active or conflict, unless auto_rebuild_after_sync is false or one is already queued, and report whether one was queued and its id",
+        "Report missing_on_origin, ref_changed, workspace_busy, origin_fetch_failed and the read-back failure with their documented statuses, never leaving the patch record describing a move that did not happen"
+      ],
+      "touches": [
+        "src/patch/reset_to_origin.ts",
+        "src/patch/reset_to_origin.test.ts",
+        "src/patch/reset_to_origin.integration.test.ts",
+        "src/routes/patches.ts"
+      ],
+      "depends_on": [
+        1,
+        5
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 7,
+      "kind": "implement",
+      "title": "Extend the sync for a carry-patch workspace",
+      "criteria": [
+        "09-REQ-5"
+      ],
+      "tests": [
+        "TS-09-21",
+        "TS-09-22",
+        "TS-09-23",
+        "TS-09-24",
+        "TS-09-25",
+        "TS-09-26",
+        "TS-09-27",
+        "TS-09-28"
+      ],
+      "steps": [
+        "Add this task's behaviours to the carry-patch sync integration test file, and confirm they fail",
+        "Take over package 08's sync route at its documented branch point for carry_patch workspaces",
+        "Perform the steps in order: resolve the fork's credentials under patch_branch_source origin, fetch every upstream branch and the upstream head, fetch and prune the fork under origin, detect a force-push, refresh the patch branches, detect patches merged upstream, write the sync fields, queue a rebuild",
+        "Refresh each active, conflict or disabled patch's branch by the first rule that applies, under the divergence policy, never touching the integration branch, recording each patch's origin state, SHA and time and clearing all three under patch_branch_source hub",
+        "Detect patches merged upstream by ancestry, by content and by a pull request number in a recent upstream commit message, according to squash_merge_detection, clearing the origin fields of a matched patch",
+        "Queue one rebuild when the upstream advanced, an active or conflict patch's branch moved, or a patch became merged upstream, unless auto_rebuild_after_sync is false or one is already queued",
+        "On a branch refresh failure answer 500 with a message distinguishing the three cases, record the outcomes already reached, queue a rebuild for branches already moved, and write neither upstream_head_sha nor last_sync_at",
+        "Answer with the workspace plus patches_merged, rebuild_triggered, rebuild_job_id, force_push_detected, origin_fetched and, under patch_branch_source origin, patches_synced and patches_diverged, leaving sync_error unused and updating last_sync_at on every completed sync"
+      ],
+      "touches": [
+        "src/sync/carry_patch.ts",
+        "src/sync/carry_patch.integration.test.ts",
+        "src/sync/refresh_patches.ts",
+        "src/sync/merged_upstream.ts",
+        "src/routes/sync.ts"
+      ],
+      "depends_on": [
+        1,
+        5
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 8,
+      "kind": "implement",
+      "title": "Serve the rerere routes",
+      "criteria": [
+        "09-REQ-8"
+      ],
+      "tests": [
+        "TS-09-43",
+        "TS-09-44",
+        "TS-09-45"
+      ],
+      "steps": [
+        "Add this task's behaviours to the rerere routes' test files, and confirm they fail",
+        "List a workspace's recorded resolutions newest first with their identity, path, recorded time and whether a resolution will be replayed, answering an empty array when there are none",
+        "Forget a resolution by identity, or by a path that is currently in conflict, answering 204 so the next occurrence is reported rather than replayed",
+        "Refuse an empty or invalid pathspec with 400 before the workspace is looked up, an unmatched identity or path with 404, and a held lock with 409 workspace_busy",
+        "Keep the slashes of a path pathspec while percent-encoding everything else, as the CLI reference requires"
+      ],
+      "touches": [
+        "src/routes/rerere.ts",
+        "src/routes/rerere.test.ts",
+        "src/routes/rerere.integration.test.ts"
+      ],
+      "depends_on": [
+        4
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 9,
+      "kind": "implement",
+      "title": "Serve the patch-status dashboard",
+      "criteria": [
+        "09-REQ-9"
+      ],
+      "tests": [
+        "TS-09-46",
+        "TS-09-47",
+        "TS-09-48"
+      ],
+      "steps": [
+        "Add this task's behaviours to the dashboard test files, and confirm they fail",
+        "Assemble the workspace's state, its latest rebuild's id and status, every non-deleted patch in position order with its latest rebuild result, and the summary counts",
+        "Include a patch's conflicting files only where its latest rebuild result is a conflict, and its origin fields only under patch_branch_source origin",
+        "Make the counts agree with the patches listed, proved by a generative test, and report 0 rerere resolutions when they cannot be read",
+        "Refuse a workspace that is not carry_patch with 400"
+      ],
+      "touches": [
+        "src/routes/patch_status.ts",
+        "src/routes/patch_status.test.ts",
+        "src/routes/patch_status.integration.test.ts"
+      ],
+      "depends_on": [
+        2,
+        5
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 10,
+      "kind": "implement",
+      "title": "Queue a rebuild when a patch branch is pushed",
+      "criteria": [
+        "09-REQ-10"
+      ],
+      "tests": [
+        "TS-09-49",
+        "TS-09-50"
+      ],
+      "steps": [
+        "Add this task's behaviours to the rebuild trigger integration test file, and confirm they fail",
+        "At the after-push step package 07 left for it, queue a rebuild when an accepted update touched a registered patch branch and auto_rebuild_after_push is not false",
+        "Do not make the push's answer wait for the rebuild",
+        "Queue at most one rebuild per workspace whatever the trigger, so a push, a sync and a reset never produce a second while one is queued or running, and report rebuild_triggered false where the caller is told"
+      ],
+      "touches": [
+        "src/git/after_push.ts",
+        "src/rebuild/trigger.ts",
+        "src/rebuild/trigger.integration.test.ts"
+      ],
+      "depends_on": [
+        5,
+        6,
+        7
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 11,
+      "kind": "integration",
+      "title": "Verify the patch stack end to end against a running deployment",
+      "tests": [
+        "TS-09-51",
+        "TS-09-52",
+        "TS-09-53",
+        "TS-09-54"
+      ],
+      "steps": [
+        "Add the four smoke tests and confirm each passes against a running deployment with a real upstream and fork and the real afc binary, or skips with a message naming what was missing",
+        "Trace 09-PATH-1: the add resolves the branch in the real repository, the submit queues a real job, the job drives the history engine of package 06 against the repository store of package 05, and the integration branch is set",
+        "Trace 09-PATH-2: the sync fetches the real upstream, the merged-upstream detection reads real commits, and the queued rebuild retires the merged patch",
+        "Trace 09-PATH-3: the conflict reaches the resolution store of package 06 and the second rebuild replays it, with no fixture standing in for either",
+        "Trace 09-PATH-4: the divergence is found against the real fork and the reset keeps the old tip where package 05's capability report says replaced tips are kept",
+        "For every criterion carrying a contract, confirm a caller in production code consumes the producer's result and not only a test: the branch resolution is called by the add, the history engine by the rebuild and the preview, the trigger by the push, the sync and the reset, and the capability report by the replaced-tip handling",
+        "Confirm the rebuild holds the workspace lock only at its start and its end by running a sync and a branch push while a rebuild applies patches",
+        "Grep src/patch/, src/rebuild/, src/sync/ and the files every task's touches lists for TODO, FIXME and the project's not-implemented marker, and remove any that remain",
+        "Add the carry-patch conformance cases to the harness from package 01"
+      ],
+      "touches": [
+        "src/rebuild/carry_patch.smoke.test.ts",
+        "conformance/carry_patch.ts"
+      ],
+      "depends_on": [
+        3,
+        6,
+        7,
+        8,
+        9,
+        10
+      ],
+      "done_when": [
+        "`make check` passes with no network access and no deployment configured",
+        "afc patch, afc rebuild, afc rerere and afc workspace patch-status behave as docs/prd/cli.md specifies against a running deployment"
+      ],
+      "state": "pending"
+    }
+  ]
+}

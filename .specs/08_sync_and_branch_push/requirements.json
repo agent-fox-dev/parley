@@ -1,0 +1,400 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v2.json",
+  "spec_id": "08",
+  "spec_name": "sync_and_branch_push",
+  "schema_version": 2,
+  "introduction": "Two routes keep a workspace and its remote in step: a sync that brings the remote's work in, with six distinct outcomes, and a branch push that sends one branch back out under eight ordered checks. A reclone recovers a repository that is beyond repair without losing commits that exist only inside Parley.",
+  "glossary": {
+    "branch push": "Sending exactly one branch of the workspace's repository to origin with the workspace's stored credential, fast-forward only unless force is given.",
+    "diverged origin": "An origin whose head does not descend from the workspace's local head, usually because someone force-pushed. It is refused rather than merged, and recovered with reset_to_upstream.",
+    "protected branch": "The workspace's own branch, which this route refuses to force-push.",
+    "reclone": "Discarding a workspace's repository and copying it again, after first pushing out what branches it can, as the last resort for a repository that cannot be repaired.",
+    "sync outcome": "One of the six results of a standard sync: up to date, fast-forward, reset, diverged, fetch failure, or cancelled. Each has its own status and its own effect on the workspace's fields."
+  },
+  "requirements": [
+    {
+      "id": "08-REQ-1",
+      "title": "The outcomes of a standard sync",
+      "rationale": "A client distinguishes recoverable divergence from a failed fetch by the status and the recorded error, and conflating them hides the recovery.",
+      "criteria": [
+        {
+          "id": "08-REQ-1.1",
+          "pattern": "complex_event",
+          "condition": "a sync runs on a standard workspace",
+          "guard": "origin's head equals the workspace's local head",
+          "system": "Parley service",
+          "action": "report the workspace as up to date and record the time",
+          "contract": "HTTP 200 with the workspace; last_sync_at is the time of this sync; head_sha is unchanged and sync_error is null"
+        },
+        {
+          "id": "08-REQ-1.2",
+          "pattern": "complex_event",
+          "condition": "a sync runs on a standard workspace",
+          "guard": "origin's head descends from the workspace's local head",
+          "system": "Parley service",
+          "action": "fast-forward the workspace's branch to origin's head",
+          "contract": "HTTP 200; head_sha and upstream_head_sha both equal origin's head; last_sync_at is updated and sync_error is null"
+        },
+        {
+          "id": "08-REQ-1.3",
+          "pattern": "complex_event",
+          "condition": "a sync runs with reset_to_upstream true on a standard workspace",
+          "guard": "origin's head differs from the workspace's local head",
+          "system": "Parley service",
+          "action": "move the workspace's branch to origin's head whatever the ancestry",
+          "contract": "HTTP 200; head_sha and upstream_head_sha equal origin's head even where origin's head does not descend from the previous local head; sync_error is null"
+        },
+        {
+          "id": "08-REQ-1.4",
+          "pattern": "unwanted",
+          "condition": "origin's head does not descend from the workspace's local head and reset_to_upstream was not given",
+          "system": "Parley service",
+          "action": "refuse the sync and record how to recover",
+          "contract": "HTTP 409 in the error envelope; sync_error is set and names reset_to_upstream as the recovery; head_sha is unchanged"
+        },
+        {
+          "id": "08-REQ-1.5",
+          "pattern": "unwanted",
+          "condition": "the fetch from origin fails, or the credentials cannot be resolved",
+          "system": "Parley service",
+          "action": "refuse the sync and record the failure",
+          "contract": "HTTP 502 in the error envelope; sync_error is set and contains no credential; head_sha and upstream_head_sha are unchanged"
+        },
+        {
+          "id": "08-REQ-1.6",
+          "pattern": "unwanted",
+          "condition": "a sync is cancelled part way, by a timeout or a disconnected client",
+          "system": "Parley service",
+          "action": "end the sync and record that it was cancelled",
+          "contract": "HTTP 504 in the error envelope; sync_error is set; the workspace is left in a state a retry recovers from"
+        },
+        {
+          "id": "08-REQ-1.7",
+          "pattern": "event_driven",
+          "condition": "a sync succeeds after an earlier one failed",
+          "system": "Parley service",
+          "action": "clear the recorded sync error",
+          "contract": "sync_error is null after the successful sync, so the field describes the present condition rather than a history"
+        }
+      ]
+    },
+    {
+      "id": "08-REQ-2",
+      "title": "When a sync may run",
+      "rationale": "A sync writes the repository, so the preconditions are what stop two of them colliding or one running against a repository that does not exist.",
+      "criteria": [
+        {
+          "id": "08-REQ-2.1",
+          "pattern": "unwanted",
+          "condition": "a sync is called on a workspace that is not ready, or whose sync_enabled setting is false",
+          "system": "Parley service",
+          "action": "refuse it and change nothing",
+          "contract": "HTTP 400 in the error envelope; no fetch is attempted and no workspace field changes"
+        },
+        {
+          "id": "08-REQ-2.2",
+          "pattern": "unwanted",
+          "condition": "a sync finds another operation holding the workspace's lock",
+          "system": "Parley service",
+          "action": "refuse it at once rather than waiting",
+          "contract": "HTTP 409 with error_type workspace_busy; the same sync succeeds once the lock is free"
+        },
+        {
+          "id": "08-REQ-2.3",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "treat a sync in progress as the holding of the lock and not as a stored status",
+          "contract": "the workspace's status stays ready throughout a sync; a second concurrent sync is refused by the lock"
+        }
+      ]
+    },
+    {
+      "id": "08-REQ-3",
+      "title": "Recloning a workspace",
+      "rationale": "It is the last resort for an unusable repository, and it must not be the operation that loses the commits it was meant to rescue.",
+      "criteria": [
+        {
+          "id": "08-REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "a reclone is called on a workspace that is not archived and has no copy under way",
+          "system": "Parley service",
+          "action": "push what branches it can to origin, discard the repository, clear the sync fields and copy the repository again",
+          "contract": "HTTP 200 with the workspace at status pending, sync_error null and upstream_head_sha null; the status then follows the new copy to ready or failed"
+        },
+        {
+          "id": "08-REQ-3.2",
+          "pattern": "unwanted",
+          "condition": "the reclone's push to origin fails, or there is no usable credential",
+          "system": "Parley service",
+          "action": "carry on with the reclone regardless",
+          "contract": "the reclone still answers 200 with status pending and the repository is copied again; the push failure does not surface as the route's answer"
+        },
+        {
+          "id": "08-REQ-3.3",
+          "pattern": "unwanted",
+          "condition": "a reclone is called on an archived workspace, on one whose copy is already under way, or while the workspace's lock is held",
+          "system": "Parley service",
+          "action": "refuse it and change nothing",
+          "contract": "HTTP 400 for an archived workspace, HTTP 409 for a copy under way, HTTP 409 with error_type workspace_busy for a held lock; the repository is untouched"
+        },
+        {
+          "id": "08-REQ-3.4",
+          "pattern": "unwanted",
+          "condition": "the repository cannot be discarded, or the workspace cannot be updated",
+          "system": "Parley service",
+          "action": "refuse the reclone",
+          "contract": "HTTP 500 in the error envelope; the workspace keeps its previous status and repository"
+        }
+      ]
+    },
+    {
+      "id": "08-REQ-4",
+      "title": "The branch push's checks, in order",
+      "rationale": "Every refusal here can be produced for the wrong reason, and only the order distinguishes a correct implementation from one that happens to agree on simple cases.",
+      "criteria": [
+        {
+          "id": "08-REQ-4.1",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "check the credential, then a personal access token's workspaces:write before the workspace is looked up, then the workspace and write access, then the body, then the branch name, then that the workspace is ready, then the branches it will not push, then the workspace lock without waiting",
+          "contract": "for each pair of conditions that would both fail, the answer is the one belonging to the earlier check; a PAT without the scope gets 403 even for a slug that names nothing"
+        },
+        {
+          "id": "08-REQ-4.2",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "take the branch name from one path segment, decoded exactly once",
+          "contract": "fix%2F42-nil-map names fix/42-nil-map and a%2525b names a%25b; a name with an unescaped slash matches no route and is 404"
+        },
+        {
+          "id": "08-REQ-4.3",
+          "pattern": "unwanted",
+          "condition": "the branch name breaks git's branch-name rules or starts with a hyphen",
+          "system": "Parley service",
+          "action": "refuse the request, naming the rule broken",
+          "contract": "HTTP 404 with error_type branch_not_found and a message beginning \"branch_not_found: \" and naming the rule"
+        },
+        {
+          "id": "08-REQ-4.4",
+          "pattern": "unwanted",
+          "condition": "the workspace's status is not ready, or the body is not a JSON object or carries a non-boolean force",
+          "system": "Parley service",
+          "action": "refuse the request and push nothing",
+          "contract": "HTTP 400 in the error envelope; an empty body, {} and a body with unknown fields are all accepted and push without force"
+        },
+        {
+          "id": "08-REQ-4.5",
+          "pattern": "unwanted",
+          "condition": "the branch is a carry_patch workspace's integration branch, a registered patch that is not deleted, or — with force — the workspace's own branch",
+          "system": "Parley service",
+          "action": "refuse the request and push nothing",
+          "contract": "HTTP 400 with error_type integration_branch, patch_branch or protected_branch respectively; the answer is the same whether or not the workspace's lock is held"
+        },
+        {
+          "id": "08-REQ-4.6",
+          "pattern": "unwanted",
+          "condition": "the branch push finds the workspace's lock held",
+          "system": "Parley service",
+          "action": "refuse it at once rather than waiting",
+          "contract": "HTTP 409 with error_type workspace_busy"
+        },
+        {
+          "id": "08-REQ-4.7",
+          "pattern": "unwanted",
+          "condition": "force is given and the workspace has no branch set and the name is the branch HEAD points to, or the repository has no such branch",
+          "system": "Parley service",
+          "action": "refuse the request and push nothing",
+          "contract": "HTTP 400 with error_type protected_branch for the HEAD branch; HTTP 404 with error_type branch_not_found and the message naming the branch for one the repository lacks"
+        }
+      ]
+    },
+    {
+      "id": "08-REQ-5",
+      "title": "What a branch push answers",
+      "rationale": "afc prints the result verbatim, and a push that reports the wrong result tells an operator a branch reached the forge when it did not.",
+      "criteria": [
+        {
+          "id": "08-REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "a branch push succeeds",
+          "system": "Parley service",
+          "action": "answer with the branch, the commit offered, the remote and its URL, and the result",
+          "contract": "HTTP 200 with branch, sha as the 40-character tip offered to origin, remote \"origin\", remote_url and result"
+        },
+        {
+          "id": "08-REQ-5.2",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "report result as up_to_date when origin already had the commit and nothing was sent, forced when force was given and origin accepted an update, and pushed otherwise",
+          "contract": "pushing an unchanged branch again reports up_to_date, including with force; a forced update origin accepts reports forced"
+        },
+        {
+          "id": "08-REQ-5.3",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "report remote_url as git_url without its userinfo, leaving an scp-style address unchanged",
+          "contract": "an https URL carrying userinfo is reported without it; git@host:path is reported exactly as stored"
+        },
+        {
+          "id": "08-REQ-5.4",
+          "pattern": "event_driven",
+          "condition": "the caller of a branch push disconnects while the push is running",
+          "system": "Parley service",
+          "action": "run the push to its end or its two-minute deadline and record its outcome as if the caller were there",
+          "contract": "the branch's state on origin after the disconnect is the same as it would have been had the caller waited; calling the route again reports where the branch stands"
+        }
+      ]
+    },
+    {
+      "id": "08-REQ-6",
+      "title": "How a branch push fails",
+      "rationale": "afc shows only the message, so the error type has to be in it, and nothing in it may be a credential.",
+      "criteria": [
+        {
+          "id": "08-REQ-6.1",
+          "pattern": "unwanted",
+          "condition": "origin's branch has commits the workspace's branch lacks",
+          "system": "Parley service",
+          "action": "refuse the push and say how to proceed",
+          "contract": "HTTP 409 with error_type non_fast_forward; the message names origin's commit when origin's refs could be listed and ends with an instruction to push with force, or to sync the workspace when the branch is the workspace's own; where force was given and origin still refused, it says origin refuses non-fast-forward updates even with force"
+        },
+        {
+          "id": "08-REQ-6.2",
+          "pattern": "unwanted",
+          "condition": "origin has no such repository or the credential cannot see it, or origin refuses the ref",
+          "system": "Parley service",
+          "action": "refuse the push with the matching type",
+          "contract": "HTTP 404 with error_type forge_not_found for the first; HTTP 422 with error_type forge_rejected for the second, carrying origin's scrubbed reason"
+        },
+        {
+          "id": "08-REQ-6.3",
+          "pattern": "unwanted",
+          "condition": "origin answers 401 or 403, the connection fails, origin answers in a way the service cannot read, or the two-minute deadline passes",
+          "system": "Parley service",
+          "action": "refuse the push with the matching type",
+          "contract": "HTTP 502 with error_type forge_unauthenticated, forge_forbidden, forge_unreachable or forge_error as applicable, and HTTP 504 with error_type forge_timeout at the deadline; forge_unauthenticated says whether the workspace has no stored credential or which kind origin rejected"
+        },
+        {
+          "id": "08-REQ-6.4",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "begin the message of any answer carrying one of this route's own error types with that type followed by a colon and a space",
+          "contract": "for each of this route's error types the message starts with \"<type>: \"; answers shared with other routes keep their usual messages"
+        },
+        {
+          "id": "08-REQ-6.5",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "keep the credential, the userinfo of git_url and the underlying git error out of every answer of both routes",
+          "contract": "no response body of a sync, a reclone or a branch push contains the credential, userinfo, or the git transport's own error text"
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "08-PATH-1",
+      "title": "A sync brings the remote's new commits in",
+      "steps": [
+        {
+          "actor": "API client",
+          "action": "calls the sync route on a standard workspace whose origin has advanced"
+        },
+        {
+          "actor": "Parley service",
+          "action": "takes the workspace lock and resolves the origin credential from the workspace's secrets"
+        },
+        {
+          "actor": "Parley service",
+          "action": "fetches origin and fast-forwards the workspace's branch in the repository"
+        },
+        {
+          "actor": "repository store",
+          "action": "holds the advanced branch"
+        },
+        {
+          "actor": "API client",
+          "action": "receives the workspace with head_sha and upstream_head_sha at origin's head, last_sync_at set and sync_error null"
+        }
+      ]
+    },
+    {
+      "id": "08-PATH-2",
+      "title": "A rewritten origin is refused and then recovered",
+      "steps": [
+        {
+          "actor": "API client",
+          "action": "syncs a workspace whose origin was force-pushed"
+        },
+        {
+          "actor": "Parley service",
+          "action": "finds origin's head does not descend from the local head, records the sync error and answers 409"
+        },
+        {
+          "actor": "API client",
+          "action": "reads the workspace and sees sync_error naming reset_to_upstream"
+        },
+        {
+          "actor": "API client",
+          "action": "syncs again with reset_to_upstream"
+        },
+        {
+          "actor": "Parley service",
+          "action": "moves the branch to origin's head, clears sync_error and answers 200"
+        }
+      ]
+    },
+    {
+      "id": "08-PATH-3",
+      "title": "An agent's branch is pushed to the forge",
+      "steps": [
+        {
+          "actor": "git client",
+          "action": "pushes a branch whose name contains a slash to Parley's git server"
+        },
+        {
+          "actor": "API client",
+          "action": "calls the branch push route with that name as one escaped path segment"
+        },
+        {
+          "actor": "Parley service",
+          "action": "runs its checks in order, takes the lock and resolves the origin credential"
+        },
+        {
+          "actor": "forge",
+          "action": "accepts the branch at the offered commit"
+        },
+        {
+          "actor": "API client",
+          "action": "receives result pushed with the branch, the SHA offered and the remote URL without userinfo"
+        }
+      ]
+    },
+    {
+      "id": "08-PATH-4",
+      "title": "A broken repository is recloned",
+      "steps": [
+        {
+          "actor": "API client",
+          "action": "calls the reclone route on a workspace whose repository is unusable"
+        },
+        {
+          "actor": "Parley service",
+          "action": "pushes what branches it can to origin, then discards the repository and clears the sync fields"
+        },
+        {
+          "actor": "Parley service",
+          "action": "copies the repository again and answers 200 with status pending"
+        },
+        {
+          "actor": "repository store",
+          "action": "holds the freshly copied repository"
+        },
+        {
+          "actor": "API client",
+          "action": "polls the workspace and finds it ready again"
+        }
+      ]
+    }
+  ]
+}

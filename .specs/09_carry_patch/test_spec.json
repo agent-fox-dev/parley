@@ -1,0 +1,1032 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/test_spec.v2.json",
+  "spec_id": "09",
+  "spec_name": "carry_patch",
+  "schema_version": 2,
+  "tests": [
+    {
+      "id": "TS-09-1",
+      "kind": "integration",
+      "verifies": [
+        "09-REQ-1.1",
+        "09-REQ-1.3"
+      ],
+      "title": "A patch is added and its branch resolved by the documented order",
+      "given": [
+        "a carry_patch workspace with a branch in its own repository, one present only as the fork's fetched copy, and one only on the fork"
+      ],
+      "when": "each is added, with patch_branch_source hub and then origin, and once with skip_branch_check",
+      "then": [
+        "each add answers 201 with status active and a position",
+        "the resolutions are local, origin_tracking and origin_fetch respectively",
+        "origin_fetch happens only with patch_branch_source origin",
+        "skip_branch_check reports skipped and creates no branch"
+      ],
+      "pseudocode": "in the patch routes' integration test file, table over (branchLocation, setting, expectedResolution)"
+    },
+    {
+      "id": "TS-09-2",
+      "kind": "unit",
+      "verifies": [
+        "09-REQ-1.2"
+      ],
+      "title": "A position inserts and shifts, and past the end appends",
+      "given": [
+        "a workspace with three patches"
+      ],
+      "when": "patches are added at position 1, at position 3, at position 99 and with no position",
+      "then": [
+        "each insert moves the patches at and after it down by one",
+        "a position past the end and an omitted position both append",
+        "the positions are 1 to n with no gap after each add"
+      ],
+      "pseudocode": "in the patch list test file, table over the positions asserting the resulting order"
+    },
+    {
+      "id": "TS-09-3",
+      "kind": "unit",
+      "verifies": [
+        "09-REQ-1.4"
+      ],
+      "title": "if_not_exists answers with the existing patch",
+      "given": [
+        "a workspace whose list already holds a branch"
+      ],
+      "when": "the same branch is added with if_not_exists and then without it",
+      "then": [
+        "the first answers 200 with the existing patch unchanged",
+        "the second answers 409",
+        "no second patch is added in either case"
+      ],
+      "pseudocode": "in the patch routes' test file: assert post(branch, if_not_exists=True).status == 200 and post(branch).status == 409"
+    },
+    {
+      "id": "TS-09-4",
+      "kind": "integration",
+      "verifies": [
+        "09-REQ-1.5"
+      ],
+      "title": "A batch validates all syntax first and then all branches",
+      "given": [
+        "a carry_patch workspace and a fork"
+      ],
+      "when": "a batch is sent whose first element names a missing branch and whose second has position 0, and then a batch whose second element names a missing branch after a first whose branch must be created",
+      "then": [
+        "the first batch answers for the second element's syntax, not the first element's missing branch",
+        "the second batch is refused whole and adds no patch",
+        "the branch created for its first element remains and resolves as local on a later add"
+      ],
+      "pseudocode": "in the patch routes' integration test file: assert 'patch[1]' in post(batchA).json.error.message; post(batchB); assert patches() == [] and resolution(retry) == 'local'"
+    },
+    {
+      "id": "TS-09-5",
+      "kind": "unit",
+      "verifies": [
+        "09-REQ-1.6"
+      ],
+      "title": "Malformed adds are refused and change nothing",
+      "given": [
+        "a carry_patch workspace, a standard one and an archived one"
+      ],
+      "when": "adds are made with no branch name, an empty one, the integration branch, position 0, a branch that cannot be resolved, and against the standard and archived workspaces",
+      "then": [
+        "each answers 400",
+        "a batch element's message begins with patch[i]",
+        "the patch list is unchanged in every case"
+      ],
+      "pseudocode": "in the patch routes' test file, table over the refused adds asserting 400 and an unchanged list"
+    },
+    {
+      "id": "TS-09-6",
+      "kind": "unit",
+      "verifies": [
+        "09-REQ-1.7"
+      ],
+      "title": "Duplicates, a busy workspace and a failed fork fetch are refused",
+      "given": [
+        "a workspace whose list holds a branch, a workspace whose lock is held, and a fork that refuses a fetch"
+      ],
+      "when": "the existing branch is added, a batch names one branch twice, a branch needing creation is added while the lock is held, and a branch is added that needs a fork fetch that fails",
+      "then": [
+        "the duplicate and the repeated batch entry answer 409",
+        "the busy workspace answers 409 workspace_busy",
+        "the failed fetch answers 502 with error_type origin_fetch_failed",
+        "the list is unchanged in every case"
+      ],
+      "pseudocode": "in the patch routes' test file, table over the four cases asserting status, error_type and an unchanged list"
+    },
+    {
+      "id": "TS-09-7",
+      "kind": "unit",
+      "verifies": [
+        "09-REQ-2.1"
+      ],
+      "title": "Patches are listed in position order without deleted ones",
+      "given": [
+        "a carry_patch workspace with four patches of which one is deleted, and a standard workspace"
+      ],
+      "when": "each workspace's patches are listed",
+      "then": [
+        "the carry_patch workspace returns three patches in ascending position order",
+        "the deleted patch is absent",
+        "the standard workspace returns an empty array"
+      ],
+      "pseudocode": "in the patch routes' test file: assert [p.position for p in list()] == [1,2,3] and deleted.id not in ids(list())"
+    },
+    {
+      "id": "TS-09-8",
+      "kind": "integration",
+      "verifies": [
+        "09-REQ-2.2"
+      ],
+      "title": "One patch is read, a deleted one included, with its replaced tip where one is kept",
+      "given": [
+        "a live patch with a kept replaced tip, a live patch with none, a deleted patch, and a workspace with no repository"
+      ],
+      "when": "each is read",
+      "then": [
+        "each answers 200 with the patch",
+        "replaced_sha is the 40-character SHA only where a backup exists",
+        "it is absent for the workspace with no repository, and a failed lookup does not fail the request"
+      ],
+      "pseudocode": "in the patch routes' integration test file, table over the four cases asserting the presence of replaced_sha"
+    },
+    {
+      "id": "TS-09-9",
+      "kind": "unit",
+      "verifies": [
+        "09-REQ-2.3"
+      ],
+      "title": "An update changes the fields it names and keeps the list contiguous",
+      "given": [
+        "a workspace with four patches"
+      ],
+      "when": "a patch's position, status, description and upstream pull request are changed, singly and together, and a branch_name is included in a body",
+      "then": [
+        "each named field changes and the others do not",
+        "the branch_name in the body is ignored",
+        "the positions are 1 to n after a position change"
+      ],
+      "pseudocode": "in the patch routes' test file, table over the fields asserting the change and the resulting positions"
+    },
+    {
+      "id": "TS-09-10",
+      "kind": "unit",
+      "verifies": [
+        "09-REQ-2.4"
+      ],
+      "title": "Invalid updates are refused",
+      "given": [
+        "a workspace with two patches and one deleted patch"
+      ],
+      "when": "updates set an unknown status, the status deleted, a position of 0 and of n+1, name a patch that does not exist, and target the deleted patch",
+      "then": [
+        "the invalid status, the status deleted and the out-of-range positions answer 400",
+        "the unknown patch answers 404",
+        "the deleted patch answers 409",
+        "no patch changes"
+      ],
+      "pseudocode": "in the patch routes' test file, table over the six cases asserting status and an unchanged patch"
+    },
+    {
+      "id": "TS-09-11",
+      "kind": "property",
+      "verifies": [
+        "09-REQ-2.5"
+      ],
+      "title": "Positions stay contiguous under any sequence of operations",
+      "given": [
+        "a carry_patch workspace and the patch operations: add, update position, remove, restore, reorder and rebuild"
+      ],
+      "when": "generated sequences of those operations are applied",
+      "then": [
+        "after every operation the non-deleted patches hold positions 1 to n",
+        "no position is repeated and none is skipped"
+      ],
+      "pseudocode": "in the patch list test file, a generative test over operation sequences asserting positions == list(range(1, n+1))"
+    },
+    {
+      "id": "TS-09-12",
+      "kind": "integration",
+      "verifies": [
+        "09-REQ-3.1"
+      ],
+      "title": "Removing a patch closes the positions and discards its backup",
+      "given": [
+        "a workspace with three patches, the middle one holding a kept replaced tip"
+      ],
+      "when": "the middle patch is removed, and a removal is made where discarding the backup fails",
+      "then": [
+        "each answers 204",
+        "the remaining patches hold positions 1 and 2",
+        "the backup is gone after the first",
+        "the failed discard does not change the answer"
+      ],
+      "pseudocode": "in the patch routes' integration test file: delete(mid); assert [p.position for p in list()] == [1,2] and backup(mid) is None"
+    },
+    {
+      "id": "TS-09-13",
+      "kind": "unit",
+      "verifies": [
+        "09-REQ-3.2"
+      ],
+      "title": "A deleted patch is restored to the end as active",
+      "given": [
+        "a workspace with two live patches and one deleted"
+      ],
+      "when": "the deleted patch is restored",
+      "then": [
+        "the response is 200 with status active",
+        "its position is the last",
+        "deleted_at is null"
+      ],
+      "pseudocode": "in the patch routes' test file: r = post(restore); assert r.json.status == 'active' and r.json.position == 3 and r.json.deleted_at is None"
+    },
+    {
+      "id": "TS-09-14",
+      "kind": "unit",
+      "verifies": [
+        "09-REQ-3.3"
+      ],
+      "title": "A reorder sets the whole list's order",
+      "given": [
+        "a workspace with three patches"
+      ],
+      "when": "the reorder route is called with their ids in a new order",
+      "then": [
+        "the response is 200 with every patch in the new order",
+        "the first id holds position 1 and the last position 3"
+      ],
+      "pseudocode": "in the patch routes' test file: r = post(reorder, [c, a, b]); assert [p.id for p in r.json] == [c, a, b]"
+    },
+    {
+      "id": "TS-09-15",
+      "kind": "unit",
+      "verifies": [
+        "09-REQ-3.4"
+      ],
+      "title": "Bad reorders and restores are refused",
+      "given": [
+        "a workspace with three patches, a live patch, and another workspace's patch"
+      ],
+      "when": "reorders are sent that are empty, omit an id, repeat one and name a foreign patch, and restores are called on a live patch, on a standard workspace and on an archived one",
+      "then": [
+        "each reorder answers 400 and no position changes",
+        "the restore of a live patch answers 400",
+        "an unknown patch answers 404"
+      ],
+      "pseudocode": "in the patch routes' test file, two tables asserting the status and an unchanged list"
+    },
+    {
+      "id": "TS-09-16",
+      "kind": "unit",
+      "verifies": [
+        "09-REQ-4.1"
+      ],
+      "title": "reset-to-origin checks its preconditions in order",
+      "given": [
+        "an archived workspace, a standard one, one that is not ready, a missing patch, the integration branch and a merged_upstream patch"
+      ],
+      "when": "reset-to-origin is called for each, including combinations where two preconditions would both fail",
+      "then": [
+        "the answer is the one belonging to the earlier check in each combination",
+        "an archived or standard workspace answers 400, a workspace that is not ready answers 409, a missing patch answers 404, the integration branch answers 400 and a merged_upstream or deleted patch answers 409"
+      ],
+      "pseudocode": "in the reset-to-origin test file, table over (conditions, expectedStatus)"
+    },
+    {
+      "id": "TS-09-17",
+      "kind": "integration",
+      "verifies": [
+        "09-REQ-4.2"
+      ],
+      "title": "reset-to-origin applies the first rule that fits",
+      "given": [
+        "a patch the workspace lacks, one at the same commit as the fork, one the fork has advanced beyond, and one that has diverged"
+      ],
+      "when": "reset-to-origin is called for each",
+      "then": [
+        "the actions reported are created, none, fast_forwarded and replaced respectively",
+        "the branch is at the fork's tip afterwards in every case but none",
+        "the none case writes nothing and still answers 200"
+      ],
+      "pseudocode": "in the reset-to-origin integration test file, table over the four cases asserting the action and the resulting ref"
+    },
+    {
+      "id": "TS-09-18",
+      "kind": "integration",
+      "verifies": [
+        "09-REQ-4.3"
+      ],
+      "title": "A reset that discards commits keeps the old tip",
+      "given": [
+        "a patch branch that has diverged from the fork, and one that already has an earlier backup"
+      ],
+      "when": "reset-to-origin is called for each",
+      "then": [
+        "the old tip is recoverable afterwards and is reported as replaced_sha",
+        "the earlier backup is superseded by the new one",
+        "a fast-forward keeps no backup"
+      ],
+      "pseudocode": "in the reset-to-origin integration test file: r = post(reset); assert r.json.replaced_sha == oldTip and backup(branch) == oldTip"
+    },
+    {
+      "id": "TS-09-19",
+      "kind": "integration",
+      "verifies": [
+        "09-REQ-4.4"
+      ],
+      "title": "A reset that moves an active patch queues a rebuild",
+      "given": [
+        "an active patch, a conflict patch, a disabled patch, a workspace with auto_rebuild_after_sync false, and one with a rebuild already queued"
+      ],
+      "when": "reset-to-origin moves the branch in each case",
+      "then": [
+        "the active and conflict patches queue a rebuild and report its id",
+        "the disabled patch queues none",
+        "auto_rebuild_after_sync false queues none",
+        "an existing queued rebuild is not duplicated and rebuild_triggered is false"
+      ],
+      "pseudocode": "in the reset-to-origin integration test file, table over the five cases asserting rebuild_triggered and the job count"
+    },
+    {
+      "id": "TS-09-20",
+      "kind": "integration",
+      "verifies": [
+        "09-REQ-4.5"
+      ],
+      "title": "reset-to-origin reports its failures without leaving the patch inconsistent",
+      "given": [
+        "a fork without the branch, a branch another operation changes mid-reset, a fork that cannot be fetched, a held lock, and a store that fails the read-back after the move"
+      ],
+      "when": "reset-to-origin is called in each case",
+      "then": [
+        "the statuses are 409 missing_on_origin, 409 ref_changed, 502 origin_fetch_failed, 409 workspace_busy and 500 respectively",
+        "the patch record is never left describing a move that did not happen"
+      ],
+      "pseudocode": "in the reset-to-origin integration test file, table over the five failures asserting status, error_type and the patch record"
+    },
+    {
+      "id": "TS-09-21",
+      "kind": "integration",
+      "verifies": [
+        "09-REQ-5.1"
+      ],
+      "title": "A carry-patch sync fetches the upstream, and the fork only when configured to",
+      "given": [
+        "a carry_patch workspace with patch_branch_source hub, and one with origin, each with a recording upstream and fork"
+      ],
+      "when": "each is synced",
+      "then": [
+        "both fetch the upstream",
+        "the hub-sourced workspace makes no request to the fork and reports origin_fetched false",
+        "the origin-sourced workspace fetches the fork, pruning branches it deleted, and reports origin_fetched true"
+      ],
+      "pseudocode": "in the carry-patch sync integration test file, table over the setting asserting fork.requests and origin_fetched"
+    },
+    {
+      "id": "TS-09-22",
+      "kind": "integration",
+      "verifies": [
+        "09-REQ-5.2"
+      ],
+      "title": "The sync's steps run in the documented order",
+      "given": [
+        "failures injected at the credential resolution, the upstream fetch and the fork fetch in turn"
+      ],
+      "when": "a sync is run against each",
+      "then": [
+        "a failure at an earlier step prevents the later ones",
+        "the credential failure answers 502 and fetches nothing",
+        "the upstream fetch failure answers 502 and never fetches the fork",
+        "the fork fetch failure answers 502 with origin_fetch_failed after the upstream was fetched"
+      ],
+      "pseudocode": "in the carry-patch sync integration test file, table over the injected failures asserting the status and which fetches happened"
+    },
+    {
+      "id": "TS-09-23",
+      "kind": "integration",
+      "verifies": [
+        "09-REQ-5.3"
+      ],
+      "title": "An upstream force-push is reported, not refused",
+      "given": [
+        "a carry_patch workspace whose upstream history was rewritten since the last sync"
+      ],
+      "when": "the sync runs",
+      "then": [
+        "the response is 200 with force_push_detected true",
+        "upstream_head_sha advances to the rewritten head",
+        "the queued rebuild applies the patches to the rewritten upstream"
+      ],
+      "pseudocode": "in the carry-patch sync integration test file: r = post(sync); assert r.status == 200 and r.json.force_push_detected is True"
+    },
+    {
+      "id": "TS-09-24",
+      "kind": "integration",
+      "verifies": [
+        "09-REQ-5.4"
+      ],
+      "title": "Patch branches are refreshed from the fork under the divergence policy",
+      "given": [
+        "patches whose branches are missing on the fork, absent locally, identical, behind the fork and diverged",
+        "the replace and the report policies",
+        "the integration branch and a merged_upstream patch"
+      ],
+      "when": "a sync runs with patch_branch_source origin under each policy, and once with patch_branch_source hub",
+      "then": [
+        "the actions are missing_on_origin, created, none, fast_forwarded and, under replace, replaced with the old tip kept, or under report, diverged and left alone",
+        "patches_diverged is empty under replace and lists the branch under report",
+        "the integration branch is never refreshed and a merged_upstream patch is not refreshed",
+        "each patch's origin state, SHA and time are recorded, and with patch_branch_source hub all three are cleared"
+      ],
+      "pseudocode": "in the carry-patch sync integration test file, table over (branchState, policy) asserting the action, the resulting ref and the recorded origin fields"
+    },
+    {
+      "id": "TS-09-25",
+      "kind": "integration",
+      "verifies": [
+        "09-REQ-5.5"
+      ],
+      "title": "Patches merged upstream are found by the configured strategies",
+      "given": [
+        "a patch contained in the upstream by ancestry, one whose commits the upstream has by content, one whose pull request number appears in a recent upstream commit message, and one that is in none of those"
+      ],
+      "when": "a sync runs under squash_merge_detection ancestry_only, content_based and both",
+      "then": [
+        "ancestry_only matches the ancestry case alone",
+        "content_based matches the content and pull request cases",
+        "both matches all three",
+        "each matched patch becomes merged_upstream, has its origin fields cleared and is listed in patches_merged",
+        "the unrelated patch is never matched"
+      ],
+      "pseudocode": "in the carry-patch sync integration test file, table over (strategy, patchKind, expectedMatch)"
+    },
+    {
+      "id": "TS-09-26",
+      "kind": "integration",
+      "verifies": [
+        "09-REQ-5.6"
+      ],
+      "title": "A sync queues one rebuild under the documented conditions",
+      "given": [
+        "syncs where the upstream advanced, where only a disabled patch's branch moved, where an active patch's branch moved, where a patch became merged upstream, and where nothing changed",
+        "workspaces with auto_rebuild_after_sync false and with a rebuild already queued"
+      ],
+      "when": "each sync runs",
+      "then": [
+        "a rebuild is queued when the upstream advanced, an active or conflict patch's branch moved, or a patch became merged upstream",
+        "none is queued when nothing changed, when only a disabled patch's branch moved, or when auto_rebuild_after_sync is false",
+        "an existing queued or running rebuild is not duplicated, and rebuild_triggered is false with rebuild_job_id absent rather than null"
+      ],
+      "pseudocode": "in the carry-patch sync integration test file, table over the conditions asserting rebuild_triggered and the queued job count"
+    },
+    {
+      "id": "TS-09-27",
+      "kind": "integration",
+      "verifies": [
+        "09-REQ-5.7"
+      ],
+      "title": "A failed branch refresh ends the sync with its partial effects recorded",
+      "given": [
+        "syncs where writing a branch fails, where the ancestry comparison fails, and where the working state cannot follow a moved branch"
+      ],
+      "when": "each sync runs after one branch has already been moved",
+      "then": [
+        "each answers 500 with a message distinguishing the three cases",
+        "the outcomes already reached are recorded on their patches",
+        "a rebuild is queued for the branch already moved, unless auto_rebuild_after_sync is false",
+        "neither upstream_head_sha nor last_sync_at is written"
+      ],
+      "pseudocode": "in the carry-patch sync integration test file, table over the three failures asserting the message, the recorded outcomes and the unwritten sync fields"
+    },
+    {
+      "id": "TS-09-28",
+      "kind": "integration",
+      "verifies": [
+        "09-REQ-5.8"
+      ],
+      "title": "A completed carry-patch sync answers with its own fields",
+      "given": [
+        "a carry_patch workspace with patch_branch_source hub and one with origin"
+      ],
+      "when": "each is synced, once where nothing advanced",
+      "then": [
+        "each answers 200 with every workspace field plus patches_merged, rebuild_triggered, force_push_detected and origin_fetched",
+        "patches_synced and patches_diverged appear only with patch_branch_source origin",
+        "sync_error is not set on this path",
+        "last_sync_at is updated even when nothing advanced"
+      ],
+      "pseudocode": "in the carry-patch sync integration test file: r = post(sync); assert set(EXTRA_FIELDS) <= set(r.json) and r.json.sync_error is None"
+    },
+    {
+      "id": "TS-09-29",
+      "kind": "integration",
+      "verifies": [
+        "09-REQ-6.1"
+      ],
+      "title": "A rebuild starts from the fetched upstream head and applies patches in order",
+      "given": [
+        "a carry_patch workspace with four active patches and an upstream that advances between the submit and the start"
+      ],
+      "when": "a rebuild runs",
+      "then": [
+        "the job records the upstream head it fetched at its start",
+        "the patches are attempted in ascending position order",
+        "the results are reported in that order"
+      ],
+      "pseudocode": "in the rebuild integration test file: j = run_rebuild(); assert j.upstream_head_sha == fetched and [r.position for r in j.patch_results] == [1,2,3,4]"
+    },
+    {
+      "id": "TS-09-30",
+      "kind": "unit",
+      "verifies": [
+        "09-REQ-6.2"
+      ],
+      "title": "A rebuild skips the patches it must, with reasons",
+      "given": [
+        "a stack holding a merged_upstream patch, a disabled one, a deleted one, one whose branch is missing and two ordinary ones"
+      ],
+      "when": "a rebuild runs",
+      "then": [
+        "each of the four is reported skipped with the reason merged_upstream, disabled, deleted or branch_not_found",
+        "none of them contributes to the result",
+        "the two ordinary patches are applied"
+      ],
+      "pseudocode": "in the rebuild test file: j = run_rebuild(); assert {r.branch_name: r.skipped_reason for r in j.patch_results if r.status == 'skipped'} == expected"
+    },
+    {
+      "id": "TS-09-31",
+      "kind": "integration",
+      "verifies": [
+        "09-REQ-6.3"
+      ],
+      "title": "A conflict ends or is carried past according to the fail mode",
+      "given": [
+        "a stack of three patches whose second conflicts, with no recorded resolution and then with one"
+      ],
+      "when": "a rebuild runs with fail_fast and with continue, in each case",
+      "then": [
+        "with fail_fast and no resolution the job fails, reporting the conflicting patch and its files",
+        "with continue and no resolution the patch is marked conflict, its changes are left out and the third patch is still attempted",
+        "with a recorded resolution the patch applies cleanly under both fail modes"
+      ],
+      "pseudocode": "in the rebuild integration test file, table over (failMode, resolutionRecorded) asserting the job status and the patch statuses"
+    },
+    {
+      "id": "TS-09-32",
+      "kind": "integration",
+      "verifies": [
+        "09-REQ-6.4"
+      ],
+      "title": "A rebuild's end sets the branch, retires merged patches and closes the positions",
+      "given": [
+        "a stack with one merged_upstream patch among four"
+      ],
+      "when": "a rebuild completes",
+      "then": [
+        "the integration branch is at the rebuilt head",
+        "the merged patch has status deleted with deleted_at set",
+        "the remaining patches hold positions 1 to 3",
+        "the job reports both the new and the previous integration head"
+      ],
+      "pseudocode": "in the rebuild integration test file: j = run_rebuild(); assert ref(integration) == j.integration_head_sha and positions() == [1,2,3]"
+    },
+    {
+      "id": "TS-09-33",
+      "kind": "integration",
+      "verifies": [
+        "09-REQ-6.5"
+      ],
+      "title": "The integration branch is pushed to the fork when the setting says so, and a failure does not fail the job",
+      "given": [
+        "a workspace with rebuild_push_integration_branch true against a fork that accepts, one against a fork that refuses, and one with the setting false"
+      ],
+      "when": "a rebuild completes in each",
+      "then": [
+        "the accepting case force-pushes the branch and reports integration_branch_pushed true",
+        "the refusing case still completes the job",
+        "the setting false pushes nothing"
+      ],
+      "pseudocode": "in the rebuild integration test file, table over the three cases asserting the job status and the fork's refs"
+    },
+    {
+      "id": "TS-09-34",
+      "kind": "integration",
+      "verifies": [
+        "09-REQ-6.6"
+      ],
+      "title": "A tip that moves mid-rebuild yields one follow-up job",
+      "given": [
+        "a rebuild in progress and a patch tip that is advanced while it applies patches, and separately an upstream head that advances"
+      ],
+      "when": "each rebuild completes",
+      "then": [
+        "the completed job's result reflects the tips it started with",
+        "exactly one follow-up rebuild is queued",
+        "the follow-up is recorded as submitted by the system rather than a user"
+      ],
+      "pseudocode": "in the rebuild integration test file: start(); move_tip(); wait(); assert queued_rebuilds() == 1 and followup.submitted_by.startswith('system')"
+    },
+    {
+      "id": "TS-09-35",
+      "kind": "integration",
+      "verifies": [
+        "09-REQ-6.7"
+      ],
+      "title": "A rebuild holds the lock only at its start and its end",
+      "given": [
+        "a rebuild made to spend measurable time applying patches"
+      ],
+      "when": "a sync, a merge submit, a rerere forget, a rollback, a branch push, an archive and a reclone are each attempted while it applies patches",
+      "then": [
+        "the sync, merge, rerere forget, rollback and branch push all succeed",
+        "the archive and the reclone answer 409 workspace_busy",
+        "an operation attempted during the rebuild's start or end window answers 409 workspace_busy"
+      ],
+      "pseudocode": "in the rebuild integration test file, table over the operations asserting success or workspace_busy during the applying phase"
+    },
+    {
+      "id": "TS-09-36",
+      "kind": "integration",
+      "verifies": [
+        "09-REQ-6.8"
+      ],
+      "title": "A running rebuild's per-patch results grow as it proceeds",
+      "given": [
+        "a rebuild over four patches, made to pause between them"
+      ],
+      "when": "the job is read after each patch finishes",
+      "then": [
+        "each read returns the results of the patches completed so far",
+        "the number of results grows monotonically",
+        "the job's status reads running until it completes"
+      ],
+      "pseudocode": "in the rebuild integration test file: counts = [len(read(job).patch_results) for _ in range(4)]; assert counts == sorted(counts) and counts[-1] == 4"
+    },
+    {
+      "id": "TS-09-37",
+      "kind": "integration",
+      "verifies": [
+        "09-REQ-7.1"
+      ],
+      "title": "A rebuild is submitted and queued with the right strategy and fail mode",
+      "given": [
+        "a ready carry_patch workspace with active patches and settings naming a strategy and a fail mode"
+      ],
+      "when": "a rebuild is submitted with no body, with a strategy, and with both a strategy and a fail mode",
+      "then": [
+        "each answers 202 with the queued job carrying its id, type, status queued and payload",
+        "the body's values override the settings and an absent body uses the settings"
+      ],
+      "pseudocode": "in the rebuild routes' integration test file, table over the bodies asserting 202 and the effective strategy"
+    },
+    {
+      "id": "TS-09-38",
+      "kind": "unit",
+      "verifies": [
+        "09-REQ-7.2"
+      ],
+      "title": "A rebuild submit is refused for every documented reason",
+      "given": [
+        "a standard workspace, a carry_patch workspace that is not ready, one with no active or conflict patch, and one with a rebuild already queued"
+      ],
+      "when": "a rebuild is submitted for each, and with an invalid strategy and an invalid fail mode",
+      "then": [
+        "the standard workspace answers 400 workspace_mode_mismatch",
+        "no active patches answers 400 no_active_patches",
+        "the unready workspace and the invalid fields answer 400",
+        "the existing rebuild answers 409 concurrent_rebuild",
+        "no job is queued in any case"
+      ],
+      "pseudocode": "in the rebuild routes' test file, table over the six cases asserting status, error_type and the job count"
+    },
+    {
+      "id": "TS-09-39",
+      "kind": "unit",
+      "verifies": [
+        "09-REQ-7.3"
+      ],
+      "title": "Rebuild jobs are listed and read",
+      "given": [
+        "a workspace with three rebuild jobs and another workspace with one"
+      ],
+      "when": "the jobs are listed, one is read, another workspace's job is read, and an unknown id is read",
+      "then": [
+        "the list answers 200 newest first",
+        "the read answers 200 with the job and its per-patch results",
+        "the foreign job and the unknown id both answer 404"
+      ],
+      "pseudocode": "in the rebuild routes' test file: assert [j.id for j in list()] == newest_first; assert read(foreign).status == 404"
+    },
+    {
+      "id": "TS-09-40",
+      "kind": "unit",
+      "verifies": [
+        "09-REQ-7.4"
+      ],
+      "title": "A queued rebuild is cancelled and a dead-lettered one requeued",
+      "given": [
+        "jobs at queued, running, completed, failed, dead_letter and cancelled"
+      ],
+      "when": "each is cancelled and each is requeued, and a dead-lettered job is requeued while another rebuild is queued",
+      "then": [
+        "cancelling the queued job answers 200 with status cancelled and every other status answers 409",
+        "requeuing the dead-lettered job answers 200 with status queued and every other status answers 409",
+        "requeuing while another rebuild is queued answers 409"
+      ],
+      "pseudocode": "in the rebuild routes' test file, table over (jobStatus, action, expected)"
+    },
+    {
+      "id": "TS-09-41",
+      "kind": "integration",
+      "verifies": [
+        "09-REQ-7.5"
+      ],
+      "title": "A completed rebuild is rolled back to the previous integration head",
+      "given": [
+        "a workspace with two completed rebuilds, a first rebuild with no previous head, and one whose lock is held"
+      ],
+      "when": "each is rolled back, and once against a store whose branch reset fails",
+      "then": [
+        "the rollback answers 200 reporting the SHA it rolled back to and the integration branch is at it",
+        "the first rebuild answers 409",
+        "the held lock answers 409 workspace_busy",
+        "the failed reset answers 500 and leaves the branch where it was"
+      ],
+      "pseudocode": "in the rebuild routes' integration test file, table over the four cases asserting status and the integration branch"
+    },
+    {
+      "id": "TS-09-42",
+      "kind": "integration",
+      "verifies": [
+        "09-REQ-7.6"
+      ],
+      "title": "The preview predicts every patch without writing anything",
+      "given": [
+        "a stack holding patches that would apply, one that would conflict, a disabled one, a merged_upstream one and one whose branch is missing"
+      ],
+      "when": "the preview is requested, and requested for a standard workspace",
+      "then": [
+        "each attempted patch is reported would_succeed with a tree or would_conflict with its files",
+        "a predicted conflict does not stop the later predictions",
+        "the disabled and merged_upstream patches are not attempted",
+        "a patch whose branch is missing is reported would_succeed",
+        "no ref or object of the repository changes",
+        "the standard workspace answers 400"
+      ],
+      "pseudocode": "in the rebuild routes' integration test file: before = refs(); r = get(preview); assert refs() == before and statuses(r) == expected"
+    },
+    {
+      "id": "TS-09-43",
+      "kind": "integration",
+      "verifies": [
+        "09-REQ-8.1"
+      ],
+      "title": "Recorded resolutions are listed with their state",
+      "given": [
+        "a workspace with a resolution recorded while its path was known, one recorded by an earlier rebuild with no known path, a conflict seen but unresolved, and a workspace with none"
+      ],
+      "when": "the resolutions are listed for each",
+      "then": [
+        "the listing answers 200 newest first with id, path, recorded_at and resolved",
+        "path is null where it is not known",
+        "resolved is true only where a resolution will be replayed",
+        "the workspace with none answers an empty resolutions array"
+      ],
+      "pseudocode": "in the rerere routes' integration test file: r = get(rerere); assert [e.resolved for e in r.json.resolutions] == expected"
+    },
+    {
+      "id": "TS-09-44",
+      "kind": "integration",
+      "verifies": [
+        "09-REQ-8.2"
+      ],
+      "title": "A resolution is forgotten by identity or by a path in conflict",
+      "given": [
+        "two recorded resolutions, one for a path currently in conflict"
+      ],
+      "when": "one is forgotten by identity and the other by path, and a rebuild is then run that reaches each conflict",
+      "then": [
+        "each forget answers 204 and the entry is gone from the listing",
+        "the next rebuild reports each conflict rather than replaying it"
+      ],
+      "pseudocode": "in the rerere routes' integration test file: delete(rerere, id); assert id not in ids(list()); assert run_rebuild().conflicts"
+    },
+    {
+      "id": "TS-09-45",
+      "kind": "unit",
+      "verifies": [
+        "09-REQ-8.3"
+      ],
+      "title": "A bad or unmatched forget is refused",
+      "given": [
+        "a workspace with one recorded resolution and a held lock in one case"
+      ],
+      "when": "forgets are called with an empty pathspec, a pathspec starting with a hyphen, an identity matching nothing, a path with no recorded resolution, and against the busy workspace",
+      "then": [
+        "the empty and invalid pathspecs answer 400, checked before the workspace is looked up",
+        "the unmatched identity and path answer 404",
+        "the busy workspace answers 409 workspace_busy",
+        "nothing is removed in any case"
+      ],
+      "pseudocode": "in the rerere routes' test file, table over the five cases asserting status and an unchanged listing"
+    },
+    {
+      "id": "TS-09-46",
+      "kind": "integration",
+      "verifies": [
+        "09-REQ-9.1"
+      ],
+      "title": "The dashboard reports the workspace, the latest rebuild and every patch",
+      "given": [
+        "a carry_patch workspace with patches at several statuses, one with a conflict in the latest rebuild, and one whose latest rebuild has not run"
+      ],
+      "when": "the dashboard is requested",
+      "then": [
+        "the response is 200 with the documented object",
+        "patches are in position order and deleted ones are absent",
+        "each patch carries its latest rebuild result or null, with conflicting files only where that result is a conflict",
+        "last_rebuild is the latest job's id and status, or null when none has run"
+      ],
+      "pseudocode": "in the dashboard integration test file: r = get(patch_status); assert [p.position for p in r.json.patches] == sorted(...) and r.json.last_rebuild.status in STATUSES"
+    },
+    {
+      "id": "TS-09-47",
+      "kind": "property",
+      "verifies": [
+        "09-REQ-9.2"
+      ],
+      "title": "The dashboard's counts agree with the patches it lists",
+      "given": [
+        "generated workspaces with patches across every status and origin state, under both patch_branch_source settings"
+      ],
+      "when": "the dashboard is requested for each",
+      "then": [
+        "total_patches equals the length of the patches array and the sum of the four status counts",
+        "patches_diverged and patches_missing_on_origin count the patches whose origin state says so, and are 0 with patch_branch_source hub",
+        "total_rerere_resolutions is 0 when the resolutions cannot be read"
+      ],
+      "pseudocode": "in the dashboard test file, a generative test asserting the identities between summary and patches"
+    },
+    {
+      "id": "TS-09-48",
+      "kind": "unit",
+      "verifies": [
+        "09-REQ-9.3"
+      ],
+      "title": "The dashboard refuses a standard workspace",
+      "given": [
+        "a standard workspace"
+      ],
+      "when": "the dashboard is requested",
+      "then": [
+        "the response is 400 in the error envelope"
+      ],
+      "pseudocode": "in the dashboard test file: assert get(patch_status, standardWs).status == 400"
+    },
+    {
+      "id": "TS-09-49",
+      "kind": "integration",
+      "verifies": [
+        "09-REQ-10.1"
+      ],
+      "title": "An accepted push to a patch branch queues a rebuild without delaying the push",
+      "given": [
+        "a carry_patch workspace with a registered patch branch, with auto_rebuild_after_push true and then false"
+      ],
+      "when": "a push updating that branch is accepted, and a push updating an ordinary branch is accepted",
+      "then": [
+        "with the setting true a rebuild is queued for the patch branch push",
+        "the push's answer does not wait for the rebuild",
+        "with the setting false none is queued",
+        "the ordinary branch queues none"
+      ],
+      "pseudocode": "in the rebuild trigger integration test file, table over (branchKind, setting) asserting the queued job count and the push's latency"
+    },
+    {
+      "id": "TS-09-50",
+      "kind": "integration",
+      "verifies": [
+        "09-REQ-10.2"
+      ],
+      "title": "At most one rebuild is queued for a workspace whatever triggered it",
+      "given": [
+        "a workspace with a rebuild already queued, and one with a rebuild running"
+      ],
+      "when": "a push, a sync and a reset-to-origin each occur that would otherwise queue a rebuild",
+      "then": [
+        "no second rebuild is queued in any case",
+        "the sync and the reset report rebuild_triggered false",
+        "once the first rebuild completes a later trigger queues one again"
+      ],
+      "pseudocode": "in the rebuild trigger integration test file: assert queued_count() == 1 after each trigger"
+    },
+    {
+      "id": "TS-09-51",
+      "kind": "smoke",
+      "verifies": [
+        "09-PATH-1"
+      ],
+      "title": "A patch is registered and the stack rebuilt against a running deployment",
+      "given": [
+        "a running deployment with a real carry_patch workspace, a real upstream and a branch pushed to Parley"
+      ],
+      "when": "afc patch add is run, then afc rebuild submit --wait",
+      "then": [
+        "the add exits 0 and prints the patch as active",
+        "the rebuild reaches completed and prints a result per patch",
+        "the integration branch is at the rebuilt head"
+      ],
+      "pseudocode": "in the carry-patch smoke test file: run('afc patch add'); r = run('afc rebuild submit --wait'); assert r.exit == 0 and json(r.stdout).status == 'completed'",
+      "real_components": [
+        "running deployment",
+        "patch routes",
+        "rebuild job",
+        "history engine",
+        "repository store",
+        "real upstream",
+        "afc"
+      ]
+    },
+    {
+      "id": "TS-09-52",
+      "kind": "smoke",
+      "verifies": [
+        "09-PATH-2"
+      ],
+      "title": "An upstream advance is absorbed by a sync and its rebuild",
+      "given": [
+        "a running deployment, a carry_patch workspace, and a real upstream that has taken one of the patches and advanced"
+      ],
+      "when": "afc workspace sync --wait is run and the dashboard is then read",
+      "then": [
+        "the sync reports the merged patch and a queued rebuild",
+        "the rebuild completes and the merged patch becomes deleted",
+        "the remaining positions are contiguous and the dashboard shows the new integration head"
+      ],
+      "pseudocode": "in the carry-patch smoke test file: r = run('afc workspace sync --wait'); assert merged in json(r.stdout).patches_merged; assert run('afc workspace patch-status').exit == 0",
+      "real_components": [
+        "running deployment",
+        "carry-patch sync",
+        "rebuild job",
+        "history engine",
+        "repository store",
+        "real upstream",
+        "afc"
+      ]
+    },
+    {
+      "id": "TS-09-53",
+      "kind": "smoke",
+      "verifies": [
+        "09-PATH-3"
+      ],
+      "title": "A conflict is recorded once and replayed on the next rebuild",
+      "given": [
+        "a running deployment and a carry_patch workspace whose second patch conflicts with the upstream"
+      ],
+      "when": "a rebuild is run with the continue fail mode, the conflict is resolved, and a second rebuild is run",
+      "then": [
+        "the first rebuild completes with that patch marked conflict and its files reported",
+        "the second rebuild applies the patch cleanly with no conflict reported",
+        "afc rerere list shows the recorded resolution between the two"
+      ],
+      "pseudocode": "in the carry-patch smoke test file: run('afc rebuild submit --fail-mode continue --wait'); resolve(); assert 'conflict' not in run('afc rebuild submit --wait').stdout",
+      "real_components": [
+        "running deployment",
+        "rebuild job",
+        "history engine",
+        "resolution store",
+        "repository store",
+        "afc"
+      ]
+    },
+    {
+      "id": "TS-09-54",
+      "kind": "smoke",
+      "verifies": [
+        "09-PATH-4"
+      ],
+      "title": "A diverged patch branch is reported and then reset",
+      "given": [
+        "a running deployment, a carry_patch workspace with patch_branch_source origin and patch_divergence_policy report, and a fork whose patch branch has diverged"
+      ],
+      "when": "afc workspace sync is run, then afc patch reset-to-origin",
+      "then": [
+        "the sync lists the branch in patches_diverged",
+        "the reset moves the branch to the fork's tip and prints the replaced SHA",
+        "a rebuild is queued and its id is printed"
+      ],
+      "pseudocode": "in the carry-patch smoke test file: assert branch in json(run('afc workspace sync').stdout).patches_diverged; r = run('afc patch reset-to-origin'); assert json(r.stdout).replaced_sha",
+      "real_components": [
+        "running deployment",
+        "carry-patch sync",
+        "reset-to-origin",
+        "repository store",
+        "real fork",
+        "afc"
+      ]
+    }
+  ]
+}

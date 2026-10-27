@@ -1,0 +1,616 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v2.json",
+  "spec_id": "09",
+  "spec_name": "carry_patch",
+  "schema_version": 2,
+  "introduction": "A carry_patch workspace keeps an ordered list of patch branches and an integration branch rebuilt from the upstream head plus those patches. This package manages the list, extends the sync to fetch upstream and reconcile the patches, runs the rebuild job, and serves the rebuild, rerere and patch-status routes.",
+  "glossary": {
+    "branch resolution": "How an added patch's branch is found: in the workspace's own repository, in the fork's already-fetched copy, or by fetching the fork; reported as local, origin_tracking, origin_fetch or skipped.",
+    "divergence policy": "What a sync does when the workspace's copy of a patch branch and the fork's have diverged: replace the workspace's with the fork's tip, keeping the old one, or report the divergence and leave it alone.",
+    "integration branch": "The branch a carry_patch workspace rebuilds from the upstream head plus its active patches. It is never pushed by the branch push route and is never a registered patch.",
+    "merged upstream": "A patch whose changes the upstream has taken, found by ancestry, by content, or by a pull request number in a recent upstream commit message, according to the squash_merge_detection setting.",
+    "patch": "A branch registered in a carry_patch workspace's ordered list, applied onto the upstream base by a rebuild. It has a position, a status and, where the fork is its source, a record of how it stood against the fork at the last sync.",
+    "rebuild": "The job that recreates the integration branch from the upstream head and the patches, in position order, by the chosen strategy.",
+    "stale snapshot": "A patch tip or upstream head that moved while a rebuild was applying patches. The running job keeps the tips it started with and one follow-up rebuild is queued afterwards."
+  },
+  "requirements": [
+    {
+      "id": "09-REQ-1",
+      "title": "Adding patches to the list",
+      "rationale": "The add is the only route that touches the repository to create a branch, and its batch semantics are the most exacting part of the patch endpoints.",
+      "criteria": [
+        {
+          "id": "09-REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "a single patch is added to a carry_patch workspace with a branch that can be resolved",
+          "system": "Parley service",
+          "action": "add it to the list with status active and report how its branch was resolved",
+          "contract": "HTTP 201 with the patch carrying status \"active\", its position, and a branch resolution of local, origin_tracking, origin_fetch or skipped"
+        },
+        {
+          "id": "09-REQ-1.2",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "insert a patch at the position given, moving the patches at and after it down by one, and append when the position is past the end or omitted",
+          "contract": "after the add the positions are 1 to n with no gap and no repeat, and the new patch sits where it was asked to"
+        },
+        {
+          "id": "09-REQ-1.3",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "resolve an added patch's branch by trying the workspace's own repository, then the fork's already-fetched copy, then — only with patch_branch_source origin — a fetch from the fork, stopping at the first that succeeds",
+          "contract": "the reported resolution names which succeeded; a branch found locally writes nothing; one found as the fork's copy or fetched is created in the repository; with skip_branch_check none of this happens and the resolution is skipped"
+        },
+        {
+          "id": "09-REQ-1.4",
+          "pattern": "complex_event",
+          "condition": "an add names a branch already in the list",
+          "guard": "if_not_exists was given",
+          "system": "Parley service",
+          "action": "answer with the existing patch instead of refusing",
+          "contract": "HTTP 200 with the existing patch unchanged; without if_not_exists the same request is HTTP 409"
+        },
+        {
+          "id": "09-REQ-1.5",
+          "pattern": "event_driven",
+          "condition": "several patches are added in one request",
+          "system": "Parley service",
+          "action": "check every element's syntax first in array order, then every element's branch, and add all of them or none",
+          "contract": "a batch whose first element names a missing branch and whose second has an invalid position answers for the second element's syntax; a branch failure refuses the whole batch and adds no patch, while branches created for earlier elements remain and resolve as local next time"
+        },
+        {
+          "id": "09-REQ-1.6",
+          "pattern": "unwanted",
+          "condition": "an add has a missing or empty branch name, names the integration branch, gives a position below 1, targets a standard or archived workspace, or names a branch that cannot be resolved",
+          "system": "Parley service",
+          "action": "refuse the request and add nothing",
+          "contract": "HTTP 400 in the error envelope; in a batch the message begins \"patch[i]: \" naming the element; the list is unchanged"
+        },
+        {
+          "id": "09-REQ-1.7",
+          "pattern": "unwanted",
+          "condition": "an add names a branch already in the list without if_not_exists, names one branch twice in a batch, needs the repository while the lock is held, or cannot fetch from the fork",
+          "system": "Parley service",
+          "action": "refuse the request and add nothing",
+          "contract": "HTTP 409 for a duplicate and for a branch repeated within a batch, HTTP 409 with error_type workspace_busy for a held lock, HTTP 502 with error_type origin_fetch_failed for a failed fork fetch; the list is unchanged"
+        }
+      ]
+    },
+    {
+      "id": "09-REQ-2",
+      "title": "Reading and changing patches",
+      "rationale": "Position and status drive what a rebuild applies, so a list that is not contiguous or a status that can be set to deleted breaks the rebuild rather than the route.",
+      "criteria": [
+        {
+          "id": "09-REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "a workspace's patches are listed",
+          "system": "Parley service",
+          "action": "return them in position order, leaving deleted ones out",
+          "contract": "HTTP 200 with an array in ascending position order and no patch of status deleted; a standard workspace answers an empty array"
+        },
+        {
+          "id": "09-REQ-2.2",
+          "pattern": "event_driven",
+          "condition": "one patch is read",
+          "system": "Parley service",
+          "action": "return it, a deleted one included, with the SHA of a replaced tip where one is kept",
+          "contract": "HTTP 200 with the patch; replaced_sha is the 40-character SHA when a backup exists and is absent when there is none, when the workspace has no repository, or when the lookup fails, which never fails the request"
+        },
+        {
+          "id": "09-REQ-2.3",
+          "pattern": "event_driven",
+          "condition": "a patch is updated with a position, status, description or upstream pull request",
+          "system": "Parley service",
+          "action": "change only those fields and keep the positions contiguous",
+          "contract": "HTTP 200 with the updated patch; a branch_name in the body is ignored; after a position change the positions are 1 to n with no gap"
+        },
+        {
+          "id": "09-REQ-2.4",
+          "pattern": "unwanted",
+          "condition": "an update gives an invalid status or the status deleted, gives a position outside 1 to n, names a patch that does not exist, or targets a deleted patch",
+          "system": "Parley service",
+          "action": "refuse the request and change nothing",
+          "contract": "HTTP 400 for an invalid status or position, HTTP 404 for a patch not found, HTTP 409 for a deleted patch; the patch is unchanged"
+        },
+        {
+          "id": "09-REQ-2.5",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "keep the positions of a workspace's patches contiguous from 1 after every add, update, removal, restore, reorder and rebuild",
+          "contract": "for any sequence of those operations the positions of the non-deleted patches are exactly 1 to n in order"
+        }
+      ]
+    },
+    {
+      "id": "09-REQ-3",
+      "title": "Removing, restoring and reordering",
+      "rationale": "A patch removed by mistake must be recoverable, and a reorder that silently drops a patch changes what ships.",
+      "criteria": [
+        {
+          "id": "09-REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "a patch is removed",
+          "system": "Parley service",
+          "action": "take it out of the list, close the positions and discard any backup of a replaced tip",
+          "contract": "HTTP 204; the remaining patches hold positions 1 to n-1; discarding the backup is best effort and never changes the answer"
+        },
+        {
+          "id": "09-REQ-3.2",
+          "pattern": "event_driven",
+          "condition": "a deleted patch is restored",
+          "system": "Parley service",
+          "action": "return it to the list as active at the end, clearing the time it was deleted",
+          "contract": "HTTP 200 with the patch at status active, at the last position, and deleted_at null"
+        },
+        {
+          "id": "09-REQ-3.3",
+          "pattern": "event_driven",
+          "condition": "the whole list is reordered with a list of patch ids",
+          "system": "Parley service",
+          "action": "set the positions to the order given",
+          "contract": "HTTP 200 with every patch in the new order; the first id holds position 1 and so on"
+        },
+        {
+          "id": "09-REQ-3.4",
+          "pattern": "unwanted",
+          "condition": "a reorder does not name every patch of the workspace exactly once, or a restore names a patch that is not deleted, a standard workspace or an archived one",
+          "system": "Parley service",
+          "action": "refuse the request and change no position or status",
+          "contract": "HTTP 400 for a reorder that is empty while patches exist, omits an id, repeats one or names another workspace's patch, and for a restore of a patch that is not deleted; HTTP 404 for a patch not found; the list is unchanged"
+        }
+      ]
+    },
+    {
+      "id": "09-REQ-4",
+      "title": "Resetting a patch branch to the fork",
+      "rationale": "It is the escape hatch when the workspace's copy and the fork's have diverged, and it is the operation that can discard commits.",
+      "criteria": [
+        {
+          "id": "09-REQ-4.1",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "check, in order, that the workspace is not archived and is carry_patch, that its status is ready, that the patch exists, that its branch is not the integration branch, and that its status is active, conflict or disabled",
+          "contract": "HTTP 400 for an archived or standard workspace and for the integration branch, HTTP 409 for a workspace that is not ready and for a merged_upstream or deleted patch, HTTP 404 for a patch that does not exist, each given by the first failing check"
+        },
+        {
+          "id": "09-REQ-4.2",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "move the branch by the first rule that applies: create it at the fork's tip when the workspace lacks it, write nothing when the commits match, fast-forward when the fork's tip descends from the workspace's, and otherwise replace it",
+          "contract": "the reported action is created, none, fast_forwarded or replaced accordingly, and the branch afterwards is at the fork's tip in every case but none"
+        },
+        {
+          "id": "09-REQ-4.3",
+          "pattern": "complex_event",
+          "condition": "a reset moves a patch branch",
+          "guard": "the move discards commits the workspace held",
+          "system": "Parley service",
+          "action": "keep the old tip where a replaced tip is kept for this deployment, replacing any earlier backup",
+          "contract": "the old tip is recoverable afterwards and is reported as replaced_sha; an earlier backup for the same branch is superseded"
+        },
+        {
+          "id": "09-REQ-4.4",
+          "pattern": "complex_event",
+          "condition": "a reset moves a patch branch",
+          "guard": "the patch is active or conflict and auto_rebuild_after_sync is not false",
+          "system": "Parley service",
+          "action": "queue a rebuild and report it",
+          "contract": "the answer carries rebuild_triggered true and the queued job's id; a disabled patch queues none; an already queued or running rebuild is not duplicated and rebuild_triggered is false"
+        },
+        {
+          "id": "09-REQ-4.5",
+          "pattern": "unwanted",
+          "condition": "the fork has no such branch, another operation changed the branch while the reset ran, the fork could not be fetched, the lock is held, or the branch moved but the patch could not be read back",
+          "system": "Parley service",
+          "action": "refuse or report the failure without leaving the patch record inconsistent",
+          "contract": "HTTP 409 with error_type missing_on_origin, ref_changed or workspace_busy as applicable, HTTP 502 with error_type origin_fetch_failed or naming a credential failure, HTTP 500 when the branch moved and could not be read back"
+        }
+      ]
+    },
+    {
+      "id": "09-REQ-5",
+      "title": "Syncing a carry-patch workspace",
+      "rationale": "Eight ordered steps whose partial failure still has effects; written as a single success or failure it loses work the caller is owed.",
+      "criteria": [
+        {
+          "id": "09-REQ-5.1",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "fetch the upstream rather than the fork, fetching the fork as well only when patch_branch_source is origin",
+          "contract": "with patch_branch_source hub no request reaches the fork and origin_fetched is false; with origin the fork is fetched, pruning branches it deleted, and origin_fetched is true"
+        },
+        {
+          "id": "09-REQ-5.2",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "perform the sync's steps in the documented order: resolve the fork's credentials, fetch upstream, fetch the fork, detect a force-push, refresh the patch branches, detect patches merged upstream, write the sync fields, and queue a rebuild",
+          "contract": "an earlier step's failure prevents the later steps; the effects of the steps already completed are those the reference states for that failure"
+        },
+        {
+          "id": "09-REQ-5.3",
+          "pattern": "event_driven",
+          "condition": "the upstream advanced and the previous upstream head is not an ancestor of the new one",
+          "system": "Parley service",
+          "action": "report that the upstream history was rewritten without treating it as an error",
+          "contract": "force_push_detected is true and the sync still answers 200; the rebuild applies the patches to the rewritten upstream"
+        },
+        {
+          "id": "09-REQ-5.4",
+          "pattern": "complex_event",
+          "condition": "a sync refreshes the patch branches",
+          "guard": "patch_branch_source is origin",
+          "system": "Parley service",
+          "action": "bring each active, conflict or disabled patch's branch to the fork's tip by the first rule that applies, and record how each stood",
+          "contract": "each branch is reported as missing_on_origin, created, none, fast_forwarded, replaced or diverged; under the replace policy a diverged branch is replaced with the old tip kept and patches_diverged is empty, and under the report policy it is left alone and listed in patches_diverged; the integration branch is never refreshed; each patch's origin state, SHA and time are recorded, and with patch_branch_source hub those three are cleared"
+        },
+        {
+          "id": "09-REQ-5.5",
+          "pattern": "complex_event",
+          "condition": "the upstream advanced, or a branch of an active or conflict patch moved",
+          "guard": "the squash_merge_detection setting permits the strategy",
+          "system": "Parley service",
+          "action": "mark as merged upstream the patches the upstream has taken, by ancestry, by content, or by a pull request number in a recent upstream commit message",
+          "contract": "ancestry_only uses ancestry alone, content_based uses content and the pull request number, and both uses all three; a matched patch's status becomes merged_upstream, its origin fields are cleared, and its branch is listed in patches_merged"
+        },
+        {
+          "id": "09-REQ-5.6",
+          "pattern": "complex_event",
+          "condition": "the upstream advanced, a branch of an active or conflict patch moved, or a patch became merged upstream",
+          "guard": "auto_rebuild_after_sync is not false and no rebuild is queued or running",
+          "system": "Parley service",
+          "action": "queue one rebuild and report it",
+          "contract": "rebuild_triggered is true and rebuild_job_id carries the job's id; with auto_rebuild_after_sync false, or with a rebuild already queued or running, rebuild_triggered is false and rebuild_job_id is absent rather than null"
+        },
+        {
+          "id": "09-REQ-5.7",
+          "pattern": "unwanted",
+          "condition": "refreshing a patch branch fails",
+          "system": "Parley service",
+          "action": "end the sync in failure while keeping the outcomes already reached and the rebuild already owed",
+          "contract": "HTTP 500 whose message distinguishes a failed branch write, a failed ancestry comparison and a failed working-state update; the outcomes already reached are recorded; a rebuild is queued for branches already moved unless auto_rebuild_after_sync is false; neither upstream_head_sha nor last_sync_at is written"
+        },
+        {
+          "id": "09-REQ-5.8",
+          "pattern": "event_driven",
+          "condition": "a carry-patch sync completes",
+          "system": "Parley service",
+          "action": "answer with the workspace and the sync's own fields",
+          "contract": "HTTP 200 with every workspace field plus patches_merged, rebuild_triggered, force_push_detected, origin_fetched, and, with patch_branch_source origin, patches_synced and patches_diverged; sync_error is not used on this path and last_sync_at is updated by every completed sync whether or not anything advanced"
+        }
+      ]
+    },
+    {
+      "id": "09-REQ-6",
+      "title": "How a rebuild runs",
+      "rationale": "This is the operation the whole feature exists for, and the one whose lock discipline lets other work proceed while it runs.",
+      "criteria": [
+        {
+          "id": "09-REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "a rebuild runs",
+          "system": "Parley service",
+          "action": "start from the upstream head it fetches at its start and apply the patches in position order",
+          "contract": "the job records the upstream head it started from; the patches are attempted in ascending position order and the result lists them in that order"
+        },
+        {
+          "id": "09-REQ-6.2",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "skip a patch that is merged upstream, disabled or deleted, or whose branch does not exist, recording why",
+          "contract": "each skipped patch is reported with status skipped and a reason of merged_upstream, disabled, deleted or branch_not_found, and contributes nothing to the result"
+        },
+        {
+          "id": "09-REQ-6.3",
+          "pattern": "complex_event",
+          "condition": "applying a patch conflicts after a recorded resolution has been replayed",
+          "guard": "the job's fail mode is fail_fast",
+          "system": "Parley service",
+          "action": "end the job as failed",
+          "contract": "the job's status is failed with the conflicting patch and its files reported; with fail_mode continue the patch is marked conflict, its changes are left out and the later patches are still attempted"
+        },
+        {
+          "id": "09-REQ-6.4",
+          "pattern": "event_driven",
+          "condition": "a rebuild reaches its end",
+          "system": "Parley service",
+          "action": "set the integration branch to the result, mark patches merged upstream as deleted and close the positions",
+          "contract": "the integration branch is at the rebuilt head; each merged_upstream patch has status deleted with deleted_at set; the remaining positions are 1 to n; the job reports the new and the previous integration head"
+        },
+        {
+          "id": "09-REQ-6.5",
+          "pattern": "complex_event",
+          "condition": "a rebuild completes",
+          "guard": "the rebuild_push_integration_branch setting is true",
+          "system": "Parley service",
+          "action": "force-push the integration branch to the fork without letting a failure fail the job",
+          "contract": "the job reports integration_branch_pushed true on success; on failure the job still completes and the field reflects that the push did not happen"
+        },
+        {
+          "id": "09-REQ-6.6",
+          "pattern": "complex_event",
+          "condition": "a rebuild completes",
+          "guard": "a patch tip or the upstream head moved while it was applying patches",
+          "system": "Parley service",
+          "action": "keep the result built from the tips it started with and queue one follow-up rebuild",
+          "contract": "the completed job's result reflects the tips it started with; exactly one follow-up rebuild is queued, submitted by the system rather than a user"
+        },
+        {
+          "id": "09-REQ-6.7",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "hold the workspace lock only while fetching the upstream at the start and while updating the integration branch at the end",
+          "contract": "a sync, a merge, a rerere forget, a rollback and a branch push all succeed while a rebuild is applying patches; archive and reclone answer 409 workspace_busy for the whole rebuild"
+        },
+        {
+          "id": "09-REQ-6.8",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "make each patch's result readable as soon as that patch finishes",
+          "contract": "reading a running job returns the results of the patches completed so far, growing as the job proceeds"
+        }
+      ]
+    },
+    {
+      "id": "09-REQ-7",
+      "title": "The rebuild routes",
+      "rationale": "A queued job is only useful if a client can follow it, stop it and undo it.",
+      "criteria": [
+        {
+          "id": "09-REQ-7.1",
+          "pattern": "event_driven",
+          "condition": "a rebuild is submitted for a carry_patch workspace that is ready, has at least one active or conflict patch and has no rebuild queued or running",
+          "system": "Parley service",
+          "action": "queue the job, taking the strategy and fail mode from the body or the workspace's settings",
+          "contract": "HTTP 202 with the queued job carrying its id, type, status queued and payload; a body naming strategy or fail_mode overrides the setting and an absent body uses the settings"
+        },
+        {
+          "id": "09-REQ-7.2",
+          "pattern": "unwanted",
+          "condition": "a rebuild is submitted for a workspace that is not carry_patch or not ready, with no active or conflict patch, with an invalid strategy or fail mode, or while one is queued or running",
+          "system": "Parley service",
+          "action": "refuse the request and queue nothing",
+          "contract": "HTTP 400 with error_type workspace_mode_mismatch, no_active_patches, or no type for a workspace that is not ready or an invalid field; HTTP 409 with error_type concurrent_rebuild for one already queued or running"
+        },
+        {
+          "id": "09-REQ-7.3",
+          "pattern": "event_driven",
+          "condition": "a workspace's rebuilds are listed or one is read",
+          "system": "Parley service",
+          "action": "return the jobs newest first, or the one named with its per-patch results",
+          "contract": "HTTP 200 with the jobs or the job; a job of another workspace or an unknown id is HTTP 404"
+        },
+        {
+          "id": "09-REQ-7.4",
+          "pattern": "event_driven",
+          "condition": "a queued rebuild is cancelled, or a dead-lettered one is requeued",
+          "system": "Parley service",
+          "action": "change its state accordingly",
+          "contract": "HTTP 200 with status cancelled for a cancel, and the job back at queued for a requeue; a job that is not queued is HTTP 409 on cancel, and one that is not dead-lettered, or whose workspace already has a rebuild queued or running, is HTTP 409 on requeue"
+        },
+        {
+          "id": "09-REQ-7.5",
+          "pattern": "event_driven",
+          "condition": "a completed rebuild is rolled back",
+          "system": "Parley service",
+          "action": "set the integration branch back to the head it had before that rebuild",
+          "contract": "HTTP 200 reporting the SHA rolled back to, and the integration branch is at it; a job with no previous head is HTTP 409, a held lock is HTTP 409 workspace_busy, and a failure to reset the branch is HTTP 500"
+        },
+        {
+          "id": "09-REQ-7.6",
+          "pattern": "event_driven",
+          "condition": "the rebuild preview is requested",
+          "system": "Parley service",
+          "action": "predict for each patch that is not disabled or merged upstream whether it would apply, without writing anything",
+          "contract": "HTTP 200 with a result per patch of would_succeed with a resulting tree, or would_conflict with the conflicting files; a predicted conflict does not stop the later predictions; a patch whose branch does not exist is reported would_succeed; no ref or object of the repository changes; a workspace that is not carry_patch is HTTP 400"
+        }
+      ]
+    },
+    {
+      "id": "09-REQ-8",
+      "title": "The rerere routes",
+      "rationale": "A recorded resolution that cannot be inspected or dropped is one a person cannot correct when it is wrong.",
+      "criteria": [
+        {
+          "id": "09-REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "a workspace's recorded resolutions are listed",
+          "system": "Parley service",
+          "action": "return them newest first with their identity, path, recorded time and whether a resolution will be replayed",
+          "contract": "HTTP 200 with a resolutions array, empty when there are none; path is null for a resolution recorded by an earlier rebuild; resolved is true only when a resolution will be replayed"
+        },
+        {
+          "id": "09-REQ-8.2",
+          "pattern": "event_driven",
+          "condition": "a resolution is forgotten by its identity, or by a path that is currently in conflict",
+          "system": "Parley service",
+          "action": "remove it so the conflict is reported again",
+          "contract": "HTTP 204; the entry is gone from the listing and the next occurrence of that conflict is reported rather than replayed"
+        },
+        {
+          "id": "09-REQ-8.3",
+          "pattern": "unwanted",
+          "condition": "a forget is called with an empty or invalid pathspec, names no recorded entry, or finds the workspace's lock held",
+          "system": "Parley service",
+          "action": "refuse the request and remove nothing",
+          "contract": "HTTP 400 for an empty or invalid pathspec, checked before the workspace is looked up; HTTP 404 when no entry matches the identity or no resolution is recorded for the path; HTTP 409 with error_type workspace_busy for a held lock"
+        }
+      ]
+    },
+    {
+      "id": "09-REQ-9",
+      "title": "The patch-status dashboard",
+      "rationale": "One answer a person reads to know whether the stack is healthy, which means its counts have to agree with the list they summarise.",
+      "criteria": [
+        {
+          "id": "09-REQ-9.1",
+          "pattern": "event_driven",
+          "condition": "the patch-status dashboard is requested for a carry_patch workspace",
+          "system": "Parley service",
+          "action": "return the workspace's state, its latest rebuild, every non-deleted patch with its latest rebuild result, and the summary counts",
+          "contract": "HTTP 200 with the documented object; patches are in position order; each patch carries its latest rebuild result or null, and its conflicting files only where that result is a conflict; last_rebuild is the latest job's id and status, or null"
+        },
+        {
+          "id": "09-REQ-9.2",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "make the summary counts agree with the patches the same answer lists",
+          "contract": "total_patches equals the length of the patches array and equals active plus merged_upstream plus conflict plus disabled; patches_diverged and patches_missing_on_origin count the patches whose origin state says so and are 0 with patch_branch_source hub; total_rerere_resolutions is 0 when the resolutions cannot be read"
+        },
+        {
+          "id": "09-REQ-9.3",
+          "pattern": "unwanted",
+          "condition": "the dashboard is requested for a workspace that is not carry_patch",
+          "system": "Parley service",
+          "action": "refuse the request",
+          "contract": "HTTP 400 in the error envelope"
+        }
+      ]
+    },
+    {
+      "id": "09-REQ-10",
+      "title": "Triggering a rebuild from a push",
+      "rationale": "This is what makes the stack rebuild itself when an agent pushes, and duplicating the trigger would queue a rebuild per push.",
+      "criteria": [
+        {
+          "id": "09-REQ-10.1",
+          "pattern": "complex_event",
+          "condition": "a push to the git server accepts an update of a registered patch branch on a carry_patch workspace",
+          "guard": "the auto_rebuild_after_push setting is not false",
+          "system": "Parley service",
+          "action": "queue a rebuild without making the push wait for it",
+          "contract": "the push's answer does not wait for the rebuild; a rebuild is queued for that workspace; with auto_rebuild_after_push false none is queued"
+        },
+        {
+          "id": "09-REQ-10.2",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "queue at most one rebuild for a workspace at a time, whatever triggered it",
+          "contract": "when a rebuild is already queued or running, a push, a sync or a reset queues no second one and reports that none was triggered"
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "09-PATH-1",
+      "title": "A patch is registered and the stack rebuilt",
+      "steps": [
+        {
+          "actor": "API client",
+          "action": "adds a branch as a patch to a carry_patch workspace"
+        },
+        {
+          "actor": "Parley service",
+          "action": "resolves the branch in the workspace's repository, appends the patch as active and reports the resolution"
+        },
+        {
+          "actor": "API client",
+          "action": "submits a rebuild and receives the queued job"
+        },
+        {
+          "actor": "Parley service",
+          "action": "takes the workspace lock, fetches the upstream head and releases the lock"
+        },
+        {
+          "actor": "history engine",
+          "action": "applies each active patch onto the upstream head in position order"
+        },
+        {
+          "actor": "Parley service",
+          "action": "retakes the lock, sets the integration branch, closes the positions and completes the job"
+        },
+        {
+          "actor": "API client",
+          "action": "polls the job and reads a result for every patch"
+        }
+      ]
+    },
+    {
+      "id": "09-PATH-2",
+      "title": "An upstream advance is absorbed by a sync and a rebuild",
+      "steps": [
+        {
+          "actor": "API client",
+          "action": "syncs a carry_patch workspace whose upstream has advanced"
+        },
+        {
+          "actor": "Parley service",
+          "action": "fetches the upstream, detects one patch as merged upstream and writes the sync fields"
+        },
+        {
+          "actor": "Parley service",
+          "action": "queues a rebuild and answers with its id and the merged patch's branch"
+        },
+        {
+          "actor": "history engine",
+          "action": "applies the remaining patches onto the new upstream head"
+        },
+        {
+          "actor": "Parley service",
+          "action": "marks the merged patch deleted, closes the positions and sets the integration branch"
+        },
+        {
+          "actor": "API client",
+          "action": "reads the patch-status dashboard and sees the new integration head and each patch's result"
+        }
+      ]
+    },
+    {
+      "id": "09-PATH-3",
+      "title": "A conflict is recorded once and replayed on the next rebuild",
+      "steps": [
+        {
+          "actor": "API client",
+          "action": "submits a rebuild with the continue fail mode on a stack whose second patch conflicts"
+        },
+        {
+          "actor": "history engine",
+          "action": "reports the conflict and its files for that patch"
+        },
+        {
+          "actor": "Parley service",
+          "action": "marks the patch conflict, leaves its changes out, applies the later patches and completes the job"
+        },
+        {
+          "actor": "API client",
+          "action": "resolves the conflict so the resolution is recorded"
+        },
+        {
+          "actor": "API client",
+          "action": "submits another rebuild of the same stack"
+        },
+        {
+          "actor": "history engine",
+          "action": "replays the recorded resolution and applies the patch cleanly"
+        }
+      ]
+    },
+    {
+      "id": "09-PATH-4",
+      "title": "A diverged patch branch is reported and then reset",
+      "steps": [
+        {
+          "actor": "API client",
+          "action": "syncs a workspace whose patch branches come from the fork under the report policy"
+        },
+        {
+          "actor": "Parley service",
+          "action": "fetches the fork, finds one patch branch diverged and lists it in patches_diverged"
+        },
+        {
+          "actor": "API client",
+          "action": "calls reset-to-origin for that patch"
+        },
+        {
+          "actor": "Parley service",
+          "action": "moves the branch to the fork's tip, keeps the old tip where replaced tips are kept and queues a rebuild"
+        },
+        {
+          "actor": "API client",
+          "action": "reads the patch and finds the replaced SHA and the queued rebuild's id"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,655 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/test_spec.v2.json",
+  "spec_id": "08",
+  "spec_name": "sync_and_branch_push",
+  "schema_version": 2,
+  "tests": [
+    {
+      "id": "TS-08-1",
+      "kind": "integration",
+      "verifies": [
+        "08-REQ-1.1"
+      ],
+      "title": "A sync against an unchanged origin reports up to date",
+      "given": [
+        "a ready standard workspace whose origin is at the same commit as its branch"
+      ],
+      "when": "the sync route is called",
+      "then": [
+        "the response is 200 with the workspace",
+        "last_sync_at is the time of this sync",
+        "head_sha is unchanged and sync_error is null"
+      ],
+      "pseudocode": "in the sync integration test file: r = post(sync); assert r.status == 200 and r.json.head_sha == before and r.json.sync_error is None"
+    },
+    {
+      "id": "TS-08-2",
+      "kind": "integration",
+      "verifies": [
+        "08-REQ-1.2"
+      ],
+      "title": "A sync fast-forwards the branch when origin has advanced",
+      "given": [
+        "a ready standard workspace whose origin has two commits the workspace lacks"
+      ],
+      "when": "the sync route is called",
+      "then": [
+        "the response is 200",
+        "head_sha and upstream_head_sha both equal origin's head",
+        "last_sync_at is updated and sync_error is null",
+        "the branch in the repository is at origin's head"
+      ],
+      "pseudocode": "in the sync integration test file: assert post(sync).json.head_sha == origin_head and store_ref(branch) == origin_head"
+    },
+    {
+      "id": "TS-08-3",
+      "kind": "integration",
+      "verifies": [
+        "08-REQ-1.3"
+      ],
+      "title": "reset_to_upstream moves the branch whatever the ancestry",
+      "given": [
+        "a ready standard workspace whose origin was force-pushed to an unrelated commit"
+      ],
+      "when": "the sync route is called with reset_to_upstream true",
+      "then": [
+        "the response is 200",
+        "head_sha and upstream_head_sha equal origin's head",
+        "sync_error is null",
+        "the branch moved although origin's head does not descend from the previous local head"
+      ],
+      "pseudocode": "in the sync integration test file: r = post(sync + '?reset_to_upstream=true'); assert r.json.head_sha == origin_head"
+    },
+    {
+      "id": "TS-08-4",
+      "kind": "integration",
+      "verifies": [
+        "08-REQ-1.4"
+      ],
+      "title": "A diverged origin is refused with a recovery instruction",
+      "given": [
+        "a ready standard workspace whose origin was force-pushed"
+      ],
+      "when": "the sync route is called without reset_to_upstream",
+      "then": [
+        "the response is 409",
+        "sync_error is set and names reset_to_upstream",
+        "head_sha is unchanged"
+      ],
+      "pseudocode": "in the sync integration test file: assert post(sync).status == 409 and 'reset_to_upstream' in read().json.sync_error"
+    },
+    {
+      "id": "TS-08-5",
+      "kind": "integration",
+      "verifies": [
+        "08-REQ-1.5"
+      ],
+      "title": "A failed fetch answers 502 and records the error without a credential",
+      "given": [
+        "a workspace whose origin is unreachable, one whose origin refuses the credential, and one whose credential cannot be resolved"
+      ],
+      "when": "the sync route is called for each",
+      "then": [
+        "each answers 502",
+        "sync_error is set in each case and contains no credential",
+        "head_sha and upstream_head_sha are unchanged"
+      ],
+      "pseudocode": "in the sync integration test file, table over the three failures asserting 502, a set sync_error and the absence of the token"
+    },
+    {
+      "id": "TS-08-6",
+      "kind": "integration",
+      "verifies": [
+        "08-REQ-1.6"
+      ],
+      "title": "A cancelled sync answers 504 and leaves a recoverable workspace",
+      "given": [
+        "a sync whose fetch is made to exceed its deadline, and one whose client disconnects"
+      ],
+      "when": "each is run",
+      "then": [
+        "each answers 504",
+        "sync_error is set",
+        "a later sync of the same workspace succeeds"
+      ],
+      "pseudocode": "in the sync integration test file: assert post(sync).status == 504; assert post(sync).status == 200 once the fetch is healthy"
+    },
+    {
+      "id": "TS-08-7",
+      "kind": "integration",
+      "verifies": [
+        "08-REQ-1.7"
+      ],
+      "title": "A successful sync clears an earlier error",
+      "given": [
+        "a workspace whose last sync failed and left sync_error set"
+      ],
+      "when": "a sync succeeds",
+      "then": [
+        "sync_error is null afterwards",
+        "the field reflects the present condition rather than the history"
+      ],
+      "pseudocode": "in the sync integration test file: assert read().json.sync_error is not None; fix_origin(); assert post(sync).json.sync_error is None"
+    },
+    {
+      "id": "TS-08-8",
+      "kind": "unit",
+      "verifies": [
+        "08-REQ-2.1"
+      ],
+      "title": "A sync is refused for a workspace that is not ready or has syncing disabled",
+      "given": [
+        "workspaces at pending, cloning, failed and archived, and a ready one with sync_enabled false"
+      ],
+      "when": "the sync route is called for each",
+      "then": [
+        "each answers 400",
+        "no fetch is attempted",
+        "no workspace field changes"
+      ],
+      "pseudocode": "in the sync test file, table over the five cases asserting 400 and remote.fetches == 0"
+    },
+    {
+      "id": "TS-08-9",
+      "kind": "unit",
+      "verifies": [
+        "08-REQ-2.2"
+      ],
+      "title": "A sync against a busy workspace is refused at once",
+      "given": [
+        "a ready workspace whose lock is held by a long operation"
+      ],
+      "when": "the sync route is called, and again after the lock is released",
+      "then": [
+        "the first answers 409 with error_type workspace_busy",
+        "it answers without waiting for the lock",
+        "the second succeeds"
+      ],
+      "pseudocode": "in the sync test file: assert post(sync).json.error.error_type == 'workspace_busy'; release(); assert post(sync).status == 200"
+    },
+    {
+      "id": "TS-08-10",
+      "kind": "integration",
+      "verifies": [
+        "08-REQ-2.3"
+      ],
+      "title": "A sync in progress is not a stored status",
+      "given": [
+        "a ready workspace and a sync made to run slowly"
+      ],
+      "when": "the workspace is read while the sync runs, and a second sync is attempted",
+      "then": [
+        "the workspace's status reads ready throughout",
+        "the second sync is refused with workspace_busy and not by a status check"
+      ],
+      "pseudocode": "in the sync integration test file: start_slow_sync(); assert read().json.status == 'ready' and post(sync).json.error.error_type == 'workspace_busy'"
+    },
+    {
+      "id": "TS-08-11",
+      "kind": "integration",
+      "verifies": [
+        "08-REQ-3.1"
+      ],
+      "title": "A reclone pushes out, discards and copies again",
+      "given": [
+        "a ready workspace with a usable credential, a branch that exists only in its repository, and sync_error and upstream_head_sha set"
+      ],
+      "when": "the reclone route is called and the workspace is polled to a terminal status",
+      "then": [
+        "the response is 200 with status pending, sync_error null and upstream_head_sha null",
+        "the local-only branch exists on origin afterwards",
+        "the workspace reaches ready with a freshly copied repository"
+      ],
+      "pseudocode": "in the reclone integration test file: r = post(reclone); assert r.json.status == 'pending' and localOnly in remote_refs(); assert poll() == 'ready'"
+    },
+    {
+      "id": "TS-08-12",
+      "kind": "integration",
+      "verifies": [
+        "08-REQ-3.2"
+      ],
+      "title": "A reclone proceeds although its push failed",
+      "given": [
+        "a workspace whose origin refuses the push, and one with no usable credential"
+      ],
+      "when": "the reclone route is called for each",
+      "then": [
+        "each answers 200 with status pending",
+        "each repository is copied again",
+        "the push failure does not appear as the route's answer"
+      ],
+      "pseudocode": "in the reclone integration test file, table over the two cases asserting 200 and a completed re-copy"
+    },
+    {
+      "id": "TS-08-13",
+      "kind": "unit",
+      "verifies": [
+        "08-REQ-3.3"
+      ],
+      "title": "A reclone is refused for an archived, copying or busy workspace",
+      "given": [
+        "an archived workspace, one at pending, one at cloning, and a ready one whose lock is held"
+      ],
+      "when": "the reclone route is called for each",
+      "then": [
+        "the archived one answers 400",
+        "the copying ones answer 409",
+        "the busy one answers 409 with error_type workspace_busy",
+        "no repository is discarded"
+      ],
+      "pseudocode": "in the reclone test file, table over the four cases asserting the status and that the repository still exists"
+    },
+    {
+      "id": "TS-08-14",
+      "kind": "unit",
+      "verifies": [
+        "08-REQ-3.4"
+      ],
+      "title": "A reclone that cannot discard the repository fails without changing the workspace",
+      "given": [
+        "a store whose discard raises, and a store whose workspace update raises"
+      ],
+      "when": "the reclone route is called against each",
+      "then": [
+        "each answers 500",
+        "the workspace keeps its previous status",
+        "the repository still exists"
+      ],
+      "pseudocode": "in the reclone test file: with discard raising, assert post(reclone).status == 500 and read().json.status == before"
+    },
+    {
+      "id": "TS-08-15",
+      "kind": "unit",
+      "verifies": [
+        "08-REQ-4.1"
+      ],
+      "title": "The branch push checks run in the documented order",
+      "given": [
+        "combinations where two checks would both fail: a PAT without the scope for a slug naming nothing, a member pushing to an unready workspace, an invalid branch name on an unready workspace, a patch branch on a busy workspace, and a missing branch without force"
+      ],
+      "when": "each combination is requested",
+      "then": [
+        "each answers the refusal belonging to the earlier check",
+        "a PAT without the scope answers 403 even for a slug that names nothing",
+        "the patch-branch refusal is given although the workspace is busy"
+      ],
+      "pseudocode": "in the branch push test file, table over (conditions, expectedStatus, expectedErrorType)"
+    },
+    {
+      "id": "TS-08-16",
+      "kind": "unit",
+      "verifies": [
+        "08-REQ-4.2"
+      ],
+      "title": "The branch name is one segment decoded exactly once",
+      "given": [
+        "branches named fix/42-nil-map, a%25b and plain"
+      ],
+      "when": "the route is called with fix%2F42-nil-map, a%2525b, plain, and with an unescaped slash in the path",
+      "then": [
+        "each escaped form names the intended branch",
+        "a%2525b names a%25b and not a%b",
+        "the unescaped slash matches no route and answers 404"
+      ],
+      "pseudocode": "in the branch push test file, table over (segment, expectedBranchName)"
+    },
+    {
+      "id": "TS-08-17",
+      "kind": "unit",
+      "verifies": [
+        "08-REQ-4.3"
+      ],
+      "title": "An invalid branch name is refused with the rule it broke",
+      "given": [
+        "names starting with a hyphen, containing two dots, containing a control character, ending with .lock, and an empty name"
+      ],
+      "when": "the route is called for each",
+      "then": [
+        "each answers 404 with error_type branch_not_found",
+        "each message begins \"branch_not_found: \" and names the rule broken",
+        "nothing is pushed"
+      ],
+      "pseudocode": "in the branch push test file, table over the invalid names asserting the status, type and message prefix"
+    },
+    {
+      "id": "TS-08-18",
+      "kind": "unit",
+      "verifies": [
+        "08-REQ-4.4"
+      ],
+      "title": "An unready workspace or a malformed body is refused, and a thin body is accepted",
+      "given": [
+        "workspaces at pending, cloning, failed and archived, and a ready one"
+      ],
+      "when": "the route is called on each, and on the ready one with no body, {}, a body with unknown fields, a non-object body and a non-boolean force",
+      "then": [
+        "each unready workspace answers 400",
+        "the non-object body and the non-boolean force answer 400",
+        "no body, {} and unknown fields are accepted and push without force"
+      ],
+      "pseudocode": "in the branch push test file, two tables over the workspace statuses and the body shapes"
+    },
+    {
+      "id": "TS-08-19",
+      "kind": "unit",
+      "verifies": [
+        "08-REQ-4.5"
+      ],
+      "title": "The branches this route will not push are refused by kind",
+      "given": [
+        "a carry_patch workspace with an integration branch and a registered patch that is not deleted, and a workspace with its own branch set"
+      ],
+      "when": "each of those branches is pushed, with the workspace's lock free and again with it held, and the workspace's own branch is pushed with force",
+      "then": [
+        "the integration branch answers 400 integration_branch",
+        "the registered patch answers 400 patch_branch",
+        "the workspace's own branch with force answers 400 protected_branch",
+        "each answer is the same whether or not the lock is held"
+      ],
+      "pseudocode": "in the branch push test file, table over (branchKind, lockHeld, expectedErrorType)"
+    },
+    {
+      "id": "TS-08-20",
+      "kind": "unit",
+      "verifies": [
+        "08-REQ-4.6"
+      ],
+      "title": "A branch push against a busy workspace is refused at once",
+      "given": [
+        "a ready workspace whose lock is held, and an ordinary branch"
+      ],
+      "when": "the route is called, and again after the lock is released",
+      "then": [
+        "the first answers 409 with error_type workspace_busy without waiting",
+        "the second succeeds"
+      ],
+      "pseudocode": "in the branch push test file: assert post(push).json.error.error_type == 'workspace_busy'"
+    },
+    {
+      "id": "TS-08-21",
+      "kind": "unit",
+      "verifies": [
+        "08-REQ-4.7"
+      ],
+      "title": "Forced pushes are protected against HEAD and missing branches",
+      "given": [
+        "a workspace with no branch set whose HEAD points at main, and a name the repository lacks"
+      ],
+      "when": "main is pushed with force, and the missing branch is pushed with and without force",
+      "then": [
+        "main with force answers 400 protected_branch",
+        "the missing branch answers 404 branch_not_found with the message naming it",
+        "nothing is pushed in either case"
+      ],
+      "pseudocode": "in the branch push test file, table over the three cases asserting status, error_type and remote.pushes == 0"
+    },
+    {
+      "id": "TS-08-22",
+      "kind": "integration",
+      "verifies": [
+        "08-REQ-5.1"
+      ],
+      "title": "A successful push answers with the documented body",
+      "given": [
+        "a ready workspace with a branch origin does not have"
+      ],
+      "when": "the branch is pushed",
+      "then": [
+        "the response is 200 with branch, sha, remote and remote_url",
+        "sha is the 40-character tip that was offered to origin",
+        "remote is \"origin\"",
+        "the branch is on origin at that commit"
+      ],
+      "pseudocode": "in the branch push integration test file: r = post(push); assert r.json.remote == 'origin' and len(r.json.sha) == 40 and remote_ref(branch) == r.json.sha"
+    },
+    {
+      "id": "TS-08-23",
+      "kind": "integration",
+      "verifies": [
+        "08-REQ-5.2"
+      ],
+      "title": "The result distinguishes pushed, up_to_date and forced",
+      "given": [
+        "a branch origin lacks, a branch origin already has at the same commit, and a branch origin has at a divergent commit"
+      ],
+      "when": "each is pushed, the unchanged one twice and the divergent one with force, and the unchanged one once more with force",
+      "then": [
+        "the new branch reports pushed",
+        "the unchanged branch reports up_to_date, with and without force",
+        "the divergent branch with force reports forced"
+      ],
+      "pseudocode": "in the branch push integration test file, table over (originState, force, expectedResult)"
+    },
+    {
+      "id": "TS-08-24",
+      "kind": "unit",
+      "verifies": [
+        "08-REQ-5.3"
+      ],
+      "title": "remote_url is reported without userinfo",
+      "given": [
+        "workspaces whose git_url is https with userinfo, https without, and an scp-style address"
+      ],
+      "when": "a branch is pushed in each",
+      "then": [
+        "the https URL with userinfo is reported without it",
+        "the plain https URL is unchanged",
+        "the scp-style address is reported exactly as stored"
+      ],
+      "pseudocode": "in the branch push test file, table over (gitUrl, expectedRemoteUrl)"
+    },
+    {
+      "id": "TS-08-25",
+      "kind": "integration",
+      "verifies": [
+        "08-REQ-5.4"
+      ],
+      "title": "A push finishes although its caller went away",
+      "given": [
+        "a ready workspace and a push whose transfer takes measurable time"
+      ],
+      "when": "the client disconnects after the request is sent and before the answer",
+      "then": [
+        "the branch reaches origin at the offered commit",
+        "the outcome is recorded as if the caller had waited",
+        "calling the route again reports up_to_date"
+      ],
+      "pseudocode": "in the branch push integration test file: send_and_disconnect(); assert eventually(remote_ref(branch) == tip); assert post(push).json.result == 'up_to_date'"
+    },
+    {
+      "id": "TS-08-26",
+      "kind": "integration",
+      "verifies": [
+        "08-REQ-6.1"
+      ],
+      "title": "A non-fast-forward push is refused with the right instruction",
+      "given": [
+        "origin ahead of the workspace on an ordinary branch, the same on the workspace's own branch, an origin whose refs cannot be listed, and an origin that refuses even a forced update"
+      ],
+      "when": "each is pushed",
+      "then": [
+        "each answers 409 with error_type non_fast_forward",
+        "the ordinary branch's message names origin's commit and ends with the instruction to push with force",
+        "the workspace's own branch's message ends with the instruction to sync",
+        "the forced refusal says origin refuses non-fast-forward updates even with force"
+      ],
+      "pseudocode": "in the branch push integration test file, table over the four cases asserting the status, type and message ending"
+    },
+    {
+      "id": "TS-08-27",
+      "kind": "integration",
+      "verifies": [
+        "08-REQ-6.2"
+      ],
+      "title": "A missing repository and a refused ref map to their own answers",
+      "given": [
+        "an origin that answers not found, and one that refuses the ref with a reason"
+      ],
+      "when": "a branch is pushed against each",
+      "then": [
+        "the first answers 404 with error_type forge_not_found",
+        "the second answers 422 with error_type forge_rejected carrying origin's reason",
+        "the reason is scrubbed of any credential"
+      ],
+      "pseudocode": "in the branch push integration test file, table over the two origins asserting status, type and a scrubbed message"
+    },
+    {
+      "id": "TS-08-28",
+      "kind": "integration",
+      "verifies": [
+        "08-REQ-6.3"
+      ],
+      "title": "Authentication, connection and deadline failures map to their own answers",
+      "given": [
+        "origins answering 401 and 403, one unreachable, one answering unreadably, one exceeding the two-minute deadline, and a workspace with no stored credential"
+      ],
+      "when": "a branch is pushed against each",
+      "then": [
+        "401 and 403 answer 502 with forge_unauthenticated and forge_forbidden",
+        "the unreachable and unreadable origins answer 502 with forge_unreachable and forge_error",
+        "the deadline answers 504 with forge_timeout",
+        "the forge_unauthenticated message says whether no credential was stored or which kind origin rejected"
+      ],
+      "pseudocode": "in the branch push integration test file, table over the six cases asserting status and error_type"
+    },
+    {
+      "id": "TS-08-29",
+      "kind": "unit",
+      "verifies": [
+        "08-REQ-6.4"
+      ],
+      "title": "This route's own error types are repeated at the start of the message",
+      "given": [
+        "one failure for each of this route's own error types"
+      ],
+      "when": "each answer is produced",
+      "then": [
+        "each message begins with its error_type followed by a colon and a space",
+        "an answer shared with other routes, such as workspace_busy, keeps its usual message"
+      ],
+      "pseudocode": "in the branch push test file, table over the route's error types asserting message.startswith(f'{type}: ')"
+    },
+    {
+      "id": "TS-08-30",
+      "kind": "unit",
+      "verifies": [
+        "08-REQ-6.5"
+      ],
+      "title": "No answer of either route leaks a credential, userinfo or a git error",
+      "given": [
+        "a workspace whose credential and whose git_url userinfo are distinctive, and a git transport whose error text is distinctive"
+      ],
+      "when": "every failure answer of the sync, reclone and branch push routes is produced",
+      "then": [
+        "no response body contains the credential",
+        "none contains the userinfo",
+        "none contains the transport's own error text"
+      ],
+      "pseudocode": "in the branch push test file, over every failure case: assert CRED not in body and USERINFO not in body and GITERR not in body"
+    },
+    {
+      "id": "TS-08-31",
+      "kind": "smoke",
+      "verifies": [
+        "08-PATH-1"
+      ],
+      "title": "A sync fast-forwards a workspace against a running deployment",
+      "given": [
+        "a running deployment, a ready standard workspace and a real remote that has advanced"
+      ],
+      "when": "afc workspace sync is run",
+      "then": [
+        "the command exits 0 and prints the workspace",
+        "head_sha and upstream_head_sha are at the remote's head",
+        "last_sync_at is set and sync_error is null"
+      ],
+      "pseudocode": "in the sync smoke test file: r = run('afc workspace sync', slug); assert r.exit == 0 and json(r.stdout).head_sha == remote_head",
+      "real_components": [
+        "running deployment",
+        "sync route",
+        "repository store",
+        "credential resolution",
+        "real remote",
+        "afc"
+      ]
+    },
+    {
+      "id": "TS-08-32",
+      "kind": "smoke",
+      "verifies": [
+        "08-PATH-2"
+      ],
+      "title": "A rewritten remote is refused and then recovered with reset_to_upstream",
+      "given": [
+        "a running deployment and a workspace whose real remote was force-pushed"
+      ],
+      "when": "afc workspace sync is run, then run again with --reset-to-upstream",
+      "then": [
+        "the first exits 1 and the workspace's sync_error names reset_to_upstream",
+        "the second exits 0 and the branch is at the remote's head",
+        "sync_error is cleared"
+      ],
+      "pseudocode": "in the sync smoke test file: assert run('afc workspace sync').exit == 1; assert run('afc workspace sync --reset-to-upstream').exit == 0",
+      "real_components": [
+        "running deployment",
+        "sync route",
+        "repository store",
+        "real remote",
+        "afc"
+      ]
+    },
+    {
+      "id": "TS-08-33",
+      "kind": "smoke",
+      "verifies": [
+        "08-PATH-3"
+      ],
+      "title": "A branch pushed to Parley reaches the forge",
+      "given": [
+        "a running deployment, a workspace, and a branch with a slash in its name pushed to Parley's git server"
+      ],
+      "when": "afc workspace push is run for that branch",
+      "then": [
+        "the command exits 0 and prints result pushed with the branch and the SHA",
+        "the branch exists on the real remote at that commit",
+        "remote_url carries no credentials"
+      ],
+      "pseudocode": "in the branch push smoke test file: run('git push', hub_url, 'fix/42'); r = run('afc workspace push', slug, 'fix/42'); assert json(r.stdout).result == 'pushed'",
+      "real_components": [
+        "running deployment",
+        "git server",
+        "branch push route",
+        "repository store",
+        "real remote",
+        "afc",
+        "real git client"
+      ]
+    },
+    {
+      "id": "TS-08-34",
+      "kind": "smoke",
+      "verifies": [
+        "08-PATH-4"
+      ],
+      "title": "A reclone recovers a workspace against a running deployment",
+      "given": [
+        "a running deployment and a workspace whose repository has been made unusable"
+      ],
+      "when": "afc workspace reclone --confirm is run and the workspace is polled",
+      "then": [
+        "the command exits 0 and prints status pending",
+        "the workspace reaches ready",
+        "branches that existed only in the old repository are on the remote"
+      ],
+      "pseudocode": "in the reclone smoke test file: r = run('afc workspace reclone --confirm', slug); assert json(r.stdout).status == 'pending'; assert poll() == 'ready'",
+      "real_components": [
+        "running deployment",
+        "reclone route",
+        "repository store",
+        "copy-in",
+        "real remote",
+        "afc"
+      ]
+    }
+  ]
+}
