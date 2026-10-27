@@ -1,5 +1,7 @@
 import { Hono } from 'hono';
 import type { Context } from 'hono';
+import { type AuthOptions, authentication, requireScope } from '../auth/middleware.js';
+import { redactCredentials } from '../auth/credentials.js';
 import { DEFAULT_MAX_BODY_BYTES, DEFAULT_MOUNT_POINT } from '../config.js';
 import type { Clock, MetricsSink, RelationalStore } from '../platform/index.js';
 import { elapsedSeconds, recordRequest } from '../metrics/http.js';
@@ -13,13 +15,17 @@ export { DEFAULT_MOUNT_POINT } from '../config.js';
 /** Where an unhandled failure's detail goes. It never reaches a response body. */
 export interface LogSink {
   error(message: string, detail?: unknown): void;
+  /** What the service answered, for an operator reading the log. */
+  info?(message: string, detail?: unknown): void;
 }
 
 export interface RouteDefinition {
   path: string;
-  handler: () => Response | Promise<Response>;
+  handler: (c: Context) => Response | Promise<Response>;
   /** The methods this route answers. Defaults to GET alone. */
   methods?: readonly string[];
+  /** The scope a personal access token needs to reach this route. */
+  scope?: string;
 }
 
 export interface AppOptions {
@@ -39,17 +45,52 @@ export interface AppOptions {
   metrics?: MetricsSink;
   /** Read to time a request. Defaults to the host's own clock. */
   clock?: Clock;
+  /** Where a credential is identified. Omitted, every route is public. */
+  auth?: AuthOptions;
 }
 
 const consoleLog: LogSink = {
   error(message, detail) {
     console.error(message, detail);
   },
+  info(message, detail) {
+    console.log(message, detail);
+  },
 };
+
+/**
+ * A log that cannot carry a credential, whatever a failure put in its
+ * message. Every record of the service goes through it.
+ */
+function scrub(detail: unknown): unknown {
+  if (detail === undefined) {
+    return undefined;
+  }
+  if (detail instanceof Error) {
+    // Still an Error, so a reader of the log sees the failure as it was
+    // raised; only a credential inside it is replaced.
+    const safe = new Error(redactCredentials(detail.message));
+    safe.name = detail.name;
+    safe.stack = redactCredentials(detail.stack ?? '');
+    return safe;
+  }
+  if (typeof detail === 'string') {
+    return redactCredentials(detail);
+  }
+  const encoded = JSON.stringify(detail);
+  return encoded === undefined ? '[unserialisable]' : JSON.parse(redactCredentials(encoded));
+}
+
+function redacting(log: LogSink): LogSink {
+  return {
+    error: (message, detail) => log.error(redactCredentials(message), scrub(detail)),
+    info: (message, detail) => log.info?.(redactCredentials(message), scrub(detail)),
+  };
+}
 
 export function buildApp(options: AppOptions = {}): Hono {
   const mountPoint = options.mountPoint ?? DEFAULT_MOUNT_POINT;
-  const log = options.log ?? consoleLog;
+  const log = redacting(options.log ?? consoleLog);
   const maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
   const metrics = options.metrics ?? inMemoryMetrics();
   const clock = options.clock ?? systemClock();
@@ -89,9 +130,19 @@ export function buildApp(options: AppOptions = {}): Hono {
     return undefined;
   });
 
+  if (options.auth !== undefined) {
+    app.use('*', authentication({ ...options.auth, log }));
+  }
+
+  for (const route of routes) {
+    if (route.scope !== undefined) {
+      app.use(route.path, requireScope(route.scope));
+    }
+  }
+
   for (const route of routes) {
     for (const method of route.methods ?? ['GET']) {
-      app.on(method, route.path, () => route.handler());
+      app.on(method, route.path, (c) => route.handler(c));
     }
     // Registered after the route's own methods, so only another one reaches it.
     app.all(route.path, () =>

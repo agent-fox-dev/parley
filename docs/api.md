@@ -11,6 +11,8 @@ implemented; routes appear here as they are built.
 ## Contents
 
 - [Conventions](#conventions)
+- [Authentication](#authentication)
+- [Permission Scopes](#permission-scopes)
 - [Error Response Schema](#error-response-schema)
 - [Server Endpoints](#server-endpoints)
 
@@ -32,6 +34,74 @@ implemented; routes appear here as they are built.
   timestamp a client sends may carry any offset and is converted to UTC,
   preserving the instant; one that is not valid RFC 3339 is answered `400`
   with a message naming the field.
+
+## Authentication
+
+Every route except the public ones needs a credential in the
+`Authorization: Bearer <credential>` header. The public routes are the four
+[server endpoints](#server-endpoints), `GET /api/v1/auth/providers`,
+`POST /api/v1/auth/callback` and the forge webhook ingress under
+`/hooks/forge/`.
+
+Three kinds of credential are accepted:
+
+| Kind                  | Shape                             | Identity               | Scopes                    |
+| --------------------- | --------------------------------- | ---------------------- | ------------------------- |
+| API key               | `af_<key_id>_<secret>`            | the user it belongs to | every scope, implicitly   |
+| Personal access token | `af_pat_<token_id>_<secret>`      | the user it belongs to | only those it was granted |
+| Admin token           | the deployment's configured value | none — it owns nothing | every scope, implicitly   |
+
+A request that carries no credential, or one the service does not accept, is
+answered:
+
+```json
+{ "error": { "code": 401, "message": "authentication required" } }
+```
+
+The same answer is given whether the credential was absent, malformed,
+unknown, revoked, expired, or belongs to a blocked user. A caller learns
+nothing from it about which applied.
+
+Blocking a user stops every credential of theirs working **without revoking
+any of them**: the block is read on each request, so unblocking makes the
+same credentials work again.
+
+No credential, and no `Authorization` header, is written to a log record or
+a response body. Secrets are stored only as a hash
+([ADR 3](adr/03-hash-credential-secrets-with-one-pass-of-sha-256.md)).
+
+## Permission Scopes
+
+Every hub resource has one `read` and one `write` scope, and the identity
+routes use their own. API keys and admin tokens hold them all; only a
+personal access token is checked.
+
+| Resource scopes                      |                                    |
+| ------------------------------------ | ---------------------------------- |
+| `workspaces:read` `workspaces:write` | `patches:read` `patches:write`     |
+| `rebuilds:read` `rebuilds:write`     | `merges:read` `merges:write`       |
+| `git:read` `git:write`               | `secrets:read` `secrets:write`     |
+| `vars:read` `vars:write`             | `sessions:read` `sessions:write`   |
+| `audit:read` `audit:write`           | `sandboxes:read` `sandboxes:write` |
+| `forge:read` `forge:write`           |                                    |
+
+The identity scopes are `users:read`, `keys:read`, `keys:manage`,
+`tokens:read`, `tokens:write`, `tokens:manage`, `orgs:read` and
+`orgs:write`.
+
+`<resource>:write` grants `<resource>:read`. Nothing else is implied: a read
+scope never reaches a write route, and `tokens:manage` does not grant
+`tokens:read`.
+
+A token that does not hold the scope a route needs is answered `403` in the
+error envelope, with **no** `error_type`, and the route's handler does not
+run.
+
+These names of earlier hub releases are refused when a token asks for them:
+`workspaces:create`, `workspaces:delete`, `workspaces:sync`, `secrets:list`,
+`secrets:manage`, `secrets:delete`, `vars:manage` and `vars:delete`. So is
+any name outside the registered set; either is answered `400` naming the
+scope.
 
 ## Error Response Schema
 

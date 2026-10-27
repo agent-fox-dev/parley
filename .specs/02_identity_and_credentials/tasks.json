@@ -53,7 +53,7 @@
         "src/store/migrations/",
         "src/store/identity.ts"
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 2,

@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { noStore } from '../platform/store.js';
 import { buildApp } from '../http/router.js';
 import { SERVER_ROUTE_PATHS } from './server.js';
 
@@ -73,6 +74,7 @@ describe('the liveness probe', () => {
   it('answers ok without touching any store', async () => {
     const calls: string[] = [];
     const store = {
+      ...noStore(),
       ping: async () => {
         calls.push('ping');
         throw new Error('the store must not be called');
@@ -96,7 +98,7 @@ describe('the server routes and credentials', () => {
       ].map(([name, header]) => [path, name, header] as const),
     ),
   )('answers %s with %s without demanding a credential', async (path, _name, header) => {
-    const app = buildApp({ store: { ping: async () => {} } });
+    const app = buildApp({ store: noStore() });
 
     const response = await app.request(
       path,

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { HTTP_DURATION_BUCKETS } from './registry.js';
 import { parseExposition } from './exposition.js';
+import { noStore } from '../platform/store.js';
 import { buildApp } from '../http/router.js';
 import { inMemoryMetrics } from '../platform/local/metrics.js';
 
@@ -10,7 +11,7 @@ import { inMemoryMetrics } from '../platform/local/metrics.js';
  */
 describe('an answered request', () => {
   it('is counted and timed under its method, route template and status', async () => {
-    const app = buildApp({ metrics: inMemoryMetrics(), store: { ping: async () => {} } });
+    const app = buildApp({ metrics: inMemoryMetrics(), store: noStore() });
 
     await app.request('/healthz');
     const families = parseExposition(await (await app.request('/metrics')).text());
