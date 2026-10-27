@@ -8,6 +8,7 @@ import { inMemoryMetrics } from '../../platform/local/metrics.js';
 import { maxBodyBytesFrom, type Platform } from '../../platform/index.js';
 import { configuredProviders } from '../../auth/oauth.js';
 import { serviceRoutes } from '../../routes/index.js';
+import { storeLocks } from '../../platform/store_lock.js';
 import { migrate } from '../../store/migrations/index.js';
 
 export interface Env {
@@ -21,12 +22,9 @@ export interface Env {
 /** Assembles the platform a Worker is deployed with. */
 export function cloudflarePlatform(env: Env): Platform {
   const config = envConfig(env as unknown as Record<string, unknown>);
-  return {
-    store: env.DB === undefined ? noStore() : d1Store(env.DB),
-    clock: systemClock(),
-    config,
-    metrics: inMemoryMetrics(),
-  };
+  const store = env.DB === undefined ? noStore() : d1Store(env.DB);
+  const clock = systemClock();
+  return { store, clock, config, metrics: inMemoryMetrics(), locks: storeLocks(store, clock) };
 }
 
 // Built once per isolate: the metrics sink must outlive a single request.

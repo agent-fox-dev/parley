@@ -8,6 +8,7 @@ import { sqliteStore } from '../../platform/local/store.js';
 import { maxBodyBytesFrom, type Platform } from '../../platform/index.js';
 import { configuredProviders } from '../../auth/oauth.js';
 import { serviceRoutes } from '../../routes/index.js';
+import { storeLocks } from '../../platform/store_lock.js';
 import { migrate } from '../../store/migrations/index.js';
 
 /**
@@ -17,12 +18,9 @@ import { migrate } from '../../store/migrations/index.js';
  */
 export function localPlatform(env: Record<string, string | undefined>): Platform {
   const config = processConfig(env);
-  return {
-    store: sqliteStore(config.get('PARLEY_DB_PATH') ?? 'parley.db'),
-    clock: systemClock(),
-    config,
-    metrics: inMemoryMetrics(),
-  };
+  const store = sqliteStore(config.get('PARLEY_DB_PATH') ?? 'parley.db');
+  const clock = systemClock();
+  return { store, clock, config, metrics: inMemoryMetrics(), locks: storeLocks(store, clock) };
 }
 
 export function buildLocalApp(env: Record<string, string | undefined>) {

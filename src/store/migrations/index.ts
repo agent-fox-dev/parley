@@ -98,6 +98,17 @@ export const MIGRATIONS: readonly Migration[] = [
        )`,
     ],
   },
+  {
+    name: '003_locks',
+    statements: [
+      `CREATE TABLE workspace_locks (
+         key TEXT PRIMARY KEY,
+         holder TEXT NOT NULL,
+         taken_at TEXT NOT NULL,
+         expires_at TEXT NOT NULL
+       )`,
+    ],
+  },
 ];
 
 /**

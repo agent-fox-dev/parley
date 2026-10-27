@@ -9,7 +9,9 @@ import { fixedClock } from './local/clock.js';
 import { inMemoryMetrics } from './local/metrics.js';
 import { processConfig } from './local/config.js';
 import { sqliteStore } from './local/store.js';
-import { systemClock } from './local/clock.js';
+import { movableClock, systemClock } from './local/clock.js';
+import { storeLocks } from './store_lock.js';
+import { migrate } from '../store/migrations/index.js';
 import type { Clock, ConfigSource, MetricsSink, RelationalStore } from './index.js';
 
 /**
@@ -160,6 +162,78 @@ describe.each<Candidate<RelationalStore>>([
     const store = await withTable();
 
     await expect(store.all('SELECT * FROM absent')).rejects.toThrow();
+  });
+});
+
+describe.each<Candidate<RelationalStore>>([
+  {
+    name: 'the Cloudflare store over D1',
+    make: () => d1Store(fakeD1(tempPath()) as never),
+  },
+  { name: 'the local store over SQLite', make: () => sqliteStore(tempPath()) },
+])('the lock contract: over $name', ({ make }) => {
+  async function locked(leaseMs = 60_000) {
+    const store = await make();
+    await migrate(store);
+    const moving = movableClock(new Date('2026-03-01T12:00:00Z'));
+    return { store, moving, locks: storeLocks(store, moving.clock, { leaseMs }) };
+  }
+
+  it('gives the lock to one taker and refuses the next', async () => {
+    const { locks } = await locked();
+
+    expect(await locks.take('a-key')).toBeDefined();
+    expect(await locks.take('a-key')).toBeUndefined();
+  });
+
+  it('gives it to the next taker once the holder releases it', async () => {
+    const { locks } = await locked();
+    const held = await locks.take('a-key');
+
+    await held?.release();
+
+    expect(await locks.take('a-key')).toBeDefined();
+  });
+
+  it('holds one key without holding another', async () => {
+    const { locks } = await locked();
+
+    expect(await locks.take('one')).toBeDefined();
+    expect(await locks.take('two')).toBeDefined();
+  });
+
+  it('frees a lock whose lease ran out', async () => {
+    const { locks, moving } = await locked(1000);
+    expect(await locks.take('a-key')).toBeDefined();
+
+    expect(await locks.take('a-key')).toBeUndefined();
+    moving.advance(1001);
+
+    expect(await locks.take('a-key')).toBeDefined();
+  });
+
+  it('is shared by two instances over the same store', async () => {
+    const { store, moving } = await locked();
+    const first = storeLocks(store, moving.clock);
+    const second = storeLocks(store, moving.clock);
+
+    const held = await first.take('a-key');
+
+    expect(await second.take('a-key')).toBeUndefined();
+    await held?.release();
+    expect(await second.take('a-key')).toBeDefined();
+  });
+
+  it('does not let a release by a later holder be undone by the earlier one', async () => {
+    const { locks, moving } = await locked(1000);
+    const expired = await locks.take('a-key');
+    moving.advance(1001);
+    const current = await locks.take('a-key');
+
+    await expired?.release();
+
+    expect(await locks.take('a-key')).toBeUndefined();
+    await current?.release();
   });
 });
 
