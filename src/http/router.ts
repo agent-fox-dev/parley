@@ -144,10 +144,13 @@ export function buildApp(options: AppOptions = {}): Hono {
     for (const method of route.methods ?? ['GET']) {
       app.on(method, route.path, (c) => route.handler(c));
     }
-    // Registered after the route's own methods, so only another one reaches it.
-    app.all(route.path, () =>
-      errorResponse(new HttpError(405, `method not allowed on ${route.path}`)),
-    );
+  }
+
+  // After every route's own methods, so that two groups serving different
+  // methods of one path do not shadow each other, and only a method nobody
+  // answers reaches the refusal.
+  for (const path of new Set(routes.map((route) => route.path))) {
+    app.all(path, () => errorResponse(new HttpError(405, `method not allowed on ${path}`)));
   }
 
   app.notFound(() => errorResponse(new HttpError(404, 'not found')));

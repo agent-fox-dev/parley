@@ -174,6 +174,48 @@ export async function insertCredential(
   );
 }
 
+export async function listUsers(store: RelationalStore): Promise<UserRecord[]> {
+  const rows = await store.all('SELECT * FROM users ORDER BY created_at, id');
+  return rows.map(toUser);
+}
+
+export async function deleteUser(store: RelationalStore, id: string): Promise<void> {
+  await store.batch([
+    { sql: 'DELETE FROM org_members WHERE user_id = ?', params: [id] },
+    { sql: 'DELETE FROM credentials WHERE user_id = ?', params: [id] },
+    { sql: 'DELETE FROM users WHERE id = ?', params: [id] },
+  ]);
+}
+
+export async function setUserRole(
+  store: RelationalStore,
+  id: string,
+  role: 'user' | 'admin',
+  at: string,
+): Promise<void> {
+  await store.run('UPDATE users SET role = ?, updated_at = ? WHERE id = ?', [role, at, id]);
+}
+
+export async function setUserStatus(
+  store: RelationalStore,
+  id: string,
+  status: 'active' | 'blocked',
+  at: string,
+): Promise<void> {
+  await store.run('UPDATE users SET status = ?, updated_at = ? WHERE id = ?', [status, at, id]);
+}
+
+/**
+ * How many admins could still administer the deployment. A blocked admin
+ * cannot, so a deployment is not allowed to rely on one.
+ */
+export async function countActiveAdmins(store: RelationalStore): Promise<number> {
+  const rows = await store.all<{ total: number }>(
+    "SELECT COUNT(*) AS total FROM users WHERE role = 'admin' AND status = 'active'",
+  );
+  return Number(rows[0]?.total ?? 0);
+}
+
 export async function insertOrg(store: RelationalStore, org: OrgRecord): Promise<void> {
   await store.run(
     `INSERT INTO orgs (id, name, slug, url, owner_id, status, created_at, updated_at)
@@ -311,6 +353,75 @@ export async function isMember(
     [orgId, userId],
   );
   return rows.length > 0;
+}
+
+export async function listOrgs(store: RelationalStore): Promise<OrgRecord[]> {
+  const rows = await store.all('SELECT * FROM orgs ORDER BY created_at, id');
+  return rows.map(toOrg);
+}
+
+export async function findOrgByNameOrSlug(
+  store: RelationalStore,
+  name: string,
+  slug: string,
+): Promise<OrgRecord | undefined> {
+  const rows = await store.all('SELECT * FROM orgs WHERE name = ? OR slug = ?', [name, slug]);
+  return rows[0] === undefined ? undefined : toOrg(rows[0]);
+}
+
+export async function updateOrg(
+  store: RelationalStore,
+  id: string,
+  fields: { name?: string; url?: string; status?: 'active' | 'blocked' },
+  at: string,
+): Promise<void> {
+  const assignments: string[] = [];
+  const params: unknown[] = [];
+  for (const [column, value] of Object.entries(fields)) {
+    if (value !== undefined) {
+      assignments.push(`${column} = ?`);
+      params.push(value);
+    }
+  }
+  assignments.push('updated_at = ?');
+  params.push(at, id);
+  await store.run(`UPDATE orgs SET ${assignments.join(', ')} WHERE id = ?`, params);
+}
+
+export async function deleteOrg(store: RelationalStore, id: string): Promise<void> {
+  await store.batch([
+    { sql: 'DELETE FROM org_members WHERE org_id = ?', params: [id] },
+    { sql: 'DELETE FROM orgs WHERE id = ?', params: [id] },
+  ]);
+}
+
+export async function membersOfOrg(
+  store: RelationalStore,
+  orgId: string,
+): Promise<MembershipRecord[]> {
+  const rows = await store.all(
+    `SELECT org_members.org_id, org_members.user_id, users.username, users.email,
+            org_members.role, org_members.created_at
+     FROM org_members JOIN users ON users.id = org_members.user_id
+     WHERE org_members.org_id = ? ORDER BY org_members.created_at, org_members.user_id`,
+    [orgId],
+  );
+  return rows.map((row) => ({
+    org_id: text(row['org_id']),
+    user_id: text(row['user_id']),
+    username: text(row['username']),
+    email: text(row['email']),
+    role: text(row['role']),
+    created_at: text(row['created_at']),
+  }));
+}
+
+export async function removeMember(
+  store: RelationalStore,
+  orgId: string,
+  userId: string,
+): Promise<void> {
+  await store.run('DELETE FROM org_members WHERE org_id = ? AND user_id = ?', [orgId, userId]);
 }
 
 /** The organizations a user belongs to, read on every workspace decision. */

@@ -1,6 +1,8 @@
 import type { RouteDefinition } from '../http/router.js';
 import type { ProviderDirectory } from '../auth/oauth.js';
 import type { Clock, MetricsSink, RelationalStore } from '../platform/index.js';
+import { adminOrgRoutes } from './admin_orgs.js';
+import { adminUserRoutes } from './admin_users.js';
 import { authRoutes } from './auth.js';
 import { keyRoutes } from './keys.js';
 import { orgRoutes } from './orgs.js';
@@ -48,5 +50,15 @@ export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
       clock: config.clock,
     }),
     ...orgRoutes({ mountPoint: config.mountPoint, store: config.store }),
+    ...adminUserRoutes({
+      mountPoint: config.mountPoint,
+      store: config.store,
+      clock: config.clock,
+    }),
+    ...adminOrgRoutes({
+      mountPoint: config.mountPoint,
+      store: config.store,
+      clock: config.clock,
+    }),
   ];
 }

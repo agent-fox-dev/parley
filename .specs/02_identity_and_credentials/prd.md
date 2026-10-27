@@ -4,7 +4,7 @@ spec_name: "identity_and_credentials"
 title: "Authenticate callers and manage users, keys, tokens and organizations"
 status: "active"
 created_at: "2026-10-27T18:08:22Z"
-updated_at: "2026-10-27T21:20:30Z"
+updated_at: "2026-10-27T21:24:13Z"
 intent_hash: "5c12b2ab9b6760c4fa001e303703d41b6a7ceab230b206a7d5d5d9ce3a5d2646"
 schema_version: 2
 source: "docs/prd/01-port-af-hub-to-typescript-on-cloudflare.md"

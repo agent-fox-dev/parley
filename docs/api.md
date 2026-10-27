@@ -19,6 +19,7 @@ implemented; routes appear here as they are built.
 - [API keys](#api-keys)
 - [Personal access tokens](#personal-access-tokens)
 - [Organizations](#organizations)
+- [Administration](#administration)
 - [Server Endpoints](#server-endpoints)
 
 ## Conventions
@@ -374,6 +375,54 @@ body when the client's `If-None-Match` still matches.
 | ------ | ------------------------------------------------------ |
 | 403    | The organization exists and the caller is not a member |
 | 404    | No organization has that id                            |
+
+## Administration
+
+These routes need the deployment's admin token or an API key of a user
+holding the admin role. There is no `/admin` prefix. Every one answers
+`401` without a credential and `403` for any other accepted credential —
+including a personal access token holding every registered scope, because
+a scope is not a role.
+
+### Users
+
+| Endpoint                                    | Description                                                                                                                                      |
+| ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `POST /api/v1/users`                        | Create a user. Body: `{username, email, provider, provider_id}`, each required. `201`; `409` when the username or the provider identity is taken |
+| `GET /api/v1/users`                         | List every user                                                                                                                                  |
+| `GET /api/v1/users/:id`                     | Read a user. Supports `ETag`, answering `304` when it matches                                                                                    |
+| `PATCH /api/v1/users/:id`                   | Change a user. Body: `{full_name}`, required                                                                                                     |
+| `DELETE /api/v1/users/:id`                  | Delete a user with their credentials and memberships; `204`, or `409` for the last active admin                                                  |
+| `POST /api/v1/users/:id/promote`            | Give the admin role. Repeating it succeeds and changes nothing                                                                                   |
+| `POST /api/v1/users/:id/demote`             | Take the admin role away; `409` for the last active admin                                                                                        |
+| `POST /api/v1/users/:id/block`              | Block a user: every credential of theirs stops working, none is revoked                                                                          |
+| `POST /api/v1/users/:id/unblock`            | Unblock: every credential that is not revoked or expired works again                                                                             |
+| `GET /api/v1/users/:id/keys`                | List a user's API keys; each entry carries `user_id` and no secret                                                                               |
+| `DELETE /api/v1/users/:id/keys/:key_id`     | Revoke one of their keys; `204`                                                                                                                  |
+| `GET /api/v1/users/:id/tokens`              | List a user's tokens; each entry carries `user_id` and no secret                                                                                 |
+| `DELETE /api/v1/users/:id/tokens/:token_id` | Revoke one of their tokens; `204`                                                                                                                |
+
+A **blocked** admin does not count as active, so a deployment cannot be
+left with one admin who cannot sign in.
+
+### Organizations
+
+| Endpoint                                   | Description                                                                                                                                                                                                                                                           |
+| ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST /api/v1/orgs`                        | Create an organization. Body: `{name, slug, owner_id}` required, `url` optional. `201`; `409` for a taken name or slug; `400` for a slug that is not lower-case words joined by single hyphens, or an `owner_id` naming no user. The owner is a member from the start |
+| `GET /api/v1/orgs`                         | List every organization                                                                                                                                                                                                                                               |
+| `PATCH /api/v1/orgs/:id`                   | Change `name`, `url`, or both; at least one is required. `409` on a name collision                                                                                                                                                                                    |
+| `DELETE /api/v1/orgs/:id`                  | Delete an organization and its memberships; `204`                                                                                                                                                                                                                     |
+| `POST /api/v1/orgs/:id/block`              | Block an organization                                                                                                                                                                                                                                                 |
+| `POST /api/v1/orgs/:id/unblock`            | Unblock an organization                                                                                                                                                                                                                                               |
+| `GET /api/v1/orgs/:id/members`             | List the memberships                                                                                                                                                                                                                                                  |
+| `PUT /api/v1/orgs/:id/members/:user_id`    | Add a member; `200` with the membership                                                                                                                                                                                                                               |
+| `DELETE /api/v1/orgs/:id/members/:user_id` | Remove a member; `204`                                                                                                                                                                                                                                                |
+
+A membership is `{org_id, user_id, username, email, role, created_at}`.
+
+`GET /api/v1/orgs/:id` is **not** an administration route: it is the
+member-facing read described under [Organizations](#organizations).
 
 ## Server Endpoints
 
