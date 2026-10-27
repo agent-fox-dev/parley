@@ -59,7 +59,7 @@ export async function deleteWorkspaceAndTokens(
   await store.batch([
     ...retireBindingsOf(workspace.slug, at),
     {
-      sql: 'DELETE FROM workspace_secrets WHERE scope = ?',
+      sql: 'DELETE FROM entries WHERE scope = ?',
       params: [workspaceScope(workspace.slug)],
     },
     { sql: 'DELETE FROM workspaces WHERE slug = ?', params: [workspace.slug] },

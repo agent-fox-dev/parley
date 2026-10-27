@@ -53,6 +53,35 @@ export async function deploymentKey(
  * two equal secrets do not look equal in the store, and the tag means a
  * value changed in the store is refused rather than returned (see ADR 4).
  */
+/** Seals a value under the deployment's key, with a fresh nonce each time. */
+export function sealWith(key: CryptoKey): (value: string) => Promise<string> {
+  return async (value: string) => {
+    const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES));
+    const sealed = await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv: iv as BufferSource },
+      key,
+      new TextEncoder().encode(value),
+    );
+    return `${toBase64(iv)}.${toBase64(new Uint8Array(sealed))}`;
+  };
+}
+
+/** Opens what sealWith sealed, refusing anything the tag does not vouch for. */
+export function openWith(key: CryptoKey): (stored: string) => Promise<string> {
+  return async (stored: string) => {
+    const [iv, sealed] = stored.split('.');
+    if (iv === undefined || sealed === undefined) {
+      throw new Error('the stored secret is not in the sealed form');
+    }
+    const opened = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: fromBase64(iv) as BufferSource },
+      key,
+      fromBase64(sealed) as BufferSource,
+    );
+    return new TextDecoder().decode(opened);
+  };
+}
+
 export function sealedSecrets(store: RelationalStore, key: CryptoKey): SecretStore {
   async function seal(value: string): Promise<string> {
     const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES));
@@ -81,29 +110,32 @@ export function sealedSecrets(store: RelationalStore, key: CryptoKey): SecretSto
     async put(scope: string, name: string, value: string): Promise<void> {
       const at = new Date().toISOString();
       await store.run(
-        `INSERT INTO workspace_secrets (scope, key, sealed, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT (scope, key) DO UPDATE SET sealed = excluded.sealed, updated_at = excluded.updated_at`,
-        [scope, name, await seal(value), at, at],
+        `INSERT INTO entries (scope, kind, key, key_folded, value, created_at, updated_at)
+         VALUES (?, 'secret', ?, ?, ?, ?, ?)
+         ON CONFLICT (scope, kind, key_folded) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+        [scope, name, name.toLowerCase(), await seal(value), at, at],
       );
     },
 
     async get(scope: string, name: string): Promise<string | undefined> {
-      const rows = await store.all<{ sealed: string }>(
-        'SELECT sealed FROM workspace_secrets WHERE scope = ? AND key = ?',
-        [scope, name],
+      const rows = await store.all<{ value: string }>(
+        "SELECT value FROM entries WHERE scope = ? AND kind = 'secret' AND key_folded = ?",
+        [scope, name.toLowerCase()],
       );
       const row = rows[0];
-      return row === undefined ? undefined : open(row.sealed);
+      return row === undefined ? undefined : open(row.value);
     },
 
     async delete(scope: string, name: string): Promise<void> {
-      await store.run('DELETE FROM workspace_secrets WHERE scope = ? AND key = ?', [scope, name]);
+      await store.run(
+        "DELETE FROM entries WHERE scope = ? AND kind = 'secret' AND key_folded = ?",
+        [scope, name.toLowerCase()],
+      );
     },
 
     async names(scope: string): Promise<string[]> {
       const rows = await store.all<{ key: string }>(
-        'SELECT key FROM workspace_secrets WHERE scope = ? ORDER BY key',
+        "SELECT key FROM entries WHERE scope = ? AND kind = 'secret' ORDER BY key_folded",
         [scope],
       );
       return rows.map((row) => row.key);

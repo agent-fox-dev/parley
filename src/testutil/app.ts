@@ -3,7 +3,7 @@ import type { RouteDefinition } from '../http/router.js';
 import { inMemoryMetrics } from '../platform/local/metrics.js';
 import type { RelationalStore } from '../platform/index.js';
 import { serviceRoutes } from '../routes/index.js';
-import { deploymentKey, sealedSecrets } from '../secrets/store.js';
+import { deploymentKey, openWith, sealWith, sealedSecrets } from '../secrets/store.js';
 import { storeLocks } from '../platform/store_lock.js';
 import type { SecretStore } from '../platform/secrets.js';
 import { freshStore, seedClock } from './identity.js';
@@ -32,6 +32,7 @@ export async function identityService(extra: RouteDefinition[] = []): Promise<Se
   const clock = seedClock();
   const key = await deploymentKey(SECRET_KEY);
   const secrets = sealedSecrets(seeded.store, key as CryptoKey);
+  const secretCipher = { seal: sealWith(key as CryptoKey), open: openWith(key as CryptoKey) };
   const app = buildApp({
     routes: [
       ...serviceRoutes({
@@ -43,6 +44,7 @@ export async function identityService(extra: RouteDefinition[] = []): Promise<Se
         metrics: inMemoryMetrics(),
         providers: stubDirectory({ codes: { 'a-code': providerIdentity() } }),
         secrets,
+        secretCipher,
         externalUrl: EXTERNAL_URL,
         locks: storeLocks(seeded.store, clock),
       }),
