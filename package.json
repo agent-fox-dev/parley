@@ -17,7 +17,9 @@
     "fmt": "prettier --write .",
     "fmt:check": "prettier --check .",
     "vet": "tsc --noEmit",
-    "lint": "oxlint src"
+    "lint": "oxlint src conformance",
+    "conformance": "npm run build:conformance && node dist/conformance.mjs",
+    "build:conformance": "esbuild conformance/run.ts --bundle --platform=node --format=esm --target=node22 --packages=external --outfile=dist/conformance.mjs"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261027.1",

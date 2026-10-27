@@ -61,6 +61,20 @@ See [configuration](docs/configuration.md) for what it reads from the
 environment, and [the architecture](docs/architecture.md#two-platform-targets)
 for why the two targets exist.
 
+## Conformance
+
+The conformance harness checks a running deployment against the contract.
+Every check whose dependency is missing is skipped with a reason, so the
+fast gate still passes on a laptop and offline.
+
+```sh
+make conformance                               # every check skips, exit 0
+PARLEY_BASE_URL=https://parley.example.com make conformance
+```
+
+The checks that drive `afc` need a commit of `af-hub` pinned in
+`conformance/hub-commit.txt`; while it reads `unpinned` they skip.
+
 ## Read more
 
 - [API reference](docs/api.md) — every route, what it answers and how it fails

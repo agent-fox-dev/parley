@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help build test test-smoke fmt fmt-check vet lint check check-release tidy clean
+.PHONY: help build test test-smoke conformance fmt fmt-check vet lint check check-release tidy clean
 
 NPM ?= npm
 
@@ -31,7 +31,10 @@ lint: ## Lint the sources
 
 check: fmt-check vet lint test ## The fast gate: run before committing
 
-check-release: fmt-check vet lint test test-smoke ## The full gate; run by a person, never by an agent
+conformance: ## Run the conformance checks against PARLEY_BASE_URL
+	$(NPM) run conformance
+
+check-release: fmt-check vet lint test test-smoke conformance ## The full gate; run by a person, never by an agent
 
 tidy: ## Reconcile the dependency manifest and lockfile
 	$(NPM) install --package-lock-only
