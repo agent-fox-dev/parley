@@ -5,8 +5,8 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { startLocalTarget } from './main.js';
 
 /**
- * 01-PATH-2: the second target on one host, probed over HTTP with no
- * Cloudflare credential in the environment.
+ * The second target on one host, probed over HTTP with no Cloudflare
+ * credential in the environment.
  */
 const CLOUDFLARE_VARS = ['CLOUDFLARE_API_TOKEN', 'CLOUDFLARE_ACCOUNT_ID', 'CF_API_TOKEN'];
 

@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 
 /**
- * 01-PATH-1: an operator brings the service up and probes it. Run against a
- * real deployment named by PARLEY_BASE_URL.
+ * An operator brings the service up and probes it, against a real
+ * deployment named by PARLEY_BASE_URL.
  */
 const baseUrl = process.env['PARLEY_BASE_URL'];
 

@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest';
 
 /**
- * 01-PATH-3: a missed route is answered in the envelope and counted under
- * the bounded route-template label, read back from the deployment's own
- * metrics endpoint.
+ * A missed route is answered in the envelope and counted under the bounded
+ * route-template label, read back from the deployment's own metrics
+ * endpoint.
  */
 const baseUrl = process.env['PARLEY_BASE_URL'];
 

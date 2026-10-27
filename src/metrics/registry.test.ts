@@ -29,12 +29,14 @@ describe('the metrics route', () => {
     },
   );
 
-  it.each(DOCUMENTED_METRICS.filter((m) => m.labels.length === 0).map((m) => m.name))(
+  it.each(DOCUMENTED_METRICS.map((m) => m.name))(
     'exposes %s with the value 0 on a service that has measured nothing',
     async (name) => {
       const { families } = await exposition(buildApp({ metrics: inMemoryMetrics() }));
+      const samples = families.get(name)?.samples ?? [];
 
-      expect(families.get(name)?.samples[0]?.value).toBe(0);
+      expect(samples.length).toBeGreaterThan(0);
+      expect(samples.every((sample) => sample.value === 0)).toBe(true);
     },
   );
 
