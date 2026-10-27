@@ -23,6 +23,8 @@ implemented; routes appear here as they are built.
 - [Workspace access](#workspace-access)
 - [Workspaces](#workspaces)
 - [Workspace-bound tokens](#workspace-bound-tokens)
+- [Secrets](#secrets)
+- [Variables](#variables)
 - [Sandboxes](#sandboxes)
 - [Server Endpoints](#server-endpoints)
 
@@ -703,6 +705,81 @@ revokes the live tokens of bindings whose workspace is gone and removes
 bindings whose token is gone; a binding of a revoked or expired token of a
 workspace that still exists is kept, so that workspace's token list still
 shows it.
+
+## Secrets
+
+Named values kept for a user, an organization or a workspace — the git
+credentials of a workspace, a forge webhook secret, whatever a deployment
+needs. **Their values are never returned.**
+
+| Routes                             | Whose                          | Who may reach them                                                                                      |
+| ---------------------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------- |
+| `/api/v1/user/secrets`             | the caller's own               | any user; an admin token gets `403`, having no user                                                     |
+| `/api/v1/orgs/:slug/secrets`       | an organization's, **by slug** | members and admin tokens; anybody else gets `404`, as for an organization that does not exist           |
+| `/api/v1/workspaces/:slug/secrets` | a workspace's                  | private access: the owner and admin tokens; a member of its organization gets `404`, as a stranger does |
+
+Each scope serves four routes:
+
+| Route                     | Answer                                                                                      |
+| ------------------------- | ------------------------------------------------------------------------------------------- |
+| `POST .../secrets`        | `201` with the created entries, **no values**                                               |
+| `GET .../secrets`         | `200` with the entries, sorted by key ignoring case, **no values**                          |
+| `PATCH .../secrets/:key`  | `200` with the entry, **no value**; `400` when `value` is missing; `404` for an unknown key |
+| `DELETE .../secrets/:key` | `204`; `404` for an unknown key                                                             |
+
+A secret in a response is `{key, created_at, updated_at}` — there is no
+`value` field at all, so no route can answer with one.
+
+Values are sealed before they reach the store
+([ADR 4](adr/04-seal-secrets-with-aes-gcm-under-a-deployment-key.md)), and a
+route that reads a value registers it with the request, so a failure the
+service did not expect cannot carry it into a log.
+
+The access needed is `secrets:read` to read and `secrets:write` to change.
+
+### Rules both kinds obey
+
+| Rule         | Constraint                                                                                                         |
+| ------------ | ------------------------------------------------------------------------------------------------------------------ |
+| Key format   | Letters, digits and underscores; never starting with a digit                                                       |
+| Key length   | At most 255 characters                                                                                             |
+| Key matching | Case-insensitive, both in lookups and in the uniqueness check; the stored key keeps the casing it was created with |
+| Value size   | At most 262,144 bytes, measured in bytes and not characters                                                        |
+| Entries      | At most 100 per scope, counted per kind                                                                            |
+| Ordering     | Every list is sorted by key, ignoring case                                                                         |
+
+A create is all or nothing: one duplicate key (`409`) or one entry over the
+cap (`400`) and none of the create's entries is written.
+
+## Variables
+
+The same thing, at the same three scopes, under the same rules — except
+that **their values are returned** and a workspace's are read at read
+access and changed at write access, so a member of its organization lists
+a workspace's variables and gets `403 forbidden` on a change.
+
+A variable in a response is `{key, value, created_at, updated_at}`. The
+access needed is `vars:read` to read and `vars:write` to change.
+
+A variable named after a [workspace setting](#workspace-settings) is an
+ordinary variable and changes no behaviour.
+
+### GET /api/v1/workspaces/:slug/vars/resolved
+
+The variables a workspace sees, merged from three tiers: the workspace's
+override the organization's, which override the **owner's**.
+
+**Access:** `vars:read`; read access.
+
+**Response:** `200 OK` with an array sorted by key ignoring case, each
+entry carrying `key`, `value`, `origin` (`user`, `org` or `workspace`),
+`created_at` and `updated_at`.
+
+Two rules make this a property of the workspace rather than of who asked:
+the user tier is the **workspace owner's**, never the caller's, so a member
+of the organization is answered exactly what the owner is answered; and the
+organization tier is included only when the owner belongs to that
+organization.
 
 ## Sandboxes
 

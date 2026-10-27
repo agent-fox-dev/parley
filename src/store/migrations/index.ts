@@ -120,6 +120,29 @@ export const MIGRATIONS: readonly Migration[] = [
       'CREATE INDEX token_bindings_by_workspace ON token_bindings (workspace_slug)',
     ],
   },
+  {
+    name: '005_entries',
+    statements: [
+      // One table for both kinds, so the key, size, count and ordering
+      // rules cannot drift between them. A secret's value is sealed, a
+      // variable's is not; what a route may return is the only difference
+      // the service makes between them.
+      `CREATE TABLE entries (
+         scope TEXT NOT NULL,
+         kind TEXT NOT NULL,
+         key TEXT NOT NULL,
+         key_folded TEXT NOT NULL,
+         value TEXT NOT NULL,
+         created_at TEXT NOT NULL,
+         updated_at TEXT NOT NULL,
+         PRIMARY KEY (scope, kind, key_folded)
+       )`,
+      `INSERT INTO entries (scope, kind, key, key_folded, value, created_at, updated_at)
+       SELECT scope, 'secret', key, lower(key), sealed, created_at, updated_at
+       FROM workspace_secrets`,
+      'DROP TABLE workspace_secrets',
+    ],
+  },
 ];
 
 /**

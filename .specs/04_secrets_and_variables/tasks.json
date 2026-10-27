@@ -62,7 +62,7 @@
         "src/routes/secrets.integration.test.ts",
         "src/store/migrations/"
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 2,
@@ -93,7 +93,7 @@
       "depends_on": [
         1
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 3,
@@ -125,7 +125,7 @@
       "depends_on": [
         1
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 4,
@@ -157,7 +157,7 @@
       "depends_on": [
         3
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 5,
@@ -191,7 +191,7 @@
         "`make check` passes with no network access and no deployment configured",
         "afc secrets create, list, update and delete and afc vars create, list, update, delete and resolve behave as docs/prd/cli.md specifies against a running deployment"
       ],
-      "state": "pending"
+      "state": "done"
     }
   ]
 }

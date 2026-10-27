@@ -2,6 +2,7 @@ import type { RouteDefinition } from '../http/router.js';
 import type { ProviderDirectory } from '../auth/oauth.js';
 import type { Clock, Locks, MetricsSink, RelationalStore } from '../platform/index.js';
 import type { SecretStore } from '../platform/secrets.js';
+import type { Cipher } from '../entries/store.js';
 import { adminOrgRoutes } from './admin_orgs.js';
 import { adminUserRoutes } from './admin_users.js';
 import { authRoutes } from './auth.js';
@@ -9,6 +10,8 @@ import { keyRoutes } from './keys.js';
 import { orgRoutes } from './orgs.js';
 import { boundTokenRoutes } from './bound_tokens.js';
 import { sandboxRoutes } from './sandboxes.js';
+import { secretRoutes } from './secrets.js';
+import { varRoutes } from './vars.js';
 import { workspaceRoutes } from './workspaces.js';
 import { tokenPermissionRoutes } from './token_permissions.js';
 import { tokenRoutes } from './tokens.js';
@@ -25,6 +28,7 @@ export interface ServiceRouteConfig {
   providers: ProviderDirectory;
   /** Absent where the deployment configured no key to seal secrets with. */
   secrets?: SecretStore;
+  secretCipher?: Cipher;
   /** The deployment's own URL, for the clone URLs it advertises. */
   externalUrl?: string;
   locks: Locks;
@@ -60,6 +64,17 @@ export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
     }),
     ...orgRoutes({ mountPoint: config.mountPoint, store: config.store }),
     ...sandboxRoutes(config.mountPoint),
+    ...secretRoutes({
+      mountPoint: config.mountPoint,
+      store: config.store,
+      clock: config.clock,
+      ...(config.secretCipher === undefined ? {} : { cipher: config.secretCipher }),
+    }),
+    ...varRoutes({
+      mountPoint: config.mountPoint,
+      store: config.store,
+      clock: config.clock,
+    }),
     ...boundTokenRoutes({
       mountPoint: config.mountPoint,
       store: config.store,

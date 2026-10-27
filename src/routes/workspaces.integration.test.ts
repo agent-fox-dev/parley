@@ -158,7 +158,7 @@ describe('the credentials a create carries', () => {
     expect(text).not.toContain(sentinel);
     expect((await held.secrets.names(workspaceScope('my-project'))).toSorted()).toEqual(names);
 
-    const raw = await held.store.all('SELECT * FROM workspace_secrets');
+    const raw = await held.store.all("SELECT * FROM entries WHERE kind = 'secret'");
     expect(JSON.stringify(raw)).not.toContain(sentinel);
     expect(await held.secrets.get(workspaceScope('my-project'), names[0] as string)).toBeDefined();
   });

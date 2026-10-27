@@ -45,7 +45,7 @@ describe('a secret in the store', () => {
     const { store, secrets: vault } = await secrets();
 
     await vault.put(workspaceScope('demo'), 'GIT_PAT', SENTINEL);
-    const rows = await store.all('SELECT * FROM workspace_secrets');
+    const rows = await store.all("SELECT * FROM entries WHERE kind = 'secret'");
 
     expect(rows).toHaveLength(1);
     expect(JSON.stringify(rows)).not.toContain(SENTINEL);
@@ -57,8 +57,8 @@ describe('a secret in the store', () => {
     await vault.put(workspaceScope('one'), 'GIT_PAT', SENTINEL);
     await vault.put(workspaceScope('two'), 'GIT_PAT', SENTINEL);
     const sealed = (
-      await store.all<{ sealed: string }>('SELECT sealed FROM workspace_secrets')
-    ).map((row) => row.sealed);
+      await store.all<{ value: string }>("SELECT value FROM entries WHERE kind = 'secret'")
+    ).map((row) => row.value);
 
     expect(sealed[0]).not.toBe(sealed[1]);
   });
@@ -70,7 +70,7 @@ describe('a secret in the store', () => {
     await vault.put(workspaceScope('demo'), 'GIT_PAT', 'second');
 
     expect(await vault.get(workspaceScope('demo'), 'GIT_PAT')).toBe('second');
-    expect(await store.all('SELECT key FROM workspace_secrets')).toHaveLength(1);
+    expect(await store.all("SELECT key FROM entries WHERE kind = 'secret'")).toHaveLength(1);
   });
 
   it('is gone after it is deleted, and deleting what is absent is no error', async () => {

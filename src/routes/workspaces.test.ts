@@ -104,7 +104,7 @@ describe('a create the service refuses', () => {
 
     expect(response.status).toBe(400);
     expect(await held.store.all('SELECT slug FROM workspaces')).toEqual([]);
-    expect(await held.store.all('SELECT key FROM workspace_secrets')).toEqual([]);
+    expect(await held.store.all("SELECT key FROM entries WHERE kind = 'secret'")).toEqual([]);
   });
 
   it('names the setting and its choices when a value is refused', async () => {

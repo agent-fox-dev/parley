@@ -3,6 +3,7 @@ import type { Context } from 'hono';
 import { type AuthOptions, authentication, scopeRefusal } from '../auth/middleware.js';
 import { confinement } from '../auth/confinement.js';
 import { redactCredentials } from '../auth/credentials.js';
+import { redactProtected } from './redaction.js';
 import { DEFAULT_MAX_BODY_BYTES, DEFAULT_MOUNT_POINT } from '../config.js';
 import type { Clock, MetricsSink, RelationalStore } from '../platform/index.js';
 import { elapsedSeconds, recordRequest } from '../metrics/http.js';
@@ -68,29 +69,32 @@ const consoleLog: LogSink = {
  * A log that cannot carry a credential, whatever a failure put in its
  * message. Every record of the service goes through it.
  */
-function scrub(detail: unknown): unknown {
+function scrub(detail: unknown, c?: Context): unknown {
+  const clean = (text: string) => redactProtected(c, redactCredentials(text));
   if (detail === undefined) {
     return undefined;
   }
   if (detail instanceof Error) {
     // Still an Error, so a reader of the log sees the failure as it was
-    // raised; only a credential inside it is replaced.
-    const safe = new Error(redactCredentials(detail.message));
+    // raised; only a credential or a protected value inside it is replaced.
+    const safe = new Error(clean(detail.message));
     safe.name = detail.name;
-    safe.stack = redactCredentials(detail.stack ?? '');
+    safe.stack = clean(detail.stack ?? '');
     return safe;
   }
   if (typeof detail === 'string') {
-    return redactCredentials(detail);
+    return clean(detail);
   }
   const encoded = JSON.stringify(detail);
-  return encoded === undefined ? '[unserialisable]' : JSON.parse(redactCredentials(encoded));
+  return encoded === undefined ? '[unserialisable]' : JSON.parse(clean(encoded));
 }
 
-function redacting(log: LogSink): LogSink {
+function redacting(log: LogSink, c?: Context): LogSink {
   return {
-    error: (message, detail) => log.error(redactCredentials(message), scrub(detail)),
-    info: (message, detail) => log.info?.(redactCredentials(message), scrub(detail)),
+    error: (message, detail) =>
+      log.error(redactProtected(c, redactCredentials(message)), scrub(detail, c)),
+    info: (message, detail) =>
+      log.info?.(redactProtected(c, redactCredentials(message)), scrub(detail, c)),
   };
 }
 
@@ -166,13 +170,18 @@ export function buildApp(options: AppOptions = {}): Hono {
 
   app.notFound(() => errorResponse(new HttpError(404, 'not found')));
 
-  app.onError((err) => {
+  app.onError((err, c) => {
     // A route that refused the request said what to answer; anything else
     // is a failure nobody expected, and its detail goes to the log alone.
     if (err instanceof HttpError) {
       return errorResponse(err);
     }
-    log.error('unhandled failure while answering a request', err);
+    // Redacted against this request, so a value it asked to protect cannot
+    // leave through a failure it did not expect.
+    redacting(options.log ?? consoleLog, c).error(
+      'unhandled failure while answering a request',
+      err,
+    );
     return errorResponse(new HttpError(500, 'internal server error'));
   });
 
