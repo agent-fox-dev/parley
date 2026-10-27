@@ -58,6 +58,21 @@ Both targets apply the same schema migrations to their store before serving
 a request, so a deployment on Cloudflare and one on a host hold the same
 tables.
 
+## Checking a deployment
+
+The smoke suites (`make test-smoke`) and the conformance harness
+(`make conformance`) run against a deployment named by `PARLEY_BASE_URL`.
+Each check says what it needs and skips naming it rather than passing on
+nothing.
+
+| Variable                      | Needed by                              | Description                                                                                                           |
+| ----------------------------- | -------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `PARLEY_BASE_URL`             | both                                   | The deployment to exercise, for example `https://parley.example.com`.                                                 |
+| `PARLEY_SMOKE_OAUTH_CODE`     | the sign-in, token and blocking suites | An authorization code the deployment's provider accepts, which a stub authorization server supplies.                  |
+| `PARLEY_SMOKE_OAUTH_PROVIDER` | the same                               | The provider name to sign in with. Defaults to `github`.                                                              |
+| `PARLEY_ADMIN_TOKEN`          | the blocking suite                     | The deployment's admin token, so the suite can block and unblock.                                                     |
+| `PARLEY_SMOKE_API_KEY`        | two conformance checks                 | An API key of any user, to check that a listing carries no secret and that administration refuses an ordinary caller. |
+
 ## Local development
 
 No configuration is needed to run the tests: they build the service in
