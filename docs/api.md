@@ -15,6 +15,8 @@ implemented; routes appear here as they are built.
 - [Permission Scopes](#permission-scopes)
 - [Error Response Schema](#error-response-schema)
 - [Signing in](#signing-in)
+- [The caller's profile](#the-callers-profile)
+- [API keys](#api-keys)
 - [Server Endpoints](#server-endpoints)
 
 ## Conventions
@@ -200,6 +202,73 @@ them.
 | 401    | The authorization code is invalid or expired                                                                                                                              |
 | 403    | The user is blocked                                                                                                                                                       |
 | 409    | The username belongs to another provider identity                                                                                                                         |
+
+## The caller's profile
+
+### GET /api/v1/user
+
+The profile of the user behind the credential.
+
+**Access:** `users:read`.
+
+**Response:** `200 OK` with `id`, `username`, `email`, `full_name`,
+`status`, `role`, `provider`, `provider_id`, `created_at` and `updated_at`.
+
+**Errors:** `404` when the credential has no user of its own, which is the
+case for an admin token.
+
+### PATCH /api/v1/user
+
+Change `full_name`, the only mutable field.
+
+**Access:** `users:read`. **Request:** `{"full_name": "Alice Example"}`.
+
+**Response:** `200 OK` with the updated profile.
+
+**Errors:** `400` for a body that is not a JSON object, or a `full_name`
+that is absent, null, empty or not a string; the stored profile is
+unchanged.
+
+## API keys
+
+A key is created only by [signing in](#post-apiv1authcallback); these
+routes list, rotate and revoke them.
+
+### GET /api/v1/user/keys
+
+**Access:** `keys:read`.
+
+**Response:** `200 OK` with one entry per key — `key_id`, `created_at`,
+`expires_at`, `revoked_at` — and an `ETag`. Revoked and expired keys are
+listed too. **No entry carries a secret or its hash.** A repeat request
+whose `If-None-Match` still matches is answered `304` with no body.
+
+### POST /api/v1/user/keys/:key_id/refresh
+
+Issue a new secret under the same `key_id`. The expiry is computed again
+from the span the key was originally issued for, counted from now.
+
+**Access:** an API key only.
+
+**Response:** `200 OK` with `key`, `key_id` and `expires_at`. The previous
+secret is refused from the next request on.
+
+| Status | Condition                              |
+| ------ | -------------------------------------- |
+| 400    | The key is revoked or has expired      |
+| 401    | The caller is not an API key           |
+| 404    | No such key, or it is not the caller's |
+
+### DELETE /api/v1/user/keys/:key_id
+
+Revoke a key. A key may revoke itself; the request still completes, and the
+next request made with it is refused `401`.
+
+**Access:** `keys:manage`. **Response:** `204 No Content`.
+
+**Errors:** `404` when no such key exists or it belongs to another user.
+The two are answered identically, so a caller cannot learn which
+identifiers exist.
 
 ## Server Endpoints
 

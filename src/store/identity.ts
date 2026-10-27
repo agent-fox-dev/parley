@@ -192,6 +192,56 @@ export async function addMember(
   );
 }
 
+export async function updateFullName(
+  store: RelationalStore,
+  id: string,
+  fullName: string,
+  at: string,
+): Promise<void> {
+  await store.run('UPDATE users SET full_name = ?, updated_at = ? WHERE id = ?', [
+    fullName,
+    at,
+    id,
+  ]);
+}
+
+/** Every credential of one kind a user holds, revoked and expired included. */
+export async function credentialsOfUser(
+  store: RelationalStore,
+  userId: string,
+  kind: 'api_key' | 'pat',
+): Promise<CredentialRecord[]> {
+  const rows = await store.all(
+    'SELECT * FROM credentials WHERE user_id = ? AND kind = ? ORDER BY created_at, id',
+    [userId, kind],
+  );
+  return rows.map(toCredential);
+}
+
+export async function rotateSecret(
+  store: RelationalStore,
+  id: string,
+  secretHash: string,
+  expiresAt: string | null,
+): Promise<void> {
+  await store.run('UPDATE credentials SET secret_hash = ?, expires_at = ? WHERE id = ?', [
+    secretHash,
+    expiresAt,
+    id,
+  ]);
+}
+
+export async function revokeCredential(
+  store: RelationalStore,
+  id: string,
+  at: string,
+): Promise<void> {
+  await store.run('UPDATE credentials SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL', [
+    at,
+    id,
+  ]);
+}
+
 /**
  * Retires every API key the user holds and issues the one given, so that a
  * sign-in never leaves two live keys or, on a failure, none.

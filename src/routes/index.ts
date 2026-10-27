@@ -2,6 +2,8 @@ import type { RouteDefinition } from '../http/router.js';
 import type { ProviderDirectory } from '../auth/oauth.js';
 import type { Clock, MetricsSink, RelationalStore } from '../platform/index.js';
 import { authRoutes } from './auth.js';
+import { keyRoutes } from './keys.js';
+import { userRoutes } from './user.js';
 import { serverRoutes } from './server.js';
 
 export interface ServiceRouteConfig {
@@ -34,5 +36,7 @@ export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
       clock: config.clock,
       providers: config.providers,
     }),
+    ...userRoutes({ mountPoint: config.mountPoint, store: config.store, clock: config.clock }),
+    ...keyRoutes({ mountPoint: config.mountPoint, store: config.store, clock: config.clock }),
   ];
 }
