@@ -9,7 +9,8 @@
     "node": ">=22"
   },
   "scripts": {
-    "build": "tsc --noEmit",
+    "build": "tsc --noEmit && npm run build:local",
+    "build:local": "esbuild src/targets/local/main.ts --bundle --platform=node --format=esm --target=node22 --packages=external --outfile=dist/parley.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:smoke": "vitest run --config vitest.smoke.config.ts --passWithNoTests",
@@ -21,6 +22,7 @@
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261027.1",
     "@types/node": "^26.6.5",
+    "esbuild": "^0.28.2",
     "oxlint": "^1.90.0",
     "prettier": "^3.9.10",
     "typescript": "^7.0.2",
@@ -28,6 +30,7 @@
     "wrangler": "^4.154.0"
   },
   "dependencies": {
+    "@hono/node-server": "^2.1.5",
     "hono": "^4.13.14"
   }
 }

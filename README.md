@@ -45,6 +45,22 @@ make test     # the tests alone
 `make check` is the gate to run before committing. `make check-release`
 adds the slow suites and is run by a person, before a release or a merge.
 
+## Run it without Cloudflare
+
+Parley runs on one Linux or macOS host with no Cloudflare account and no
+network access to Cloudflare, using SQLite on the host's own disk instead of
+D1 and the process environment instead of Worker bindings.
+
+```sh
+make build                      # type-check and bundle to dist/parley.mjs
+PARLEY_PORT=8787 node dist/parley.mjs
+curl localhost:8787/healthz     # {"status":"ok"}
+```
+
+See [configuration](docs/configuration.md) for what it reads from the
+environment, and [the architecture](docs/architecture.md#two-platform-targets)
+for why the two targets exist.
+
 ## Read more
 
 - [API reference](docs/api.md) — every route, what it answers and how it fails

@@ -28,6 +28,16 @@ as the empty string.
 | -------------------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | maximum request body | 1,048,576 bytes | A request whose body exceeds it is answered `413` in the error envelope before any route handler runs. The service reads it from its own configuration; no deployment variable exposes it yet. |
 
+## The second target
+
+The non-Cloudflare target reads the same settings from the process
+environment, and two of its own.
+
+| Variable         | Default     | Description                                                 |
+| ---------------- | ----------- | ----------------------------------------------------------- |
+| `PARLEY_PORT`    | `8787`      | The port the host process listens on.                       |
+| `PARLEY_DB_PATH` | `parley.db` | Where SQLite keeps the relational store on the host's disk. |
+
 ## Local development
 
 No configuration is needed to run the tests: they build the service in

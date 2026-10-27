@@ -1,5 +1,5 @@
 name = "parley"
-main = "src/index.ts"
+main = "src/targets/cloudflare/worker.ts"
 compatibility_date = "2026-10-27"
 compatibility_flags = ["nodejs_compat"]
 
