@@ -57,7 +57,7 @@
         "src/secrets/store.integration.test.ts",
         "src/store/migrations/"
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 2,
