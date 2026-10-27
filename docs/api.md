@@ -17,6 +17,7 @@ implemented; routes appear here as they are built.
 - [Signing in](#signing-in)
 - [The caller's profile](#the-callers-profile)
 - [API keys](#api-keys)
+- [Personal access tokens](#personal-access-tokens)
 - [Server Endpoints](#server-endpoints)
 
 ## Conventions
@@ -269,6 +270,57 @@ next request made with it is refused `401`.
 **Errors:** `404` when no such key exists or it belongs to another user.
 The two are answered identically, so a caller cannot learn which
 identifiers exist.
+
+## Personal access tokens
+
+A token belongs to a user and is limited to the scopes it was granted.
+
+### GET /api/v1/user/tokens
+
+**Access:** `tokens:read`.
+
+**Response:** `200 OK` with one entry per token — `token_id`, `name`,
+`permissions`, `expires_at`, `created_at`, `revoked_at`. No entry carries
+the token string or its hash.
+
+### POST /api/v1/user/tokens
+
+**Access:** `tokens:manage`. A token may grant only scopes it holds itself;
+an API key may grant any registered scope.
+
+**Request:**
+
+| Field         | Required | Type     | Description                                                     |
+| ------------- | -------- | -------- | --------------------------------------------------------------- |
+| `name`        | yes      | string   | Label, at most 255 characters                                   |
+| `permissions` | yes      | string[] | [Scopes](#permission-scopes) to grant, at least one             |
+| `expires`     | no       | integer  | Lifetime in days: `0` (never), `30`, `60` or `90`. Default `90` |
+
+**Response:** `201 Created` with the metadata and `token`, in the form
+`af_pat_<token_id>_<secret>`. **The token is returned here and nowhere
+else.**
+
+| Status | Condition                                                                                                                                                             |
+| ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 400    | A body that is not an object; `name` absent, empty or too long; `permissions` absent, empty, not an array, or naming a retired or unregistered scope; a bad `expires` |
+| 403    | A token granting a scope it does not hold                                                                                                                             |
+
+### GET /api/v1/user/tokens/:token_id
+
+**Access:** `tokens:read`. **Response:** `200 OK` with the metadata.
+`404` when no such token exists or it is not the caller's.
+
+### DELETE /api/v1/user/tokens/:token_id
+
+**Access:** `tokens:manage`.
+
+**Response:** `200 OK` with the token's metadata and `revoked_at` set —
+**not** `204`. The token is refused `401` from the next request on.
+
+| Status | Condition                                |
+| ------ | ---------------------------------------- |
+| 400    | The token is already revoked             |
+| 404    | No such token, or it is not the caller's |
 
 ## Server Endpoints
 
