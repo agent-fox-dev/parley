@@ -19,3 +19,16 @@ export interface Platform {
   config: ConfigSource;
   metrics: MetricsSink;
 }
+
+/**
+ * The configured request body limit, where the deployment set a usable one.
+ * Anything unreadable leaves the service's own default in place.
+ */
+export function maxBodyBytesFrom(config: ConfigSource): { maxBodyBytes?: number } {
+  const raw = config.get('PARLEY_MAX_BODY_BYTES');
+  if (raw === undefined) {
+    return {};
+  }
+  const value = Number(raw);
+  return Number.isInteger(value) && value > 0 ? { maxBodyBytes: value } : {};
+}

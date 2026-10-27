@@ -93,7 +93,9 @@ Build information and the mount point in use. Cached publicly
 `runtime_version` is the JavaScript runtime's version, reported under a
 truthful key in place of the hub's `go_version`. `build_time` and `commit`
 come from the deployment's environment and are the empty string where it
-supplied neither.
+supplied neither. `build_time` is rendered as RFC 3339 in UTC whatever
+offset the deployment supplied, and is the empty string when it supplied
+something unreadable.
 
 ### GET /metrics
 

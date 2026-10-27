@@ -4,7 +4,7 @@ import { systemClock } from '../../platform/local/clock.js';
 import { processConfig } from '../../platform/local/config.js';
 import { inMemoryMetrics } from '../../platform/local/metrics.js';
 import { sqliteStore } from '../../platform/local/store.js';
-import type { Platform } from '../../platform/index.js';
+import { maxBodyBytesFrom, type Platform } from '../../platform/index.js';
 
 /**
  * The second target: the same service on one host, with the non-Cloudflare
@@ -29,34 +29,41 @@ export function buildLocalApp(env: Record<string, string | undefined>) {
     clock: platform.clock,
     metrics: platform.metrics,
     ...(mountPoint === undefined ? {} : { mountPoint }),
+    ...maxBodyBytesFrom(platform.config),
     buildTime: platform.config.get('PARLEY_BUILD_TIME') ?? '',
     commit: platform.config.get('PARLEY_COMMIT') ?? '',
   });
 }
 
-export function startLocalTarget(env: Record<string, string | undefined> = process.env): {
-  port: number;
-  stop: () => Promise<void>;
-} {
+/**
+ * Starts the second target and resolves once it is listening. A host that
+ * refuses to bind rejects here rather than leaving a server that answers
+ * nothing.
+ */
+export async function startLocalTarget(
+  env: Record<string, string | undefined> = process.env,
+): Promise<{ port: number; stop: () => Promise<void> }> {
   const requested = Number(env['PARLEY_PORT'] ?? '8787');
-  const server = serve({ fetch: buildLocalApp(env).fetch, port: requested });
-  const address = server.address();
-  const port = typeof address === 'object' && address !== null ? address.port : requested;
 
-  return {
-    port,
-    stop: () =>
-      new Promise<void>((resolve, reject) => {
-        server.close((err) => (err === undefined || err === null ? resolve() : reject(err)));
-      }),
-  };
+  return new Promise((resolve, reject) => {
+    const server = serve({ fetch: buildLocalApp(env).fetch, port: requested }, (info) => {
+      resolve({
+        port: info.port,
+        stop: () =>
+          new Promise<void>((done, failed) => {
+            server.close((err) => (err === undefined || err === null ? done() : failed(err)));
+          }),
+      });
+    });
+    server.on('error', reject);
+  });
 }
 
 // Started as a program rather than imported as a module.
 if (
-  process.argv[1] !== undefined &&
-  import.meta.url.endsWith(process.argv[1].split('/').pop() ?? '\u0000')
+  process.argv[1]?.endsWith('parley.mjs') === true ||
+  process.argv[1]?.endsWith('main.ts') === true
 ) {
-  const { port } = startLocalTarget();
+  const { port } = await startLocalTarget();
   console.log(`parley listening on http://127.0.0.1:${port}`);
 }

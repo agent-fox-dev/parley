@@ -3,7 +3,7 @@ import { envConfig } from '../../platform/cloudflare/config.js';
 import { d1Store } from '../../platform/cloudflare/store.js';
 import { systemClock } from '../../platform/local/clock.js';
 import { inMemoryMetrics } from '../../platform/local/metrics.js';
-import type { Platform } from '../../platform/index.js';
+import { maxBodyBytesFrom, type Platform } from '../../platform/index.js';
 
 export interface Env {
   PARLEY_MOUNT_POINT?: string;
@@ -37,6 +37,7 @@ export default {
         ...(platform.config.get('PARLEY_MOUNT_POINT') === undefined
           ? {}
           : { mountPoint: platform.config.get('PARLEY_MOUNT_POINT') as string }),
+        ...maxBodyBytesFrom(platform.config),
         buildTime: platform.config.get('PARLEY_BUILD_TIME') ?? '',
         commit: platform.config.get('PARLEY_COMMIT') ?? '',
       });

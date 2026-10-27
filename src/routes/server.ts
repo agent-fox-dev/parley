@@ -1,6 +1,7 @@
 import { HttpError, errorResponse } from '../http/errors.js';
 import type { RouteDefinition } from '../http/router.js';
 import { renderExposition } from '../metrics/exposition.js';
+import { parseTimestamp, renderTimestamp } from '../time/rfc3339.js';
 import type { MetricsSink, RelationalStore } from '../platform/index.js';
 
 /**
@@ -45,6 +46,22 @@ function json(body: unknown, headers: Record<string, string> = {}): Response {
   });
 }
 
+/**
+ * The build time as RFC 3339 in UTC. A deployment may supply it with any
+ * offset, and one that supplies something unreadable is treated as having
+ * supplied none, because a probe must not fail over its own build label.
+ */
+export function normalisedBuildTime(supplied: string): string {
+  if (supplied.length === 0) {
+    return '';
+  }
+  try {
+    return renderTimestamp(parseTimestamp(supplied, 'build_time'));
+  } catch {
+    return '';
+  }
+}
+
 export function serverRoutes(config: ServerRouteConfig): RouteDefinition[] {
   return [
     // Liveness answers from the process alone and reads no store.
@@ -66,7 +83,7 @@ export function serverRoutes(config: ServerRouteConfig): RouteDefinition[] {
       handler: () =>
         json(
           {
-            build_time: config.buildTime,
+            build_time: normalisedBuildTime(config.buildTime),
             commit: config.commit,
             mount_point: config.mountPoint,
             runtime_version: runtimeVersion(),

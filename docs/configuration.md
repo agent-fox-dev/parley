@@ -24,9 +24,9 @@ as the empty string.
 
 ## Limits
 
-| Setting              | Default         | Description                                                                                                                                                                                    |
-| -------------------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| maximum request body | 1,048,576 bytes | A request whose body exceeds it is answered `413` in the error envelope before any route handler runs. The service reads it from its own configuration; no deployment variable exposes it yet. |
+| Setting              | Default         | Description                                                                                                                                 |
+| -------------------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| maximum request body | 1,048,576 bytes | A request whose body exceeds it is answered `413` in the error envelope before any route handler runs. Set it with `PARLEY_MAX_BODY_BYTES`. |
 
 ## The second target
 
