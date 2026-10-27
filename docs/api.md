@@ -11,7 +11,15 @@ implemented; routes appear here as they are built.
 ## Contents
 
 - [Conventions](#conventions)
+- [Authentication](#authentication)
+- [Permission Scopes](#permission-scopes)
 - [Error Response Schema](#error-response-schema)
+- [Signing in](#signing-in)
+- [The caller's profile](#the-callers-profile)
+- [API keys](#api-keys)
+- [Personal access tokens](#personal-access-tokens)
+- [Organizations](#organizations)
+- [Administration](#administration)
 - [Server Endpoints](#server-endpoints)
 
 ## Conventions
@@ -32,6 +40,74 @@ implemented; routes appear here as they are built.
   timestamp a client sends may carry any offset and is converted to UTC,
   preserving the instant; one that is not valid RFC 3339 is answered `400`
   with a message naming the field.
+
+## Authentication
+
+Every route except the public ones needs a credential in the
+`Authorization: Bearer <credential>` header. The public routes are the four
+[server endpoints](#server-endpoints), `GET /api/v1/auth/providers`,
+`POST /api/v1/auth/callback` and the forge webhook ingress under
+`/hooks/forge/`.
+
+Three kinds of credential are accepted:
+
+| Kind                  | Shape                             | Identity               | Scopes                    |
+| --------------------- | --------------------------------- | ---------------------- | ------------------------- |
+| API key               | `af_<key_id>_<secret>`            | the user it belongs to | every scope, implicitly   |
+| Personal access token | `af_pat_<token_id>_<secret>`      | the user it belongs to | only those it was granted |
+| Admin token           | the deployment's configured value | none — it owns nothing | every scope, implicitly   |
+
+A request that carries no credential, or one the service does not accept, is
+answered:
+
+```json
+{ "error": { "code": 401, "message": "authentication required" } }
+```
+
+The same answer is given whether the credential was absent, malformed,
+unknown, revoked, expired, or belongs to a blocked user. A caller learns
+nothing from it about which applied.
+
+Blocking a user stops every credential of theirs working **without revoking
+any of them**: the block is read on each request, so unblocking makes the
+same credentials work again.
+
+No credential, and no `Authorization` header, is written to a log record or
+a response body. Secrets are stored only as a hash
+([ADR 3](adr/03-hash-credential-secrets-with-one-pass-of-sha-256.md)).
+
+## Permission Scopes
+
+Every hub resource has one `read` and one `write` scope, and the identity
+routes use their own. API keys and admin tokens hold them all; only a
+personal access token is checked.
+
+| Resource scopes                      |                                    |
+| ------------------------------------ | ---------------------------------- |
+| `workspaces:read` `workspaces:write` | `patches:read` `patches:write`     |
+| `rebuilds:read` `rebuilds:write`     | `merges:read` `merges:write`       |
+| `git:read` `git:write`               | `secrets:read` `secrets:write`     |
+| `vars:read` `vars:write`             | `sessions:read` `sessions:write`   |
+| `audit:read` `audit:write`           | `sandboxes:read` `sandboxes:write` |
+| `forge:read` `forge:write`           |                                    |
+
+The identity scopes are `users:read`, `keys:read`, `keys:manage`,
+`tokens:read`, `tokens:write`, `tokens:manage`, `orgs:read` and
+`orgs:write`.
+
+`<resource>:write` grants `<resource>:read`. Nothing else is implied: a read
+scope never reaches a write route, and `tokens:manage` does not grant
+`tokens:read`.
+
+A token that does not hold the scope a route needs is answered `403` in the
+error envelope, with **no** `error_type`, and the route's handler does not
+run.
+
+These names of earlier hub releases are refused when a token asks for them:
+`workspaces:create`, `workspaces:delete`, `workspaces:sync`, `secrets:list`,
+`secrets:manage`, `secrets:delete`, `vars:manage` and `vars:delete`. So is
+any name outside the registered set; either is answered `400` naming the
+scope.
 
 ## Error Response Schema
 
@@ -54,6 +130,299 @@ contract lists one for that condition and **absent** — not null — otherwise.
 An unhandled failure is answered `500` with the message exactly
 `internal server error`. No part of the underlying failure reaches the
 response body; it goes to the log.
+
+## Signing in
+
+OAuth is the only source of an API key; there is no password login. Both
+routes are public.
+
+### GET /api/v1/auth/providers
+
+The OAuth providers this deployment is configured with, and where to send a
+person to authorise. Cached publicly (`Cache-Control: public, max-age=300`).
+
+**Response:** `200 OK`
+
+```json
+[{ "name": "github", "authorize_url": "https://github.com/login/oauth/authorize?client_id=..." }]
+```
+
+A deployment that configured no provider answers `200` with an empty array:
+sign-in is unavailable, every other route still works.
+
+### POST /api/v1/auth/callback
+
+Exchange a provider's authorization code for the user and a new API key.
+
+**Request:**
+
+| Field          | Required | Type    | Description                                                         |
+| -------------- | -------- | ------- | ------------------------------------------------------------------- |
+| `provider`     | yes      | string  | A provider from the list above                                      |
+| `code`         | yes      | string  | The provider's authorization code                                   |
+| `redirect_uri` | no       | string  | Must be on the provider's allowlist, where it has one               |
+| `expires`      | no       | integer | Key lifetime in days: `0` (never), `30`, `60` or `90`. Default `90` |
+
+**Behaviour.** The user is created or found, **every** API key that user
+already holds is revoked, and one new key is issued — the revocation and the
+issue in a single transaction, so a failure leaves neither half done.
+Automation holding an older key of the same user stops working after a
+sign-in; this is the hub's behaviour and Parley reproduces it. A user
+signing in for the first time also gets a personal organization, owned by
+them.
+
+**Response:** `200 OK`. **The key is returned here and by no other route.**
+
+```json
+{
+  "user": {
+    "id": "uuid-string",
+    "username": "alice",
+    "email": "alice@example.com",
+    "full_name": "Alice Example",
+    "status": "active",
+    "role": "user",
+    "provider": "github",
+    "provider_id": "12345",
+    "created_at": "2026-03-01T12:00:00Z",
+    "updated_at": "2026-03-01T12:00:00Z"
+  },
+  "api_key": {
+    "key": "af_<key_id>_<secret>",
+    "key_id": "<key_id>",
+    "expires_at": "2026-05-30T12:00:00Z"
+  }
+}
+```
+
+`expires_at` is `null` for a key issued with `expires` of `0`.
+
+**Errors.** None of them creates a user, issues a key or revokes one.
+
+| Status | Condition                                                                                                                                                                 |
+| ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 400    | A body that is not a JSON object; `provider` or `code` missing; an unconfigured provider; a `redirect_uri` outside the allowlist; an `expires` other than 0, 30, 60 or 90 |
+| 401    | The authorization code is invalid or expired                                                                                                                              |
+| 403    | The user is blocked                                                                                                                                                       |
+| 409    | The username belongs to another provider identity                                                                                                                         |
+
+## The caller's profile
+
+### GET /api/v1/user
+
+The profile of the user behind the credential.
+
+**Access:** `users:read`.
+
+**Response:** `200 OK` with `id`, `username`, `email`, `full_name`,
+`status`, `role`, `provider`, `provider_id`, `created_at` and `updated_at`.
+
+**Errors:** `404` when the credential has no user of its own, which is the
+case for an admin token.
+
+### PATCH /api/v1/user
+
+Change `full_name`, the only mutable field.
+
+**Access:** `users:read`. **Request:** `{"full_name": "Alice Example"}`.
+
+**Response:** `200 OK` with the updated profile.
+
+**Errors:** `400` for a body that is not a JSON object, or a `full_name`
+that is absent, null, empty or not a string; the stored profile is
+unchanged.
+
+## API keys
+
+A key is created only by [signing in](#post-apiv1authcallback); these
+routes list, rotate and revoke them.
+
+### GET /api/v1/user/keys
+
+**Access:** `keys:read`.
+
+**Response:** `200 OK` with one entry per key — `key_id`, `created_at`,
+`expires_at`, `revoked_at` — and an `ETag`. Revoked and expired keys are
+listed too. **No entry carries a secret or its hash.** A repeat request
+whose `If-None-Match` still matches is answered `304` with no body.
+
+### POST /api/v1/user/keys/:key_id/refresh
+
+Issue a new secret under the same `key_id`. The expiry is computed again
+from the span the key was originally issued for, counted from now.
+
+**Access:** an API key only.
+
+**Response:** `200 OK` with `key`, `key_id` and `expires_at`. The previous
+secret is refused from the next request on.
+
+| Status | Condition                              |
+| ------ | -------------------------------------- |
+| 400    | The key is revoked or has expired      |
+| 401    | The caller is not an API key           |
+| 404    | No such key, or it is not the caller's |
+
+### DELETE /api/v1/user/keys/:key_id
+
+Revoke a key. A key may revoke itself; the request still completes, and the
+next request made with it is refused `401`.
+
+**Access:** `keys:manage`. **Response:** `204 No Content`.
+
+**Errors:** `404` when no such key exists or it belongs to another user.
+The two are answered identically, so a caller cannot learn which
+identifiers exist.
+
+## Personal access tokens
+
+A token belongs to a user and is limited to the scopes it was granted.
+
+### GET /api/v1/user/tokens
+
+**Access:** `tokens:read`.
+
+**Response:** `200 OK` with one entry per token — `token_id`, `name`,
+`permissions`, `expires_at`, `created_at`, `revoked_at`. No entry carries
+the token string or its hash.
+
+### POST /api/v1/user/tokens
+
+**Access:** `tokens:manage`. A token may grant only scopes it holds itself;
+an API key may grant any registered scope.
+
+**Request:**
+
+| Field         | Required | Type     | Description                                                     |
+| ------------- | -------- | -------- | --------------------------------------------------------------- |
+| `name`        | yes      | string   | Label, at most 255 characters                                   |
+| `permissions` | yes      | string[] | [Scopes](#permission-scopes) to grant, at least one             |
+| `expires`     | no       | integer  | Lifetime in days: `0` (never), `30`, `60` or `90`. Default `90` |
+
+**Response:** `201 Created` with the metadata and `token`, in the form
+`af_pat_<token_id>_<secret>`. **The token is returned here and nowhere
+else.**
+
+| Status | Condition                                                                                                                                                             |
+| ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 400    | A body that is not an object; `name` absent, empty or too long; `permissions` absent, empty, not an array, or naming a retired or unregistered scope; a bad `expires` |
+| 403    | A token granting a scope it does not hold                                                                                                                             |
+
+### GET /api/v1/user/tokens/:token_id
+
+**Access:** `tokens:read`. **Response:** `200 OK` with the metadata.
+`404` when no such token exists or it is not the caller's.
+
+### DELETE /api/v1/user/tokens/:token_id
+
+**Access:** `tokens:manage`.
+
+**Response:** `200 OK` with the token's metadata and `revoked_at` set —
+**not** `204`. The token is refused `401` from the next request on.
+
+| Status | Condition                                |
+| ------ | ---------------------------------------- |
+| 400    | The token is already revoked             |
+| 404    | No such token, or it is not the caller's |
+
+### PUT / PATCH / DELETE /api/v1/user/tokens/:token_id/permissions
+
+Change a token's scopes: `PUT` replaces the set, `PATCH` adds to it,
+`DELETE` removes from it.
+
+**Access:** `tokens:write`. A token may add only scopes it holds itself;
+removing needs no such check.
+
+**Request:** `{"permissions": ["workspaces:read"]}`. `permissions` must be
+present and not null.
+
+**Response:** `200 OK` with the token's metadata after the change.
+Removing a scope the token does not hold succeeds and changes nothing.
+
+**`PUT` with an empty array** removes every permission **and revokes the
+token**: the answer carries `"permissions": []` with `revoked_at` set, and
+the token is refused `401` from the next request on. `PATCH` and `DELETE`
+refuse an empty array.
+
+| Status | Condition                                                                                                                          |
+| ------ | ---------------------------------------------------------------------------------------------------------------------------------- |
+| 400    | `permissions` absent or null; an empty array on `PATCH` or `DELETE`; a retired or unregistered scope; the token is already revoked |
+| 403    | A token adding a scope it does not hold                                                                                            |
+| 404    | No such token, or it is not the caller's                                                                                           |
+
+## Organizations
+
+An organization is read by its **id**. A user gets a personal one at first
+sign-in, and it is listed with any other they belong to.
+
+### GET /api/v1/user/orgs
+
+**Access:** `orgs:read`.
+
+**Response:** `200 OK` with one entry per organization the caller belongs
+to — `id`, `name`, `slug`, `url`, `owner_id`, `status`, `created_at`,
+`updated_at`. An admin token belongs to no user, so it is answered with an
+empty array.
+
+### GET /api/v1/orgs/:id
+
+**Access:** `orgs:read`, and the caller must be a member or an
+administrator.
+
+**Response:** `200 OK` with the organization and an `ETag`; `304` with no
+body when the client's `If-None-Match` still matches.
+
+| Status | Condition                                              |
+| ------ | ------------------------------------------------------ |
+| 403    | The organization exists and the caller is not a member |
+| 404    | No organization has that id                            |
+
+## Administration
+
+These routes need the deployment's admin token or an API key of a user
+holding the admin role. There is no `/admin` prefix. Every one answers
+`401` without a credential and `403` for any other accepted credential —
+including a personal access token holding every registered scope, because
+a scope is not a role.
+
+### Users
+
+| Endpoint                                    | Description                                                                                                                                      |
+| ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `POST /api/v1/users`                        | Create a user. Body: `{username, email, provider, provider_id}`, each required. `201`; `409` when the username or the provider identity is taken |
+| `GET /api/v1/users`                         | List every user                                                                                                                                  |
+| `GET /api/v1/users/:id`                     | Read a user. Supports `ETag`, answering `304` when it matches                                                                                    |
+| `PATCH /api/v1/users/:id`                   | Change a user. Body: `{full_name}`, required                                                                                                     |
+| `DELETE /api/v1/users/:id`                  | Delete a user with their credentials and memberships; `204`, or `409` for the last active admin                                                  |
+| `POST /api/v1/users/:id/promote`            | Give the admin role. Repeating it succeeds and changes nothing                                                                                   |
+| `POST /api/v1/users/:id/demote`             | Take the admin role away; `409` for the last active admin                                                                                        |
+| `POST /api/v1/users/:id/block`              | Block a user: every credential of theirs stops working, none is revoked                                                                          |
+| `POST /api/v1/users/:id/unblock`            | Unblock: every credential that is not revoked or expired works again                                                                             |
+| `GET /api/v1/users/:id/keys`                | List a user's API keys; each entry carries `user_id` and no secret                                                                               |
+| `DELETE /api/v1/users/:id/keys/:key_id`     | Revoke one of their keys; `204`                                                                                                                  |
+| `GET /api/v1/users/:id/tokens`              | List a user's tokens; each entry carries `user_id` and no secret                                                                                 |
+| `DELETE /api/v1/users/:id/tokens/:token_id` | Revoke one of their tokens; `204`                                                                                                                |
+
+A **blocked** admin does not count as active, so a deployment cannot be
+left with one admin who cannot sign in.
+
+### Organizations
+
+| Endpoint                                   | Description                                                                                                                                                                                                                                                           |
+| ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST /api/v1/orgs`                        | Create an organization. Body: `{name, slug, owner_id}` required, `url` optional. `201`; `409` for a taken name or slug; `400` for a slug that is not lower-case words joined by single hyphens, or an `owner_id` naming no user. The owner is a member from the start |
+| `GET /api/v1/orgs`                         | List every organization                                                                                                                                                                                                                                               |
+| `PATCH /api/v1/orgs/:id`                   | Change `name`, `url`, or both; at least one is required. `409` on a name collision                                                                                                                                                                                    |
+| `DELETE /api/v1/orgs/:id`                  | Delete an organization and its memberships; `204`                                                                                                                                                                                                                     |
+| `POST /api/v1/orgs/:id/block`              | Block an organization                                                                                                                                                                                                                                                 |
+| `POST /api/v1/orgs/:id/unblock`            | Unblock an organization                                                                                                                                                                                                                                               |
+| `GET /api/v1/orgs/:id/members`             | List the memberships                                                                                                                                                                                                                                                  |
+| `PUT /api/v1/orgs/:id/members/:user_id`    | Add a member; `200` with the membership                                                                                                                                                                                                                               |
+| `DELETE /api/v1/orgs/:id/members/:user_id` | Remove a member; `204`                                                                                                                                                                                                                                                |
+
+A membership is `{org_id, user_id, username, email, role, created_at}`.
+
+`GET /api/v1/orgs/:id` is **not** an administration route: it is the
+member-facing read described under [Organizations](#organizations).
 
 ## Server Endpoints
 

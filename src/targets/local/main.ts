@@ -1,10 +1,14 @@
 import { serve } from '@hono/node-server';
+import { DEFAULT_MOUNT_POINT } from '../../config.js';
 import { buildApp } from '../../http/router.js';
 import { systemClock } from '../../platform/local/clock.js';
 import { processConfig } from '../../platform/local/config.js';
 import { inMemoryMetrics } from '../../platform/local/metrics.js';
 import { sqliteStore } from '../../platform/local/store.js';
 import { maxBodyBytesFrom, type Platform } from '../../platform/index.js';
+import { configuredProviders } from '../../auth/oauth.js';
+import { serviceRoutes } from '../../routes/index.js';
+import { migrate } from '../../store/migrations/index.js';
 
 /**
  * The second target: the same service on one host, with the non-Cloudflare
@@ -24,6 +28,7 @@ export function localPlatform(env: Record<string, string | undefined>): Platform
 export function buildLocalApp(env: Record<string, string | undefined>) {
   const platform = localPlatform(env);
   const mountPoint = platform.config.get('PARLEY_MOUNT_POINT');
+  const adminToken = platform.config.get('PARLEY_ADMIN_TOKEN');
   return buildApp({
     store: platform.store,
     clock: platform.clock,
@@ -32,6 +37,21 @@ export function buildLocalApp(env: Record<string, string | undefined>) {
     ...maxBodyBytesFrom(platform.config),
     buildTime: platform.config.get('PARLEY_BUILD_TIME') ?? '',
     commit: platform.config.get('PARLEY_COMMIT') ?? '',
+    routes: serviceRoutes({
+      mountPoint: mountPoint ?? DEFAULT_MOUNT_POINT,
+      buildTime: platform.config.get('PARLEY_BUILD_TIME') ?? '',
+      commit: platform.config.get('PARLEY_COMMIT') ?? '',
+      store: platform.store,
+      clock: platform.clock,
+      metrics: platform.metrics,
+      providers: configuredProviders(platform.config),
+    }),
+    auth: {
+      store: platform.store,
+      clock: platform.clock,
+      mountPoint: mountPoint ?? DEFAULT_MOUNT_POINT,
+      ...(adminToken === undefined ? {} : { adminToken }),
+    },
   });
 }
 
@@ -44,6 +64,8 @@ export async function startLocalTarget(
   env: Record<string, string | undefined> = process.env,
 ): Promise<{ port: number; stop: () => Promise<void> }> {
   const requested = Number(env['PARLEY_PORT'] ?? '8787');
+  // The same schema the Worker runs, applied before the first request.
+  await migrate(localPlatform(env).store);
 
   return new Promise((resolve, reject) => {
     const server = serve({ fetch: buildLocalApp(env).fetch, port: requested }, (info) => {

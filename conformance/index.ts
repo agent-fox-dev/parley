@@ -1,4 +1,5 @@
 import { prepareAfc } from './afc.js';
+import { identityChecks } from './identity.js';
 import { type Check, formatReport, runHarness } from './harness.js';
 
 /**
@@ -55,7 +56,7 @@ export function foundationChecks(): Check[] {
 export async function main(): Promise<number> {
   const result = await runHarness({
     baseUrl: process.env['PARLEY_BASE_URL'] ?? '',
-    checks: foundationChecks(),
+    checks: [...foundationChecks(), ...identityChecks()],
   });
   console.log(formatReport(result));
   return result.exitCode;

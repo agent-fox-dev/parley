@@ -1,4 +1,8 @@
-import { describe, expect, it } from 'vitest';
+import { DatabaseSync } from 'node:sqlite';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
 import { d1Store } from './cloudflare/store.js';
 import { envConfig } from './cloudflare/config.js';
 import { fixedClock } from './local/clock.js';
@@ -46,6 +50,116 @@ describe.each<Candidate<RelationalStore>>([
 
     await store.ping();
     await expect(store.ping()).resolves.toBeUndefined();
+  });
+});
+
+/**
+ * D1 over SQLite, so the Cloudflare adapter's own binding and batching code
+ * is exercised rather than a stub that agrees with it.
+ */
+function fakeD1(path: string) {
+  const db = new DatabaseSync(path);
+  const statement = (sql: string, params: unknown[] = []) => ({
+    bind: (...bound: unknown[]) => statement(sql, bound),
+    first: async () => Promise.resolve(db.prepare(sql).get(...(params as never[])) ?? null),
+    all: async () => Promise.resolve({ results: db.prepare(sql).all(...(params as never[])) }),
+    run: async () => Promise.resolve(db.prepare(sql).run(...(params as never[]))),
+    sql,
+    params,
+  });
+  return {
+    prepare: (sql: string) => statement(sql),
+    batch: async (statements: Array<{ sql: string; params: unknown[] }>) => {
+      db.exec('BEGIN');
+      try {
+        for (const one of statements) {
+          db.prepare(one.sql).run(...(one.params as never[]));
+        }
+        db.exec('COMMIT');
+      } catch (err) {
+        db.exec('ROLLBACK');
+        throw err;
+      }
+      return Promise.resolve([]);
+    },
+  };
+}
+
+const storeDirs: string[] = [];
+
+function tempPath(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'parley-contract-'));
+  storeDirs.push(dir);
+  return join(dir, 'parley.db');
+}
+
+afterEach(() => {
+  for (const dir of storeDirs.splice(0)) {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+describe.each<Candidate<RelationalStore>>([
+  {
+    name: 'the Cloudflare store over D1',
+    make: () => d1Store(fakeD1(tempPath()) as never),
+  },
+  { name: 'the local store over SQLite', make: () => sqliteStore(tempPath()) },
+])('the relational store contract: reading and writing with $name', ({ make }) => {
+  async function withTable(): Promise<RelationalStore> {
+    const store = await make();
+    await store.run('CREATE TABLE things (id TEXT PRIMARY KEY, label TEXT NOT NULL)');
+    return store;
+  }
+
+  it('reads back the rows it wrote, with the values bound in order', async () => {
+    const store = await withTable();
+
+    await store.run('INSERT INTO things (id, label) VALUES (?, ?)', ['a', 'first']);
+    await store.run('INSERT INTO things (id, label) VALUES (?, ?)', ['b', 'second']);
+
+    expect(await store.all('SELECT label FROM things WHERE id = ?', ['b'])).toEqual([
+      { label: 'second' },
+    ]);
+  });
+
+  it('answers a select that matches nothing with no rows', async () => {
+    const store = await withTable();
+
+    expect(await store.all('SELECT * FROM things WHERE id = ?', ['missing'])).toEqual([]);
+  });
+
+  it('applies every statement of a batch', async () => {
+    const store = await withTable();
+
+    await store.batch([
+      { sql: 'INSERT INTO things (id, label) VALUES (?, ?)', params: ['a', 'first'] },
+      { sql: 'INSERT INTO things (id, label) VALUES (?, ?)', params: ['b', 'second'] },
+    ]);
+
+    expect(await store.all('SELECT id FROM things ORDER BY id')).toEqual([
+      { id: 'a' },
+      { id: 'b' },
+    ]);
+  });
+
+  it('leaves nothing behind when one statement of a batch fails', async () => {
+    const store = await withTable();
+
+    await expect(
+      store.batch([
+        { sql: 'INSERT INTO things (id, label) VALUES (?, ?)', params: ['a', 'first'] },
+        { sql: 'INSERT INTO things (id, label) VALUES (?, ?)', params: ['a', 'again'] },
+      ]),
+    ).rejects.toThrow();
+
+    expect(await store.all('SELECT id FROM things')).toEqual([]);
+  });
+
+  it('rejects a statement the store cannot run', async () => {
+    const store = await withTable();
+
+    await expect(store.all('SELECT * FROM absent')).rejects.toThrow();
   });
 });
 

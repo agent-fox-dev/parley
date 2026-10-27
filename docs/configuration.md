@@ -17,10 +17,26 @@ Set as Worker variables, in `wrangler.toml` or by the deployment.
 | `PARLEY_MOUNT_POINT` | `/api/v1` | The path prefix every versioned route is served under. The four [server endpoints](api.md#server-endpoints) are served at the server root whatever this is set to, and `GET /version` reports the value in use. |
 | `PARLEY_BUILD_TIME`  | `""`      | The build's timestamp, reported by `GET /version`. Empty where the deployment supplies none.                                                                                                                    |
 | `PARLEY_COMMIT`      | `""`      | The commit the build came from, reported by `GET /version`. Empty where the deployment supplies none.                                                                                                           |
+| `PARLEY_ADMIN_TOKEN` | unset     | The deployment's admin token. A caller presenting exactly this value is an admin token: every scope, access to every user, and no user identity of its own. Where it is unset, no admin token is accepted.      |
 
 Neither `PARLEY_BUILD_TIME` nor `PARLEY_COMMIT` affects behaviour; a
 deployment that sets neither answers `GET /version` successfully with both
 as the empty string.
+
+## Signing in
+
+Sign-in is configured per provider. GitHub is the only one implemented.
+Where the client id or the client secret is unset, the provider list is
+empty and `POST /api/v1/auth/callback` refuses every provider name.
+
+| Variable                            | Default  | Description                                                                                 |
+| ----------------------------------- | -------- | ------------------------------------------------------------------------------------------- |
+| `PARLEY_OAUTH_GITHUB_CLIENT_ID`     | unset    | The OAuth application's client id. Appears in the `authorize_url` the provider list serves. |
+| `PARLEY_OAUTH_GITHUB_CLIENT_SECRET` | unset    | The OAuth application's client secret, sent only to the provider's token endpoint.          |
+| `PARLEY_OAUTH_GITHUB_REDIRECT_URIS` | unset    | Comma-separated redirect URIs a callback may name. Unset allows any.                        |
+| `PARLEY_OAUTH_GITHUB_AUTHORIZE_URL` | GitHub's | Where a person is sent to authorise. Set it to point at a stub while testing.               |
+| `PARLEY_OAUTH_GITHUB_TOKEN_URL`     | GitHub's | Where a code is exchanged for an access token.                                              |
+| `PARLEY_OAUTH_GITHUB_PROFILE_URL`   | GitHub's | Where the signed-in person's profile is read.                                               |
 
 ## Limits
 
@@ -37,6 +53,25 @@ environment, and two of its own.
 | ---------------- | ----------- | ----------------------------------------------------------- |
 | `PARLEY_PORT`    | `8787`      | The port the host process listens on.                       |
 | `PARLEY_DB_PATH` | `parley.db` | Where SQLite keeps the relational store on the host's disk. |
+
+Both targets apply the same schema migrations to their store before serving
+a request, so a deployment on Cloudflare and one on a host hold the same
+tables.
+
+## Checking a deployment
+
+The smoke suites (`make test-smoke`) and the conformance harness
+(`make conformance`) run against a deployment named by `PARLEY_BASE_URL`.
+Each check says what it needs and skips naming it rather than passing on
+nothing.
+
+| Variable                      | Needed by                              | Description                                                                                                           |
+| ----------------------------- | -------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `PARLEY_BASE_URL`             | both                                   | The deployment to exercise, for example `https://parley.example.com`.                                                 |
+| `PARLEY_SMOKE_OAUTH_CODE`     | the sign-in, token and blocking suites | An authorization code the deployment's provider accepts, which a stub authorization server supplies.                  |
+| `PARLEY_SMOKE_OAUTH_PROVIDER` | the same                               | The provider name to sign in with. Defaults to `github`.                                                              |
+| `PARLEY_ADMIN_TOKEN`          | the blocking suite                     | The deployment's admin token, so the suite can block and unblock.                                                     |
+| `PARLEY_SMOKE_API_KEY`        | two conformance checks                 | An API key of any user, to check that a listing carries no secret and that administration refuses an ordinary caller. |
 
 ## Local development
 
