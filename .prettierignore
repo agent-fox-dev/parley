@@ -3,3 +3,6 @@ dist
 package-lock.json
 .specs
 docs/prd
+
+# Project instruction files, not ours to reformat
+AGENTS.md
