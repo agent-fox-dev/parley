@@ -1,0 +1,410 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/test_spec.v2.json",
+  "spec_id": "11",
+  "spec_name": "sessions_and_cost",
+  "schema_version": 2,
+  "tests": [
+    {
+      "id": "TS-11-1",
+      "kind": "unit",
+      "verifies": [
+        "11-REQ-1.1",
+        "11-REQ-1.2"
+      ],
+      "title": "A page carries next_cursor and has_more, and the cursor returns the following rows",
+      "given": [
+        "an ordered set of 7 rows behind the pagination facility"
+      ],
+      "when": "the first page of 3 is read and its next_cursor passed back twice more",
+      "then": [
+        "the first two pages carry has_more true and a non-null next_cursor",
+        "the third carries has_more false and next_cursor null",
+        "the first row of each later page follows the previous page's last row"
+      ],
+      "pseudocode": "in the pagination test file: p1 = page(limit=3); p2 = page(cursor=p1.next_cursor); p3 = page(cursor=p2.next_cursor); assert p3.next_cursor is None and rows(p1)+rows(p2)+rows(p3) == all_rows"
+    },
+    {
+      "id": "TS-11-2",
+      "kind": "property",
+      "verifies": [
+        "11-REQ-1.3"
+      ],
+      "title": "Reading every page of any set in any page size yields each row once in order",
+      "given": [
+        "the pagination facility over generated sets of rows"
+      ],
+      "when": "for generated row counts from 0 to 200, page sizes from 1 to 50 and both orders, pages are read until has_more is false",
+      "then": [
+        "the concatenation equals the full set in the requested order",
+        "no row appears twice and none is missing"
+      ],
+      "pseudocode": "in the pagination test file, a generative test over (rowCount, pageSize, order) asserting the collected rows"
+    },
+    {
+      "id": "TS-11-3",
+      "kind": "unit",
+      "verifies": [
+        "11-REQ-1.4"
+      ],
+      "title": "A cursor this service did not issue is refused",
+      "given": [
+        "one valid cursor and a set of bad ones: truncated, one character altered, from an unrelated encoding, empty, and re-encoded by hand"
+      ],
+      "when": "a page is requested with each",
+      "then": [
+        "each bad cursor answers 400 and returns no rows",
+        "the valid cursor still works afterwards"
+      ],
+      "pseudocode": "in the pagination test file, table over the bad cursors asserting 400 and no rows, then asserting the good one still pages"
+    },
+    {
+      "id": "TS-11-4",
+      "kind": "integration",
+      "verifies": [
+        "11-REQ-2.1",
+        "11-REQ-2.2"
+      ],
+      "title": "A session is opened and a repeated id returns the same session",
+      "given": [
+        "a workspace the caller may write"
+      ],
+      "when": "a session is opened with a client-chosen id, and the same id is opened again",
+      "then": [
+        "the first answers 201 with the session, its credential id and type, status active and a start time",
+        "the second answers 200 with the same session unchanged",
+        "only one session exists"
+      ],
+      "pseudocode": "in the session routes' integration test file: a = post(sessions, {id}); b = post(sessions, {id}); assert a.status == 201 and b.status == 200 and count() == 1"
+    },
+    {
+      "id": "TS-11-5",
+      "kind": "unit",
+      "verifies": [
+        "11-REQ-2.3"
+      ],
+      "title": "Opening a session needs write access whatever the workspace's status",
+      "given": [
+        "an active and an archived workspace, their owner, a member of the organization, a stranger and an admin token"
+      ],
+      "when": "each opens a session against each workspace",
+      "then": [
+        "the owner and the admin token succeed against both",
+        "the member is refused",
+        "the stranger is refused"
+      ],
+      "pseudocode": "in the session routes' test file, table over (caller, workspaceStatus, expected)"
+    },
+    {
+      "id": "TS-11-6",
+      "kind": "unit",
+      "verifies": [
+        "11-REQ-2.4"
+      ],
+      "title": "An open without a workspace, or for one the caller cannot see, is refused",
+      "given": [
+        "a workspace the caller cannot see holding a session"
+      ],
+      "when": "opens are made with no workspace_slug, an empty one, a slug naming nothing, a slug the caller cannot see, and replaying an id of the invisible workspace's session",
+      "then": [
+        "the missing and empty slug answer 400",
+        "the other three answer 404 workspace not found",
+        "no session is recorded in any case"
+      ],
+      "pseudocode": "in the session routes' test file, table over the five cases asserting status and the session count"
+    },
+    {
+      "id": "TS-11-7",
+      "kind": "integration",
+      "verifies": [
+        "11-REQ-3.1",
+        "11-REQ-3.2"
+      ],
+      "title": "A session is completed and its usage recorded",
+      "given": [
+        "an active session opened by a known credential"
+      ],
+      "when": "usage is reported twice for two models, the session is completed, and it is completed again",
+      "then": [
+        "each usage report answers 201 with the record",
+        "the complete answers 200 with the session at the given status",
+        "the second complete answers 200 with the session unchanged",
+        "the session's token summary includes both reports"
+      ],
+      "pseudocode": "in the session routes' integration test file: post(usage); post(usage); r = post(complete); assert r.json.status == 'completed'; assert post(complete).json == r.json"
+    },
+    {
+      "id": "TS-11-8",
+      "kind": "unit",
+      "verifies": [
+        "11-REQ-3.3"
+      ],
+      "title": "Only the session's creator or an admin token may close it or spend against it",
+      "given": [
+        "a session opened by one credential, the workspace's owner who is not that credential, a second agent, and an admin token"
+      ],
+      "when": "each calls the complete and the usage route for that session",
+      "then": [
+        "the creator and the admin token are admitted",
+        "the workspace's owner, when not the creator, is refused",
+        "the second agent is refused"
+      ],
+      "pseudocode": "in the session routes' test file, table over (caller, route, expected)"
+    },
+    {
+      "id": "TS-11-9",
+      "kind": "unit",
+      "verifies": [
+        "11-REQ-3.4"
+      ],
+      "title": "A bad complete is refused and the session unchanged",
+      "given": [
+        "an active session, a terminal one, and a close already in flight"
+      ],
+      "when": "completes are made with an unknown status, with terminated, by a caller who is not the creator, for a session that does not exist, and concurrently with another close",
+      "then": [
+        "the unknown status and terminated answer 400",
+        "the wrong caller answers 403 not session owner",
+        "the unknown session answers 404",
+        "the concurrent close answers 409",
+        "the session's status is unchanged in every refusal"
+      ],
+      "pseudocode": "in the session routes' test file, table over the five cases asserting status and the stored session"
+    },
+    {
+      "id": "TS-11-10",
+      "kind": "unit",
+      "verifies": [
+        "11-REQ-3.5"
+      ],
+      "title": "A bad usage report is refused and nothing recorded",
+      "given": [
+        "an active session, a completed one, and a session of another creator"
+      ],
+      "when": "usage is reported with no model, by a caller who is not the creator, for a session that does not exist, for the completed session, and with a negative token count",
+      "then": [
+        "the missing model answers 400",
+        "the wrong caller answers 403",
+        "the unknown session answers 404",
+        "the completed session answers 409",
+        "the negative count answers 422",
+        "no usage record is written in any case"
+      ],
+      "pseudocode": "in the session routes' test file, table over the five cases asserting status and the usage count"
+    },
+    {
+      "id": "TS-11-11",
+      "kind": "integration",
+      "verifies": [
+        "11-REQ-4.1"
+      ],
+      "title": "Sessions are listed with their filters, order and page size",
+      "given": [
+        "sessions across two workspaces, two runs, several statuses, two credential types and two days"
+      ],
+      "when": "the list is read with no filter, with each filter in turn, in both orders, and with page sizes of 1, 50 and 501",
+      "then": [
+        "the default order is newest first and the default page size 50",
+        "each filter narrows the result to the matching sessions",
+        "a page size above 500 is capped at 500",
+        "each session carries its token summary"
+      ],
+      "pseudocode": "in the session routes' integration test file, table over the filters asserting the returned ids"
+    },
+    {
+      "id": "TS-11-12",
+      "kind": "integration",
+      "verifies": [
+        "11-REQ-4.2"
+      ],
+      "title": "Usage totals cover the whole session whatever the page size",
+      "given": [
+        "a session with 12 usage records across two models"
+      ],
+      "when": "the usage is listed with page sizes of 1, 5 and 1000, and with a page size above 1000",
+      "then": [
+        "the totals are identical in every case and cover all 12 records",
+        "the records paginate correctly",
+        "a page size above 1000 is capped at 1000"
+      ],
+      "pseudocode": "in the session routes' integration test file: assert {page(limit=n).totals for n in (1,5,1000)} has one element"
+    },
+    {
+      "id": "TS-11-13",
+      "kind": "unit",
+      "verifies": [
+        "11-REQ-4.3"
+      ],
+      "title": "Session reads need read access and an active workspace",
+      "given": [
+        "an active and an archived workspace, each with a session, and the owner, a member, a stranger and an admin token"
+      ],
+      "when": "each reads the session list, the session and its usage for each workspace",
+      "then": [
+        "the owner, the member and the admin token are served for the active workspace",
+        "every caller, the owner included, is answered 403 workspace access denied for the archived one",
+        "the stranger is answered 403 for the active one"
+      ],
+      "pseudocode": "in the session routes' test file, table over (caller, workspaceStatus, route, expected)"
+    },
+    {
+      "id": "TS-11-14",
+      "kind": "unit",
+      "verifies": [
+        "11-REQ-4.4"
+      ],
+      "title": "An unknown session and an invalid cursor are refused",
+      "given": [
+        "a session id naming nothing and an invalid cursor"
+      ],
+      "when": "the session is read and the list and usage routes are called with the cursor",
+      "then": [
+        "the unknown session answers 404",
+        "each invalid cursor answers 400"
+      ],
+      "pseudocode": "in the session routes' test file: assert get(session, unknown).status == 404 and get(sessions, cursor=bad).status == 400"
+    },
+    {
+      "id": "TS-11-15",
+      "kind": "integration",
+      "verifies": [
+        "11-REQ-5.1"
+      ],
+      "title": "Cost is aggregated by day, session and model and agrees with the sessions",
+      "given": [
+        "three sessions across two days using two models, each with usage records"
+      ],
+      "when": "the cost is read with no parameters and then grouped by day, by session and by model",
+      "then": [
+        "the default grouping is day and the default period the last 24 hours",
+        "the totals equal the sum of the breakdown in every grouping",
+        "the totals agree with the sum of the sessions' own usage records"
+      ],
+      "pseudocode": "in the cost integration test file, table over the groupings asserting sum(breakdown) == totals == sum(usage_records)"
+    },
+    {
+      "id": "TS-11-16",
+      "kind": "unit",
+      "verifies": [
+        "11-REQ-5.2"
+      ],
+      "title": "An invalid period or grouping is refused",
+      "given": [
+        "a workspace with sessions"
+      ],
+      "when": "the cost is read with a start equal to the end, a start after the end, and a grouping of hour and of an empty string",
+      "then": [
+        "each answers 400 in the error envelope"
+      ],
+      "pseudocode": "in the cost test file, table over the four cases asserting 400"
+    },
+    {
+      "id": "TS-11-17",
+      "kind": "unit",
+      "verifies": [
+        "11-REQ-5.3"
+      ],
+      "title": "Cost reads are refused for an archived or unreadable workspace",
+      "given": [
+        "an archived workspace and one the caller cannot read"
+      ],
+      "when": "the cost is read by the owner, a member, a stranger and an admin token",
+      "then": [
+        "every caller is answered 403 workspace access denied for the archived workspace",
+        "the stranger is answered 403 for the readable one"
+      ],
+      "pseudocode": "in the cost test file, table over (caller, workspaceStatus) asserting 403"
+    },
+    {
+      "id": "TS-11-18",
+      "kind": "integration",
+      "verifies": [
+        "11-REQ-6.1",
+        "11-REQ-6.2"
+      ],
+      "title": "Archiving or deleting a workspace ends its active sessions",
+      "given": [
+        "a workspace with two active sessions and one already completed, and a second workspace with one active session"
+      ],
+      "when": "the first workspace is archived and the second's is deleted after archiving",
+      "then": [
+        "each formerly active session has status terminated afterwards",
+        "the already completed session is unchanged",
+        "no session of either workspace remains active",
+        "sessions of other workspaces are untouched"
+      ],
+      "pseudocode": "in the session lifecycle integration test file: post(archive); assert statuses(sessions(ws)) == ['terminated','terminated','completed']"
+    },
+    {
+      "id": "TS-11-19",
+      "kind": "smoke",
+      "verifies": [
+        "11-PATH-1"
+      ],
+      "title": "An agent run is recorded end to end against a running deployment",
+      "given": [
+        "a running deployment and a workspace the caller may write"
+      ],
+      "when": "a session is opened, usage is reported twice for two models, the session is completed, and the session and its usage are read back",
+      "then": [
+        "the open answers 201 and the complete 200",
+        "the session's token summary covers both reports",
+        "the usage list's totals cover both records whatever the page size"
+      ],
+      "pseudocode": "in the sessions smoke test file: s = post(sessions); post(usage); post(usage); post(complete); assert totals(get(usage)) == expected",
+      "real_components": [
+        "running deployment",
+        "session routes",
+        "pagination facility",
+        "relational store"
+      ]
+    },
+    {
+      "id": "TS-11-20",
+      "kind": "smoke",
+      "verifies": [
+        "11-PATH-2"
+      ],
+      "title": "A cost report is read across days and models against a running deployment",
+      "given": [
+        "a running deployment and several recorded sessions across two days and two models"
+      ],
+      "when": "the workspace's cost is read grouped by day and then by model",
+      "then": [
+        "both answer 200 with totals and a breakdown",
+        "the two groupings report the same totals",
+        "the totals agree with the sessions' usage records"
+      ],
+      "pseudocode": "in the cost smoke test file: d = get(cost, group_by='day'); m = get(cost, group_by='model'); assert d.json.totals == m.json.totals",
+      "real_components": [
+        "running deployment",
+        "cost route",
+        "session store",
+        "relational store"
+      ]
+    },
+    {
+      "id": "TS-11-21",
+      "kind": "smoke",
+      "verifies": [
+        "11-PATH-3"
+      ],
+      "title": "Archiving a workspace terminates its running session",
+      "given": [
+        "a running deployment, a workspace and an open session against it"
+      ],
+      "when": "the workspace is archived and the session is then read",
+      "then": [
+        "the session's status is terminated",
+        "the read of the session is answered 403 workspace access denied",
+        "no session of the workspace remains active"
+      ],
+      "pseudocode": "in the sessions smoke test file: post(archive); assert get(session).status == 403 and status_via_admin(session) == 'terminated'",
+      "real_components": [
+        "running deployment",
+        "workspace routes",
+        "session routes",
+        "relational store"
+      ]
+    }
+  ]
+}

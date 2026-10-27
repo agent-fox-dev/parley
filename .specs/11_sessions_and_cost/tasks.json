@@ -1,0 +1,239 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v2.json",
+  "spec_id": "11",
+  "spec_name": "sessions_and_cost",
+  "schema_version": 2,
+  "test_commands": {
+    "all_tests": "make test",
+    "linter": "make lint"
+  },
+  "dependencies": [
+    {
+      "spec": "01",
+      "reason": "uses its router, error envelope and request conventions, and implements the cursor pagination those conventions define"
+    },
+    {
+      "spec": "02",
+      "reason": "records the opening credential's identity and type from its authentication"
+    },
+    {
+      "spec": "03",
+      "reason": "uses its workspace record and access decision, and hooks into its archive and delete to end active sessions"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "kind": "implement",
+      "title": "Build the cursor pagination every paged route will use",
+      "criteria": [
+        "11-REQ-1"
+      ],
+      "tests": [
+        "TS-11-1",
+        "TS-11-2",
+        "TS-11-3"
+      ],
+      "steps": [
+        "Add this task's behaviours to the pagination test file, and confirm they fail",
+        "Implement an opaque cursor that encodes a position in an ordered result and is tamper-evident, so one this service did not issue cannot be made to return a wrong page",
+        "Return next_cursor and has_more with every page, with next_cursor null exactly on the last page",
+        "Continue from a returned cursor so that reading to the end yields every row exactly once in the requested order, proved by a generative test over row counts, page sizes and both orders",
+        "Refuse a malformed, truncated or unissued cursor with 400 and no rows",
+        "Expose the facility so that package 12 and any later paged route reuse it rather than writing another"
+      ],
+      "touches": [
+        "src/paging/cursor.ts",
+        "src/paging/cursor.test.ts",
+        "src/paging/page.ts"
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 2,
+      "kind": "implement",
+      "title": "Open sessions idempotently",
+      "criteria": [
+        "11-REQ-2"
+      ],
+      "tests": [
+        "TS-11-4",
+        "TS-11-5",
+        "TS-11-6"
+      ],
+      "steps": [
+        "Add this task's behaviours to the session routes' test files, and confirm they fail",
+        "Define the session and usage tables, with a migration the second target runs too",
+        "Implement the open: record the workspace, run, node, archetype, model and metadata with the opening credential's id and type, and answer 201",
+        "Answer 200 with the existing session when the id already exists and the caller may read its workspace, recording no second session",
+        "Require write access to the named workspace whatever its status, so a member is refused and an archived workspace is still allowed",
+        "Refuse a missing or empty workspace_slug with 400, and a workspace the caller may not see or a replayed id belonging to one with 404"
+      ],
+      "touches": [
+        "src/routes/sessions.ts",
+        "src/routes/sessions.test.ts",
+        "src/routes/sessions.integration.test.ts",
+        "src/session/store.ts",
+        "src/store/migrations/"
+      ],
+      "depends_on": [
+        1
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 3,
+      "kind": "implement",
+      "title": "Complete sessions and record their usage",
+      "criteria": [
+        "11-REQ-3"
+      ],
+      "tests": [
+        "TS-11-7",
+        "TS-11-8",
+        "TS-11-9",
+        "TS-11-10"
+      ],
+      "steps": [
+        "Add this task's behaviours to the session routes' test files, and confirm they fail",
+        "Admit the complete and usage routes to the session's creator and to an admin token alone, refusing the workspace's owner when they are not the creator",
+        "Close an active session with completed, failed or timeout, and answer 200 with an already terminal session unchanged",
+        "Record a usage report against an active session and include it in the session's token summary",
+        "Refuse an invalid status and the status terminated with 400, a caller who is not the creator with 403 not session owner, an unknown session with 404 and a concurrent close with 409",
+        "Refuse a usage report with no model with 400, one for a session that is not active with 409, and one with a negative token count with 422, writing nothing"
+      ],
+      "touches": [
+        "src/routes/sessions.ts",
+        "src/session/complete.ts",
+        "src/session/usage.ts",
+        "src/routes/sessions.test.ts"
+      ],
+      "depends_on": [
+        2
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 4,
+      "kind": "implement",
+      "title": "Read sessions and their usage",
+      "criteria": [
+        "11-REQ-4"
+      ],
+      "tests": [
+        "TS-11-11",
+        "TS-11-12",
+        "TS-11-13",
+        "TS-11-14"
+      ],
+      "steps": [
+        "Add this task's behaviours to the session routes' test files, and confirm they fail",
+        "List sessions newest first by default with their token summaries, honouring the workspace, run, status, credential type and start-time filters, the order, and a page size defaulting to 50 and capped at 500",
+        "Read one session with its token summary, answering 404 for an unknown id",
+        "List a session's usage records with a page size defaulting to 100 and capped at 1000, computing the totals over every record of the session so they do not change with the page size",
+        "Require read access and an active workspace for every read, answering 403 workspace access denied to anyone else and to every caller of an archived workspace",
+        "Refuse an invalid cursor with 400"
+      ],
+      "touches": [
+        "src/routes/sessions.ts",
+        "src/session/read.ts",
+        "src/routes/sessions.integration.test.ts",
+        "src/paging/page.ts"
+      ],
+      "depends_on": [
+        3
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 5,
+      "kind": "implement",
+      "title": "Aggregate a workspace's cost",
+      "criteria": [
+        "11-REQ-5"
+      ],
+      "tests": [
+        "TS-11-15",
+        "TS-11-16",
+        "TS-11-17"
+      ],
+      "steps": [
+        "Add this task's behaviours to the cost test files, and confirm they fail",
+        "Aggregate the workspace's sessions' usage over a period, grouped by day, session or model, defaulting to day and to the last 24 hours",
+        "Answer with the workspace, the period, the totals and the breakdown, with the totals equal to the sum of the breakdown and agreeing with the usage records",
+        "Refuse a start that is not before the end, and a grouping outside day, session and model, with 400",
+        "Require read access and an active workspace, answering 403 workspace access denied otherwise"
+      ],
+      "touches": [
+        "src/routes/cost.ts",
+        "src/session/cost.ts",
+        "src/session/cost.test.ts",
+        "src/session/cost.integration.test.ts"
+      ],
+      "depends_on": [
+        4
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 6,
+      "kind": "implement",
+      "title": "End sessions when their workspace is retired",
+      "criteria": [
+        "11-REQ-6"
+      ],
+      "tests": [
+        "TS-11-18"
+      ],
+      "steps": [
+        "Add this task's behaviours to the session lifecycle integration test file, and confirm they fail",
+        "At the archive and delete of package 03, end every active session of the workspace with the status terminated",
+        "Leave sessions that were already terminal unchanged, and sessions of other workspaces untouched",
+        "Confirm no session of the retired workspace remains active afterwards",
+        "Leave a documented place for package 12 to record the force-closed event for each session ended"
+      ],
+      "touches": [
+        "src/workspace/lifecycle.ts",
+        "src/session/terminate.ts",
+        "src/session/terminate.integration.test.ts"
+      ],
+      "depends_on": [
+        3
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 7,
+      "kind": "integration",
+      "title": "Verify recording, reporting and retirement against a running deployment",
+      "tests": [
+        "TS-11-19",
+        "TS-11-20",
+        "TS-11-21"
+      ],
+      "steps": [
+        "Add the three smoke tests and confirm each passes against a running deployment, or skips with a message naming the missing deployment",
+        "Trace 11-PATH-1: the open records the real credential identity of package 02, the usage reports reach the real store, and the read returns totals computed over every record through the pagination facility",
+        "Trace 11-PATH-2: the cost route reads the same usage records the session route reports, so the two agree rather than being computed twice",
+        "Trace 11-PATH-3: package 03's archive reaches the session termination, and the subsequent read is refused by the active-workspace rule rather than by a stale status",
+        "For every criterion carrying a contract, confirm a caller in production code consumes the producer's result and not only a test: the pagination facility is used by the session list, the usage list and nothing writes its own cursor; the access rule is used by every read route; and the termination is reached from the real archive and delete",
+        "Grep src/session/, src/paging/ and the files every task's touches lists for TODO, FIXME and the project's not-implemented marker, and remove any that remain",
+        "Add the session and cost conformance cases to the harness from package 01"
+      ],
+      "touches": [
+        "src/session/sessions.smoke.test.ts",
+        "src/session/cost.smoke.test.ts",
+        "conformance/sessions.ts"
+      ],
+      "depends_on": [
+        5,
+        6
+      ],
+      "done_when": [
+        "`make check` passes with no network access and no deployment configured",
+        "the session, usage and cost routes answer as docs/prd/api.md specifies against a running deployment, cursor paging included"
+      ],
+      "state": "pending"
+    }
+  ]
+}

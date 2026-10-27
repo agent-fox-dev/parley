@@ -1,0 +1,299 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v2.json",
+  "spec_id": "11",
+  "spec_name": "sessions_and_cost",
+  "schema_version": 2,
+  "introduction": "An agent session records one agent run against one workspace: who opened it, with which credential, how it ended and the tokens it consumed. This package opens, closes and reads sessions, aggregates their cost, ends them with their workspace, and builds the cursor pagination every later paged route uses.",
+  "glossary": {
+    "agent session": "The record of one agent run against one workspace, from the credential that opened it to its terminal status and its token usage.",
+    "cursor": "An opaque string identifying a position in an ordered result, issued by the service and accepted back to continue from that position.",
+    "session creator": "The credential that opened a session. Only it and an admin token may complete the session or report its usage, so one agent cannot close another's.",
+    "token summary": "The totals of a session's usage records, returned with the session itself."
+  },
+  "requirements": [
+    {
+      "id": "11-REQ-1",
+      "title": "Cursor pagination",
+      "rationale": "Every later paged route depends on it, and a cursor that skips or repeats a row is a correctness bug a client cannot see.",
+      "criteria": [
+        {
+          "id": "11-REQ-1.1",
+          "pattern": "ubiquitous",
+          "system": "pagination facility",
+          "action": "return next_cursor and has_more with every page, where next_cursor is null exactly on the last page",
+          "contract": "the page object carries {\"next_cursor\": <string or null>, \"has_more\": <boolean>}; has_more is false exactly when next_cursor is null"
+        },
+        {
+          "id": "11-REQ-1.2",
+          "pattern": "event_driven",
+          "condition": "a caller passes a page's next_cursor back as the cursor parameter",
+          "system": "pagination facility",
+          "action": "return the rows that follow the last row of that page, in the requested order",
+          "contract": "the first row of the new page is the row immediately after the previous page's last row in the requested order"
+        },
+        {
+          "id": "11-REQ-1.3",
+          "pattern": "ubiquitous",
+          "system": "pagination facility",
+          "action": "for any set of rows, any page size of 1 or more and either order, yield every row exactly once in the requested order when pages are read until has_more is false",
+          "contract": "the concatenation of the pages equals the full ordered set, with no row repeated and none missing"
+        },
+        {
+          "id": "11-REQ-1.4",
+          "pattern": "unwanted",
+          "condition": "a cursor is malformed, truncated, or not one this service issued",
+          "system": "pagination facility",
+          "action": "refuse the request and return no rows",
+          "contract": "HTTP 400 in the error envelope; the response carries no page and no rows; a valid cursor still works afterwards"
+        }
+      ]
+    },
+    {
+      "id": "11-REQ-2",
+      "title": "Opening a session",
+      "rationale": "An agent that cannot open a session runs uncounted, and an open that is not idempotent double-counts a retried start.",
+      "criteria": [
+        {
+          "id": "11-REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "a session is opened against a workspace the caller may write",
+          "system": "Parley service",
+          "action": "record it with its workspace, run, node, archetype, model and metadata, and answer with it",
+          "contract": "HTTP 201 with the session carrying its id, workspace_slug, credential_id, credential_type, status active and started_at"
+        },
+        {
+          "id": "11-REQ-2.2",
+          "pattern": "event_driven",
+          "condition": "an open repeats an id that already exists and the caller may read that session's workspace",
+          "system": "Parley service",
+          "action": "answer with the existing session rather than creating a second",
+          "contract": "HTTP 200 with the existing session unchanged; no second session is recorded"
+        },
+        {
+          "id": "11-REQ-2.3",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "require write access to the named workspace whatever the workspace's status",
+          "contract": "the owner and an admin token may open a session on an active and on an archived workspace; a member of its organization is refused"
+        },
+        {
+          "id": "11-REQ-2.4",
+          "pattern": "unwanted",
+          "condition": "an open has no workspace_slug, names a workspace the caller may not see, or replays an id belonging to a workspace the caller may not read",
+          "system": "Parley service",
+          "action": "refuse the request and record nothing",
+          "contract": "HTTP 400 for a missing or empty workspace_slug and HTTP 404 \"workspace not found\" for the other two; no session is recorded"
+        }
+      ]
+    },
+    {
+      "id": "11-REQ-3",
+      "title": "Completing a session and reporting its usage",
+      "rationale": "Several agents share a workspace, so the wrong access rule here lets one agent close another's session or spend against it.",
+      "criteria": [
+        {
+          "id": "11-REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "the creator of an active session completes it with completed, failed or timeout",
+          "system": "Parley service",
+          "action": "close it with that status and answer with it",
+          "contract": "HTTP 200 with the session at the given status; completing an already terminal session answers 200 with it unchanged"
+        },
+        {
+          "id": "11-REQ-3.2",
+          "pattern": "event_driven",
+          "condition": "the creator of an active session reports usage with a model and its token counts",
+          "system": "Parley service",
+          "action": "record the usage against the session",
+          "contract": "HTTP 201 with the usage record; the session's token summary afterwards includes these counts"
+        },
+        {
+          "id": "11-REQ-3.3",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "admit the complete and usage routes only to the session's creator and to an admin token",
+          "contract": "the workspace's owner, when not the session's creator, is refused; the creator and an admin token are admitted"
+        },
+        {
+          "id": "11-REQ-3.4",
+          "pattern": "unwanted",
+          "condition": "a complete has an invalid status or the status terminated, or a caller is not the session's creator, or the session does not exist, or another close of the same session is under way",
+          "system": "Parley service",
+          "action": "refuse the request and leave the session as it is",
+          "contract": "HTTP 400 for an invalid status and for terminated, HTTP 403 \"not session owner\", HTTP 404 for an unknown session and HTTP 409 for a concurrent close; the session's status is unchanged"
+        },
+        {
+          "id": "11-REQ-3.5",
+          "pattern": "unwanted",
+          "condition": "a usage report has no model, comes from a caller who is not the creator, names a session that does not exist or is not active, or carries a negative token count",
+          "system": "Parley service",
+          "action": "refuse the request and record no usage",
+          "contract": "HTTP 400 for a missing model, HTTP 403 \"not session owner\", HTTP 404 for an unknown session, HTTP 409 for a session that is not active and HTTP 422 for a negative count; no usage record is written"
+        }
+      ]
+    },
+    {
+      "id": "11-REQ-4",
+      "title": "Reading sessions and their usage",
+      "rationale": "A total that changes with the page size is not a total, and the archived-workspace answer differs here from everywhere else.",
+      "criteria": [
+        {
+          "id": "11-REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "sessions are listed",
+          "system": "Parley service",
+          "action": "return them newest first by default, each with its token summary, honouring the workspace, run, status, credential type and start-time filters, the order and the page size",
+          "contract": "HTTP 200 with sessions, next_cursor and has_more; the default order is newest first and the default page size 50, with 500 the maximum; each filter narrows the result to the sessions matching it"
+        },
+        {
+          "id": "11-REQ-4.2",
+          "pattern": "event_driven",
+          "condition": "one session's usage records are listed",
+          "system": "Parley service",
+          "action": "return the page of records together with totals computed over every record of the session",
+          "contract": "HTTP 200 with records, totals, next_cursor and has_more; the default page size is 100 with 1000 the maximum; the totals are identical whatever page size is used"
+        },
+        {
+          "id": "11-REQ-4.3",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "require read access and an active workspace for every session and usage read",
+          "contract": "the owner, a member and an admin token read sessions of an active workspace; anyone else, and a member or owner of an archived workspace, is answered HTTP 403 \"workspace access denied\""
+        },
+        {
+          "id": "11-REQ-4.4",
+          "pattern": "unwanted",
+          "condition": "a session read names a session that does not exist, or a list or usage read carries an invalid cursor",
+          "system": "Parley service",
+          "action": "refuse the request",
+          "contract": "HTTP 404 for an unknown session and HTTP 400 for an invalid cursor"
+        }
+      ]
+    },
+    {
+      "id": "11-REQ-5",
+      "title": "Reporting a workspace's cost",
+      "rationale": "This is the aggregate a person actually reads, so it has to agree with the sessions it summarises.",
+      "criteria": [
+        {
+          "id": "11-REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "a workspace's cost is requested",
+          "system": "Parley service",
+          "action": "aggregate its sessions' token usage over the period, grouped by day, session or model",
+          "contract": "HTTP 200 with the workspace, the period, the totals and a breakdown; the grouping defaults to day and the period to the last 24 hours; the totals equal the sum of the breakdown and agree with the sessions' own usage records"
+        },
+        {
+          "id": "11-REQ-5.2",
+          "pattern": "unwanted",
+          "condition": "the period's start is not before its end, or the grouping is not day, session or model",
+          "system": "Parley service",
+          "action": "refuse the request",
+          "contract": "HTTP 400 in the error envelope"
+        },
+        {
+          "id": "11-REQ-5.3",
+          "pattern": "unwanted",
+          "condition": "the cost of a workspace the caller may not read, or of an archived workspace, is requested",
+          "system": "Parley service",
+          "action": "refuse the request",
+          "contract": "HTTP 403 \"workspace access denied\", including for a member and for the owner of an archived workspace"
+        }
+      ]
+    },
+    {
+      "id": "11-REQ-6",
+      "title": "Ending sessions with their workspace",
+      "rationale": "A session left active on a retired workspace counts against nothing and never closes.",
+      "criteria": [
+        {
+          "id": "11-REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "a workspace is archived or deleted",
+          "system": "Parley service",
+          "action": "end every active session of that workspace with the status terminated",
+          "contract": "each formerly active session has status terminated afterwards; sessions that were already terminal are unchanged"
+        },
+        {
+          "id": "11-REQ-6.2",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "leave no active session on a workspace that has been archived or deleted",
+          "contract": "a listing of that workspace's sessions, by an admin token, returns none at status active"
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "11-PATH-1",
+      "title": "An agent run is recorded from open to completion",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "opens a session against a workspace it may write"
+        },
+        {
+          "actor": "Parley service",
+          "action": "records the session with the opening credential and answers 201"
+        },
+        {
+          "actor": "agent",
+          "action": "reports usage twice as it works, for two different models"
+        },
+        {
+          "actor": "agent",
+          "action": "completes the session with completed and a duration"
+        },
+        {
+          "actor": "API client",
+          "action": "reads the session and finds its token summary, then lists its usage records and finds totals over both reports"
+        }
+      ]
+    },
+    {
+      "id": "11-PATH-2",
+      "title": "A cost report is read across days and models",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "runs several sessions across two days using two models, reporting usage for each"
+        },
+        {
+          "actor": "API client",
+          "action": "reads the workspace's cost grouped by day"
+        },
+        {
+          "actor": "Parley service",
+          "action": "aggregates the usage records over the period and answers with totals and a breakdown"
+        },
+        {
+          "actor": "API client",
+          "action": "reads the same cost grouped by model and finds totals that agree with the first"
+        }
+      ]
+    },
+    {
+      "id": "11-PATH-3",
+      "title": "A workspace is archived under a running agent",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "opens a session and begins working"
+        },
+        {
+          "actor": "API client",
+          "action": "archives the workspace"
+        },
+        {
+          "actor": "Parley service",
+          "action": "ends the workspace's active sessions with the status terminated"
+        },
+        {
+          "actor": "agent",
+          "action": "reads its session and is refused 403 workspace access denied, because the workspace is no longer active"
+        }
+      ]
+    }
+  ]
+}

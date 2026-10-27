@@ -1,0 +1,269 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v2.json",
+  "spec_id": "10",
+  "spec_name": "merges",
+  "schema_version": 2,
+  "introduction": "A merge job rebases an agent's branch onto a target inside the workspace's repository and fast-forwards the target, running in the background and waiting its turn for the workspace. Batch rebase offers the same arithmetic synchronously over several branches at once.",
+  "glossary": {
+    "batch rebase": "A synchronous request that rebases each of several branches onto one target in turn, answering with a result per branch.",
+    "dead-lettered": "A job that stopped making progress and was set aside, so that it can be requeued rather than retried for ever.",
+    "merge job": "A queued job that rebases a source ref onto a target branch and fast-forwards the target to the result. It produces no merge commit."
+  },
+  "requirements": [
+    {
+      "id": "10-REQ-1",
+      "title": "What a merge job does",
+      "rationale": "The job is the service's answer to merging agent branches by hand, so its semantics and its recorded outcome are what a person trusts instead of doing it themselves.",
+      "criteria": [
+        {
+          "id": "10-REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "a merge job runs and the rebase applies cleanly",
+          "system": "Parley service",
+          "action": "rebase the source onto the target and fast-forward the target to the result",
+          "contract": "the target branch afterwards holds the source's commits on top of the commits it had, with no merge commit; the job records the target's head before as base_sha and after as merged_sha"
+        },
+        {
+          "id": "10-REQ-1.2",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "move a merge job through queued, running and then completed, failed, dead_letter or cancelled, recording its fields throughout",
+          "contract": "the job carries id, workspace_slug, target_branch, source_ref, status, base_sha, merged_sha, conflict_files, error, retry_count, submitted_by, created_at and updated_at; base_sha and merged_sha are null until it completes and conflict_files is empty without a conflict"
+        },
+        {
+          "id": "10-REQ-1.3",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "make a merge job wait its turn for the workspace's lock rather than refusing it for a busy workspace",
+          "contract": "a job submitted while another operation holds the lock is still queued and runs once the lock frees; it is never answered 409 workspace_busy"
+        },
+        {
+          "id": "10-REQ-1.4",
+          "pattern": "unwanted",
+          "condition": "the rebase of the source onto the target conflicts",
+          "system": "Parley service",
+          "action": "end the job as failed with the conflicting files recorded and leave the target branch where it was",
+          "contract": "the job's status is failed, conflict_files names every conflicting path, and the target branch holds the head it had before the job ran"
+        }
+      ]
+    },
+    {
+      "id": "10-REQ-2",
+      "title": "Submitting a merge job",
+      "rationale": "The submit is where a duplicate or a non-existent branch has to be caught, because the job itself runs out of the caller's sight.",
+      "criteria": [
+        {
+          "id": "10-REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "a merge is submitted with a target branch and a source ref that both exist in a ready workspace",
+          "system": "Parley service",
+          "action": "queue the job and answer with it",
+          "contract": "HTTP 202 with the job at status queued, carrying its id, the target, the source and the submitting user"
+        },
+        {
+          "id": "10-REQ-2.2",
+          "pattern": "unwanted",
+          "condition": "a merge submit has a malformed body, a missing or invalid branch name, a workspace that is not ready, or a branch that does not exist",
+          "system": "Parley service",
+          "action": "refuse the request and queue nothing",
+          "contract": "HTTP 400 in the error envelope; the body is checked before the workspace, so a malformed branch name is 400 even for a workspace the caller cannot see"
+        },
+        {
+          "id": "10-REQ-2.3",
+          "pattern": "unwanted",
+          "condition": "a merge of the same source into the same target is already queued or running",
+          "system": "Parley service",
+          "action": "refuse the request and queue nothing",
+          "contract": "HTTP 409 with error_type duplicate_merge; the existing job is unaffected and a merge of the same source into a different target is accepted"
+        }
+      ]
+    },
+    {
+      "id": "10-REQ-3",
+      "title": "Following and undoing a job",
+      "rationale": "A background job nobody can watch or stop is one an operator cannot recover from.",
+      "criteria": [
+        {
+          "id": "10-REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "a workspace's merge jobs are listed or one is read",
+          "system": "Parley service",
+          "action": "return the jobs, at most 200, or the one named",
+          "contract": "HTTP 200 with an array, empty when there are none and never more than 200 entries, or with the single job; a job of another workspace and an unknown id are both HTTP 404"
+        },
+        {
+          "id": "10-REQ-3.2",
+          "pattern": "event_driven",
+          "condition": "a queued merge job is cancelled",
+          "system": "Parley service",
+          "action": "cancel it so it never runs",
+          "contract": "HTTP 200 with status cancelled; the job does not run afterwards and the target branch is untouched"
+        },
+        {
+          "id": "10-REQ-3.3",
+          "pattern": "unwanted",
+          "condition": "a cancel names a job that is running, completed, failed, dead-lettered or already cancelled",
+          "system": "Parley service",
+          "action": "refuse the request and leave the job as it is",
+          "contract": "HTTP 409 in the error envelope; the job's status is unchanged"
+        },
+        {
+          "id": "10-REQ-3.4",
+          "pattern": "event_driven",
+          "condition": "a dead-lettered merge job is requeued and no merge of the same source and target is queued or running",
+          "system": "Parley service",
+          "action": "return it to the queue",
+          "contract": "HTTP 200 with the job at status queued; a job that is not dead-lettered, and one whose source and target are already queued or running, are both HTTP 409"
+        }
+      ]
+    },
+    {
+      "id": "10-REQ-4",
+      "title": "Batch rebase",
+      "rationale": "It answers while the caller waits, so its failure modes are the caller's problem rather than a job record's.",
+      "criteria": [
+        {
+          "id": "10-REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "a batch rebase is requested with a target ref and a list of branches",
+          "system": "Parley service",
+          "action": "rebase each branch onto the target in turn while the request waits and answer with one result per branch",
+          "contract": "HTTP 200 with a results array in the order the branches were given; each result is ok with the branch's new head, conflict with its conflicting files, or error"
+        },
+        {
+          "id": "10-REQ-4.2",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "continue a batch rebase past a branch that conflicts or errors",
+          "contract": "a batch where the second of three branches conflicts still reports results for all three, and the first and third are rebased"
+        },
+        {
+          "id": "10-REQ-4.3",
+          "pattern": "unwanted",
+          "condition": "a batch rebase has a malformed body, a missing target ref, an empty branch list, an invalid branch name, more than 20 branches, or a workspace that is not ready",
+          "system": "Parley service",
+          "action": "refuse the whole request and rebase nothing",
+          "contract": "HTTP 400 in the error envelope, naming the offending branch by its index where there is one; the body is checked before the workspace; no branch is moved"
+        },
+        {
+          "id": "10-REQ-4.4",
+          "pattern": "unwanted",
+          "condition": "a batch rebase finds the workspace's lock held, or the rebase itself fails",
+          "system": "Parley service",
+          "action": "refuse or fail the request without leaving a branch part way",
+          "contract": "HTTP 409 with error_type workspace_busy for a held lock and HTTP 500 for a failed rebase; every branch is either at its new head or at the head it had before"
+        }
+      ]
+    },
+    {
+      "id": "10-REQ-5",
+      "title": "Durability",
+      "rationale": "A job lost to a restart is a merge an operator believes happened, which is worse than one that visibly failed.",
+      "criteria": [
+        {
+          "id": "10-REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "the component running a merge job restarts or is evicted",
+          "system": "Parley service",
+          "action": "either complete the job or return it to the queue",
+          "contract": "after the restart the job's status is one of queued, completed or failed, never running with nothing running it, and the job is never silently dropped"
+        },
+        {
+          "id": "10-REQ-5.2",
+          "pattern": "unwanted",
+          "condition": "a merge job makes no progress for 15 minutes",
+          "system": "Parley service",
+          "action": "set it aside so it can be requeued rather than retried for ever",
+          "contract": "the job's status becomes dead_letter and its retry count is recorded; a requeue then returns it to queued"
+        },
+        {
+          "id": "10-REQ-5.3",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "leave the target branch either at the merged result or at the head it had before the job",
+          "contract": "for a job interrupted at any point, the target branch holds one of those two heads and never an intermediate one"
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "10-PATH-1",
+      "title": "An agent's branch is merged into the target through the queue",
+      "steps": [
+        {
+          "actor": "API client",
+          "action": "submits a merge of an agent's branch into the target branch"
+        },
+        {
+          "actor": "Parley service",
+          "action": "validates the body, confirms both branches exist and queues the job, answering 202"
+        },
+        {
+          "actor": "Parley service",
+          "action": "takes its turn for the workspace lock and starts the job"
+        },
+        {
+          "actor": "history engine",
+          "action": "rebases the source onto the target and reports the result"
+        },
+        {
+          "actor": "repository store",
+          "action": "holds the fast-forwarded target branch"
+        },
+        {
+          "actor": "API client",
+          "action": "polls the job to completed and reads the target's head before and after"
+        }
+      ]
+    },
+    {
+      "id": "10-PATH-2",
+      "title": "A conflicting merge is recorded and the target left alone",
+      "steps": [
+        {
+          "actor": "API client",
+          "action": "submits a merge of a branch that conflicts with the target"
+        },
+        {
+          "actor": "Parley service",
+          "action": "queues the job and starts it in its turn"
+        },
+        {
+          "actor": "history engine",
+          "action": "reports the conflicting files and writes nothing"
+        },
+        {
+          "actor": "Parley service",
+          "action": "ends the job as failed with the conflicting files recorded"
+        },
+        {
+          "actor": "API client",
+          "action": "reads the job, sees the conflicting files, and finds the target branch at its previous head"
+        }
+      ]
+    },
+    {
+      "id": "10-PATH-3",
+      "title": "Several branches are rebased in one request",
+      "steps": [
+        {
+          "actor": "API client",
+          "action": "submits a batch rebase of three branches onto the target"
+        },
+        {
+          "actor": "Parley service",
+          "action": "takes the lock and rebases each branch in turn while the request waits"
+        },
+        {
+          "actor": "history engine",
+          "action": "rebases two branches cleanly and reports a conflict on the third"
+        },
+        {
+          "actor": "API client",
+          "action": "receives three results in order: two new heads and one conflict with its files"
+        }
+      ]
+    }
+  ]
+}

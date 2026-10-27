@@ -1,0 +1,208 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v2.json",
+  "spec_id": "10",
+  "spec_name": "merges",
+  "schema_version": 2,
+  "test_commands": {
+    "all_tests": "make test",
+    "linter": "make lint"
+  },
+  "dependencies": [
+    {
+      "spec": "03",
+      "reason": "uses its workspace record, its access decision and its lock, which a merge job waits on rather than being refused by"
+    },
+    {
+      "spec": "05",
+      "reason": "merges inside the repository its store holds"
+    },
+    {
+      "spec": "06",
+      "reason": "rebases and detects conflicts through its history engine, which also guarantees the result matches the real git binary"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "kind": "implement",
+      "title": "Run a merge job and record its outcome",
+      "criteria": [
+        "10-REQ-1"
+      ],
+      "tests": [
+        "TS-10-1",
+        "TS-10-2",
+        "TS-10-3",
+        "TS-10-4"
+      ],
+      "steps": [
+        "Add this task's behaviours to the merge job integration test file, and confirm they fail",
+        "Define the merge job record with its statuses and documented fields, and a migration the second target runs too",
+        "Run the job through the platform's queue, waiting its turn for the workspace lock rather than refusing a busy workspace",
+        "Rebase the source onto the target through the history engine and fast-forward the target to the result, producing no merge commit",
+        "Record the target's head before as base_sha and after as merged_sha, and leave both null until the job completes",
+        "End a conflicting job as failed with the conflicting files recorded and the target branch at the head it had before"
+      ],
+      "touches": [
+        "src/merge/job.ts",
+        "src/merge/job.integration.test.ts",
+        "src/jobs/merge.ts",
+        "src/store/migrations/"
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 2,
+      "kind": "implement",
+      "title": "Submit merge jobs and refuse the ones that cannot run",
+      "criteria": [
+        "10-REQ-2"
+      ],
+      "tests": [
+        "TS-10-5",
+        "TS-10-6",
+        "TS-10-7"
+      ],
+      "steps": [
+        "Add this task's behaviours to the merge routes' test files, and confirm they fail",
+        "Validate the body before the workspace is looked up: both names required, both following git's branch-name rules",
+        "Confirm the workspace is ready and both branches exist, refusing with 400 otherwise",
+        "Queue the job and answer 202 with it at status queued, carrying the submitting user",
+        "Refuse a merge of the same source into the same target that is already queued or running with 409 duplicate_merge, leaving the existing job alone"
+      ],
+      "touches": [
+        "src/routes/merges.ts",
+        "src/routes/merges.test.ts",
+        "src/routes/merges.integration.test.ts"
+      ],
+      "depends_on": [
+        1
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 3,
+      "kind": "implement",
+      "title": "List, read, cancel and requeue merge jobs",
+      "criteria": [
+        "10-REQ-3"
+      ],
+      "tests": [
+        "TS-10-8",
+        "TS-10-9",
+        "TS-10-10",
+        "TS-10-11"
+      ],
+      "steps": [
+        "Add this task's behaviours to the merge routes' test files, and confirm they fail",
+        "List a workspace's jobs capped at 200 and read one, answering 404 for an unknown id and for a job of another workspace alike",
+        "Cancel a queued job so it never runs and the target is untouched, refusing any other status with 409",
+        "Requeue a dead-lettered job to queued, refusing any other status with 409 and refusing one whose source and target are already queued or running"
+      ],
+      "touches": [
+        "src/routes/merges.ts",
+        "src/routes/merges.test.ts",
+        "src/merge/job.ts"
+      ],
+      "depends_on": [
+        2
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 4,
+      "kind": "implement",
+      "title": "Rebase several branches in one request",
+      "criteria": [
+        "10-REQ-4"
+      ],
+      "tests": [
+        "TS-10-12",
+        "TS-10-13",
+        "TS-10-14",
+        "TS-10-15"
+      ],
+      "steps": [
+        "Add this task's behaviours to the batch rebase test files, and confirm they fail",
+        "Validate the body before the workspace: a target ref, a non-empty list of at most 20 branches, each following git's branch-name rules, naming an offending branch by its index",
+        "Take the workspace lock without waiting, answering 409 workspace_busy when it is held",
+        "Rebase each branch onto the target in turn through the history engine while the request waits, continuing past a branch that conflicts or errors",
+        "Answer with one result per branch in the order given: ok with the new head, conflict with the conflicting files, or error",
+        "Leave every branch either at its new head or at the head it had before, including when the rebase itself fails with 500"
+      ],
+      "touches": [
+        "src/routes/rebase.ts",
+        "src/merge/batch_rebase.ts",
+        "src/merge/batch_rebase.test.ts",
+        "src/merge/batch_rebase.integration.test.ts"
+      ],
+      "depends_on": [
+        1
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 5,
+      "kind": "implement",
+      "title": "Make a job survive a restart and a stall",
+      "criteria": [
+        "10-REQ-5"
+      ],
+      "tests": [
+        "TS-10-16",
+        "TS-10-17",
+        "TS-10-18"
+      ],
+      "steps": [
+        "Add this task's behaviours to the merge job integration test file, and confirm they fail",
+        "Make a job that was running when its component restarted come back as queued, completed or failed, never as running with nothing running it",
+        "Dead-letter a job that has made no progress for 15 minutes, recording its retry count, and let a requeue return it to the queue",
+        "Make the fast-forward of the target atomic with respect to the job, so the target holds either its previous head or the merged result and never an intermediate commit"
+      ],
+      "touches": [
+        "src/merge/job.ts",
+        "src/jobs/merge.ts",
+        "src/jobs/stall_sweep.ts",
+        "src/merge/job.integration.test.ts"
+      ],
+      "depends_on": [
+        1
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 6,
+      "kind": "integration",
+      "title": "Verify merging and batch rebasing against a running deployment",
+      "tests": [
+        "TS-10-19",
+        "TS-10-20",
+        "TS-10-21"
+      ],
+      "steps": [
+        "Add the three smoke tests and confirm each passes against a running deployment with the real afc binary, or skips with a message naming what was missing",
+        "Trace 10-PATH-1: the submit validates and queues, the job waits for package 03's real lock, the history engine of package 06 rebases against package 05's store, and the target is fast-forwarded",
+        "Trace 10-PATH-2: the conflict comes from the real engine and the job's conflict_files carries the engine's path list unchanged",
+        "Trace 10-PATH-3: the batch rebase drives the same engine synchronously and reports a result per branch",
+        "For every criterion carrying a contract, confirm a caller in production code consumes the producer's result and not only a test: the history engine is called by both the job and the batch rebase, the lock by both, and the job record by the list, read, cancel and requeue routes",
+        "Confirm a merge job queues rather than being refused while another operation holds the lock, which distinguishes it from the sync and the archive",
+        "Grep src/merge/ and the files every task's touches lists for TODO, FIXME and the project's not-implemented marker, and remove any that remain",
+        "Add the merge conformance cases to the harness from package 01"
+      ],
+      "touches": [
+        "src/merge/merge.smoke.test.ts",
+        "conformance/merges.ts"
+      ],
+      "depends_on": [
+        3,
+        4,
+        5
+      ],
+      "done_when": [
+        "`make check` passes with no network access and no deployment configured",
+        "afc merge submit, list, status, cancel and requeue and afc rebase submit behave as docs/prd/cli.md specifies against a running deployment"
+      ],
+      "state": "pending"
+    }
+  ]
+}
