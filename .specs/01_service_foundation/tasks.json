@@ -1,0 +1,279 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v2.json",
+  "spec_id": "01",
+  "spec_name": "service_foundation",
+  "schema_version": 2,
+  "test_commands": {
+    "all_tests": "make test",
+    "linter": "make lint"
+  },
+  "dependencies": [],
+  "tasks": [
+    {
+      "id": 1,
+      "kind": "implement",
+      "title": "Create the project and serve the routed surface, the error envelope and the version route",
+      "criteria": [
+        "01-REQ-1",
+        "01-REQ-2",
+        "01-REQ-5"
+      ],
+      "tests": [
+        "TS-01-1",
+        "TS-01-2",
+        "TS-01-3",
+        "TS-01-4",
+        "TS-01-5",
+        "TS-01-11"
+      ],
+      "steps": [
+        "Create the TypeScript project: package.json, tsconfig.json, the test runner's and the linter's configuration, and the Worker's deployment configuration. Every file in this package is new; the repository has no source today",
+        "Add a Makefile with the targets build, test, fmt, vet, lint, check, check-release, tidy and clean, implemented with the TypeScript toolchain, where check runs fmt, vet, lint and the tests. Add no doc target and no docs/generated directory",
+        "Add this task's behaviours to the router's, the error renderer's and the server routes' test files, and confirm they fail",
+        "Implement the error renderer: a JSON body carrying error.code equal to the HTTP status and a non-empty error.message, with error.error_type present only when the error was raised with a machine-readable class and the key absent otherwise",
+        "Implement the Worker entry point and the router, reading the mount point from configuration with the default /api/v1",
+        "Register GET /healthz, GET /readyz, GET /version and GET /metrics at the server root, outside the mount point, so they resolve whatever the mount point is configured to. Leave /readyz and /metrics as minimal handlers for tasks 4 and 5 to complete",
+        "Answer any path that matches no route with 404 in the error envelope, whether it is under the mount point or not",
+        "Answer a server route requested with a method other than GET with 405 in the error envelope, without invoking its handler",
+        "Catch any unhandled failure while answering a request: answer 500 with error.message exactly \"internal server error\", write the underlying failure to the log, and let no part of it reach the response body",
+        "Implement GET /version: report build_time, commit, mount_point and runtime_version and no other key, take build_time and commit from the build and report the empty string for either the build did not supply, and set a Cache-Control header permitting public caching"
+      ],
+      "touches": [
+        "package.json",
+        "tsconfig.json",
+        "Makefile",
+        "wrangler.toml",
+        "src/http/router.ts",
+        "src/http/router.test.ts",
+        "src/http/errors.ts",
+        "src/http/errors.test.ts",
+        "src/routes/server.ts",
+        "src/routes/server.test.ts"
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 2,
+      "kind": "implement",
+      "title": "Enforce the request body limit and normalise timestamps",
+      "criteria": [
+        "01-REQ-3"
+      ],
+      "tests": [
+        "TS-01-6",
+        "TS-01-7"
+      ],
+      "steps": [
+        "Add this task's behaviours to the router's and the timestamp facility's test files, and confirm they fail",
+        "Read the maximum request body size from configuration, defaulting to 1048576 bytes",
+        "Reject a request whose body exceeds the maximum with 413 in the error envelope, before the route handler is invoked",
+        "Implement the timestamp facility: render every instant as RFC 3339 in UTC, ending in Z",
+        "Parse a client-supplied RFC 3339 timestamp carrying any offset and convert it to UTC, preserving the instant",
+        "Reject a client-supplied timestamp that is not valid RFC 3339 with 400 in the error envelope, with a message naming the field, changing no stored value"
+      ],
+      "touches": [
+        "src/http/router.ts",
+        "src/http/router.test.ts",
+        "src/time/rfc3339.ts",
+        "src/time/rfc3339.test.ts",
+        "src/config.ts"
+      ],
+      "depends_on": [
+        1
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 3,
+      "kind": "implement",
+      "title": "Define the platform interfaces and implement each one twice",
+      "criteria": [
+        "01-REQ-7.1"
+      ],
+      "tests": [
+        "TS-01-15"
+      ],
+      "steps": [
+        "Write one shared contract suite per interface in the interface's own contract test file, and confirm each fails against a not-implemented stub",
+        "Define the four platform interfaces this package needs: the relational store, the clock, the configuration source and the metrics sink. Define no interface this package does not use; later packages add theirs against this pattern",
+        "Implement each interface against Cloudflare",
+        "Implement each interface without Cloudflare, so that it runs on one Linux or macOS host with no Cloudflare account",
+        "Run each interface's contract suite parameterised over both of its implementations, so the same cases execute twice",
+        "Change the service to receive its platform facilities rather than construct them, so a caller chooses the implementation"
+      ],
+      "touches": [
+        "src/platform/index.ts",
+        "src/platform/store.ts",
+        "src/platform/clock.ts",
+        "src/platform/config.ts",
+        "src/platform/metrics.ts",
+        "src/platform/cloudflare/",
+        "src/platform/local/",
+        "src/platform/contract.test.ts"
+      ],
+      "depends_on": [
+        1
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 4,
+      "kind": "implement",
+      "title": "Answer the liveness and readiness probes from the real store",
+      "criteria": [
+        "01-REQ-4"
+      ],
+      "tests": [
+        "TS-01-8",
+        "TS-01-9",
+        "TS-01-10"
+      ],
+      "steps": [
+        "Add this task's behaviours to the server routes' unit and integration test files, and confirm they fail",
+        "Answer GET /healthz with 200 and {\"status\": \"ok\"} without calling the relational store at all",
+        "Answer GET /readyz with 200 and {\"status\": \"ready\"} when the relational store answers a liveness query through its platform interface",
+        "Answer GET /readyz with 503 in the error envelope when the store does not answer, and recover to 200 once it answers again",
+        "Confirm that none of the four server routes answers 401 to a request with no Authorization header or a malformed one"
+      ],
+      "touches": [
+        "src/routes/server.ts",
+        "src/routes/server.test.ts",
+        "src/routes/server.integration.test.ts"
+      ],
+      "depends_on": [
+        3
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 5,
+      "kind": "implement",
+      "title": "Expose the documented metrics and record every request against a bounded label",
+      "criteria": [
+        "01-REQ-6"
+      ],
+      "tests": [
+        "TS-01-12",
+        "TS-01-13",
+        "TS-01-14"
+      ],
+      "steps": [
+        "Add this task's behaviours to the metrics test files, and confirm they fail",
+        "Answer GET /metrics with 200, Content-Type \"text/plain; version=0.0.4\" and a body in the Prometheus text exposition format",
+        "Register every metric named in the API reference's metrics table with the type and the label names that table gives it, and report 0 for each one this service has no source for yet",
+        "Count every answered request in afhub_http_requests_total labelled with the method, the matched route template and the status, and observe its latency in afhub_http_request_duration_seconds with the bucket boundaries the reference lists",
+        "Label every request that matched no route with one fixed route-template value rather than its URI, so that no caller can grow the set of path label values"
+      ],
+      "touches": [
+        "src/metrics/registry.ts",
+        "src/metrics/registry.test.ts",
+        "src/metrics/http.ts",
+        "src/metrics/http.integration.test.ts",
+        "src/routes/server.ts"
+      ],
+      "depends_on": [
+        1,
+        3
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 6,
+      "kind": "implement",
+      "title": "Package the second target and prove the two wirings answer alike",
+      "criteria": [
+        "01-REQ-7.2",
+        "01-REQ-7.3"
+      ],
+      "tests": [
+        "TS-01-16"
+      ],
+      "steps": [
+        "Add the parity behaviours to the platform parity integration test file, and confirm they fail",
+        "Build the second target as a single artefact that starts on one Linux or macOS host, wiring the non-Cloudflare implementation of every platform interface, with its own relational store",
+        "Confirm the artefact needs no Cloudflare account and makes no network call to Cloudflare to serve the four server routes",
+        "Record the status and the body keys of each server route under both wirings and assert they are equal, allowing only build_time, commit and measured metric samples to differ",
+        "Confirm the readiness probe answers 503 in the error envelope under both wirings once the relational store is unreachable",
+        "Document how to start the second target in README.md, including that it needs no Cloudflare account"
+      ],
+      "touches": [
+        "src/targets/local/main.ts",
+        "src/targets/cloudflare/worker.ts",
+        "src/platform/parity.integration.test.ts",
+        "README.md"
+      ],
+      "depends_on": [
+        3,
+        4,
+        5
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 7,
+      "kind": "implement",
+      "title": "Build the conformance harness with its reporting and its skip behaviour",
+      "criteria": [
+        "01-REQ-8"
+      ],
+      "tests": [
+        "TS-01-20",
+        "TS-01-21",
+        "TS-01-22",
+        "TS-01-23"
+      ],
+      "steps": [
+        "Add this task's behaviours to the harness's test files, and confirm they fail",
+        "Implement the harness: it takes a deployment's base URL, runs its registered checks against it, and reports each check as pass, fail or skip",
+        "Exit 0 when no check failed and non-zero when at least one did, so that a skipped check never changes the outcome",
+        "Let a check declare the binary, network or deployment it needs; when one is unavailable, skip the check with a message naming what was missing",
+        "Record the pinned commit of github.com/agent-fox-dev/hub in the repository, and build afc from that commit when a check needs it, reporting the commit built",
+        "Wire the harness into the check-release target, and confirm the check target passes on a host with no network access and no deployment configured, reporting the dependent checks as skipped"
+      ],
+      "touches": [
+        "conformance/harness.ts",
+        "conformance/harness.test.ts",
+        "conformance/afc.ts",
+        "conformance/afc.integration.test.ts",
+        "conformance/hub-commit.txt",
+        "Makefile"
+      ],
+      "depends_on": [
+        1
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 8,
+      "kind": "integration",
+      "title": "Verify the three execution paths against running deployments",
+      "tests": [
+        "TS-01-17",
+        "TS-01-18",
+        "TS-01-19"
+      ],
+      "steps": [
+        "Add the three smoke tests and confirm each passes against a running deployment, or skips with a message naming the missing deployment",
+        "Trace 01-PATH-1 through the real code: the operator's probe reaches the router, the router reaches the server route, and the readiness route reaches the Cloudflare relational store through its platform interface. Confirm no step is served by a stub",
+        "Trace 01-PATH-2 by starting the second target as its own process and probing it over HTTP, with no Cloudflare credential in the environment. Confirm the four routes are served by the same service code as on Cloudflare, differing only in the platform implementations it was given",
+        "Trace 01-PATH-3 by requesting an unmatched path and then scraping GET /metrics on the same running deployment. Confirm the request is counted under the fixed unmatched-route label and not under its URI",
+        "For every criterion carrying a contract, confirm a caller in production code consumes the producer's result and not only a test: the error renderer is reached from the router's failure path, the timestamp facility from a route that renders or parses a timestamp, the configuration source from the mount point and the body limit, and the metrics sink from the request path",
+        "Grep src/, conformance/ and the files every task's touches lists for TODO, FIXME and the project's not-implemented marker, and remove any that remain"
+      ],
+      "touches": [
+        "src/routes/server.smoke.test.ts",
+        "src/targets/local/local.smoke.test.ts",
+        "src/metrics/metrics.smoke.test.ts"
+      ],
+      "depends_on": [
+        6,
+        7
+      ],
+      "done_when": [
+        "`make check` passes with no network access and no deployment configured",
+        "`make check-release` passes against a Cloudflare deployment and against the second target"
+      ],
+      "state": "pending"
+    }
+  ]
+}

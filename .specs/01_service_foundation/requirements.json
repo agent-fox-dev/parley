@@ -1,0 +1,391 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v2.json",
+  "spec_id": "01",
+  "spec_name": "service_foundation",
+  "schema_version": 2,
+  "introduction": "The service foundation is the envelope every later Parley route is served inside: where routes live, how errors are reported, how timestamps and pages are handled, and how an operator learns the service is alive. It also lays the platform floor, proved by running the same behavioural suite against a Cloudflare implementation and a second implementation that needs no Cloudflare account.",
+  "glossary": {
+    "conformance harness": "The test harness that runs HTTP checks, and checks driving the real afc binary, against a deployment named by its base URL, reporting each check as pass, fail or skip.",
+    "error envelope": "The response body shape every Parley error uses: {\"error\": {\"code\": <http status>, \"message\": <text for a person>, \"error_type\": <machine-readable class, only where the API reference lists one>}}.",
+    "mount point": "The path prefix every versioned API route is served under, configurable and defaulting to /api/v1. The four server routes, the git server and the webhook ingress are served outside it, at the server root.",
+    "platform interface": "A named interface through which the service reaches one facility of its host platform, so that the facility can be provided by Cloudflare or by something else without the service changing.",
+    "route template": "The parameterised path a request matched, such as /api/v1/sessions/:id, as opposed to the concrete URI the client requested. Metrics are labelled with the template so the label set stays bounded.",
+    "second target": "The non-Cloudflare implementation of every platform interface, packaged as a single artefact that runs on one Linux or macOS host with no Cloudflare account and no network access to Cloudflare."
+  },
+  "requirements": [
+    {
+      "id": "01-REQ-1",
+      "title": "Route surface and mount point",
+      "rationale": "A route served at the wrong place is invisible to every client, and the mount point is the one setting that moves all of them at once.",
+      "criteria": [
+        {
+          "id": "01-REQ-1.1",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "serve GET /healthz, GET /readyz, GET /version and GET /metrics at the server root, outside the mount point, whatever the mount point is configured to",
+          "contract": "each of the four paths resolves to its handler both when the mount point is /api/v1 and when it is configured to any other prefix"
+        },
+        {
+          "id": "01-REQ-1.2",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "read the mount point from configuration, defaulting to /api/v1 when it is not configured",
+          "contract": "GET /version reports the mount point in use in its mount_point field"
+        },
+        {
+          "id": "01-REQ-1.3",
+          "pattern": "event_driven",
+          "condition": "a request arrives for a path under the mount point that matches no route",
+          "system": "Parley service",
+          "action": "answer 404 in the error envelope",
+          "contract": "HTTP 404 with body {\"error\": {\"code\": 404, \"message\": <non-empty string>}}"
+        },
+        {
+          "id": "01-REQ-1.4",
+          "pattern": "event_driven",
+          "condition": "a request arrives for a path that is neither under the mount point nor one of the four server routes",
+          "system": "Parley service",
+          "action": "answer 404 in the error envelope",
+          "contract": "HTTP 404 with body {\"error\": {\"code\": 404, \"message\": <non-empty string>}}"
+        },
+        {
+          "id": "01-REQ-1.5",
+          "pattern": "event_driven",
+          "condition": "one of the four server routes is requested with a method other than GET",
+          "system": "Parley service",
+          "action": "answer 405 in the error envelope and run no handler",
+          "contract": "HTTP 405 with body {\"error\": {\"code\": 405, \"message\": <non-empty string>}}"
+        }
+      ]
+    },
+    {
+      "id": "01-REQ-2",
+      "title": "The error envelope",
+      "rationale": "Every later route reports failure through this one shape, so a client can read any error from any part of the service the same way.",
+      "criteria": [
+        {
+          "id": "01-REQ-2.1",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "answer every error with a JSON body carrying error.code and error.message, where error.code repeats the HTTP status",
+          "contract": "Content-Type is application/json; body.error.code equals the response status; body.error.message is a non-empty string"
+        },
+        {
+          "id": "01-REQ-2.2",
+          "pattern": "event_driven",
+          "condition": "an error is raised with a machine-readable class",
+          "system": "Parley service",
+          "action": "include that class as error.error_type, and omit the error_type key entirely when the error was raised without one",
+          "contract": "body.error.error_type equals the class given; for an error raised without a class the key is absent from the body, not present and null"
+        },
+        {
+          "id": "01-REQ-2.3",
+          "pattern": "unwanted",
+          "condition": "answering a request raises a failure no handler expected",
+          "system": "Parley service",
+          "action": "answer 500 in the error envelope with a fixed message and record the underlying failure in the log",
+          "contract": "HTTP 500 with body.error.message exactly \"internal server error\"; the response body carries no text from the underlying failure; the log record carries that text"
+        }
+      ]
+    },
+    {
+      "id": "01-REQ-3",
+      "title": "Request body limit and timestamps",
+      "rationale": "Both are fixed by the API reference for every route, so getting them wrong once gets them wrong everywhere.",
+      "criteria": [
+        {
+          "id": "01-REQ-3.1",
+          "pattern": "unwanted",
+          "condition": "a request body is larger than the configured maximum",
+          "system": "Parley service",
+          "action": "answer 413 in the error envelope without invoking the route handler",
+          "contract": "HTTP 413 with body {\"error\": {\"code\": 413, \"message\": <non-empty string>}}; the route handler is not invoked"
+        },
+        {
+          "id": "01-REQ-3.2",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "read the maximum request body size from configuration, defaulting to 1048576 bytes when it is not configured",
+          "contract": "a body of 1048576 bytes is accepted and one of 1048577 bytes is answered 413 under the default configuration"
+        },
+        {
+          "id": "01-REQ-3.3",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "render every timestamp it returns as RFC 3339 in UTC",
+          "contract": "every timestamp in a response body matches ^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?Z$"
+        },
+        {
+          "id": "01-REQ-3.4",
+          "pattern": "event_driven",
+          "condition": "a client supplies a valid RFC 3339 timestamp carrying an offset other than UTC",
+          "system": "Parley service",
+          "action": "convert it to UTC, preserving the instant, before using or storing it",
+          "contract": "the value read back names the same instant and is rendered with a Z offset"
+        },
+        {
+          "id": "01-REQ-3.5",
+          "pattern": "unwanted",
+          "condition": "a client supplies a timestamp that is not valid RFC 3339",
+          "system": "Parley service",
+          "action": "answer 400 in the error envelope, naming the field, and process nothing further",
+          "contract": "HTTP 400 with body.error.message naming the offending field; no stored value changes"
+        }
+      ]
+    },
+    {
+      "id": "01-REQ-4",
+      "title": "Liveness and readiness",
+      "rationale": "A load balancer needs to tell a process that is up from a process that can actually serve, and conflating the two takes a deployment down.",
+      "criteria": [
+        {
+          "id": "01-REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "GET /healthz is requested",
+          "system": "Parley service",
+          "action": "answer 200 with the liveness document without reading any store",
+          "contract": "HTTP 200 with body {\"status\": \"ok\"}; the relational store receives no call"
+        },
+        {
+          "id": "01-REQ-4.2",
+          "pattern": "complex_event",
+          "condition": "GET /readyz is requested",
+          "guard": "the relational store answers",
+          "system": "Parley service",
+          "action": "answer 200 with the readiness document",
+          "contract": "HTTP 200 with body {\"status\": \"ready\"}"
+        },
+        {
+          "id": "01-REQ-4.3",
+          "pattern": "unwanted",
+          "condition": "GET /readyz is requested while the relational store does not answer",
+          "system": "Parley service",
+          "action": "answer 503 in the error envelope",
+          "contract": "HTTP 503 with body {\"error\": {\"code\": 503, \"message\": <non-empty string>}}"
+        },
+        {
+          "id": "01-REQ-4.4",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "serve the four server routes without requiring a credential",
+          "contract": "a request carrying no Authorization header is never answered 401 on any of the four routes"
+        }
+      ]
+    },
+    {
+      "id": "01-REQ-5",
+      "title": "Build information",
+      "rationale": "An operator comparing two deployments needs to know which build each is running, and a truthful key name is cheaper than a decoder ring.",
+      "criteria": [
+        {
+          "id": "01-REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "GET /version is requested",
+          "system": "Parley service",
+          "action": "answer 200 with the build time, the commit, the mount point and the JavaScript runtime version",
+          "contract": "HTTP 200 with a body whose keys are exactly build_time, commit, mount_point and runtime_version; runtime_version is a non-empty string; mount_point equals the configured mount point; the body has no go_version key"
+        },
+        {
+          "id": "01-REQ-5.2",
+          "pattern": "state_driven",
+          "condition": "the build supplies no build time, no commit, or neither",
+          "system": "Parley service",
+          "action": "report the empty string for each value the build did not supply and answer successfully",
+          "contract": "HTTP 200 with build_time and/or commit equal to \"\"; the request does not fail"
+        },
+        {
+          "id": "01-REQ-5.3",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "allow the version response to be cached publicly",
+          "contract": "the response carries a Cache-Control header whose directives permit public caching"
+        }
+      ]
+    },
+    {
+      "id": "01-REQ-6",
+      "title": "Operational metrics",
+      "rationale": "A scraper reads one endpoint for the life of the deployment, so the metric names and the shape of their labels are a contract from the first commit.",
+      "criteria": [
+        {
+          "id": "01-REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "GET /metrics is requested",
+          "system": "Parley service",
+          "action": "answer 200 with the metrics in the Prometheus text exposition format",
+          "contract": "HTTP 200 with Content-Type \"text/plain; version=0.0.4\" and a body that parses as Prometheus text exposition"
+        },
+        {
+          "id": "01-REQ-6.2",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "expose every metric named in the API reference's metrics table, each with the type and the label names that table gives it",
+          "contract": "the exposition carries a # TYPE line for each of the named metrics with the type the reference states, and each sample carries exactly the reference's label names"
+        },
+        {
+          "id": "01-REQ-6.3",
+          "pattern": "state_driven",
+          "condition": "a metric names a quantity this service has no source for yet",
+          "system": "Parley service",
+          "action": "expose that metric with the value 0 rather than omitting it",
+          "contract": "the metric appears in the exposition with value 0"
+        },
+        {
+          "id": "01-REQ-6.4",
+          "pattern": "event_driven",
+          "condition": "the service answers any request",
+          "system": "Parley service",
+          "action": "increment the HTTP request counter for the request's method, route template and status, and observe its latency in the request duration histogram",
+          "contract": "after one request, afhub_http_requests_total for that method, route template and status reads 1, and afhub_http_request_duration_seconds for that method and route template has one observation, in the bucket boundaries the API reference lists"
+        },
+        {
+          "id": "01-REQ-6.5",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "label metrics with the matched route template, and label every request that matched no route with one fixed value, so that the number of distinct path label values cannot be grown by a caller",
+          "contract": "for any number of requests to distinct unmatched paths, the exposition carries exactly one path label value for them"
+        }
+      ]
+    },
+    {
+      "id": "01-REQ-7",
+      "title": "The same service on two platform targets",
+      "rationale": "A portability claim that is only asserted is usually wrong; running the same checks on a second target is what makes it a measured claim.",
+      "criteria": [
+        {
+          "id": "01-REQ-7.1",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "for each platform interface it defines, satisfy one shared contract suite with its Cloudflare implementation and with its non-Cloudflare implementation alike",
+          "contract": "the contract suite of every interface passes against both of its implementations; a case that passes against one implementation and fails against the other fails the run rather than being skipped"
+        },
+        {
+          "id": "01-REQ-7.2",
+          "pattern": "event_driven",
+          "condition": "the second target is started on one host with no Cloudflare account and no network access to Cloudflare",
+          "system": "second target",
+          "action": "serve the four server routes",
+          "contract": "GET /healthz, /readyz, /version and /metrics each answer with the same status and the same body keys as the Cloudflare deployment, differing only in build_time, commit and measured metric values"
+        },
+        {
+          "id": "01-REQ-7.3",
+          "pattern": "unwanted",
+          "condition": "the relational store behind either target stops answering",
+          "system": "Parley service",
+          "action": "answer the readiness probe 503 on that target, identically on both",
+          "contract": "HTTP 503 in the error envelope on the Cloudflare target and on the second target alike"
+        }
+      ]
+    },
+    {
+      "id": "01-REQ-8",
+      "title": "The conformance harness",
+      "rationale": "Later packages add their conformance cases to this harness, so its reporting and its skip behaviour are settled before there is anything to conform.",
+      "criteria": [
+        {
+          "id": "01-REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "the harness is run against a deployment named by its base URL",
+          "system": "conformance harness",
+          "action": "run its checks against that deployment and report each check's outcome as pass, fail or skip",
+          "contract": "the report names every check with one of the three outcomes; the exit code is 0 when no check failed and non-zero when at least one did"
+        },
+        {
+          "id": "01-REQ-8.2",
+          "pattern": "event_driven",
+          "condition": "a check needs the afc binary and the Go toolchain and a network are available",
+          "system": "conformance harness",
+          "action": "build afc from the commit of github.com/agent-fox-dev/hub pinned in this repository",
+          "contract": "the binary used is built from the pinned commit, and the harness reports which commit it built"
+        },
+        {
+          "id": "01-REQ-8.3",
+          "pattern": "unwanted",
+          "condition": "a check needs a binary, a network or a deployment that is unavailable",
+          "system": "conformance harness",
+          "action": "skip that check with a message naming what was missing, and leave the run's outcome unaffected",
+          "contract": "the check's outcome is skip, its message names the missing dependency, and the harness's exit code is the same as if the check had not been defined"
+        },
+        {
+          "id": "01-REQ-8.4",
+          "pattern": "ubiquitous",
+          "system": "project quality gate",
+          "action": "complete the fast check successfully on a host with no network access and no deployment reachable",
+          "contract": "the fast check command exits 0 with no network and no deployment, reporting any dependent check as skipped"
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "01-PATH-1",
+      "title": "An operator brings the service up on Cloudflare and probes it",
+      "steps": [
+        {
+          "actor": "operator",
+          "action": "deploys the service to Cloudflare from the checked-in configuration"
+        },
+        {
+          "actor": "operator",
+          "action": "requests GET /healthz and receives 200 with the liveness document"
+        },
+        {
+          "actor": "Parley service",
+          "action": "answers the readiness probe by querying the relational store through its platform interface"
+        },
+        {
+          "actor": "relational store",
+          "action": "answers the readiness query"
+        },
+        {
+          "actor": "operator",
+          "action": "requests GET /version and reads the build time, commit, mount point and runtime version of the running deployment"
+        }
+      ]
+    },
+    {
+      "id": "01-PATH-2",
+      "title": "An operator runs the same service on one host with no Cloudflare account",
+      "steps": [
+        {
+          "actor": "operator",
+          "action": "starts the second target on one host, with its own relational store and no network access to Cloudflare"
+        },
+        {
+          "actor": "second target",
+          "action": "serves the four server routes from the same service code, with the non-Cloudflare implementation of every platform interface"
+        },
+        {
+          "actor": "operator",
+          "action": "requests GET /healthz, GET /readyz and GET /version and receives the same statuses and body keys as from the Cloudflare deployment"
+        },
+        {
+          "actor": "operator",
+          "action": "stops the relational store and sees the readiness probe answer 503 in the error envelope"
+        }
+      ]
+    },
+    {
+      "id": "01-PATH-3",
+      "title": "A missed route is answered in the envelope and counted in the metrics",
+      "steps": [
+        {
+          "actor": "API client",
+          "action": "requests a path under the mount point that matches no route"
+        },
+        {
+          "actor": "Parley service",
+          "action": "answers 404 in the error envelope and records the request against the bounded route-template label"
+        },
+        {
+          "actor": "metrics scraper",
+          "action": "requests GET /metrics and reads the Prometheus exposition"
+        },
+        {
+          "actor": "metrics scraper",
+          "action": "finds the request counted in afhub_http_requests_total with its latency observed, under one fixed path label for unmatched requests"
+        }
+      ]
+    }
+  ]
+}

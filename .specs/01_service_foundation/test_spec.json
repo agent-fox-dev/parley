@@ -1,0 +1,463 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/test_spec.v2.json",
+  "spec_id": "01",
+  "spec_name": "service_foundation",
+  "schema_version": 2,
+  "tests": [
+    {
+      "id": "TS-01-1",
+      "kind": "unit",
+      "verifies": [
+        "01-REQ-1.1",
+        "01-REQ-1.2"
+      ],
+      "title": "The four server routes answer at the root whatever the mount point, and the mount point in use is reported",
+      "given": [
+        "a service built with the default configuration",
+        "a service built with the mount point configured to /api/v2"
+      ],
+      "when": "each of GET /healthz, /readyz, /version and /metrics is requested against each service",
+      "then": [
+        "every route answers with a non-404 status on both services",
+        "GET /version reports mount_point /api/v1 on the default service",
+        "GET /version reports mount_point /api/v2 on the reconfigured service"
+      ],
+      "pseudocode": "in the HTTP router's test file: for mp in ['/api/v1', '/api/v2']: app = build(mountPoint=mp); for p in ROOT_ROUTES: assert get(app, p).status != 404; assert get(app, '/version').json.mount_point == mp"
+    },
+    {
+      "id": "TS-01-2",
+      "kind": "unit",
+      "verifies": [
+        "01-REQ-1.3",
+        "01-REQ-1.4"
+      ],
+      "title": "A path that matches no route is answered 404 in the error envelope",
+      "given": [
+        "a service with the default mount point"
+      ],
+      "when": "paths that match no route are requested: one under the mount point, one at the root, one deep under the mount point, and one that is a prefix of a server route",
+      "then": [
+        "each answers 404",
+        "each body is {\"error\": {\"code\": 404, \"message\": <non-empty string>}}",
+        "no body carries an error_type key"
+      ],
+      "pseudocode": "in the HTTP router's test file, table-driven over the four paths: r = get(app, path); assert r.status == 404 and r.json.error.code == 404 and r.json.error.message != '' and 'error_type' not in r.json.error"
+    },
+    {
+      "id": "TS-01-3",
+      "kind": "unit",
+      "verifies": [
+        "01-REQ-1.5"
+      ],
+      "title": "A server route requested with a method other than GET is answered 405",
+      "given": [
+        "a service with the default configuration"
+      ],
+      "when": "each server route is requested with POST, PUT, PATCH and DELETE",
+      "then": [
+        "each answers 405",
+        "each body is the error envelope with code 405",
+        "the route's handler is not invoked"
+      ],
+      "pseudocode": "in the HTTP router's test file, table over the four routes x four methods, with the handlers replaced by recording stubs: assert r.status == 405 and stub.calls == 0"
+    },
+    {
+      "id": "TS-01-4",
+      "kind": "unit",
+      "verifies": [
+        "01-REQ-2.1",
+        "01-REQ-2.2"
+      ],
+      "title": "An error is rendered as the envelope, carrying error_type only when one was raised",
+      "given": [
+        "the error renderer"
+      ],
+      "when": "errors are rendered for a range of statuses, some raised with a machine-readable class and some without",
+      "then": [
+        "every body is application/json carrying error.code equal to the status and a non-empty error.message",
+        "a body for an error raised with a class carries that class in error.error_type",
+        "a body for an error raised without a class has no error_type key at all, rather than the key with a null value"
+      ],
+      "pseudocode": "in the error renderer's test file, table over (status, class|none): body = render(err); assert body.error.code == status; assert ('error_type' in body.error) == (class is not None); when present assert body.error.error_type == class"
+    },
+    {
+      "id": "TS-01-5",
+      "kind": "unit",
+      "verifies": [
+        "01-REQ-2.3"
+      ],
+      "title": "An unexpected failure is answered 500 with a fixed message and the detail reaches only the log",
+      "given": [
+        "a route whose handler raises an error carrying a distinctive secret string",
+        "a recording log sink"
+      ],
+      "when": "that route is requested",
+      "then": [
+        "the response is 500 with error.message exactly \"internal server error\"",
+        "the response body does not contain the distinctive string anywhere",
+        "the log sink received a record containing the distinctive string"
+      ],
+      "pseudocode": "in the HTTP router's test file: app = build(logSink=rec); register('/boom', () => { throw Error('SENTINEL-9f3a') }); r = get(app, '/boom'); assert r.status == 500 and r.json.error.message == 'internal server error' and 'SENTINEL-9f3a' not in r.text; assert any('SENTINEL-9f3a' in x for x in rec.records)"
+    },
+    {
+      "id": "TS-01-6",
+      "kind": "unit",
+      "verifies": [
+        "01-REQ-3.1",
+        "01-REQ-3.2"
+      ],
+      "title": "A request body over the limit is refused with 413 before the handler runs",
+      "given": [
+        "a service with the default body limit",
+        "a service with the body limit configured to 1024 bytes",
+        "a recording handler on a POST route"
+      ],
+      "when": "bodies at the limit, one byte over it, far over it, and empty are posted to each service",
+      "then": [
+        "a body of exactly the limit is accepted and reaches the handler",
+        "a body one byte over the limit answers 413 in the error envelope",
+        "the handler is not invoked for any body over the limit",
+        "the default limit is 1048576 bytes"
+      ],
+      "pseudocode": "in the HTTP router's test file, table over (limit, size, expectAccepted): app = build(maxBody=limit, handler=rec); r = post(app, '/t', 'x'*size); assert accepted ? (r.status != 413 and rec.calls == 1) : (r.status == 413 and rec.calls == 0)"
+    },
+    {
+      "id": "TS-01-7",
+      "kind": "unit",
+      "verifies": [
+        "01-REQ-3.3",
+        "01-REQ-3.4",
+        "01-REQ-3.5"
+      ],
+      "title": "Timestamps are rendered as RFC 3339 UTC and parsed from any offset, and a malformed value is refused",
+      "given": [
+        "the timestamp facility"
+      ],
+      "when": "instants are rendered, and values are parsed: a Z value, a +02:00 value, a -08:00 value, one with fractional seconds, and the malformed values \"2026-13-01T00:00:00Z\", \"not-a-time\" and \"\"",
+      "then": [
+        "every rendered value ends in Z and matches the RFC 3339 UTC form",
+        "each valid offset parses to the same instant as its UTC equivalent and renders with a Z offset",
+        "each malformed value is refused with a 400 in the error envelope whose message names the field"
+      ],
+      "pseudocode": "in the timestamp facility's test file, two tables: render cases assert the regex; parse cases assert parse('2026-01-02T05:04:05+02:00') == parse('2026-01-02T03:04:05Z') and that malformed values produce a 400 naming the field"
+    },
+    {
+      "id": "TS-01-8",
+      "kind": "unit",
+      "verifies": [
+        "01-REQ-4.1"
+      ],
+      "title": "The liveness probe answers ok without touching any store",
+      "given": [
+        "a service whose relational store is a recording stub that fails on any call"
+      ],
+      "when": "GET /healthz is requested",
+      "then": [
+        "the response is 200 with body {\"status\": \"ok\"}",
+        "the store stub recorded no call"
+      ],
+      "pseudocode": "in the server routes' test file: app = build(store=failing_recorder); r = get(app, '/healthz'); assert r.status == 200 and r.json == {'status': 'ok'}; assert store.calls == 0"
+    },
+    {
+      "id": "TS-01-9",
+      "kind": "integration",
+      "verifies": [
+        "01-REQ-4.2",
+        "01-REQ-4.3"
+      ],
+      "title": "The readiness probe reflects whether the relational store really answers",
+      "given": [
+        "the service wired to a real relational store through its platform interface"
+      ],
+      "when": "GET /readyz is requested while the store answers, and again after the store has been made unreachable",
+      "then": [
+        "the first answers 200 with body {\"status\": \"ready\"}",
+        "the second answers 503 with the error envelope and error.code 503",
+        "the probe recovers to 200 once the store answers again"
+      ],
+      "pseudocode": "in the server routes' integration test file, against the non-Cloudflare store implementation: assert get('/readyz').status == 200; store.stop(); assert get('/readyz').status == 503; store.start(); assert get('/readyz').status == 200"
+    },
+    {
+      "id": "TS-01-10",
+      "kind": "unit",
+      "verifies": [
+        "01-REQ-4.4"
+      ],
+      "title": "The server routes need no credential",
+      "given": [
+        "a service with the default configuration"
+      ],
+      "when": "each of the four server routes is requested with no Authorization header, and with a malformed one",
+      "then": [
+        "no response is 401 on any of the eight requests"
+      ],
+      "pseudocode": "in the server routes' test file, table over the four routes x (no header, 'Bearer nonsense'): assert get(app, route, headers).status != 401"
+    },
+    {
+      "id": "TS-01-11",
+      "kind": "unit",
+      "verifies": [
+        "01-REQ-5.1",
+        "01-REQ-5.2",
+        "01-REQ-5.3"
+      ],
+      "title": "The version route reports the build and the runtime under truthful keys",
+      "given": [
+        "a service built with a build time and a commit",
+        "a service built with neither"
+      ],
+      "when": "GET /version is requested against each",
+      "then": [
+        "the body's keys are exactly build_time, commit, mount_point and runtime_version",
+        "there is no go_version key",
+        "runtime_version is a non-empty string and mount_point is the configured mount point",
+        "the service built with neither reports \"\" for build_time and commit and still answers 200",
+        "the response carries a Cache-Control header permitting public caching"
+      ],
+      "pseudocode": "in the server routes' test file: r = get(app, '/version'); assert set(r.json.keys()) == {'build_time','commit','mount_point','runtime_version'}; assert r.json.runtime_version != ''; assert 'public' in r.headers['Cache-Control']"
+    },
+    {
+      "id": "TS-01-12",
+      "kind": "unit",
+      "verifies": [
+        "01-REQ-6.1",
+        "01-REQ-6.2",
+        "01-REQ-6.3"
+      ],
+      "title": "The metrics route exposes every documented metric in Prometheus text format",
+      "given": [
+        "a freshly started service that has answered no request"
+      ],
+      "when": "GET /metrics is requested and the body is parsed as Prometheus text exposition",
+      "then": [
+        "the response is 200 with Content-Type \"text/plain; version=0.0.4\"",
+        "the body parses as Prometheus text exposition",
+        "every metric name the API reference's metrics table lists is present with the type that table gives it and with exactly its label names",
+        "every metric for which the service has no source yet is present with the value 0"
+      ],
+      "pseudocode": "in the metrics test file: r = get(app, '/metrics'); fams = parse_prometheus(r.text); for name, typ, labels in API_METRICS_TABLE: assert fams[name].type == typ and fams[name].label_names == labels; for name in SOURCELESS: assert value(fams[name]) == 0"
+    },
+    {
+      "id": "TS-01-13",
+      "kind": "integration",
+      "verifies": [
+        "01-REQ-6.4"
+      ],
+      "title": "An answered request is counted and timed under its method, route template and status",
+      "given": [
+        "the service with its real metrics sink, having answered no request"
+      ],
+      "when": "one request is made to a matched route and the metrics are read",
+      "then": [
+        "afhub_http_requests_total for that method, route template and status reads 1",
+        "afhub_http_request_duration_seconds for that method and route template has exactly one observation",
+        "the histogram's bucket boundaries are the ones the API reference lists"
+      ],
+      "pseudocode": "in the metrics integration test file: get(app, '/healthz'); fams = parse_prometheus(get(app, '/metrics').text); assert sample(fams, 'afhub_http_requests_total', {'method':'GET','path':'/healthz','status':'200'}) == 1; assert histogram_count(fams, 'afhub_http_request_duration_seconds', {'method':'GET','path':'/healthz'}) == 1"
+    },
+    {
+      "id": "TS-01-14",
+      "kind": "unit",
+      "verifies": [
+        "01-REQ-6.5"
+      ],
+      "title": "Unmatched paths cannot grow the metric label set",
+      "given": [
+        "a freshly started service"
+      ],
+      "when": "50 requests are made to 50 distinct paths that match no route, and the metrics are read",
+      "then": [
+        "the path label of afhub_http_requests_total takes exactly one value for those 50 requests",
+        "that one value is not any of the 50 requested URIs",
+        "the counter for that single label set reads 50"
+      ],
+      "pseudocode": "in the metrics test file: for i in range(50): get(app, f'/api/v1/nope-{i}'); labels = {s.labels['path'] for s in samples(fams, 'afhub_http_requests_total') if s.labels['status'] == '404'}; assert len(labels) == 1"
+    },
+    {
+      "id": "TS-01-15",
+      "kind": "integration",
+      "verifies": [
+        "01-REQ-7.1"
+      ],
+      "title": "Every platform interface satisfies one contract suite with both of its implementations",
+      "given": [
+        "the shared contract suite of each platform interface this package defines: the relational store, the clock, the configuration source and the metrics sink"
+      ],
+      "when": "the contract suite of each interface is run against its Cloudflare implementation and against its non-Cloudflare implementation",
+      "then": [
+        "every case passes against both implementations",
+        "the suite is the same code in both runs, parameterised only by which implementation it is given",
+        "a case that passes against one implementation and fails against the other is reported as a failure, not a skip"
+      ],
+      "pseudocode": "in each interface's contract test file: for impl in [cloudflareImpl(), localImpl()]: runContractSuite(impl) — one suite definition, two parameterised runs"
+    },
+    {
+      "id": "TS-01-16",
+      "kind": "integration",
+      "verifies": [
+        "01-REQ-7.2",
+        "01-REQ-7.3"
+      ],
+      "title": "The service answers identically whichever implementation of the platform interfaces it is given",
+      "given": [
+        "the service wired in process to the Cloudflare implementations",
+        "the service wired in process to the non-Cloudflare implementations"
+      ],
+      "when": "the four server routes are requested against each wiring, and the readiness probe is requested again after each wiring's relational store has been made unreachable",
+      "then": [
+        "each route answers with the same status under both wirings",
+        "each response body carries the same keys under both wirings, differing only in the values of build_time, commit and the measured metric samples",
+        "the readiness probe answers 503 in the error envelope under both wirings once the store is unreachable"
+      ],
+      "pseudocode": "in the platform parity integration test file: for wiring in [cloudflareWiring(), localWiring()]: app = build(wiring); record status and body keys for each of ROOT_ROUTES; wiring.store.stop(); record get('/readyz'). Then assert the two recordings are equal field for field except build_time, commit and metric values."
+    },
+    {
+      "id": "TS-01-17",
+      "kind": "smoke",
+      "verifies": [
+        "01-PATH-2",
+        "01-REQ-7.2",
+        "01-REQ-7.3"
+      ],
+      "title": "The second target serves the same four routes on one host with no Cloudflare account",
+      "given": [
+        "the second target started as its single artefact on one host, with its own relational store and no network access to Cloudflare"
+      ],
+      "when": "the four server routes are requested against it, its relational store is then stopped, and the readiness probe is requested again",
+      "then": [
+        "each route answers with the same status and the same body keys as the Cloudflare deployment, differing only in build_time, commit and measured metric values",
+        "after the store is stopped the readiness probe answers 503 in the error envelope",
+        "the run completes with no Cloudflare credential present in the environment"
+      ],
+      "pseudocode": "in the second target's smoke test file: proc = start_local_target(); for p in ROOT_ROUTES: assert shape_of(get(proc.url + p)) == shape_of(reference_response(p)); proc.store.stop(); assert get(proc.url + '/readyz').status == 503",
+      "real_components": [
+        "second target process",
+        "HTTP router",
+        "server routes",
+        "non-Cloudflare relational store",
+        "non-Cloudflare configuration source"
+      ]
+    },
+    {
+      "id": "TS-01-18",
+      "kind": "smoke",
+      "verifies": [
+        "01-PATH-1"
+      ],
+      "title": "An operator probes a real Cloudflare deployment and reads its build information",
+      "given": [
+        "the service deployed to Cloudflare from the checked-in configuration, with a real relational store"
+      ],
+      "when": "GET /healthz, GET /readyz and GET /version are requested in turn against the deployment's base URL",
+      "then": [
+        "the liveness probe answers 200 with {\"status\": \"ok\"}",
+        "the readiness probe answers 200 with {\"status\": \"ready\"}, having queried the real store",
+        "the version route reports the build time, commit, mount point and runtime version of that deployment"
+      ],
+      "pseudocode": "in the deployment smoke test file, skipping with a named reason when no deployment URL is configured: assert get(base + '/healthz').json == {'status':'ok'}; assert get(base + '/readyz').json == {'status':'ready'}; assert get(base + '/version').json.runtime_version != ''",
+      "real_components": [
+        "Cloudflare Worker deployment",
+        "HTTP router",
+        "server routes",
+        "Cloudflare relational store"
+      ]
+    },
+    {
+      "id": "TS-01-19",
+      "kind": "smoke",
+      "verifies": [
+        "01-PATH-3"
+      ],
+      "title": "A missed route is answered in the envelope and shows up in the scraped metrics",
+      "given": [
+        "a running deployment that has answered no request"
+      ],
+      "when": "an API client requests a path under the mount point that matches no route, and a scraper then reads GET /metrics",
+      "then": [
+        "the client receives 404 with the error envelope",
+        "the scraped exposition counts that request in afhub_http_requests_total with status 404 and its latency observed",
+        "the path label of that sample is the fixed unmatched-route value, not the requested URI"
+      ],
+      "pseudocode": "in the deployment smoke test file: get(base + '/api/v1/no-such-thing'); fams = parse_prometheus(get(base + '/metrics').text); s = sample(fams, 'afhub_http_requests_total', status='404'); assert s.value >= 1 and s.labels['path'] != '/api/v1/no-such-thing'",
+      "real_components": [
+        "running deployment",
+        "HTTP router",
+        "metrics sink",
+        "server routes"
+      ]
+    },
+    {
+      "id": "TS-01-20",
+      "kind": "integration",
+      "verifies": [
+        "01-REQ-8.1"
+      ],
+      "title": "The harness reports every check's outcome and sets its exit code from the failures",
+      "given": [
+        "the harness configured with a passing check, a failing check and a skipping check, against a stub deployment"
+      ],
+      "when": "the harness is run against the stub deployment's base URL, and then run again with the failing check removed",
+      "then": [
+        "the report names all three checks, each with outcome pass, fail or skip",
+        "the first run exits non-zero because a check failed",
+        "the second run exits 0 although a check was skipped"
+      ],
+      "pseudocode": "in the harness test file: r = run_harness(baseURL=stub.url, checks=[ok, bad, skipped]); assert r.exit != 0 and {c.name: c.outcome for c in r.report} == {'ok':'pass','bad':'fail','skipped':'skip'}; r2 = run_harness(checks=[ok, skipped]); assert r2.exit == 0"
+    },
+    {
+      "id": "TS-01-21",
+      "kind": "integration",
+      "verifies": [
+        "01-REQ-8.2"
+      ],
+      "title": "The harness builds afc from the pinned hub commit",
+      "given": [
+        "the Go toolchain and a network available",
+        "the pinned commit of github.com/agent-fox-dev/hub recorded in the repository"
+      ],
+      "when": "the harness prepares a check that needs afc",
+      "then": [
+        "an afc binary is built and is executable",
+        "the harness reports the commit it built from",
+        "the reported commit is the one pinned in the repository, not a branch tip"
+      ],
+      "pseudocode": "in the harness test file, skipping with a named reason when Go or the network is absent: b = harness.prepare_afc(); assert is_executable(b.path) and b.commit == read_pin()"
+    },
+    {
+      "id": "TS-01-22",
+      "kind": "unit",
+      "verifies": [
+        "01-REQ-8.3"
+      ],
+      "title": "A check whose dependency is missing is skipped with a named reason and does not change the outcome",
+      "given": [
+        "the harness with checks declaring a missing binary, an unreachable network and an absent deployment"
+      ],
+      "when": "the harness is run with none of those dependencies available, alongside one passing check",
+      "then": [
+        "each dependent check has outcome skip",
+        "each skip message names the dependency that was missing",
+        "the exit code is the same as a run defined with the passing check alone"
+      ],
+      "pseudocode": "in the harness test file, table over the three missing-dependency kinds: r = run_harness(checks=[ok, dependent]); assert outcome(dependent) == 'skip' and dependency_name in message(dependent) and r.exit == run_harness(checks=[ok]).exit"
+    },
+    {
+      "id": "TS-01-23",
+      "kind": "integration",
+      "verifies": [
+        "01-REQ-8.4"
+      ],
+      "title": "The fast check passes offline with no deployment",
+      "given": [
+        "a checkout with dependencies installed, no network access and no deployment configured"
+      ],
+      "when": "the project's fast check command is run",
+      "then": [
+        "it exits 0",
+        "its output reports the conformance checks as skipped rather than failed",
+        "no check attempts a network call"
+      ],
+      "pseudocode": "in the build gate's test file: r = run('make check', env=no_network, deployment=None); assert r.exit == 0 and 'skip' in r.output.lower()"
+    }
+  ]
+}
