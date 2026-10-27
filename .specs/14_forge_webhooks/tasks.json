@@ -1,0 +1,239 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v2.json",
+  "spec_id": "14",
+  "spec_name": "forge_webhooks",
+  "schema_version": 2,
+  "test_commands": {
+    "all_tests": "make test",
+    "linter": "make lint"
+  },
+  "dependencies": [
+    {
+      "spec": "01",
+      "reason": "uses its router to serve the ingress at the server root, outside the mount point and outside the API's body limit"
+    },
+    {
+      "spec": "03",
+      "reason": "uses its workspace record and access decision for the webhook and delivery-log routes"
+    },
+    {
+      "spec": "04",
+      "reason": "stores and reads the webhook secret through its entry store as the ordinary workspace secret"
+    },
+    {
+      "spec": "12",
+      "reason": "relays each delivery's events through its recorder, which carries them to the audit query and the event stream"
+    },
+    {
+      "spec": "13",
+      "reason": "reuses its repository identification to decide which of a workspace's repositories a delivery is about, and feeds the webhook block of its description route"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "kind": "implement",
+      "title": "Set and remove the webhook secret",
+      "criteria": [
+        "14-REQ-1"
+      ],
+      "tests": [
+        "TS-14-1",
+        "TS-14-2",
+        "TS-14-3",
+        "TS-14-4"
+      ],
+      "steps": [
+        "Confirm against GitHub's and GitLab's current documentation the header names and payload shapes of their webhooks, and confirm that the platform makes the raw request body available unmodified before a signature is computed over it. Record both findings",
+        "Add this task's behaviours to the webhook routes' test files, and confirm they fail",
+        "Store the secret as the ordinary workspace secret FORGE_WEBHOOK_SECRET through package 04's entry store, so the secrets routes set the same value",
+        "Generate a secret of 64 lowercase hex characters when the caller supplies none, and return it in that answer alone",
+        "Accept a supplied secret of 16 to 255 printable ASCII characters from ! to ~, returning no secret field",
+        "Refuse a non-object body, a non-string secret, a secret of the wrong length or with a disallowed character, a workspace whose secrets are full, and an archived workspace with 400, naming the rule and never the value",
+        "Remove the secret with 204 whether or not one existed, on an archived workspace too, keeping the recorded deliveries",
+        "Read the secret afresh for every delivery, and never read a secret of that name at an organization or user scope"
+      ],
+      "touches": [
+        "src/routes/webhook.ts",
+        "src/routes/webhook.test.ts",
+        "src/routes/webhook.integration.test.ts",
+        "src/webhook/secret.ts",
+        "docs/adr/"
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 2,
+      "kind": "implement",
+      "title": "Record and serve the delivery log",
+      "criteria": [
+        "14-REQ-2"
+      ],
+      "tests": [
+        "TS-14-5",
+        "TS-14-6",
+        "TS-14-7"
+      ],
+      "steps": [
+        "Add this task's behaviours to the delivery log test files, and confirm they fail",
+        "Define the delivery table keyed by workspace and delivery id, with a migration the second target runs too",
+        "Serve the log newest first, breaking ties within a second by the recording order with the latest first",
+        "Report the delivery id, forge, event name cut to 64 bytes, action, target, outcome, relayed events and received time, and nothing of the payload",
+        "Accept a time lower bound keeping whole seconds and a limit of 1 to 100 defaulting to 30, refusing a bad, unparseable or repeated parameter with 400 naming it",
+        "Add the hourly prune of deliveries older than 7 days and of those belonging to workspaces that no longer exist",
+        "Feed the last-delivery time the webhook block of package 13's description route reports"
+      ],
+      "touches": [
+        "src/routes/deliveries.ts",
+        "src/routes/deliveries.test.ts",
+        "src/routes/deliveries.integration.test.ts",
+        "src/webhook/log.ts",
+        "src/jobs/delivery_prune.ts",
+        "src/store/migrations/"
+      ],
+      "depends_on": [
+        1
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 3,
+      "kind": "implement",
+      "title": "Prove the sender of a delivery",
+      "criteria": [
+        "14-REQ-3"
+      ],
+      "tests": [
+        "TS-14-8",
+        "TS-14-9",
+        "TS-14-10",
+        "TS-14-11",
+        "TS-14-12"
+      ],
+      "steps": [
+        "Add this task's behaviours to the webhook ingress test files, and confirm they fail",
+        "Serve the ingress at the server root without bearer authentication and outside the API's body limit and content-type check",
+        "Check in order: the workspace exists and has a non-empty secret, which scheme the headers name, GitLab's token, the body up to 1 MiB, then GitHub's signature — reading no byte of the body before the first three have passed",
+        "Answer an unknown slug and a workspace with no or an empty secret with one identical 404, and a failing secrets store with 500",
+        "Compare GitLab's token and GitHub's signature in constant time, answering one identical 401 for a missing, malformed or wrong credential and recording and emitting nothing",
+        "Compute GitHub's signature as the HMAC-SHA256 of the raw request bytes, never of a re-serialised body, expecting the sha256 prefix and 64 lowercase hex digits",
+        "Refuse a body over 1048576 bytes with 413 body_too_large, accepting one exactly at the limit",
+        "Read the delivery id and event name from each forge's documented headers, refusing a missing one, an id over 255 characters and an id outside printable ASCII with 400"
+      ],
+      "touches": [
+        "src/routes/ingress.ts",
+        "src/routes/ingress.test.ts",
+        "src/webhook/verify.ts",
+        "src/webhook/verify.test.ts",
+        "src/webhook/ingress.integration.test.ts"
+      ],
+      "depends_on": [
+        1
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 4,
+      "kind": "implement",
+      "title": "Process each delivery exactly once",
+      "criteria": [
+        "14-REQ-4"
+      ],
+      "tests": [
+        "TS-14-13",
+        "TS-14-14"
+      ],
+      "steps": [
+        "Add this task's behaviours to the webhook ingress test files, and confirm they fail",
+        "Record the delivery per workspace and delivery id before anything is relayed, so the row exists before the first event",
+        "Answer a delivery whose id is already recorded for the workspace with 202 and the outcome duplicate, emitting nothing and adding no row",
+        "Make several simultaneous copies of one delivery produce exactly one processed delivery and one set of events",
+        "Treat the same id for a different workspace as its own delivery",
+        "Answer 500 and emit nothing when the recording itself fails, so the forge's redelivery is processed in full rather than treated as a duplicate"
+      ],
+      "touches": [
+        "src/webhook/dedupe.ts",
+        "src/webhook/dedupe.test.ts",
+        "src/webhook/ingress.integration.test.ts",
+        "src/routes/ingress.ts"
+      ],
+      "depends_on": [
+        2,
+        3
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 5,
+      "kind": "implement",
+      "title": "Answer the forge and relay the events",
+      "criteria": [
+        "14-REQ-5"
+      ],
+      "tests": [
+        "TS-14-15",
+        "TS-14-16",
+        "TS-14-17",
+        "TS-14-18",
+        "TS-14-19",
+        "TS-14-20"
+      ],
+      "steps": [
+        "Add this task's behaviours to the webhook ingress and webhook mapping test files, and confirm they fail",
+        "Write the 202 with its outcome before relaying any event, and relay afterwards even when the forge has disconnected",
+        "Report the outcome as relayed, ignored, repository_mismatch or duplicate in both the answer and the log row",
+        "Record a body that is not one JSON object, or that lacks the repository, an issue or pull request number, a label name or a push ref, as malformed and answer 400, while letting a missing title, URL or branch name default to empty",
+        "Decide the target by comparing the payload's repository path, ignoring case, with the origin's and, on a carry_patch workspace with an upstream, with the upstream's, using the repository identification of package 13",
+        "Transcribe the reference's two mapping tables into one declaration and relay exactly the events each row gives, in that order, through package 12's recorder",
+        "Emit a GitLab update's unlabeled events before its labeled ones, each group sorted by name, capping label events at 100 per delivery and labels at 100 per event",
+        "Relay nothing for a ping, a GitHub pull_request labeled, an edited issue comment, a GitLab confidential hook and a note on a commit or snippet",
+        "Keep the payload out of every row, log record and event beyond the fields the tables list, and make no outbound request to the forge while processing a delivery"
+      ],
+      "touches": [
+        "src/webhook/mapping.ts",
+        "src/webhook/mapping.test.ts",
+        "src/webhook/mapping.integration.test.ts",
+        "src/webhook/relay.ts",
+        "src/routes/ingress.ts"
+      ],
+      "depends_on": [
+        4
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 6,
+      "kind": "integration",
+      "title": "Verify setup, delivery and refusal against a running deployment",
+      "tests": [
+        "TS-14-21",
+        "TS-14-22",
+        "TS-14-23"
+      ],
+      "steps": [
+        "Add the three smoke tests and confirm each passes against a running deployment with the real afc binary, or skips with a message naming what was missing",
+        "Trace 14-PATH-1: the set writes through package 04's entry store, the ingress reads it back and verifies over the raw bytes, the delivery is recorded, the answer is written, and the relayed event reaches package 12's recorder, the event stream and the audit query",
+        "Trace 14-PATH-2: the duplicate is detected from the recorded row rather than from an in-memory cache, so it holds across a restart",
+        "Trace 14-PATH-3: the refusals happen before the body is read and leave no row and no event",
+        "For every criterion carrying a contract, confirm a caller in production code consumes the producer's result and not only a test: the secret store of package 04 is read by the ingress, the repository identification of package 13 by the target decision, the mapping declaration by the relay, and the recorder of package 12 by every relayed event",
+        "Confirm by test that every row of the reference's two mapping tables is exercised by a delivery and produces exactly its listed events",
+        "Confirm the webhook block of package 13's description route reports this package's last delivery time",
+        "Grep src/webhook/ and the files every task's touches lists for TODO, FIXME and the project's not-implemented marker, and remove any that remain",
+        "Add the webhook conformance cases to the harness from package 01"
+      ],
+      "touches": [
+        "src/webhook/webhook.smoke.test.ts",
+        "conformance/webhooks.ts"
+      ],
+      "depends_on": [
+        5
+      ],
+      "done_when": [
+        "`make check` passes with no network access and no deployment configured",
+        "afc forge webhook set, afc forge webhook unset and afc forge deliveries behave as docs/prd/cli.md specifies against a running deployment",
+        "a signed delivery posted to a running deployment is relayed to the event stream and appears in the delivery log"
+      ],
+      "state": "pending"
+    }
+  ]
+}

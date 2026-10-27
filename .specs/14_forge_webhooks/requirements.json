@@ -1,0 +1,316 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v2.json",
+  "spec_id": "14",
+  "spec_name": "forge_webhooks",
+  "schema_version": 2,
+  "introduction": "A workspace's forge tells Parley what happened on the repository by posting a signed delivery to an ingress served without a bearer credential. Parley proves the sender from the workspace's secret, records the delivery once, answers the forge, and then relays the documented hub events. It never acts on a delivery and never contacts the forge for one.",
+  "glossary": {
+    "delivery": "One webhook request a forge posts to the ingress, identified by the forge's own delivery id and recorded once per workspace.",
+    "event relay": "Emitting the hub events a delivery maps to, after the forge has been answered. Distinct from the git relay of spec 07, which passes a client's git request through to the repository store.",
+    "ingress": "POST /hooks/forge/:slug, served at the server root without bearer authentication, where the forge proves itself with the workspace's secret.",
+    "outcome": "What the hub made of a delivery: relayed, ignored, repository_mismatch, duplicate or malformed.",
+    "webhook secret": "The workspace secret FORGE_WEBHOOK_SECRET, the HMAC key GitHub signs with and the token GitLab sends, set either through the webhook route or through the ordinary secrets routes."
+  },
+  "requirements": [
+    {
+      "id": "14-REQ-1",
+      "title": "Setting and removing the webhook secret",
+      "rationale": "A generated secret is shown once and is the only thing standing between the public ingress and a forged delivery.",
+      "criteria": [
+        {
+          "id": "14-REQ-1.1",
+          "pattern": "complex_event",
+          "condition": "the webhook route is called to set a workspace's secret",
+          "guard": "the caller supplied no secret",
+          "system": "Parley service",
+          "action": "generate one and return it with the ingress URL",
+          "contract": "HTTP 200 with configured true, the ingress URL or null where the service has no external URL, and the generated secret of 64 lowercase hex characters; the secret appears in no other response, log record, event or delivery row"
+        },
+        {
+          "id": "14-REQ-1.2",
+          "pattern": "complex_event",
+          "condition": "the webhook route is called to set a workspace's secret",
+          "guard": "the caller supplied a secret of 16 to 255 printable ASCII characters from ! to ~",
+          "system": "Parley service",
+          "action": "store it and report that the webhook is configured, without returning it",
+          "contract": "HTTP 200 with configured true and the URL, and no secret field; the stored value is the one supplied"
+        },
+        {
+          "id": "14-REQ-1.3",
+          "pattern": "unwanted",
+          "condition": "the body is not a JSON object with an optional string secret, the secret is outside 16 to 255 characters or carries a character outside ! to ~, the workspace's secrets are full, or the workspace is archived",
+          "system": "Parley service",
+          "action": "refuse the request and store nothing",
+          "contract": "HTTP 400 in the error envelope with a message naming the rule broken and never the value; the workspace's stored secret is unchanged"
+        },
+        {
+          "id": "14-REQ-1.4",
+          "pattern": "event_driven",
+          "condition": "the webhook route is called to remove a workspace's secret",
+          "system": "Parley service",
+          "action": "remove it and keep the recorded deliveries",
+          "contract": "HTTP 204 whether or not a secret existed; the route works on an archived workspace; the delivery log is unchanged; the ingress answers 404 for that workspace afterwards"
+        },
+        {
+          "id": "14-REQ-1.5",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "keep the webhook secret as the ordinary workspace secret FORGE_WEBHOOK_SECRET and read it afresh for every delivery",
+          "contract": "setting it through the secrets routes has the same effect as the webhook route; a rotation applies from the next delivery with no restart; a secret of that name at an organization or user scope is never read"
+        }
+      ]
+    },
+    {
+      "id": "14-REQ-2",
+      "title": "The delivery log",
+      "rationale": "It is the only way to debug a webhook that is not arriving, and it must not become the place the payload leaks.",
+      "criteria": [
+        {
+          "id": "14-REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "a workspace's deliveries are listed",
+          "system": "Parley service",
+          "action": "return them newest first, with those of the same second ordered by when they were recorded",
+          "contract": "HTTP 200 with an array, empty when there are none; the order is by received time descending, ties broken by the recording order with the latest first"
+        },
+        {
+          "id": "14-REQ-2.2",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "report for each delivery the forge's id, the forge, the event name cut to 64 bytes, the action, the target, the outcome, the events relayed and when it arrived, and nothing of the payload",
+          "contract": "every row carries those eight fields; target is origin, upstream or null; relayed is empty for any outcome but relayed; no row contains any part of the payload"
+        },
+        {
+          "id": "14-REQ-2.3",
+          "pattern": "unwanted",
+          "condition": "the delivery list is called with a time bound that is not RFC 3339, a limit outside 1 to 100, or either parameter given more than once",
+          "system": "Parley service",
+          "action": "refuse the request",
+          "contract": "HTTP 400 naming the parameter; the limit defaults to 30 and whole seconds are kept from the time bound, so a fractional one starts at the next second"
+        },
+        {
+          "id": "14-REQ-2.4",
+          "pattern": "event_driven",
+          "condition": "an hour passes",
+          "system": "Parley service",
+          "action": "remove recorded deliveries older than 7 days and those of workspaces that no longer exist",
+          "contract": "a delivery 7 days and one second old is gone after the sweep and one 6 days old remains; no delivery of an existing workspace younger than 7 days is removed"
+        }
+      ]
+    },
+    {
+      "id": "14-REQ-3",
+      "title": "Proving the sender",
+      "rationale": "This is the one route anyone on the internet can call, so its checks and their order are the whole of its security.",
+      "criteria": [
+        {
+          "id": "14-REQ-3.1",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "check, in order, that the workspace exists and has a non-empty secret, which scheme the headers name, GitLab's token, the body's size, and then GitHub's signature",
+          "contract": "each check is reached only when the earlier ones passed; the body is not read before the workspace, the scheme and GitLab's token have been decided"
+        },
+        {
+          "id": "14-REQ-3.2",
+          "pattern": "unwanted",
+          "condition": "the slug names no workspace, or the workspace has no secret or an empty one",
+          "system": "Parley service",
+          "action": "answer that it was not found, before the body is read",
+          "contract": "HTTP 404 with the same body in both cases, so neither discloses whether the workspace exists; the request body is not read; a failure of the secrets store answers HTTP 500 instead"
+        },
+        {
+          "id": "14-REQ-3.3",
+          "pattern": "unwanted",
+          "condition": "neither forge's signature header is present, or a signature or token is missing, malformed or wrong",
+          "system": "Parley service",
+          "action": "refuse the delivery, recording and emitting nothing",
+          "contract": "HTTP 401 with the same answer whatever is wrong; no delivery row is written and no event is emitted; GitLab's token and GitHub's signature are each compared in constant time"
+        },
+        {
+          "id": "14-REQ-3.4",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "verify GitHub's signature as the HMAC-SHA256 of the raw request body under the workspace's secret",
+          "contract": "a signature over the bytes as sent verifies; one computed over a re-serialised or re-encoded body does not; the comparison is in constant time and the expected form is the sha256 prefix with 64 lowercase hex digits"
+        },
+        {
+          "id": "14-REQ-3.5",
+          "pattern": "unwanted",
+          "condition": "the request body is larger than 1048576 bytes",
+          "system": "Parley service",
+          "action": "refuse the delivery",
+          "contract": "HTTP 413 with error_type body_too_large; a body of exactly 1048576 bytes is accepted"
+        },
+        {
+          "id": "14-REQ-3.6",
+          "pattern": "unwanted",
+          "condition": "the delivery carries no id or no event name, or an id longer than 255 characters or holding a character outside printable ASCII",
+          "system": "Parley service",
+          "action": "refuse the delivery and record nothing",
+          "contract": "HTTP 400; no delivery row is written and no event is emitted; the id is taken from each forge's documented header and the event name from its own"
+        }
+      ]
+    },
+    {
+      "id": "14-REQ-4",
+      "title": "Processing a delivery once",
+      "rationale": "Forges redeliver and retry, so a consumer that sees one event per delivery depends entirely on this.",
+      "criteria": [
+        {
+          "id": "14-REQ-4.1",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "record a delivery per workspace and delivery id before relaying anything",
+          "contract": "the delivery row exists before the first event is emitted; the same id for a different workspace is a different delivery"
+        },
+        {
+          "id": "14-REQ-4.2",
+          "pattern": "unwanted",
+          "condition": "a delivery's id is already recorded for the workspace, or several copies of one delivery arrive at the same time",
+          "system": "Parley service",
+          "action": "process exactly one of them and answer the rest as duplicates",
+          "contract": "HTTP 202 with the outcome duplicate; no event is emitted and no row is added for the duplicate; for simultaneous copies exactly one set of events is relayed"
+        },
+        {
+          "id": "14-REQ-4.3",
+          "pattern": "unwanted",
+          "condition": "recording the delivery fails",
+          "system": "Parley service",
+          "action": "refuse the delivery so the forge will redeliver it",
+          "contract": "HTTP 500; no event is emitted; a later redelivery of the same id is processed in full rather than treated as a duplicate"
+        }
+      ]
+    },
+    {
+      "id": "14-REQ-5",
+      "title": "Answering and relaying",
+      "rationale": "The forge is answered before the relay, so the relay has to survive the forge hanging up, and the events have to be exactly those the reference lists.",
+      "criteria": [
+        {
+          "id": "14-REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "a delivery is accepted and recorded",
+          "system": "Parley service",
+          "action": "answer the forge with the outcome before relaying any event, and relay afterwards",
+          "contract": "HTTP 202 with the outcome; the answer is written before the first event is emitted; the events are still relayed when the forge has disconnected by then"
+        },
+        {
+          "id": "14-REQ-5.2",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "report the outcome as relayed when at least one event was relayed, ignored when the event and action are not ones it relays or the payload has nothing to relay, repository_mismatch when the delivery is about neither of the workspace's repositories, and duplicate for a repeated id",
+          "contract": "each outcome appears in the answer and in the delivery log row; an ignored or mismatched delivery emits no event"
+        },
+        {
+          "id": "14-REQ-5.3",
+          "pattern": "unwanted",
+          "condition": "the body is not one JSON object, or lacks the repository, the number of an issue or pull request, the name of a label, or the ref of a push that the delivery is about",
+          "system": "Parley service",
+          "action": "record the delivery as malformed and refuse it",
+          "contract": "HTTP 400 with the delivery recorded with the outcome malformed; a descriptive field that is missing, such as a title, a URL or a branch name, defaults to empty instead of making the delivery malformed"
+        },
+        {
+          "id": "14-REQ-5.4",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "decide the target by comparing the payload's repository path, ignoring case, with the origin's owner and name and, on a carry_patch workspace with an upstream URL, with the upstream's",
+          "contract": "a match with the origin is target origin, one only with the upstream is target upstream, and a match with neither is the repository_mismatch outcome with target null"
+        },
+        {
+          "id": "14-REQ-5.5",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "relay exactly the hub events the reference's two mapping tables give for the delivery's event and action, in the order those tables give, and relay nothing for any other event or action",
+          "contract": "each mapped delivery emits exactly its listed events with the listed metadata keys; a GitLab update emits its unlabeled events before its labeled ones, each group sorted by name; at most 100 label events are relayed per delivery and at most 100 labels listed per event; a ping, a GitHub pull_request labeled, an edited issue comment, a GitLab confidential hook and a note on a commit or snippet relay nothing"
+        },
+        {
+          "id": "14-REQ-5.6",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "neither store nor log the payload, and never contact the forge because of a delivery",
+          "contract": "no delivery row, log record or event metadata contains a field of the payload beyond those the mapping tables list; no outbound request is made to the forge while processing a delivery"
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "14-PATH-1",
+      "title": "A webhook is set up and its first delivery is relayed",
+      "steps": [
+        {
+          "actor": "operator",
+          "action": "calls the webhook route with no secret and receives a generated one with the ingress URL"
+        },
+        {
+          "actor": "Parley service",
+          "action": "stores the secret as the workspace secret FORGE_WEBHOOK_SECRET"
+        },
+        {
+          "actor": "operator",
+          "action": "enters the URL and the secret in the forge's webhook settings"
+        },
+        {
+          "actor": "forge",
+          "action": "posts a signed delivery about a labelled issue to the ingress"
+        },
+        {
+          "actor": "Parley service",
+          "action": "verifies the signature over the raw body, records the delivery and answers 202 relayed"
+        },
+        {
+          "actor": "Parley service",
+          "action": "relays the labelled event afterwards, which reaches a client on the event stream and the delivery log"
+        }
+      ]
+    },
+    {
+      "id": "14-PATH-2",
+      "title": "A redelivery changes nothing",
+      "steps": [
+        {
+          "actor": "forge",
+          "action": "redelivers a delivery whose id the hub already recorded"
+        },
+        {
+          "actor": "Parley service",
+          "action": "finds the id recorded for that workspace and answers 202 with the outcome duplicate"
+        },
+        {
+          "actor": "Parley service",
+          "action": "emits no event and adds no row"
+        },
+        {
+          "actor": "API client",
+          "action": "reads the delivery log and finds one entry for that id"
+        }
+      ]
+    },
+    {
+      "id": "14-PATH-3",
+      "title": "An unsigned and a wrongly signed delivery are refused",
+      "steps": [
+        {
+          "actor": "forge",
+          "action": "posts a delivery with neither forge's signature header"
+        },
+        {
+          "actor": "Parley service",
+          "action": "answers 401 before reading the body, recording and emitting nothing"
+        },
+        {
+          "actor": "forge",
+          "action": "posts a delivery with a signature computed under the wrong secret"
+        },
+        {
+          "actor": "Parley service",
+          "action": "compares it in constant time, answers 401, and records and emits nothing"
+        },
+        {
+          "actor": "API client",
+          "action": "reads the delivery log and finds no row for either"
+        }
+      ]
+    }
+  ]
+}

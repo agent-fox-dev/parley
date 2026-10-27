@@ -1,0 +1,356 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v2.json",
+  "spec_id": "13",
+  "spec_name": "forge_api",
+  "schema_version": 2,
+  "introduction": "An agent reads and changes its workspace's repository on GitHub or GitLab through Parley, which uses the credential the workspace already holds rather than the caller's. This package covers working out which forge to talk to, the nine read routes, the nine write routes, the body limits and the mapping of every forge failure onto a documented answer.",
+  "glossary": {
+    "body-like field": "One of the four fields measured against the forge's length limit: an issue's body on create and update, a close's comment, a comment's body and a pull request's body.",
+    "credential kind": "What the hub holds for a forge: a token, a username and password whose password is sent as the token, or nothing.",
+    "forge": "The service hosting a workspace's repository, GitHub or GitLab, reached over its own HTTP API.",
+    "scrubbed message": "A message from the forge with the token replaced, URL userinfo removed and the text cut to 1024 bytes before it reaches a response or an event.",
+    "target": "Which of a workspace's two repositories a forge route works on: origin, the workspace's own, or upstream, the one a carry_patch workspace follows."
+  },
+  "requirements": [
+    {
+      "id": "13-REQ-1",
+      "title": "Working out how to reach the forge",
+      "rationale": "Eighteen routes depend on this one decision, and getting it wrong sends a workspace's credential to the wrong host.",
+      "criteria": [
+        {
+          "id": "13-REQ-1.1",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "read the repository's host, owner and name from the remote URL, removing a .git suffix and any userinfo and keeping a GitLab subgroup path as the owner",
+          "contract": "an https URL, an ssh URL and an scp-style address for the same repository all yield the same host, owner and name; a nested GitLab path yields the full namespace as the owner; a URL naming no repository yields none"
+        },
+        {
+          "id": "13-REQ-1.2",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "identify the forge from the host's name or from an API URL setting containing one of the two forge names, and derive the API URL from the setting or the host's documented default",
+          "contract": "a github.com host yields GitHub and the public API URL; another GitHub host and a GitLab host yield their documented default paths; a GitLab setting gains the version suffix when it lacks one"
+        },
+        {
+          "id": "13-REQ-1.3",
+          "pattern": "unwanted",
+          "condition": "neither the host nor an API URL setting tells which forge it is, or the remote URL names no repository",
+          "system": "Parley service",
+          "action": "refuse the request without contacting anything",
+          "contract": "HTTP 422 with error_type forge_unknown; no network request is made"
+        },
+        {
+          "id": "13-REQ-1.4",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "send the workspace's own credential and never the caller's, nor any token in the deployment's environment for a write",
+          "contract": "the forge receives the workspace's credential; a request carrying a different caller credential reaches the forge with the same workspace credential; with no stored credential the request carries no token"
+        },
+        {
+          "id": "13-REQ-1.5",
+          "pattern": "complex_event",
+          "condition": "a forge route is called with the target upstream",
+          "guard": "the workspace is carry_patch with a non-empty upstream URL",
+          "system": "Parley service",
+          "action": "work on the upstream repository with the upstream credential and the upstream API URL setting",
+          "contract": "the upstream API URL setting is used and does not fall back to the origin's; the upstream credential is used, falling back to the origin's only where no upstream secret exists; any other workspace answers HTTP 400 with error_type workspace_mode_mismatch, and a target other than origin or upstream answers HTTP 400"
+        },
+        {
+          "id": "13-REQ-1.6",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "resolve the forge, its API URL and its credential afresh for every call, and give every request the hub's user agent, a refusal of any redirect to another host, port or scheme, and a 30-second deadline covering its retries",
+          "contract": "a secret or setting changed between two calls takes effect on the second; every outbound request carries the user agent; a redirect to another host answers HTTP 502 forge_error; a call exceeding 30 seconds answers HTTP 504 forge_timeout"
+        }
+      ]
+    },
+    {
+      "id": "13-REQ-2",
+      "title": "Describing how the forge is reached",
+      "rationale": "It is the route an operator runs when another forge route says it cannot tell which forge this is, so it must answer without needing the forge.",
+      "criteria": [
+        {
+          "id": "13-REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "the forge description route is requested",
+          "system": "Parley service",
+          "action": "report the forge, the API URL, the repository, the credential's kind and the upstream's equivalent, without contacting the forge",
+          "contract": "HTTP 200 with forge, api_url, repository, credential and upstream; no request reaches the forge; an unclassifiable host is reported as unknown with a null API URL rather than refused; the route answers for an archived workspace"
+        },
+        {
+          "id": "13-REQ-2.2",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "report in the webhook block whether the workspace has the secret, where the forge should post and when the last delivery arrived, and never the secret itself",
+          "contract": "configured reflects the presence of the workspace-scoped secret; url is the ingress address or null when the service has no external URL; no field carries the secret's value"
+        },
+        {
+          "id": "13-REQ-2.3",
+          "pattern": "unwanted",
+          "condition": "an API URL setting is not an absolute https URL with a host and without userinfo, query or fragment, or the secret store or delivery log cannot be read",
+          "system": "Parley service",
+          "action": "refuse the request rather than answering in part",
+          "contract": "HTTP 422 with error_type forge_api_url_invalid, naming the setting and the rule but not the value, for the setting; HTTP 500 for the store, with no partial body"
+        }
+      ]
+    },
+    {
+      "id": "13-REQ-3",
+      "title": "Reading from the forge",
+      "rationale": "These are what an agent uses to understand the work it was given, and a silently dropped parameter changes the answer without saying so.",
+      "criteria": [
+        {
+          "id": "13-REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "one of the nine read routes is called for a workspace the caller may read",
+          "system": "Parley service",
+          "action": "return what the forge holds, in the documented shape",
+          "contract": "HTTP 200 with the repository, an issue array, an issue thread, a comment array, a pull request, its state, its changed files, its check runs or its reviews; every list is a bare array and is empty rather than null; the route answers for an archived workspace"
+        },
+        {
+          "id": "13-REQ-3.2",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "send an issue-list parameter only when the caller gave it, so the forge's own default applies otherwise",
+          "contract": "a parameter the caller omitted appears in no outbound request; the limit is always sent and defaults to 30; a labels value drops empty items and is sent only if any remain"
+        },
+        {
+          "id": "13-REQ-3.3",
+          "pattern": "complex_event",
+          "condition": "an issue thread is read",
+          "guard": "the issue was read but its comments could not be",
+          "system": "Parley service",
+          "action": "answer with the issue and carry the comments' error",
+          "contract": "HTTP 200 with the issue, an empty comment list and the comments' error scrubbed of the token and URL userinfo; a thread with more comments than were read says so"
+        },
+        {
+          "id": "13-REQ-3.4",
+          "pattern": "unwanted",
+          "condition": "a path number is not a positive decimal integer, or a query parameter has a bad, empty or repeated value",
+          "system": "Parley service",
+          "action": "refuse the request without contacting the forge",
+          "contract": "HTTP 400 with a message beginning with the parameter's name, or saying the number must be a positive decimal integer; no request reaches the forge"
+        }
+      ]
+    },
+    {
+      "id": "13-REQ-4",
+      "title": "Writing to the forge",
+      "rationale": "A write changes something a person will see, and two of these routes make several requests whose ordering decides what is left behind when one fails.",
+      "criteria": [
+        {
+          "id": "13-REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "one of the nine write routes is called with a valid body for a workspace the caller may write and which is not archived",
+          "system": "Parley service",
+          "action": "make the change on the forge and answer with the documented result",
+          "contract": "HTTP 201 with the issue, the pull request or the comment URL, HTTP 200 for an issue update, a close and an existing label, and HTTP 204 for the two label routes, as the reference's table gives each"
+        },
+        {
+          "id": "13-REQ-4.2",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "change on an issue update only the fields the body names, replacing the whole label and assignee sets where they are given",
+          "contract": "an absent or null field is left alone; an empty body for the body field clears it; an empty label or assignee array removes every entry; a body naming none of the updatable fields answers HTTP 400 nothing to update, as does one naming only assignees on GitLab"
+        },
+        {
+          "id": "13-REQ-4.3",
+          "pattern": "complex_event",
+          "condition": "the close route is called for an issue",
+          "guard": "the request carries a comment that is not blank",
+          "system": "Parley service",
+          "action": "post the comment first and close the issue only if that succeeded",
+          "contract": "a refused comment leaves the issue open and is answered with the comment's error; a close that fails after the comment leaves the comment in place, is answered with the close's error, and records the comment's URL; closing an already closed issue answers HTTP 200"
+        },
+        {
+          "id": "13-REQ-4.4",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "answer a label removal 204 whether or not the issue had the label, re-reading the issue once when the forge answers not found",
+          "contract": "HTTP 204 for a label the issue had and for one it never had; when the forge answers not found the issue is read once more and the answer is 204 if it exists and HTTP 404 forge_not_found if it does not; the label name is taken from the last path segment decoded exactly once"
+        },
+        {
+          "id": "13-REQ-4.5",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "ensure a label exists without ever changing one that does",
+          "contract": "a label that exists answers HTTP 200 as the forge holds it, with its colour and description untouched; one that does not is created and answers HTTP 201; a create refused while a concurrent call created it is followed by one more read and answers 200 if the label is there"
+        },
+        {
+          "id": "13-REQ-4.6",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "send a pull request's head exactly as given and keep no idempotency key",
+          "contract": "a head of the form owner:branch opens a pull request from a fork; a second create for the same head and base is refused by the forge and answered HTTP 422 forge_rejected; a retried create that already succeeded can create a second pull request"
+        }
+      ]
+    },
+    {
+      "id": "13-REQ-5",
+      "title": "Body limits",
+      "rationale": "A body the forge will refuse is cheaper to refuse here, and measuring the wrong fields would reject titles and label names the forge accepts.",
+      "criteria": [
+        {
+          "id": "13-REQ-5.1",
+          "pattern": "unwanted",
+          "condition": "a body-like field is longer than the forge's limit, measured in Unicode code points",
+          "system": "Parley service",
+          "action": "refuse the request and send nothing to the forge",
+          "contract": "HTTP 413 with error_type body_too_large and a message giving the field's length and the forge's limit; the limit is 65536 code points on GitHub and 1000000 on GitLab; no request reaches the forge and no event is recorded"
+        },
+        {
+          "id": "13-REQ-5.2",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "measure only the four body-like fields, leaving titles, heads, bases, label names and descriptions and assignee names to the forge",
+          "contract": "an over-long title is sent and the forge's refusal is answered like any other; a body of exactly the limit is sent; a multi-byte character counts as one code point"
+        }
+      ]
+    },
+    {
+      "id": "13-REQ-6",
+      "title": "Failing",
+      "rationale": "A forge failure is not the caller's failure, so the status has to say whose credential or which service was at fault without disclosing either.",
+      "criteria": [
+        {
+          "id": "13-REQ-6.1",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "map every forge failure onto one row of the reference's failure table",
+          "contract": "the forge's 404 answers HTTP 404 forge_not_found, its 401 HTTP 502 forge_unauthenticated, a non-rate-limit 403 HTTP 502 forge_forbidden, another 4xx HTTP 422 forge_rejected, a 5xx or unreadable answer HTTP 502 forge_error, a failed connection HTTP 502 forge_unreachable and the deadline HTTP 504 forge_timeout"
+        },
+        {
+          "id": "13-REQ-6.2",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "carry the forge's own message through scrubbed and truncated, adding the stored-token hint when a username and password were refused",
+          "contract": "the message reads as the forge answering with its status, with the token replaced, URL userinfo removed and the text cut to 1024 bytes; a 401 for a basic credential adds the hint to store a token; a write prevented by a missing credential answers HTTP 502 forge_error with nothing sent and no event recorded"
+        },
+        {
+          "id": "13-REQ-6.3",
+          "pattern": "event_driven",
+          "condition": "the forge answers with a rate limit",
+          "system": "Parley service",
+          "action": "wait out a backoff of up to 120 seconds and try once more, and otherwise refuse",
+          "contract": "a wait the 30-second deadline allows is taken and the retry's result is answered; a rate limit it cannot wait out answers HTTP 429 forge_rate_limited with Retry-After in whole seconds rounded up where the wait is known; a wait cut short by the deadline answers HTTP 504 forge_timeout"
+        },
+        {
+          "id": "13-REQ-6.4",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "keep the credential and every URL's userinfo out of every response and every recorded event",
+          "contract": "for each failure of each route, no response body and no event metadata contains the workspace's credential or the userinfo of any URL"
+        }
+      ]
+    },
+    {
+      "id": "13-REQ-7",
+      "title": "The order of checks",
+      "rationale": "The reads and the writes check in different orders, and the wrong order answers correctly for the wrong reason or leaks that a workspace exists.",
+      "criteria": [
+        {
+          "id": "13-REQ-7.1",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "check a read route in order: the credential, then a personal access token's forge scope before the workspace is looked up, then the workspace, then the target, then the path and query parameters, then the forge and its client",
+          "contract": "a PAT without the scope answers HTTP 403 naming forge:read even for a slug that names nothing; a bad target is answered before a bad path parameter; an unidentifiable forge is answered last"
+        },
+        {
+          "id": "13-REQ-7.2",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "check a write route in order: the credential, then a personal access token's forge:write scope before the workspace, then the workspace with a member refused, then that the workspace is not archived, then the request, then the forge and its client, then the body limit",
+          "contract": "a PAT holding only forge:read answers HTTP 403 naming forge:write before the workspace is looked up; a member answers HTTP 403 forbidden; an archived workspace answers HTTP 400 before the body is validated; an oversized body on a workspace whose forge cannot be identified answers HTTP 422 forge_unknown rather than 413"
+        },
+        {
+          "id": "13-REQ-7.3",
+          "pattern": "unwanted",
+          "condition": "a forge request is refused at any of those steps",
+          "system": "Parley service",
+          "action": "send nothing to the forge and record no event",
+          "contract": "for every refusal of every route, the forge receives no request and no hub event is recorded"
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "13-PATH-1",
+      "title": "An agent triages an issue on the forge",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "lists the workspace's open issues filtered by a label"
+        },
+        {
+          "actor": "Parley service",
+          "action": "works out the forge and the API URL, resolves the workspace's credential and sends only the parameters the agent gave"
+        },
+        {
+          "actor": "forge",
+          "action": "answers with the matching issues"
+        },
+        {
+          "actor": "agent",
+          "action": "reads one issue with its comments and then adds a label to it"
+        },
+        {
+          "actor": "Parley service",
+          "action": "performs the label write with the workspace's credential and records one forge write event"
+        }
+      ]
+    },
+    {
+      "id": "13-PATH-2",
+      "title": "An agent opens a pull request against the upstream",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "opens a pull request on a carry_patch workspace with the target set to upstream"
+        },
+        {
+          "actor": "Parley service",
+          "action": "resolves the upstream repository, the upstream API URL setting and the upstream credential"
+        },
+        {
+          "actor": "forge",
+          "action": "creates the pull request and answers with it"
+        },
+        {
+          "actor": "Parley service",
+          "action": "answers 201 with the pull request and records one forge write event"
+        },
+        {
+          "actor": "agent",
+          "action": "reads the pull request's state through the same target and sees it open"
+        }
+      ]
+    },
+    {
+      "id": "13-PATH-3",
+      "title": "The forge rejects the workspace's credential and the caller is told why",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "creates an issue on a workspace whose stored credential the forge no longer accepts"
+        },
+        {
+          "actor": "Parley service",
+          "action": "sends the request with the workspace's credential"
+        },
+        {
+          "actor": "forge",
+          "action": "answers 401"
+        },
+        {
+          "actor": "Parley service",
+          "action": "answers 502 forge_unauthenticated with the forge's message scrubbed and the hint to store a token, and records the event with that error type"
+        },
+        {
+          "actor": "agent",
+          "action": "reads the answer and finds no credential and no userinfo in it"
+        }
+      ]
+    }
+  ]
+}

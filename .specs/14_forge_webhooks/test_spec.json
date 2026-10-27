@@ -1,0 +1,460 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/test_spec.v2.json",
+  "spec_id": "14",
+  "spec_name": "forge_webhooks",
+  "schema_version": 2,
+  "tests": [
+    {
+      "id": "TS-14-1",
+      "kind": "integration",
+      "verifies": [
+        "14-REQ-1.1",
+        "14-REQ-1.2"
+      ],
+      "title": "The webhook secret is generated once or supplied",
+      "given": [
+        "an active workspace with no webhook secret",
+        "a service with an external URL and one without"
+      ],
+      "when": "the webhook route is called with no body, with an empty object, with a null secret, and with a supplied 32-character secret, and the workspace's secrets and the description route are then read",
+      "then": [
+        "the three generating calls answer 200 with configured true and a 64-character lowercase hex secret",
+        "the supplied-secret call answers 200 with no secret field and stores the value supplied",
+        "the URL is the ingress address, or null where the service has no external URL",
+        "the generated secret appears in no later response, log record, event or delivery row"
+      ],
+      "pseudocode": "in the webhook routes' integration test file: r = put(webhook); assert len(r.json.secret) == 64; assert 'secret' not in get(forge).json.webhook"
+    },
+    {
+      "id": "TS-14-2",
+      "kind": "unit",
+      "verifies": [
+        "14-REQ-1.3"
+      ],
+      "title": "A malformed or disallowed secret is refused",
+      "given": [
+        "an active workspace, an archived one, and a workspace holding 100 secrets"
+      ],
+      "when": "the webhook route is called with a non-object body, a non-string secret, secrets of 15 and 256 characters, a secret containing a space and one containing a control character, against the full workspace, and against the archived workspace",
+      "then": [
+        "each answers 400",
+        "each message names the rule broken and does not contain the value",
+        "the workspace's stored secret is unchanged in every case"
+      ],
+      "pseudocode": "in the webhook routes' test file, table over the refused bodies asserting 400, the message and the stored secret"
+    },
+    {
+      "id": "TS-14-3",
+      "kind": "integration",
+      "verifies": [
+        "14-REQ-1.4"
+      ],
+      "title": "Removing the secret closes the ingress and keeps the log",
+      "given": [
+        "a workspace with a secret and two recorded deliveries, and an archived workspace with a secret"
+      ],
+      "when": "the webhook route's removal is called for each, then called again, and a delivery is posted afterwards",
+      "then": [
+        "each removal answers 204, including the repeat and the archived workspace",
+        "the recorded deliveries are still listed",
+        "a delivery posted afterwards answers 404"
+      ],
+      "pseudocode": "in the webhook routes' integration test file: delete(webhook); assert delete(webhook).status == 204 and len(get(deliveries).json) == 2 and post(ingress).status == 404"
+    },
+    {
+      "id": "TS-14-4",
+      "kind": "integration",
+      "verifies": [
+        "14-REQ-1.5"
+      ],
+      "title": "The secret is an ordinary workspace secret and is read afresh",
+      "given": [
+        "a workspace, and the same secret name at the owner's user scope and the organization scope"
+      ],
+      "when": "the secret is set through the secrets routes, a delivery is signed with it, it is rotated through the secrets routes, and a delivery is signed with the old and then the new value",
+      "then": [
+        "the secret set through the secrets routes is accepted by the ingress",
+        "after the rotation the old value is refused and the new one accepted, with no restart",
+        "the user-scoped and organization-scoped secrets of the same name are never used"
+      ],
+      "pseudocode": "in the webhook ingress integration test file: set_secret_via_secrets_route(v1); assert post(ingress, sign(v1)).status == 202; rotate(v2); assert post(ingress, sign(v1)).status == 401"
+    },
+    {
+      "id": "TS-14-5",
+      "kind": "integration",
+      "verifies": [
+        "14-REQ-2.1",
+        "14-REQ-2.2"
+      ],
+      "title": "The delivery log lists what arrived, newest first, without the payload",
+      "given": [
+        "a workspace with deliveries of each outcome, two recorded within one second, and a distinctive string in one payload"
+      ],
+      "when": "the delivery log is read",
+      "then": [
+        "the rows are newest first with the same-second pair ordered by recording time, latest first",
+        "every row carries the delivery id, forge, event, action, target, outcome, relayed events and received time",
+        "relayed is empty for every outcome but relayed",
+        "no row contains the distinctive payload string"
+      ],
+      "pseudocode": "in the delivery log integration test file: r = get(deliveries); assert [x.received_at for x in r.json] == sorted(..., reverse=True) and SENTINEL not in r.text"
+    },
+    {
+      "id": "TS-14-6",
+      "kind": "unit",
+      "verifies": [
+        "14-REQ-2.3"
+      ],
+      "title": "Bad delivery-log parameters are refused and the defaults applied",
+      "given": [
+        "a workspace with 40 deliveries"
+      ],
+      "when": "the log is read with no parameters, with a limit of 0, 101 and abc, with a malformed time bound, with a fractional time bound, and with each parameter given twice",
+      "then": [
+        "the default limit is 30",
+        "the bad limits and the malformed time answer 400 naming the parameter",
+        "a repeated parameter answers 400 saying it must be given once",
+        "a fractional time bound starts at the next whole second"
+      ],
+      "pseudocode": "in the delivery log test file, table over the parameter cases asserting the status and the returned count"
+    },
+    {
+      "id": "TS-14-7",
+      "kind": "integration",
+      "verifies": [
+        "14-REQ-2.4"
+      ],
+      "title": "Deliveries are pruned after seven days and with their workspace",
+      "given": [
+        "deliveries aged 6 days, exactly 7 days and one second, and 30 days, and deliveries of a workspace that has since been deleted",
+        "a controllable clock"
+      ],
+      "when": "the hourly prune runs",
+      "then": [
+        "the 7-day-and-one-second and 30-day deliveries are gone",
+        "the 6-day delivery remains",
+        "the deleted workspace's deliveries are gone whatever their age"
+      ],
+      "pseudocode": "in the delivery log integration test file: run_prune(); assert ages_remaining() == [6] and deliveries_of(deletedWs) == []"
+    },
+    {
+      "id": "TS-14-8",
+      "kind": "unit",
+      "verifies": [
+        "14-REQ-3.1"
+      ],
+      "title": "The ingress checks in order and reads the body last",
+      "given": [
+        "a recording body reader, and combinations where two checks would both fail: an unknown slug with no signature header, a workspace without a secret with an oversized body, and a wrong GitLab token with an oversized body"
+      ],
+      "when": "each combination is posted",
+      "then": [
+        "each answers the refusal belonging to the earlier check",
+        "the body is not read for the unknown slug, the secretless workspace or the wrong GitLab token",
+        "the signature is verified only after the body has been read"
+      ],
+      "pseudocode": "in the webhook ingress test file, table over the combinations asserting the status and bodyReader.calls == 0"
+    },
+    {
+      "id": "TS-14-9",
+      "kind": "unit",
+      "verifies": [
+        "14-REQ-3.2"
+      ],
+      "title": "An unknown workspace and one without a secret are indistinguishable",
+      "given": [
+        "a slug naming nothing, a workspace with no secret, a workspace with an empty secret, an archived workspace with a secret, and a secrets store made to raise"
+      ],
+      "when": "a delivery is posted to each",
+      "then": [
+        "the first three answer 404 with the same body",
+        "the archived workspace with a secret is processed normally",
+        "the failing store answers 500",
+        "no body is read for the 404s"
+      ],
+      "pseudocode": "in the webhook ingress test file: assert resp(unknown) == resp(noSecret) == resp(emptySecret) and status == 404"
+    },
+    {
+      "id": "TS-14-10",
+      "kind": "unit",
+      "verifies": [
+        "14-REQ-3.3"
+      ],
+      "title": "A missing, malformed or wrong signature is refused identically",
+      "given": [
+        "a workspace with a known secret"
+      ],
+      "when": "deliveries are posted with neither signature header, with a GitHub signature that is empty, malformed, of the wrong length and computed under another secret, with a GitLab token that is empty and wrong, and with a header given twice",
+      "then": [
+        "each answers 401 with the same body",
+        "no delivery row is written and no event is emitted for any of them",
+        "the comparisons do not short-circuit on the first differing byte"
+      ],
+      "pseudocode": "in the webhook ingress test file, table over the cases asserting 401, an unchanged log and no events"
+    },
+    {
+      "id": "TS-14-11",
+      "kind": "integration",
+      "verifies": [
+        "14-REQ-3.4"
+      ],
+      "title": "GitHub's signature is verified over the raw bytes",
+      "given": [
+        "a workspace with a known secret and a payload whose re-serialisation differs from the bytes sent, by key order and by whitespace"
+      ],
+      "when": "a delivery is posted signed over the bytes as sent, and another signed over the re-serialised form",
+      "then": [
+        "the signature over the bytes as sent is accepted",
+        "the signature over the re-serialised form is refused 401",
+        "the expected form is the sha256 prefix with 64 lowercase hex digits"
+      ],
+      "pseudocode": "in the webhook ingress integration test file: assert post(raw, sign(raw)).status == 202 and post(raw, sign(reserialised)).status == 401"
+    },
+    {
+      "id": "TS-14-12",
+      "kind": "unit",
+      "verifies": [
+        "14-REQ-3.5",
+        "14-REQ-3.6"
+      ],
+      "title": "An oversized body and a bad delivery identity are refused",
+      "given": [
+        "a workspace with a secret"
+      ],
+      "when": "deliveries are posted of exactly 1048576 and of 1048577 bytes, and with no delivery id, no event name, an id of 256 characters and an id containing a control character",
+      "then": [
+        "the body at the limit is accepted and the one over it answers 413 body_too_large",
+        "each bad identity answers 400",
+        "no delivery row is written and no event emitted for any refusal"
+      ],
+      "pseudocode": "in the webhook ingress test file, two tables asserting the statuses and an unchanged log"
+    },
+    {
+      "id": "TS-14-13",
+      "kind": "integration",
+      "verifies": [
+        "14-REQ-4.1",
+        "14-REQ-4.2"
+      ],
+      "title": "A delivery is recorded before relaying and processed exactly once",
+      "given": [
+        "a workspace with a secret and a delivery that maps to two events"
+      ],
+      "when": "the delivery is posted, then posted again with the same id, then five copies are posted at the same time, and the same id is posted for a second workspace",
+      "then": [
+        "the row exists before the first event is emitted",
+        "the repeat answers 202 duplicate, emitting nothing and adding no row",
+        "exactly one set of events is relayed for the five simultaneous copies",
+        "the same id for the other workspace is processed as its own delivery"
+      ],
+      "pseudocode": "in the webhook ingress integration test file: post(d); assert post(d).json.outcome == 'duplicate'; post_concurrently(d, 5); assert events_for(d) == 2"
+    },
+    {
+      "id": "TS-14-14",
+      "kind": "unit",
+      "verifies": [
+        "14-REQ-4.3"
+      ],
+      "title": "A failure to record refuses the delivery so it is redelivered",
+      "given": [
+        "a delivery store made to raise on the insert"
+      ],
+      "when": "a valid signed delivery is posted, the store is repaired, and the same delivery is posted again",
+      "then": [
+        "the first answers 500 and emits no event",
+        "the second is processed in full rather than treated as a duplicate",
+        "its events are relayed"
+      ],
+      "pseudocode": "in the webhook ingress test file: with store raising assert post(d).status == 500 and events == 0; repair(); assert post(d).json.outcome == 'relayed'"
+    },
+    {
+      "id": "TS-14-15",
+      "kind": "integration",
+      "verifies": [
+        "14-REQ-5.1"
+      ],
+      "title": "The forge is answered before the events are relayed",
+      "given": [
+        "an event recorder made to block, and a forge client that disconnects as soon as it is answered"
+      ],
+      "when": "a valid delivery is posted",
+      "then": [
+        "the 202 is written before the first event is emitted",
+        "the forge's connection is not held open by the recorder",
+        "the events are still relayed after the forge has disconnected"
+      ],
+      "pseudocode": "in the webhook ingress integration test file: r = post(d); assert r.received_at < firstEvent.emitted_at; disconnect(); assert eventually(events_for(d) == expected)"
+    },
+    {
+      "id": "TS-14-16",
+      "kind": "integration",
+      "verifies": [
+        "14-REQ-5.2"
+      ],
+      "title": "Each outcome is reported in the answer and the log",
+      "given": [
+        "deliveries that map to events, that map to none, that are about another repository, and one already recorded"
+      ],
+      "when": "each is posted",
+      "then": [
+        "the outcomes are relayed, ignored, repository_mismatch and duplicate respectively",
+        "each outcome appears in the answer and in the delivery log row",
+        "the ignored and mismatched deliveries emit no event"
+      ],
+      "pseudocode": "in the webhook ingress integration test file, table over the four deliveries asserting the outcome and the emitted events"
+    },
+    {
+      "id": "TS-14-17",
+      "kind": "integration",
+      "verifies": [
+        "14-REQ-5.3"
+      ],
+      "title": "A payload missing what the delivery is about is recorded as malformed",
+      "given": [
+        "bodies that are not one JSON object, and bodies missing the repository, the issue number, the label name and the push ref",
+        "a body missing only a title, a URL and a branch name"
+      ],
+      "when": "each is posted with a valid signature",
+      "then": [
+        "each of the first set answers 400 and is recorded with the outcome malformed",
+        "the body missing only descriptive fields is processed, with those fields defaulting to empty",
+        "no event is emitted for a malformed delivery"
+      ],
+      "pseudocode": "in the webhook ingress integration test file, table over the bodies asserting the status, the recorded outcome and the emitted events"
+    },
+    {
+      "id": "TS-14-18",
+      "kind": "integration",
+      "verifies": [
+        "14-REQ-5.4"
+      ],
+      "title": "The target is decided by comparing the repository path",
+      "given": [
+        "a carry_patch workspace with an origin and an upstream, and a standard workspace"
+      ],
+      "when": "deliveries are posted naming the origin's path, the upstream's path, each in a different case, and an unrelated path",
+      "then": [
+        "a match with the origin is target origin",
+        "a match only with the upstream is target upstream",
+        "the comparison ignores case",
+        "an unrelated path is the repository_mismatch outcome with a null target",
+        "a standard workspace never reports target upstream"
+      ],
+      "pseudocode": "in the webhook ingress integration test file, table over (payloadPath, workspaceKind, expectedTarget, expectedOutcome)"
+    },
+    {
+      "id": "TS-14-19",
+      "kind": "integration",
+      "verifies": [
+        "14-REQ-5.5"
+      ],
+      "title": "The mapping tables are reproduced exactly",
+      "given": [
+        "one delivery for every row of the GitHub and GitLab mapping tables, plus a ping, a GitHub pull_request labeled, an edited issue comment, a GitLab confidential hook and a note on a commit",
+        "a GitLab update removing three labels and adding two, and one changing 150 labels"
+      ],
+      "when": "each is posted",
+      "then": [
+        "each mapped delivery emits exactly the listed events with the listed metadata keys",
+        "a GitLab update emits its unlabeled events before its labeled ones, each group sorted by name",
+        "the 150-label update relays at most 100 label events and lists at most 100 labels in an event",
+        "each unmapped delivery relays nothing and reports the outcome ignored"
+      ],
+      "pseudocode": "in the webhook mapping integration test file, driven from a table transcribed from the reference: post(d); assert [e.event_type for e in emitted()] == expected"
+    },
+    {
+      "id": "TS-14-20",
+      "kind": "unit",
+      "verifies": [
+        "14-REQ-5.6"
+      ],
+      "title": "The payload is never kept and the forge is never called",
+      "given": [
+        "a payload carrying a distinctive string in a field no mapping table lists",
+        "a recording log sink and a recording outbound client"
+      ],
+      "when": "deliveries of every outcome are posted",
+      "then": [
+        "no delivery row, log record or event metadata contains the distinctive string",
+        "no outbound request is made to the forge while processing any of them"
+      ],
+      "pseudocode": "in the webhook ingress test file: post(d); assert SENTINEL not in (log.text + json(deliveries) + json(events)) and outbound.requests == 0"
+    },
+    {
+      "id": "TS-14-21",
+      "kind": "smoke",
+      "verifies": [
+        "14-PATH-1"
+      ],
+      "title": "A webhook is set up and its first delivery is relayed, against a running deployment",
+      "given": [
+        "a running deployment, a workspace, and a client watching the event stream"
+      ],
+      "when": "afc forge webhook set is run, a signed delivery about a labelled issue is posted to the printed URL, and the stream, the audit query and afc forge deliveries are read",
+      "then": [
+        "the set prints a generated secret and the URL once",
+        "the delivery answers 202 with the outcome relayed",
+        "the labelled event reaches the stream and the audit query",
+        "the delivery log shows one row naming the relayed event"
+      ],
+      "pseudocode": "in the webhook smoke test file: r = run('afc forge webhook set'); post(url, sign(secret, payload)); assert stream.next_event().event_type == 'hub.forge.issue.labeled'",
+      "real_components": [
+        "running deployment",
+        "webhook routes",
+        "webhook ingress",
+        "secret store",
+        "event recorder",
+        "event stream",
+        "afc"
+      ]
+    },
+    {
+      "id": "TS-14-22",
+      "kind": "smoke",
+      "verifies": [
+        "14-PATH-2"
+      ],
+      "title": "A redelivery changes nothing against a running deployment",
+      "given": [
+        "a running deployment and a delivery already processed"
+      ],
+      "when": "the same delivery id is posted again and the delivery log and the audit query are read",
+      "then": [
+        "the repeat answers 202 with the outcome duplicate",
+        "no new event appears in the audit query",
+        "the delivery log still shows one row for that id"
+      ],
+      "pseudocode": "in the webhook smoke test file: assert post(ingress, same).json.outcome == 'duplicate' and count_rows(id) == 1",
+      "real_components": [
+        "running deployment",
+        "webhook ingress",
+        "delivery log",
+        "event recorder"
+      ]
+    },
+    {
+      "id": "TS-14-23",
+      "kind": "smoke",
+      "verifies": [
+        "14-PATH-3"
+      ],
+      "title": "Unsigned and wrongly signed deliveries are refused against a running deployment",
+      "given": [
+        "a running deployment and a workspace with a webhook secret"
+      ],
+      "when": "a delivery is posted with no signature header and another with a signature computed under the wrong secret",
+      "then": [
+        "each answers 401",
+        "the delivery log shows no row for either",
+        "the audit query shows no event for either"
+      ],
+      "pseudocode": "in the webhook smoke test file: assert post(ingress, unsigned).status == 401 and post(ingress, badsig).status == 401 and get(deliveries).json == []",
+      "real_components": [
+        "running deployment",
+        "webhook ingress",
+        "secret store",
+        "delivery log"
+      ]
+    }
+  ]
+}

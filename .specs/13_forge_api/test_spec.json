@@ -1,0 +1,579 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/test_spec.v2.json",
+  "spec_id": "13",
+  "spec_name": "forge_api",
+  "schema_version": 2,
+  "tests": [
+    {
+      "id": "TS-13-1",
+      "kind": "unit",
+      "verifies": [
+        "13-REQ-1.1"
+      ],
+      "title": "The repository is read from every remote URL shape",
+      "given": [
+        "https, ssh and scp-style URLs for one repository, with and without a .git suffix and with and without userinfo",
+        "a nested GitLab group path and a URL naming no repository"
+      ],
+      "when": "the repository is read from each",
+      "then": [
+        "the three shapes for one repository yield the same host, owner and name",
+        "the .git suffix and the userinfo are removed",
+        "the nested path yields the full namespace as the owner",
+        "the URL naming no repository yields none"
+      ],
+      "pseudocode": "in the forge target test file, table over (url, expectedHostOwnerName)"
+    },
+    {
+      "id": "TS-13-2",
+      "kind": "unit",
+      "verifies": [
+        "13-REQ-1.2"
+      ],
+      "title": "The forge and its API URL are derived from the host or the setting",
+      "given": [
+        "hosts github.com, a self-hosted GitHub host and a GitLab host",
+        "API URL settings naming each forge, one with and one without the version suffix, and one with surrounding whitespace and a trailing slash"
+      ],
+      "when": "the forge and API URL are derived for each",
+      "then": [
+        "github.com yields GitHub and the public API URL",
+        "the other hosts yield their documented default paths",
+        "a setting naming a forge overrides the host",
+        "a GitLab setting gains the version suffix when it lacks one, and whitespace and trailing slashes are ignored"
+      ],
+      "pseudocode": "in the forge target test file, table over (host, setting, expectedForge, expectedApiUrl)"
+    },
+    {
+      "id": "TS-13-3",
+      "kind": "unit",
+      "verifies": [
+        "13-REQ-1.3"
+      ],
+      "title": "An unidentifiable forge is refused without a request",
+      "given": [
+        "a workspace whose host names neither forge and which has no API URL setting, and one whose remote URL names no repository"
+      ],
+      "when": "a read route and a write route are called for each",
+      "then": [
+        "each answers 422 with error_type forge_unknown",
+        "no network request is made in any case"
+      ],
+      "pseudocode": "in the forge target test file: assert get(issues).json.error.error_type == 'forge_unknown' and outbound.requests == 0"
+    },
+    {
+      "id": "TS-13-4",
+      "kind": "integration",
+      "verifies": [
+        "13-REQ-1.4"
+      ],
+      "title": "The workspace's credential is sent, never the caller's",
+      "given": [
+        "a workspace holding a distinctive token, a caller holding a different one, and an environment token for the forge"
+      ],
+      "when": "a read and a write are made, and once with the workspace holding no credential",
+      "then": [
+        "the forge receives the workspace's token in every case",
+        "it never receives the caller's token",
+        "a write never carries the environment's token",
+        "with no stored credential the request carries no token"
+      ],
+      "pseudocode": "in the forge client integration test file: call(read, caller=tokenB); assert forge.lastAuth == workspaceToken"
+    },
+    {
+      "id": "TS-13-5",
+      "kind": "integration",
+      "verifies": [
+        "13-REQ-1.5"
+      ],
+      "title": "The upstream target uses the upstream URL, credential and setting",
+      "given": [
+        "a carry_patch workspace with an upstream URL, an upstream credential and an upstream API URL setting",
+        "a standard workspace and a carry_patch workspace with an empty upstream URL"
+      ],
+      "when": "a read and a write are called with the target upstream against each, and once with a target of ORIGIN and once with an empty target",
+      "then": [
+        "the carry_patch workspace's calls reach the upstream repository with the upstream credential and the upstream API URL",
+        "the upstream API URL setting does not fall back to the origin's when it is empty",
+        "the standard and empty-upstream workspaces answer 400 workspace_mode_mismatch",
+        "ORIGIN and the empty target answer 400"
+      ],
+      "pseudocode": "in the forge client integration test file, table over (workspaceKind, target, expected)"
+    },
+    {
+      "id": "TS-13-6",
+      "kind": "integration",
+      "verifies": [
+        "13-REQ-1.6"
+      ],
+      "title": "Nothing is cached and every request carries the hub's rules",
+      "given": [
+        "a workspace whose credential and API URL setting are changed between two calls",
+        "a forge that redirects to another host and one that never answers"
+      ],
+      "when": "two calls are made across the change, and calls are made against the redirecting and the silent forges",
+      "then": [
+        "the second call uses the new credential and the new setting",
+        "every outbound request carries the hub's user agent",
+        "the cross-host redirect answers 502 forge_error",
+        "the call exceeding 30 seconds answers 504 forge_timeout"
+      ],
+      "pseudocode": "in the forge client integration test file: call(); rotate(); call(); assert forge.lastAuth == newToken; assert call(redirecting).json.error.error_type == 'forge_error'"
+    },
+    {
+      "id": "TS-13-7",
+      "kind": "integration",
+      "verifies": [
+        "13-REQ-2.1",
+        "13-REQ-2.2"
+      ],
+      "title": "The forge description answers without contacting the forge",
+      "given": [
+        "an active workspace, an archived one, one with an unclassifiable host, a carry_patch workspace with an upstream, and a recording forge"
+      ],
+      "when": "the description route is requested for each",
+      "then": [
+        "each answers 200 with forge, api_url, repository, credential and upstream",
+        "no request reaches the forge",
+        "the unclassifiable host is reported as unknown with a null API URL rather than refused",
+        "the archived workspace is answered",
+        "the webhook block reports whether the secret exists, the ingress URL or null, and the last delivery time, and carries no secret"
+      ],
+      "pseudocode": "in the forge status integration test file: r = get(forge); assert forge.requests == 0 and 'secret' not in r.json.webhook"
+    },
+    {
+      "id": "TS-13-8",
+      "kind": "unit",
+      "verifies": [
+        "13-REQ-2.3"
+      ],
+      "title": "An invalid API URL setting and a failed store are refused",
+      "given": [
+        "settings that are relative, http, carry userinfo, carry a query and carry a fragment",
+        "a secrets store and a delivery log made to raise"
+      ],
+      "when": "the description route is requested for each",
+      "then": [
+        "each invalid setting answers 422 with error_type forge_api_url_invalid",
+        "each message names the setting and the rule and not the value",
+        "each failing store answers 500 with no partial body"
+      ],
+      "pseudocode": "in the forge status test file, table over the invalid settings asserting 422 and that the value is absent from the message"
+    },
+    {
+      "id": "TS-13-9",
+      "kind": "integration",
+      "verifies": [
+        "13-REQ-3.1"
+      ],
+      "title": "The nine read routes return the documented shapes",
+      "given": [
+        "a stub GitHub and a stub GitLab holding a repository, issues, comments, a pull request, its files, checks and reviews",
+        "an archived workspace"
+      ],
+      "when": "each read route is called against each forge, and once against the archived workspace",
+      "then": [
+        "each answers 200 with the documented type",
+        "every list is a bare array and is empty rather than null when there is nothing",
+        "the archived workspace is served"
+      ],
+      "pseudocode": "in the forge reads integration test file, table over (route, forgeKind) asserting the response shape"
+    },
+    {
+      "id": "TS-13-10",
+      "kind": "unit",
+      "verifies": [
+        "13-REQ-3.2"
+      ],
+      "title": "Only the issue-list parameters the caller gave are sent",
+      "given": [
+        "a recording forge"
+      ],
+      "when": "the issue list is called with no parameters, with each parameter alone, with a labels value containing empty items, and with every parameter together",
+      "then": [
+        "a parameter the caller omitted appears in no outbound request",
+        "the limit is always sent and defaults to 30",
+        "the labels value drops empty items and is sent only if any remain"
+      ],
+      "pseudocode": "in the forge reads test file, table over (givenParams, expectedOutboundParams)"
+    },
+    {
+      "id": "TS-13-11",
+      "kind": "integration",
+      "verifies": [
+        "13-REQ-3.3"
+      ],
+      "title": "An issue thread reports truncation and a comments failure",
+      "given": [
+        "an issue with more comments than are read in one request, and a forge that answers the issue and then fails the comments"
+      ],
+      "when": "the issue thread is read in each case",
+      "then": [
+        "the truncated thread says so",
+        "the failing-comments case answers 200 with the issue, an empty comment list and the comments' error",
+        "that error carries no token and no URL userinfo"
+      ],
+      "pseudocode": "in the forge reads integration test file: r = get(issue_thread); assert r.status == 200 and r.json.comments_err and TOKEN not in r.text"
+    },
+    {
+      "id": "TS-13-12",
+      "kind": "unit",
+      "verifies": [
+        "13-REQ-3.4"
+      ],
+      "title": "Bad path numbers and query values are refused before the forge",
+      "given": [
+        "a recording forge"
+      ],
+      "when": "read routes are called with a path number of 0, -1, abc and 1.5, and the issue list with a bad state, a limit of 0 and of 101, an empty state and a repeated state",
+      "then": [
+        "each answers 400 with a message beginning with the parameter's name or saying the number must be a positive decimal integer",
+        "no request reaches the forge"
+      ],
+      "pseudocode": "in the forge reads test file, table over the bad values asserting 400 and forge.requests == 0"
+    },
+    {
+      "id": "TS-13-13",
+      "kind": "integration",
+      "verifies": [
+        "13-REQ-4.1"
+      ],
+      "title": "The nine write routes make their change and answer as documented",
+      "given": [
+        "a stub GitHub and a stub GitLab, and an active workspace the caller may write"
+      ],
+      "when": "each write route is called with a valid body against each forge",
+      "then": [
+        "each answers the status its entry gives: 201 for a created issue, pull request or comment, 200 for an update, a close and an existing label, and 204 for the two label routes",
+        "each change is visible on the stub forge afterwards",
+        "one forge write event is recorded for each"
+      ],
+      "pseudocode": "in the forge writes integration test file, table over (route, forgeKind) asserting the status and the forge's state"
+    },
+    {
+      "id": "TS-13-14",
+      "kind": "unit",
+      "verifies": [
+        "13-REQ-4.2"
+      ],
+      "title": "An issue update changes only what it names and refuses an empty change",
+      "given": [
+        "an issue with a title, a body, labels and assignees"
+      ],
+      "when": "updates set the title alone, the body to empty, the labels to a new set, the assignees to an empty array, a field to null, no updatable field at all, and on GitLab only the assignees",
+      "then": [
+        "each named field changes and the others do not",
+        "an empty body clears the body and an empty array removes every label or assignee",
+        "a null field is left alone",
+        "the empty update and the GitLab assignees-only update answer 400 nothing to update"
+      ],
+      "pseudocode": "in the forge writes test file, table over the update bodies asserting the forge's resulting issue"
+    },
+    {
+      "id": "TS-13-15",
+      "kind": "integration",
+      "verifies": [
+        "13-REQ-4.3"
+      ],
+      "title": "A close with a comment posts the comment first",
+      "given": [
+        "a forge that accepts both, one that refuses the comment, one that accepts the comment and refuses the close, and an already closed issue"
+      ],
+      "when": "the close route is called with a non-blank comment against each, and once with no comment and once with a blank one",
+      "then": [
+        "the accepting case posts the comment and then closes",
+        "the refused comment leaves the issue open and is answered with the comment's error",
+        "the failed close leaves the comment in place, is answered with the close's error and records the comment's URL",
+        "no body and a blank comment close without commenting",
+        "the already closed issue answers 200"
+      ],
+      "pseudocode": "in the forge writes integration test file, table over the five cases asserting the forge's state and the recorded event"
+    },
+    {
+      "id": "TS-13-16",
+      "kind": "integration",
+      "verifies": [
+        "13-REQ-4.4"
+      ],
+      "title": "A label removal answers 204 whether or not the issue had the label",
+      "given": [
+        "an issue with the label, one without it, a forge answering not found for the removal with the issue still present, and one where the issue is gone"
+      ],
+      "when": "the removal is called in each case, and with label names containing a slash, a colon and a dot",
+      "then": [
+        "the first two answer 204",
+        "the not-found-with-issue-present case re-reads the issue once and answers 204",
+        "the missing issue answers 404 forge_not_found",
+        "each name is taken from the last path segment decoded exactly once"
+      ],
+      "pseudocode": "in the forge writes integration test file, table over the cases asserting the status and the number of forge reads"
+    },
+    {
+      "id": "TS-13-17",
+      "kind": "integration",
+      "verifies": [
+        "13-REQ-4.5"
+      ],
+      "title": "Ensuring a label never changes one that exists",
+      "given": [
+        "a label that exists with a known colour and description, a label that does not, and a forge that refuses the create because a concurrent call just made it"
+      ],
+      "when": "the label create is called with a different colour and description in each case, and twice in a row",
+      "then": [
+        "the existing label answers 200 as the forge holds it, with its colour and description untouched",
+        "the missing label is created and answers 201",
+        "the raced create is followed by one more read and answers 200",
+        "calling twice is harmless and both exit successfully"
+      ],
+      "pseudocode": "in the forge writes integration test file, table over the three cases asserting the status and the forge's stored label"
+    },
+    {
+      "id": "TS-13-18",
+      "kind": "integration",
+      "verifies": [
+        "13-REQ-4.6"
+      ],
+      "title": "A pull request's head is sent as given and creates are not deduplicated",
+      "given": [
+        "a forge accepting a pull request and refusing a second for the same head and base"
+      ],
+      "when": "a pull request is opened with a plain branch head, with an owner:branch head, and then created again for the same head and base",
+      "then": [
+        "each head reaches the forge exactly as given",
+        "the duplicate is refused by the forge and answered 422 forge_rejected",
+        "the hub keeps no idempotency key, so a retried create that already succeeded creates a second"
+      ],
+      "pseudocode": "in the forge writes integration test file: post(pulls, head='owner:b'); assert forge.lastBody.head == 'owner:b'"
+    },
+    {
+      "id": "TS-13-19",
+      "kind": "unit",
+      "verifies": [
+        "13-REQ-5.1",
+        "13-REQ-5.2"
+      ],
+      "title": "Body-like fields are measured and nothing else is",
+      "given": [
+        "a GitHub workspace and a GitLab workspace, and a recording forge"
+      ],
+      "when": "each of the four body-like fields is sent at the limit and one code point over, with multi-byte characters, and an over-long title, head, base, label name and assignee are sent",
+      "then": [
+        "each field at the limit is sent and each one over answers 413 body_too_large naming the length and the limit",
+        "the limits are 65536 on GitHub and 1000000 on GitLab",
+        "a multi-byte character counts as one code point",
+        "the over-long title, head, base, label name and assignee are sent to the forge",
+        "no request reaches the forge for a refused body and no event is recorded"
+      ],
+      "pseudocode": "in the forge writes test file, table over (field, forgeKind, length, expected)"
+    },
+    {
+      "id": "TS-13-20",
+      "kind": "integration",
+      "verifies": [
+        "13-REQ-6.1"
+      ],
+      "title": "Every forge failure maps to its documented answer",
+      "given": [
+        "forges answering 404, 401, a non-rate-limit 403, another 4xx, a 5xx, an unreadable body, and a forge that cannot be connected to"
+      ],
+      "when": "a read and a write are called against each",
+      "then": [
+        "the statuses and error types are 404 forge_not_found, 502 forge_unauthenticated, 502 forge_forbidden, 422 forge_rejected, 502 forge_error, 502 forge_error and 502 forge_unreachable respectively",
+        "a read and a write map identically"
+      ],
+      "pseudocode": "in the forge failures integration test file, table over (forgeBehaviour, expectedStatus, expectedErrorType)"
+    },
+    {
+      "id": "TS-13-21",
+      "kind": "integration",
+      "verifies": [
+        "13-REQ-6.2"
+      ],
+      "title": "The forge's message is scrubbed, truncated and given its hint",
+      "given": [
+        "a forge answering with a message containing the token and a URL with userinfo, and one answering a 2000-character message",
+        "a workspace with a username and password, and one with no credential"
+      ],
+      "when": "a write is attempted against each",
+      "then": [
+        "the message reads as the forge answering with its status",
+        "the token is replaced and the userinfo removed",
+        "the message is cut to 1024 bytes",
+        "the 401 for a basic credential adds the hint to store a token",
+        "the workspace with no credential answers 502 forge_error with nothing sent and no event recorded"
+      ],
+      "pseudocode": "in the forge failures integration test file: r = post(write); assert TOKEN not in r.text and len(r.json.error.message) <= 1024"
+    },
+    {
+      "id": "TS-13-22",
+      "kind": "integration",
+      "verifies": [
+        "13-REQ-6.3"
+      ],
+      "title": "A rate limit is waited out once, or refused with Retry-After",
+      "given": [
+        "a forge rate-limiting with a 5-second wait then succeeding, one with a 200-second wait, one with a 29-second wait, and one giving no wait"
+      ],
+      "when": "a read is called against each",
+      "then": [
+        "the 5-second wait is taken and the retry's result is answered",
+        "the 200-second wait answers 429 forge_rate_limited with Retry-After in whole seconds rounded up",
+        "the 29-second wait is cut short by the deadline and answers 504 forge_timeout",
+        "the unknown wait answers 429 without a Retry-After"
+      ],
+      "pseudocode": "in the forge failures integration test file, table over the four behaviours asserting the status, the error type and the Retry-After header"
+    },
+    {
+      "id": "TS-13-23",
+      "kind": "unit",
+      "verifies": [
+        "13-REQ-6.4"
+      ],
+      "title": "No response or event carries a credential or userinfo",
+      "given": [
+        "a workspace whose credential and whose remote URL userinfo are distinctive",
+        "every failure mode of every forge route"
+      ],
+      "when": "each failure is produced and its response and recorded event are inspected",
+      "then": [
+        "no response body contains the credential or the userinfo",
+        "no recorded event's metadata contains either"
+      ],
+      "pseudocode": "in the forge failures test file, over every route and failure: assert CRED not in body and USERINFO not in body and CRED not in event.metadata"
+    },
+    {
+      "id": "TS-13-24",
+      "kind": "unit",
+      "verifies": [
+        "13-REQ-7.1"
+      ],
+      "title": "A read route checks in the documented order",
+      "given": [
+        "combinations where two checks would both fail: a PAT without the scope for a slug naming nothing, a bad target with a bad path number, and a bad path number on a workspace whose forge cannot be identified"
+      ],
+      "when": "each combination is requested",
+      "then": [
+        "the PAT without the scope answers 403 naming forge:read even for a slug that names nothing",
+        "the bad target is answered before the bad path number",
+        "the bad path number is answered before the unidentifiable forge"
+      ],
+      "pseudocode": "in the forge order test file, table over (conditions, expectedAnswer)"
+    },
+    {
+      "id": "TS-13-25",
+      "kind": "unit",
+      "verifies": [
+        "13-REQ-7.2"
+      ],
+      "title": "A write route checks in the documented order",
+      "given": [
+        "a PAT holding only forge:read, a member, an archived workspace, a body that breaks a rule, a workspace whose forge cannot be identified, and an oversized body"
+      ],
+      "when": "combinations are requested where two checks would both fail",
+      "then": [
+        "the forge:read PAT answers 403 naming forge:write before the workspace is looked up",
+        "a member answers 403 forbidden",
+        "an archived workspace answers 400 before the body is validated",
+        "an oversized body on a workspace whose forge cannot be identified answers 422 forge_unknown rather than 413"
+      ],
+      "pseudocode": "in the forge order test file, table over (conditions, expectedStatus, expectedErrorType)"
+    },
+    {
+      "id": "TS-13-26",
+      "kind": "unit",
+      "verifies": [
+        "13-REQ-7.3"
+      ],
+      "title": "A refused forge request sends nothing and records nothing",
+      "given": [
+        "a recording forge and a recording event store"
+      ],
+      "when": "every refusal of every read and write route is produced",
+      "then": [
+        "the forge received no request for any of them",
+        "no hub event was recorded for any of them"
+      ],
+      "pseudocode": "in the forge order test file, over every refusal: assert forge.requests == 0 and events.recorded == 0"
+    },
+    {
+      "id": "TS-13-27",
+      "kind": "smoke",
+      "verifies": [
+        "13-PATH-1"
+      ],
+      "title": "An agent triages an issue against a running deployment",
+      "given": [
+        "a running deployment, a workspace whose repository is on a real or stubbed forge with a stored credential"
+      ],
+      "when": "afc issue list with a label filter, afc issue get and afc issue label are run in turn",
+      "then": [
+        "the list returns the matching issues",
+        "the get returns the issue with its comments",
+        "the label write succeeds and the label is on the issue afterwards",
+        "one forge write event is recorded for the label write and none for the reads"
+      ],
+      "pseudocode": "in the forge smoke test file: run('afc issue list --label af:triage'); run('afc issue get'); run('afc issue label'); assert events_for(workspace) has one forge write",
+      "real_components": [
+        "running deployment",
+        "forge read routes",
+        "forge write routes",
+        "credential resolution",
+        "event recorder",
+        "forge",
+        "afc"
+      ]
+    },
+    {
+      "id": "TS-13-28",
+      "kind": "smoke",
+      "verifies": [
+        "13-PATH-2"
+      ],
+      "title": "An agent opens a pull request upstream against a running deployment",
+      "given": [
+        "a running deployment and a carry_patch workspace with an upstream repository, an upstream credential and a branch already pushed to it"
+      ],
+      "when": "afc pr create --target upstream is run and then afc pr state --target upstream",
+      "then": [
+        "the create answers 201 with the pull request",
+        "the upstream credential and the upstream API URL were used, not the origin's",
+        "the state read reports it open"
+      ],
+      "pseudocode": "in the forge smoke test file: r = run('afc pr create --target upstream ...'); assert r.exit == 0 and json(run('afc pr state --target upstream').stdout).state == 'open'",
+      "real_components": [
+        "running deployment",
+        "forge write routes",
+        "credential resolution",
+        "upstream forge",
+        "afc"
+      ]
+    },
+    {
+      "id": "TS-13-29",
+      "kind": "smoke",
+      "verifies": [
+        "13-PATH-3"
+      ],
+      "title": "A rejected credential is reported without disclosing it",
+      "given": [
+        "a running deployment and a workspace whose stored forge credential the forge rejects"
+      ],
+      "when": "afc issue create is run",
+      "then": [
+        "the command exits 1 and the envelope carries error_type forge_unauthenticated",
+        "the message carries the forge's scrubbed answer and the hint to store a token",
+        "no output contains the credential",
+        "one forge write event is recorded carrying that error type"
+      ],
+      "pseudocode": "in the forge smoke test file: r = run('afc issue create ...'); assert r.exit == 1 and json(r.stdout).error.error_type == 'forge_unauthenticated' and CRED not in r.stdout",
+      "real_components": [
+        "running deployment",
+        "forge write routes",
+        "credential resolution",
+        "event recorder",
+        "forge",
+        "afc"
+      ]
+    }
+  ]
+}

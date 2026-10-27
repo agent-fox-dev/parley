@@ -1,0 +1,459 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/test_spec.v2.json",
+  "spec_id": "15",
+  "spec_name": "web_ui",
+  "schema_version": 2,
+  "tests": [
+    {
+      "id": "TS-15-1",
+      "kind": "unit",
+      "verifies": [
+        "15-REQ-1.1"
+      ],
+      "title": "The landing page describes the service and offers sign-in",
+      "given": [
+        "a visitor with no session"
+      ],
+      "when": "the service's root page is opened",
+      "then": [
+        "the page is served successfully",
+        "it carries a description of the service",
+        "it carries a sign-in control that leads to the provider"
+      ],
+      "pseudocode": "in the landing page test file: r = render('/'); assert r.ok and r.text contains the description and a sign-in control"
+    },
+    {
+      "id": "TS-15-2",
+      "kind": "integration",
+      "verifies": [
+        "15-REQ-1.2"
+      ],
+      "title": "An unauthenticated visitor is told nothing about the deployment",
+      "given": [
+        "a deployment holding workspaces, users and organizations with distinctive names"
+      ],
+      "when": "every page reachable without a session is fetched, including the landing page and the addresses of the dashboard and a workspace view",
+      "then": [
+        "no response contains any workspace slug, user name or organization name",
+        "no response contains a count of them"
+      ],
+      "pseudocode": "in the web smoke-adjacent integration test file: for page in public_pages(): assert no SENTINEL names in page.text"
+    },
+    {
+      "id": "TS-15-3",
+      "kind": "integration",
+      "verifies": [
+        "15-REQ-2.1"
+      ],
+      "title": "Signing in establishes a session for the right user",
+      "given": [
+        "a stub OAuth provider and two users with different workspaces"
+      ],
+      "when": "each signs in through the web interface and opens the dashboard",
+      "then": [
+        "each session identifies the user the provider authenticated",
+        "each dashboard shows that user's workspaces and not the other's"
+      ],
+      "pseudocode": "in the web session integration test file: s = sign_in(userA); assert slugs(dashboard(s)) == workspaces_of(userA)"
+    },
+    {
+      "id": "TS-15-4",
+      "kind": "integration",
+      "verifies": [
+        "15-REQ-2.2"
+      ],
+      "title": "A browser sign-in leaves the person's API keys alone",
+      "given": [
+        "a user holding two live API keys and a personal access token"
+      ],
+      "when": "the user signs in through the web interface and the credentials are then used and listed",
+      "then": [
+        "both API keys are still accepted by the API",
+        "the token is still accepted",
+        "the user's key list is unchanged and no new key was created"
+      ],
+      "pseudocode": "in the web session integration test file: before = keys(user); sign_in_web(user); assert keys(user) == before and call(keyA).status == 200"
+    },
+    {
+      "id": "TS-15-5",
+      "kind": "integration",
+      "verifies": [
+        "15-REQ-2.3"
+      ],
+      "title": "A session cannot be replayed, outlives nothing and ends on sign-out",
+      "given": [
+        "a signed-in person, a controllable clock and a request originating from another site"
+      ],
+      "when": "a cross-site request is made with no deliberate credential, the clock is advanced past the session's lifetime, and the person signs out and the old session value is reused",
+      "then": [
+        "the cross-site request is not served as that person",
+        "the expired session is not accepted",
+        "the signed-out session value is refused"
+      ],
+      "pseudocode": "in the web session integration test file, table over the three cases asserting the request is not served as the user"
+    },
+    {
+      "id": "TS-15-6",
+      "kind": "unit",
+      "verifies": [
+        "15-REQ-2.4"
+      ],
+      "title": "A missing or dead session shows the landing page",
+      "given": [
+        "no session, an expired session and a signed-out session"
+      ],
+      "when": "the dashboard and a workspace view are opened with each",
+      "then": [
+        "each shows the landing page with its sign-in control",
+        "no error page or stack trace is shown"
+      ],
+      "pseudocode": "in the web session test file, table over (sessionState, page) asserting the landing page is rendered"
+    },
+    {
+      "id": "TS-15-7",
+      "kind": "integration",
+      "verifies": [
+        "15-REQ-3.1"
+      ],
+      "title": "The dashboard lists workspaces with their four fields and links",
+      "given": [
+        "a signed-in person with three workspaces at different statuses and access levels, one never synced"
+      ],
+      "when": "the dashboard is opened",
+      "then": [
+        "each workspace appears once with its slug, status, the person's access and its last sync",
+        "the never-synced workspace shows that it has not synced rather than an empty cell",
+        "each row links to that workspace's view and the link resolves"
+      ],
+      "pseudocode": "in the dashboard integration test file: d = render(dashboard, session); assert rows(d) have the four fields and each link resolves"
+    },
+    {
+      "id": "TS-15-8",
+      "kind": "integration",
+      "verifies": [
+        "15-REQ-3.2"
+      ],
+      "title": "The dashboard lists exactly what the API would",
+      "given": [
+        "a person owning two workspaces, a member of an organization owning one more, and two workspaces belonging to neither"
+      ],
+      "when": "the dashboard is opened and the API's workspace list is read with the same person's credential",
+      "then": [
+        "the set of slugs shown equals the set the API returns",
+        "neither unrelated workspace appears"
+      ],
+      "pseudocode": "in the dashboard integration test file: assert set(slugs(dashboard(session))) == set(slugs(api_list(user)))"
+    },
+    {
+      "id": "TS-15-9",
+      "kind": "unit",
+      "verifies": [
+        "15-REQ-3.3"
+      ],
+      "title": "A person with no workspaces is told so",
+      "given": [
+        "a signed-in person with no workspaces"
+      ],
+      "when": "the dashboard is opened",
+      "then": [
+        "the page carries a message saying there are no workspaces yet and what to do next",
+        "it is not an empty list with no explanation"
+      ],
+      "pseudocode": "in the dashboard test file: assert 'no workspaces' in render(dashboard, emptyUser).text"
+    },
+    {
+      "id": "TS-15-10",
+      "kind": "integration",
+      "verifies": [
+        "15-REQ-4.1"
+      ],
+      "title": "The workspace view shows the workspace's fields",
+      "given": [
+        "a ready workspace with a description and settings, a failed one with a clone error, and one with a sync error"
+      ],
+      "when": "each is opened",
+      "then": [
+        "the slug, display name, description, status, mode, head, upstream head, last sync and settings are shown with the API's values",
+        "the clone error and the sync error are shown where set",
+        "an error field that is null is not shown"
+      ],
+      "pseudocode": "in the workspace view integration test file, table over the three workspaces asserting the rendered fields against the API's response"
+    },
+    {
+      "id": "TS-15-11",
+      "kind": "integration",
+      "verifies": [
+        "15-REQ-4.2"
+      ],
+      "title": "A carry-patch workspace shows its patches and latest rebuild",
+      "given": [
+        "a carry_patch workspace with four patches at different statuses and a completed rebuild, one with no rebuild yet, and a standard workspace"
+      ],
+      "when": "each is opened",
+      "then": [
+        "the patches appear in ascending position order with position, branch, status and latest rebuild result",
+        "the latest rebuild's status is shown, or a statement that none has run",
+        "the standard workspace shows no patch section"
+      ],
+      "pseudocode": "in the workspace view integration test file: assert [p.position for p in patches(view)] == [1,2,3,4] and 'no rebuild' in view_without_rebuild.text"
+    },
+    {
+      "id": "TS-15-12",
+      "kind": "integration",
+      "verifies": [
+        "15-REQ-4.3"
+      ],
+      "title": "The workspace view shows recent jobs and events",
+      "given": [
+        "a workspace with several merge and rebuild jobs and a dozen recorded events"
+      ],
+      "when": "the workspace view is opened",
+      "then": [
+        "the most recent jobs the API returns are shown, newest first, each with its kind and time",
+        "the most recent events are shown, newest first, each with its kind and time"
+      ],
+      "pseudocode": "in the workspace view integration test file: assert [e.time for e in events(view)] == sorted(..., reverse=True)"
+    },
+    {
+      "id": "TS-15-13",
+      "kind": "integration",
+      "verifies": [
+        "15-REQ-4.4"
+      ],
+      "title": "One failing section leaves the rest of the page usable",
+      "given": [
+        "a workspace whose patch read, whose job read and whose event read fail in turn"
+      ],
+      "when": "the workspace view is opened in each case",
+      "then": [
+        "the other sections render with their data",
+        "the failing section carries a message naming what could not be read",
+        "the page is served rather than failing as a whole"
+      ],
+      "pseudocode": "in the workspace view integration test file, table over the failing sections asserting the others rendered and a named message"
+    },
+    {
+      "id": "TS-15-14",
+      "kind": "integration",
+      "verifies": [
+        "15-REQ-5.1"
+      ],
+      "title": "Every page reads through the API as the signed-in person",
+      "given": [
+        "a recording API layer and recording store clients"
+      ],
+      "when": "the dashboard and a workspace view are rendered for a signed-in person",
+      "then": [
+        "every datum shown corresponds to a response the API returned for that person",
+        "no page read the relational store or the repository store directly"
+      ],
+      "pseudocode": "in the web reads integration test file: render(views); assert store.directReads == 0 and api.calls were all made as the session's user"
+    },
+    {
+      "id": "TS-15-15",
+      "kind": "unit",
+      "verifies": [
+        "15-REQ-5.2"
+      ],
+      "title": "A workspace the person may not read cannot be opened by address",
+      "given": [
+        "a workspace belonging to someone else, an archived one they may not see, and an address naming no workspace"
+      ],
+      "when": "each address is opened by a signed-in person",
+      "then": [
+        "each page says the workspace is not available",
+        "none shows any field of a workspace",
+        "the three answers are indistinguishable"
+      ],
+      "pseudocode": "in the workspace view test file: assert render(foreign).text == render(unknown).text and no workspace fields are present"
+    },
+    {
+      "id": "TS-15-16",
+      "kind": "integration",
+      "verifies": [
+        "15-REQ-5.3"
+      ],
+      "title": "A member sees the member's view",
+      "given": [
+        "a workspace, its owner and a member of its organization"
+      ],
+      "when": "both open the workspace view",
+      "then": [
+        "the member sees the fields the API returns them",
+        "every section the API would refuse the member is absent from their page",
+        "the member's access is shown as member"
+      ],
+      "pseudocode": "in the workspace view integration test file: assert sections(view(member)) <= sections(view(owner)) and view(member).access == 'member'"
+    },
+    {
+      "id": "TS-15-17",
+      "kind": "unit",
+      "verifies": [
+        "15-REQ-6.1"
+      ],
+      "title": "The pages use the shared design tokens and patterns",
+      "given": [
+        "the rendered landing page, dashboard and workspace view"
+      ],
+      "when": "each is inspected for its components and its type and spacing values",
+      "then": [
+        "the dashboard uses the repository-list pattern, a workspace's status uses the status-badge pattern and the events use the timeline pattern",
+        "every type and spacing value comes from the project's design tokens rather than a literal",
+        "the same token set is used by all three pages"
+      ],
+      "pseudocode": "in the design system test file: assert uses_pattern(dashboard, 'repo-list') and no hard-coded font sizes or spacings appear in the rendered styles"
+    },
+    {
+      "id": "TS-15-18",
+      "kind": "integration",
+      "verifies": [
+        "15-REQ-6.2"
+      ],
+      "title": "Both themes render and meet the contrast level",
+      "given": [
+        "every page, rendered with the system setting dark, with it light, and with an explicit override of each"
+      ],
+      "when": "each rendering is inspected and its text and background pairs measured",
+      "then": [
+        "every page renders in both themes",
+        "the theme follows the system setting by default and an explicit choice is remembered across a reload",
+        "every text and background pair meets the contrast level for normal text in both themes"
+      ],
+      "pseudocode": "in the theming integration test file: for page, theme in product(PAGES, THEMES): assert min_contrast(render(page, theme)) >= NORMAL_TEXT_LEVEL"
+    },
+    {
+      "id": "TS-15-19",
+      "kind": "integration",
+      "verifies": [
+        "15-REQ-6.3"
+      ],
+      "title": "Every page works at a phone's width",
+      "given": [
+        "every page, rendered at a viewport 360 pixels wide, with both a short and a long workspace slug and a long description"
+      ],
+      "when": "each rendering is measured",
+      "then": [
+        "no page scrolls horizontally",
+        "no content is clipped or overlapping",
+        "the long slug and description wrap rather than widening the page"
+      ],
+      "pseudocode": "in the responsive integration test file: for page in PAGES: r = render(page, width=360); assert r.scrollWidth <= 360 and no overlaps"
+    },
+    {
+      "id": "TS-15-20",
+      "kind": "integration",
+      "verifies": [
+        "15-REQ-6.4"
+      ],
+      "title": "Every page is operable from the keyboard and announced correctly",
+      "given": [
+        "every page with its interactive elements"
+      ],
+      "when": "each is traversed by keyboard and inspected for structure and names",
+      "then": [
+        "every link, button and control is reachable in a sensible order and can be activated from the keyboard",
+        "each focused element shows a visible focus indicator",
+        "each page has one main landmark and a heading structure with no skipped level",
+        "every control has an accessible name"
+      ],
+      "pseudocode": "in the accessibility integration test file: for page in PAGES: assert tab_order_covers_all_controls(page) and one_main_landmark(page) and no_skipped_heading_levels(page)"
+    },
+    {
+      "id": "TS-15-21",
+      "kind": "unit",
+      "verifies": [
+        "15-REQ-6.5"
+      ],
+      "title": "The interface is Parley's and does not present itself as GitHub",
+      "given": [
+        "every page in both themes"
+      ],
+      "when": "each is inspected for names, marks and claims",
+      "then": [
+        "every page carries Parley's name",
+        "no page uses GitHub's name, logo or wordmark as its own identity",
+        "no page claims or implies an association with GitHub"
+      ],
+      "pseudocode": "in the branding test file: for page in PAGES: assert 'Parley' in page.text and no GitHub mark is used as the site identity"
+    },
+    {
+      "id": "TS-15-22",
+      "kind": "smoke",
+      "verifies": [
+        "15-PATH-1"
+      ],
+      "title": "A developer signs in and their agent's key keeps working",
+      "given": [
+        "a running deployment with the web interface served, a stub OAuth provider, and a user holding a live API key"
+      ],
+      "when": "a browser opens the landing page, signs in, lands on the dashboard, and the API key is then used",
+      "then": [
+        "the dashboard shows that user's workspaces",
+        "the API key is still accepted",
+        "the user's key list is unchanged"
+      ],
+      "pseudocode": "in the web smoke test file, driving a real browser against a running deployment: open('/'); sign_in(); assert dashboard_visible(); assert call(apiKey).status == 200",
+      "real_components": [
+        "running deployment",
+        "web interface",
+        "browser session",
+        "stub OAuth provider",
+        "workspace routes",
+        "real browser"
+      ]
+    },
+    {
+      "id": "TS-15-23",
+      "kind": "smoke",
+      "verifies": [
+        "15-PATH-2"
+      ],
+      "title": "A developer reads a patch stack's health in the browser",
+      "given": [
+        "a running deployment, a signed-in developer and a carry_patch workspace with patches, a completed rebuild, recent jobs and recent events"
+      ],
+      "when": "the developer opens the workspace from the dashboard",
+      "then": [
+        "the workspace's state, its patches with their latest rebuild results, the latest rebuild and the recent events are all on the page",
+        "the values match what the API returns for that person",
+        "the page renders in the viewer's theme at a phone's width"
+      ],
+      "pseudocode": "in the web smoke test file: open(dashboard); click(workspace); assert patches_visible() and latest_rebuild_visible() and events_visible()",
+      "real_components": [
+        "running deployment",
+        "web interface",
+        "workspace routes",
+        "patch routes",
+        "rebuild routes",
+        "audit query",
+        "real browser"
+      ]
+    },
+    {
+      "id": "TS-15-24",
+      "kind": "smoke",
+      "verifies": [
+        "15-PATH-3"
+      ],
+      "title": "A member sees their organization's workspaces and nothing else",
+      "given": [
+        "a running deployment, a person who is a member of an organization with one workspace and owns another, and a third workspace they may not read"
+      ],
+      "when": "the person signs in, reads the dashboard, opens the organization's workspace, and then types the address of the third",
+      "then": [
+        "the dashboard lists their own and the organization's workspaces and not the third",
+        "the organization's workspace opens with the member's view",
+        "the third's address says it is not available and shows none of its fields"
+      ],
+      "pseudocode": "in the web smoke test file: assert slugs(dashboard) == {own, orgWs}; open(orgWs); assert access_shown == 'member'; open(foreign); assert not_available()",
+      "real_components": [
+        "running deployment",
+        "web interface",
+        "browser session",
+        "workspace routes",
+        "access decision",
+        "real browser"
+      ]
+    }
+  ]
+}

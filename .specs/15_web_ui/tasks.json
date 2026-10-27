@@ -1,0 +1,284 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v2.json",
+  "spec_id": "15",
+  "spec_name": "web_ui",
+  "schema_version": 2,
+  "test_commands": {
+    "all_tests": "make test",
+    "linter": "make lint"
+  },
+  "dependencies": [
+    {
+      "spec": "01",
+      "reason": "is served by the same service and must run on both of its deployment targets"
+    },
+    {
+      "spec": "02",
+      "reason": "shares the OAuth provider its sign-in uses, and identifies the same user, without using the API key route"
+    },
+    {
+      "spec": "03",
+      "reason": "reads its workspaces and inherits its access decision through the API"
+    },
+    {
+      "spec": "09",
+      "reason": "reads the patch list and the rebuilds the workspace view shows"
+    },
+    {
+      "spec": "10",
+      "reason": "reads the merge jobs the workspace view shows"
+    },
+    {
+      "spec": "12",
+      "reason": "reads the recent events the workspace view shows"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "kind": "implement",
+      "title": "Choose the front-end tooling and lay down the design tokens",
+      "criteria": [
+        "15-REQ-6.1"
+      ],
+      "tests": [
+        "TS-15-17"
+      ],
+      "steps": [
+        "Choose the front-end framework, the build, the session mechanism and the accessibility and contrast testing tools, verify each against its installed types, and record the choices in an ADR",
+        "Add this task's behaviours to the design system test file, and confirm they fail",
+        "Define the design tokens once — type scale, spacing, status colours and the dark and light palettes — in the visual language of GitHub and GitHub Copilot",
+        "Build the three shared patterns the pages use: the repository list, the status badge and the timeline",
+        "Forbid hard-coded type and spacing values in page styles, so every page draws from the tokens",
+        "Confirm the web interface builds and is served by both deployment targets of package 01"
+      ],
+      "touches": [
+        "web/package.json",
+        "web/tokens.css",
+        "web/components/",
+        "web/components/design_system.test.ts",
+        "Makefile",
+        "docs/adr/"
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 2,
+      "kind": "implement",
+      "title": "Serve the landing page",
+      "criteria": [
+        "15-REQ-1"
+      ],
+      "tests": [
+        "TS-15-1",
+        "TS-15-2"
+      ],
+      "steps": [
+        "Add this task's behaviours to the landing page test files, and confirm they fail",
+        "Serve a landing page saying what the service is and what it does, with a sign-in control leading to the provider",
+        "Serve it to a visitor with no session, including at the addresses of the dashboard and a workspace view",
+        "Confirm by test that no page served without a session carries a workspace slug, a user name, an organization name or a count of them"
+      ],
+      "touches": [
+        "web/pages/landing.tsx",
+        "web/pages/landing.test.ts",
+        "web/pages/public.integration.test.ts"
+      ],
+      "depends_on": [
+        1
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 3,
+      "kind": "implement",
+      "title": "Sign a person in without touching their API keys",
+      "criteria": [
+        "15-REQ-2"
+      ],
+      "tests": [
+        "TS-15-3",
+        "TS-15-4",
+        "TS-15-5",
+        "TS-15-6"
+      ],
+      "steps": [
+        "Add this task's behaviours to the web session test files, and confirm they fail",
+        "Implement the browser sign-in against the same OAuth provider the API uses, establishing a session that identifies the same user",
+        "Do not call the API's callback route, and neither issue nor revoke an API key, so a key the person's automation holds keeps working",
+        "Carry the session so that another site cannot make a request with it, give it a lifetime, and end it on sign-out",
+        "Show the landing page, not an error, to a visitor with no session or with one that has expired or been signed out"
+      ],
+      "touches": [
+        "web/session.ts",
+        "web/session.test.ts",
+        "web/pages/signin.tsx",
+        "web/session.integration.test.ts",
+        "src/routes/web_auth.ts"
+      ],
+      "depends_on": [
+        2
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 4,
+      "kind": "implement",
+      "title": "Read everything through the API as the signed-in person",
+      "criteria": [
+        "15-REQ-5"
+      ],
+      "tests": [
+        "TS-15-14",
+        "TS-15-15",
+        "TS-15-16"
+      ],
+      "steps": [
+        "Add this task's behaviours to the web reads test files, and confirm they fail",
+        "Make every page read through the service's own API as the signed-in person, with no direct access to the relational store or the repository store",
+        "Show one indistinguishable not-available page for a workspace the person may not read, one that is archived and invisible to them, and an address naming nothing, revealing no field of any of them",
+        "Show a member exactly what the API returns a member, omitting every section the API would refuse them"
+      ],
+      "touches": [
+        "web/api_client.ts",
+        "web/api_client.test.ts",
+        "web/pages/not_available.tsx",
+        "web/reads.integration.test.ts"
+      ],
+      "depends_on": [
+        3
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 5,
+      "kind": "implement",
+      "title": "Show the dashboard",
+      "criteria": [
+        "15-REQ-3"
+      ],
+      "tests": [
+        "TS-15-7",
+        "TS-15-8",
+        "TS-15-9"
+      ],
+      "steps": [
+        "Add this task's behaviours to the dashboard test files, and confirm they fail",
+        "List the signed-in person's workspaces with slug, status, their access and last sync, each linking to that workspace's view",
+        "Show a never-synced workspace as not yet synced rather than as an empty cell",
+        "Confirm by test that the set of workspaces shown equals the set the API returns for the same person",
+        "Show a person with no workspaces a message saying so and what to do next"
+      ],
+      "touches": [
+        "web/pages/dashboard.tsx",
+        "web/pages/dashboard.test.ts",
+        "web/pages/dashboard.integration.test.ts"
+      ],
+      "depends_on": [
+        4
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 6,
+      "kind": "implement",
+      "title": "Show one workspace's state",
+      "criteria": [
+        "15-REQ-4"
+      ],
+      "tests": [
+        "TS-15-10",
+        "TS-15-11",
+        "TS-15-12",
+        "TS-15-13"
+      ],
+      "steps": [
+        "Add this task's behaviours to the workspace view test files, and confirm they fail",
+        "Show the workspace's slug, display name, description, status, mode, head, upstream head, last sync, settings and any clone or sync error, omitting an error that is null",
+        "Show a carry_patch workspace's patches in position order with position, branch, status and latest rebuild result, and the latest rebuild or a statement that none has run, showing no patch section for a standard workspace",
+        "Show the workspace's most recent jobs and most recent events, newest first, each with its kind and time",
+        "Render each section independently, so a failing read leaves the rest of the page usable and names what could not be read"
+      ],
+      "touches": [
+        "web/pages/workspace.tsx",
+        "web/pages/workspace.test.ts",
+        "web/pages/workspace.integration.test.ts",
+        "web/components/"
+      ],
+      "depends_on": [
+        5
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 7,
+      "kind": "implement",
+      "title": "Make every page themed, responsive, keyboard-operable and Parley's own",
+      "criteria": [
+        "15-REQ-6.2",
+        "15-REQ-6.3",
+        "15-REQ-6.4",
+        "15-REQ-6.5"
+      ],
+      "tests": [
+        "TS-15-18",
+        "TS-15-19",
+        "TS-15-20",
+        "TS-15-21"
+      ],
+      "steps": [
+        "Add this task's behaviours to the theming, responsive, accessibility and branding test files, and confirm they fail",
+        "Provide a dark and a light theme following the viewer's system setting, overridable and remembered across a reload",
+        "Confirm by measurement that every text and background pair meets the contrast level for normal text in both themes",
+        "Make every page render at a viewport 360 pixels wide with no horizontal scrolling and no clipped or overlapping content, with long slugs and descriptions wrapping",
+        "Make every link, button and control reachable in a sensible keyboard order with a visible focus indicator, give each page one main landmark and a heading structure with no skipped level, and give every control an accessible name",
+        "Carry Parley's name and marks on every page, and use no GitHub name, logo or wordmark as the site's identity"
+      ],
+      "touches": [
+        "web/theme.ts",
+        "web/theme.integration.test.ts",
+        "web/responsive.integration.test.ts",
+        "web/accessibility.integration.test.ts",
+        "web/branding.test.ts",
+        "web/tokens.css"
+      ],
+      "depends_on": [
+        6
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 8,
+      "kind": "integration",
+      "title": "Drive a real browser against a running deployment",
+      "tests": [
+        "TS-15-22",
+        "TS-15-23",
+        "TS-15-24"
+      ],
+      "steps": [
+        "Add the three smoke tests and confirm each passes against a running deployment with a real browser, or skips with a message naming what was missing",
+        "Trace 15-PATH-1: the sign-in reaches the stub provider, establishes a session through the web auth route, and the dashboard reads through the API as that person, while the API key held throughout is still accepted",
+        "Trace 15-PATH-2: the workspace view's sections each read their own API route as the signed-in person, and the values rendered match those responses",
+        "Trace 15-PATH-3: the dashboard's list and the not-available page both come from the access decision of package 03 through the API, with no separate rule in the web layer",
+        "For every criterion carrying a contract, confirm a caller in production code consumes the producer's result and not only a test: the design tokens are used by every page, the API client by every read, and the session by every page behind sign-in",
+        "Confirm the web interface is served by both deployment targets of package 01, so the portability claim covers it",
+        "Grep web/ and the files every task's touches lists for TODO, FIXME and the project's not-implemented marker, and remove any that remain",
+        "Add the web interface conformance cases to the harness from package 01"
+      ],
+      "touches": [
+        "web/web.smoke.test.ts",
+        "conformance/web.ts"
+      ],
+      "depends_on": [
+        7
+      ],
+      "done_when": [
+        "`make check` passes with no network access and no deployment configured",
+        "a real browser signs in, reads the dashboard and opens a workspace against a running deployment",
+        "the contrast, responsive and keyboard checks pass for every page in both themes"
+      ],
+      "state": "pending"
+    }
+  ]
+}

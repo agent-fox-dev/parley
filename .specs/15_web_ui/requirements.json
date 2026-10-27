@@ -1,0 +1,286 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v2.json",
+  "spec_id": "15",
+  "spec_name": "web_ui",
+  "schema_version": 2,
+  "introduction": "A read-only browser interface: a landing page, a sign-in that does not disturb the person's API keys, a dashboard of their workspaces and a view of one workspace's state. It reads through the service's own API with the person's session, so the access rules already specified are the only ones.",
+  "glossary": {
+    "browser session": "What a person holds after signing in through the web interface. It identifies the same user an API credential would, but is not an API key and neither issues nor revokes one.",
+    "dashboard": "The page listing the signed-in person's workspaces with their status and access.",
+    "visual language": "The density, type scale, spacing, status colours and component patterns the interface borrows from GitHub and GitHub Copilot, under Parley's own name and marks.",
+    "workspace view": "The page showing one workspace's state, its patches where it carries them, its recent jobs and its recent events."
+  },
+  "requirements": [
+    {
+      "id": "15-REQ-1",
+      "title": "The landing page",
+      "rationale": "It is the only page an unauthenticated visitor sees, so it is also the page that must disclose nothing about the deployment.",
+      "criteria": [
+        {
+          "id": "15-REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "a visitor who is not signed in opens the service's root page",
+          "system": "Parley web interface",
+          "action": "describe what the service is and what it does, and offer sign-in",
+          "contract": "the page is served with a success status, carries a description of the service and a sign-in control, and does not redirect to an error"
+        },
+        {
+          "id": "15-REQ-1.2",
+          "pattern": "ubiquitous",
+          "system": "Parley web interface",
+          "action": "disclose nothing of the deployment's contents to a visitor who is not signed in",
+          "contract": "no page served to an unauthenticated visitor contains a workspace slug, a user name, an organization name or any count of them"
+        }
+      ]
+    },
+    {
+      "id": "15-REQ-2",
+      "title": "Signing in",
+      "rationale": "The API's sign-in revokes every existing key of the user, so a browser that shared it would make opening the dashboard destructive.",
+      "criteria": [
+        {
+          "id": "15-REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "a visitor signs in through the web interface with the configured OAuth provider",
+          "system": "Parley web interface",
+          "action": "establish a browser session identifying the same user the API would",
+          "contract": "the session identifies the user the provider authenticated; the dashboard afterwards shows that user's workspaces"
+        },
+        {
+          "id": "15-REQ-2.2",
+          "pattern": "ubiquitous",
+          "system": "Parley web interface",
+          "action": "neither issue nor revoke an API key when a person signs in",
+          "contract": "an API key held before a browser sign-in is accepted by the API after it; no new API key is created by signing in; the user's key list is unchanged"
+        },
+        {
+          "id": "15-REQ-2.3",
+          "pattern": "ubiquitous",
+          "system": "Parley web interface",
+          "action": "carry the session so that another site cannot make a request with it, expire it, and end it when the person signs out",
+          "contract": "a cross-site request carrying no deliberate credential is not served as that person; an expired session is not accepted; after signing out the same session value is refused"
+        },
+        {
+          "id": "15-REQ-2.4",
+          "pattern": "unwanted",
+          "condition": "a visitor with no session, or one whose session has expired or been signed out, opens a page behind sign-in",
+          "system": "Parley web interface",
+          "action": "show the landing page rather than an error",
+          "contract": "the visitor is taken to the landing page with its sign-in control; no error page and no stack trace is shown"
+        }
+      ]
+    },
+    {
+      "id": "15-REQ-3",
+      "title": "The dashboard",
+      "rationale": "It is the first thing a person sees after signing in, and the place a leak of someone else's workspace would show.",
+      "criteria": [
+        {
+          "id": "15-REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "a signed-in person opens the dashboard",
+          "system": "Parley web interface",
+          "action": "list their workspaces with each one's slug, status, their access to it and when it last synced, each linking to its own view",
+          "contract": "every workspace the API would list for that person appears once, with those four fields shown and a working link to its view"
+        },
+        {
+          "id": "15-REQ-3.2",
+          "pattern": "ubiquitous",
+          "system": "Parley web interface",
+          "action": "list exactly the workspaces the same person's credential is given by the API, and no others",
+          "contract": "the set of slugs shown equals the set the API returns for that person; a workspace of another user or organization never appears"
+        },
+        {
+          "id": "15-REQ-3.3",
+          "pattern": "state_driven",
+          "condition": "the signed-in person has no workspaces",
+          "system": "Parley web interface",
+          "action": "say so and suggest what to do next",
+          "contract": "the page carries a message explaining that there are no workspaces yet, rather than an empty list with no explanation"
+        }
+      ]
+    },
+    {
+      "id": "15-REQ-4",
+      "title": "The workspace view",
+      "rationale": "This is the page the whole feature exists for: enough to tell whether a workspace is healthy without running a command.",
+      "criteria": [
+        {
+          "id": "15-REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "a signed-in person opens a workspace they may read",
+          "system": "Parley web interface",
+          "action": "show the workspace's slug, display name, description, status, mode, head, upstream head, last sync, any clone or sync error, and its settings",
+          "contract": "each of those fields is shown with the value the API reports; an error field is shown when it is set and omitted when it is null"
+        },
+        {
+          "id": "15-REQ-4.2",
+          "pattern": "state_driven",
+          "condition": "the workspace being viewed carries patches",
+          "system": "Parley web interface",
+          "action": "show the patch list in position order with each patch's position, branch, status and latest rebuild result, and show the latest rebuild",
+          "contract": "the patches appear in ascending position order with those four fields; the latest rebuild's status is shown, or a statement that none has run; a standard workspace shows no patch section"
+        },
+        {
+          "id": "15-REQ-4.3",
+          "pattern": "event_driven",
+          "condition": "a workspace view is opened",
+          "system": "Parley web interface",
+          "action": "show the workspace's most recent jobs and its most recent audit events",
+          "contract": "the most recent jobs and events the API returns for that workspace are shown, newest first, each with its kind and time"
+        },
+        {
+          "id": "15-REQ-4.4",
+          "pattern": "unwanted",
+          "condition": "one section of the workspace view cannot be read",
+          "system": "Parley web interface",
+          "action": "show the rest of the page and say which part could not be read",
+          "contract": "the other sections render with their data; the failing section carries a message naming what could not be read; the page does not fail as a whole"
+        }
+      ]
+    },
+    {
+      "id": "15-REQ-5",
+      "title": "Reading only what the person may",
+      "rationale": "A second read path into the store would be a second place for the member, archived and bound-token rules to be got wrong.",
+      "criteria": [
+        {
+          "id": "15-REQ-5.1",
+          "pattern": "ubiquitous",
+          "system": "Parley web interface",
+          "action": "make every read through the service's own API, as the signed-in person, rather than through a private path into the store",
+          "contract": "every datum shown corresponds to a response the same person's session is entitled to; no page reads the relational store or the repository store directly"
+        },
+        {
+          "id": "15-REQ-5.2",
+          "pattern": "unwanted",
+          "condition": "a signed-in person opens the address of a workspace they may not read",
+          "system": "Parley web interface",
+          "action": "show that it is not available, disclosing nothing about it",
+          "contract": "the page says the workspace is not available and shows none of its fields; the answer is the same for a workspace that exists and one that does not"
+        },
+        {
+          "id": "15-REQ-5.3",
+          "pattern": "ubiquitous",
+          "system": "Parley web interface",
+          "action": "show a member of a workspace's organization exactly what the API gives a member",
+          "contract": "a member's workspace view shows the fields the API returns them and omits every section the API would refuse them"
+        }
+      ]
+    },
+    {
+      "id": "15-REQ-6",
+      "title": "How it looks and how it is used",
+      "rationale": "The interface is for people, and a page that is unreadable in dark mode, unusable on a phone or unreachable by keyboard fails them regardless of its data.",
+      "criteria": [
+        {
+          "id": "15-REQ-6.1",
+          "pattern": "ubiquitous",
+          "system": "Parley web interface",
+          "action": "follow the visual language of GitHub and GitHub Copilot in its density, type scale, spacing, status colours and its patterns for a repository list, a status badge and a timeline",
+          "contract": "the dashboard uses the repository-list pattern, a workspace's status uses the status-badge pattern, and the events use the timeline pattern, each with the type scale and spacing the project's design tokens define once and reuse"
+        },
+        {
+          "id": "15-REQ-6.2",
+          "pattern": "ubiquitous",
+          "system": "Parley web interface",
+          "action": "provide a dark and a light theme following the viewer's system setting and overridable by the viewer",
+          "contract": "every page renders in both themes; the theme follows the system setting by default and an explicit choice is remembered; every pair of text and background colour meets the contrast level for normal text in both themes"
+        },
+        {
+          "id": "15-REQ-6.3",
+          "pattern": "ubiquitous",
+          "system": "Parley web interface",
+          "action": "render every page usably at a phone's width",
+          "contract": "at a viewport 360 pixels wide, every page renders with no horizontal scrolling and no content clipped or overlapping"
+        },
+        {
+          "id": "15-REQ-6.4",
+          "pattern": "ubiquitous",
+          "system": "Parley web interface",
+          "action": "make every interactive element reachable and operable from the keyboard, and give each page one main landmark, a heading structure with no skipped level and an accessible name for every control",
+          "contract": "every link, button and control is reachable by keyboard in a sensible order, has a visible focus indicator and can be activated from the keyboard; each page has one main landmark, a heading structure with no skipped level, and an accessible name for every control"
+        },
+        {
+          "id": "15-REQ-6.5",
+          "pattern": "ubiquitous",
+          "system": "Parley web interface",
+          "action": "carry Parley's own name and marks and never present itself as GitHub or imply an association with it",
+          "contract": "every page carries Parley's name; no page carries GitHub's name, logo or wordmark as its own identity, and none claims or implies an association"
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "15-PATH-1",
+      "title": "A developer signs in and their agent keeps running",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "opens the landing page and chooses to sign in"
+        },
+        {
+          "actor": "OAuth provider",
+          "action": "authenticates the developer and returns them to the service"
+        },
+        {
+          "actor": "Parley web interface",
+          "action": "establishes a browser session without issuing or revoking an API key"
+        },
+        {
+          "actor": "Parley web interface",
+          "action": "reads the person's workspaces through the service's own API and shows the dashboard"
+        },
+        {
+          "actor": "API client",
+          "action": "makes a request with the API key it held throughout and is still served"
+        }
+      ]
+    },
+    {
+      "id": "15-PATH-2",
+      "title": "A developer reads a patch stack's health in the browser",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "opens a carry_patch workspace from the dashboard"
+        },
+        {
+          "actor": "Parley web interface",
+          "action": "reads the workspace, its patches, its latest rebuild, its recent jobs and its recent events through the API as that person"
+        },
+        {
+          "actor": "Parley service",
+          "action": "answers each read under the person's own access"
+        },
+        {
+          "actor": "developer",
+          "action": "sees the workspace's state, each patch with its latest rebuild result, the latest rebuild and the recent events on one page"
+        }
+      ]
+    },
+    {
+      "id": "15-PATH-3",
+      "title": "A member sees their organization's workspaces and nothing else",
+      "steps": [
+        {
+          "actor": "organization member",
+          "action": "signs in and opens the dashboard"
+        },
+        {
+          "actor": "Parley web interface",
+          "action": "lists the workspaces the API gives that person, their organization's among them"
+        },
+        {
+          "actor": "organization member",
+          "action": "opens one of the organization's workspaces and is shown the member's view"
+        },
+        {
+          "actor": "organization member",
+          "action": "types the address of a workspace they may not read and is told it is not available, with none of its fields shown"
+        }
+      ]
+    }
+  ]
+}

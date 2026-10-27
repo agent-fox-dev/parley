@@ -1,0 +1,343 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v2.json",
+  "spec_id": "12",
+  "spec_name": "audit_and_events",
+  "schema_version": 2,
+  "introduction": "This package gives the service its memory: the hub's own audit events for every operation that has one, the per-run records agents ingest, one query that reads across both sources, the transcript rebuilt from traces, and a live stream.",
+  "glossary": {
+    "agent event": "A record an agent ingests about one run: an audit event, a session outcome, a tool call, a tool error, a trace event or a postmortem.",
+    "event bus": "The platform interface that carries a recorded event from the component that recorded it to the components serving event streams.",
+    "hub event": "An event the service records about something it did, with an actor, a workspace, a resource, an action and the metadata keys the reference lists for its type.",
+    "run id": "The identifier of one agent run, formed of a date, a time and six lowercase hex characters.",
+    "unified query": "The route that returns hub events and agent events together, newest first, with their times compared as instants so the two sources interleave correctly."
+  },
+  "requirements": [
+    {
+      "id": "12-REQ-1",
+      "title": "Recording the hub's own events",
+      "rationale": "These events are the only record of what the service did, and metadata that drifts from the reference makes a consumer's filter silently wrong.",
+      "criteria": [
+        {
+          "id": "12-REQ-1.1",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "record one event for each operation the API reference's two event tables name, with that table's event type, actor, workspace, resource type and id, action and metadata keys",
+          "contract": "for every operation in the tables, performing it records exactly one event whose type and action match the table and whose metadata keys are exactly those the table lists, with no extra key"
+        },
+        {
+          "id": "12-REQ-1.2",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "answer a request the same way whether or not its event could be recorded",
+          "contract": "with the event recorder failing, every operation that would record an event still returns the status and body it returns with the recorder working"
+        },
+        {
+          "id": "12-REQ-1.3",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "record at most one bound-token refusal event per token per minute, counting the refusals held back since that token's previous event",
+          "contract": "for many refusals of one token within a minute exactly one event is recorded, and its suppressed count equals the number held back; a refusal more than a minute after the previous event records again"
+        },
+        {
+          "id": "12-REQ-1.4",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "return an event that belongs to no workspace only to an admin token",
+          "contract": "a user's query and stream never carry a workspace-less event; an admin token's query carries them"
+        }
+      ]
+    },
+    {
+      "id": "12-REQ-2",
+      "title": "Ingesting what an agent did",
+      "rationale": "An agent retries, so a non-idempotent ingestion double-counts a run, and the access rule here is the reverse of the rest of the service.",
+      "criteria": [
+        {
+          "id": "12-REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "an audit event, session outcome, tool call, tool error or trace event is ingested for a run",
+          "system": "Parley service",
+          "action": "store it and answer with its identity",
+          "contract": "HTTP 201 with the record's id, run id and the fields the route's entry names; the record is afterwards returned by that run's list route"
+        },
+        {
+          "id": "12-REQ-2.2",
+          "pattern": "event_driven",
+          "condition": "an ingested record repeats an id already stored",
+          "system": "Parley service",
+          "action": "answer as a duplicate and change nothing",
+          "contract": "HTTP 200 rather than 201; the stored record is unchanged and no second record exists"
+        },
+        {
+          "id": "12-REQ-2.3",
+          "pattern": "unwanted",
+          "condition": "a run id is not a date, a time and six lowercase hex characters, or a client timestamp is not RFC 3339, or a required field is missing or invalid",
+          "system": "Parley service",
+          "action": "refuse the request and store nothing",
+          "contract": "HTTP 400 in the error envelope; in a batch the failing item is reported on its own; no record is stored for a refused item"
+        },
+        {
+          "id": "12-REQ-2.4",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "check, for every ingestion route, that the workspace exists, then that it is not archived, then that the caller owns it",
+          "contract": "an unknown workspace and one a bound token may not reach are HTTP 404; an archived workspace is HTTP 409 with error_type workspace_archived, answered before ownership is considered; a member or a stranger is HTTP 403 with error_type workspace_access_denied, not 404; a refused request stores nothing"
+        },
+        {
+          "id": "12-REQ-2.5",
+          "pattern": "event_driven",
+          "condition": "a batch of 1 to 1000 audit events or trace events is ingested",
+          "system": "Parley service",
+          "action": "accept, deduplicate or reject each item on its own and report the counts",
+          "contract": "HTTP 200 with the number accepted, the number of duplicates and an error naming the index of each failing item; an item's failure does not prevent the others being stored; an empty array is HTTP 400 and more than 1000 items is HTTP 413"
+        }
+      ]
+    },
+    {
+      "id": "12-REQ-3",
+      "title": "The run's postmortem",
+      "rationale": "A run has at most one, and a second submit from a retrying agent must not replace the first.",
+      "criteria": [
+        {
+          "id": "12-REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "a postmortem is submitted for a run that has none",
+          "system": "Parley service",
+          "action": "store it and answer with its identity",
+          "contract": "HTTP 201 with the run id, the run status and the time it was stored"
+        },
+        {
+          "id": "12-REQ-3.2",
+          "pattern": "event_driven",
+          "condition": "a postmortem is submitted for a run that already has one",
+          "system": "Parley service",
+          "action": "answer with the existing one and change nothing",
+          "contract": "HTTP 200; the stored postmortem is the first one submitted"
+        },
+        {
+          "id": "12-REQ-3.3",
+          "pattern": "unwanted",
+          "condition": "a postmortem is missing a required field, carries an invalid run status or time, or names a schema version other than 1",
+          "system": "Parley service",
+          "action": "refuse the request and store nothing",
+          "contract": "HTTP 400 for a missing field and an invalid status or time; HTTP 422 with error_type unknown_schema_version for another version"
+        },
+        {
+          "id": "12-REQ-3.4",
+          "pattern": "unwanted",
+          "condition": "the postmortem of a run that has none is read",
+          "system": "Parley service",
+          "action": "answer that there is none",
+          "contract": "HTTP 404 with error_type postmortem_not_found"
+        }
+      ]
+    },
+    {
+      "id": "12-REQ-4",
+      "title": "Reading a run's records",
+      "rationale": "The reads are how an operator inspects a run, and they are open to a member where the writes are not.",
+      "criteria": [
+        {
+          "id": "12-REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "a run's events, session outcomes, tool calls, tool errors or traces are listed",
+          "system": "Parley service",
+          "action": "return the matching records with the route's filters applied, paged",
+          "contract": "HTTP 200 with the route's named collection, next_cursor and has_more; the order defaults to newest first and the page size to 50 with 500 the maximum; each documented filter narrows the result"
+        },
+        {
+          "id": "12-REQ-4.2",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "admit a run read to the owner, a member and an admin token whatever the workspace's status",
+          "contract": "all three are served for an active and for an archived workspace; anyone else is answered HTTP 404 workspace not found"
+        },
+        {
+          "id": "12-REQ-4.3",
+          "pattern": "unwanted",
+          "condition": "a run read carries an invalid run id, cursor or time bound",
+          "system": "Parley service",
+          "action": "refuse the request",
+          "contract": "HTTP 400 in the error envelope"
+        }
+      ]
+    },
+    {
+      "id": "12-REQ-5",
+      "title": "The unified query",
+      "rationale": "Two sources with separate clocks are the one place an ordering bug is invisible until someone reads a timeline that makes no sense.",
+      "criteria": [
+        {
+          "id": "12-REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "the unified query is requested",
+          "system": "Parley service",
+          "action": "return hub events and agent events together, newest first, comparing their times as instants",
+          "contract": "HTTP 200 with events, next_cursor and has_more; for interleaved hub and agent events the returned order is by instant descending, including across fractional seconds and differing stored precisions"
+        },
+        {
+          "id": "12-REQ-5.2",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "narrow the result by the documented filters, leaving agent events out when a hub-only filter is given and hub events out when a run filter is given",
+          "contract": "giving actor_id, actor_type, resource_type or action returns only hub events; giving run_id returns only agent events; source selects one of the two directly"
+        },
+        {
+          "id": "12-REQ-5.3",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "return the events of every workspace the caller owns or shares an organization with, whatever its status",
+          "contract": "events of an archived workspace the caller can see are returned; events of a workspace they cannot see are not; workspace-less events are returned to admin tokens only"
+        },
+        {
+          "id": "12-REQ-5.4",
+          "pattern": "unwanted",
+          "condition": "the unified query carries an invalid cursor or time, a start that is not before its end, or names a workspace the caller may not read",
+          "system": "Parley service",
+          "action": "refuse the request",
+          "contract": "HTTP 400 for the cursor, the time and the inverted period; HTTP 404 workspace not found for the workspace"
+        }
+      ]
+    },
+    {
+      "id": "12-REQ-6",
+      "title": "The transcript",
+      "rationale": "It is the one place a person reads an agent's conversation, assembled from records that were never written as one.",
+      "criteria": [
+        {
+          "id": "12-REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "a transcript is requested for a run and a node",
+          "system": "Parley service",
+          "action": "rebuild that node's conversation from its trace events, in order",
+          "contract": "HTTP 200 with the run, the node and the messages; a session init becomes a system message, an assistant message an assistant message, a tool use a tool_use message with its tool name, and a tool error a tool_error message; other trace types appear in no message"
+        },
+        {
+          "id": "12-REQ-6.2",
+          "pattern": "unwanted",
+          "condition": "a transcript is requested without a node",
+          "system": "Parley service",
+          "action": "refuse the request",
+          "contract": "HTTP 400 in the error envelope"
+        }
+      ]
+    },
+    {
+      "id": "12-REQ-7",
+      "title": "The live event stream",
+      "rationale": "A watcher that misses events, or that one component's writes never reach, is worse than no stream at all.",
+      "criteria": [
+        {
+          "id": "12-REQ-7.1",
+          "pattern": "event_driven",
+          "condition": "a client opens the event stream",
+          "system": "Parley service",
+          "action": "serve a server-sent event stream with a heartbeat at once and every 30 seconds after",
+          "contract": "HTTP 200 with Content-Type text/event-stream; a heartbeat frame arrives immediately and then at 30-second intervals; each event is delivered as its own frame"
+        },
+        {
+          "id": "12-REQ-7.2",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "close a connection with no reads for 60 seconds, and drop the oldest event when a client's buffer of 256 is full",
+          "contract": "a client that stops reading is disconnected after 60 seconds; a client 300 events behind receives the most recent 256 and loses the oldest, rather than the stream stalling or the service growing without bound"
+        },
+        {
+          "id": "12-REQ-7.3",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "fix the set of workspaces a stream may see when it opens",
+          "contract": "a user added to or removed from an organization during a stream sees no change in it; the change takes effect on the next connection"
+        },
+        {
+          "id": "12-REQ-7.4",
+          "pattern": "event_driven",
+          "condition": "any component of the deployment records an event for a workspace a stream is subscribed to",
+          "system": "Parley service",
+          "action": "deliver it to that stream",
+          "contract": "an event recorded by a component other than the one serving the stream reaches the subscriber, with no reconnection"
+        },
+        {
+          "id": "12-REQ-7.5",
+          "pattern": "unwanted",
+          "condition": "a stream names a workspace the caller may not read, or the configured limit of concurrent streams is reached",
+          "system": "Parley service",
+          "action": "refuse the connection",
+          "contract": "HTTP 404 workspace not found before the stream starts, and HTTP 503 at the connection limit; neither leaves a half-open stream"
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "12-PATH-1",
+      "title": "A hub operation is recorded and found again",
+      "steps": [
+        {
+          "actor": "API client",
+          "action": "archives a workspace"
+        },
+        {
+          "actor": "Parley service",
+          "action": "performs the archive and records one workspace archive event with the caller as actor"
+        },
+        {
+          "actor": "API client",
+          "action": "queries the unified audit filtered to that workspace"
+        },
+        {
+          "actor": "Parley service",
+          "action": "returns the event with its type, actor, resource and metadata"
+        }
+      ]
+    },
+    {
+      "id": "12-PATH-2",
+      "title": "An agent reports a run and it is read back",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "ingests a batch of trace events for a run, some repeating ids from an earlier batch"
+        },
+        {
+          "actor": "Parley service",
+          "action": "stores the new ones, counts the repeats as duplicates and reports both"
+        },
+        {
+          "actor": "agent",
+          "action": "submits the run's postmortem"
+        },
+        {
+          "actor": "API client",
+          "action": "lists the run's traces, reads the postmortem and reads one node's transcript"
+        },
+        {
+          "actor": "Parley service",
+          "action": "rebuilds the conversation from the stored traces and answers with its messages"
+        }
+      ]
+    },
+    {
+      "id": "12-PATH-3",
+      "title": "A watcher sees an event recorded elsewhere in the deployment",
+      "steps": [
+        {
+          "actor": "API client",
+          "action": "opens the event stream for a workspace and receives a heartbeat at once"
+        },
+        {
+          "actor": "Parley service",
+          "action": "records an event for that workspace in a different component from the one serving the stream"
+        },
+        {
+          "actor": "event bus",
+          "action": "carries the event to the component serving the stream"
+        },
+        {
+          "actor": "API client",
+          "action": "receives the event frame without reconnecting"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,286 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v2.json",
+  "spec_id": "12",
+  "spec_name": "audit_and_events",
+  "schema_version": 2,
+  "test_commands": {
+    "all_tests": "make test",
+    "linter": "make lint"
+  },
+  "dependencies": [
+    {
+      "spec": "01",
+      "reason": "uses its router, error envelope, metrics registry and platform interface pattern, which the event bus follows"
+    },
+    {
+      "spec": "02",
+      "reason": "records the acting credential's user and type as an event's actor"
+    },
+    {
+      "spec": "03",
+      "reason": "uses its access decision, and records the workspace and bound-token events its routes left ready"
+    },
+    {
+      "spec": "11",
+      "reason": "reuses its cursor pagination for every paged read here rather than writing a second one"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "kind": "implement",
+      "title": "Record the hub's own events from the routes that cause them",
+      "criteria": [
+        "12-REQ-1"
+      ],
+      "tests": [
+        "TS-12-1",
+        "TS-12-2",
+        "TS-12-3",
+        "TS-12-4"
+      ],
+      "steps": [
+        "Add this task's behaviours to the event recorder test files, and confirm they fail",
+        "Define the hub event table and the recorder, with a migration the second target runs too",
+        "Transcribe the API reference's two event tables into one declaration of type, resource type, action and metadata keys, and record from it rather than from each call site's own idea of the shape",
+        "Call the recorder from the routes of packages 03, 04, 07, 08, 09, 10 and 11 at the places they left for it, so each operation records exactly one event with exactly the listed metadata keys",
+        "Make a failure to record leave the causing request's answer unchanged",
+        "Record a bound token's refusal at most once per token per minute, counting those held back since that token's previous event",
+        "Mark events that belong to no workspace so that only an admin token is given them",
+        "Feed the audit counters of package 01's metrics registry"
+      ],
+      "touches": [
+        "src/audit/recorder.ts",
+        "src/audit/recorder.test.ts",
+        "src/audit/events_table.ts",
+        "src/audit/recorder.integration.test.ts",
+        "src/store/migrations/"
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 2,
+      "kind": "implement",
+      "title": "Ingest a run's events, outcomes, calls, errors and traces",
+      "criteria": [
+        "12-REQ-2"
+      ],
+      "tests": [
+        "TS-12-5",
+        "TS-12-6",
+        "TS-12-7",
+        "TS-12-8"
+      ],
+      "steps": [
+        "Add this task's behaviours to the ingestion test files, and confirm they fail",
+        "Define the per-run tables for events, session outcomes, tool calls, tool errors and traces, with a migration the second target runs too",
+        "Implement the five single-record routes, answering 201 with the record's identity and 200 for a repeated id without storing a second",
+        "Validate the run id's shape and every client timestamp, refusing a malformed one with 400 and storing nothing",
+        "Apply the ingestion access rule in order: the workspace exists, then it is not archived with 409 workspace_archived, then the caller owns it with 403 workspace_access_denied",
+        "Implement the two batch routes for 1 to 1000 items, accepting, deduplicating or rejecting each on its own and reporting the counts and the failing indices, with 400 for an empty array and 413 past 1000"
+      ],
+      "touches": [
+        "src/routes/ingest.ts",
+        "src/routes/ingest.test.ts",
+        "src/routes/ingest.integration.test.ts",
+        "src/audit/run_records.ts",
+        "src/store/migrations/"
+      ],
+      "depends_on": [
+        1
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 3,
+      "kind": "implement",
+      "title": "Store and serve a run's postmortem",
+      "criteria": [
+        "12-REQ-3"
+      ],
+      "tests": [
+        "TS-12-9",
+        "TS-12-10"
+      ],
+      "steps": [
+        "Add this task's behaviours to the postmortem test files, and confirm they fail",
+        "Store at most one postmortem per run, answering 201 for the first and 200 with the existing one for any later submit",
+        "Refuse a missing required field and an invalid run status or time with 400, and a schema version other than 1 with 422 unknown_schema_version",
+        "Serve the read, answering 404 with error_type postmortem_not_found for a run that has none"
+      ],
+      "touches": [
+        "src/routes/postmortem.ts",
+        "src/routes/postmortem.test.ts",
+        "src/routes/postmortem.integration.test.ts"
+      ],
+      "depends_on": [
+        2
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 4,
+      "kind": "implement",
+      "title": "Read a run's records",
+      "criteria": [
+        "12-REQ-4"
+      ],
+      "tests": [
+        "TS-12-11",
+        "TS-12-12",
+        "TS-12-13"
+      ],
+      "steps": [
+        "Add this task's behaviours to the run reads test files, and confirm they fail",
+        "Implement the five list routes with their documented filters, ordering and cursor paging, reusing the pagination facility of package 11",
+        "Default the order to newest first and the page size to 50, capping it at 500",
+        "Admit the owner, a member and an admin token whatever the workspace's status, answering 404 workspace not found to anyone else",
+        "Refuse an invalid run id, cursor or time bound with 400"
+      ],
+      "touches": [
+        "src/routes/run_reads.ts",
+        "src/routes/run_reads.test.ts",
+        "src/routes/run_reads.integration.test.ts",
+        "src/paging/page.ts"
+      ],
+      "depends_on": [
+        2
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 5,
+      "kind": "implement",
+      "title": "Query hub and agent events together",
+      "criteria": [
+        "12-REQ-5"
+      ],
+      "tests": [
+        "TS-12-14",
+        "TS-12-15",
+        "TS-12-16",
+        "TS-12-17"
+      ],
+      "steps": [
+        "Add this task's behaviours to the audit query test files, and confirm they fail",
+        "Return hub and agent events together, newest first, comparing their times as instants so the two sources interleave correctly across differing stored precisions",
+        "Apply the documented filters, letting a hub-only filter exclude agent events and a run filter exclude hub events",
+        "Return the events of every workspace the caller owns or shares an organization with, whatever its status, and workspace-less events to admin tokens only",
+        "Page the result with the facility of package 11, so reading to the end yields every event once",
+        "Refuse an invalid cursor or time and an inverted period with 400, and a workspace the caller may not read with 404"
+      ],
+      "touches": [
+        "src/routes/audit_query.ts",
+        "src/routes/audit_query.test.ts",
+        "src/routes/audit_query.integration.test.ts",
+        "src/audit/query.ts"
+      ],
+      "depends_on": [
+        1,
+        4
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 6,
+      "kind": "implement",
+      "title": "Rebuild a node's transcript",
+      "criteria": [
+        "12-REQ-6"
+      ],
+      "tests": [
+        "TS-12-18",
+        "TS-12-19"
+      ],
+      "steps": [
+        "Add this task's behaviours to the transcript test files, and confirm they fail",
+        "Rebuild one node's conversation from its trace events in order, mapping session init to a system message, an assistant message to an assistant message, a tool use to a tool_use message with its tool name and a tool error to a tool_error message",
+        "Leave trace types outside those four out of the transcript, and leave other nodes' traces out",
+        "Refuse a request with no node with 400"
+      ],
+      "touches": [
+        "src/routes/transcript.ts",
+        "src/routes/transcript.test.ts",
+        "src/routes/transcript.integration.test.ts"
+      ],
+      "depends_on": [
+        4
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 7,
+      "kind": "implement",
+      "title": "Stream events live across the deployment",
+      "criteria": [
+        "12-REQ-7"
+      ],
+      "tests": [
+        "TS-12-20",
+        "TS-12-21",
+        "TS-12-22",
+        "TS-12-23",
+        "TS-12-24"
+      ],
+      "steps": [
+        "Add this task's behaviours to the event stream test files, and confirm they fail",
+        "Define the event bus as a platform interface with a Cloudflare implementation and a non-Cloudflare one, and add its contract suite to the set package 01 established",
+        "Publish every recorded event to the bus and deliver it to the streams subscribed to its workspace, including streams served by another component",
+        "Serve the stream as server-sent events with a heartbeat at once and every 30 seconds after",
+        "Close a connection with no reads for 60 seconds, and buffer 256 events per client, dropping the oldest when full",
+        "Fix the stream's visible workspaces when it opens, so a membership change takes effect only on the next connection",
+        "Refuse a workspace the caller may not read with 404 before the stream starts, and the configured concurrent-stream limit with 503, leaving no half-open stream",
+        "Feed the open-stream gauge of package 01's metrics registry"
+      ],
+      "touches": [
+        "src/routes/events_stream.ts",
+        "src/routes/events_stream.test.ts",
+        "src/routes/events_stream.integration.test.ts",
+        "src/platform/eventbus.ts",
+        "src/platform/cloudflare/eventbus.ts",
+        "src/platform/local/eventbus.ts",
+        "src/platform/eventbus.contract.test.ts"
+      ],
+      "depends_on": [
+        1
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 8,
+      "kind": "integration",
+      "title": "Verify recording, ingestion and streaming against a running deployment",
+      "tests": [
+        "TS-12-25",
+        "TS-12-26",
+        "TS-12-27"
+      ],
+      "steps": [
+        "Add the three smoke tests and confirm each passes against a running deployment, or skips with a message naming what was missing",
+        "Trace 12-PATH-1: the archive of package 03 calls the recorder, the event reaches the relational store, and the unified query reads it back",
+        "Trace 12-PATH-2: the batch ingestion stores through the run tables, the postmortem through its own, and the transcript is rebuilt from the stored traces rather than from a fixture",
+        "Trace 12-PATH-3: an event recorded by one component reaches a stream served by another through the event bus, with both implementations of that interface",
+        "For every criterion carrying a contract, confirm a caller in production code consumes the producer's result and not only a test: the recorder is called by every event-bearing route of packages 03 to 11, the event table declaration by the recorder, the pagination facility of package 11 by every paged read here, and the event bus by the stream",
+        "Confirm by test that every event type named in the API reference's two tables is recorded by some production path, so no documented event is left unemitted",
+        "Grep src/audit/ and the files every task's touches lists for TODO, FIXME and the project's not-implemented marker, and remove any that remain",
+        "Add the audit conformance cases to the harness from package 01"
+      ],
+      "touches": [
+        "src/audit/audit.smoke.test.ts",
+        "conformance/audit.ts"
+      ],
+      "depends_on": [
+        3,
+        5,
+        6,
+        7
+      ],
+      "done_when": [
+        "`make check` passes with no network access and no deployment configured",
+        "every event type the API reference lists is recorded by a production path, proved by test",
+        "the audit, ingestion, transcript and stream routes answer as docs/prd/api.md specifies against a running deployment"
+      ],
+      "state": "pending"
+    }
+  ]
+}

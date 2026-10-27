@@ -1,0 +1,516 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/test_spec.v2.json",
+  "spec_id": "12",
+  "spec_name": "audit_and_events",
+  "schema_version": 2,
+  "tests": [
+    {
+      "id": "TS-12-1",
+      "kind": "integration",
+      "verifies": [
+        "12-REQ-1.1"
+      ],
+      "title": "Every operation in the event tables records exactly its documented event",
+      "given": [
+        "a deployment able to perform every operation the two event tables name"
+      ],
+      "when": "each operation is performed in turn and the recorded events are read",
+      "then": [
+        "each records exactly one event",
+        "each event's type and action match the table",
+        "each event's metadata keys are exactly those the table lists, with no extra key",
+        "the actor is the calling credential's user and type, or the system actor where the table says so"
+      ],
+      "pseudocode": "in the event recorder integration test file, driven from a table transcribed from the reference: perform(op); e = latest_event(); assert (e.event_type, e.action) == expected and set(e.metadata) == expected_keys"
+    },
+    {
+      "id": "TS-12-2",
+      "kind": "unit",
+      "verifies": [
+        "12-REQ-1.2"
+      ],
+      "title": "A failing recorder does not change any request's answer",
+      "given": [
+        "an event recorder made to raise on every call"
+      ],
+      "when": "a representative operation from each event-recording package is performed, successfully and in a refused form",
+      "then": [
+        "every status and body matches the answer given with the recorder working",
+        "no request fails because of the recorder"
+      ],
+      "pseudocode": "in the event recorder test file: for op in OPS: a = run(op, recorder=ok); b = run(op, recorder=raising); assert a.status == b.status and a.json == b.json"
+    },
+    {
+      "id": "TS-12-3",
+      "kind": "integration",
+      "verifies": [
+        "12-REQ-1.3"
+      ],
+      "title": "A bound token's refusals are recorded at most once a minute with the rest counted",
+      "given": [
+        "a bound token and a controllable clock"
+      ],
+      "when": "the token is refused twenty times within a minute, then once more after the minute has passed",
+      "then": [
+        "exactly one event is recorded for the first twenty",
+        "its suppressed count is nineteen",
+        "the refusal after the minute records a second event"
+      ],
+      "pseudocode": "in the event recorder integration test file: for _ in range(20): refuse(); assert len(events()) == 1 and events()[0].metadata.suppressed == 19; clock.advance(61); refuse(); assert len(events()) == 2"
+    },
+    {
+      "id": "TS-12-4",
+      "kind": "unit",
+      "verifies": [
+        "12-REQ-1.4"
+      ],
+      "title": "Workspace-less events reach admin tokens only",
+      "given": [
+        "recorded events that belong to no workspace and events of a workspace the caller owns"
+      ],
+      "when": "the unified query and the stream are read by a user and by an admin token",
+      "then": [
+        "the user receives only the workspace events",
+        "the admin token receives both",
+        "the same holds for the stream"
+      ],
+      "pseudocode": "in the audit query test file: assert all(e.workspace for e in query(user)) and any(not e.workspace for e in query(admin))"
+    },
+    {
+      "id": "TS-12-5",
+      "kind": "integration",
+      "verifies": [
+        "12-REQ-2.1",
+        "12-REQ-2.2"
+      ],
+      "title": "Each per-run record is ingested once and a repeat is a duplicate",
+      "given": [
+        "a workspace the caller owns and a valid run id"
+      ],
+      "when": "an audit event, a session outcome, a tool call, a tool error and a trace event are each ingested, and each is then ingested again with the same id",
+      "then": [
+        "each first ingestion answers 201 with the record's identity",
+        "each repeat answers 200 and stores no second record",
+        "each record is afterwards returned by its run's list route"
+      ],
+      "pseudocode": "in the ingestion integration test file, table over the five record kinds asserting 201 then 200 and a count of one"
+    },
+    {
+      "id": "TS-12-6",
+      "kind": "unit",
+      "verifies": [
+        "12-REQ-2.3"
+      ],
+      "title": "Malformed run ids, timestamps and fields are refused",
+      "given": [
+        "a workspace the caller owns"
+      ],
+      "when": "ingestions are made with a run id of the wrong shape, with uppercase hex, with a malformed timestamp, with an invalid severity, and with a required field missing",
+      "then": [
+        "each answers 400",
+        "no record is stored for any of them",
+        "a batch's failing item is reported by its index while the others are stored"
+      ],
+      "pseudocode": "in the ingestion test file, table over the malformed inputs asserting 400 and the stored count"
+    },
+    {
+      "id": "TS-12-7",
+      "kind": "unit",
+      "verifies": [
+        "12-REQ-2.4"
+      ],
+      "title": "Ingestion checks the workspace, then that it is not archived, then ownership",
+      "given": [
+        "an owned active workspace, an owned archived one, a workspace the caller is only a member of, one they cannot see, and a slug naming nothing"
+      ],
+      "when": "each ingestion route is called against each, including a member against an archived workspace",
+      "then": [
+        "the unknown and invisible workspaces answer 404",
+        "the archived workspace answers 409 workspace_archived, including for a member, because the status is checked before ownership",
+        "a member or stranger of an active workspace answers 403 workspace_access_denied, not 404",
+        "no record is stored for any refusal"
+      ],
+      "pseudocode": "in the ingestion test file, table over (caller, workspaceStatus, expectedStatus, expectedErrorType)"
+    },
+    {
+      "id": "TS-12-8",
+      "kind": "integration",
+      "verifies": [
+        "12-REQ-2.5"
+      ],
+      "title": "A batch reports accepted, duplicate and failing items separately",
+      "given": [
+        "a run with some records already ingested"
+      ],
+      "when": "a batch of 100 items is sent of which 3 repeat existing ids and 2 are malformed, then an empty array, then a batch of 1001 items",
+      "then": [
+        "the batch answers 200 with 95 accepted, 3 duplicates and 2 errors naming their indices",
+        "the 95 valid items are stored despite the failures",
+        "the empty array answers 400 and the oversized batch answers 413"
+      ],
+      "pseudocode": "in the ingestion integration test file: r = post(batch); assert (r.json.accepted, r.json.duplicates, len(r.json.errors)) == (95, 3, 2)"
+    },
+    {
+      "id": "TS-12-9",
+      "kind": "integration",
+      "verifies": [
+        "12-REQ-3.1",
+        "12-REQ-3.2"
+      ],
+      "title": "A run has exactly one postmortem",
+      "given": [
+        "a run with no postmortem"
+      ],
+      "when": "a postmortem is submitted and then a different one is submitted for the same run",
+      "then": [
+        "the first answers 201 with the run id, the run status and the time stored",
+        "the second answers 200",
+        "the stored postmortem is the first one"
+      ],
+      "pseudocode": "in the postmortem integration test file: a = post(pm1); b = post(pm2); assert a.status == 201 and b.status == 200 and get(pm).json.run_status == pm1.run_status"
+    },
+    {
+      "id": "TS-12-10",
+      "kind": "unit",
+      "verifies": [
+        "12-REQ-3.3",
+        "12-REQ-3.4"
+      ],
+      "title": "A malformed postmortem is refused and a missing one is reported",
+      "given": [
+        "a run with no postmortem"
+      ],
+      "when": "postmortems are submitted with a missing required field, an invalid run status, an invalid time and a schema version of 2, and the postmortem of a run without one is read",
+      "then": [
+        "the missing field and the invalid status and time answer 400",
+        "the schema version answers 422 with error_type unknown_schema_version",
+        "the read answers 404 with error_type postmortem_not_found",
+        "nothing is stored"
+      ],
+      "pseudocode": "in the postmortem test file, table over the four submissions plus the read asserting the statuses and error types"
+    },
+    {
+      "id": "TS-12-11",
+      "kind": "integration",
+      "verifies": [
+        "12-REQ-4.1"
+      ],
+      "title": "A run's records are listed with their filters and paging",
+      "given": [
+        "a run with records of each kind across several nodes, sessions, types and times"
+      ],
+      "when": "each list route is read with no filter, with each documented filter, in both orders, and with page sizes of 1, 50 and 501",
+      "then": [
+        "each answers 200 with its named collection, next_cursor and has_more",
+        "the default order is newest first and the default page size 50, capped at 500",
+        "each filter narrows the result to the matching records"
+      ],
+      "pseudocode": "in the run reads integration test file, table over (route, filter) asserting the returned ids"
+    },
+    {
+      "id": "TS-12-12",
+      "kind": "unit",
+      "verifies": [
+        "12-REQ-4.2"
+      ],
+      "title": "A run's records are readable by the owner, a member and an admin token whatever the status",
+      "given": [
+        "an active and an archived workspace with run records, and the owner, a member, a stranger and an admin token"
+      ],
+      "when": "each list route is read by each caller against each workspace",
+      "then": [
+        "the owner, the member and the admin token are served for both workspaces",
+        "the stranger is answered 404 workspace not found"
+      ],
+      "pseudocode": "in the run reads test file, table over (caller, workspaceStatus, expected)"
+    },
+    {
+      "id": "TS-12-13",
+      "kind": "unit",
+      "verifies": [
+        "12-REQ-4.3"
+      ],
+      "title": "A run read with a bad run id, cursor or time is refused",
+      "given": [
+        "a readable workspace"
+      ],
+      "when": "each list route is read with a malformed run id, an invalid cursor, a malformed since and an until before the since",
+      "then": [
+        "each answers 400 in the error envelope"
+      ],
+      "pseudocode": "in the run reads test file, table over (route, badParameter) asserting 400"
+    },
+    {
+      "id": "TS-12-14",
+      "kind": "integration",
+      "verifies": [
+        "12-REQ-5.1"
+      ],
+      "title": "Hub and agent events interleave by instant",
+      "given": [
+        "hub events and agent events recorded alternately, some within the same second and with differing fractional precision"
+      ],
+      "when": "the unified query is read and paged to the end",
+      "then": [
+        "the events are returned newest first by instant across both sources",
+        "events of the same second are ordered by their fractional parts",
+        "paging to the end yields every event exactly once"
+      ],
+      "pseudocode": "in the audit query integration test file: all = read_all_pages(); assert [e.timestamp for e in all] == sorted(timestamps, reverse=True)"
+    },
+    {
+      "id": "TS-12-15",
+      "kind": "unit",
+      "verifies": [
+        "12-REQ-5.2"
+      ],
+      "title": "A source-specific filter excludes the other source",
+      "given": [
+        "hub events and agent events for one workspace"
+      ],
+      "when": "the query is read with source hub, source agent, actor_id, actor_type, resource_type, action, run_id, event_type and event_type_prefix",
+      "then": [
+        "actor_id, actor_type, resource_type and action return only hub events",
+        "run_id returns only agent events",
+        "source selects one source directly",
+        "event_type and its prefix narrow within whichever sources remain"
+      ],
+      "pseudocode": "in the audit query test file, table over (filter, expectedSources)"
+    },
+    {
+      "id": "TS-12-16",
+      "kind": "integration",
+      "verifies": [
+        "12-REQ-5.3"
+      ],
+      "title": "The query returns the caller's workspaces whatever their status",
+      "given": [
+        "events of a workspace the caller owns, one of an archived workspace they own, one of a workspace they share an organization with, one of a workspace they cannot see, and workspace-less events"
+      ],
+      "when": "the query is read by the user and by an admin token",
+      "then": [
+        "the user receives the owned, archived and shared workspaces' events",
+        "the user receives neither the invisible workspace's nor the workspace-less events",
+        "the admin token receives all of them"
+      ],
+      "pseudocode": "in the audit query integration test file: assert workspaces(query(user)) == {owned, archived, shared}"
+    },
+    {
+      "id": "TS-12-17",
+      "kind": "unit",
+      "verifies": [
+        "12-REQ-5.4"
+      ],
+      "title": "A bad query is refused",
+      "given": [
+        "a readable workspace and one the caller cannot read"
+      ],
+      "when": "the query is read with an invalid cursor, a malformed time, a since equal to and after the until, and naming the unreadable workspace",
+      "then": [
+        "the cursor, the time and the inverted period answer 400",
+        "the unreadable workspace answers 404 workspace not found"
+      ],
+      "pseudocode": "in the audit query test file, table over the four cases asserting the status"
+    },
+    {
+      "id": "TS-12-18",
+      "kind": "integration",
+      "verifies": [
+        "12-REQ-6.1"
+      ],
+      "title": "A transcript is rebuilt from a node's traces",
+      "given": [
+        "a run whose node has trace events of every type, in a known order, plus traces of another node"
+      ],
+      "when": "the transcript is requested for that node",
+      "then": [
+        "the messages are in the traces' order",
+        "a session init is a system message, an assistant message an assistant message, a tool use a tool_use message with its tool name, and a tool error a tool_error message",
+        "trace types outside those four produce no message",
+        "the other node's traces do not appear"
+      ],
+      "pseudocode": "in the transcript integration test file: r = get(transcript, node_id=n); assert [m.role for m in r.json.messages] == expected"
+    },
+    {
+      "id": "TS-12-19",
+      "kind": "unit",
+      "verifies": [
+        "12-REQ-6.2"
+      ],
+      "title": "A transcript without a node is refused",
+      "given": [
+        "a run with traces"
+      ],
+      "when": "the transcript is requested with no node and with an empty node",
+      "then": [
+        "each answers 400 in the error envelope"
+      ],
+      "pseudocode": "in the transcript test file: assert get(transcript).status == 400 and get(transcript, node_id='').status == 400"
+    },
+    {
+      "id": "TS-12-20",
+      "kind": "integration",
+      "verifies": [
+        "12-REQ-7.1"
+      ],
+      "title": "The stream opens with a heartbeat and keeps beating",
+      "given": [
+        "a readable workspace and a controllable clock"
+      ],
+      "when": "a client opens the stream and waits past two heartbeat intervals while an event is recorded",
+      "then": [
+        "the response is 200 with Content-Type text/event-stream",
+        "a heartbeat frame arrives immediately",
+        "further heartbeats arrive at 30-second intervals",
+        "the recorded event arrives as its own frame"
+      ],
+      "pseudocode": "in the event stream integration test file: s = open(stream); assert s.next().event == 'heartbeat'; clock.advance(30); assert s.next().event == 'heartbeat'"
+    },
+    {
+      "id": "TS-12-21",
+      "kind": "integration",
+      "verifies": [
+        "12-REQ-7.2"
+      ],
+      "title": "A silent client is disconnected and a slow one loses the oldest events",
+      "given": [
+        "a client that stops reading, and one that reads slowly while 300 events are recorded"
+      ],
+      "when": "60 seconds pass for the first, and the second is allowed to drain",
+      "then": [
+        "the silent client's connection is closed after 60 seconds",
+        "the slow client receives the most recent 256 events and loses the oldest",
+        "the service's memory does not grow without bound in either case"
+      ],
+      "pseudocode": "in the event stream integration test file: stop_reading(); clock.advance(61); assert closed(s); assert len(drain(slow)) == 256"
+    },
+    {
+      "id": "TS-12-22",
+      "kind": "integration",
+      "verifies": [
+        "12-REQ-7.3"
+      ],
+      "title": "A stream's visible workspaces are fixed when it opens",
+      "given": [
+        "a user streaming the events of the organizations they belong to"
+      ],
+      "when": "the user is added to another organization and removed from one, while the stream is open, and events are recorded for both",
+      "then": [
+        "the open stream's visible set does not change",
+        "a new connection reflects the new membership"
+      ],
+      "pseudocode": "in the event stream integration test file: s = open(stream); change_membership(); assert visible(s) == before; assert visible(open(stream)) == after"
+    },
+    {
+      "id": "TS-12-23",
+      "kind": "integration",
+      "verifies": [
+        "12-REQ-7.4"
+      ],
+      "title": "An event recorded by another component reaches the stream",
+      "given": [
+        "two instances of the service over one platform, with a stream served by the first"
+      ],
+      "when": "the second instance records an event for the subscribed workspace",
+      "then": [
+        "the subscriber receives the event",
+        "it does so without reconnecting",
+        "the same holds with the two instances swapped"
+      ],
+      "pseudocode": "in the event stream integration test file: s = instanceA.open(stream); instanceB.record(event); assert s.next().data.id == event.id"
+    },
+    {
+      "id": "TS-12-24",
+      "kind": "unit",
+      "verifies": [
+        "12-REQ-7.5"
+      ],
+      "title": "An unreadable workspace and the connection limit are refused",
+      "given": [
+        "a workspace the caller cannot read and a service at its configured stream limit"
+      ],
+      "when": "a stream is opened for the unreadable workspace and another at the limit",
+      "then": [
+        "the unreadable workspace answers 404 before any frame is sent",
+        "the limit answers 503",
+        "neither leaves a half-open stream"
+      ],
+      "pseudocode": "in the event stream test file: assert open(stream, foreign).status == 404 and open(stream).status == 503 at the limit"
+    },
+    {
+      "id": "TS-12-25",
+      "kind": "smoke",
+      "verifies": [
+        "12-PATH-1"
+      ],
+      "title": "An archive is recorded and found through the query",
+      "given": [
+        "a running deployment and a ready workspace"
+      ],
+      "when": "the workspace is archived and the unified query is read for it",
+      "then": [
+        "the archive succeeds",
+        "exactly one workspace archive event is returned, with the caller as actor",
+        "its metadata keys are those the reference lists"
+      ],
+      "pseudocode": "in the audit smoke test file: post(archive); e = query(workspace=slug).json.events[0]; assert e.event_type == 'hub.workspace.archive'",
+      "real_components": [
+        "running deployment",
+        "workspace routes",
+        "event recorder",
+        "audit query",
+        "relational store"
+      ]
+    },
+    {
+      "id": "TS-12-26",
+      "kind": "smoke",
+      "verifies": [
+        "12-PATH-2"
+      ],
+      "title": "A run is ingested and read back against a running deployment",
+      "given": [
+        "a running deployment and a workspace the caller owns"
+      ],
+      "when": "a batch of traces with some repeated ids is ingested, a postmortem is submitted, and the traces, the postmortem and one node's transcript are read",
+      "then": [
+        "the batch reports the accepted and duplicate counts",
+        "the postmortem is returned as submitted",
+        "the transcript's messages are rebuilt from the ingested traces in order"
+      ],
+      "pseudocode": "in the audit smoke test file: post(traces_batch); post(postmortem); assert get(transcript, node_id=n).json.messages",
+      "real_components": [
+        "running deployment",
+        "ingestion routes",
+        "run read routes",
+        "transcript",
+        "relational store"
+      ]
+    },
+    {
+      "id": "TS-12-27",
+      "kind": "smoke",
+      "verifies": [
+        "12-PATH-3"
+      ],
+      "title": "A watcher receives an event recorded elsewhere in the deployment",
+      "given": [
+        "a running deployment serving more than one instance, and a readable workspace"
+      ],
+      "when": "a stream is opened for the workspace and an operation on another instance records an event for it",
+      "then": [
+        "the stream delivers a heartbeat at once",
+        "the event arrives as its own frame without reconnection",
+        "the event's id matches the one recorded"
+      ],
+      "pseudocode": "in the audit smoke test file: s = open(stream); trigger_event_elsewhere(); assert s.next_event().id == recorded.id",
+      "real_components": [
+        "running deployment",
+        "event stream",
+        "event bus",
+        "event recorder",
+        "relational store"
+      ]
+    }
+  ]
+}

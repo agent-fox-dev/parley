@@ -1,0 +1,291 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v2.json",
+  "spec_id": "13",
+  "spec_name": "forge_api",
+  "schema_version": 2,
+  "test_commands": {
+    "all_tests": "make test",
+    "linter": "make lint"
+  },
+  "dependencies": [
+    {
+      "spec": "01",
+      "reason": "uses its router and error envelope"
+    },
+    {
+      "spec": "02",
+      "reason": "checks the caller's forge scopes through its scope registry"
+    },
+    {
+      "spec": "03",
+      "reason": "uses its workspace record, its access decision and the two forge API URL settings"
+    },
+    {
+      "spec": "05",
+      "reason": "resolves the origin and upstream credentials through its credential resolution"
+    },
+    {
+      "spec": "12",
+      "reason": "records one forge write event through its recorder for every write that reached the forge"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "kind": "implement",
+      "title": "Work out which forge to reach and how",
+      "criteria": [
+        "13-REQ-1"
+      ],
+      "tests": [
+        "TS-13-1",
+        "TS-13-2",
+        "TS-13-3",
+        "TS-13-4",
+        "TS-13-5",
+        "TS-13-6"
+      ],
+      "steps": [
+        "Confirm against GitHub's and GitLab's current documentation the paths and payload shapes for issues, comments, labels, pull requests, files, checks and reviews, the rate-limit headers each returns, and the two body limits, and record any divergence from this package's requirements",
+        "Add this task's behaviours to the forge target and forge client test files, and confirm they fail",
+        "Read the repository's host, owner and name from an https, ssh or scp-style URL, removing the .git suffix and any userinfo and keeping a GitLab subgroup path as the owner",
+        "Identify the forge from the host or from an API URL setting naming one, derive the API URL from the setting or the host's default, and append GitLab's version suffix where it is missing",
+        "Refuse with 422 forge_unknown when neither the host nor a setting tells the forge, or the remote URL names no repository, without contacting anything",
+        "Resolve the credential through package 05 for the chosen target, sending the workspace's and never the caller's, and never an environment token on a write",
+        "Make the upstream target use the upstream URL, credential and API URL setting with no fallback to the origin's setting, refusing another workspace with 400 workspace_mode_mismatch and an unknown target value with 400",
+        "Resolve the forge, the API URL and the credential afresh on every call, and give every outbound request the hub's user agent, a refusal of any cross-host redirect and a 30-second deadline covering retries"
+      ],
+      "touches": [
+        "src/forge/target.ts",
+        "src/forge/target.test.ts",
+        "src/forge/client.ts",
+        "src/forge/client.integration.test.ts",
+        "docs/adr/"
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 2,
+      "kind": "implement",
+      "title": "Order the checks of the read and write routes",
+      "criteria": [
+        "13-REQ-7"
+      ],
+      "tests": [
+        "TS-13-24",
+        "TS-13-25",
+        "TS-13-26"
+      ],
+      "steps": [
+        "Add this task's behaviours to the forge order test file, and confirm they fail",
+        "Order a read route's checks: the credential, a PAT's forge scope before the workspace is looked up, the workspace, the target, the path and query parameters, then the forge and its client",
+        "Order a write route's checks: the credential, a PAT's forge:write scope before the workspace, the workspace with a member refused 403 forbidden, that the workspace is not archived, the request, the forge and its client, then the body limit",
+        "Make a PAT lacking the scope answer 403 naming the scope even for a slug that names nothing",
+        "Make an oversized body on a workspace whose forge cannot be identified answer 422 forge_unknown rather than 413",
+        "Confirm that every refusal at any step sends nothing to the forge and records no event"
+      ],
+      "touches": [
+        "src/forge/guard.ts",
+        "src/forge/guard.test.ts",
+        "src/routes/forge.ts"
+      ],
+      "depends_on": [
+        1
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 3,
+      "kind": "implement",
+      "title": "Describe how the forge is reached",
+      "criteria": [
+        "13-REQ-2"
+      ],
+      "tests": [
+        "TS-13-7",
+        "TS-13-8"
+      ],
+      "steps": [
+        "Add this task's behaviours to the forge status test files, and confirm they fail",
+        "Serve the description route with the forge, the API URL, the repository, the credential's kind and the upstream's equivalent, contacting the forge not at all",
+        "Report an unclassifiable host as unknown with a null API URL rather than refusing, and serve the route for an archived workspace",
+        "Report the webhook block from the workspace's secret and the delivery log: whether it is configured, where the forge should post or null, and when the last delivery arrived, never the secret",
+        "Refuse an API URL setting that is not an absolute https URL with a host and without userinfo, query or fragment with 422 forge_api_url_invalid, naming the setting and the rule and not the value",
+        "Answer 500 with no partial body when the secrets store or the delivery log cannot be read"
+      ],
+      "touches": [
+        "src/routes/forge_status.ts",
+        "src/routes/forge_status.test.ts",
+        "src/routes/forge_status.integration.test.ts"
+      ],
+      "depends_on": [
+        2
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 4,
+      "kind": "implement",
+      "title": "Serve the nine read routes",
+      "criteria": [
+        "13-REQ-3"
+      ],
+      "tests": [
+        "TS-13-9",
+        "TS-13-10",
+        "TS-13-11",
+        "TS-13-12"
+      ],
+      "steps": [
+        "Add this task's behaviours to the forge reads test files, and confirm they fail",
+        "Implement the repository, issue list, issue thread, comments, pull request, state, files, checks and reviews routes for GitHub and GitLab, mapping each forge's payload onto the documented type",
+        "Return every list as a bare array, empty rather than null, and serve the reads for an archived workspace",
+        "Send an issue-list parameter only when the caller gave it, always sending the limit with its default of 30, and dropping empty items from a labels value",
+        "Report an issue thread's truncation, and answer 200 with the issue and the comments' scrubbed error when the comments alone could not be read",
+        "Refuse a path number that is not a positive decimal integer, and a bad, empty or repeated query value, with 400 naming the parameter and contacting the forge not at all"
+      ],
+      "touches": [
+        "src/routes/forge_reads.ts",
+        "src/routes/forge_reads.test.ts",
+        "src/routes/forge_reads.integration.test.ts",
+        "src/forge/github.ts",
+        "src/forge/gitlab.ts",
+        "src/forge/types.ts"
+      ],
+      "depends_on": [
+        2
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 5,
+      "kind": "implement",
+      "title": "Serve the nine write routes",
+      "criteria": [
+        "13-REQ-4"
+      ],
+      "tests": [
+        "TS-13-13",
+        "TS-13-14",
+        "TS-13-15",
+        "TS-13-16",
+        "TS-13-17",
+        "TS-13-18"
+      ],
+      "steps": [
+        "Add this task's behaviours to the forge writes test files, and confirm they fail",
+        "Implement the issue create and update, the close, the issue and pull request comments, the label add and remove, the label create and the pull request create, for both forges, answering each entry's documented status",
+        "Change on an issue update only the fields given, replacing the whole label and assignee sets, clearing a body given as empty, and refusing a body that names nothing with 400 nothing to update, including a GitLab update naming only assignees",
+        "Post a close's non-blank comment first and close only if it succeeded, leaving the issue open on a refused comment and recording the comment's URL even when the close then failed",
+        "Answer a label removal 204 whether or not the issue had the label, re-reading the issue once when the forge answers not found and answering 404 forge_not_found only if it is gone, taking the name from the last path segment decoded exactly once",
+        "Answer a label create 200 for a label that exists without changing it, 201 for one created, and re-read once when the create is refused by a race",
+        "Send a pull request's head exactly as given and keep no idempotency key",
+        "Record one forge write event through package 12's recorder for every write that reached the forge, successful or not, and none for one refused before"
+      ],
+      "touches": [
+        "src/routes/forge_writes.ts",
+        "src/routes/forge_writes.test.ts",
+        "src/routes/forge_writes.integration.test.ts",
+        "src/forge/github.ts",
+        "src/forge/gitlab.ts"
+      ],
+      "depends_on": [
+        4
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 6,
+      "kind": "implement",
+      "title": "Measure the body-like fields",
+      "criteria": [
+        "13-REQ-5"
+      ],
+      "tests": [
+        "TS-13-19"
+      ],
+      "steps": [
+        "Add this task's behaviours to the forge writes test file, and confirm they fail",
+        "Measure the four body-like fields in Unicode code points against the forge's limit, 65536 on GitHub and 1000000 on GitLab",
+        "Refuse a field over the limit with 413 body_too_large, naming the field's length and the limit, sending nothing and recording no event",
+        "Leave titles, heads, bases, label names and descriptions and assignee names unmeasured, so the forge's own refusal is answered like any other",
+        "Apply the limit after the forge has been identified, as the check order requires"
+      ],
+      "touches": [
+        "src/forge/body_limits.ts",
+        "src/forge/body_limits.test.ts",
+        "src/routes/forge_writes.ts"
+      ],
+      "depends_on": [
+        5
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 7,
+      "kind": "implement",
+      "title": "Map every forge failure onto its documented answer",
+      "criteria": [
+        "13-REQ-6"
+      ],
+      "tests": [
+        "TS-13-20",
+        "TS-13-21",
+        "TS-13-22",
+        "TS-13-23"
+      ],
+      "steps": [
+        "Add this task's behaviours to the forge failures test files, and confirm they fail",
+        "Map the forge's statuses and transport failures onto the reference's table: 404 forge_not_found, 502 forge_unauthenticated, 502 forge_forbidden, 422 forge_rejected, 502 forge_error, 502 forge_unreachable and 504 forge_timeout",
+        "Carry the forge's message through with the token replaced, URL userinfo removed and the text cut to 1024 bytes, adding the stored-token hint to a 401 for a basic credential",
+        "Answer a write prevented by a missing credential with 502 forge_error, sending nothing and recording no event",
+        "Wait out a rate-limit backoff of up to 120 seconds and retry once, answering 429 forge_rate_limited with Retry-After in whole seconds rounded up where the wait is known, and 504 forge_timeout where the deadline cuts the wait short",
+        "Confirm by test that no response and no recorded event carries the credential or any URL's userinfo"
+      ],
+      "touches": [
+        "src/forge/failures.ts",
+        "src/forge/failures.test.ts",
+        "src/forge/failures.integration.test.ts",
+        "src/forge/client.ts"
+      ],
+      "depends_on": [
+        5
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 8,
+      "kind": "integration",
+      "title": "Verify reading, writing and failing against a running deployment",
+      "tests": [
+        "TS-13-27",
+        "TS-13-28",
+        "TS-13-29"
+      ],
+      "steps": [
+        "Add the three smoke tests and confirm each passes against a running deployment with a real or stubbed forge and the real afc binary, or skips with a message naming what was missing",
+        "Trace 13-PATH-1: the read routes resolve the forge and the workspace's credential through packages 03 and 05 for each call, and the label write records one event through package 12's recorder",
+        "Trace 13-PATH-2: the upstream target reaches the upstream repository with the upstream credential and the upstream API URL setting, with no fallback to the origin's",
+        "Trace 13-PATH-3: the forge's 401 reaches the failure mapping, the scrubbed message reaches the response and the event, and the credential reaches neither",
+        "For every criterion carrying a contract, confirm a caller in production code consumes the producer's result and not only a test: the forge resolution is called by all eighteen routes, the credential resolution of package 05 by the client, the body limits by the writes, and the recorder of package 12 by every write that reached the forge",
+        "Confirm by test that every write that reached the forge recorded exactly one event and every refusal recorded none",
+        "Grep src/forge/ and the files every task's touches lists for TODO, FIXME and the project's not-implemented marker, and remove any that remain",
+        "Add the forge conformance cases to the harness from package 01"
+      ],
+      "touches": [
+        "src/forge/forge.smoke.test.ts",
+        "conformance/forge.ts"
+      ],
+      "depends_on": [
+        3,
+        6,
+        7
+      ],
+      "done_when": [
+        "`make check` passes with no network access and no deployment configured",
+        "afc forge status, afc issue, afc pr and afc label behave as docs/prd/cli.md specifies against a running deployment"
+      ],
+      "state": "pending"
+    }
+  ]
+}
