@@ -18,6 +18,7 @@ implemented; routes appear here as they are built.
 - [The caller's profile](#the-callers-profile)
 - [API keys](#api-keys)
 - [Personal access tokens](#personal-access-tokens)
+- [Organizations](#organizations)
 - [Server Endpoints](#server-endpoints)
 
 ## Conventions
@@ -346,6 +347,33 @@ refuse an empty array.
 | 400    | `permissions` absent or null; an empty array on `PATCH` or `DELETE`; a retired or unregistered scope; the token is already revoked |
 | 403    | A token adding a scope it does not hold                                                                                            |
 | 404    | No such token, or it is not the caller's                                                                                           |
+
+## Organizations
+
+An organization is read by its **id**. A user gets a personal one at first
+sign-in, and it is listed with any other they belong to.
+
+### GET /api/v1/user/orgs
+
+**Access:** `orgs:read`.
+
+**Response:** `200 OK` with one entry per organization the caller belongs
+to — `id`, `name`, `slug`, `url`, `owner_id`, `status`, `created_at`,
+`updated_at`. An admin token belongs to no user, so it is answered with an
+empty array.
+
+### GET /api/v1/orgs/:id
+
+**Access:** `orgs:read`, and the caller must be a member or an
+administrator.
+
+**Response:** `200 OK` with the organization and an `ETag`; `304` with no
+body when the client's `If-None-Match` still matches.
+
+| Status | Condition                                              |
+| ------ | ------------------------------------------------------ |
+| 403    | The organization exists and the caller is not a member |
+| 404    | No organization has that id                            |
 
 ## Server Endpoints
 

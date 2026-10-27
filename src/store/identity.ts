@@ -292,6 +292,27 @@ export async function replaceApiKeys(
   ]);
 }
 
+export async function findOrg(store: RelationalStore, id: string): Promise<OrgRecord | undefined> {
+  const rows = await store.all('SELECT * FROM orgs WHERE id = ?', [id]);
+  return rows[0] === undefined ? undefined : toOrg(rows[0]);
+}
+
+/**
+ * Whether a user belongs to an organization. The workspace access check of
+ * the later packages reads this on every request that names a workspace.
+ */
+export async function isMember(
+  store: RelationalStore,
+  orgId: string,
+  userId: string,
+): Promise<boolean> {
+  const rows = await store.all(
+    'SELECT 1 AS present FROM org_members WHERE org_id = ? AND user_id = ?',
+    [orgId, userId],
+  );
+  return rows.length > 0;
+}
+
 /** The organizations a user belongs to, read on every workspace decision. */
 export async function orgsOfUser(store: RelationalStore, userId: string): Promise<OrgRecord[]> {
   const rows = await store.all(

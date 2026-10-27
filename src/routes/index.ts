@@ -3,6 +3,7 @@ import type { ProviderDirectory } from '../auth/oauth.js';
 import type { Clock, MetricsSink, RelationalStore } from '../platform/index.js';
 import { authRoutes } from './auth.js';
 import { keyRoutes } from './keys.js';
+import { orgRoutes } from './orgs.js';
 import { tokenPermissionRoutes } from './token_permissions.js';
 import { tokenRoutes } from './tokens.js';
 import { userRoutes } from './user.js';
@@ -46,5 +47,6 @@ export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
       store: config.store,
       clock: config.clock,
     }),
+    ...orgRoutes({ mountPoint: config.mountPoint, store: config.store }),
   ];
 }
