@@ -109,3 +109,58 @@ describe('an unexpected failure while answering', () => {
     expect(records.some((record) => record.includes(sentinel))).toBe(true);
   });
 });
+
+describe('the request body limit', () => {
+  const DEFAULT_LIMIT = 1_048_576;
+
+  it.each([
+    ['at the configured limit', 1024, 1024, true],
+    ['one byte over the configured limit', 1024, 1025, false],
+    ['far over the configured limit', 1024, 64_000, false],
+    ['empty', 1024, 0, true],
+    ['at the default limit', undefined, DEFAULT_LIMIT, true],
+    ['one byte over the default limit', undefined, DEFAULT_LIMIT + 1, false],
+  ])('answers a body %s', async (_name, maxBodyBytes, size, accepted) => {
+    const handler = vi.fn(() => new Response('served'));
+    const app = buildApp({
+      ...(maxBodyBytes === undefined ? {} : { maxBodyBytes }),
+      routes: [{ path: '/t', handler, methods: ['POST'] }],
+    });
+
+    const response = await app.request('/t', { method: 'POST', body: 'x'.repeat(size) });
+
+    if (accepted) {
+      expect(response.status).not.toBe(413);
+      expect(handler).toHaveBeenCalledTimes(1);
+    } else {
+      const body = (await response.json()) as { error: { code: number; message: string } };
+      expect(response.status).toBe(413);
+      expect(body.error.code).toBe(413);
+      expect(body.error.message.length).toBeGreaterThan(0);
+      expect(handler).not.toHaveBeenCalled();
+    }
+  });
+
+  it('refuses an over-sized body sent without a content length', async () => {
+    const handler = vi.fn(() => new Response('served'));
+    const app = buildApp({
+      maxBodyBytes: 64,
+      routes: [{ path: '/t', handler, methods: ['POST'] }],
+    });
+
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('x'.repeat(256)));
+        controller.close();
+      },
+    });
+    const response = await app.request('/t', {
+      method: 'POST',
+      body: stream,
+      duplex: 'half',
+    } as RequestInit);
+
+    expect(response.status).toBe(413);
+    expect(handler).not.toHaveBeenCalled();
+  });
+});

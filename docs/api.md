@@ -25,6 +25,13 @@ implemented; routes appear here as they are built.
   point.
 - **Methods.** A server endpoint requested with a method other than `GET` is
   answered `405` in the error envelope, and its handler does not run.
+- **Bodies** are JSON. A request body larger than the configured maximum,
+  1,048,576 bytes by default, is answered `413` before any route handler
+  runs.
+- **Timestamps** are RFC 3339, rendered in UTC and always ending in `Z`. A
+  timestamp a client sends may carry any offset and is converted to UTC,
+  preserving the instant; one that is not valid RFC 3339 is answered `400`
+  with a message naming the field.
 
 ## Error Response Schema
 

@@ -22,6 +22,12 @@ Neither `PARLEY_BUILD_TIME` nor `PARLEY_COMMIT` affects behaviour; a
 deployment that sets neither answers `GET /version` successfully with both
 as the empty string.
 
+## Limits
+
+| Setting              | Default         | Description                                                                                                                                                                                    |
+| -------------------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| maximum request body | 1,048,576 bytes | A request whose body exceeds it is answered `413` in the error envelope before any route handler runs. The service reads it from its own configuration; no deployment variable exposes it yet. |
+
 ## Local development
 
 No configuration is needed to run the tests: they build the service in
