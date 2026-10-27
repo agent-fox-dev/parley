@@ -94,67 +94,12 @@ export function adminUserRoutes(config: AdminRouteConfig): RouteDefinition[] {
     {
       path: base,
       methods: ['GET', 'POST'],
-      handler: async (c) => {
-        await requireAdmin(c, store);
-        if (c.req.method === 'GET') {
-          return jsonResponse(await listUsers(store));
-        }
-
-        const body = await readJsonObject(c);
-        const username = requiredString(body, 'username');
-        const email = requiredString(body, 'email');
-        const provider = requiredString(body, 'provider');
-        const providerId = requiredString(body, 'provider_id');
-
-        if (
-          (await findUserByUsername(store, username)) !== undefined ||
-          (await findUserByProviderIdentity(store, provider, providerId)) !== undefined
-        ) {
-          throw new HttpError(409, 'that username or provider identity is taken');
-        }
-
-        const at = clock.now().toISOString();
-        const user: UserRecord = {
-          id: crypto.randomUUID(),
-          username,
-          email,
-          full_name: typeof body['full_name'] === 'string' ? body['full_name'] : '',
-          status: 'active',
-          role: 'user',
-          provider,
-          provider_id: providerId,
-          created_at: at,
-          updated_at: at,
-        };
-        await insertUser(store, user);
-        return jsonResponse(user, 201);
-      },
+      handler: async (c) => listOrCreateUser(c, config),
     },
     {
       path: `${base}/:id`,
       methods: ['GET', 'PATCH', 'DELETE'],
-      handler: async (c) => {
-        await requireAdmin(c, store);
-        const user = await namedUser(c, store);
-
-        if (c.req.method === 'GET') {
-          return conditionalJson(c, user);
-        }
-        if (c.req.method === 'DELETE') {
-          await keepOneAdmin(store, user);
-          await deleteUser(store, user.id);
-          return emptyResponse(204);
-        }
-
-        const body = await readJsonObject(c);
-        const fullName = body['full_name'];
-        if (typeof fullName !== 'string' || fullName.length === 0) {
-          throw new HttpError(400, 'full_name is required');
-        }
-        const at = clock.now().toISOString();
-        await updateFullName(store, user.id, fullName, at);
-        return jsonResponse({ ...user, full_name: fullName, updated_at: at });
-      },
+      handler: async (c) => readUpdateOrDeleteUser(c, config),
     },
     roleRoute('promote', 'admin'),
     roleRoute('demote', 'user'),
@@ -189,6 +134,67 @@ export function adminUserRoutes(config: AdminRouteConfig): RouteDefinition[] {
       handler: async (c) => revokeOf(c, config, 'pat', 'token_id'),
     },
   ];
+}
+
+async function listOrCreateUser(c: Context, config: AdminRouteConfig): Promise<Response> {
+  const { store, clock } = config;
+  await requireAdmin(c, store);
+  if (c.req.method === 'GET') {
+    return jsonResponse(await listUsers(store));
+  }
+
+  const body = await readJsonObject(c);
+  const username = requiredString(body, 'username');
+  const email = requiredString(body, 'email');
+  const provider = requiredString(body, 'provider');
+  const providerId = requiredString(body, 'provider_id');
+
+  if (
+    (await findUserByUsername(store, username)) !== undefined ||
+    (await findUserByProviderIdentity(store, provider, providerId)) !== undefined
+  ) {
+    throw new HttpError(409, 'that username or provider identity is taken');
+  }
+
+  const at = clock.now().toISOString();
+  const user: UserRecord = {
+    id: crypto.randomUUID(),
+    username,
+    email,
+    full_name: typeof body['full_name'] === 'string' ? body['full_name'] : '',
+    status: 'active',
+    role: 'user',
+    provider,
+    provider_id: providerId,
+    created_at: at,
+    updated_at: at,
+  };
+  await insertUser(store, user);
+  return jsonResponse(user, 201);
+}
+
+async function readUpdateOrDeleteUser(c: Context, config: AdminRouteConfig): Promise<Response> {
+  const { store, clock } = config;
+  await requireAdmin(c, store);
+  const user = await namedUser(c, store);
+
+  if (c.req.method === 'GET') {
+    return conditionalJson(c, user);
+  }
+  if (c.req.method === 'DELETE') {
+    await keepOneAdmin(store, user);
+    await deleteUser(store, user.id);
+    return emptyResponse(204);
+  }
+
+  const body = await readJsonObject(c);
+  const fullName = body['full_name'];
+  if (typeof fullName !== 'string' || fullName.length === 0) {
+    throw new HttpError(400, 'full_name is required');
+  }
+  const at = clock.now().toISOString();
+  await updateFullName(store, user.id, fullName, at);
+  return jsonResponse({ ...user, full_name: fullName, updated_at: at });
 }
 
 async function revokeOf(
