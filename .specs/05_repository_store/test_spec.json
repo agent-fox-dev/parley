@@ -18,7 +18,8 @@
       "then": [
         "each workspace yields the same name on both computations",
         "no two workspaces yield the same name",
-        "the name is valid for the store's naming rules"
+        "the name is the workspace's slug with the short hash of its id, and holds only alphanumerics, dots, hyphens and underscores",
+        "renaming a workspace does not change its repository name"
       ],
       "pseudocode": "in the repository naming test file: assert name(ws) == name(ws); assert len({name(w) for w in workspaces}) == len(workspaces)"
     },
@@ -136,17 +137,18 @@
       "verifies": [
         "05-REQ-2.4"
       ],
-      "title": "Credentials the remote refuses stop the create before anything is written",
+      "title": "An authentication refusal stops the create, an unreachable remote does not",
       "given": [
-        "a remote that refuses a particular token"
+        "a remote that refuses a particular token",
+        "a remote that cannot be reached at all"
       ],
-      "when": "a workspace is created with that token",
+      "when": "a workspace is created against each",
       "then": [
-        "the create answers 400",
-        "no workspace row, no secret and no repository exists afterwards",
-        "the message does not contain the token"
+        "the refused credential answers 400, and no workspace row, no secret and no repository exists afterwards",
+        "the unreachable remote answers 201 and the workspace fails the copy with clone_error",
+        "neither message contains the token"
       ],
-      "pseudocode": "in the copy-in integration test file: r = post(workspace, badTok); assert r.status == 400 and not exists(ws) and not store.exists(name(ws)) and badTok not in r.text"
+      "pseudocode": "in the copy-in integration test file, table over (remoteBehaviour, expectedStatus) asserting the create status, what was written and that the token is absent"
     },
     {
       "id": "TS-05-9",
@@ -172,7 +174,7 @@
       "verifies": [
         "05-REQ-2.6"
       ],
-      "title": "A copy larger than one unit of work continues and completes",
+      "title": "A copy larger than one unit of work resumes at the refs it has not brought",
       "given": [
         "a remote whose transfer cannot finish within one unit of platform work"
       ],
@@ -180,9 +182,9 @@
       "then": [
         "the workspace reaches ready",
         "every branch of the remote is present",
-        "the copy was resumed at least once rather than restarted from the beginning"
+        "the copy ran in more than one unit of work and each later unit asked only for the refs the earlier ones had not brought"
       ],
-      "pseudocode": "in the copy-in integration test file: create(bigRemote); assert eventually(status == 'ready') and refs(ws) == refs(remote) and resumeCount >= 1"
+      "pseudocode": "in the copy-in integration test file: create(bigRemote); assert eventually(status == 'ready') and refs(ws) == refs(remote) and units > 1 and no ref was transferred twice"
     },
     {
       "id": "TS-05-11",
@@ -245,17 +247,17 @@
         "05-REQ-4.1",
         "05-REQ-4.3"
       ],
-      "title": "The store's three undocumented capabilities are established by exercising them",
+      "title": "Each implementation's capability declaration is held against a real store",
       "given": [
         "a real store and a scratch repository"
       ],
-      "when": "a ref outside refs/heads/ and refs/tags/ is pushed, a non-fast-forward update is pushed, and a ref deletion is pushed",
+      "when": "a ref outside refs/heads/ and refs/tags/, a non-fast-forward update and a ref deletion are each pushed to it",
       "then": [
         "each attempt yields a definite supported or unsupported result",
-        "the capability report matches what each attempt did",
-        "the report is derived from the attempts and not from a hard-coded table"
+        "the implementation's declaration matches what each attempt did",
+        "a declaration that does not match is reported as a failure, not reconciled"
       ],
-      "pseudocode": "in the store capability integration test file: for cap in CAPS: observed = attempt(cap); assert store.capabilities()[cap] == observed"
+      "pseudocode": "in the store capability integration test file: for cap in CAPS: assert store.capabilities()[cap] == attempt(cap)"
     },
     {
       "id": "TS-05-15",
@@ -289,9 +291,10 @@
       "then": [
         "each reaches status ready",
         "every ref is readable afterwards",
-        "a subsequent write succeeds"
+        "a subsequent write succeeds",
+        "where the fixture cannot be built the case skips with a reason naming what is missing"
       ],
-      "pseudocode": "in the repository size integration test file, skipping with a named reason when the fixture cannot be built: assert status == 'ready' and len(refs(ws)) == 10000"
+      "pseudocode": "in the repository size integration test file, generating the fixtures rather than committing them and skipping with a named reason: assert status == 'ready' and len(refs(ws)) == 10000"
     },
     {
       "id": "TS-05-17",
@@ -306,10 +309,10 @@
       "when": "a write that would exceed the limit is attempted",
       "then": [
         "the operation fails with the documented storage-failure answer",
-        "the message names the limit exceeded",
+        "the message names the 1 GB repository limit, which the service accounts for itself because the store reports none",
         "the workspace is still readable and its earlier refs are unchanged"
       ],
-      "pseudocode": "in the repository size integration test file: r = write_over_limit(); assert r.failed and 'limit' in r.message and refs(ws) == before"
+      "pseudocode": "in the repository size integration test file: r = write_over_limit(); assert r.failed and '1 GB' in r.message and refs(ws) == before"
     },
     {
       "id": "TS-05-18",
@@ -391,13 +394,14 @@
       "verifies": [
         "05-REQ-7.1"
       ],
-      "title": "Archiving pushes every branch to origin and then releases the repository",
+      "title": "Archiving pushes every branch to origin without forcing and then releases the repository",
       "given": [
         "a ready workspace with a usable origin credential and a branch that exists only in its repository"
       ],
       "when": "the workspace is archived",
       "then": [
         "the branch exists on origin afterwards",
+        "no ref already on origin was rewritten",
         "the repository is released from the store",
         "the workspace's status is archived"
       ],
@@ -412,15 +416,16 @@
       "title": "A failed archive push keeps the repository rather than losing commits",
       "given": [
         "a ready workspace with a branch that exists only in its repository, and a remote that refuses the push",
+        "a ready workspace whose branch has diverged from origin, so a non-forced push is rejected",
         "a second workspace with no usable credential"
       ],
       "when": "each is archived",
       "then": [
-        "both reach status archived",
-        "both repositories are still in the store with the local-only branch present",
-        "reactivating either reuses the kept repository"
+        "all reach status archived",
+        "every repository is still in the store with the local-only branch present",
+        "reactivating any of them reuses the kept repository"
       ],
-      "pseudocode": "in the repository retirement integration test file, table over the two cases asserting status, store.exists and the branch's presence"
+      "pseudocode": "in the repository retirement integration test file, table over the three cases asserting status, store.exists and the branch's presence"
     },
     {
       "id": "TS-05-24",

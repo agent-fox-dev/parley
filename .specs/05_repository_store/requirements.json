@@ -21,8 +21,8 @@
           "id": "05-REQ-1.1",
           "pattern": "ubiquitous",
           "system": "Parley service",
-          "action": "address each workspace's repository by a name derived from the workspace, so the mapping needs no separate record",
-          "contract": "for a given workspace the same repository name is computed on every call; two workspaces never compute the same name"
+          "action": "address each workspace's repository by a name derived from the workspace's slug and the short hash of its id, so the mapping needs no separate record",
+          "contract": "for a given workspace the same repository name is computed on every call; two workspaces never compute the same name; the name holds only characters the store accepts"
         },
         {
           "id": "05-REQ-1.2",
@@ -82,10 +82,10 @@
         {
           "id": "05-REQ-2.4",
           "pattern": "unwanted",
-          "condition": "the credentials given on create are refused by the remote",
+          "condition": "the credentials given on create are refused by the remote with an authentication failure",
           "system": "Parley service",
           "action": "refuse the create before any workspace is written",
-          "contract": "HTTP 400 in the error envelope; no workspace row, no secret and no repository exists afterwards"
+          "contract": "HTTP 400 in the error envelope; no workspace row, no secret and no repository exists afterwards; a remote that is unreachable, that fails or that does not answer is not refused this way but answers 201 and fails the copy"
         },
         {
           "id": "05-REQ-2.5",
@@ -100,8 +100,8 @@
           "pattern": "event_driven",
           "condition": "a copy cannot finish within one unit of platform work",
           "system": "Parley service",
-          "action": "continue it in another and carry it to completion",
-          "contract": "a repository larger than one unit of work can transfer reaches status ready, with every branch present"
+          "action": "continue it in another, resuming at the first ref it has not yet brought across",
+          "contract": "a repository larger than one unit of work can transfer reaches status ready with every branch present, and the refs an earlier unit brought across are not transferred again"
         }
       ]
     },
@@ -145,8 +145,8 @@
           "id": "05-REQ-4.1",
           "pattern": "ubiquitous",
           "system": "repository store",
-          "action": "report whether it accepts a ref outside refs/heads/ and refs/tags/, a non-fast-forward update of a ref, and the deletion of a ref",
-          "contract": "each capability is reported as supported or not, and the report is produced by attempting the operation against a real store rather than by assertion"
+          "action": "declare whether it accepts a ref outside refs/heads/ and refs/tags/, a non-fast-forward update of a ref, and the deletion of a ref, and be held to that declaration against a real store",
+          "contract": "each capability is declared as supported or not; attempting all three against a real store yields a definite result for each, and a declaration that does not match what the store did is a failure"
         },
         {
           "id": "05-REQ-4.2",
@@ -174,16 +174,16 @@
           "id": "05-REQ-5.1",
           "pattern": "ubiquitous",
           "system": "Parley service",
-          "action": "copy in, read and write a repository holding at most 500 MB of packed objects and at most 10000 refs",
-          "contract": "a repository at both limits reaches status ready and its refs are all readable afterwards"
+          "action": "copy in, read and write a repository holding at most 500 MB of packed objects and at most 10000 refs, those figures standing until they are measured against a real store",
+          "contract": "a repository at both limits reaches status ready and its refs are all readable afterwards; where the fixture cannot be built the check skips with a reason naming what is missing, and the measured ceilings replace these figures"
         },
         {
           "id": "05-REQ-5.2",
           "pattern": "unwanted",
           "condition": "an operation would take a repository past what the store accepts",
           "system": "Parley service",
-          "action": "fail it with the route's documented storage-failure answer and leave the workspace usable",
-          "contract": "the error message names the limit exceeded; the workspace is still readable and its earlier refs are unchanged"
+          "action": "fail it with the route's documented storage-failure answer, from its own accounting of what it has written, and leave the workspace usable",
+          "contract": "the error message names the 1 GB repository limit; the workspace is still readable and its earlier refs are unchanged"
         }
       ]
     },
@@ -234,13 +234,13 @@
           "condition": "a workspace is archived",
           "guard": "its status is ready and a usable origin credential exists",
           "system": "Parley service",
-          "action": "push every branch of its repository to origin and then release the repository",
-          "contract": "each branch present only in the workspace's repository exists on origin afterwards; the repository is released from the store"
+          "action": "push every branch of its repository to origin without forcing, and then release the repository",
+          "contract": "each branch present only in the workspace's repository, and accepted by origin, exists on origin afterwards; no ref on origin is rewritten; the repository is released from the store"
         },
         {
           "id": "05-REQ-7.2",
           "pattern": "unwanted",
-          "condition": "the archive push fails, or the workspace has no usable origin credential",
+          "condition": "origin refuses any branch of the archive push, the push fails, or the workspace has no usable origin credential",
           "system": "Parley service",
           "action": "archive the workspace anyway and keep its repository",
           "contract": "the workspace's status is \"archived\" and the repository is still in the store with every commit; reactivating it reuses that repository"
@@ -264,7 +264,7 @@
           "id": "05-REQ-8.1",
           "pattern": "ubiquitous",
           "system": "Parley service",
-          "action": "reach the repository store only through its platform interface, with a Cloudflare implementation over Artifacts and a non-Cloudflare one",
+          "action": "reach the repository store only through its platform interface, whose vocabulary is refs and packs rather than any store's SDK, with a Cloudflare implementation over Artifacts and a non-Cloudflare one",
           "contract": "one contract suite exists for the interface and passes against both implementations, as the platform interfaces of package 01 do"
         },
         {
@@ -296,7 +296,7 @@
         },
         {
           "actor": "Parley service",
-          "action": "copies every branch and tag from the remote into the repository with the stored credential, moving the status through cloning"
+          "action": "copies the refs of the remote into the repository with the stored credential, in batches it can resume, moving the status through cloning"
         },
         {
           "actor": "repository store",
@@ -340,7 +340,7 @@
         },
         {
           "actor": "Parley service",
-          "action": "resolves the origin credential from the workspace's secrets and pushes every branch to origin"
+          "action": "resolves the origin credential from the workspace's secrets and pushes every branch to origin without forcing"
         },
         {
           "actor": "forge",
