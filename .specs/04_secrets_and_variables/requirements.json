@@ -1,0 +1,287 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v2.json",
+  "spec_id": "04",
+  "spec_name": "secrets_and_variables",
+  "schema_version": 2,
+  "introduction": "Secrets and variables are named values kept for a user, an organization or a workspace. They share their key, size, count and ordering rules; they differ in that a secret's value never comes back out, and in the access a workspace's entries need.",
+  "glossary": {
+    "origin": "The tier a resolved variable's value came from: user, org or workspace.",
+    "resolved view": "The merge of a workspace's variables with those of its organization and of its owner, a workspace value overriding an organization value, which overrides a user value.",
+    "entry scope": "One owner of secret or variable entries: one user, one organization or one workspace. Each holds at most 100 entries and keys are unique within it, ignoring case. Distinct from a permission scope, which is a named permission on a credential.",
+    "secret": "A named value kept for a user, an organization or a workspace whose value is never returned by any route, log record or audit event.",
+    "variable": "A named value with the same rules as a secret, whose value is returned."
+  },
+  "requirements": [
+    {
+      "id": "04-REQ-1",
+      "title": "Rules shared by both kinds at every scope",
+      "rationale": "Six rules repeated across twenty-five routes; implemented once they hold everywhere, implemented per route they drift.",
+      "criteria": [
+        {
+          "id": "04-REQ-1.1",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "accept a key only when it holds letters, digits and underscores, does not start with a digit, and is at most 255 characters",
+          "contract": "a conforming key is accepted; a key with a hyphen, a space, a dot, a leading digit, an empty key or one of 256 characters is refused 400 and writes nothing"
+        },
+        {
+          "id": "04-REQ-1.2",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "match keys case-insensitively, both when looking an entry up and when deciding whether one already exists in the scope",
+          "contract": "an entry created as MY_KEY is found by my_key and MyKey; a create of my_key in a scope already holding MY_KEY is refused as a duplicate"
+        },
+        {
+          "id": "04-REQ-1.3",
+          "pattern": "unwanted",
+          "condition": "a value is larger than 262144 bytes",
+          "system": "Parley service",
+          "action": "refuse the request and write nothing",
+          "contract": "HTTP 400 in the error envelope; a value of exactly 262144 bytes is accepted and one of 262145 is refused"
+        },
+        {
+          "id": "04-REQ-1.4",
+          "pattern": "unwanted",
+          "condition": "a create would take a scope past 100 entries",
+          "system": "Parley service",
+          "action": "refuse the whole request and write none of its entries",
+          "contract": "HTTP 400 in the error envelope; the scope still holds the entries it held before, and a create that brings it to exactly 100 succeeds"
+        },
+        {
+          "id": "04-REQ-1.5",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "return every list sorted by key, ignoring case",
+          "contract": "for keys differing only in case and in letter, the order is the case-insensitive ascending order of the keys"
+        }
+      ]
+    },
+    {
+      "id": "04-REQ-2",
+      "title": "Secrets at the three scopes",
+      "rationale": "The scopes differ in who may reach them, and a workspace's secrets are private in a way its variables are not.",
+      "criteria": [
+        {
+          "id": "04-REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "a create is called at any of the three secret scopes with one or more entries",
+          "system": "Parley service",
+          "action": "store each entry and answer with the created entries, carrying no value",
+          "contract": "HTTP 201 with an array of {key, created_at, updated_at}; no element carries a value key"
+        },
+        {
+          "id": "04-REQ-2.2",
+          "pattern": "event_driven",
+          "condition": "a list, replace or delete is called at any of the three secret scopes",
+          "system": "Parley service",
+          "action": "list the scope's keys, replace one entry's value, or remove one entry",
+          "contract": "HTTP 200 with an array of {key, created_at, updated_at} for a list, HTTP 200 with the entry for a replace, HTTP 204 for a delete; no response carries a value"
+        },
+        {
+          "id": "04-REQ-2.3",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "admit the user secret routes to a user credential only, the organization secret routes to members of that organization and admin tokens, and the workspace secret routes at private access",
+          "contract": "an admin token on a user secret route is 403; a non-member on an organization secret route is 404; a member of the workspace's organization on a workspace secret route is 404, as a stranger is"
+        },
+        {
+          "id": "04-REQ-2.4",
+          "pattern": "unwanted",
+          "condition": "a create names a key the scope already holds ignoring case",
+          "system": "Parley service",
+          "action": "refuse the whole request and write none of its entries",
+          "contract": "HTTP 409 in the error envelope; the existing entry's value and updated_at are unchanged, and no other entry of the same request is written"
+        },
+        {
+          "id": "04-REQ-2.5",
+          "pattern": "unwanted",
+          "condition": "a replace carries no value, or a replace or delete names a key the scope does not hold, or the named organization or workspace cannot be reached",
+          "system": "Parley service",
+          "action": "refuse the request and change nothing",
+          "contract": "HTTP 400 for a missing value, HTTP 404 for an unknown key and for an unreachable organization or workspace; the scope's entries are unchanged"
+        }
+      ]
+    },
+    {
+      "id": "04-REQ-3",
+      "title": "Variables at the three scopes",
+      "rationale": "Variables share every rule with secrets except the two that matter: their values come back, and a workspace's are readable by a member.",
+      "criteria": [
+        {
+          "id": "04-REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "a create, list or replace is called at any of the three variable scopes",
+          "system": "Parley service",
+          "action": "answer with the entries including their values",
+          "contract": "HTTP 201 on create and 200 on list and replace, each element carrying {key, value, created_at, updated_at}; HTTP 204 on delete"
+        },
+        {
+          "id": "04-REQ-3.2",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "apply the same key, value-size, entry-count and ordering rules to variables as to secrets",
+          "contract": "the key, size, count and duplicate refusals of the secret routes answer identically on the variable routes"
+        },
+        {
+          "id": "04-REQ-3.3",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "require read access to read a workspace's variables and write access to change them",
+          "contract": "a member of the workspace's organization lists and reads them as the owner does"
+        },
+        {
+          "id": "04-REQ-3.4",
+          "pattern": "unwanted",
+          "condition": "a member of the workspace's organization creates, replaces or deletes a workspace variable",
+          "system": "Parley service",
+          "action": "refuse the request and change nothing",
+          "contract": "HTTP 403 with error_type forbidden and the message \"org members have read-only access to this workspace\"; the workspace's variables are unchanged"
+        },
+        {
+          "id": "04-REQ-3.5",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "treat a variable whose key matches the name of a workspace setting as an ordinary variable that governs no behaviour",
+          "contract": "setting a variable named like a setting changes no value in the workspace's settings object and alters no behaviour the settings control"
+        }
+      ]
+    },
+    {
+      "id": "04-REQ-4",
+      "title": "The resolved view",
+      "rationale": "It is computed from the workspace's owner rather than the caller, so a caller-centred implementation passes every owner test and is still wrong.",
+      "criteria": [
+        {
+          "id": "04-REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "GET /api/v1/workspaces/:slug/vars/resolved is requested by a caller with read access",
+          "system": "Parley service",
+          "action": "merge the three tiers, a workspace value overriding an organization value and an organization value overriding a user value, and report where each surviving value came from",
+          "contract": "HTTP 200 with an array of {key, value, origin, created_at, updated_at}, origin being user, org or workspace; a key set at all three tiers appears once with the workspace's value and origin workspace"
+        },
+        {
+          "id": "04-REQ-4.2",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "take the user tier from the workspace's owner, never from the caller",
+          "contract": "a variable set only in the caller's own user scope does not appear; one set only in the owner's user scope appears with origin user; the answer is identical whoever with read access asks"
+        },
+        {
+          "id": "04-REQ-4.3",
+          "pattern": "state_driven",
+          "condition": "the workspace's owner is not a member of the workspace's organization",
+          "system": "Parley service",
+          "action": "leave the organization tier out of the merge",
+          "contract": "a variable set only at that organization's scope does not appear in the resolved view"
+        },
+        {
+          "id": "04-REQ-4.4",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "return the resolved view sorted by key, ignoring case",
+          "contract": "the array is in case-insensitive ascending key order whatever the tier each value came from"
+        }
+      ]
+    },
+    {
+      "id": "04-REQ-5",
+      "title": "Keeping a secret secret",
+      "rationale": "A secret that can be read back from a route, a log or the database is not a secret, and that is the whole difference between the two kinds.",
+      "criteria": [
+        {
+          "id": "04-REQ-5.1",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "return no secret's value from any route, including the create and replace routes that just received it",
+          "contract": "for any secret route and any scope, no response body contains the value that was stored"
+        },
+        {
+          "id": "04-REQ-5.2",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "encrypt a secret's value before it reaches any store",
+          "contract": "after a secret with a distinctive value is written, a raw dump of the underlying store contains no occurrence of that value"
+        },
+        {
+          "id": "04-REQ-5.3",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "keep secret values out of every log record",
+          "contract": "after a create, a replace, a refused create and a request that raises an unhandled failure, no log record contains the value"
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "04-PATH-1",
+      "title": "An owner stores a workspace secret and can never read it back",
+      "steps": [
+        {
+          "actor": "API client",
+          "action": "creates a secret in a workspace's scope with a distinctive value"
+        },
+        {
+          "actor": "Parley service",
+          "action": "validates the key, checks the scope's entry count, encrypts the value and writes it through the secret store"
+        },
+        {
+          "actor": "Parley service",
+          "action": "answers 201 with the key and its timestamps and no value"
+        },
+        {
+          "actor": "API client",
+          "action": "lists the workspace's secrets and sees the key with no value"
+        },
+        {
+          "actor": "operator",
+          "action": "inspects the raw store and finds no occurrence of the value"
+        }
+      ]
+    },
+    {
+      "id": "04-PATH-2",
+      "title": "Variables resolve from the workspace outwards",
+      "steps": [
+        {
+          "actor": "API client",
+          "action": "sets one key at the owner's user scope, the same key at the organization's scope and at the workspace's scope, and a second key at the user scope alone"
+        },
+        {
+          "actor": "API client",
+          "action": "reads GET /api/v1/workspaces/:slug/vars/resolved"
+        },
+        {
+          "actor": "Parley service",
+          "action": "merges the owner's user tier, the organization tier and the workspace tier and reports each value's origin"
+        },
+        {
+          "actor": "API client",
+          "action": "finds the first key once with the workspace's value and origin workspace, and the second with origin user"
+        }
+      ]
+    },
+    {
+      "id": "04-PATH-3",
+      "title": "A member reads a workspace's variables and is refused its secrets and its writes",
+      "steps": [
+        {
+          "actor": "organization member",
+          "action": "lists the workspace's variables and is served with their values"
+        },
+        {
+          "actor": "organization member",
+          "action": "creates a workspace variable and is refused 403 forbidden"
+        },
+        {
+          "actor": "Parley service",
+          "action": "applies read access to the variable list and write access to the variable create"
+        },
+        {
+          "actor": "organization member",
+          "action": "lists the workspace's secrets and is refused 404, because that route needs private access"
+        }
+      ]
+    }
+  ]
+}

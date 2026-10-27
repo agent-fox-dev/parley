@@ -1,0 +1,197 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v2.json",
+  "spec_id": "04",
+  "spec_name": "secrets_and_variables",
+  "schema_version": 2,
+  "test_commands": {
+    "all_tests": "make test",
+    "linter": "make lint"
+  },
+  "dependencies": [
+    {
+      "spec": "01",
+      "reason": "uses its router, error envelope and platform interfaces"
+    },
+    {
+      "spec": "02",
+      "reason": "uses its credential identity, scope check and organization membership lookup"
+    },
+    {
+      "spec": "03",
+      "reason": "uses its workspace record, its access decision at private and at read and write levels, and the secret store interface with the encryption it defined"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "kind": "implement",
+      "title": "Store entries under the shared rules and serve the secret routes",
+      "criteria": [
+        "04-REQ-1",
+        "04-REQ-2"
+      ],
+      "tests": [
+        "TS-04-1",
+        "TS-04-2",
+        "TS-04-3",
+        "TS-04-4",
+        "TS-04-5",
+        "TS-04-6",
+        "TS-04-7",
+        "TS-04-8",
+        "TS-04-9",
+        "TS-04-10"
+      ],
+      "steps": [
+        "Add this task's behaviours to the entry validation, entry store and secret routes test files, and confirm they fail",
+        "Define the entry table for both kinds at the three scopes, with a migration the second target runs too",
+        "Implement the shared rules once: the key shape, the 255-character key limit, case-insensitive matching for lookup and uniqueness, the 262144-byte value limit, the 100-entry cap per scope and case-insensitive ordering of every list",
+        "Make a create atomic across its entries, so a duplicate or an over-full scope writes none of them",
+        "Serve the four user secret routes, refusing an admin token with 403 because it has no user",
+        "Serve the four organization secret routes by slug, for members and admin tokens, refusing an unknown organization and a non-member alike with 404",
+        "Serve the four workspace secret routes at private access, so a member of the workspace's organization is refused 404 as a stranger is",
+        "Refuse a replace with no value with 400 and an unknown key on replace or delete with 404, changing nothing"
+      ],
+      "touches": [
+        "src/entries/validate.ts",
+        "src/entries/validate.test.ts",
+        "src/entries/store.ts",
+        "src/entries/store.integration.test.ts",
+        "src/routes/secrets.ts",
+        "src/routes/secrets.test.ts",
+        "src/routes/secrets.integration.test.ts",
+        "src/store/migrations/"
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 2,
+      "kind": "implement",
+      "title": "Keep secret values out of responses, the store and the logs",
+      "criteria": [
+        "04-REQ-5"
+      ],
+      "tests": [
+        "TS-04-20",
+        "TS-04-21",
+        "TS-04-22"
+      ],
+      "steps": [
+        "Add this task's behaviours to the secret routes' and the secret store's test files, and confirm they fail",
+        "Give the secret routes a serialiser that cannot emit a value, rather than one that omits it, so a new route cannot leak one by forgetting",
+        "Encrypt every secret value through the secret store before it reaches the relational store, and decrypt only where the service itself uses the value",
+        "Confirm by test that a raw dump of the store holds the keys and none of the values",
+        "Scrub secret values from log records on the success, refusal and unhandled-failure paths alike"
+      ],
+      "touches": [
+        "src/routes/secrets.ts",
+        "src/entries/serialise.ts",
+        "src/secrets/store.ts",
+        "src/secrets/store.integration.test.ts",
+        "src/routes/secrets.test.ts"
+      ],
+      "depends_on": [
+        1
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 3,
+      "kind": "implement",
+      "title": "Serve the variable routes at their own access levels",
+      "criteria": [
+        "04-REQ-3"
+      ],
+      "tests": [
+        "TS-04-11",
+        "TS-04-12",
+        "TS-04-13",
+        "TS-04-14",
+        "TS-04-15"
+      ],
+      "steps": [
+        "Add this task's behaviours to the variable routes' test files, and confirm they fail",
+        "Serve the four variable routes at each of the three scopes over the same entry store, returning the value in every response",
+        "Apply the shared key, size, count, duplicate and ordering rules to the variable routes without reimplementing them",
+        "Require read access to read a workspace's variables and write access to change them, so a member lists them and is refused 403 forbidden on a write",
+        "Confirm that a variable whose key matches a workspace setting changes no setting and no behaviour those settings govern"
+      ],
+      "touches": [
+        "src/routes/vars.ts",
+        "src/routes/vars.test.ts",
+        "src/routes/vars.integration.test.ts",
+        "src/entries/store.ts"
+      ],
+      "depends_on": [
+        1
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 4,
+      "kind": "implement",
+      "title": "Resolve a workspace's variables from the owner outwards",
+      "criteria": [
+        "04-REQ-4"
+      ],
+      "tests": [
+        "TS-04-16",
+        "TS-04-17",
+        "TS-04-18",
+        "TS-04-19"
+      ],
+      "steps": [
+        "Add this task's behaviours to the resolved view's test files, and confirm they fail",
+        "Implement the merge: a workspace value overrides an organization value, which overrides a user value, each surviving entry reporting its origin",
+        "Take the user tier from the workspace's owner and never from the caller, so every caller with read access gets the same answer",
+        "Include the organization tier only when the workspace's owner is a member of the workspace's organization",
+        "Return the result sorted by key ignoring case",
+        "Serve the route at read access, so a member of the organization receives the owner's answer"
+      ],
+      "touches": [
+        "src/vars/resolve.ts",
+        "src/vars/resolve.test.ts",
+        "src/vars/resolve.integration.test.ts",
+        "src/routes/vars.ts"
+      ],
+      "depends_on": [
+        3
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 5,
+      "kind": "integration",
+      "title": "Verify storage, resolution and access against a running deployment",
+      "tests": [
+        "TS-04-23",
+        "TS-04-24",
+        "TS-04-25"
+      ],
+      "steps": [
+        "Add the three smoke tests and confirm each passes against a running deployment, or skips with a message naming the missing deployment",
+        "Trace 04-PATH-1: the create route validates through the shared rules, writes through the secret store's encryption into the relational store, and the list route reads back through the serialiser that cannot emit a value. Confirm no step is served by a stub",
+        "Trace 04-PATH-2: the resolved view reads all three tiers from the entry store and the owner from the workspace record, with no tier served from a fixture",
+        "Trace 04-PATH-3: the variable list and the variable create reach the access decision of package 03 at read and write level respectively, and the secret list reaches it at private level",
+        "For every criterion carrying a contract, confirm a caller in production code consumes the producer's result and not only a test: the shared rules are called by both kinds at all three scopes, the encryption by every secret write, and the access decision by the workspace routes of both kinds",
+        "Confirm the creation credentials package 03 writes are readable through this package's store, so the two are one store and not two",
+        "Grep src/ and the files every task's touches lists for TODO, FIXME and the project's not-implemented marker, and remove any that remain",
+        "Add the secrets and variables conformance cases to the harness from package 01"
+      ],
+      "touches": [
+        "src/routes/secrets.smoke.test.ts",
+        "src/routes/vars.smoke.test.ts",
+        "conformance/entries.ts"
+      ],
+      "depends_on": [
+        2,
+        4
+      ],
+      "done_when": [
+        "`make check` passes with no network access and no deployment configured",
+        "afc secrets create, list, update and delete and afc vars create, list, update, delete and resolve behave as docs/prd/cli.md specifies against a running deployment"
+      ],
+      "state": "pending"
+    }
+  ]
+}

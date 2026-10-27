@@ -1,0 +1,364 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v2.json",
+  "spec_id": "05",
+  "spec_name": "repository_store",
+  "schema_version": 2,
+  "introduction": "Each workspace's repository is held durably in Cloudflare Artifacts, copied in from the forge with the workspace's own credential and reached through one platform interface. This package also establishes, by exercising them, the three store capabilities the contract needs and the documentation does not describe.",
+  "glossary": {
+    "copy-in": "Bringing the repository at a workspace's git_url into the workspace's repository, with the workspace's credential where it has one, as the initial clone and as the mechanism every later sync reuses.",
+    "origin credential": "The credential for a workspace's own remote, resolved from the workspace secrets GIT_PAT, else GIT_USERNAME with GIT_PASSWORD, else none.",
+    "repository store": "The platform interface through which the service creates, reads, writes and removes a workspace's repository. Its Cloudflare implementation is Cloudflare Artifacts.",
+    "store capability": "One of the three behaviours the contract needs and the store's documentation does not describe: refs outside refs/heads/ and refs/tags/, a non-fast-forward update, and a ref deletion.",
+    "upstream credential": "The credential for a carry_patch workspace's upstream, resolved from UPSTREAM_GIT_PAT, else UPSTREAM_GIT_USERNAME with UPSTREAM_GIT_PASSWORD, else the origin credential."
+  },
+  "requirements": [
+    {
+      "id": "05-REQ-1",
+      "title": "One durable repository per workspace",
+      "rationale": "Every later package addresses a workspace's repository, so the mapping and its durability have to be unambiguous before anything is built on them.",
+      "criteria": [
+        {
+          "id": "05-REQ-1.1",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "address each workspace's repository by a name derived from the workspace, so the mapping needs no separate record",
+          "contract": "for a given workspace the same repository name is computed on every call; two workspaces never compute the same name"
+        },
+        {
+          "id": "05-REQ-1.2",
+          "pattern": "event_driven",
+          "condition": "a workspace is created",
+          "system": "Parley service",
+          "action": "create its repository in the store",
+          "contract": "the store holds a repository under the workspace's derived name immediately after the create route answers"
+        },
+        {
+          "id": "05-REQ-1.3",
+          "pattern": "ubiquitous",
+          "system": "repository store",
+          "action": "keep a repository and its refs across the restart or eviction of every other component of the deployment",
+          "contract": "refs and objects written before a restart are readable after it, with no re-copy"
+        },
+        {
+          "id": "05-REQ-1.4",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "take the workspace lock around every operation that writes a workspace's repository",
+          "contract": "for any two concurrent writing operations on one workspace, one completes before the other begins, and the second answers 409 workspace_busy when it may not wait"
+        }
+      ]
+    },
+    {
+      "id": "05-REQ-2",
+      "title": "Copying a repository in",
+      "rationale": "A private repository is the ordinary case, and the store's own import cannot carry a credential, so this path carries almost every workspace.",
+      "criteria": [
+        {
+          "id": "05-REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "a workspace is created with a valid body",
+          "system": "Parley service",
+          "action": "copy the repository at git_url into the workspace's repository, bringing every branch and tag",
+          "contract": "once the copy completes, every branch and tag of the remote is present in the workspace's repository at the same commit"
+        },
+        {
+          "id": "05-REQ-2.2",
+          "pattern": "complex_event",
+          "condition": "a repository is copied in",
+          "guard": "the workspace has a stored origin credential",
+          "system": "Parley service",
+          "action": "authenticate to the remote with that credential",
+          "contract": "a private remote is copied successfully; the credential appears in no response body and no log record"
+        },
+        {
+          "id": "05-REQ-2.3",
+          "pattern": "complex_event",
+          "condition": "a repository is copied in",
+          "guard": "the workspace has no stored origin credential",
+          "system": "Parley service",
+          "action": "copy from the remote without authenticating",
+          "contract": "a public remote is copied successfully with no credential; a private one fails and is reported as a failed copy"
+        },
+        {
+          "id": "05-REQ-2.4",
+          "pattern": "unwanted",
+          "condition": "the credentials given on create are refused by the remote",
+          "system": "Parley service",
+          "action": "refuse the create before any workspace is written",
+          "contract": "HTTP 400 in the error envelope; no workspace row, no secret and no repository exists afterwards"
+        },
+        {
+          "id": "05-REQ-2.5",
+          "pattern": "unwanted",
+          "condition": "a copy fails after the workspace was created, whether from the network, a refusal by the remote or a remote that does not exist",
+          "system": "Parley service",
+          "action": "leave the workspace readable with status failed and the reason recorded",
+          "contract": "the workspace's status is \"failed\" and clone_error names the failure; the workspace is still readable and can be archived or recloned; no credential appears in clone_error"
+        },
+        {
+          "id": "05-REQ-2.6",
+          "pattern": "event_driven",
+          "condition": "a copy cannot finish within one unit of platform work",
+          "system": "Parley service",
+          "action": "continue it in another and carry it to completion",
+          "contract": "a repository larger than one unit of work can transfer reaches status ready, with every branch present"
+        }
+      ]
+    },
+    {
+      "id": "05-REQ-3",
+      "title": "Clone status",
+      "rationale": "status and clone_error are what every client polls, and a workspace stuck in cloning is one nobody can use or recover.",
+      "criteria": [
+        {
+          "id": "05-REQ-3.1",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "move a workspace's status from pending to cloning and then to ready or failed, and set head_sha from the repository's HEAD once it is ready",
+          "contract": "the observed sequence of statuses is a prefix of pending, cloning, ready or pending, cloning, failed; head_sha is a 40-character hex string when the status is ready and null before"
+        },
+        {
+          "id": "05-REQ-3.2",
+          "pattern": "unwanted",
+          "condition": "a workspace has been in status cloning for 30 minutes",
+          "system": "Parley service",
+          "action": "move it to failed and record why",
+          "contract": "the workspace's status is \"failed\" with clone_error set; no workspace remains in cloning indefinitely"
+        },
+        {
+          "id": "05-REQ-3.3",
+          "pattern": "complex_event",
+          "condition": "an archived workspace is reactivated",
+          "guard": "its repository was kept when it was archived",
+          "system": "Parley service",
+          "action": "reuse the kept repository rather than copying from the remote again",
+          "contract": "the workspace reaches ready without a transfer from the remote, and commits present only in the kept repository are still present"
+        }
+      ]
+    },
+    {
+      "id": "05-REQ-4",
+      "title": "What the store really does with refs",
+      "rationale": "Three capabilities the contract needs are undocumented, and three later packages are designed differently depending on the answer.",
+      "criteria": [
+        {
+          "id": "05-REQ-4.1",
+          "pattern": "ubiquitous",
+          "system": "repository store",
+          "action": "report whether it accepts a ref outside refs/heads/ and refs/tags/, a non-fast-forward update of a ref, and the deletion of a ref",
+          "contract": "each capability is reported as supported or not, and the report is produced by attempting the operation against a real store rather than by assertion"
+        },
+        {
+          "id": "05-REQ-4.2",
+          "pattern": "unwanted",
+          "condition": "an operation needs a capability the store does not have",
+          "system": "Parley service",
+          "action": "fail the operation with an answer naming the missing capability",
+          "contract": "the error message names the capability; the operation does not fall back to a different effect, and the repository is left as it was"
+        },
+        {
+          "id": "05-REQ-4.3",
+          "pattern": "ubiquitous",
+          "system": "repository store",
+          "action": "behave as its capability report says for each of the three capabilities",
+          "contract": "for each capability reported as supported, the operation succeeds against a real store; for each reported as unsupported, it fails"
+        }
+      ]
+    },
+    {
+      "id": "05-REQ-5",
+      "title": "Size",
+      "rationale": "The store caps a repository, and an operation that silently truncates or hangs at the cap is worse than one that refuses.",
+      "criteria": [
+        {
+          "id": "05-REQ-5.1",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "copy in, read and write a repository holding at most 500 MB of packed objects and at most 10000 refs",
+          "contract": "a repository at both limits reaches status ready and its refs are all readable afterwards"
+        },
+        {
+          "id": "05-REQ-5.2",
+          "pattern": "unwanted",
+          "condition": "an operation would take a repository past what the store accepts",
+          "system": "Parley service",
+          "action": "fail it with the route's documented storage-failure answer and leave the workspace usable",
+          "contract": "the error message names the limit exceeded; the workspace is still readable and its earlier refs are unchanged"
+        }
+      ]
+    },
+    {
+      "id": "05-REQ-6",
+      "title": "Resolving a workspace's git credential",
+      "rationale": "Every remote operation in every later package reads this, so a wrong fallback order sends the wrong credential to the wrong host.",
+      "criteria": [
+        {
+          "id": "05-REQ-6.1",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "resolve the origin credential as GIT_PAT, else GIT_USERNAME with GIT_PASSWORD, else none",
+          "contract": "with both GIT_PAT and the basic pair present the token is used; with only the pair the pair is used; with neither no credential is sent"
+        },
+        {
+          "id": "05-REQ-6.2",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "resolve the upstream credential as UPSTREAM_GIT_PAT, else UPSTREAM_GIT_USERNAME with UPSTREAM_GIT_PASSWORD, else the origin credential",
+          "contract": "with no upstream secret at all the origin credential is used for the upstream; with an upstream token present it is used instead"
+        },
+        {
+          "id": "05-REQ-6.3",
+          "pattern": "unwanted",
+          "condition": "only one half of a basic credential pair is stored",
+          "system": "Parley service",
+          "action": "ignore the half that is present, treat the pair as absent and record that it was ignored",
+          "contract": "the resolution falls through to the next option as though neither half existed; a log record says the half pair was ignored and does not contain its value"
+        },
+        {
+          "id": "05-REQ-6.4",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "read the reserved credential names only from the workspace's own scope",
+          "contract": "a secret of the same name at the owner's user scope or the workspace's organization scope is not used, and the resolution behaves as though it did not exist"
+        }
+      ]
+    },
+    {
+      "id": "05-REQ-7",
+      "title": "Retiring a repository",
+      "rationale": "Branches pushed to Parley exist only there, so releasing a repository without first offering them to the remote loses commits.",
+      "criteria": [
+        {
+          "id": "05-REQ-7.1",
+          "pattern": "complex_event",
+          "condition": "a workspace is archived",
+          "guard": "its status is ready and a usable origin credential exists",
+          "system": "Parley service",
+          "action": "push every branch of its repository to origin and then release the repository",
+          "contract": "each branch present only in the workspace's repository exists on origin afterwards; the repository is released from the store"
+        },
+        {
+          "id": "05-REQ-7.2",
+          "pattern": "unwanted",
+          "condition": "the archive push fails, or the workspace has no usable origin credential",
+          "system": "Parley service",
+          "action": "archive the workspace anyway and keep its repository",
+          "contract": "the workspace's status is \"archived\" and the repository is still in the store with every commit; reactivating it reuses that repository"
+        },
+        {
+          "id": "05-REQ-7.3",
+          "pattern": "event_driven",
+          "condition": "a workspace is deleted",
+          "system": "Parley service",
+          "action": "remove its repository from the store",
+          "contract": "the store holds no repository under that workspace's derived name afterwards"
+        }
+      ]
+    },
+    {
+      "id": "05-REQ-8",
+      "title": "The repository store interface",
+      "rationale": "This is the one place Cloudflare Artifacts is reached, and the token it issues must never leave the deployment.",
+      "criteria": [
+        {
+          "id": "05-REQ-8.1",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "reach the repository store only through its platform interface, with a Cloudflare implementation over Artifacts and a non-Cloudflare one",
+          "contract": "one contract suite exists for the interface and passes against both implementations, as the platform interfaces of package 01 do"
+        },
+        {
+          "id": "05-REQ-8.2",
+          "pattern": "ubiquitous",
+          "system": "Parley service",
+          "action": "keep every store credential inside the deployment",
+          "contract": "no response body and no log record contains a repo-scoped store token; a token the service mints for its own use is never returned to a caller"
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "05-PATH-1",
+      "title": "A private repository is registered and copied in",
+      "steps": [
+        {
+          "actor": "API client",
+          "action": "creates a workspace for a private remote, supplying a git_pat"
+        },
+        {
+          "actor": "Parley service",
+          "action": "checks the credential against the remote before writing anything"
+        },
+        {
+          "actor": "Parley service",
+          "action": "writes the workspace at pending, creates its repository in the store and queues the copy"
+        },
+        {
+          "actor": "Parley service",
+          "action": "copies every branch and tag from the remote into the repository with the stored credential, moving the status through cloning"
+        },
+        {
+          "actor": "repository store",
+          "action": "holds the refs and objects durably"
+        },
+        {
+          "actor": "API client",
+          "action": "polls the workspace and finds status ready with head_sha set"
+        }
+      ]
+    },
+    {
+      "id": "05-PATH-2",
+      "title": "A copy fails and the workspace records why",
+      "steps": [
+        {
+          "actor": "API client",
+          "action": "creates a workspace for a remote that is reachable at create time but fails during the copy"
+        },
+        {
+          "actor": "Parley service",
+          "action": "answers 201 with status pending and begins the copy"
+        },
+        {
+          "actor": "Parley service",
+          "action": "fails the copy and sets the workspace to failed with clone_error naming the failure"
+        },
+        {
+          "actor": "API client",
+          "action": "reads the workspace and sees status failed and clone_error, with no credential in the message"
+        }
+      ]
+    },
+    {
+      "id": "05-PATH-3",
+      "title": "A repository is pushed out, released and finally removed",
+      "steps": [
+        {
+          "actor": "API client",
+          "action": "archives a ready workspace holding a branch that exists nowhere else"
+        },
+        {
+          "actor": "Parley service",
+          "action": "resolves the origin credential from the workspace's secrets and pushes every branch to origin"
+        },
+        {
+          "actor": "forge",
+          "action": "accepts the branches"
+        },
+        {
+          "actor": "Parley service",
+          "action": "releases the repository and answers with status archived"
+        },
+        {
+          "actor": "API client",
+          "action": "deletes the archived workspace"
+        },
+        {
+          "actor": "repository store",
+          "action": "no longer holds a repository for that workspace"
+        }
+      ]
+    }
+  ]
+}

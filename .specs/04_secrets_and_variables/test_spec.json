@@ -1,0 +1,475 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/test_spec.v2.json",
+  "spec_id": "04",
+  "spec_name": "secrets_and_variables",
+  "schema_version": 2,
+  "tests": [
+    {
+      "id": "TS-04-1",
+      "kind": "unit",
+      "verifies": [
+        "04-REQ-1.1"
+      ],
+      "title": "Keys are accepted only in the documented shape",
+      "given": [
+        "a scope with room for entries"
+      ],
+      "when": "entries are created with keys A, A_1, a1, _A, a 255-character key, an empty key, a 256-character key, 1A, A-B, A.B and A B",
+      "then": [
+        "A, A_1, a1, _A and the 255-character key are accepted",
+        "the empty key, the 256-character key and the ones with a leading digit, a hyphen, a dot or a space are refused 400",
+        "no entry is written for a refused key"
+      ],
+      "pseudocode": "in the entry validation test file, table over the key cases asserting the status and the scope's entry count"
+    },
+    {
+      "id": "TS-04-2",
+      "kind": "integration",
+      "verifies": [
+        "04-REQ-1.2"
+      ],
+      "title": "Keys match case-insensitively for lookup and for uniqueness",
+      "given": [
+        "a scope holding one entry created as MY_KEY"
+      ],
+      "when": "it is read, replaced and deleted as my_key and MyKey, and a create names my_key",
+      "then": [
+        "each lookup finds the entry",
+        "the create of my_key is refused as a duplicate",
+        "the stored key keeps the casing it was created with"
+      ],
+      "pseudocode": "in the entry store integration test file: assert patch('my_key').status == 200; assert post([{'key':'my_key'}]).status == 409; assert list()[0].key == 'MY_KEY'"
+    },
+    {
+      "id": "TS-04-3",
+      "kind": "unit",
+      "verifies": [
+        "04-REQ-1.3"
+      ],
+      "title": "A value at the size limit is accepted and one over it is refused",
+      "given": [
+        "a scope with room for entries"
+      ],
+      "when": "entries are created and replaced with values of 0, 1, 262144 and 262145 bytes",
+      "then": [
+        "the values up to and including 262144 bytes are accepted",
+        "262145 bytes is refused 400 on both create and replace",
+        "the stored value is unchanged after a refused replace"
+      ],
+      "pseudocode": "in the entry validation test file, table over the four sizes for both create and replace"
+    },
+    {
+      "id": "TS-04-4",
+      "kind": "integration",
+      "verifies": [
+        "04-REQ-1.4"
+      ],
+      "title": "A scope holds at most 100 entries and an over-full create writes none of them",
+      "given": [
+        "a scope holding 98 entries"
+      ],
+      "when": "a create of two entries is made, then a create of one, and then a create of three against a scope holding 98",
+      "then": [
+        "the create that brings the scope to exactly 100 succeeds",
+        "the next create of one entry is refused 400",
+        "the create of three against 98 is refused 400 and writes none of the three, leaving the count at 98"
+      ],
+      "pseudocode": "in the entry store integration test file: fill(98); assert post(2).status == 201 and count() == 100; assert post(1).status == 400; reset(98); assert post(3).status == 400 and count() == 98"
+    },
+    {
+      "id": "TS-04-5",
+      "kind": "unit",
+      "verifies": [
+        "04-REQ-1.5"
+      ],
+      "title": "Lists are ordered by key ignoring case",
+      "given": [
+        "a scope holding keys created in the order B_KEY, a_key, C_KEY and A_OTHER"
+      ],
+      "when": "the scope is listed",
+      "then": [
+        "the order is a_key, A_OTHER, B_KEY, C_KEY",
+        "the same order is produced for both secrets and variables"
+      ],
+      "pseudocode": "in the entry store test file: assert [e.key for e in list()] == ['a_key','A_OTHER','B_KEY','C_KEY']"
+    },
+    {
+      "id": "TS-04-6",
+      "kind": "integration",
+      "verifies": [
+        "04-REQ-2.1"
+      ],
+      "title": "Secrets are created at each scope and the response carries no value",
+      "given": [
+        "a user, an organization the user belongs to, and a workspace the user owns"
+      ],
+      "when": "a create of two entries is made at each of the three secret scopes",
+      "then": [
+        "each answers 201 with an array of the created entries",
+        "every element carries key, created_at and updated_at and no value key",
+        "each entry is afterwards present in its own scope and absent from the other two"
+      ],
+      "pseudocode": "in the secret routes' integration test file, table over the three scopes: r = post(scope, entries); assert r.status == 201 and all('value' not in e for e in r.json)"
+    },
+    {
+      "id": "TS-04-7",
+      "kind": "integration",
+      "verifies": [
+        "04-REQ-2.2"
+      ],
+      "title": "Secrets are listed, replaced and deleted at each scope without ever returning a value",
+      "given": [
+        "each of the three secret scopes holding two entries"
+      ],
+      "when": "the scope is listed, one entry's value is replaced, the entry is read back in a list, and then deleted",
+      "then": [
+        "the list answers 200 with keys and timestamps and no values",
+        "the replace answers 200 with the entry and no value, and updates updated_at",
+        "the delete answers 204 and the entry is gone from the list"
+      ],
+      "pseudocode": "in the secret routes' integration test file, table over the three scopes running the four calls in sequence"
+    },
+    {
+      "id": "TS-04-8",
+      "kind": "unit",
+      "verifies": [
+        "04-REQ-2.3"
+      ],
+      "title": "Each secret scope admits exactly the callers the reference names",
+      "given": [
+        "a user credential, an admin token, a member of the organization, a non-member, a workspace owner, a member of the workspace's organization and a stranger"
+      ],
+      "when": "each calls the list route of each of the three secret scopes",
+      "then": [
+        "the admin token is refused 403 on the user scope",
+        "a non-member is refused 404 on the organization scope",
+        "a member of the workspace's organization and a stranger are both refused 404 on the workspace scope",
+        "the owner and an admin token are served the workspace scope"
+      ],
+      "pseudocode": "in the secret routes' test file, table over (scope, caller, expectedStatus)"
+    },
+    {
+      "id": "TS-04-9",
+      "kind": "unit",
+      "verifies": [
+        "04-REQ-2.4"
+      ],
+      "title": "A duplicate key refuses the whole create",
+      "given": [
+        "a scope already holding MY_KEY with a known value"
+      ],
+      "when": "a create names my_key alone, and then a create names a fresh key and my_key together",
+      "then": [
+        "both answer 409",
+        "the existing entry's value and updated_at are unchanged",
+        "the fresh key of the second create was not written"
+      ],
+      "pseudocode": "in the entry store test file: assert post([{'key':'my_key'}]).status == 409; assert post([fresh, dup]).status == 409 and fresh.key not in keys()"
+    },
+    {
+      "id": "TS-04-10",
+      "kind": "unit",
+      "verifies": [
+        "04-REQ-2.5"
+      ],
+      "title": "Missing values, unknown keys and unreachable scopes are refused",
+      "given": [
+        "a scope holding one entry, an organization slug naming nothing, and a workspace slug naming nothing"
+      ],
+      "when": "a replace is called with no value, a replace and a delete name a key the scope lacks, and a list is called for the unknown organization and the unknown workspace",
+      "then": [
+        "the replace with no value answers 400",
+        "the unknown key answers 404 on both replace and delete",
+        "the unknown organization and workspace answer 404",
+        "the scope's entries are unchanged throughout"
+      ],
+      "pseudocode": "in the secret routes' test file, table over the five cases asserting status and an unchanged scope"
+    },
+    {
+      "id": "TS-04-11",
+      "kind": "integration",
+      "verifies": [
+        "04-REQ-3.1"
+      ],
+      "title": "Variables are created, listed, replaced and deleted, with their values",
+      "given": [
+        "each of the three variable scopes"
+      ],
+      "when": "two entries are created, listed, one replaced and one deleted at each scope",
+      "then": [
+        "create answers 201 and list and replace answer 200, every element carrying key, value, created_at and updated_at",
+        "the value returned is the one stored",
+        "delete answers 204 and the entry is gone"
+      ],
+      "pseudocode": "in the variable routes' integration test file, table over the three scopes running the four calls in sequence"
+    },
+    {
+      "id": "TS-04-12",
+      "kind": "unit",
+      "verifies": [
+        "04-REQ-3.2"
+      ],
+      "title": "Variables obey the same key, size, count and duplicate rules as secrets",
+      "given": [
+        "a variable scope"
+      ],
+      "when": "the key, value-size, entry-count and duplicate cases of the secret tests are replayed against the variable routes",
+      "then": [
+        "each answers with the same status as its secret counterpart",
+        "no entry is written for any refused case"
+      ],
+      "pseudocode": "in the variable routes' test file, reusing the secret rule table against the variable routes and asserting identical statuses"
+    },
+    {
+      "id": "TS-04-13",
+      "kind": "integration",
+      "verifies": [
+        "04-REQ-3.3"
+      ],
+      "title": "A member of the organization reads a workspace's variables as the owner does",
+      "given": [
+        "a workspace with two variables, its owner and a member of its organization"
+      ],
+      "when": "both list the workspace's variables",
+      "then": [
+        "both answer 200",
+        "the two responses are identical, values included"
+      ],
+      "pseudocode": "in the variable routes' integration test file: assert list(owner).json == list(member).json"
+    },
+    {
+      "id": "TS-04-14",
+      "kind": "unit",
+      "verifies": [
+        "04-REQ-3.4"
+      ],
+      "title": "A member cannot change a workspace's variables",
+      "given": [
+        "a workspace with one variable and a member of its organization"
+      ],
+      "when": "the member creates, replaces and deletes a workspace variable",
+      "then": [
+        "each answers 403 with error_type forbidden and the documented message",
+        "the workspace's variables are unchanged"
+      ],
+      "pseudocode": "in the variable routes' test file, table over the three write verbs asserting 403, the error_type and an unchanged scope"
+    },
+    {
+      "id": "TS-04-15",
+      "kind": "integration",
+      "verifies": [
+        "04-REQ-3.5"
+      ],
+      "title": "A variable named like a workspace setting governs nothing",
+      "given": [
+        "a workspace whose settings are at their defaults"
+      ],
+      "when": "variables named after each of the twelve settings are created at the workspace scope, with values that would be valid for those settings",
+      "then": [
+        "the workspace's settings object is unchanged",
+        "no behaviour the settings control changes",
+        "the variables are listed as ordinary variables"
+      ],
+      "pseudocode": "in the variable routes' integration test file: for name in SETTING_NAMES: create_var(name, value); assert workspace().settings == DEFAULTS"
+    },
+    {
+      "id": "TS-04-16",
+      "kind": "integration",
+      "verifies": [
+        "04-REQ-4.1"
+      ],
+      "title": "The resolved view merges three tiers and reports each value's origin",
+      "given": [
+        "a workspace whose owner belongs to its organization",
+        "a key set at all three tiers, one at the organization and workspace tiers, one only at the organization tier and one only at the workspace tier"
+      ],
+      "when": "the resolved view is requested",
+      "then": [
+        "each key appears exactly once",
+        "the key set at all three carries the workspace's value and origin workspace",
+        "the key set at the organization and workspace tiers carries the workspace's value",
+        "the organization-only key carries origin org and the workspace-only key origin workspace"
+      ],
+      "pseudocode": "in the resolved view integration test file: r = get(f'/api/v1/workspaces/{slug}/vars/resolved'); assert {e.key: (e.value, e.origin) for e in r.json} == expected"
+    },
+    {
+      "id": "TS-04-17",
+      "kind": "integration",
+      "verifies": [
+        "04-REQ-4.2"
+      ],
+      "title": "The user tier is the workspace owner's, not the caller's",
+      "given": [
+        "a workspace, its owner with a variable at user scope, and a member of its organization with a different variable at their own user scope"
+      ],
+      "when": "the owner and the member each read the resolved view",
+      "then": [
+        "the owner's user variable appears with origin user in both answers",
+        "the member's own user variable appears in neither",
+        "the two answers are identical"
+      ],
+      "pseudocode": "in the resolved view integration test file: assert get(resolved, owner).json == get(resolved, member).json and ownerVar in keys and memberVar not in keys"
+    },
+    {
+      "id": "TS-04-18",
+      "kind": "integration",
+      "verifies": [
+        "04-REQ-4.3"
+      ],
+      "title": "The organization tier is skipped when the owner is not a member of it",
+      "given": [
+        "a workspace in an organization whose owner is not a member of that organization, with a variable set at that organization's scope"
+      ],
+      "when": "the resolved view is requested",
+      "then": [
+        "the organization's variable does not appear",
+        "variables from the owner's user scope and the workspace scope still appear"
+      ],
+      "pseudocode": "in the resolved view integration test file: remove_owner_from_org(); assert orgVar not in keys(get(resolved).json)"
+    },
+    {
+      "id": "TS-04-19",
+      "kind": "unit",
+      "verifies": [
+        "04-REQ-4.4"
+      ],
+      "title": "The resolved view is ordered by key ignoring case",
+      "given": [
+        "variables across the three tiers whose keys interleave in case-insensitive order"
+      ],
+      "when": "the resolved view is requested",
+      "then": [
+        "the array is in case-insensitive ascending key order",
+        "the order does not depend on which tier each value came from"
+      ],
+      "pseudocode": "in the resolved view test file: assert [e.key for e in resolved()] == sorted(all_keys, key=str.lower)"
+    },
+    {
+      "id": "TS-04-20",
+      "kind": "unit",
+      "verifies": [
+        "04-REQ-5.1"
+      ],
+      "title": "No secret route returns a value",
+      "given": [
+        "a distinctive value stored as a secret at each of the three scopes"
+      ],
+      "when": "the create, list, replace and delete routes of each scope are called and their responses inspected",
+      "then": [
+        "no response body contains the distinctive value",
+        "no response body carries a value key at all",
+        "the corresponding variable routes do return the value, so the difference is of the kind and not of the serialiser"
+      ],
+      "pseudocode": "in the secret routes' test file, table over (scope, route): assert SENTINEL not in response.text and 'value' not in element"
+    },
+    {
+      "id": "TS-04-21",
+      "kind": "integration",
+      "verifies": [
+        "04-REQ-5.2"
+      ],
+      "title": "A stored secret's value is not recoverable from the store",
+      "given": [
+        "a secret written with a distinctive value at each of the three scopes"
+      ],
+      "when": "the raw contents of the underlying store are dumped",
+      "then": [
+        "the dump contains no occurrence of any distinctive value",
+        "the keys are present in the dump, so the absence of the values is encryption and not a failed write",
+        "reading each secret back through the service still yields the original value to the code that uses it"
+      ],
+      "pseudocode": "in the secret store integration test file: write(SENTINEL); assert SENTINEL not in raw_dump() and key in raw_dump(); assert store.get(scope, key) == SENTINEL"
+    },
+    {
+      "id": "TS-04-22",
+      "kind": "unit",
+      "verifies": [
+        "04-REQ-5.3"
+      ],
+      "title": "No secret value reaches a log record",
+      "given": [
+        "a recording log sink and a distinctive secret value"
+      ],
+      "when": "a create, a replace, a refused create and a request that raises an unhandled failure are made with that value",
+      "then": [
+        "no log record contains the value",
+        "the log records do carry the request's route template, so the scrubbing is of the value and not of logging generally"
+      ],
+      "pseudocode": "in the secret routes' test file: for scenario in SCENARIOS: run(scenario, value=SENTINEL); assert SENTINEL not in sink.text"
+    },
+    {
+      "id": "TS-04-23",
+      "kind": "smoke",
+      "verifies": [
+        "04-PATH-1"
+      ],
+      "title": "A workspace secret is stored and never comes back out",
+      "given": [
+        "a running deployment and a workspace owned by the caller"
+      ],
+      "when": "a secret with a distinctive value is created in the workspace's scope, the scope is listed, and the store is inspected",
+      "then": [
+        "the create answers 201 with the key and no value",
+        "the list shows the key and no value",
+        "the raw store holds no occurrence of the value"
+      ],
+      "pseudocode": "in the secrets smoke test file: post(workspace secret, SENTINEL); assert 'value' not in list()[0]; assert SENTINEL not in raw_dump()",
+      "real_components": [
+        "running deployment",
+        "secret routes",
+        "secret store",
+        "encryption",
+        "relational store"
+      ]
+    },
+    {
+      "id": "TS-04-24",
+      "kind": "smoke",
+      "verifies": [
+        "04-PATH-2"
+      ],
+      "title": "Variables resolve across the three tiers against a running deployment",
+      "given": [
+        "a running deployment, a workspace whose owner belongs to its organization"
+      ],
+      "when": "one key is set at the owner's user scope, the organization scope and the workspace scope, a second only at the user scope, and the resolved view is read",
+      "then": [
+        "the first key appears once with the workspace's value and origin workspace",
+        "the second appears with origin user",
+        "the array is ordered by key ignoring case"
+      ],
+      "pseudocode": "in the variables smoke test file: set three tiers; r = get(resolved); assert r.json matches the expected (value, origin) pairs",
+      "real_components": [
+        "running deployment",
+        "variable routes",
+        "resolved view",
+        "relational store"
+      ]
+    },
+    {
+      "id": "TS-04-25",
+      "kind": "smoke",
+      "verifies": [
+        "04-PATH-3"
+      ],
+      "title": "A member reads a workspace's variables and is refused its writes and its secrets",
+      "given": [
+        "a running deployment, a workspace with variables and secrets, and a member of its organization"
+      ],
+      "when": "the member lists the variables, creates one, and lists the secrets",
+      "then": [
+        "the variable list answers 200 with values",
+        "the variable create answers 403 with error_type forbidden",
+        "the secret list answers 404"
+      ],
+      "pseudocode": "in the variables smoke test file: assert list_vars(member).status == 200 and create_var(member).json.error.error_type == 'forbidden' and list_secrets(member).status == 404",
+      "real_components": [
+        "running deployment",
+        "variable routes",
+        "secret routes",
+        "access decision",
+        "relational store"
+      ]
+    }
+  ]
+}

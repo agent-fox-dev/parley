@@ -1,0 +1,279 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v2.json",
+  "spec_id": "05",
+  "spec_name": "repository_store",
+  "schema_version": 2,
+  "test_commands": {
+    "all_tests": "make test",
+    "linter": "make lint"
+  },
+  "dependencies": [
+    {
+      "spec": "01",
+      "reason": "follows its platform interface pattern and adds the repository store to the contract suite set it established"
+    },
+    {
+      "spec": "03",
+      "reason": "completes its create route, and uses its workspace record, workspace lock and secret store"
+    },
+    {
+      "spec": "04",
+      "reason": "reads the reserved workspace secrets through its entry store to resolve a workspace's git credential"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "kind": "implement",
+      "title": "Establish what the store really does and put it behind an interface",
+      "criteria": [
+        "05-REQ-4",
+        "05-REQ-8"
+      ],
+      "tests": [
+        "TS-05-14",
+        "TS-05-15",
+        "TS-05-25",
+        "TS-05-26"
+      ],
+      "steps": [
+        "Add this task's behaviours to the store capability and repository store contract test files, and confirm they fail",
+        "Against a real store, attempt each of the three undocumented capabilities on a scratch repository: a ref outside refs/heads/ and refs/tags/, a non-fast-forward update, and a ref deletion",
+        "Record what each attempt did in an ADR under docs/adr/, as the rule later packages follow, and say plainly which capabilities the store has",
+        "Define the repository store platform interface, including a capability report derived from those attempts rather than hard-coded",
+        "Implement it over Cloudflare Artifacts, verifying each binding signature against the installed types before use and correcting the PRD's Verified External API where the documentation was wrong",
+        "Implement the non-Cloudflare version and add one contract suite that runs against both",
+        "Fail any operation needing a capability the store lacks with an error naming that capability, leaving the repository unchanged and applying no substitute effect",
+        "Keep every repo-scoped store token inside the deployment, out of response bodies and log records"
+      ],
+      "touches": [
+        "src/platform/repostore.ts",
+        "src/platform/cloudflare/artifacts.ts",
+        "src/platform/local/repostore.ts",
+        "src/platform/repostore.contract.test.ts",
+        "src/repo/capabilities.ts",
+        "src/repo/capabilities.test.ts",
+        "src/repo/capabilities.integration.test.ts",
+        "docs/adr/"
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 2,
+      "kind": "implement",
+      "title": "Give every workspace one durable repository",
+      "criteria": [
+        "05-REQ-1"
+      ],
+      "tests": [
+        "TS-05-1",
+        "TS-05-2",
+        "TS-05-3",
+        "TS-05-4"
+      ],
+      "steps": [
+        "Add this task's behaviours to the repository naming and repository store integration test files, and confirm they fail",
+        "Derive a workspace's repository name from the workspace, deterministically and without collisions, and use it everywhere rather than storing a mapping",
+        "Create the repository as part of creating the workspace",
+        "Take the workspace lock of package 03 around every operation that writes a workspace's repository",
+        "Confirm by test that refs and objects survive a restart of every component but the store"
+      ],
+      "touches": [
+        "src/repo/naming.ts",
+        "src/repo/naming.test.ts",
+        "src/repo/repository.ts",
+        "src/repo/repository.integration.test.ts",
+        "src/routes/workspaces.ts"
+      ],
+      "depends_on": [
+        1
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 3,
+      "kind": "implement",
+      "title": "Resolve a workspace's git credential from its reserved secrets",
+      "criteria": [
+        "05-REQ-6"
+      ],
+      "tests": [
+        "TS-05-18",
+        "TS-05-19",
+        "TS-05-20",
+        "TS-05-21"
+      ],
+      "steps": [
+        "Add this task's behaviours to the credential resolution test files, and confirm they fail",
+        "Resolve the origin credential as GIT_PAT, else GIT_USERNAME with GIT_PASSWORD, else none",
+        "Resolve the upstream credential as UPSTREAM_GIT_PAT, else the upstream basic pair, else the origin credential",
+        "Ignore a basic pair with only one half present, fall through as though neither existed, and log that it was ignored without logging its value",
+        "Read the reserved names only from the workspace's own scope, never from the owner's user scope or the workspace's organization scope"
+      ],
+      "touches": [
+        "src/repo/credentials.ts",
+        "src/repo/credentials.test.ts",
+        "src/repo/credentials.integration.test.ts"
+      ],
+      "depends_on": [
+        1
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 4,
+      "kind": "implement",
+      "title": "Copy a repository in, with or without a credential",
+      "criteria": [
+        "05-REQ-2"
+      ],
+      "tests": [
+        "TS-05-5",
+        "TS-05-6",
+        "TS-05-7",
+        "TS-05-8",
+        "TS-05-9",
+        "TS-05-10"
+      ],
+      "steps": [
+        "Add this task's behaviours to the copy-in integration test file, and confirm they fail",
+        "Implement the copy: fetch every branch and tag from the remote and write them into the workspace's repository over the git protocol, authenticating with the resolved origin credential where there is one",
+        "Complete the create route of package 03 by checking the given credentials against the remote before any workspace is written, answering 400 and writing nothing when the remote refuses them",
+        "Queue the copy after the create answers, and let it continue across units of platform work rather than restarting",
+        "On any failure after creation, set the workspace to failed with clone_error naming the failure and carrying no credential, leaving the workspace readable and archivable",
+        "Use this same copy path for every workspace, public remote or private, rather than the store's own import"
+      ],
+      "touches": [
+        "src/repo/copy_in.ts",
+        "src/repo/copy_in.integration.test.ts",
+        "src/routes/workspaces.ts",
+        "src/jobs/copy_in.ts"
+      ],
+      "depends_on": [
+        2,
+        3
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 5,
+      "kind": "implement",
+      "title": "Follow the copy with the workspace's status",
+      "criteria": [
+        "05-REQ-3"
+      ],
+      "tests": [
+        "TS-05-11",
+        "TS-05-12",
+        "TS-05-13"
+      ],
+      "steps": [
+        "Add this task's behaviours to the clone status integration test file, and confirm they fail",
+        "Move the status from pending to cloning when the copy starts and to ready or failed when it ends, and set head_sha from the repository's HEAD on success",
+        "Fail a workspace that has been in cloning for 30 minutes, setting clone_error to say the copy timed out, so none is ever stuck",
+        "Reuse a kept repository when an archived workspace is reactivated, rather than copying from the remote again, preserving commits that exist nowhere else"
+      ],
+      "touches": [
+        "src/repo/clone_status.ts",
+        "src/repo/clone_status.integration.test.ts",
+        "src/jobs/clone_timeout.ts",
+        "src/workspace/lifecycle.ts"
+      ],
+      "depends_on": [
+        4
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 6,
+      "kind": "implement",
+      "title": "Work at the stated sizes and refuse cleanly past them",
+      "criteria": [
+        "05-REQ-5"
+      ],
+      "tests": [
+        "TS-05-16",
+        "TS-05-17"
+      ],
+      "steps": [
+        "Add this task's behaviours to the repository size integration test file, and confirm they fail or skip with a named reason when the fixture cannot be built",
+        "Confirm a repository of 500 MB of packed objects and one of 10000 refs copy in, read back and accept a write",
+        "Measure where the real ceilings lie and record them, correcting the figures in this package's requirements and in the source PRD's decision D17 if they differ",
+        "Fail an operation that would exceed what the store accepts with the documented storage-failure answer, naming the limit, and leave the workspace readable with its earlier refs unchanged"
+      ],
+      "touches": [
+        "src/repo/limits.ts",
+        "src/repo/limits.integration.test.ts",
+        "docs/adr/"
+      ],
+      "depends_on": [
+        4
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 7,
+      "kind": "implement",
+      "title": "Push a repository out on archive and remove it on delete",
+      "criteria": [
+        "05-REQ-7"
+      ],
+      "tests": [
+        "TS-05-22",
+        "TS-05-23",
+        "TS-05-24"
+      ],
+      "steps": [
+        "Add this task's behaviours to the repository retirement integration test file, and confirm they fail",
+        "On archiving a ready workspace with a usable origin credential, push every branch of its repository to origin and then release the repository",
+        "When that push fails, or there is no usable credential, archive the workspace and keep the repository, so no commit is lost",
+        "On deleting a workspace, remove its repository from the store",
+        "Confirm that reactivating a workspace whose repository was kept reuses it"
+      ],
+      "touches": [
+        "src/repo/retire.ts",
+        "src/repo/retire.integration.test.ts",
+        "src/workspace/lifecycle.ts"
+      ],
+      "depends_on": [
+        4,
+        5
+      ],
+      "state": "pending"
+    },
+    {
+      "id": 8,
+      "kind": "integration",
+      "title": "Verify registration, failure and retirement against a running deployment",
+      "tests": [
+        "TS-05-27",
+        "TS-05-28",
+        "TS-05-29"
+      ],
+      "steps": [
+        "Add the three smoke tests and confirm each passes against a running deployment with a real store, or skips with a message naming the missing deployment, store or remote",
+        "Trace 05-PATH-1: the create route checks the credential against the real remote, writes the workspace and the secret, creates the repository through the store interface, and the copy job transfers every ref. Confirm no step is served by a stub",
+        "Trace 05-PATH-2: the failure reaches clone_error through the same path, and the workspace remains readable and archivable afterwards",
+        "Trace 05-PATH-3: the archive resolves the credential through this package's resolution, pushes to the real remote and releases the repository, and the delete removes it",
+        "For every criterion carrying a contract, confirm a caller in production code consumes the producer's result and not only a test: the capability report is read by the operations that need each capability, the credential resolution by the copy and the archive push, and the repository name by every store call",
+        "Confirm the create route of package 03 now performs the remote credential check, so that route is complete rather than split",
+        "Grep src/ and the files every task's touches lists for TODO, FIXME and the project's not-implemented marker, and remove any that remain",
+        "Add the repository conformance cases to the harness from package 01"
+      ],
+      "touches": [
+        "src/repo/repository.smoke.test.ts",
+        "conformance/repository.ts"
+      ],
+      "depends_on": [
+        6,
+        7
+      ],
+      "done_when": [
+        "`make check` passes with no network access and no deployment configured",
+        "afc workspace create --wait reaches ready against a running deployment for a private repository",
+        "the ADR recording the store's three capabilities exists and the code reads the capability report rather than repeating its conclusions"
+      ],
+      "state": "pending"
+    }
+  ]
+}

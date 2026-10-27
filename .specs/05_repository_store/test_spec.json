@@ -1,0 +1,558 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/test_spec.v2.json",
+  "spec_id": "05",
+  "spec_name": "repository_store",
+  "schema_version": 2,
+  "tests": [
+    {
+      "id": "TS-05-1",
+      "kind": "unit",
+      "verifies": [
+        "05-REQ-1.1"
+      ],
+      "title": "A workspace's repository name is derived and collision-free",
+      "given": [
+        "a set of workspaces with slugs that differ only in case, in hyphens and in length"
+      ],
+      "when": "the repository name is computed for each, twice",
+      "then": [
+        "each workspace yields the same name on both computations",
+        "no two workspaces yield the same name",
+        "the name is valid for the store's naming rules"
+      ],
+      "pseudocode": "in the repository naming test file: assert name(ws) == name(ws); assert len({name(w) for w in workspaces}) == len(workspaces)"
+    },
+    {
+      "id": "TS-05-2",
+      "kind": "integration",
+      "verifies": [
+        "05-REQ-1.2"
+      ],
+      "title": "Creating a workspace creates its repository",
+      "given": [
+        "a store with no repositories"
+      ],
+      "when": "a workspace is created",
+      "then": [
+        "the store holds a repository under the workspace's derived name once the create route has answered",
+        "a second workspace adds a second repository and leaves the first alone"
+      ],
+      "pseudocode": "in the repository store integration test file: post(workspace); assert store.exists(name(ws))"
+    },
+    {
+      "id": "TS-05-3",
+      "kind": "integration",
+      "verifies": [
+        "05-REQ-1.3"
+      ],
+      "title": "Refs and objects survive a restart of the service",
+      "given": [
+        "a workspace whose repository holds two branches and a tag"
+      ],
+      "when": "every component but the store is restarted and the repository is read again",
+      "then": [
+        "every ref is present at the same commit",
+        "the objects are readable",
+        "no re-copy from the remote happened"
+      ],
+      "pseudocode": "in the repository store integration test file: before = refs(ws); restart_service(); assert refs(ws) == before and remote.fetch_count == 1"
+    },
+    {
+      "id": "TS-05-4",
+      "kind": "integration",
+      "verifies": [
+        "05-REQ-1.4"
+      ],
+      "title": "Two writes to one workspace's repository are serialised",
+      "given": [
+        "a workspace and two operations that write its repository and record their start and end instants"
+      ],
+      "when": "both are started concurrently on the same workspace, and then one on each of two workspaces",
+      "then": [
+        "on one workspace the intervals do not overlap",
+        "a writer that may not wait answers 409 workspace_busy",
+        "writes to different workspaces may overlap"
+      ],
+      "pseudocode": "in the repository store integration test file: run concurrently and assert not overlapping(a, b) for one workspace"
+    },
+    {
+      "id": "TS-05-5",
+      "kind": "integration",
+      "verifies": [
+        "05-REQ-2.1"
+      ],
+      "title": "A copy brings every branch and tag at the right commit",
+      "given": [
+        "a remote with three branches, two tags and a non-default HEAD"
+      ],
+      "when": "a workspace is created for it and the copy completes",
+      "then": [
+        "all three branches and both tags exist in the workspace's repository",
+        "each is at the same commit as on the remote",
+        "HEAD points where the remote's HEAD points"
+      ],
+      "pseudocode": "in the copy-in integration test file: assert refs(ws) == refs(remote) and head(ws) == head(remote)"
+    },
+    {
+      "id": "TS-05-6",
+      "kind": "integration",
+      "verifies": [
+        "05-REQ-2.2"
+      ],
+      "title": "A private remote is copied with the stored credential, which never leaks",
+      "given": [
+        "a private remote that requires a token, and a workspace created with that token as git_pat"
+      ],
+      "when": "the copy runs",
+      "then": [
+        "the copy succeeds and the workspace reaches ready",
+        "the remote saw the token",
+        "the token appears in no response body and no log record"
+      ],
+      "pseudocode": "in the copy-in integration test file: assert status(ws) == 'ready' and remote.sawToken == tok and tok not in logs.text"
+    },
+    {
+      "id": "TS-05-7",
+      "kind": "integration",
+      "verifies": [
+        "05-REQ-2.3"
+      ],
+      "title": "A public remote needs no credential and a private one without a credential fails",
+      "given": [
+        "a public remote and a private remote",
+        "workspaces created for each with no credential"
+      ],
+      "when": "each copy runs",
+      "then": [
+        "the public one reaches ready and the remote saw no credential",
+        "the private one ends at failed with clone_error set",
+        "neither leaves the workspace unreadable"
+      ],
+      "pseudocode": "in the copy-in integration test file, table over (remoteVisibility, expectedStatus)"
+    },
+    {
+      "id": "TS-05-8",
+      "kind": "integration",
+      "verifies": [
+        "05-REQ-2.4"
+      ],
+      "title": "Credentials the remote refuses stop the create before anything is written",
+      "given": [
+        "a remote that refuses a particular token"
+      ],
+      "when": "a workspace is created with that token",
+      "then": [
+        "the create answers 400",
+        "no workspace row, no secret and no repository exists afterwards",
+        "the message does not contain the token"
+      ],
+      "pseudocode": "in the copy-in integration test file: r = post(workspace, badTok); assert r.status == 400 and not exists(ws) and not store.exists(name(ws)) and badTok not in r.text"
+    },
+    {
+      "id": "TS-05-9",
+      "kind": "integration",
+      "verifies": [
+        "05-REQ-2.5"
+      ],
+      "title": "A copy that fails after creation leaves a readable failed workspace",
+      "given": [
+        "a remote that accepts the credential check and then fails the transfer, one that disappears, and one that refuses after creation"
+      ],
+      "when": "a workspace is created for each and each copy runs",
+      "then": [
+        "each workspace ends at failed with clone_error naming the failure",
+        "each workspace is still readable and can be archived",
+        "no clone_error contains a credential"
+      ],
+      "pseudocode": "in the copy-in integration test file, table over the three failure modes asserting status, clone_error and that read and archive still work"
+    },
+    {
+      "id": "TS-05-10",
+      "kind": "integration",
+      "verifies": [
+        "05-REQ-2.6"
+      ],
+      "title": "A copy larger than one unit of work continues and completes",
+      "given": [
+        "a remote whose transfer cannot finish within one unit of platform work"
+      ],
+      "when": "a workspace is created for it and the copy runs to completion",
+      "then": [
+        "the workspace reaches ready",
+        "every branch of the remote is present",
+        "the copy was resumed at least once rather than restarted from the beginning"
+      ],
+      "pseudocode": "in the copy-in integration test file: create(bigRemote); assert eventually(status == 'ready') and refs(ws) == refs(remote) and resumeCount >= 1"
+    },
+    {
+      "id": "TS-05-11",
+      "kind": "integration",
+      "verifies": [
+        "05-REQ-3.1"
+      ],
+      "title": "The status sequence and head_sha follow the copy",
+      "given": [
+        "a workspace being created for a reachable remote and one for an unreachable remote"
+      ],
+      "when": "the workspace is polled throughout the copy",
+      "then": [
+        "the observed statuses are a prefix of pending, cloning, ready for the first and of pending, cloning, failed for the second",
+        "head_sha is null before ready and a 40-character hex string after",
+        "no status outside the four appears"
+      ],
+      "pseudocode": "in the clone status integration test file: seq = poll_until_terminal(); assert is_prefix(seq, ['pending','cloning','ready'])"
+    },
+    {
+      "id": "TS-05-12",
+      "kind": "integration",
+      "verifies": [
+        "05-REQ-3.2"
+      ],
+      "title": "A workspace does not stay in cloning for ever",
+      "given": [
+        "a copy that hangs without failing, and a controllable clock"
+      ],
+      "when": "the clock is advanced past 30 minutes with the workspace still in cloning",
+      "then": [
+        "the workspace moves to failed with clone_error set",
+        "the clone_error says the copy timed out",
+        "the workspace can then be recloned or archived"
+      ],
+      "pseudocode": "in the clone status integration test file: start_hanging_copy(); clock.advance(31*60); assert status(ws) == 'failed' and clone_error is not None"
+    },
+    {
+      "id": "TS-05-13",
+      "kind": "integration",
+      "verifies": [
+        "05-REQ-3.3"
+      ],
+      "title": "Reactivating a workspace whose repository was kept reuses it",
+      "given": [
+        "an archived workspace whose archive push failed, so its repository was kept, holding a branch that exists on no remote"
+      ],
+      "when": "the workspace is reactivated and reaches ready",
+      "then": [
+        "the branch that exists on no remote is still present",
+        "no transfer from the remote happened",
+        "the workspace reaches ready"
+      ],
+      "pseudocode": "in the clone status integration test file: post(reactivate); assert eventually(status == 'ready') and localOnlyBranch in refs(ws) and remote.fetch_count == before"
+    },
+    {
+      "id": "TS-05-14",
+      "kind": "integration",
+      "verifies": [
+        "05-REQ-4.1",
+        "05-REQ-4.3"
+      ],
+      "title": "The store's three undocumented capabilities are established by exercising them",
+      "given": [
+        "a real store and a scratch repository"
+      ],
+      "when": "a ref outside refs/heads/ and refs/tags/ is pushed, a non-fast-forward update is pushed, and a ref deletion is pushed",
+      "then": [
+        "each attempt yields a definite supported or unsupported result",
+        "the capability report matches what each attempt did",
+        "the report is derived from the attempts and not from a hard-coded table"
+      ],
+      "pseudocode": "in the store capability integration test file: for cap in CAPS: observed = attempt(cap); assert store.capabilities()[cap] == observed"
+    },
+    {
+      "id": "TS-05-15",
+      "kind": "unit",
+      "verifies": [
+        "05-REQ-4.2"
+      ],
+      "title": "An operation needing a missing capability fails and names it",
+      "given": [
+        "a store implementation reporting each capability as unsupported in turn"
+      ],
+      "when": "an operation requiring that capability is attempted",
+      "then": [
+        "the operation fails",
+        "the error names the missing capability",
+        "the repository is unchanged, and no different effect was applied in its place"
+      ],
+      "pseudocode": "in the store capability test file, table over the three capabilities asserting the failure, the message and an unchanged ref list"
+    },
+    {
+      "id": "TS-05-16",
+      "kind": "integration",
+      "verifies": [
+        "05-REQ-5.1"
+      ],
+      "title": "A repository at the stated size limits is copied, read and written",
+      "given": [
+        "a remote with 500 MB of packed objects and one with 10000 refs"
+      ],
+      "when": "each is copied in, read back and written to",
+      "then": [
+        "each reaches status ready",
+        "every ref is readable afterwards",
+        "a subsequent write succeeds"
+      ],
+      "pseudocode": "in the repository size integration test file, skipping with a named reason when the fixture cannot be built: assert status == 'ready' and len(refs(ws)) == 10000"
+    },
+    {
+      "id": "TS-05-17",
+      "kind": "integration",
+      "verifies": [
+        "05-REQ-5.2"
+      ],
+      "title": "An operation past the store's limit fails cleanly and leaves the workspace usable",
+      "given": [
+        "a workspace near the store's storage limit"
+      ],
+      "when": "a write that would exceed the limit is attempted",
+      "then": [
+        "the operation fails with the documented storage-failure answer",
+        "the message names the limit exceeded",
+        "the workspace is still readable and its earlier refs are unchanged"
+      ],
+      "pseudocode": "in the repository size integration test file: r = write_over_limit(); assert r.failed and 'limit' in r.message and refs(ws) == before"
+    },
+    {
+      "id": "TS-05-18",
+      "kind": "unit",
+      "verifies": [
+        "05-REQ-6.1"
+      ],
+      "title": "The origin credential follows the documented order",
+      "given": [
+        "workspaces holding every combination of GIT_PAT, GIT_USERNAME and GIT_PASSWORD"
+      ],
+      "when": "the origin credential is resolved for each",
+      "then": [
+        "GIT_PAT wins when present, even alongside a complete basic pair",
+        "a complete basic pair is used when there is no GIT_PAT",
+        "no credential is produced when neither is present"
+      ],
+      "pseudocode": "in the credential resolution test file, table over the eight combinations asserting the resolved credential"
+    },
+    {
+      "id": "TS-05-19",
+      "kind": "unit",
+      "verifies": [
+        "05-REQ-6.2"
+      ],
+      "title": "The upstream credential falls back to the origin credential",
+      "given": [
+        "workspaces holding every combination of the upstream names and the origin names"
+      ],
+      "when": "the upstream credential is resolved for each",
+      "then": [
+        "UPSTREAM_GIT_PAT wins when present",
+        "the upstream basic pair is used when there is no upstream token",
+        "with no upstream secret at all the origin credential is used",
+        "with neither upstream nor origin credential none is produced"
+      ],
+      "pseudocode": "in the credential resolution test file, table over the combinations asserting the resolved upstream credential"
+    },
+    {
+      "id": "TS-05-20",
+      "kind": "unit",
+      "verifies": [
+        "05-REQ-6.3"
+      ],
+      "title": "A half basic pair is ignored and the fact is recorded",
+      "given": [
+        "a workspace holding GIT_USERNAME without GIT_PASSWORD, and one holding GIT_PASSWORD without GIT_USERNAME",
+        "a recording log sink"
+      ],
+      "when": "the origin credential is resolved for each",
+      "then": [
+        "the resolution falls through as though neither half existed",
+        "a log record says the half pair was ignored",
+        "no log record contains the value of the half that was present"
+      ],
+      "pseudocode": "in the credential resolution test file: assert resolve(ws) is None and 'ignored' in sink.text and value not in sink.text"
+    },
+    {
+      "id": "TS-05-21",
+      "kind": "integration",
+      "verifies": [
+        "05-REQ-6.4"
+      ],
+      "title": "Only the workspace's own scope is read for the reserved names",
+      "given": [
+        "a workspace with no GIT_PAT, whose owner has GIT_PAT at user scope and whose organization has GIT_PAT at organization scope"
+      ],
+      "when": "the origin credential is resolved",
+      "then": [
+        "no credential is produced",
+        "neither the user's nor the organization's value is used",
+        "adding GIT_PAT at the workspace scope then produces it"
+      ],
+      "pseudocode": "in the credential resolution integration test file: assert resolve(ws) is None; set_workspace_secret('GIT_PAT', v); assert resolve(ws) == v"
+    },
+    {
+      "id": "TS-05-22",
+      "kind": "integration",
+      "verifies": [
+        "05-REQ-7.1"
+      ],
+      "title": "Archiving pushes every branch to origin and then releases the repository",
+      "given": [
+        "a ready workspace with a usable origin credential and a branch that exists only in its repository"
+      ],
+      "when": "the workspace is archived",
+      "then": [
+        "the branch exists on origin afterwards",
+        "the repository is released from the store",
+        "the workspace's status is archived"
+      ],
+      "pseudocode": "in the repository retirement integration test file: post(archive); assert localOnlyBranch in refs(remote) and not store.exists(name(ws))"
+    },
+    {
+      "id": "TS-05-23",
+      "kind": "integration",
+      "verifies": [
+        "05-REQ-7.2"
+      ],
+      "title": "A failed archive push keeps the repository rather than losing commits",
+      "given": [
+        "a ready workspace with a branch that exists only in its repository, and a remote that refuses the push",
+        "a second workspace with no usable credential"
+      ],
+      "when": "each is archived",
+      "then": [
+        "both reach status archived",
+        "both repositories are still in the store with the local-only branch present",
+        "reactivating either reuses the kept repository"
+      ],
+      "pseudocode": "in the repository retirement integration test file, table over the two cases asserting status, store.exists and the branch's presence"
+    },
+    {
+      "id": "TS-05-24",
+      "kind": "integration",
+      "verifies": [
+        "05-REQ-7.3"
+      ],
+      "title": "Deleting a workspace removes its repository",
+      "given": [
+        "an archived workspace whose repository was kept"
+      ],
+      "when": "the workspace is deleted",
+      "then": [
+        "the store holds no repository under that workspace's derived name",
+        "the delete answers 204"
+      ],
+      "pseudocode": "in the repository retirement integration test file: delete(ws); assert not store.exists(name(ws))"
+    },
+    {
+      "id": "TS-05-25",
+      "kind": "integration",
+      "verifies": [
+        "05-REQ-8.1"
+      ],
+      "title": "The repository store contract suite passes against both implementations",
+      "given": [
+        "the repository store contract suite, the Cloudflare implementation over Artifacts and the non-Cloudflare implementation"
+      ],
+      "when": "the suite is run against each",
+      "then": [
+        "every case passes against both",
+        "the suite is one definition run twice, parameterised only by the implementation",
+        "a case that passes against one and fails against the other is reported as a failure"
+      ],
+      "pseudocode": "in the repository store contract test file: for impl in [artifactsImpl(), localImpl()]: runContractSuite(impl)"
+    },
+    {
+      "id": "TS-05-26",
+      "kind": "unit",
+      "verifies": [
+        "05-REQ-8.2"
+      ],
+      "title": "No store token reaches a response or a log",
+      "given": [
+        "a store implementation that mints a distinctive repo-scoped token",
+        "a recording log sink"
+      ],
+      "when": "a copy, a read, a failed write and a request that raises an unhandled failure are each performed",
+      "then": [
+        "no response body contains the token",
+        "no log record contains it",
+        "the operations themselves still succeed, so the token was used and not merely withheld"
+      ],
+      "pseudocode": "in the repository store test file: for scenario in SCENARIOS: run(scenario); assert TOKEN not in body and TOKEN not in sink.text"
+    },
+    {
+      "id": "TS-05-27",
+      "kind": "smoke",
+      "verifies": [
+        "05-PATH-1"
+      ],
+      "title": "A private repository is registered and reaches ready against a running deployment",
+      "given": [
+        "a running deployment, a real store, and a private remote with a working token"
+      ],
+      "when": "a workspace is created with that token and polled until its status is terminal",
+      "then": [
+        "the create answers 201 with status pending",
+        "the workspace reaches ready with head_sha set",
+        "every branch of the remote is present in the workspace's repository",
+        "the token appears in no response"
+      ],
+      "pseudocode": "in the repository smoke test file: post(workspace, git_pat=tok); assert poll_until_terminal() == 'ready' and head_sha is not None",
+      "real_components": [
+        "running deployment",
+        "workspace routes",
+        "repository store",
+        "credential resolution",
+        "secret store",
+        "private remote"
+      ]
+    },
+    {
+      "id": "TS-05-28",
+      "kind": "smoke",
+      "verifies": [
+        "05-PATH-2"
+      ],
+      "title": "A failed copy leaves a readable workspace that says why",
+      "given": [
+        "a running deployment and a remote that becomes unreachable after the credential check"
+      ],
+      "when": "a workspace is created for it and polled until its status is terminal",
+      "then": [
+        "the create answers 201",
+        "the workspace reaches failed with clone_error naming the failure",
+        "the workspace is still readable and can be archived",
+        "clone_error contains no credential"
+      ],
+      "pseudocode": "in the repository smoke test file: post(workspace); assert poll_until_terminal() == 'failed' and read().json.clone_error",
+      "real_components": [
+        "running deployment",
+        "workspace routes",
+        "repository store",
+        "copy-in",
+        "unreachable remote"
+      ]
+    },
+    {
+      "id": "TS-05-29",
+      "kind": "smoke",
+      "verifies": [
+        "05-PATH-3"
+      ],
+      "title": "Archiving pushes branches out and deleting removes the repository",
+      "given": [
+        "a running deployment, a ready workspace with a branch that exists only in its repository, and a writable remote"
+      ],
+      "when": "the workspace is archived and then deleted",
+      "then": [
+        "the branch exists on the remote after the archive",
+        "the workspace's status is archived",
+        "after the delete the store holds no repository for it"
+      ],
+      "pseudocode": "in the repository smoke test file: post(archive); assert branch in remote_refs(); delete(ws); assert not store_has(ws)",
+      "real_components": [
+        "running deployment",
+        "workspace routes",
+        "repository store",
+        "credential resolution",
+        "writable remote"
+      ]
+    }
+  ]
+}
