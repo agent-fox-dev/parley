@@ -228,3 +228,37 @@ describe('a value at the size limit', () => {
     ).toBe(400);
   });
 });
+
+describe('the credentials a workspace create stores', () => {
+  it('are the same entries the secret routes serve, under one store', async () => {
+    const held = await scopes();
+    await held.app.request(
+      `${MOUNT}/workspaces`,
+      withJson(
+        'POST',
+        {
+          slug: 'with-credentials',
+          git_url: 'https://github.com/u/r.git',
+          git_pat: 'ghp_SENTINEL_FROM_CREATE',
+        },
+        held.key,
+      ),
+    );
+
+    const listed = await held.app.request(
+      `${MOUNT}/workspaces/with-credentials/secrets`,
+      as(held.key),
+    );
+    const entries = (await listed.json()) as Array<{ key: string }>;
+
+    expect(listed.status).toBe(200);
+    expect(entries.map((e) => e.key)).toEqual(['GIT_PAT']);
+    expect(JSON.stringify(entries)).not.toContain('ghp_SENTINEL_FROM_CREATE');
+
+    // And the service itself still reads the value back, which is what a
+    // clone will need.
+    expect(await held.secrets.get('workspace:with-credentials', 'GIT_PAT')).toBe(
+      'ghp_SENTINEL_FROM_CREATE',
+    );
+  });
+});

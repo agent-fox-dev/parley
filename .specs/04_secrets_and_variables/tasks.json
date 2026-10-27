@@ -191,7 +191,7 @@
         "`make check` passes with no network access and no deployment configured",
         "afc secrets create, list, update and delete and afc vars create, list, update, delete and resolve behave as docs/prd/cli.md specifies against a running deployment"
       ],
-      "state": "pending"
+      "state": "done"
     }
   ]
 }
