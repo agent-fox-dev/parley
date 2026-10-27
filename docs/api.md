@@ -23,6 +23,7 @@ implemented; routes appear here as they are built.
 - [Workspace access](#workspace-access)
 - [Workspaces](#workspaces)
 - [Workspace-bound tokens](#workspace-bound-tokens)
+- [Sandboxes](#sandboxes)
 - [Server Endpoints](#server-endpoints)
 
 ## Conventions
@@ -702,6 +703,26 @@ revokes the live tokens of bindings whose workspace is gone and removes
 bindings whose token is gone; a binding of a revoked or expired token of a
 workspace that still exists is kept, so that workspace's token list still
 shows it.
+
+## Sandboxes
+
+This deployment lends no sandboxes. Every sandbox route is registered and
+answers `404` with `error_type: sandboxes_disabled` and the message
+`sandboxes are not enabled on this hub`, to every authenticated caller,
+**before** any scope is checked and before the workspace is looked up — so
+the answer is the same whether the workspace exists, is archived, or the
+caller's token lacks the scope.
+
+The paths are `GET /api/v1/sandbox-profiles`, `POST`, `GET`
+`/api/v1/workspaces/:slug/sandboxes`, `GET`, `DELETE`
+`/api/v1/workspaces/:slug/sandboxes/:id` and `GET /api/v1/sandboxes`.
+
+A caller with no credential is still refused `401` first: the missing
+credential is the earlier answer, and it carries no `error_type`.
+
+The routes are registered rather than left unrouted, because an unrouted
+path answers `404` with no `error_type`, which clients tell apart from a
+deployment that has sandboxes switched off.
 
 ## Server Endpoints
 

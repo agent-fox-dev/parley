@@ -8,6 +8,7 @@ import { authRoutes } from './auth.js';
 import { keyRoutes } from './keys.js';
 import { orgRoutes } from './orgs.js';
 import { boundTokenRoutes } from './bound_tokens.js';
+import { sandboxRoutes } from './sandboxes.js';
 import { workspaceRoutes } from './workspaces.js';
 import { tokenPermissionRoutes } from './token_permissions.js';
 import { tokenRoutes } from './tokens.js';
@@ -58,6 +59,7 @@ export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
       clock: config.clock,
     }),
     ...orgRoutes({ mountPoint: config.mountPoint, store: config.store }),
+    ...sandboxRoutes(config.mountPoint),
     ...boundTokenRoutes({
       mountPoint: config.mountPoint,
       store: config.store,

@@ -4,7 +4,7 @@ spec_name: "workspaces"
 title: "Register workspaces and decide who may read and change them"
 status: "active"
 created_at: "2026-10-27T18:14:09Z"
-updated_at: "2026-10-27T21:57:53Z"
+updated_at: "2026-10-27T21:58:58Z"
 intent_hash: "055fea170330eecd79d37984fe7f7d0f83290a6436e903cf296e08ccd18574b7"
 schema_version: 2
 source: "docs/prd/01-port-af-hub-to-typescript-on-cloudflare.md"
