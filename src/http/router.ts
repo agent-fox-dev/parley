@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import type { Context } from 'hono';
 import { type AuthOptions, authentication, scopeRefusal } from '../auth/middleware.js';
+import { confinement } from '../auth/confinement.js';
 import { redactCredentials } from '../auth/credentials.js';
 import { DEFAULT_MAX_BODY_BYTES, DEFAULT_MOUNT_POINT } from '../config.js';
 import type { Clock, MetricsSink, RelationalStore } from '../platform/index.js';
@@ -137,6 +138,9 @@ export function buildApp(options: AppOptions = {}): Hono {
 
   if (options.auth !== undefined) {
     app.use('*', authentication({ ...options.auth, log }));
+    // Straight after the credential is known, so a bound token is confined
+    // before any scope, existence or status check runs.
+    app.use('*', confinement(options.auth.mountPoint));
   }
 
   for (const route of routes) {

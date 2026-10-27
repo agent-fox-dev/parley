@@ -109,6 +109,17 @@ export const MIGRATIONS: readonly Migration[] = [
        )`,
     ],
   },
+  {
+    name: '004_token_bindings',
+    statements: [
+      `CREATE TABLE token_bindings (
+         token_id TEXT PRIMARY KEY,
+         workspace_slug TEXT NOT NULL,
+         created_at TEXT NOT NULL
+       )`,
+      'CREATE INDEX token_bindings_by_workspace ON token_bindings (workspace_slug)',
+    ],
+  },
 ];
 
 /**

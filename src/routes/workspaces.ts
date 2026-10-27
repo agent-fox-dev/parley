@@ -148,6 +148,7 @@ async function readWorkspace(c: Context, config: WorkspaceRouteConfig): Promise<
 async function listWorkspaces(c: Context, config: WorkspaceRouteConfig): Promise<Response> {
   const identity = identityOf(c);
   const includeArchived = c.req.query('include_archived') === 'true';
+  const boundTo = identity?.boundTo;
 
   const orgs =
     identity?.userId === undefined ? [] : await orgsOfUser(config.store, identity.userId);
@@ -160,6 +161,10 @@ async function listWorkspaces(c: Context, config: WorkspaceRouteConfig): Promise
   const slugById = new Map(orgs.map((org) => [org.id, org.slug]));
   const serialised = [];
   for (const workspace of workspaces) {
+    // A bound token sees at most its own workspace, whatever else it owns.
+    if (boundTo !== undefined && workspace.slug !== boundTo) {
+      continue;
+    }
     const level = (await accessLevel(config.store, identity, workspace)) ?? 'member';
     const known = workspace.org_id === null ? undefined : slugById.get(workspace.org_id);
     const orgSlug =

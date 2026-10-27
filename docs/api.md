@@ -22,6 +22,7 @@ implemented; routes appear here as they are built.
 - [Administration](#administration)
 - [Workspace access](#workspace-access)
 - [Workspaces](#workspaces)
+- [Workspace-bound tokens](#workspace-bound-tokens)
 - [Server Endpoints](#server-endpoints)
 
 ## Conventions
@@ -589,6 +590,70 @@ same body.
 | `forge_api_url`                   | string                                   | `""`        |
 | `upstream_forge_api_url`          | string                                   | `""`        |
 | `sync_enabled`                    | boolean                                  | `true`      |
+
+## Workspace-bound tokens
+
+A personal access token can be tied to exactly one workspace when it is
+minted. It then reaches that workspace under its scopes, with the answers
+an unbound token of the same user and scopes would get, and nothing else.
+
+### POST /api/v1/workspaces/:slug/tokens
+
+Mint a token bound to the workspace. The body, the validation, the expiry
+and the privilege rules are those of
+[`POST /api/v1/user/tokens`](#post-apiv1usertokens); the token is bound
+afterwards.
+
+**Access:** the workspace's **owner** only, with `tokens:manage`.
+
+**Response:** `201 Created`, `Cache-Control: no-store`, with the token's
+metadata, `workspace`, and `token` — the only response that carries it.
+
+**Errors**, in the order they are checked:
+
+| Status            | Condition                                                                                                    |
+| ----------------- | ------------------------------------------------------------------------------------------------------------ |
+| 401               | No credential                                                                                                |
+| 403 `token_bound` | The caller is itself a bound token                                                                           |
+| 403               | An admin token: a bound token needs a real user as its owner                                                 |
+| 404               | The workspace does not exist, or the caller is not its owner — a member of its organization is told this too |
+| 400               | The workspace is archived                                                                                    |
+| any               | The token creation's own answer, unchanged; nothing is bound                                                 |
+| 500               | The binding could not be written; the token is revoked                                                       |
+
+### GET /api/v1/workspaces/:slug/tokens
+
+List the tokens bound to the workspace, revoked and expired ones included,
+ordered by creation time then token id. Works on an archived workspace. A
+binding whose token no longer exists is left out. No entry carries a token
+or a hash.
+
+**Access:** the owner or an admin token, with `tokens:read`; a member gets
+`404`. A bound token is refused `403 token_bound`.
+
+### What a bound token may reach
+
+| Request by a token bound to `S`                                              | Answer                                                                                                      |
+| ---------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| Any route naming a workspace other than `S`                                  | `404 workspace not found`, **before** any scope, existence or status check                                  |
+| The same routes for `S`                                                      | The route's usual answer                                                                                    |
+| `GET /api/v1/workspaces`                                                     | At most `S`                                                                                                 |
+| `GET /api/v1/sandbox-profiles`                                               | As for an unbound token                                                                                     |
+| Any other route under the mount point, including one that matches nothing    | `403`, `error_type: token_bound`, message `this token is bound to workspace <S>`                            |
+| An identity route (`/user`, `/user/keys`, `/user/tokens`, `/users`, `/orgs`) | `403`, `error_type: token_bound`, message `this token is bound to a workspace` — the workspace is not named |
+
+The `404` for another workspace is the same answer an unknown slug gets, so
+a bound token learns nothing about what else exists.
+
+**A binding the service cannot read is `500`.** The token is never let
+through as though it were unbound.
+
+Deleting a workspace revokes its live bound tokens and removes their
+bindings in one transaction. At start and every hour after, a sweep
+revokes the live tokens of bindings whose workspace is gone and removes
+bindings whose token is gone; a binding of a revoked or expired token of a
+workspace that still exists is kept, so that workspace's token list still
+shows it.
 
 ## Server Endpoints
 

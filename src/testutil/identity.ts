@@ -21,6 +21,7 @@ import {
   insertUser,
 } from '../store/identity.js';
 import { type WorkspaceRecord, insertWorkspace } from '../store/workspaces.js';
+import { bindToken } from '../store/bindings.js';
 import { migrate } from '../store/migrations/index.js';
 
 /** The instant every seeded record is dated from, so expiry is decidable. */
@@ -147,6 +148,19 @@ export async function seedWorkspace(
   };
   await insertWorkspace(store, workspace);
   return workspace;
+}
+
+/** A token bound to one workspace, as the mint route would leave it. */
+export async function seedBoundToken(
+  store: RelationalStore,
+  user: UserRecord,
+  slug: string,
+  permissions: readonly string[],
+  over: Partial<CredentialRecord> = {},
+): Promise<SeededCredential> {
+  const seeded = await seedPat(store, user, permissions, over);
+  await bindToken(store, seeded.record.id, slug, SEED_NOW.toISOString());
+  return seeded;
 }
 
 export async function seedOrg(

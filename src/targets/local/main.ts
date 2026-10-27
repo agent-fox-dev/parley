@@ -9,6 +9,7 @@ import { maxBodyBytesFrom, type Platform } from '../../platform/index.js';
 import { configuredProviders } from '../../auth/oauth.js';
 import { serviceRoutes } from '../../routes/index.js';
 import { storeLocks } from '../../platform/store_lock.js';
+import { sweepBindings } from '../../store/bindings.js';
 import { migrate } from '../../store/migrations/index.js';
 
 /**
@@ -62,8 +63,18 @@ export async function startLocalTarget(
   env: Record<string, string | undefined> = process.env,
 ): Promise<{ port: number; stop: () => Promise<void> }> {
   const requested = Number(env['PARLEY_PORT'] ?? '8787');
+  const platform = localPlatform(env);
   // The same schema the Worker runs, applied before the first request.
-  await migrate(localPlatform(env).store);
+  await migrate(platform.store);
+  // At start and every hour after, as the reference asks.
+  await sweepBindings(platform.store, platform.clock.now().toISOString());
+  const sweeping = setInterval(
+    () => {
+      void sweepBindings(platform.store, platform.clock.now().toISOString());
+    },
+    60 * 60 * 1000,
+  );
+  sweeping.unref();
 
   return new Promise((resolve, reject) => {
     const server = serve({ fetch: buildLocalApp(env).fetch, port: requested }, (info) => {

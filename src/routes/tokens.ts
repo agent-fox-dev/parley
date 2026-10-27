@@ -101,33 +101,10 @@ export function tokenRoutes(config: TokenRouteConfig): RouteDefinition[] {
         }
 
         requireTokenScope(c, 'tokens:manage');
-        const body = await readJsonObject(c);
-        const name = checkedName(body);
-        const permissions = checkedScopes(body['permissions']);
-        if (permissions.length === 0) {
-          throw new HttpError(400, 'permissions must name at least one scope');
-        }
-        const now = config.clock.now();
-        const expiresAt = tokenExpiry(body['expires'], now);
-        checkedGrant(c, permissions);
+        const minted = await mintToken(c, config.store, config.clock, user.id);
 
-        const id = newIdentifier();
-        const secret = newSecret();
-        const token: CredentialRecord = {
-          id,
-          kind: 'pat',
-          user_id: user.id,
-          name,
-          secret_hash: await hashSecret(secret),
-          permissions,
-          created_at: now.toISOString(),
-          expires_at: expiresAt,
-          revoked_at: null,
-        };
-        await insertCredential(config.store, token);
-
-        // The only place a token string is ever returned.
-        return jsonResponse({ ...tokenMetadata(token), token: formatPat(id, secret) }, 201);
+        // The only place an unbound token string is ever returned.
+        return jsonResponse({ ...tokenMetadata(minted.token), token: minted.presented }, 201);
       },
     },
     {
@@ -154,6 +131,50 @@ export function tokenRoutes(config: TokenRouteConfig): RouteDefinition[] {
       },
     },
   ];
+}
+
+export interface MintedToken {
+  token: CredentialRecord;
+  /** The token string, which exists only here and in the response. */
+  presented: string;
+}
+
+/**
+ * Creates a token from the request's body, with the validation, expiry and
+ * privilege rules the reference gives. The bound-token route mints with
+ * exactly this, and binds what it gets.
+ */
+export async function mintToken(
+  c: Context,
+  store: RelationalStore,
+  clock: Clock,
+  userId: string,
+): Promise<MintedToken> {
+  const body = await readJsonObject(c);
+  const name = checkedName(body);
+  const permissions = checkedScopes(body['permissions']);
+  if (permissions.length === 0) {
+    throw new HttpError(400, 'permissions must name at least one scope');
+  }
+  const now = clock.now();
+  const expiresAt = tokenExpiry(body['expires'], now);
+  checkedGrant(c, permissions);
+
+  const id = newIdentifier();
+  const secret = newSecret();
+  const token: CredentialRecord = {
+    id,
+    kind: 'pat',
+    user_id: userId,
+    name,
+    secret_hash: await hashSecret(secret),
+    permissions,
+    created_at: now.toISOString(),
+    expires_at: expiresAt,
+    revoked_at: null,
+  };
+  await insertCredential(store, token);
+  return { token, presented: formatPat(id, secret) };
 }
 
 /**
