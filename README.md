@@ -24,3 +24,30 @@ time:
 Without a common answer, every team scripts its own: tokens end up in
 environment files, branches are merged by whoever notices, and the trail of
 what an agent did is scattered across terminals.
+
+## Install
+
+Parley runs on Node 22 or newer.
+
+```sh
+git clone https://github.com/agent-fox-dev/parley.git && cd parley
+npm install
+```
+
+## Develop
+
+```sh
+make help     # list every target
+make check    # the fast gate: formatting, static checks, lint and the tests
+make test     # the tests alone
+```
+
+`make check` is the gate to run before committing. `make check-release`
+adds the slow suites and is run by a person, before a release or a merge.
+
+## Read more
+
+- [API reference](docs/api.md) — every route, what it answers and how it fails
+- [Configuration](docs/configuration.md) — everything read from the environment
+- [Architecture](docs/architecture.md) — how the service is put together
+- [CLI](docs/cli.md) — Parley's client is `afc`, from `af-hub`

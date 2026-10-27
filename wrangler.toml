@@ -1,0 +1,7 @@
+name = "parley"
+main = "src/index.ts"
+compatibility_date = "2026-10-27"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+PARLEY_MOUNT_POINT = "/api/v1"
