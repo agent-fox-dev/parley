@@ -1,6 +1,7 @@
 import type { Context } from 'hono';
 import { HttpError } from '../http/errors.js';
 import { emptyResponse, jsonResponse, readJsonObject } from '../http/json.js';
+import { protectValue } from '../http/redaction.js';
 import type { RouteDefinition } from '../http/router.js';
 import type { Clock, RelationalStore } from '../platform/index.js';
 import { type ScopeFamily, entryScope } from '../entries/scopes.js';
@@ -55,7 +56,16 @@ async function createSecrets(
   family: ScopeFamily,
 ): Promise<Response> {
   const scope = await entryScope(c, config.store, family, NEED);
-  const inputs = checkedEntries(await readJsonObject(c));
+  const body = await readJsonObject(c);
+  // Protected before the body is validated, so a value in a request the
+  // service is about to refuse is covered too.
+  for (const one of Array.isArray(body['entries']) ? (body['entries'] as unknown[]) : []) {
+    const value = (one as Record<string, unknown> | null)?.['value'];
+    if (typeof value === 'string') {
+      protectValue(c, value);
+    }
+  }
+  const inputs = checkedEntries(body);
   const created = await createEntries(
     config.store,
     scope,
@@ -73,7 +83,11 @@ async function replaceSecret(
   family: ScopeFamily,
 ): Promise<Response> {
   const scope = await entryScope(c, config.store, family, NEED);
-  const value = checkedValue((await readJsonObject(c))['value']);
+  const given = (await readJsonObject(c))['value'];
+  if (typeof given === 'string') {
+    protectValue(c, given);
+  }
+  const value = checkedValue(given);
   const replaced = await replaceEntry(
     config.store,
     scope,

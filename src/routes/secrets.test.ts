@@ -177,3 +177,53 @@ describe('a secret change the service refuses', () => {
     expect(listed).toHaveLength(1);
   });
 });
+
+const VALUE = 'SENTINEL-secret-9f3a';
+
+describe('what a secret route answers with', () => {
+  it.each(['create', 'list', 'replace'] as const)(
+    'carries no value at all on %s',
+    async (action) => {
+      const held = await world();
+      const path = scopes(held.org.slug).user;
+      const created = await held.app.request(
+        path,
+        withJson('POST', { entries: [{ key: 'THE_KEY', value: VALUE }] }, held.ownerKey),
+      );
+
+      const response =
+        action === 'create'
+          ? created
+          : action === 'list'
+            ? await held.app.request(path, as(held.ownerKey))
+            : await held.app.request(
+                `${path}/THE_KEY`,
+                withJson('PATCH', { value: VALUE }, held.ownerKey),
+              );
+      const text = await response.text();
+      const entries = JSON.parse(text) as Array<Record<string, unknown>> | Record<string, unknown>;
+
+      expect(text).not.toContain(VALUE);
+      for (const entry of Array.isArray(entries) ? entries : [entries]) {
+        expect(Object.keys(entry)).not.toContain('value');
+      }
+    },
+  );
+
+  it('answers the delete with nothing at all', async () => {
+    const held = await world();
+    const path = scopes(held.org.slug).user;
+    await held.app.request(
+      path,
+      withJson('POST', { entries: [{ key: 'THE_KEY', value: VALUE }] }, held.ownerKey),
+    );
+
+    const response = await held.app.request(
+      `${path}/THE_KEY`,
+      as(held.ownerKey, { method: 'DELETE' }),
+    );
+
+    expect(response.status).toBe(204);
+    expect(await response.text()).toBe('');
+  });
+});
