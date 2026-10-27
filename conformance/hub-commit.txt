@@ -1,0 +1,5 @@
+# The commit of github.com/agent-fox-dev/hub that afc is built from for the
+# conformance checks. Replace `unpinned` with a full commit id to turn the
+# afc-dependent checks on; while it reads `unpinned` they skip with that
+# reason, and the gate's outcome is unaffected.
+unpinned

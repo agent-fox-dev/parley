@@ -24,3 +24,60 @@ time:
 Without a common answer, every team scripts its own: tokens end up in
 environment files, branches are merged by whoever notices, and the trail of
 what an agent did is scattered across terminals.
+
+## Install
+
+Parley runs on Node 22 or newer.
+
+```sh
+git clone https://github.com/agent-fox-dev/parley.git && cd parley
+npm install
+```
+
+## Develop
+
+```sh
+make help     # list every target
+make check    # the fast gate: formatting, static checks, lint and the tests
+make test     # the tests alone
+```
+
+`make check` is the gate to run before committing. `make check-release`
+adds the slow suites and is run by a person, before a release or a merge.
+
+## Run it without Cloudflare
+
+Parley runs on one Linux or macOS host with no Cloudflare account and no
+network access to Cloudflare, using SQLite on the host's own disk instead of
+D1 and the process environment instead of Worker bindings.
+
+```sh
+make build                      # type-check and bundle to dist/parley.mjs
+PARLEY_PORT=8787 node dist/parley.mjs
+curl localhost:8787/healthz     # {"status":"ok"}
+```
+
+See [configuration](docs/configuration.md) for what it reads from the
+environment, and [the architecture](docs/architecture.md#two-platform-targets)
+for why the two targets exist.
+
+## Conformance
+
+The conformance harness checks a running deployment against the contract.
+Every check whose dependency is missing is skipped with a reason, so the
+fast gate still passes on a laptop and offline.
+
+```sh
+make conformance                               # every check skips, exit 0
+PARLEY_BASE_URL=https://parley.example.com make conformance
+```
+
+The checks that drive `afc` need a commit of `af-hub` pinned in
+`conformance/hub-commit.txt`; while it reads `unpinned` they skip.
+
+## Read more
+
+- [API reference](docs/api.md) — every route, what it answers and how it fails
+- [Configuration](docs/configuration.md) — everything read from the environment
+- [Architecture](docs/architecture.md) — how the service is put together
+- [CLI](docs/cli.md) — Parley's client is `afc`, from `af-hub`

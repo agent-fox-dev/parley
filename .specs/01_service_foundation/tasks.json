@@ -50,7 +50,7 @@
         "src/routes/server.ts",
         "src/routes/server.test.ts"
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 2,
@@ -81,7 +81,7 @@
       "depends_on": [
         1
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 3,
@@ -114,7 +114,7 @@
       "depends_on": [
         1
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 4,
@@ -143,7 +143,7 @@
       "depends_on": [
         3
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 5,
@@ -175,7 +175,7 @@
         1,
         3
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 6,
@@ -207,7 +207,7 @@
         4,
         5
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 7,
@@ -241,7 +241,7 @@
       "depends_on": [
         1
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 8,
@@ -273,7 +273,7 @@
         "`make check` passes with no network access and no deployment configured",
         "`make check-release` passes against a Cloudflare deployment and against the second target"
       ],
-      "state": "pending"
+      "state": "done"
     }
   ]
 }
