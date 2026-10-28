@@ -4,7 +4,7 @@ spec_name: "forge_webhooks"
 title: "Receive a forge's webhook deliveries and relay them as events"
 status: "active"
 created_at: "2026-10-27T19:08:11Z"
-updated_at: "2026-10-28T14:33:32Z"
+updated_at: "2026-10-28T14:43:56Z"
 intent_hash: "4cbd3ab39cb29349d97197c5b37bae3d6fff11b4deb3f0457d8fef6a1cb77fd8"
 schema_version: 2
 source: "docs/prd/01-port-af-hub-to-typescript-on-cloudflare.md"

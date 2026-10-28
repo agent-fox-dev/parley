@@ -54,7 +54,11 @@ async function signed(body: string, secret = SECRET): Promise<string> {
   return `sha256=${[...mac].map((byte) => byte.toString(16).padStart(2, '0')).join('')}`;
 }
 
-const PAYLOAD = JSON.stringify({ repository: { full_name: 'acme/widgets' } });
+const PAYLOAD = JSON.stringify({
+  action: 'opened',
+  repository: { full_name: 'acme/widgets' },
+  issue: { number: 12 },
+});
 
 async function post(
   held: Service,
@@ -145,8 +149,24 @@ describe('what the ingress does before it reads the body', () => {
   });
 });
 
-/** A JSON body of exactly this many bytes: the envelope is ten. */
-const filler = (bytes: number) => JSON.stringify({ pad: 'x'.repeat(bytes - 10) });
+/**
+ * A delivery of exactly this many bytes: a payload the hub can read,
+ * padded in a field no mapping table looks at.
+ */
+const filler = (bytes: number) => {
+  const envelope = JSON.stringify({
+    action: 'opened',
+    repository: { full_name: 'acme/widgets' },
+    issue: { number: 12 },
+    pad: '',
+  });
+  return JSON.stringify({
+    action: 'opened',
+    repository: { full_name: 'acme/widgets' },
+    issue: { number: 12 },
+    pad: 'x'.repeat(bytes - envelope.length),
+  });
+};
 
 describe('the size of a delivery', () => {
   it('takes one exactly at the limit and refuses one over it', async () => {

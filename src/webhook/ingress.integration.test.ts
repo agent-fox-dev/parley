@@ -49,7 +49,7 @@ async function signatureOf(body: string, secret = SECRET): Promise<string> {
 }
 
 /** A payload whose spacing no re-serialisation would reproduce. */
-const SPACED = `{\n  "repository": {\n    "full_name": "acme/widgets"\n  },\n  "action": "opened"\n}`;
+const SPACED = `{\n  "repository": {\n    "full_name": "acme/widgets"\n  },\n  "action": "opened",\n  "issue": {\n    "number": 12\n  }\n}`;
 
 describe('a signed delivery', () => {
   it('is accepted when the signature is over the bytes as sent', async () => {
@@ -99,7 +99,10 @@ describe('a signed delivery', () => {
         'idempotency-key': 'd-3',
         'content-type': 'application/json',
       },
-      body: SPACED,
+      body: JSON.stringify({
+        project: { path_with_namespace: 'acme/widgets' },
+        object_attributes: { iid: 12, action: 'open' },
+      }),
     });
 
     expect(response.status).toBe(202);
@@ -230,5 +233,65 @@ describe('a delivery that arrives more than once', () => {
     for (const response of [mine, theirs]) {
       expect(((await response.json()) as { outcome: string }).outcome).not.toBe('duplicate');
     }
+  });
+});
+
+/** Stands in until the promise below hands over its own release. */
+const unblocked = () => undefined;
+
+describe('the order of the answer and the relay', () => {
+  it('answers while the recorder is still blocked, and relays once it is not', async () => {
+    // A recorder that does not finish until the suite lets it: if
+    // the answer waited for the relay, nothing below would return.
+    let release: () => void = unblocked;
+    const blocked = new Promise<void>((settled) => {
+      release = settled;
+    });
+    const seen: string[] = [];
+    const recorder = {
+      record: async (event: { type: string }) => {
+        await blocked;
+        seen.push(event.type);
+      },
+      refusal: async () => undefined,
+    };
+
+    service = await identityService([], { events: recorder });
+    const owner = await seedUser(service.store);
+    await seedWorkspace(service.store, {
+      slug: 'mine',
+      owner_id: owner.id,
+      status: 'ready',
+      git_url: 'https://github.com/acme/widgets.git',
+    });
+    await service.secrets.put(workspaceScope('mine'), 'FORGE_WEBHOOK_SECRET', SECRET);
+
+    const kept: Array<Promise<unknown>> = [];
+    const response = await service.app.request(
+      '/hooks/forge/mine',
+      {
+        method: 'POST',
+        headers: await headersFor('d-ordering'),
+        body: SPACED,
+      },
+      {},
+      {
+        waitUntil: (work: Promise<unknown>) => {
+          kept.push(work);
+        },
+        passThroughOnException: () => undefined,
+      } as unknown as ExecutionContext,
+    );
+
+    expect(response.status).toBe(202);
+    expect(seen, 'nothing was recorded before the forge was answered').toEqual([]);
+    expect(kept, 'the relay was handed to the platform').toHaveLength(1);
+
+    // The forge has its answer and may hang up; the relay finishes
+    // regardless, which is what the platform was handed it for.
+    release();
+    await Promise.all(kept);
+
+    expect(seen).toEqual(['hub.forge.issue.opened']);
   });
 });

@@ -8,6 +8,9 @@ import type { SecretStore } from '../platform/secrets.js';
 import type { EventRecorder } from '../audit/recorder.js';
 import { findWorkspace } from '../store/workspaces.js';
 import { claimDelivery } from '../webhook/dedupe.js';
+import { mapDelivery } from '../webhook/mapping.js';
+import { relayDelivery, targetOf } from '../webhook/relay.js';
+import { settleDelivery } from '../webhook/log.js';
 import { SECRET_NAME } from '../webhook/secret.js';
 import {
   type DeliveryIdentity,
@@ -108,6 +111,71 @@ export async function acceptDelivery(c: Context, config: IngressConfig): Promise
   return { workspace, identity: identityOf(headers, forge), body };
 }
 
+/**
+ * Asks the platform to let the relay finish whatever the forge
+ * does. Not every runtime offers it, and the one that does not
+ * cancels nothing, so its absence is not a failure.
+ */
+function keepRunning(c: Context, work: Promise<unknown>): void {
+  try {
+    c.executionCtx.waitUntil(work.catch(() => undefined));
+  } catch {
+    // No execution context here: nothing cancels the work either.
+  }
+}
+
+/**
+ * What the delivery meant, answered to the forge, and then relayed.
+ *
+ * The answer is written before the first event is recorded, so a
+ * slow audit store cannot hold the forge's connection open — which
+ * is also why the relay must survive the forge hanging up.
+ */
+async function answer(
+  c: Context,
+  config: IngressConfig,
+  accepted: AcceptedDelivery,
+): Promise<Response> {
+  const { workspace, identity } = accepted;
+  const settled = { workspace_slug: workspace.slug, delivery_id: identity.id };
+
+  let mapped;
+  try {
+    mapped = mapDelivery(
+      identity.forge,
+      identity.event,
+      JSON.parse(new TextDecoder().decode(accepted.body)) as unknown,
+      identity.id,
+    );
+  } catch (err) {
+    // Kept rather than discarded: a webhook that silently drops
+    // what it cannot parse is one nobody can debug.
+    await settleDelivery(config.store, settled, { outcome: 'malformed' });
+    throw err instanceof HttpError
+      ? err
+      : new HttpError(400, 'the delivery body is not one JSON object');
+  }
+
+  const target = targetOf(workspace, mapped.repository);
+  const outcome =
+    mapped.events.length === 0 ? 'ignored' : target === null ? 'repository_mismatch' : 'relayed';
+
+  const relaying = relayDelivery(
+    {
+      store: config.store,
+      ...(config.events === undefined ? {} : { events: config.events }),
+      ...(config.log === undefined ? {} : { log: config.log }),
+    },
+    workspace,
+    { id: identity.id, mapped, target },
+  );
+  // Handed to the platform and not awaited: the forge is answered
+  // now, and the relay finishes whether or not it waits.
+  keepRunning(c, relaying);
+
+  return jsonResponse({ outcome }, 202);
+}
+
 export function ingressRoutes(config: IngressConfig): RouteDefinition[] {
   return [
     {
@@ -132,7 +200,7 @@ export function ingressRoutes(config: IngressConfig): RouteDefinition[] {
             return jsonResponse({ outcome: 'duplicate' }, 202);
           }
 
-          return jsonResponse({ outcome: 'ignored' }, 202);
+          return await answer(c, config, accepted);
         } catch (err) {
           if (err instanceof HttpError) {
             return errorResponse(err);
