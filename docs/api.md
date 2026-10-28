@@ -218,6 +218,7 @@ them.
 | 401    | The authorization code is invalid or expired                                                                                                                              |
 | 403    | The user is blocked                                                                                                                                                       |
 | 409    | The username belongs to another provider identity                                                                                                                         |
+| 502    | `provider_unavailable`: the code was exchanged, but the provider would not say whose identity it was                                                                      |
 
 ## The caller's profile
 

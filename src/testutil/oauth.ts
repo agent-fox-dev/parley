@@ -8,6 +8,8 @@ export interface StubProviderOptions {
   codes: Record<string, ProviderIdentity>;
   redirectAllowlist?: readonly string[];
   clientId?: string;
+  /** Where each exchange is written down, for a suite that checks one. */
+  asked?: Array<{ code: string; redirectUri?: string }>;
 }
 
 /**
@@ -20,7 +22,8 @@ export function stubProvider(options: StubProviderOptions): OAuthProvider {
     name,
     authorizeUrl: `https://provider.invalid/authorize?client_id=${options.clientId ?? 'test-client'}`,
     redirectAllowlist: options.redirectAllowlist ?? [],
-    exchange: async (code: string): Promise<ProviderIdentity> => {
+    exchange: async (code: string, redirectUri?: string): Promise<ProviderIdentity> => {
+      options.asked?.push({ code, ...(redirectUri === undefined ? {} : { redirectUri }) });
       const identity = options.codes[code];
       if (identity === undefined) {
         throw new HttpError(401, 'the authorization code is invalid or expired');

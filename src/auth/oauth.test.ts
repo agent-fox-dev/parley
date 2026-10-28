@@ -57,6 +57,22 @@ describe('the GitHub provider', () => {
     expect(profileHeaders['authorization']).toBe('Bearer granted-token');
   });
 
+  it('introduces itself on every call, which GitHub refuses a request without', async () => {
+    const calls = answering(
+      { ok: true, body: { access_token: 'granted-token' } },
+      { ok: true, body: { id: 1, login: 'alice' } },
+    );
+
+    await githubProvider(settings).exchange('a-code');
+
+    // api.github.com answers 403 to a request carrying no
+    // User-Agent, and neither Node nor a Worker sets one.
+    for (const call of calls) {
+      const headers = (call.init?.headers ?? {}) as Record<string, string>;
+      expect(headers['user-agent'], `${call.url} introduced itself`).toBe('af-hub/parley');
+    }
+  });
+
   it('falls back to the login when the provider gives no display name', async () => {
     answering(
       { ok: true, body: { access_token: 'granted-token' } },
@@ -72,18 +88,24 @@ describe('the GitHub provider', () => {
   it.each([
     ['the token endpoint refuses the code', [{ ok: false, body: {} }]],
     ['the token endpoint returns no access token', [{ ok: true, body: { error: 'bad_code' } }]],
-    [
-      'the profile endpoint refuses the token',
-      [
-        { ok: true, body: { access_token: 't' } },
-        { ok: false, body: {} },
-      ],
-    ],
   ])('refuses the sign-in with 401 when %s', async (_name, answers) => {
     answering(...answers);
 
     await expect(githubProvider(settings).exchange('a-code')).rejects.toMatchObject({
       status: 401,
+      message: 'the authorization code is invalid or expired',
+    });
+  });
+
+  it('says the provider failed when the code was taken but the profile was not', async () => {
+    // The two are not the same thing, and an operator told that a
+    // code GitHub had just accepted was invalid looks in the wrong
+    // place for as long as the message says so.
+    answering({ ok: true, body: { access_token: 't' } }, { ok: false, body: {} });
+
+    await expect(githubProvider(settings).exchange('a-code')).rejects.toMatchObject({
+      status: 502,
+      errorType: 'provider_unavailable',
     });
   });
 

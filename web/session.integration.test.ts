@@ -55,6 +55,23 @@ describe('signing in through the browser', () => {
     expect(user?.username).toBe('alice');
   });
 
+  it('gives the provider the same address it sent them to authorize at', async () => {
+    const asked: Array<{ code: string; redirectUri?: string }> = [];
+    service = await identityService([], { asked });
+
+    const sent = await service.app.request('/signin/github');
+    const authorize = new URL(sent.headers.get('location') ?? 'https://nowhere.invalid');
+    const callback = authorize.searchParams.get('redirect_uri') ?? '';
+    expect(callback).toMatch(/\/signin\/github\/callback$/);
+
+    await service.app.request('/signin/github/callback?code=a-code');
+
+    // A provider that holds the authorization code to the address it
+    // was issued for — which the standard requires of one — refuses
+    // an exchange that names none.
+    expect(asked).toEqual([{ code: 'a-code', redirectUri: callback }]);
+  });
+
   it('refuses a code the provider does not know, and opens no session', async () => {
     const held = await world();
 

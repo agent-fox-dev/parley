@@ -1,3 +1,4 @@
+import { USER_AGENT } from '../config.js';
 import { HttpError } from '../http/errors.js';
 import type { LogSink } from '../http/router.js';
 import type { RelationalStore } from '../platform/index.js';
@@ -57,9 +58,6 @@ export interface Reached {
   credential: CredentialKind;
   client: ForgeClient;
 }
-
-/** The version the hub introduces itself as. */
-export const USER_AGENT = 'af-hub/parley';
 
 /** How long one call has, its retries included. */
 const DEADLINE_MS = 30_000;
