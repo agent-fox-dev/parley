@@ -289,7 +289,7 @@
         "`make check` passes with no network access, and reports the differential suite as skipped when no git binary is present",
         "the differential suite compares at least 200 cases with no mismatch when a git binary is present"
       ],
-      "state": "pending"
+      "state": "done"
     }
   ]
 }
