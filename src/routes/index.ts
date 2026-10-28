@@ -62,6 +62,8 @@ export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
       ...(config.adminToken === undefined ? {} : { adminToken: config.adminToken }),
       ...(config.repos === undefined ? {} : { repos: config.repos }),
       ...(config.decideRef === undefined ? {} : { decide: config.decideRef }),
+      ...(config.secrets === undefined ? {} : { secrets: config.secrets }),
+      ...(config.fetch === undefined ? {} : { fetch: config.fetch }),
     }),
     ...serverRoutes({
       mountPoint: config.mountPoint,

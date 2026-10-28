@@ -45,6 +45,8 @@ export interface PushRequest {
   pack: Uint8Array;
   /** How each ref is decided; everything is accepted without one. */
   decide?: Decider;
+  /** Run once the store has taken what it was given, whatever it was. */
+  afterward?: (outcomes: readonly RefOutcome[]) => Promise<void>;
 }
 
 /**
@@ -68,6 +70,7 @@ export async function servePush(request: PushRequest): Promise<Uint8Array> {
   }
 
   if (accepted.length === 0) {
+    await request.afterward?.(outcomes);
     return reportOf(outcomes);
   }
 
@@ -81,9 +84,13 @@ export async function servePush(request: PushRequest): Promise<Uint8Array> {
     }
   } catch (err) {
     const reason = err instanceof Error ? err.message : 'the store refused this push';
-    return reportOf(
-      outcomes.map((outcome) => (outcome.ok ? { name: outcome.name, ok: false, reason } : outcome)),
+    const refused = outcomes.map((outcome) =>
+      outcome.ok ? { name: outcome.name, ok: false, reason } : outcome,
     );
+    await request.afterward?.(refused);
+    return reportOf(refused);
   }
+
+  await request.afterward?.(outcomes);
   return reportOf(outcomes);
 }

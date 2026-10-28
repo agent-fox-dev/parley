@@ -1,10 +1,12 @@
 import type { Context } from 'hono';
-import type { RouteDefinition } from '../http/router.js';
+import type { LogSink, RouteDefinition } from '../http/router.js';
+import type { SecretStore } from '../platform/secrets.js';
 import type { StoredRef } from '../platform/repostore.js';
 import type { RefChange } from '../platform/repostore.js';
 import { type GitAccessDeps, GitRefusal, NOT_AVAILABLE, gitAccess } from './access.js';
 import { negotiation, refusedService, uploadPackResponse } from './fetch.js';
-import { type Decider, servePush } from './push.js';
+import { type Decider, type RefDecision, servePush } from './push.js';
+import { mirrorAfterPush, pushControl } from './push_control.js';
 import { ZERO_OID } from './transport.js';
 import { FLUSH, concatBytes, encodePkt, encodeSpecial, pktError } from './pktline.js';
 
@@ -21,11 +23,16 @@ const decoder = new TextDecoder();
  */
 export interface GitRouteConfig extends GitAccessDeps {
   /**
-   * What the service makes of each ref of a push, before any of it
-   * reaches the store. Push control and the protected namespace are
-   * decided here; without one every ref is accepted.
+   * What the service makes of each ref of a push, beyond the control
+   * the workspace's own settings call for. The protected namespace is
+   * decided here; without one, only push control applies.
    */
   decide?: Decider;
+  /** Where the fork's credentials are read from, for a forward. */
+  secrets?: SecretStore;
+  /** Injected so a suite reaches a fork of its own. */
+  fetch?: typeof fetch;
+  log?: LogSink;
 }
 
 export const UPLOAD_PACK = 'git-upload-pack';
@@ -222,12 +229,29 @@ export function gitRoutes(config: GitRouteConfig): RouteDefinition[] {
           });
         }
 
+        const control = {
+          store: config.store,
+          workspace: subject.workspace,
+          pack,
+          ...(config.secrets === undefined ? {} : { secrets: config.secrets }),
+          ...(config.fetch === undefined ? {} : { fetch: config.fetch }),
+          ...(config.log === undefined ? {} : { log: config.log }),
+        };
+        const controlled = pushControl(control);
+        const extra = config.decide;
+
         const report = await servePush({
           repos: subject.repos,
           repository: subject.repository,
           commands,
           pack,
-          ...(config.decide === undefined ? {} : { decide: config.decide }),
+          // Both say their piece, and the first refusal wins: the
+          // protected namespace holds whatever the settings say.
+          decide: async (command): Promise<RefDecision> => {
+            const first = extra === undefined ? { accept: true as const } : await extra(command);
+            return first.accept ? controlled(command) : first;
+          },
+          afterward: mirrorAfterPush(control, commands),
         });
         return new Response(report as BodyInit, {
           headers: { 'content-type': served, 'cache-control': 'no-cache' },

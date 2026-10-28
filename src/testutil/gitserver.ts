@@ -85,6 +85,10 @@ export interface GitWorldOptions {
   externalUrl?: string;
   /** What the service makes of each ref of a git push. */
   decideRef?: Decider;
+  /** Reaches a fork of the suite's own instead of the network. */
+  fetch?: typeof fetch;
+  /** Set on the workspace before it is served. */
+  workspace?: Partial<WorkspaceRecord>;
   cleanups: Array<() => void | Promise<void>>;
 }
 
@@ -104,6 +108,7 @@ export async function servedService(options: GitWorldOptions): Promise<GitWorld>
     repos,
     externalUrl,
     ...(options.decideRef === undefined ? {} : { decideRef: options.decideRef }),
+    ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
   });
   options.cleanups.push(service.dispose);
 
@@ -113,6 +118,7 @@ export async function servedService(options: GitWorldOptions): Promise<GitWorld>
     owner_id: owner.id,
     ...(org === undefined ? {} : { org_id: org.id }),
     status: 'ready',
+    ...options.workspace,
   });
   const key = await seedApiKey(service.store, owner);
 
