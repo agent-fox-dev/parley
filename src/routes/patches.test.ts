@@ -528,3 +528,123 @@ describe('the positions of a list under any sequence of operations', () => {
     }
   });
 });
+
+async function remove(place: World, id: string): Promise<Response> {
+  return place.service.app.request(`/api/v1/workspaces/${place.slug}/patches/${id}`, {
+    method: 'DELETE',
+    headers: { authorization: `Bearer ${place.credential}` },
+  });
+}
+
+async function restore(place: World, id: string): Promise<Response> {
+  return place.service.app.request(`/api/v1/workspaces/${place.slug}/patches/${id}/restore`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${place.credential}` },
+  });
+}
+
+async function reorder(place: World, body: unknown): Promise<Response> {
+  return place.service.app.request(`/api/v1/workspaces/${place.slug}/patches/reorder`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${place.credential}`,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+}
+
+describe('a patch removed from the list', () => {
+  it('closes the positions behind it and discards its kept tip', async () => {
+    const place = await world();
+    const ids = await three(place);
+    const kept = (await place.repos.listRefs(place.repository))[0]?.oid ?? '';
+    await place.repos.updateRefs(place.repository, [
+      { name: 'refs/hub/replaced/one', oldOid: null, newOid: kept, force: true },
+    ]);
+
+    const response = await remove(place, ids[0] ?? '');
+
+    expect(response.status).toBe(204);
+    const listed = await listAll(place);
+    expect(listed.map((patch) => patch['branch_name'])).toEqual(['two', 'three']);
+    expect(listed.map((patch) => patch['position'])).toEqual([1, 2]);
+    const refs = await place.repos.listRefs(place.repository);
+    expect(refs.some((ref) => ref.name === 'refs/hub/replaced/one')).toBe(false);
+  });
+
+  it('answers the same when the kept tip cannot be discarded', async () => {
+    const place = await world();
+    const ids = await three(place);
+    const original = place.repos.updateRefs.bind(place.repos);
+    place.repos.updateRefs = (() =>
+      Promise.reject(new Error('the store will not take it'))) as typeof place.repos.updateRefs;
+
+    const response = await remove(place, ids[0] ?? '');
+    place.repos.updateRefs = original;
+
+    expect(response.status).toBe(204);
+    expect(await listAll(place)).toHaveLength(2);
+  });
+});
+
+describe('a removed patch restored', () => {
+  it('comes back active, at the end, with its removal forgotten', async () => {
+    const place = await world();
+    const ids = await three(place);
+    await remove(place, ids[0] ?? '');
+
+    const response = await restore(place, ids[0] ?? '');
+    const patch = (await response.json()) as Record<string, unknown>;
+
+    expect(response.status).toBe(200);
+    expect(patch['status']).toBe('active');
+    expect(patch['deleted_at']).toBeNull();
+    expect(patch['position']).toBe(3);
+    expect((await listAll(place)).map((one) => one['position'])).toEqual([1, 2, 3]);
+  });
+
+  it('is refused for a patch that was never removed', async () => {
+    const place = await world();
+    const ids = await three(place);
+
+    expect((await restore(place, ids[0] ?? '')).status).toBe(400);
+  });
+
+  it('answers 404 for a patch nobody has', async () => {
+    const place = await world();
+
+    expect((await restore(place, 'nobody')).status).toBe(404);
+  });
+});
+
+describe('a reorder of the whole list', () => {
+  it('sets every position in the order it was given', async () => {
+    const place = await world();
+    const ids = await three(place);
+
+    const response = await reorder(place, { ids: [ids[2], ids[0], ids[1]] });
+    const listed = (await response.json()) as Array<Record<string, unknown>>;
+
+    expect(response.status).toBe(200);
+    expect(listed.map((patch) => patch['branch_name'])).toEqual(['three', 'one', 'two']);
+    expect(listed.map((patch) => patch['position'])).toEqual([1, 2, 3]);
+  });
+
+  it.each([
+    ['an empty order while patches exist', () => ({ ids: [] as string[] })],
+    ['one that leaves a patch out', (ids: string[]) => ({ ids: [ids[0], ids[1]] })],
+    ['one that names a patch twice', (ids: string[]) => ({ ids: [ids[0], ids[0], ids[1]] })],
+    ['one that names a stranger', (ids: string[]) => ({ ids: [ids[0], ids[1], 'elsewhere'] })],
+    ['a body that is not an order at all', () => ({ order: 'please' })],
+  ])('is refused for %s, and nothing moves', async (_what, make: (ids: string[]) => unknown) => {
+    const place = await world();
+    const ids = await three(place);
+    const before = await listAll(place);
+
+    const response = await reorder(place, make(ids));
+
+    expect(response.status).toBe(400);
+    expect(await listAll(place)).toEqual(before);
+  });
+});

@@ -8,6 +8,7 @@ import type { SecretStore } from '../platform/secrets.js';
 import { newIdentifier } from '../auth/credentials.js';
 import {
   type NewPatch,
+  closePositions,
   type PatchChanges,
   type PatchRecord,
   type PatchStatus,
@@ -327,6 +328,105 @@ async function changeOnePatch(c: Context, config: PatchRouteConfig): Promise<Res
   return jsonResponse(serialisePatch(changed));
 }
 
+/**
+ * Removes a patch and closes the list behind it. The tip the hub kept
+ * for its branch goes too, on a best-effort basis: a backup nobody can
+ * discard is not a reason to refuse the removal, and a patch that is
+ * gone has no use for one.
+ */
+async function removePatch(c: Context, config: PatchRouteConfig): Promise<Response> {
+  const { workspace } = await carryPatchWorkspace(c, config, 'write');
+  const patch = await patchById(config.store, workspace.slug, c.req.param('id') ?? '');
+  if (patch === undefined) {
+    throw new HttpError(404, 'patch not found');
+  }
+
+  const at = config.clock.now().toISOString();
+  await config.store.run(
+    'UPDATE patches SET status = ?, deleted_at = ?, position = 0, updated_at = ? WHERE id = ?',
+    ['deleted', at, at, patch.id],
+  );
+  await closePositions(config.store, workspace.slug, at);
+
+  if (config.repos !== undefined) {
+    try {
+      await config.repos.updateRefs(repositoryOf(workspace), [
+        { name: `refs/hub/replaced/${patch.branch_name}`, oldOid: null, newOid: null, force: true },
+      ]);
+    } catch {
+      // There may have been no backup, or the store may not say so.
+    }
+  }
+  return new Response(null, { status: 204 });
+}
+
+/** Brings a removed patch back, at the end of the list and active. */
+async function restorePatch(c: Context, config: PatchRouteConfig): Promise<Response> {
+  const { workspace } = await carryPatchWorkspace(c, config, 'write');
+  const patch = await patchById(config.store, workspace.slug, c.req.param('id') ?? '');
+  if (patch === undefined) {
+    throw new HttpError(404, 'patch not found');
+  }
+  if (patch.status !== 'deleted') {
+    throw new HttpError(400, 'this patch was not removed');
+  }
+
+  const at = config.clock.now().toISOString();
+  const live = await livePatches(config.store, workspace.slug);
+  await config.store.run(
+    'UPDATE patches SET status = ?, deleted_at = NULL, position = ?, updated_at = ? WHERE id = ?',
+    ['active', live.length + 1, at, patch.id],
+  );
+  await closePositions(config.store, workspace.slug, at);
+
+  const restored = await patchById(config.store, workspace.slug, patch.id);
+  return jsonResponse(serialisePatch(restored as PatchRecord));
+}
+
+/**
+ * Sets the whole order at once. It takes every live patch and no
+ * other, because a partial order is an order with a hole in it and
+ * the list has none.
+ */
+async function reorderPatches(c: Context, config: PatchRouteConfig): Promise<Response> {
+  const { workspace } = await carryPatchWorkspace(c, config, 'write');
+  const raw: unknown = await c.req.json().catch(() => undefined);
+  const asked =
+    typeof raw === 'object' && raw !== null && Array.isArray((raw as { ids?: unknown }).ids)
+      ? ((raw as { ids: unknown[] }).ids as unknown[])
+      : undefined;
+  if (asked === undefined || asked.some((id) => typeof id !== 'string')) {
+    throw new HttpError(400, 'ids must be an array of patch ids');
+  }
+
+  const live = await livePatches(config.store, workspace.slug);
+  const held = new Set(live.map((patch) => patch.id));
+  const named = new Set(asked as string[]);
+
+  if (named.size !== asked.length) {
+    throw new HttpError(400, 'a patch is named twice in this order');
+  }
+  if (asked.length !== live.length) {
+    throw new HttpError(400, `the order must name all ${String(live.length)} patches`);
+  }
+  for (const id of asked as string[]) {
+    if (!held.has(id)) {
+      throw new HttpError(400, `"${id}" is not a patch of this workspace`);
+    }
+  }
+
+  const at = config.clock.now().toISOString();
+  await config.store.batch(
+    (asked as string[]).map((id, index) => ({
+      sql: 'UPDATE patches SET position = ?, updated_at = ? WHERE id = ?',
+      params: [index + 1, at, id],
+    })),
+  );
+
+  const ordered = await livePatches(config.store, workspace.slug);
+  return jsonResponse(ordered.map((patch) => serialisePatch(patch)));
+}
+
 export function patchRoutes(config: PatchRouteConfig): RouteDefinition[] {
   return [
     {
@@ -350,6 +450,24 @@ export function patchRoutes(config: PatchRouteConfig): RouteDefinition[] {
       methods: ['PATCH'],
       scope: 'patches:write',
       handler: async (c) => changeOnePatch(c, config),
+    },
+    {
+      path: `${config.mountPoint}/workspaces/:slug/patches/:id`,
+      methods: ['DELETE'],
+      scope: 'patches:write',
+      handler: async (c) => removePatch(c, config),
+    },
+    {
+      path: `${config.mountPoint}/workspaces/:slug/patches/:id/restore`,
+      methods: ['POST'],
+      scope: 'patches:write',
+      handler: async (c) => restorePatch(c, config),
+    },
+    {
+      path: `${config.mountPoint}/workspaces/:slug/patches/reorder`,
+      methods: ['POST'],
+      scope: 'patches:write',
+      handler: async (c) => reorderPatches(c, config),
     },
   ];
 }
