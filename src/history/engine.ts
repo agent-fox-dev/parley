@@ -24,6 +24,9 @@ export interface MergeResult {
  */
 export const MERGE_RESULT_REF = 'refs/hub/engine/merge';
 
+/** Where the engine keeps the tip of its last rebase, for the same reason. */
+export const REBASE_RESULT_REF = 'refs/hub/engine/rebase';
+
 export interface RebaseResult {
   /** The commits written, oldest first, when the rebase finished. */
   commits?: string[];
@@ -124,6 +127,71 @@ async function open(repos: RepositoryStore, repository: string): Promise<Session
 const TEMP_OURS = 'refs/hub/engine/ours';
 const TEMP_THEIRS = 'refs/hub/engine/theirs';
 
+/** The commits a branch has that a base does not, oldest first. */
+async function commitsNotIn(
+  options: { fs: never; gitdir: string },
+  branch: string,
+  base: string,
+): Promise<string[]> {
+  const inBase = new Set(
+    (await git.log({ ...options, ref: base, depth: 10_000 })).map((entry) => entry.oid),
+  );
+  const own = (await git.log({ ...options, ref: branch, depth: 10_000 }))
+    .map((entry) => entry.oid)
+    .filter((oid) => !inBase.has(oid));
+  return own.toReversed();
+}
+
+/**
+ * The three-way merge of two commits over an explicit base, which is
+ * what replaying one commit onto another needs: the base must be the
+ * commit's own parent rather than the merge base of the two sides.
+ *
+ * The library offers no merge over three trees, so the base is made
+ * true by construction: a commit carrying the first side's tree is
+ * written with the base as its parent, so the merge base of the two
+ * sides is the base and nothing else.
+ */
+async function mergeOverBase(
+  options: { fs: never; gitdir: string },
+  oids: { base: string; ours: string; theirs: string },
+): Promise<MergeResult> {
+  const treeOf = async (oid: string) => (await git.readCommit({ ...options, oid })).commit.tree;
+
+  const ourSide = await git.writeCommit({
+    ...options,
+    commit: {
+      tree: await treeOf(oids.ours),
+      parent: [oids.base],
+      author: ENGINE,
+      committer: ENGINE,
+      message: 'the side a replay is landing on',
+    },
+  });
+
+  await git.writeRef({ ...options, ref: TEMP_OURS, value: ourSide, force: true });
+  await git.writeRef({ ...options, ref: TEMP_THEIRS, value: oids.theirs, force: true });
+
+  try {
+    const merged = await git.merge({
+      ...options,
+      ours: TEMP_OURS,
+      theirs: TEMP_THEIRS,
+      noUpdateBranch: true,
+      author: ENGINE,
+      committer: ENGINE,
+      message: 'replay',
+    });
+    return { tree: merged.tree ?? (await treeOf(merged.oid ?? '')) };
+  } catch (err) {
+    const conflicts = conflictingPaths(err);
+    if (conflicts === undefined) {
+      throw err;
+    }
+    return { conflicts };
+  }
+}
+
 export function historyEngine(repos: RepositoryStore): HistoryEngine {
   return {
     /**
@@ -179,8 +247,69 @@ export function historyEngine(repos: RepositoryStore): HistoryEngine {
       }
     },
 
-    async rebase(): Promise<RebaseResult> {
-      return Promise.resolve({ conflicts: [] });
+    /**
+     * Copies each of a branch's own commits onto a base, in the order
+     * the branch made them. The library has no rebase, so this is the
+     * one piece of history arithmetic written here (ADR 8), built on
+     * the merge of each commit's change against the growing base.
+     *
+     * A commit that conflicts stops the rebase there and leaves the
+     * repository as it was: the refs are untouched, so nothing a later
+     * commit would have written is reachable.
+     */
+    async rebase(request): Promise<RebaseResult> {
+      const session = await open(repos, request.repository);
+      const { fs, gitdir } = session;
+      const options = { fs: fs as never, gitdir };
+
+      const own = await commitsNotIn(options, request.branch, request.onto);
+      let parent = request.onto;
+      const written: string[] = [];
+
+      for (const oid of own) {
+        const { commit } = await git.readCommit({ ...options, oid });
+        const base = commit.parent[0];
+        if (base === undefined) {
+          throw new Error('a rebase cannot replay a commit with no parent');
+        }
+
+        // The change this commit made, replayed on what the rebase has
+        // built so far: its own parent is the base of the merge between
+        // it and the new parent.
+        const merged = await mergeOverBase(options, { base, ours: parent, theirs: oid });
+        if (merged.conflicts !== undefined) {
+          return { conflicts: merged.conflicts, stoppedAt: oid, commits: written };
+        }
+
+        // A replay that changes nothing is a commit git drops, because
+        // its content is already in the base. Keeping it would leave an
+        // empty commit the real rebase never makes.
+        const parentTree = (await git.readCommit({ ...options, oid: parent })).commit.tree;
+        if (merged.tree === parentTree) {
+          continue;
+        }
+
+        parent = await git.writeCommit({
+          ...options,
+          commit: {
+            tree: merged.tree ?? '',
+            parent: [parent],
+            // The author is the person who wrote the change; the
+            // committer is whoever moved it, which is this service.
+            author: commit.author,
+            committer: request.committer,
+            message: commit.message,
+          },
+        });
+        written.push(parent);
+      }
+
+      await session.flush(
+        written.length === 0
+          ? []
+          : [{ name: REBASE_RESULT_REF, oldOid: null, newOid: parent, force: true }],
+      );
+      return { commits: written };
     },
 
     async mergeCommit(): Promise<CommitResult> {
