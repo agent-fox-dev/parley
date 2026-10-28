@@ -15,6 +15,12 @@ export interface CopyRequest {
   batchSize?: number;
   fetch?: typeof fetch;
   log?: LogSink;
+  /**
+   * Accounts for the bytes about to be written, and refuses when they
+   * would take the repository past what it may hold. The store reports no
+   * storage error of its own, so the service counts for itself.
+   */
+  account?: (bytes: number) => Promise<void>;
 }
 
 export interface CopyProgress {
@@ -124,6 +130,9 @@ export async function copyIn(repos: RepositoryStore, request: CopyRequest): Prom
   const batch = ordered.slice(0, request.batchSize ?? BATCH);
 
   const pack = await fetchPack(remote, { wants: batch.map((ref) => ref.oid) });
+  // Counted before it is written, so a pack that would not fit leaves the
+  // repository exactly as it was.
+  await request.account?.(pack.length);
   const changes: RefChange[] = batch.map((ref) => ({
     name: ref.name,
     oldOid: null,

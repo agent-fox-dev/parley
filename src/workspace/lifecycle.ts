@@ -3,6 +3,7 @@ import type { Clock, Locks, RelationalStore } from '../platform/index.js';
 import { retireBindingsOf } from '../store/bindings.js';
 import { type WorkspaceRecord, updateWorkspace } from '../store/workspaces.js';
 import { workspaceScope } from '../platform/secrets.js';
+import { repositoryOf } from '../repo/repository.js';
 import { withWorkspaceLock } from './lock.js';
 
 /**
@@ -63,5 +64,9 @@ export async function deleteWorkspaceAndTokens(
       params: [workspaceScope(workspace.slug)],
     },
     { sql: 'DELETE FROM workspaces WHERE slug = ?', params: [workspace.slug] },
+    {
+      sql: 'DELETE FROM repository_usage WHERE repository = ?',
+      params: [repositoryOf(workspace)],
+    },
   ]);
 }

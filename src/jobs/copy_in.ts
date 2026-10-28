@@ -8,6 +8,7 @@ import type { LogSink } from '../http/router.js';
 import { findWorkspace, updateWorkspace } from '../store/workspaces.js';
 import { resolveGitCredential } from '../repo/credentials.js';
 import { copyIn } from '../repo/copy_in.js';
+import { reserveRepositoryBytes } from '../repo/limits.js';
 import { repositoryOf } from '../repo/repository.js';
 
 export const COPY_IN = 'copy-in';
@@ -79,6 +80,14 @@ export async function runCopyIn(
       ...(payload.brought === undefined ? {} : { brought: payload.brought }),
       ...(deps.fetch === undefined ? {} : { fetch: deps.fetch }),
       ...(deps.log === undefined ? {} : { log: deps.log }),
+      account: async (bytes: number) => {
+        await reserveRepositoryBytes(
+          deps.store,
+          repositoryOf(workspace),
+          bytes,
+          deps.clock.now().toISOString(),
+        );
+      },
     });
   } catch (err) {
     // A copy that fails after the workspace exists does not take the

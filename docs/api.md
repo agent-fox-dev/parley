@@ -633,6 +633,15 @@ so tokens are never revoked for a workspace that is still there.
 
 **Response:** `204 No Content`. `409` when the workspace is not archived.
 
+### Repository size
+
+A workspace's repository may hold at most **1 GB**. The service counts
+the bytes it writes, because the store reports no storage error of its
+own, and a write that would take a repository past the cap is answered
+`507` with a message naming the limit. Nothing is written, so everything
+the repository already holds is still readable and its refs are
+unchanged. See [ADR 7](adr/07-account-for-repository-bytes-and-what-the-sizes-cost.md).
+
 ### The workspace lock
 
 The operations that work on a workspace's repository take turns. A request

@@ -138,6 +138,16 @@ export const MIGRATIONS: readonly Migration[] = [
     ],
   },
   {
+    name: '007_repository_usage',
+    statements: [
+      `CREATE TABLE repository_usage (
+         repository TEXT PRIMARY KEY,
+         bytes INTEGER NOT NULL DEFAULT 0,
+         updated_at TEXT NOT NULL
+       )`,
+    ],
+  },
+  {
     name: '005_entries',
     statements: [
       // One table for both kinds, so the key, size, count and ordering
