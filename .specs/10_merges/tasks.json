@@ -49,7 +49,7 @@
         "src/jobs/merge.ts",
         "src/store/migrations/"
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 2,
