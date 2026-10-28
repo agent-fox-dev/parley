@@ -4,7 +4,7 @@ spec_name: "sessions_and_cost"
 title: "Record agent sessions and report what they cost"
 status: "active"
 created_at: "2026-10-27T18:58:10Z"
-updated_at: "2026-10-28T11:33:57Z"
+updated_at: "2026-10-28T11:37:01Z"
 intent_hash: "64fda8baa77b5e27e4f9b319ba419f534b70773392f15387b4394cb16602fe9f"
 schema_version: 2
 source: "docs/prd/01-port-af-hub-to-typescript-on-cloudflare.md"
