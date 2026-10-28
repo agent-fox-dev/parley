@@ -28,12 +28,14 @@ describe.skipIf(process.env[INNER] === '1')('the fast gate', () => {
       env,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: 120_000,
+      // The inner run is the whole suite, and it runs while the outer
+      // one is still going, so the two share the machine. The budget is
+      // generous on purpose: a gate that fails when the laptop is busy
+      // teaches people to re-run it rather than to read it.
+      timeout: 420_000,
     });
 
     expect(output).toContain('passed');
     expect(output).not.toContain('failed');
-    // The inner run is the whole suite, so it needs the subprocess's own
-    // budget rather than the default for a unit test.
-  }, 180_000);
+  }, 480_000);
 });
