@@ -135,6 +135,17 @@ async function writing<T>(
   }
 }
 
+/**
+ * A write needs a credential: the forge would refuse an anonymous
+ * one, and the reference says to refuse it here, sending nothing and
+ * recording nothing.
+ */
+function needsCredential(reached: Reached): void {
+  if (reached.credential === 'none') {
+    throw new HttpError(502, 'no authentication token configured', 'forge_error');
+  }
+}
+
 /** Everything a write needs, in the order the reference checks it. */
 async function writeOn(
   c: Context,
@@ -142,6 +153,7 @@ async function writeOn(
 ): Promise<{ api: ForgeApi; reached: Reached; target: string }> {
   const guarded = await forgeGuard(c, forgeDeps(config), 'write');
   const reached = await reachedForge(forgeDeps(config), guarded);
+  needsCredential(reached);
   return { api: apiFor(reached), reached, target: guarded.target };
 }
 
@@ -168,6 +180,7 @@ export function forgeWriteRoutes(config: ForgeWriteConfig): RouteDefinition[] {
           : { assignees: names(asked['assignees'], 'assignees') }),
       };
       const reached = await reachedForge(forgeDeps(config), guarded);
+      needsCredential(reached);
       // Last of all, because the limit is the forge's and the forge
       // is only known now.
       checkedBody(reached.target.forge, 'body', issue.body);
@@ -217,6 +230,7 @@ export function forgeWriteRoutes(config: ForgeWriteConfig): RouteDefinition[] {
       }
 
       const reached = await reachedForge(forgeDeps(config), guarded);
+      needsCredential(reached);
       // GitLab takes user ids rather than names, so an update that
       // names only assignees would change nothing there.
       const changeable =
@@ -254,6 +268,7 @@ export function forgeWriteRoutes(config: ForgeWriteConfig): RouteDefinition[] {
       const comment = optionalText(asked, 'comment') ?? '';
 
       const reached = await reachedForge(forgeDeps(config), guarded);
+      needsCredential(reached);
       checkedBody(reached.target.forge, 'comment', comment.length === 0 ? undefined : comment);
       const api = apiFor(reached);
 
@@ -343,6 +358,7 @@ export function forgeWriteRoutes(config: ForgeWriteConfig): RouteDefinition[] {
       }
 
       const reached = await reachedForge(forgeDeps(config), guarded);
+      needsCredential(reached);
       await writing(
         c,
         config,
@@ -368,6 +384,7 @@ export function forgeWriteRoutes(config: ForgeWriteConfig): RouteDefinition[] {
       }
 
       const reached = await reachedForge(forgeDeps(config), guarded);
+      needsCredential(reached);
       const api = apiFor(reached);
 
       await writing(
@@ -410,6 +427,7 @@ export function forgeWriteRoutes(config: ForgeWriteConfig): RouteDefinition[] {
       };
 
       const reached = await reachedForge(forgeDeps(config), guarded);
+      needsCredential(reached);
       const api = apiFor(reached);
 
       let created = false;
@@ -468,6 +486,7 @@ export function forgeWriteRoutes(config: ForgeWriteConfig): RouteDefinition[] {
       };
 
       const reached = await reachedForge(forgeDeps(config), guarded);
+      needsCredential(reached);
       checkedBody(reached.target.forge, 'body', pull.body);
 
       const opened = await writing(

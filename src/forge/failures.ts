@@ -32,15 +32,75 @@ export function scrubbed(message: string, token?: string): string {
   return new TextDecoder().decode(bytes.slice(0, MOST_BYTES)).replace(/�$/, '');
 }
 
+/** The hint a username and password earn when the forge refuses them. */
+export const TOKEN_HINT = 'The forge API needs a token: store one as GIT_PAT, or as GIT_PASSWORD.';
+
+/**
+ * Whether a refusal is the forge rate limiting. GitHub answers 403
+ * as well as 429 for it (ADR 11), and only its headers tell the two
+ * apart.
+ */
+export function isRateLimit(status: number, headers: Headers): boolean {
+  if (status === 429) {
+    return true;
+  }
+  if (status !== 403) {
+    return false;
+  }
+  return (
+    headers.get('x-ratelimit-remaining') === '0' ||
+    headers.get('ratelimit-remaining') === '0' ||
+    headers.has('retry-after')
+  );
+}
+
+/**
+ * How long the forge asked the hub to wait, in seconds, where it
+ * said so: its own Retry-After, or the window it named.
+ */
+export function waitSeconds(headers: Headers, now: number): number | undefined {
+  const after = headers.get('retry-after');
+  if (after !== null && /^\d+$/.test(after.trim())) {
+    return Number(after.trim());
+  }
+  for (const name of ['x-ratelimit-reset', 'ratelimit-reset']) {
+    const reset = headers.get(name);
+    if (reset !== null && /^\d+$/.test(reset.trim())) {
+      // The forge's own value plus a second, as the reference says.
+      return Math.max(0, Math.ceil(Number(reset.trim()) - now / 1000)) + 1;
+    }
+  }
+  return undefined;
+}
+
 /** What the forge said, in the words the reference gives it. */
 export function forgeFailure(
   status: number,
   body: unknown,
-  options: { token?: string } = {},
+  options: { token?: string; basic?: boolean; headers?: Headers } = {},
 ): HttpError {
   const said = messageOf(body);
   const message = `the forge answered ${String(status)}${said.length === 0 ? '' : `: ${said}`}`;
 
+  if (options.headers !== undefined && isRateLimit(status, options.headers)) {
+    const wait = waitSeconds(options.headers, Date.now());
+    return new HttpError(
+      429,
+      scrubbed(message, options.token),
+      'forge_rate_limited',
+      wait === undefined ? undefined : { 'retry-after': String(Math.ceil(wait)) },
+    );
+  }
+  if (status === 401) {
+    // A username and password cannot authenticate a forge API, and
+    // saying so is more use than repeating the forge's refusal.
+    const hint = options.basic === true ? ` ${TOKEN_HINT}` : '';
+    return new HttpError(
+      502,
+      `${scrubbed(message, options.token)}${hint}`,
+      'forge_unauthenticated',
+    );
+  }
   if (status === 404) {
     return new HttpError(404, scrubbed(message, options.token), 'forge_not_found');
   }

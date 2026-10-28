@@ -6,7 +6,7 @@ import { workspaceScope } from '../platform/secrets.js';
 import { resolveGitCredential } from '../repo/credentials.js';
 import { effectiveSettings } from '../workspace/settings.js';
 import type { WorkspaceRecord } from '../store/workspaces.js';
-import { forgeFailure } from './failures.js';
+import { forgeFailure, isRateLimit, waitSeconds } from './failures.js';
 import { type ForgeTarget, forgeFor } from './target.js';
 
 /**
@@ -123,7 +123,10 @@ export async function reachForge(
       // forge APIs take a token, and that is where the token is.
       ...(stored === undefined
         ? {}
-        : { token: stored.kind === 'token' ? stored.token : stored.password }),
+        : {
+            token: stored.kind === 'token' ? stored.token : stored.password,
+            ...(stored.kind === 'basic' ? { basic: true } : {}),
+          }),
       ...(deps.fetch === undefined ? {} : { fetch: deps.fetch }),
       ...(deps.deadlineMs === undefined ? {} : { deadlineMs: deps.deadlineMs }),
     }),
@@ -133,9 +136,16 @@ export async function reachForge(
 export interface ClientDeps {
   target: ForgeTarget;
   token?: string;
+  /** Whether the token is a password, which earns its own hint. */
+  basic?: boolean;
   fetch?: typeof fetch;
   deadlineMs?: number;
+  /** How the client waits out a rate limit; a suite gives its own. */
+  sleep?: (ms: number) => Promise<void>;
 }
+
+/** The longest backoff the hub will sit through before giving up. */
+export const MOST_BACKOFF_MS = 120_000;
 
 /** The address a request goes to, with its query. */
 function addressOf(apiUrl: string, request: ForgeRequest): string {
@@ -159,6 +169,8 @@ export function forgeClient(deps: ClientDeps): ForgeClient {
   const call = deps.fetch ?? fetch;
   const deadlineMs = deps.deadlineMs ?? DEADLINE_MS;
 
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((done) => setTimeout(done, ms)));
+
   return {
     async send(request: ForgeRequest): Promise<ForgeAnswer> {
       const headers: Record<string, string> = {
@@ -172,10 +184,15 @@ export function forgeClient(deps: ClientDeps): ForgeClient {
         headers['content-type'] = 'application/json';
       }
 
-      let address = addressOf(deps.target.apiUrl, request);
+      const address0 = addressOf(deps.target.apiUrl, request);
       const giveUp = AbortSignal.timeout(deadlineMs);
+      const started = Date.now();
+      // One rate limit is waited out and the request made again; a
+      // second refusal is answered rather than waited out for ever.
+      let waited = false;
 
-      for (let redirects = 0; redirects <= MOST_REDIRECTS; redirects += 1) {
+      let address = address0;
+      for (let redirects = 0; redirects <= MOST_REDIRECTS + 1; redirects += 1) {
         let answer: Response;
         try {
           answer = await call(address, {
@@ -202,16 +219,39 @@ export function forgeClient(deps: ClientDeps): ForgeClient {
         const location = answer.headers.get('location');
         if (!moved || location === null) {
           const body = await parsed(answer);
-          if (answer.status >= 400) {
-            // A forge that refused is not a caller who did: the
-            // mapping says whose fault the caller is told it was.
-            throw forgeFailure(
-              answer.status,
-              body,
-              deps.token === undefined ? {} : { token: deps.token },
-            );
+          if (answer.status < 400) {
+            return { status: answer.status, body, headers: answer.headers };
           }
-          return { status: answer.status, body, headers: answer.headers };
+
+          // A rate limit the hub can sit out is sat out, once.
+          if (!waited && isRateLimit(answer.status, answer.headers)) {
+            const wait = waitSeconds(answer.headers, Date.now());
+            if (wait !== undefined && wait * 1000 <= MOST_BACKOFF_MS) {
+              // The retry needs room of its own after the wait, so a
+              // wait that fills what is left of the deadline is one
+              // the hub cannot take.
+              const left = deadlineMs - (Date.now() - started);
+              if ((wait + 1) * 1000 >= left) {
+                // A wait the deadline cannot contain is the deadline
+                // passing, and the caller is told that rather than
+                // held until it does.
+                throw new HttpError(504, 'the forge did not answer in time', 'forge_timeout');
+              }
+              waited = true;
+              await sleep(wait * 1000);
+              address = address0;
+              redirects = -1;
+              continue;
+            }
+          }
+
+          // A forge that refused is not a caller who did: the
+          // mapping says whose fault the caller is told it was.
+          throw forgeFailure(answer.status, body, {
+            ...(deps.token === undefined ? {} : { token: deps.token }),
+            ...(deps.basic === true ? { basic: true } : {}),
+            headers: answer.headers,
+          });
         }
         if (!sameOrigin(address, location)) {
           throw new HttpError(
