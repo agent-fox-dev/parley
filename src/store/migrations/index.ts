@@ -462,6 +462,27 @@ export const MIGRATIONS: readonly Migration[] = [
       'CREATE INDEX event_bus_by_published ON event_bus (published_at, id)',
     ],
   },
+  {
+    // What a forge told the hub. The row is the record and the
+    // duplicate check both, so the pair of workspace and the forge's
+    // own delivery id is the key; nothing of the payload is kept.
+    name: '017_forge_deliveries',
+    statements: [
+      `CREATE TABLE forge_deliveries (
+         workspace_slug TEXT NOT NULL,
+         delivery_id TEXT NOT NULL,
+         forge TEXT NOT NULL,
+         event TEXT NOT NULL,
+         action TEXT NOT NULL DEFAULT '',
+         target TEXT,
+         outcome TEXT NOT NULL DEFAULT 'ignored',
+         relayed TEXT NOT NULL DEFAULT '[]',
+         received_at TEXT NOT NULL,
+         PRIMARY KEY (workspace_slug, delivery_id)
+       )`,
+      'CREATE INDEX deliveries_by_received ON forge_deliveries (workspace_slug, received_at)',
+    ],
+  },
 ];
 
 /**

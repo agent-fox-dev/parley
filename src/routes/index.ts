@@ -34,6 +34,10 @@ import { transcriptRoutes } from './transcript.js';
 import { forgeStatusRoutes } from './forge_status.js';
 import { forgeReadRoutes } from './forge_reads.js';
 import { forgeWriteRoutes } from './forge_writes.js';
+import { webhookRoutes } from './webhook.js';
+import { deliveryRoutes } from './deliveries.js';
+import { ingressRoutes } from './ingress.js';
+import { lastDeliveryAt } from '../webhook/log.js';
 import { eventStreamRoutes } from './events_stream.js';
 import { rebaseRoutes } from './rebase.js';
 import { tokenPermissionRoutes } from './token_permissions.js';
@@ -81,6 +85,14 @@ export interface ServiceRouteConfig {
  */
 export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
   return [
+    // At the server root, like the git routes: a forge is given this
+    // address to post to.
+    ...ingressRoutes({
+      store: config.store,
+      clock: config.clock,
+      ...(config.secrets === undefined ? {} : { secrets: config.secrets }),
+      ...(config.events === undefined ? {} : { events: config.events }),
+    }),
     // At the server root rather than under the mount point: a clone URL
     // is what a person types, and /api/v1 has no business in it.
     ...gitRoutes({
@@ -153,6 +165,19 @@ export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
           metrics: config.metrics,
           ...(config.streamLimit === undefined ? {} : { limit: config.streamLimit }),
         })),
+    ...deliveryRoutes({
+      mountPoint: config.mountPoint,
+      store: config.store,
+      clock: config.clock,
+    }),
+    ...webhookRoutes({
+      mountPoint: config.mountPoint,
+      store: config.store,
+      clock: config.clock,
+      ...(config.secrets === undefined ? {} : { secrets: config.secrets }),
+      ...(config.externalUrl === undefined ? {} : { externalUrl: config.externalUrl }),
+      ...(config.events === undefined ? {} : { events: config.events }),
+    }),
     ...forgeWriteRoutes({
       mountPoint: config.mountPoint,
       store: config.store,
@@ -173,6 +198,7 @@ export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
       mountPoint: config.mountPoint,
       store: config.store,
       clock: config.clock,
+      lastDeliveryAt: async (slug) => lastDeliveryAt(config.store, slug),
       ...(config.secrets === undefined ? {} : { secrets: config.secrets }),
       ...(config.externalUrl === undefined ? {} : { externalUrl: config.externalUrl }),
       ...(config.fetch === undefined ? {} : { fetch: config.fetch }),

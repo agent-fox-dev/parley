@@ -9,6 +9,7 @@ import { mergeChecks } from './merges.js';
 import { sessionChecks } from './sessions.js';
 import { auditChecks } from './audit.js';
 import { forgeChecks } from './forge.js';
+import { webhookChecks } from './webhooks.js';
 import { workspaceChecks } from './workspaces.js';
 import { type Check, formatReport, runHarness } from './harness.js';
 
@@ -79,6 +80,7 @@ export async function main(): Promise<number> {
       ...sessionChecks(),
       ...auditChecks(),
       ...forgeChecks(),
+      ...webhookChecks(),
     ],
   });
   console.log(formatReport(result));

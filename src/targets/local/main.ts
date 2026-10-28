@@ -19,6 +19,7 @@ import { deploymentKey, sealedSecrets } from '../../secrets/store.js';
 import { migrate } from '../../store/migrations/index.js';
 import { eventRecorder } from '../../audit/recorder.js';
 import { storeBus } from '../../platform/store_bus.js';
+import { pruneDeliveries } from '../../jobs/delivery_prune.js';
 
 /**
  * The second target: the same service on one host, with the non-Cloudflare
@@ -91,9 +92,13 @@ export async function startLocalTarget(
   await migrate(platform.store);
   // At start and every hour after, as the reference asks.
   await sweepBindings(platform.store, platform.clock.now().toISOString());
+  await pruneDeliveries(platform.store, platform.clock);
   const sweeping = setInterval(
     () => {
       void sweepBindings(platform.store, platform.clock.now().toISOString());
+      // A delivery is of use while somebody is working out why a
+      // webhook did not do what they expected, and of none a week on.
+      void pruneDeliveries(platform.store, platform.clock);
     },
     60 * 60 * 1000,
   );

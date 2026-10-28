@@ -60,7 +60,7 @@
         "src/webhook/secret.ts",
         "docs/adr/"
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 2,
@@ -94,7 +94,7 @@
       "depends_on": [
         1
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 3,
@@ -130,7 +130,7 @@
       "depends_on": [
         1
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 4,
@@ -161,7 +161,7 @@
         2,
         3
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 5,
@@ -199,7 +199,7 @@
       "depends_on": [
         4
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 6,
@@ -233,7 +233,7 @@
         "afc forge webhook set, afc forge webhook unset and afc forge deliveries behave as docs/prd/cli.md specifies against a running deployment",
         "a signed delivery posted to a running deployment is relayed to the event stream and appears in the delivery log"
       ],
-      "state": "pending"
+      "state": "done"
     }
   ]
 }

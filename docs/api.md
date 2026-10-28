@@ -1343,6 +1343,106 @@ request made again. A wait the 30-second deadline cannot contain is
 seconds where the forge said how long. A write with no credential
 configured is `502 forge_error` with nothing sent.
 
+### The webhook
+
+A forge can tell Parley what happened on the repository instead of
+being polled. A person registers the webhook: Parley gives the URL and
+the secret, and calls the forge not at all.
+
+**`PUT .../forge/webhook`** stores the secret and answers
+`{configured, url, secret?}`. With no body, `{}` or `{"secret": null}`
+Parley generates one — 32 random bytes as 64 hex characters — and
+returns it **in that answer and nowhere else ever again**. A supplied
+secret is 16 to 255 characters of printable ASCII from `!` to `~`: it
+travels in a header, where a space or a control character is at best
+ignored. A refusal names the rule and never the value. `url` is null
+where the deployment has no external URL, and the secret is stored all
+the same. The workspace must not be archived.
+
+**`DELETE .../forge/webhook`** answers `204` whether or not there was a
+secret, works on an archived workspace, and keeps the recorded
+deliveries. From then on the ingress refuses that workspace's
+deliveries with `404`.
+
+The secret is the ordinary workspace secret `FORGE_WEBHOOK_SECRET`, so
+`afc secrets create` and these routes are two doors to one value, and
+the same name at a user or organization scope is a different secret
+Parley never reads for a delivery. It is read afresh for every
+delivery, so a rotation applies from the next one.
+
+**`GET .../forge/deliveries`** lists what arrived, newest first and
+within one second by the order they were recorded. `since` (RFC 3339,
+whole seconds kept, so a fraction starts at the next second) and
+`limit` (1 to 100, 30 by default) narrow it; a bad or repeated value is
+`400` naming the parameter. Each row carries `delivery_id`, `forge`,
+`event`, `action`, `target`, `outcome`, `relayed` and `received_at` —
+and nothing of the payload, which may hold anything at all. Deliveries
+are kept for seven days, and those of a workspace that is gone are
+removed with it.
+
+### POST /hooks/forge/:slug
+
+Where the forge posts. It is served at the server root, **without
+bearer authentication** — the forge proves itself with the workspace's
+secret — and outside the API's body limit and content-type check.
+
+**The checks happen in this order, and the body is read last:**
+
+1. the workspace exists and has a non-empty secret — an unknown slug
+   and a workspace without one share a single `404 not found`, so the
+   route tells nobody which workspaces exist;
+2. which scheme the headers name: `X-Hub-Signature-256` is GitHub's,
+   else `X-Gitlab-Token` is GitLab's, else `401`;
+3. GitLab's token, compared with the secret in constant time;
+4. the body, up to 1,048,576 bytes; more is `413 body_too_large`;
+5. GitHub's signature: `sha256=` and the HMAC-SHA256 of the **raw
+   request bytes** under the secret, compared in constant time.
+
+A missing, malformed or wrong signature or token is one identical
+`401`, whatever is wrong; nothing is recorded or emitted. The
+workspace's status does not matter — an archived workspace with a
+secret still relays.
+
+The delivery's id and event name come from `X-GitHub-Delivery` and
+`X-GitHub-Event`, or from `Idempotency-Key` (else `X-Gitlab-Event-UUID`)
+and `X-Gitlab-Event`. One with neither, with an id over 255 characters,
+or with an id outside printable ASCII is `400` and records nothing.
+See [ADR 12](adr/12-what-the-two-forges-send-with-a-delivery.md).
+
+**Each delivery once.** The row is written before anything is relayed,
+keyed by the workspace and the delivery id, so copies arriving together
+compete for one primary key: the losers are answered
+`202 {"outcome":"duplicate"}` and emit nothing. A store that cannot
+take the row answers `500`, so the forge redelivers and the redelivery
+is processed in full.
+
+**Answer, then relay.** The `202` and its outcome are written before
+any event is recorded, so a slow audit store cannot hold the forge's
+connection open; the relay then finishes whether or not the forge
+waits.
+
+| Outcome               | Meaning                                                                              |
+| --------------------- | ------------------------------------------------------------------------------------ |
+| `relayed`             | at least one event was relayed                                                       |
+| `ignored`             | the event and action are not ones Parley relays, or the payload had nothing to relay |
+| `repository_mismatch` | it had events to relay but was about neither the workspace's origin nor its upstream |
+| `duplicate`           | the delivery id was recorded before                                                  |
+
+A body that is not one JSON object, or that lacks what the delivery is
+_about_ — the repository, a number, a label name, a ref — is recorded
+as `malformed` and answered `400`; a payload missing only what
+_describes_ it — a title, a URL, a branch — is processed with those
+empty.
+
+The payload's repository path is compared, ignoring case, with the
+origin's `owner/name` and, on a `carry_patch` workspace with an
+upstream, with the upstream's. The mapping of each forge's events onto
+`hub.forge.*` events is the reference's two tables, transcribed into
+one declaration; GitLab's label changes relay removals before
+additions, each group sorted by name, at most 100 events per delivery
+and 100 labels per event. Everything else is ignored, and Parley never
+acts on a delivery and never contacts the forge for one.
+
 ## Git Server
 
 Each workspace's repository is served over git's smart HTTP protocol at the

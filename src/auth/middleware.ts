@@ -41,6 +41,11 @@ const UNAUTHENTICATED = 'authentication required';
  * refusal reaches the client as pkt-line rather than as the envelope a
  * git client cannot read.
  */
+/** The webhook ingress, where the forge's own secret is the credential. */
+export function isIngressPath(path: string): boolean {
+  return path.startsWith('/hooks/');
+}
+
 export function isGitPath(path: string): boolean {
   return path === '/git' || path.startsWith('/git/');
 }
@@ -62,7 +67,7 @@ export function isPublicPath(path: string, mountPoint: string): boolean {
 export function authentication(options: AuthOptions): MiddlewareHandler {
   return async (c, next) => {
     const path = new URL(c.req.url).pathname;
-    if (!isPublicPath(path, options.mountPoint) && !isGitPath(path)) {
+    if (!isPublicPath(path, options.mountPoint) && !isGitPath(path) && !isIngressPath(path)) {
       const identity = await identifyCredential(c.req.header('authorization'), options);
       if (identity === undefined) {
         record(options.log, c, 401);
