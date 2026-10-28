@@ -20,6 +20,7 @@ import { tokenRoutes } from './tokens.js';
 import { userRoutes } from './user.js';
 import { serverRoutes } from './server.js';
 import { gitRoutes } from '../git/routes.js';
+import type { Decider } from '../git/push.js';
 
 export interface ServiceRouteConfig {
   mountPoint: string;
@@ -42,6 +43,8 @@ export interface ServiceRouteConfig {
   fetch?: typeof fetch;
   /** The deployment's admin token, which a git client may also present. */
   adminToken?: string;
+  /** What the service makes of each ref of a git push. */
+  decideRef?: Decider;
 }
 
 /**
@@ -58,6 +61,7 @@ export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
       clock: config.clock,
       ...(config.adminToken === undefined ? {} : { adminToken: config.adminToken }),
       ...(config.repos === undefined ? {} : { repos: config.repos }),
+      ...(config.decideRef === undefined ? {} : { decide: config.decideRef }),
     }),
     ...serverRoutes({
       mountPoint: config.mountPoint,

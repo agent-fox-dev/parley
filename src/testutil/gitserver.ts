@@ -13,6 +13,7 @@ import type { OrgRecord, UserRecord } from '../store/identity.js';
 import { type Service, identityService } from './app.js';
 import { buildCommit } from './history.js';
 import { seedApiKey, seedOrg, seedUser, seedWorkspace } from './identity.js';
+import type { Decider } from '../git/push.js';
 import { hasRealGit } from './realgit.js';
 
 /**
@@ -82,6 +83,8 @@ export interface GitWorld {
 export interface GitWorldOptions {
   withOrg?: boolean;
   externalUrl?: string;
+  /** What the service makes of each ref of a git push. */
+  decideRef?: Decider;
   cleanups: Array<() => void | Promise<void>>;
 }
 
@@ -97,7 +100,11 @@ export async function servedService(options: GitWorldOptions): Promise<GitWorld>
   // hub_url is built from it.
   const port = (await freePort()) ?? 0;
   const externalUrl = options.externalUrl ?? `http://127.0.0.1:${String(port)}`;
-  const service = await identityService([], { repos, externalUrl });
+  const service = await identityService([], {
+    repos,
+    externalUrl,
+    ...(options.decideRef === undefined ? {} : { decideRef: options.decideRef }),
+  });
   options.cleanups.push(service.dispose);
 
   const owner = await seedUser(service.store);

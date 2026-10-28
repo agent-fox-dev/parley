@@ -4,6 +4,7 @@ import type { StoredRef } from '../platform/repostore.js';
 import type { RefChange } from '../platform/repostore.js';
 import { type GitAccessDeps, GitRefusal, NOT_AVAILABLE, gitAccess } from './access.js';
 import { negotiation, refusedService, uploadPackResponse } from './fetch.js';
+import { type Decider, servePush } from './push.js';
 import { ZERO_OID } from './transport.js';
 import { FLUSH, concatBytes, encodePkt, encodeSpecial, pktError } from './pktline.js';
 
@@ -18,7 +19,14 @@ const decoder = new TextDecoder();
  * the person a pkt-line message and reports the service's JSON envelope
  * as a server it could not understand (ADR 10).
  */
-export type GitRouteConfig = GitAccessDeps;
+export interface GitRouteConfig extends GitAccessDeps {
+  /**
+   * What the service makes of each ref of a push, before any of it
+   * reaches the store. Push control and the protected namespace are
+   * decided here; without one every ref is accepted.
+   */
+  decide?: Decider;
+}
 
 export const UPLOAD_PACK = 'git-upload-pack';
 export const RECEIVE_PACK = 'git-receive-pack';
@@ -205,26 +213,25 @@ export function gitRoutes(config: GitRouteConfig): RouteDefinition[] {
       handler: gitHandler(async (c) => {
         const subject = await gitAccess(c, config, 'write');
         const { commands, pack } = receiveRequest(await requestBody(c));
+        const served = `application/x-${RECEIVE_PACK}-result`;
+
+        // A push with no commands is a client that changed its mind.
         if (commands.length === 0) {
           return new Response(new Uint8Array() as BodyInit, {
-            headers: { 'content-type': `application/x-${RECEIVE_PACK}-result` },
+            headers: { 'content-type': served },
           });
         }
 
-        await subject.repos.receivePack(subject.repository, pack, commands);
-        return new Response(
-          concatBytes([
-            encodePkt('unpack ok\n'),
-            ...commands.map((command) => encodePkt(`ok ${command.name}\n`)),
-            encodeSpecial(FLUSH),
-          ]) as BodyInit,
-          {
-            headers: {
-              'content-type': `application/x-${RECEIVE_PACK}-result`,
-              'cache-control': 'no-cache',
-            },
-          },
-        );
+        const report = await servePush({
+          repos: subject.repos,
+          repository: subject.repository,
+          commands,
+          pack,
+          ...(config.decide === undefined ? {} : { decide: config.decide }),
+        });
+        return new Response(report as BodyInit, {
+          headers: { 'content-type': served, 'cache-control': 'no-cache' },
+        });
       }),
     },
   ];
