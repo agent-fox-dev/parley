@@ -52,6 +52,31 @@ authenticate themselves rather than going through the middleware that
 answers in the envelope, and a failure that escapes a handler is framed
 too.
 
+## The protocol version the hub speaks
+
+**Version 0, and a client that asks for version 2 falls back to it.**
+That is what `docs/prd/api.md` describes, and the measurements say it is
+the right way round rather than a shortfall.
+
+Version 2's negotiation cannot be served statelessly. Measured against
+the real binary, on a repository of forty commits with one new commit to
+fetch:
+
+| What the service answered a round with        | What git did next                               |
+| --------------------------------------------- | ----------------------------------------------- |
+| `acknowledgments`, `NAK`                      | sent `done` **with no haves** — a full transfer |
+| `acknowledgments`, `ACK`×6, `ready`, the pack | sent `done` with no haves — a full transfer     |
+| `acknowledgments`, `ACK`×6, no `ready`        | sent `done` with no haves — a full transfer     |
+| the version 0 advertisement                   | one round, six haves, a 234-byte pack           |
+
+In version 2 a client sends its haves once and expects the server to
+remember what it acknowledged; an HTTP service that keeps no state
+between requests has nothing to remember with. In version 0 the client
+resends every have each round, so one round narrows the pack. Serving
+version 2 natively would mean keeping negotiation state somewhere both
+targets can reach, which is a cost this package does not need to pay to
+do its job.
+
 ## Consequences
 
 - The hub implements a git server, and a protocol detail it gets wrong
@@ -66,7 +91,11 @@ too.
   while the event loop is blocked.
 - `servePack` is the whole of the hub's fetch negotiation, so how well a
   fetch narrows to what the client lacks is the store's business, not
-  the route's.
+  the route's. The non-Cloudflare store answered every fetch with the
+  whole repository until this package; it now walks what the wants
+  reach and leaves out what the haves do, which is also why a result
+  the engine keeps under one ref has to be referenced by whoever goes
+  on using it.
 - Nothing stops a later version proxying the parts that need no
   decision, if the measurements ever justify it. The ref-level
   operations could not be among them.

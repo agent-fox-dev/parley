@@ -34,6 +34,7 @@ function basic(password: string, username = 'parley'): string {
 async function world(): Promise<{
   service: Service;
   repos: RepositoryStore;
+  repository: string;
   org: string;
   slug: string;
   ownerKey: string;
@@ -58,11 +59,15 @@ async function world(): Promise<{
 
   const repository = repositoryOf(workspace);
   await repos.create(repository);
-  await buildCommit(repos, repository, { 'a.txt': 'hello\n' }, [], 'first');
+  const first = await buildCommit(repos, repository, { 'a.txt': 'hello\n' }, [], 'first');
+  await repos.updateRefs(repository, [
+    { name: 'refs/heads/main', oldOid: null, newOid: first.oid },
+  ]);
 
   return {
     service,
     repos,
+    repository,
     org: org.slug,
     slug: workspace.slug,
     ownerKey: key.presented,
@@ -228,5 +233,33 @@ describe('what a git response carries', () => {
       expect(text).not.toMatch(/artifacts|bearer|token/i);
       expect([...response.headers.keys()].join(' ')).not.toMatch(/token|authorization/i);
     }
+  });
+});
+
+describe('the body a client sends', () => {
+  it('is read when the client compressed it, as git does when it is worth it', async () => {
+    const { service, path, ownerKey, repos, repository } = await world();
+    const head = (await repos.listRefs(repository))[0]?.oid ?? '';
+    const asked = new TextEncoder().encode(
+      `${(`want ${head}\n`.length + 4).toString(16).padStart(4, '0')}want ${head}\n0000`,
+    );
+    const compressed = await new Response(
+      new Response(asked as BodyInit).body?.pipeThrough(new CompressionStream('gzip')),
+    ).arrayBuffer();
+
+    const response = await service.app.request(`${path}/git-upload-pack`, {
+      method: 'POST',
+      body: compressed,
+      headers: {
+        authorization: basic(ownerKey),
+        'content-type': 'application/x-git-upload-pack-request',
+        'content-encoding': 'gzip',
+      },
+    });
+
+    expect(response.status).toBe(200);
+    const body = new Uint8Array(await response.arrayBuffer());
+    expect(new TextDecoder().decode(body.subarray(0, 8))).toBe('0008NAK\n');
+    expect(new TextDecoder().decode(body.subarray(8, 12))).toBe('PACK');
   });
 });

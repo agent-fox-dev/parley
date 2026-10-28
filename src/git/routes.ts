@@ -3,16 +3,9 @@ import type { RouteDefinition } from '../http/router.js';
 import type { StoredRef } from '../platform/repostore.js';
 import type { RefChange } from '../platform/repostore.js';
 import { type GitAccessDeps, GitRefusal, NOT_AVAILABLE, gitAccess } from './access.js';
+import { negotiation, refusedService, uploadPackResponse } from './fetch.js';
 import { ZERO_OID } from './transport.js';
-import {
-  FLUSH,
-  concatBytes,
-  decodePktLines,
-  encodePkt,
-  encodeSpecial,
-  pktError,
-  textOf,
-} from './pktline.js';
+import { FLUSH, concatBytes, encodePkt, encodeSpecial, pktError } from './pktline.js';
 
 const decoder = new TextDecoder();
 
@@ -79,22 +72,6 @@ function defaultBranch(refs: readonly StoredRef[]): string {
   );
 }
 
-/** The wants and haves a client sent, in the order it sent them. */
-export function negotiation(body: Uint8Array): { wants: string[]; haves: string[] } {
-  const wants: string[] = [];
-  const haves: string[] = [];
-  for (const line of decodePktLines(body)) {
-    const [verb, oid] = textOf(line).trim().split(' ');
-    if (verb === 'want' && oid !== undefined) {
-      wants.push(oid);
-    }
-    if (verb === 'have' && oid !== undefined) {
-      haves.push(oid);
-    }
-  }
-  return { wants, haves };
-}
-
 /**
  * The ref commands of a push and the pack that follows them. The
  * commands are read before any of it reaches the store, which is what
@@ -143,6 +120,24 @@ export function receiveRequest(body: Uint8Array): {
 }
 
 /**
+ * The request's bytes, decompressed where the client compressed them.
+ * git gzips a request body when it is worth it and says so, and a body
+ * read without undoing that is not pkt-line at all.
+ */
+async function requestBody(c: Context): Promise<Uint8Array> {
+  const raw = new Uint8Array(await c.req.arrayBuffer());
+  if ((c.req.header('content-encoding') ?? '').toLowerCase() !== 'gzip') {
+    return raw;
+  }
+  const compressed = new Response(raw as BodyInit).body;
+  if (compressed === null) {
+    return raw;
+  }
+  const stream = compressed.pipeThrough(new DecompressionStream('gzip'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+/**
  * Everything a git route answers, in git's framing. A failure nobody
  * expected is a pkt-line too: a client that receives the service's JSON
  * envelope reports that it could not understand the server, which tells
@@ -173,8 +168,13 @@ export function gitRoutes(config: GitRouteConfig): RouteDefinition[] {
       methods: ['GET'],
       handler: gitHandler(async (c) => {
         const service = new URL(c.req.url).searchParams.get('service') ?? '';
+        const refused = refusedService(service);
+        if (refused !== undefined) {
+          throw refused;
+        }
         const subject = await gitAccess(c, config, service === RECEIVE_PACK ? 'write' : 'read');
         const refs = await subject.repos.listRefs(subject.repository);
+
         return new Response(advertisement(service, refs) as BodyInit, {
           headers: {
             'content-type': `application/x-${service}-advertisement`,
@@ -188,9 +188,10 @@ export function gitRoutes(config: GitRouteConfig): RouteDefinition[] {
       methods: ['POST'],
       handler: gitHandler(async (c) => {
         const subject = await gitAccess(c, config, 'read');
-        const { wants, haves } = negotiation(new Uint8Array(await c.req.arrayBuffer()));
+        const { wants, haves } = negotiation(await requestBody(c));
         const pack = await subject.repos.servePack(subject.repository, wants, haves);
-        return new Response(concatBytes([encodePkt('NAK\n'), pack]) as BodyInit, {
+
+        return new Response(uploadPackResponse(pack) as BodyInit, {
           headers: {
             'content-type': `application/x-${UPLOAD_PACK}-result`,
             'cache-control': 'no-cache',
@@ -203,7 +204,7 @@ export function gitRoutes(config: GitRouteConfig): RouteDefinition[] {
       methods: ['POST'],
       handler: gitHandler(async (c) => {
         const subject = await gitAccess(c, config, 'write');
-        const { commands, pack } = receiveRequest(new Uint8Array(await c.req.arrayBuffer()));
+        const { commands, pack } = receiveRequest(await requestBody(c));
         if (commands.length === 0) {
           return new Response(new Uint8Array() as BodyInit, {
             headers: { 'content-type': `application/x-${RECEIVE_PACK}-result` },

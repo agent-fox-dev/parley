@@ -74,6 +74,8 @@ export interface GitWorld {
   /** The address the service is served at, which is its external URL. */
   base: string;
   url: string;
+  /** How many bytes of response body the service has sent so far. */
+  bytesServed: () => number;
   stop: () => Promise<void>;
 }
 
@@ -114,12 +116,27 @@ export async function servedService(options: GitWorldOptions): Promise<GitWorld>
     { name: 'refs/heads/main', oldOid: null, newOid: first.oid },
   ]);
 
+  // Counted on the way out, so a suite can say what a transfer cost
+  // rather than trusting a client's own report of it.
+  let bytesServed = 0;
+  const counting = async (request: Request, ...rest: unknown[]): Promise<Response> => {
+    const response = await (service.app.fetch as (...args: unknown[]) => Promise<Response>)(
+      request,
+      ...rest,
+    );
+    bytesServed += (await response.clone().arrayBuffer()).byteLength;
+    return response;
+  };
+
   // Awaited, because a clone that starts before the socket is listening
   // fails to connect rather than waiting.
   const listening = await new Promise<ReturnType<typeof serve>>((resolve) => {
-    const server = serve({ fetch: service.app.fetch, port, hostname: '127.0.0.1' }, () => {
-      resolve(server);
-    });
+    const server = serve(
+      { fetch: counting as unknown as typeof service.app.fetch, port, hostname: '127.0.0.1' },
+      () => {
+        resolve(server);
+      },
+    );
   });
   const stop = () =>
     new Promise<void>((resolve) => {
@@ -140,6 +157,7 @@ export async function servedService(options: GitWorldOptions): Promise<GitWorld>
     credential: key.presented,
     base,
     url: `${base}/git/${org?.slug ?? ''}/${workspace.slug}.git`,
+    bytesServed: () => bytesServed,
     stop,
   };
 }

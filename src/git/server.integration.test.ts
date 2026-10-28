@@ -1,5 +1,17 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { gitClone, servedService, whatIsMissing, withCredential } from '../testutil/gitserver.js';
+import { buildCommit } from '../testutil/history.js';
+import {
+  GIT_ENV,
+  gitClone,
+  gitRefs,
+  gitRun,
+  servedService,
+  whatIsMissing,
+  withCredential,
+} from '../testutil/gitserver.js';
 
 /**
  * A real git client against the real routes. It needs a listening
@@ -65,6 +77,116 @@ describe.skipIf(missing.length > 0)(
       });
 
       expect(((await read.json()) as { hub_url: string | null }).hub_url).toBeNull();
+    });
+  },
+);
+
+describe.skipIf(missing.length > 0)(
+  `fetching from the git routes${missing.length > 0 ? ` (needs ${missing.join(' and ')})` : ''}`,
+  () => {
+    it.each(['git-upload-pack', 'git-receive-pack'])(
+      'advertises refs for %s, in a body a real git client parses',
+      async (service) => {
+        const world = await servedService({ cleanups });
+        const response = await fetch(`${world.url}/info/refs?service=${service}`, {
+          headers: {
+            authorization: `Basic ${Buffer.from(`parley:${world.credential}`).toString('base64')}`,
+          },
+        });
+
+        expect(response.status).toBe(200);
+        expect(response.headers.get('content-type')).toBe(`application/x-${service}-advertisement`);
+
+        // What git itself makes of it: ls-remote parses the same
+        // advertisement a clone or a push would.
+        const listed = await gitRun(
+          'git',
+          ['ls-remote', withCredential(world.url, world.credential)],
+          { env: GIT_ENV, timeout: 30_000 },
+        );
+        expect(listed.stdout).toContain('refs/heads/main');
+      },
+    );
+
+    it('transfers only what the client lacks when it fetches again', async () => {
+      const world = await servedService({ cleanups });
+      // Enough history that a full transfer and an incremental one are
+      // not the same size by accident.
+      let parent = (await world.repos.listRefs(world.repository)).find(
+        (ref) => ref.name === 'refs/heads/main',
+      )?.oid;
+      for (let i = 0; i < 40; i += 1) {
+        const built = await buildCommit(
+          world.repos,
+          world.repository,
+          Object.fromEntries(
+            Array.from({ length: 20 }, (_, j) => [
+              `file-${String(j)}.txt`,
+              `commit ${String(i)} line ${String(j)} ${'padding '.repeat(60)}\n`,
+            ]),
+          ),
+          parent === undefined ? [] : [parent],
+          `commit ${String(i)}`,
+        );
+        parent = built.oid;
+      }
+      await world.repos.updateRefs(world.repository, [
+        { name: 'refs/heads/main', oldOid: null, newOid: parent ?? '', force: true },
+      ]);
+
+      const url = withCredential(world.url, world.credential);
+      const beforeClone = world.bytesServed();
+      const cloned = await gitClone(url, cleanups);
+      const cloneBytes = world.bytesServed() - beforeClone;
+
+      const extra = await buildCommit(
+        world.repos,
+        world.repository,
+        { 'one-more.txt': 'the only new content\n' },
+        [parent ?? ''],
+        'one more',
+      );
+      await world.repos.updateRefs(world.repository, [
+        { name: 'refs/heads/main', oldOid: parent ?? null, newOid: extra.oid, force: true },
+      ]);
+
+      const beforeFetch = world.bytesServed();
+      await gitRun('git', ['-C', cloned.dir, 'fetch', '--quiet', 'origin'], {
+        env: GIT_ENV,
+        timeout: 30_000,
+      });
+      const fetchBytes = world.bytesServed() - beforeFetch;
+
+      expect(cloneBytes).toBeGreaterThan(10_000);
+      expect(fetchBytes).toBeLessThan(cloneBytes / 10);
+      const listed = await gitRun('git', ['ls-remote', url], { env: GIT_ENV, timeout: 30_000 });
+      expect(listed.stdout).toContain(extra.oid);
+    });
+
+    it.each([
+      ['version 2', '2'],
+      ['version 0', '0'],
+    ])('clones for a client asking for protocol %s', async (_what, version) => {
+      const world = await servedService({ cleanups });
+
+      const dir = mkdtempSync(join(tmpdir(), 'parley-version-'));
+      cleanups.push(() => {
+        rmSync(dir, { recursive: true, force: true });
+      });
+      await gitRun(
+        'git',
+        [
+          '-c',
+          `protocol.version=${version}`,
+          'clone',
+          '--quiet',
+          withCredential(world.url, world.credential),
+          dir,
+        ],
+        { env: GIT_ENV, timeout: 30_000 },
+      );
+
+      expect(await gitRefs(dir)).toEqual(['refs/heads/main']);
     });
   },
 );

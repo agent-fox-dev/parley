@@ -17,6 +17,19 @@ const WHO: Identity = {
   timezoneOffset: 0,
 };
 
+/**
+ * Points a ref of this harness's own at a commit the engine made, so
+ * that it survives the next operation. The engine keeps its result
+ * under one ref, which the operation after it overwrites; a caller that
+ * goes on using a result is the one that has to keep it.
+ */
+async function kept(repos: ReturnType<typeof localRepositoryStore>, oid: string): Promise<string> {
+  await repos.updateRefs(REPO, [
+    { name: `refs/hub/corpus/${oid}`, oldOid: null, newOid: oid, force: true },
+  ]);
+  return oid;
+}
+
 /** Runs one corpus case through the engine, answering as the git harness does. */
 export async function engineCase(one: CorpusCase): Promise<CaseOutcome> {
   const dir = mkdtempSync(join(tmpdir(), 'parley-corpus-engine-'));
@@ -48,7 +61,7 @@ export async function engineCase(one: CorpusCase): Promise<CaseOutcome> {
       if (intoTopic.conflicts !== undefined) {
         return { conflicts: intoTopic.conflicts };
       }
-      branch = intoTopic.commit ?? branch;
+      branch = await kept(repos, intoTopic.commit ?? branch);
       const intoMain = await engine.mergeCommit({
         repository: REPO,
         ours: base,
@@ -59,7 +72,7 @@ export async function engineCase(one: CorpusCase): Promise<CaseOutcome> {
       if (intoMain.conflicts !== undefined) {
         return { conflicts: intoMain.conflicts };
       }
-      base = intoMain.commit ?? base;
+      base = await kept(repos, intoMain.commit ?? base);
     }
 
     if (one.operation === 'merge') {
