@@ -18,6 +18,10 @@ import { workspaceRoutes } from './workspaces.js';
 import { syncRoutes } from './sync.js';
 import { recloneRoutes } from './reclone.js';
 import { branchPushRoutes } from './branch_push.js';
+import { patchRoutes } from './patches.js';
+import { rebuildRoutes } from './rebuilds.js';
+import { rerereRoutes } from './rerere.js';
+import { patchStatusRoutes } from './patch_status.js';
 import { tokenPermissionRoutes } from './token_permissions.js';
 import { tokenRoutes } from './tokens.js';
 import { userRoutes } from './user.js';
@@ -66,6 +70,7 @@ export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
       ...(config.repos === undefined ? {} : { repos: config.repos }),
       ...(config.decideRef === undefined ? {} : { decide: config.decideRef }),
       ...(config.secrets === undefined ? {} : { secrets: config.secrets }),
+      ...(config.jobs === undefined ? {} : { jobs: config.jobs }),
       ...(config.fetch === undefined ? {} : { fetch: config.fetch }),
     }),
     ...serverRoutes({
@@ -107,6 +112,36 @@ export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
       store: config.store,
       clock: config.clock,
     }),
+    ...patchStatusRoutes({
+      mountPoint: config.mountPoint,
+      store: config.store,
+      clock: config.clock,
+      ...(config.repos === undefined ? {} : { repos: config.repos }),
+    }),
+    ...rerereRoutes({
+      mountPoint: config.mountPoint,
+      store: config.store,
+      clock: config.clock,
+      locks: config.locks,
+    }),
+    ...rebuildRoutes({
+      mountPoint: config.mountPoint,
+      store: config.store,
+      clock: config.clock,
+      locks: config.locks,
+      ...(config.repos === undefined ? {} : { repos: config.repos }),
+      ...(config.jobs === undefined ? {} : { jobs: config.jobs }),
+    }),
+    ...patchRoutes({
+      mountPoint: config.mountPoint,
+      store: config.store,
+      clock: config.clock,
+      locks: config.locks,
+      ...(config.secrets === undefined ? {} : { secrets: config.secrets }),
+      ...(config.repos === undefined ? {} : { repos: config.repos }),
+      ...(config.jobs === undefined ? {} : { jobs: config.jobs }),
+      ...(config.fetch === undefined ? {} : { fetch: config.fetch }),
+    }),
     ...branchPushRoutes({
       mountPoint: config.mountPoint,
       store: config.store,
@@ -134,6 +169,7 @@ export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
       locks: config.locks,
       ...(config.secrets === undefined ? {} : { secrets: config.secrets }),
       ...(config.repos === undefined ? {} : { repos: config.repos }),
+      ...(config.jobs === undefined ? {} : { jobs: config.jobs }),
       ...(config.externalUrl === undefined ? {} : { externalUrl: config.externalUrl }),
       ...(config.fetch === undefined ? {} : { fetch: config.fetch }),
     }),

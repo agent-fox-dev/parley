@@ -105,6 +105,7 @@ export default {
         secrets: sealedSecrets(platform.store, key),
         jobs: storeJobs(platform.store, platform.clock),
         clock: platform.clock,
+        locks: platform.locks,
       });
     }
   },

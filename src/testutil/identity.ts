@@ -189,3 +189,30 @@ export async function seedOrg(
   });
   return org;
 }
+
+/** A patch on a carry-patch workspace's list, as the route would add one. */
+export async function seedPatch(
+  store: RelationalStore,
+  slug: string,
+  branch: string,
+  over: Partial<{ position: number; status: string }> = {},
+): Promise<void> {
+  const held = await store.all<{ count: number }>(
+    'SELECT COUNT(*) AS count FROM patches WHERE workspace_slug = ?',
+    [slug],
+  );
+  await store.run(
+    `INSERT INTO patches
+       (id, workspace_slug, branch_name, position, status, added_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [
+      unique('patch'),
+      slug,
+      branch,
+      over.position ?? Number(held[0]?.count ?? 0) + 1,
+      over.status ?? 'active',
+      SEED_NOW.toISOString(),
+      SEED_NOW.toISOString(),
+    ],
+  );
+}

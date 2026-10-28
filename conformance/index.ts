@@ -4,6 +4,7 @@ import { entryChecks } from './entries.js';
 import { repositoryChecks } from './repository.js';
 import { gitServerChecks } from './git_server.js';
 import { syncPushChecks } from './sync_push.js';
+import { carryPatchChecks } from './carry_patch.js';
 import { workspaceChecks } from './workspaces.js';
 import { type Check, formatReport, runHarness } from './harness.js';
 
@@ -69,6 +70,7 @@ export async function main(): Promise<number> {
       ...repositoryChecks(),
       ...gitServerChecks(),
       ...syncPushChecks(),
+      ...carryPatchChecks(),
     ],
   });
   console.log(formatReport(result));

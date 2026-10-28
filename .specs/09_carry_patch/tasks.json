@@ -64,7 +64,7 @@
         "src/patch/resolve_branch.ts",
         "src/store/migrations/"
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 2,
@@ -97,7 +97,7 @@
       "depends_on": [
         1
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 3,
@@ -128,7 +128,7 @@
       "depends_on": [
         2
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 4,
@@ -169,7 +169,7 @@
       "depends_on": [
         1
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 5,
@@ -205,7 +205,7 @@
       "depends_on": [
         4
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 6,
@@ -240,7 +240,7 @@
         1,
         5
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 7,
@@ -280,7 +280,7 @@
         1,
         5
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 8,
@@ -309,7 +309,7 @@
       "depends_on": [
         4
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 9,
@@ -339,7 +339,7 @@
         2,
         5
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 10,
@@ -368,7 +368,7 @@
         6,
         7
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 11,
@@ -407,7 +407,7 @@
         "`make check` passes with no network access and no deployment configured",
         "afc patch, afc rebuild, afc rerere and afc workspace patch-status behave as docs/prd/cli.md specifies against a running deployment"
       ],
-      "state": "pending"
+      "state": "done"
     }
   ]
 }

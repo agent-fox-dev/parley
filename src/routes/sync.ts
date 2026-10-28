@@ -2,6 +2,7 @@ import type { Context } from 'hono';
 import { HttpError } from '../http/errors.js';
 import type { RouteDefinition } from '../http/router.js';
 import type { Clock, Locks, RelationalStore } from '../platform/index.js';
+import type { JobQueue } from '../platform/jobs.js';
 import type { RepositoryStore } from '../platform/repostore.js';
 import type { SecretStore } from '../platform/secrets.js';
 import type { LogSink } from '../http/router.js';
@@ -13,6 +14,7 @@ import { serialiseWorkspace } from '../workspace/serialise.js';
 import { syncRefusal } from '../sync/preconditions.js';
 import { jsonResponse } from '../http/json.js';
 import { syncStandard } from '../sync/standard.js';
+import { type CarryPatchSync, syncCarryPatch } from '../sync/carry_patch.js';
 
 /**
  * Bringing a workspace up to date with its remote.
@@ -30,6 +32,7 @@ export interface SyncRouteConfig {
   locks: Locks;
   secrets?: SecretStore;
   repos?: RepositoryStore;
+  jobs?: JobQueue;
   externalUrl?: string;
   fetch?: typeof fetch;
   log?: LogSink;
@@ -53,15 +56,30 @@ async function sync(c: Context, config: SyncRouteConfig): Promise<Response> {
   const asked = Number(query.get('deadline_ms') ?? '');
   const deadlineMs = Number.isFinite(asked) && asked > 0 ? asked : undefined;
 
+  // What a carry-patch sync found, which is answered beside the
+  // workspace itself.
+  let carried: CarryPatchSync | undefined;
+
   // The lock, not a status field, is what makes a second sync wait: a
   // sync in progress is not a state the workspace stores.
   await withWorkspaceLock(config.locks, workspace.slug, async () => {
     if (workspace.workspace_mode === 'carry_patch') {
-      // Where the carry-patch package takes over: it fetches upstream,
-      // refreshes the patch branches and queues a rebuild. Until it
-      // exists, a carry_patch workspace syncs nothing rather than
-      // being told the wrong thing about its patches.
-      throw new HttpError(501, 'syncing a carry-patch workspace is not served yet');
+      // The carry-patch sync is a different operation, not the
+      // standard one with extras: it fetches upstream, moves no
+      // branch of its own and reports its findings.
+      carried = await syncCarryPatch(
+        {
+          store: config.store,
+          repos,
+          clock: config.clock,
+          ...(config.jobs === undefined ? {} : { jobs: config.jobs }),
+          ...(config.secrets === undefined ? {} : { secrets: config.secrets }),
+          ...(config.fetch === undefined ? {} : { fetch: config.fetch }),
+          ...(config.log === undefined ? {} : { log: config.log }),
+        },
+        workspace,
+      );
+      return;
     }
     await syncStandard(
       {
@@ -83,13 +101,14 @@ async function sync(c: Context, config: SyncRouteConfig): Promise<Response> {
     throw new HttpError(404, 'workspace not found');
   }
   const org = updated.org_id === null ? undefined : await findOrg(config.store, updated.org_id);
-  return jsonResponse(
-    serialiseWorkspace(updated, {
+  return jsonResponse({
+    ...serialiseWorkspace(updated, {
       access: level,
       orgSlug: org?.slug ?? null,
       externalUrl: config.externalUrl,
     }),
-  );
+    ...carried,
+  });
 }
 
 export function syncRoutes(config: SyncRouteConfig): RouteDefinition[] {

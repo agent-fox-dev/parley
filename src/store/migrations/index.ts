@@ -201,6 +201,63 @@ export const MIGRATIONS: readonly Migration[] = [
        )`,
     ],
   },
+  {
+    // The rest of a patch, now that there is a package that carries
+    // one: where it sits in the stack, how it is faring, what it
+    // relates to upstream and how it stood against the fork at the
+    // last sync. The table is rebuilt rather than altered column by
+    // column, because the id is a new primary key.
+    name: '010_patch_stack',
+    statements: [
+      'DROP TABLE patches',
+      `CREATE TABLE patches (
+         id TEXT PRIMARY KEY,
+         workspace_slug TEXT NOT NULL,
+         branch_name TEXT NOT NULL,
+         position INTEGER NOT NULL,
+         status TEXT NOT NULL DEFAULT 'active',
+         conflict_files TEXT,
+         upstream_pr_url TEXT,
+         description TEXT,
+         deleted_at TEXT,
+         added_at TEXT NOT NULL,
+         updated_at TEXT NOT NULL,
+         origin_sync_state TEXT,
+         origin_sha TEXT,
+         origin_synced_at TEXT
+       )`,
+      'CREATE UNIQUE INDEX patches_by_branch ON patches (workspace_slug, branch_name)',
+      'CREATE INDEX patches_by_position ON patches (workspace_slug, position)',
+    ],
+  },
+  {
+    // A rebuild is a job rather than a request: the work is far longer
+    // than one request may take, so a client is given an id and polls
+    // it. Its per-patch results are written as each patch finishes, so
+    // a poller sees movement rather than a spinner.
+    name: '011_rebuilds',
+    statements: [
+      `CREATE TABLE rebuilds (
+         id TEXT PRIMARY KEY,
+         workspace_slug TEXT NOT NULL,
+         status TEXT NOT NULL,
+         strategy TEXT NOT NULL,
+         fail_mode TEXT NOT NULL,
+         submitted_by TEXT NOT NULL,
+         upstream_head TEXT,
+         previous_integration_head TEXT,
+         new_integration_head TEXT,
+         integration_branch_pushed INTEGER NOT NULL DEFAULT 0,
+         error TEXT,
+         results TEXT NOT NULL DEFAULT '[]',
+         follow_up_of TEXT,
+         queued_at TEXT NOT NULL,
+         started_at TEXT,
+         finished_at TEXT
+       )`,
+      'CREATE INDEX rebuilds_by_workspace ON rebuilds (workspace_slug, queued_at)',
+    ],
+  },
 ];
 
 /**

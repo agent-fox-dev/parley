@@ -27,6 +27,7 @@ implemented; routes appear here as they are built.
 - [Variables](#variables)
 - [Sandboxes](#sandboxes)
 - [Keeping a workspace and its remote in step](#keeping-a-workspace-and-its-remote-in-step)
+- [Carrying a patch stack](#carrying-a-patch-stack)
 - [Git Server](#git-server)
 - [Server Endpoints](#server-endpoints)
 
@@ -912,6 +913,58 @@ message, because the CLI shows the message and nothing else:
 | 422    | `forge_rejected`                                                               |
 | 502    | `forge_unauthenticated`, `forge_forbidden`, `forge_unreachable`, `forge_error` |
 | 504    | `forge_timeout`                                                                |
+
+## Carrying a patch stack
+
+A `carry_patch` workspace keeps an ordered list of branches and an
+integration branch rebuilt from the upstream head plus those branches.
+
+**The patch list.** `POST .../patches` adds one or, with a JSON array,
+several in one transaction: every element's syntax is checked first in
+array order, then every branch, and the first branch failure refuses
+the whole batch while leaving branches already created in place. A
+branch is looked for in the workspace's own repository, in the fork's
+already-fetched copy, and — only with `patch_branch_source` `origin` —
+on the fork itself, and which one answered is reported as
+`branch_resolution`. `GET`, `PATCH`, `DELETE`, `.../restore` and
+`.../reorder` do what they say; positions are 1 to n with no gap after
+every one of them, and a patch's branch never changes.
+
+**`POST .../patches/:id/reset-to-origin`** sets a patch branch to the
+fork's tip by the first rule that fits: `created`, `none`,
+`fast_forwarded`, or `replaced` with the old tip kept under
+`refs/hub/replaced/<branch>`.
+
+**The sync of a carry-patch workspace** is a different operation from
+the standard one: it fetches upstream rather than the fork, moves no
+branch of its own, and answers with `patches_merged`,
+`rebuild_triggered`, `force_push_detected`, `origin_fetched` and —
+with `patch_branch_source` `origin` — `patches_synced` and
+`patches_diverged`. It uses no `sync_error`. A failure refreshing a
+patch branch ends it with `500`, keeping what the earlier steps
+reached and writing neither `upstream_head_sha` nor `last_sync_at`.
+
+**Rebuilds.** `POST .../rebuild` answers `202` with a queued job;
+`GET .../rebuilds` and `.../rebuilds/:id` follow it, and its per-patch
+results grow as it runs. `DELETE` cancels a queued one,
+`.../requeue` queues a dead-lettered one again, and `.../rollback`
+sets the integration branch back to where it was.
+`POST .../rebuild/preview` predicts what a rebuild would do and writes
+nothing at all.
+
+A rebuild holds the workspace lock only at its start and its end, so a
+sync or a push may run while patches are applied; a tip that moves
+meanwhile yields exactly one follow-up rebuild, submitted by the hub.
+A workspace owes at most one rebuild at a time, whatever asked for it
+— a push to a patch branch, a sync, or a reset.
+
+**`GET .../rerere`** lists the conflict resolutions the hub will
+replay, and `DELETE .../rerere/<pathspec>` forgets one by identity or
+by path, so the next occurrence is reported rather than settled.
+
+**`GET .../patch-status`** is the dashboard: the workspace, the latest
+rebuild, every patch with what that rebuild made of it, and counts
+derived from the same list it carries.
 
 ## Git Server
 

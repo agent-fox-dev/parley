@@ -1,6 +1,8 @@
 import type { LogSink } from '../http/router.js';
 import type { JobQueue } from '../platform/jobs.js';
+import type { Locks } from '../platform/lock.js';
 import { COPY_IN, type CopyInDeps, type CopyInPayload, runCopyIn } from './copy_in.js';
+import { REBUILD, type RebuildPayload, runRebuildJob } from './rebuild.js';
 
 /** How many jobs one drain takes on before leaving the rest for the next. */
 const DEFAULT_BUDGET = 10;
@@ -14,7 +16,7 @@ const DEFAULT_BUDGET = 10;
  * process from an interval.
  */
 export async function drainJobs(
-  deps: CopyInDeps,
+  deps: CopyInDeps & { locks?: Locks },
   options: { budget?: number; log?: LogSink } = {},
 ): Promise<number> {
   const queue: JobQueue = deps.jobs;
@@ -28,6 +30,17 @@ export async function drainJobs(
     ran += 1;
 
     try {
+      if (job.kind === REBUILD) {
+        // A rebuild needs the workspace lock at its start and its end,
+        // so a deployment without one cannot run it.
+        if (deps.locks === undefined) {
+          await queue.fail(job.id, 'this deployment has no workspace lock to rebuild under');
+          continue;
+        }
+        await runRebuildJob({ ...deps, locks: deps.locks }, job.payload as RebuildPayload);
+        await queue.complete(job.id);
+        continue;
+      }
       if (job.kind !== COPY_IN) {
         await queue.fail(job.id, `no handler for ${job.kind}`);
         continue;

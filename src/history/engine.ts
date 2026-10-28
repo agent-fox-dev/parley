@@ -107,6 +107,27 @@ export interface HistoryEngine {
     /** The sizes this operation may work at; the engine's by default. */
     limits?: Partial<EngineLimits>;
   }): Promise<CommitResult>;
+  /**
+   * What would happen if these branches were applied onto a base, one
+   * after another, without applying them. Nothing is written: the work
+   * happens in the engine's own memory and is never handed back to the
+   * store, which is what makes it a prediction rather than a rehearsal.
+   */
+  predict(request: {
+    repository: string;
+    onto: string;
+    branches: readonly string[];
+    author: Identity;
+  }): Promise<PredictedPatch[]>;
+}
+
+/** What one branch would do, applied where the prediction had reached. */
+export interface PredictedPatch {
+  branch: string;
+  /** The tree it would produce, where it would apply. */
+  tree?: string;
+  /** The paths that would conflict, where it would not. */
+  conflicts?: string[];
 }
 
 interface Session {
@@ -606,6 +627,43 @@ export function historyEngine(repos: RepositoryStore, deps: EngineDeps = {}): Hi
 
     carryOn(continuation): Promise<RebaseResult> {
       return continuation.resume();
+    },
+
+    async predict(request): Promise<PredictedPatch[]> {
+      const session = await open(repos, request.repository);
+      const options = { fs: session.fs as never, gitdir: session.gitdir };
+      const predicted: PredictedPatch[] = [];
+
+      // The session is never flushed, so every commit and tree this
+      // makes lives and dies in memory.
+      let head = request.onto;
+      for (const branch of request.branches) {
+        const merged = await mergeOverBase(
+          options,
+          {
+            base: await mergeBaseOf(options, head, branch),
+            ours: head,
+            theirs: branch,
+          },
+          replayFor(request.repository),
+        );
+        if (merged.conflicts !== undefined) {
+          predicted.push({ branch, conflicts: merged.conflicts });
+          continue;
+        }
+        head = await git.writeCommit({
+          ...options,
+          commit: {
+            tree: merged.tree ?? '',
+            parent: [head, branch],
+            author: request.author,
+            committer: request.author,
+            message: `predicting ${branch}`,
+          },
+        });
+        predicted.push({ branch, tree: merged.tree ?? '' });
+      }
+      return predicted;
     },
 
     /**

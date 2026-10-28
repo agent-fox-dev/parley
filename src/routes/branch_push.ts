@@ -5,7 +5,8 @@ import { jsonResponse } from '../http/json.js';
 import type { Clock, Locks, RelationalStore } from '../platform/index.js';
 import type { RepositoryStore } from '../platform/repostore.js';
 import type { SecretStore } from '../platform/secrets.js';
-import { registeredPatches } from '../patches/registry.js';
+
+import { registeredPatches } from '../patch/list.js';
 import { repositoryOf } from '../repo/repository.js';
 import { headRef } from '../git/after_push.js';
 import { workspaceAccess } from '../workspace/access.js';
