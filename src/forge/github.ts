@@ -2,6 +2,12 @@ import type { ForgeClient } from './client.js';
 import type { Repository } from './target.js';
 import {
   type ForgeApi,
+  type ForgeLabel,
+  type IssueChanges,
+  type NewIssue,
+  type NewPullRequest,
+  isNotFound,
+  labelSegment,
   type ForgeChangedFile,
   type ForgeCheckRun,
   type ForgeComment,
@@ -95,6 +101,7 @@ export function githubApi(client: ForgeClient, repository: Repository): ForgeApi
   const at = repoPath(repository);
 
   return {
+    ...githubWrites(client, repository),
     async repository(): Promise<ForgeRepository> {
       const answer = await client.send({ method: 'GET', path: at });
       const raw = object(answer.body);
@@ -209,6 +216,134 @@ export function githubApi(client: ForgeClient, repository: Repository): ForgeApi
         body: text(raw['body']),
         submitted_at: text(raw['submitted_at']),
       }));
+    },
+  };
+}
+
+/** The write half of GitHub's API, in the reference's own shapes. */
+export function githubWrites(client: ForgeClient, repository: Repository) {
+  const at = repoPath(repository);
+
+  return {
+    async createIssue(issue: NewIssue): Promise<ForgeIssue> {
+      const answer = await client.send({
+        method: 'POST',
+        path: `${at}/issues`,
+        body: {
+          title: issue.title,
+          ...(issue.body === undefined ? {} : { body: issue.body }),
+          ...(issue.labels === undefined ? {} : { labels: issue.labels }),
+          ...(issue.assignees === undefined ? {} : { assignees: issue.assignees }),
+        },
+      });
+      return issueFrom(object(answer.body));
+    },
+
+    async updateIssue(
+      n: number,
+      changes: IssueChanges,
+    ): Promise<{ issue: ForgeIssue; fields: string[] }> {
+      const body: Record<string, unknown> = { ...changes };
+      const answer = await client.send({
+        method: 'PATCH',
+        path: `${at}/issues/${String(n)}`,
+        body,
+      });
+      return { issue: issueFrom(object(answer.body)), fields: Object.keys(body).toSorted() };
+    },
+
+    async closeIssue(n: number): Promise<ForgeIssue> {
+      const answer = await client.send({
+        method: 'PATCH',
+        path: `${at}/issues/${String(n)}`,
+        body: { state: 'closed' },
+      });
+      return issueFrom(object(answer.body));
+    },
+
+    async commentOnIssue(n: number, body: string): Promise<{ url: string }> {
+      const answer = await client.send({
+        method: 'POST',
+        path: `${at}/issues/${String(n)}/comments`,
+        body: { body },
+      });
+      const raw = object(answer.body);
+      return { url: text(raw['html_url'], text(raw['url'])) };
+    },
+
+    async commentOnPull(n: number, body: string): Promise<{ url: string }> {
+      // A pull request's conversation is the issue's, on GitHub.
+      return this.commentOnIssue(n, body);
+    },
+
+    async addLabels(n: number, names: string[]): Promise<void> {
+      await client.send({
+        method: 'POST',
+        path: `${at}/issues/${String(n)}/labels`,
+        body: { labels: names },
+      });
+    },
+
+    async removeLabel(n: number, name: string): Promise<void> {
+      await client.send({
+        method: 'DELETE',
+        path: `${at}/issues/${String(n)}/labels/${labelSegment(name)}`,
+      });
+    },
+
+    async label(name: string): Promise<ForgeLabel | undefined> {
+      try {
+        const answer = await client.send({
+          method: 'GET',
+          path: `${at}/labels/${labelSegment(name)}`,
+        });
+        const raw = object(answer.body);
+        return {
+          name: text(raw['name']),
+          ...(typeof raw['color'] === 'string' ? { color: raw['color'] } : {}),
+          ...(typeof raw['description'] === 'string' ? { description: raw['description'] } : {}),
+        };
+      } catch (err) {
+        if (isNotFound(err)) {
+          return undefined;
+        }
+        throw err;
+      }
+    },
+
+    async createLabel(label: ForgeLabel): Promise<ForgeLabel> {
+      const answer = await client.send({
+        method: 'POST',
+        path: `${at}/labels`,
+        body: {
+          name: label.name,
+          // GitHub takes the colour without its hash.
+          color: (label.color ?? 'ededed').replace(/^#/, ''),
+          ...(label.description === undefined ? {} : { description: label.description }),
+        },
+      });
+      const raw = object(answer.body);
+      return {
+        name: text(raw['name'], label.name),
+        ...(typeof raw['color'] === 'string' ? { color: raw['color'] } : {}),
+        ...(typeof raw['description'] === 'string' ? { description: raw['description'] } : {}),
+      };
+    },
+
+    async createPull(pull: NewPullRequest): Promise<ForgePullRequest> {
+      const answer = await client.send({
+        method: 'POST',
+        path: `${at}/pulls`,
+        body: {
+          title: pull.title,
+          // Sent exactly as given, so owner:branch opens from a fork.
+          head: pull.head,
+          base: pull.base,
+          ...(pull.body === undefined ? {} : { body: pull.body }),
+          draft: pull.draft,
+        },
+      });
+      return pullFrom(object(answer.body));
     },
   };
 }

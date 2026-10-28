@@ -2,6 +2,12 @@ import type { ForgeClient } from './client.js';
 import type { Repository } from './target.js';
 import {
   type ForgeApi,
+  type ForgeLabel,
+  type IssueChanges,
+  type NewIssue,
+  type NewPullRequest,
+  isNotFound,
+  labelSegment,
   type ForgeChangedFile,
   type ForgeCheckRun,
   type ForgeComment,
@@ -114,6 +120,7 @@ export function gitlabApi(client: ForgeClient, repository: Repository): ForgeApi
   const at = projectPath(repository);
 
   return {
+    ...gitlabWrites(client, repository),
     async repository(): Promise<ForgeRepository> {
       const answer = await client.send({ method: 'GET', path: at });
       const raw = object(answer.body);
@@ -224,4 +231,166 @@ export function gitlabApi(client: ForgeClient, repository: Repository): ForgeApi
       }));
     },
   };
+}
+
+/** GitLab takes label sets as a comma-separated string. */
+const joined = (names: string[]) => names.join(',');
+
+/** The write half of GitLab's API, in the reference's own shapes. */
+export function gitlabWrites(client: ForgeClient, repository: Repository) {
+  const at = projectPath(repository);
+
+  return {
+    async createIssue(issue: NewIssue): Promise<ForgeIssue> {
+      const answer = await client.send({
+        method: 'POST',
+        path: `${at}/issues`,
+        body: {
+          title: issue.title,
+          ...(issue.body === undefined ? {} : { description: issue.body }),
+          ...(issue.labels === undefined ? {} : { labels: joined(issue.labels) }),
+          // GitLab takes user ids rather than names, so assignees are
+          // accepted and not sent, as the reference says.
+        },
+      });
+      return issueFrom(object(answer.body));
+    },
+
+    async updateIssue(
+      n: number,
+      changes: IssueChanges,
+    ): Promise<{ issue: ForgeIssue; fields: string[] }> {
+      const body: Record<string, unknown> = {};
+      const fields: string[] = [];
+      if (changes.title !== undefined) {
+        body['title'] = changes.title;
+        fields.push('title');
+      }
+      if (changes.body !== undefined) {
+        body['description'] = changes.body;
+        fields.push('body');
+      }
+      if (changes.state !== undefined) {
+        body['state_event'] = changes.state === 'closed' ? 'close' : 'reopen';
+        fields.push('state');
+      }
+      if (changes.labels !== undefined) {
+        body['labels'] = joined(changes.labels);
+        fields.push('labels');
+      }
+
+      const answer = await client.send({
+        method: 'PUT',
+        path: `${at}/issues/${String(n)}`,
+        body,
+      });
+      return { issue: issueFrom(object(answer.body)), fields: fields.toSorted() };
+    },
+
+    async closeIssue(n: number): Promise<ForgeIssue> {
+      const answer = await client.send({
+        method: 'PUT',
+        path: `${at}/issues/${String(n)}`,
+        body: { state_event: 'close' },
+      });
+      return issueFrom(object(answer.body));
+    },
+
+    async commentOnIssue(n: number, body: string): Promise<{ url: string }> {
+      const answer = await client.send({
+        method: 'POST',
+        path: `${at}/issues/${String(n)}/notes`,
+        body: { body },
+      });
+      return { url: noteUrl(answer.body, `${at}/issues/${String(n)}`) };
+    },
+
+    async commentOnPull(n: number, body: string): Promise<{ url: string }> {
+      const answer = await client.send({
+        method: 'POST',
+        path: `${at}/merge_requests/${String(n)}/notes`,
+        body: { body },
+      });
+      return { url: noteUrl(answer.body, `${at}/merge_requests/${String(n)}`) };
+    },
+
+    async addLabels(n: number, names: string[]): Promise<void> {
+      await client.send({
+        method: 'PUT',
+        path: `${at}/issues/${String(n)}`,
+        body: { add_labels: joined(names) },
+      });
+    },
+
+    async removeLabel(n: number, name: string): Promise<void> {
+      await client.send({
+        method: 'PUT',
+        path: `${at}/issues/${String(n)}`,
+        body: { remove_labels: name },
+      });
+    },
+
+    async label(name: string): Promise<ForgeLabel | undefined> {
+      try {
+        const answer = await client.send({
+          method: 'GET',
+          path: `${at}/labels/${labelSegment(name)}`,
+        });
+        const raw = object(answer.body);
+        return {
+          name: text(raw['name']),
+          ...(typeof raw['color'] === 'string' ? { color: raw['color'] } : {}),
+          ...(typeof raw['description'] === 'string' ? { description: raw['description'] } : {}),
+        };
+      } catch (err) {
+        if (isNotFound(err)) {
+          return undefined;
+        }
+        throw err;
+      }
+    },
+
+    async createLabel(label: ForgeLabel): Promise<ForgeLabel> {
+      const answer = await client.send({
+        method: 'POST',
+        path: `${at}/labels`,
+        body: {
+          name: label.name,
+          // GitLab takes the colour with its hash, GitHub without.
+          color: `#${(label.color ?? 'ededed').replace(/^#/, '')}`,
+          ...(label.description === undefined ? {} : { description: label.description }),
+        },
+      });
+      const raw = object(answer.body);
+      return {
+        name: text(raw['name'], label.name),
+        ...(typeof raw['color'] === 'string' ? { color: raw['color'] } : {}),
+        ...(typeof raw['description'] === 'string' ? { description: raw['description'] } : {}),
+      };
+    },
+
+    async createPull(pull: NewPullRequest): Promise<ForgePullRequest> {
+      const answer = await client.send({
+        method: 'POST',
+        path: `${at}/merge_requests`,
+        body: {
+          title: pull.title,
+          source_branch: pull.head,
+          target_branch: pull.base,
+          ...(pull.body === undefined ? {} : { description: pull.body }),
+          // GitLab has no draft flag of its own on a create; the
+          // title prefix is what marks one.
+          ...(pull.draft ? { title: `Draft: ${pull.title}` } : {}),
+        },
+      });
+      return mergeRequestFrom(object(answer.body));
+    },
+  };
+}
+
+/** A note has no URL of its own; its anchor on the thread is the nearest. */
+function noteUrl(body: unknown, thread: string): string {
+  const raw = object(body);
+  const id = number(raw['id']);
+  return text(raw['web_url'], id === 0 ? thread : `${thread}#note_${String(id)}`);
 }
