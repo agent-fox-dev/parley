@@ -57,7 +57,7 @@
         "src/sync/standard.ts",
         "src/sync/standard.integration.test.ts"
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 2,

@@ -147,6 +147,11 @@ export interface WorkspaceChanges {
   settings?: Record<string, unknown>;
   head_sha?: string | null;
   clone_error?: string | null;
+  /** What a sync leaves behind: where origin stands, when, and why not. */
+  upstream_head_sha?: string | null;
+  last_sync_at?: string | null;
+  sync_error?: string | null;
+  branch?: string | null;
 }
 
 export async function updateWorkspace(
