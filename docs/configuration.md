@@ -6,6 +6,7 @@ setting is absent.
 ## Contents
 
 - [Deployment settings](#deployment-settings)
+- [Bindings](#bindings)
 - [Local development](#local-development)
 
 ## Deployment settings
@@ -24,6 +25,32 @@ Set as Worker variables, in `wrangler.toml` or by the deployment.
 Neither `PARLEY_BUILD_TIME` nor `PARLEY_COMMIT` affects behaviour; a
 deployment that sets neither answers `GET /version` successfully with both
 as the empty string.
+
+## Bindings
+
+A variable is not enough on Cloudflare: the store and the repositories are
+bindings, and `wrangler.toml` must name them.
+
+| Binding     | What it is           | Without it                                                                                                                                                    |
+| ----------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DB`        | the D1 database      | Every route that touches data answers `500`, the schema migrations are skipped, and `GET /readyz` answers `503` — which is how a deployment says it has none. |
+| `ARTIFACTS` | the repository store | A workspace cannot be cloned; the rest of the service works.                                                                                                  |
+
+The D1 database is created once and bound by its id:
+
+```
+wrangler d1 create parley
+```
+
+```toml
+[[d1_databases]]
+binding = "DB"
+database_name = "parley"
+database_id = "<the id that command printed>"
+```
+
+The schema needs no separate step: both targets apply their migrations
+before serving a request.
 
 ## Signing in
 

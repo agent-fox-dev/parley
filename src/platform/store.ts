@@ -23,15 +23,18 @@ export interface RelationalStore {
 }
 
 /**
- * The store of a deployment that was configured with none. It answers the
- * readiness probe, because the service itself is up, and refuses every read
- * and write rather than pretending to hold data.
+ * The store of a deployment that was configured with none. It refuses
+ * every call, the readiness probe included: a deployment whose store
+ * binding is missing serves the liveness probe, the version and the
+ * landing page, and answers 500 to everything that touches data, so a
+ * readiness probe that stayed green through that would be the one
+ * place an operator looks and the one place they are told nothing.
  */
 const absent = () => Promise.reject(new Error('no relational store is configured'));
 
 export function noStore(): RelationalStore {
   return {
-    ping: () => Promise.resolve(),
+    ping: absent,
     all: absent,
     run: absent,
     batch: absent,

@@ -8,6 +8,13 @@ PARLEY_MOUNT_POINT = "/api/v1"
 PARLEY_BASE_URL = "https://parley.m-2d9.workers.dev"
 PARLEY_EXTERNAL_URL = "https://parley.m-2d9.workers.dev"
 
+# The relational store. Both targets apply the same migrations to it
+# before serving a request, so the schema is not deployed separately.
+[[d1_databases]]
+binding = "DB"
+database_name = "parley"
+database_id = "97feffdc-1277-47d1-ac27-007f30a1af3a"
+
 # One repository per workspace lives here. The binding offers the
 # repository lifecycle and object reads; refs and packs go over the git
 # remote with a token minted per repository (see docs/adr/06-what-cloudflare-artifacts-does-with-refs.md).
