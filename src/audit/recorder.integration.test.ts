@@ -1,4 +1,5 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -24,7 +25,7 @@ import {
   seedUser,
   seedWorkspace,
 } from '../testutil/identity.js';
-import { shapeOf } from './events_table.js';
+import { HUB_EVENTS, shapeOf } from './events_table.js';
 import { eventRecorder } from './recorder.js';
 
 /**
@@ -379,5 +380,87 @@ describe('a bound token that keeps being refused', () => {
     expect((JSON.parse(recorded[1]?.metadata ?? '{}') as { suppressed: number }).suppressed).toBe(
       0,
     );
+  });
+});
+
+/**
+ * No documented event left unemitted.
+ *
+ * The declaration is checked against the reference's own two tables,
+ * so a type the reference gains and nobody declares fails here; and
+ * every declared type whose operation this service performs is
+ * checked to have a call site, so a type nobody records fails too.
+ * The forge and sandbox types are the operations this service does
+ * not perform: they land with packages 13 and 14 and with a
+ * deployment that has a sandbox provider.
+ */
+/** The events whose operation belongs to a package not yet built. */
+const awaitingItsPackage = (type: string) =>
+  type.startsWith('hub.forge.') || type.startsWith('hub.sandbox.');
+
+describe('the event types the reference lists', () => {
+  const reference = readFileSync('docs/prd/api.md', 'utf8');
+  const tables = reference.slice(
+    reference.indexOf('## Hub Audit Events'),
+    reference.indexOf('## Audit Ingestion Endpoints'),
+  );
+
+  /** The types the reference names, with its shorthand rows expanded. */
+  function documented(): string[] {
+    const named = new Set<string>();
+    for (const line of tables.split('\n').filter((one) => one.startsWith('|'))) {
+      const cell = line.split('|')[1] ?? '';
+      const types = [...cell.matchAll(/`(hub\.[a-z_.]+)`/g)].map((match) => match[1] as string);
+      for (const type of types) {
+        named.add(type);
+      }
+      // A row may name one event and then its siblings by suffix
+      // alone, as the secret and variable rows do.
+      const [first] = types;
+      if (first !== undefined) {
+        const family = first.slice(0, first.lastIndexOf('.'));
+        for (const suffix of [...cell.matchAll(/`(\.[a-z_]+)`/g)].map(
+          (match) => match[1] as string,
+        )) {
+          named.add(`${family}${suffix}`);
+        }
+      }
+    }
+    return [...named];
+  }
+
+  it('are all declared, with nothing invented beside them', () => {
+    const declared = HUB_EVENTS.map((shape) => shape.type);
+
+    expect(documented().filter((type) => !declared.includes(type))).toEqual([]);
+    expect(declared.filter((type) => !documented().includes(type))).toEqual([]);
+  });
+
+  it('are each recorded by a production path, bar the ones awaiting their package', () => {
+    const sources = [
+      'src/routes',
+      'src/audit',
+      'src/git',
+      'src/auth',
+      'src/workspace',
+      'src/merge',
+      'src/rebuild',
+      'src/sync',
+      'src/patch',
+      'src/session',
+    ]
+      .flatMap((dir) =>
+        execFileSync('git', ['ls-files', dir], { encoding: 'utf8' })
+          .split('\n')
+          .filter((path) => path.endsWith('.ts') && !path.includes('.test.')),
+      )
+      .map((path) => readFileSync(path, 'utf8'))
+      .join('\n');
+
+    const unrecorded = HUB_EVENTS.map((shape) => shape.type)
+      .filter((type) => !awaitingItsPackage(type))
+      .filter((type) => !sources.includes(type));
+
+    expect(unrecorded).toEqual([]);
   });
 });

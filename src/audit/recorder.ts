@@ -67,7 +67,7 @@ export interface RecorderDeps {
 const REFUSAL_WINDOW_MS = 60_000;
 
 /** The actor an event carries when the caller is the one who acted. */
-export function actorOf(identity: Identity | undefined): Actor {
+function actorOf(identity: Identity | undefined): Actor {
   if (identity === undefined) {
     return { id: '', type: '' };
   }
@@ -259,23 +259,4 @@ export async function recordRefusal(
   } catch (err) {
     log?.error('a bound token refusal could not be recorded', err);
   }
-}
-
-/**
- * Which events a caller may be shown. A user sees the events of the
- * workspaces they can read; an event belonging to no workspace is the
- * deployment's own business and goes to admin tokens alone.
- */
-export function visibleEventClause(
-  identity: Identity | undefined,
-  readable: readonly string[],
-): { clause: string; params: string[] } {
-  if (identity?.kind === 'admin_token') {
-    return { clause: '1 = 1', params: [] };
-  }
-  if (readable.length === 0) {
-    return { clause: '1 = 0', params: [] };
-  }
-  const places = readable.map(() => '?').join(', ');
-  return { clause: `workspace IN (${places})`, params: [...readable] };
 }

@@ -3,8 +3,9 @@ import { type Service, MOUNT, as, identityService, withJson } from '../testutil/
 import { seedApiKey, seedBoundToken, seedUser, seedWorkspace } from '../testutil/identity.js';
 import { freshStore, seedClock } from '../testutil/identity.js';
 import { inMemoryMetrics } from '../platform/local/metrics.js';
+import { queryEvents } from './query.js';
 import type { EventRecorder } from './recorder.js';
-import { eventRecorder, visibleEventClause } from './recorder.js';
+import { eventRecorder } from './recorder.js';
 
 let service: Service;
 
@@ -207,19 +208,13 @@ describe('an event that belongs to no workspace', () => {
         metadata: { token_id: 'a-token', workspace: null, permissions: [], expires_at: null },
       });
 
-      const read = async (identity: Parameters<typeof visibleEventClause>[0]) => {
-        const { clause, params } = visibleEventClause(identity, ['mine']);
-        return seeded.store.all<{ event_type: string; workspace: string | null }>(
-          `SELECT event_type, workspace FROM hub_events WHERE ${clause}`,
-          params,
-        );
-      };
+      // Through the query the routes use, because the rule is about
+      // what a caller is shown and not about a clause.
+      const read = async (visible: string[] | 'every') =>
+        queryEvents(seeded.store, visible, {}, { limit: 50, order: 'desc' });
 
-      const asUser = await read({ kind: 'api_key', userId: 'u', permissions: [] });
-      const asAdmin = await read({ kind: 'admin_token', permissions: [] });
-
-      expect(asUser.map((one) => one.workspace)).toEqual(['mine']);
-      expect(asAdmin.map((one) => one.workspace).toSorted()).toEqual(['mine', null]);
+      expect((await read(['mine'])).map((one) => one.workspace)).toEqual(['mine']);
+      expect((await read('every')).map((one) => one.workspace).toSorted()).toEqual(['mine', null]);
     } finally {
       seeded.dispose();
     }

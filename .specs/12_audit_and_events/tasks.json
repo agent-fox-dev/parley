@@ -280,7 +280,7 @@
         "every event type the API reference lists is recorded by a production path, proved by test",
         "the audit, ingestion, transcript and stream routes answer as docs/prd/api.md specifies against a running deployment"
       ],
-      "state": "pending"
+      "state": "done"
     }
   ]
 }
