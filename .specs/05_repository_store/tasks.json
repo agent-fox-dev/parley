@@ -305,7 +305,7 @@
         "afc workspace create --wait reaches ready against a running deployment for a private repository",
         "the ADR recording the store's three capabilities exists and the code reads the capability report rather than repeating its conclusions"
       ],
-      "state": "pending"
+      "state": "done"
     }
   ]
 }
