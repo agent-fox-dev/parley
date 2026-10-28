@@ -22,6 +22,12 @@ export interface Identity {
 }
 
 export interface AuthOptions {
+  /**
+   * Whose browser session a presented value is, where it is one.
+   * The web interface reads the API as the person signed into it,
+   * and this is how the credential it presents is recognised.
+   */
+  sessions?: (value: string) => Promise<string | undefined>;
   store: RelationalStore;
   clock: Clock;
   /** The deployment's admin token, where one is configured. */
@@ -46,6 +52,22 @@ export function isIngressPath(path: string): boolean {
   return path.startsWith('/hooks/');
 }
 
+/**
+ * The web interface, which a person reaches with a browser session
+ * rather than a bearer credential. Its own routes decide what a
+ * visitor without one is shown.
+ */
+export function isWebPath(path: string): boolean {
+  return (
+    path === '/' ||
+    path === '/dashboard' ||
+    path === '/signout' ||
+    path.startsWith('/web/') ||
+    path.startsWith('/signin') ||
+    path.startsWith('/workspaces/')
+  );
+}
+
 export function isGitPath(path: string): boolean {
   return path === '/git' || path.startsWith('/git/');
 }
@@ -67,7 +89,12 @@ export function isPublicPath(path: string, mountPoint: string): boolean {
 export function authentication(options: AuthOptions): MiddlewareHandler {
   return async (c, next) => {
     const path = new URL(c.req.url).pathname;
-    if (!isPublicPath(path, options.mountPoint) && !isGitPath(path) && !isIngressPath(path)) {
+    if (
+      !isPublicPath(path, options.mountPoint) &&
+      !isGitPath(path) &&
+      !isIngressPath(path) &&
+      !isWebPath(path)
+    ) {
       const identity = await identifyCredential(c.req.header('authorization'), options);
       if (identity === undefined) {
         record(options.log, c, 401);
@@ -122,6 +149,16 @@ export async function identifyCredential(
 
   if (options.adminToken !== undefined && sameDigest(presented, options.adminToken)) {
     return { kind: 'admin_token', permissions: [] };
+  }
+
+  // A browser's session is a credential of the person signed in,
+  // holding what their own key would hold and bound to nothing.
+  const session = await options.sessions?.(presented);
+  if (session !== undefined) {
+    const person = await findUser(options.store, session);
+    return person === undefined || person.status === 'blocked'
+      ? undefined
+      : { kind: 'web_session', userId: person.id, permissions: [] };
   }
 
   const parsed = parseCredential(presented);

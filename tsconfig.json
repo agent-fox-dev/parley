@@ -13,7 +13,9 @@
     "isolatedModules": true,
     "verbatimModuleSyntax": true,
     "forceConsistentCasingInFileNames": true,
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    "jsx": "react-jsx",
+    "jsxImportSource": "hono/jsx"
   },
-  "include": ["src/**/*.ts", "conformance/**/*.ts", "*.config.ts"]
+  "include": ["src/**/*.ts", "conformance/**/*.ts", "web/**/*.ts", "web/**/*.tsx", "*.config.ts"]
 }

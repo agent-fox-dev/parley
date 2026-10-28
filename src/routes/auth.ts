@@ -60,8 +60,8 @@ function checkedRedirect(provider: OAuthProvider, body: Record<string, unknown>)
  * with their personal organization. A username another identity already
  * holds is a conflict, not a silent takeover.
  */
-async function signedInUser(
-  config: AuthRouteConfig,
+export async function signedInUser(
+  config: { store: RelationalStore },
   identity: ProviderIdentity,
   now: Date,
 ): Promise<UserRecord> {

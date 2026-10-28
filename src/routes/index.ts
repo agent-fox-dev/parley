@@ -1,4 +1,4 @@
-import type { RouteDefinition } from '../http/router.js';
+import type { AppHolder, RouteDefinition } from '../http/router.js';
 import type { ProviderDirectory } from '../auth/oauth.js';
 import type { Clock, EventBus, Locks, MetricsSink, RelationalStore } from '../platform/index.js';
 import type { SecretStore } from '../platform/secrets.js';
@@ -37,6 +37,8 @@ import { forgeWriteRoutes } from './forge_writes.js';
 import { webhookRoutes } from './webhook.js';
 import { deliveryRoutes } from './deliveries.js';
 import { ingressRoutes } from './ingress.js';
+import { webRoutes } from './web.js';
+import { webAuthRoutes } from './web_auth.js';
 import { lastDeliveryAt } from '../webhook/log.js';
 import { eventStreamRoutes } from './events_stream.js';
 import { rebaseRoutes } from './rebase.js';
@@ -70,6 +72,8 @@ export interface ServiceRouteConfig {
   adminToken?: string;
   /** What the service makes of each ref of a git push. */
   decideRef?: Decider;
+  /** Where the built application appears, for the pages that read it. */
+  appHolder?: AppHolder;
   /** Where the routes write down what they did. */
   events?: EventRecorder;
   /** Where a recorded event is published for the streams watching. */
@@ -85,6 +89,21 @@ export interface ServiceRouteConfig {
  */
 export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
   return [
+    // The web interface, at the server root: a person types an
+    // address, and /api/v1 has no business in it.
+    ...webAuthRoutes({
+      mountPoint: config.mountPoint,
+      store: config.store,
+      clock: config.clock,
+      providers: config.providers,
+    }),
+    ...webRoutes({
+      store: config.store,
+      clock: config.clock,
+      providers: config.providers,
+      mountPoint: config.mountPoint,
+      ...(config.appHolder === undefined ? {} : { holder: config.appHolder }),
+    }),
     // At the server root, like the git routes: a forge is given this
     // address to post to.
     ...ingressRoutes({

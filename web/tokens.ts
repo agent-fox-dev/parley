@@ -1,0 +1,359 @@
+/**
+ * The one place the interface decides what anything looks like.
+ *
+ * It is TypeScript rather than a `.css` file because the Worker
+ * target has no file system to read one from and no bundler to
+ * inline it: the stylesheet is served by a route, from here (ADR
+ * 13). Every page draws its type, its spacing and its colours from
+ * these custom properties — a literal in a page is a value that
+ * drifts from the rest of the interface the first time anybody
+ * changes it.
+ */
+export const TOKENS = `/*
+ * The one place the interface decides what anything looks like.
+ *
+ * Every page draws its type, its spacing and its colours from these
+ * custom properties: a literal in a page's style is a value that
+ * will drift from the rest of the interface the first time anybody
+ * changes it. The scale and the density follow GitHub's and GitHub
+ * Copilot's, which is the visual language this audience reads
+ * fluently; the names and the marks are Parley's own.
+ */
+:root {
+  /* The type scale, in rem, as GitHub sets it. */
+  --text-xs: 0.75rem;
+  --text-sm: 0.875rem;
+  --text-base: 1rem;
+  --text-lg: 1.25rem;
+  --text-xl: 1.5rem;
+  --text-2xl: 2rem;
+
+  --leading-tight: 1.25;
+  --leading-normal: 1.5;
+
+  --weight-normal: 400;
+  --weight-medium: 500;
+  --weight-bold: 600;
+
+  /* The spacing scale, in multiples of four pixels. */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2rem;
+  --space-8: 3rem;
+
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 12px;
+
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+
+  --page-width: 1012px;
+
+  /* The light palette. */
+  --canvas: #ffffff;
+  --canvas-inset: #f6f8fa;
+  --surface: #ffffff;
+  --border: #d1d9e0;
+  --border-muted: #d8dee4;
+  --fg: #1f2328;
+  --fg-muted: #59636e;
+  --accent-fg: #0550ae;
+  --accent-emphasis: #0969da;
+  --success-fg: #1a7f37;
+  --success-emphasis: #1f883d;
+  --attention-fg: #9a6700;
+  --attention-emphasis: #bf8700;
+  --danger-fg: #cf222e;
+  --danger-emphasis: #d1242f;
+  --on-emphasis: #ffffff;
+}
+
+/* The dark palette, for a viewer whose system asks for one. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --canvas: #0d1117;
+    --canvas-inset: #010409;
+    --surface: #151b23;
+    --border: #3d444d;
+    --border-muted: #2f3742;
+    --fg: #f0f6fc;
+    --fg-muted: #9198a1;
+    --accent-fg: #4493f8;
+    --accent-emphasis: #1f6feb;
+    --success-fg: #3fb950;
+    --success-emphasis: #238636;
+    --attention-fg: #d29922;
+    --attention-emphasis: #9e6a03;
+    --danger-fg: #f85149;
+    --danger-emphasis: #da3633;
+    --on-emphasis: #ffffff;
+  }
+}
+
+/* And for one who asked for it outright. */
+:root[data-theme='dark'] {
+  --canvas: #0d1117;
+  --canvas-inset: #010409;
+  --surface: #151b23;
+  --border: #3d444d;
+  --border-muted: #2f3742;
+  --fg: #f0f6fc;
+  --fg-muted: #9198a1;
+  --accent-fg: #4493f8;
+  --accent-emphasis: #1f6feb;
+  --success-fg: #3fb950;
+  --success-emphasis: #238636;
+  --attention-fg: #d29922;
+  --attention-emphasis: #9e6a03;
+  --danger-fg: #f85149;
+  --danger-emphasis: #da3633;
+  --on-emphasis: #ffffff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--canvas);
+  color: var(--fg);
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+  line-height: var(--leading-normal);
+}
+
+/* Nothing is wider than the viewport, whatever a slug is called. */
+.page {
+  max-width: var(--page-width);
+  margin: 0 auto;
+  padding: var(--space-5) var(--space-4);
+}
+
+a {
+  color: var(--accent-fg);
+}
+
+a:focus-visible,
+button:focus-visible,
+summary:focus-visible {
+  outline: 2px solid var(--accent-emphasis);
+  outline-offset: 2px;
+}
+
+h1 {
+  font-size: var(--text-2xl);
+  line-height: var(--leading-tight);
+  margin: 0 0 var(--space-4);
+}
+
+h2 {
+  font-size: var(--text-xl);
+  line-height: var(--leading-tight);
+  margin: var(--space-6) 0 var(--space-3);
+}
+
+h3 {
+  font-size: var(--text-lg);
+  margin: var(--space-4) 0 var(--space-2);
+}
+
+p {
+  margin: 0 0 var(--space-3);
+}
+
+code,
+.mono {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+}
+
+/* The site's own header and footer. */
+.masthead {
+  border-bottom: 1px solid var(--border);
+  background: var(--canvas-inset);
+}
+
+.masthead .page {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  padding-top: var(--space-3);
+  padding-bottom: var(--space-3);
+  flex-wrap: wrap;
+}
+
+.wordmark {
+  font-weight: var(--weight-bold);
+  font-size: var(--text-lg);
+  color: var(--fg);
+  text-decoration: none;
+}
+
+.footer {
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+  border-top: 1px solid var(--border);
+  margin-top: var(--space-8);
+}
+
+/* The repository list: one row per workspace, as GitHub lists repos. */
+.repo-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.repo-list > li {
+  padding: var(--space-3) var(--space-4);
+  border-top: 1px solid var(--border-muted);
+  background: var(--surface);
+}
+
+.repo-list > li:first-child {
+  border-top: 0;
+}
+
+.repo-list .repo-name {
+  font-size: var(--text-base);
+  font-weight: var(--weight-bold);
+  overflow-wrap: anywhere;
+}
+
+.repo-list .repo-meta {
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+  display: flex;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+  margin-top: var(--space-1);
+}
+
+/* The status badge. */
+.badge {
+  display: inline-block;
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: 2em;
+  font-size: var(--text-xs);
+  line-height: 1.8;
+  font-weight: var(--weight-medium);
+  color: var(--fg-muted);
+  white-space: nowrap;
+}
+
+.badge-success {
+  color: var(--success-fg);
+  border-color: var(--success-fg);
+}
+
+.badge-attention {
+  color: var(--attention-fg);
+  border-color: var(--attention-fg);
+}
+
+.badge-danger {
+  color: var(--danger-fg);
+  border-color: var(--danger-fg);
+}
+
+/* The timeline, for events and jobs. */
+.timeline {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 0 var(--space-4);
+  border-left: 2px solid var(--border);
+}
+
+.timeline > li {
+  position: relative;
+  padding: 0 0 var(--space-4) var(--space-4);
+}
+
+.timeline > li::before {
+  content: '';
+  position: absolute;
+  left: calc(-1 * var(--space-4) - 5px);
+  top: var(--space-1);
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--border);
+}
+
+.timeline .when {
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+}
+
+/* Definition grids, for a workspace's fields. */
+.fields {
+  display: grid;
+  grid-template-columns: minmax(8rem, max-content) 1fr;
+  gap: var(--space-2) var(--space-4);
+  margin: 0;
+}
+
+.fields dt {
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+}
+
+.fields dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.notice {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--attention-emphasis);
+  border-radius: var(--radius-sm);
+  padding: var(--space-3) var(--space-4);
+  background: var(--surface);
+}
+
+.notice-danger {
+  border-left-color: var(--danger-emphasis);
+}
+
+.empty {
+  color: var(--fg-muted);
+  padding: var(--space-6) var(--space-4);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-md);
+  text-align: center;
+}
+
+.button {
+  display: inline-block;
+  padding: var(--space-2) var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--success-emphasis);
+  color: var(--on-emphasis);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.button-plain {
+  background: var(--surface);
+  color: var(--fg);
+}
+
+@media (max-width: 480px) {
+  .fields {
+    grid-template-columns: 1fr;
+    gap: var(--space-1) 0;
+  }
+}
+`;
