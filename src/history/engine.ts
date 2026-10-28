@@ -1,6 +1,7 @@
 import git from 'isomorphic-git';
 import type { RefChange, RepositoryStore } from '../platform/repostore.js';
 import { type FsLike, hydrate, storeBackedFs } from './adapter.js';
+import type { ResolutionStore } from './resolutions.js';
 
 export interface Identity {
   name: string;
@@ -199,6 +200,7 @@ async function commitsNotIn(
 async function mergeOverBase(
   options: { fs: never; gitdir: string },
   oids: { base: string; ours: string; theirs: string },
+  replay?: MergeDriver,
 ): Promise<MergeResult> {
   const treeOf = async (oid: string) => (await git.readCommit({ ...options, oid })).commit.tree;
 
@@ -229,6 +231,7 @@ async function mergeOverBase(
       author: ENGINE,
       committer: ENGINE,
       message: 'replay',
+      ...(replay === undefined ? {} : { mergeDriver: replay }),
     });
     return { tree: merged.tree ?? (await treeOf(merged.oid ?? '')) };
   } catch (err) {
@@ -240,7 +243,49 @@ async function mergeOverBase(
   }
 }
 
-export function historyEngine(repos: RepositoryStore): HistoryEngine {
+/**
+ * What the library asks when a path needs merging. The three contents
+ * arrive in the order base, ours, theirs.
+ */
+type MergeDriver = (args: {
+  branches: string[];
+  contents: string[];
+  path: string;
+}) => Promise<{ cleanMerge: boolean; mergedText: string }>;
+
+export interface EngineDeps {
+  /** Where resolutions are remembered, when the deployment keeps them. */
+  resolutions?: ResolutionStore;
+}
+
+export function historyEngine(repos: RepositoryStore, deps: EngineDeps = {}): HistoryEngine {
+  /**
+   * Replays what was recorded for a conflict, so an operation that met
+   * it before does not stop at it again. A path with nothing recorded
+   * is merged as it would have been.
+   */
+  function replayFor(repository: string): MergeDriver | undefined {
+    const resolutions = deps.resolutions;
+    if (resolutions === undefined) {
+      return undefined;
+    }
+    return async ({ contents, path }) => {
+      const [base, ours, theirs] = contents;
+      const recorded = await resolutions.replay(repository, {
+        path,
+        base: base ?? '',
+        ours: ours ?? '',
+        theirs: theirs ?? '',
+      });
+      if (recorded !== undefined) {
+        return { cleanMerge: true, mergedText: recorded };
+      }
+      // Nothing recorded: let the library merge it as it always would,
+      // which it does by taking the driver's refusal.
+      return { cleanMerge: false, mergedText: ours ?? '' };
+    };
+  }
+
   return {
     /**
      * The merged tree of two commits over their merge base, computed
@@ -249,50 +294,36 @@ export function historyEngine(repos: RepositoryStore): HistoryEngine {
      */
     async threeWayMerge(request): Promise<MergeResult> {
       const session = await open(repos, request.repository);
-      const { fs, gitdir } = session;
-      await git.writeRef({
-        fs: fs as never,
-        gitdir,
-        ref: TEMP_OURS,
-        value: request.ours,
-        force: true,
-      });
-      await git.writeRef({
-        fs: fs as never,
-        gitdir,
-        ref: TEMP_THEIRS,
-        value: request.theirs,
-        force: true,
-      });
+      const options = { fs: session.fs as never, gitdir: session.gitdir };
 
-      try {
-        const merged = await git.merge({
-          fs: fs as never,
-          gitdir,
-          ours: TEMP_OURS,
-          theirs: TEMP_THEIRS,
-          noUpdateBranch: true,
+      const merged = await mergeOverBase(
+        options,
+        {
+          base: await mergeBaseOf(options, request.ours, request.theirs),
+          ours: request.ours,
+          theirs: request.theirs,
+        },
+        replayFor(request.repository),
+      );
+      if (merged.conflicts !== undefined) {
+        return { conflicts: merged.conflicts };
+      }
+
+      // The merged tree goes back to the store under a commit, so the
+      // caller can read it: an object nothing points at is one the
+      // store may drop.
+      const holder = await git.writeCommit({
+        ...options,
+        commit: {
+          tree: merged.tree ?? '',
+          parent: [request.ours, request.theirs],
           author: ENGINE,
           committer: ENGINE,
           message: 'three-way merge',
-        });
-
-        // The merged tree is handed back to the store with a ref on the
-        // commit that holds it, so the caller can read it.
-        const oid = merged.oid;
-        await session.flush(
-          oid === undefined
-            ? []
-            : [{ name: MERGE_RESULT_REF, oldOid: null, newOid: oid, force: true }],
-        );
-        return { tree: merged.tree ?? oid };
-      } catch (err) {
-        const conflicts = conflictingPaths(err);
-        if (conflicts === undefined) {
-          throw err;
-        }
-        return { conflicts };
-      }
+        },
+      });
+      await session.flush([{ name: MERGE_RESULT_REF, oldOid: null, newOid: holder, force: true }]);
+      return { tree: merged.tree };
     },
 
     /**
@@ -324,7 +355,11 @@ export function historyEngine(repos: RepositoryStore): HistoryEngine {
         // The change this commit made, replayed on what the rebase has
         // built so far: its own parent is the base of the merge between
         // it and the new parent.
-        const merged = await mergeOverBase(options, { base, ours: parent, theirs: oid });
+        const merged = await mergeOverBase(
+          options,
+          { base, ours: parent, theirs: oid },
+          replayFor(request.repository),
+        );
         if (merged.conflicts !== undefined) {
           return { conflicts: merged.conflicts, stoppedAt: oid, commits: written };
         }
@@ -370,11 +405,15 @@ export function historyEngine(repos: RepositoryStore): HistoryEngine {
       const { fs, gitdir } = session;
       const options = { fs: fs as never, gitdir };
 
-      const merged = await mergeOverBase(options, {
-        base: await mergeBaseOf(options, request.ours, request.theirs),
-        ours: request.ours,
-        theirs: request.theirs,
-      });
+      const merged = await mergeOverBase(
+        options,
+        {
+          base: await mergeBaseOf(options, request.ours, request.theirs),
+          ours: request.ours,
+          theirs: request.theirs,
+        },
+        replayFor(request.repository),
+      );
       if (merged.conflicts !== undefined) {
         return { conflicts: merged.conflicts };
       }
