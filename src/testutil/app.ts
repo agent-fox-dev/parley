@@ -69,6 +69,8 @@ export async function identityService(
     events?: EventRecorder | 'raising';
     /** How many event streams the service will serve at once. */
     streamLimit?: number;
+    /** Where the provider writes down each exchange it was asked for. */
+    asked?: Array<{ code: string; redirectUri?: string }>;
   } = {},
 ): Promise<Service> {
   const seeded = await freshStore();
@@ -99,6 +101,7 @@ export async function identityService(
         clock,
         metrics: inMemoryMetrics(),
         providers: stubDirectory({
+          ...(options.asked === undefined ? {} : { asked: options.asked }),
           codes: {
             'a-code': providerIdentity(),
             'b-code': providerIdentity({ username: 'bob', provider_id: '67890' }),

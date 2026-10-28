@@ -1,3 +1,4 @@
+import { USER_AGENT } from '../config.js';
 import { HttpError } from '../http/errors.js';
 import type { ConfigSource } from '../platform/index.js';
 
@@ -64,7 +65,11 @@ export function githubProvider(settings: GithubSettings): OAuthProvider {
     async exchange(code: string, redirectUri?: string): Promise<ProviderIdentity> {
       const exchanged = await fetch(settings.tokenUrl, {
         method: 'POST',
-        headers: { accept: 'application/json', 'content-type': 'application/json' },
+        headers: {
+          accept: 'application/json',
+          'content-type': 'application/json',
+          'user-agent': USER_AGENT,
+        },
         body: JSON.stringify({
           client_id: settings.clientId,
           client_secret: settings.clientSecret,
@@ -78,11 +83,25 @@ export function githubProvider(settings: GithubSettings): OAuthProvider {
         throw new HttpError(401, 'the authorization code is invalid or expired');
       }
 
+      // GitHub's API answers 403 to a request that does not introduce
+      // itself, and neither Node nor a Worker sets a User-Agent of its
+      // own, so every call here says who is calling.
       const profiled = await fetch(settings.profileUrl, {
-        headers: { accept: 'application/json', authorization: `Bearer ${granted.access_token}` },
+        headers: {
+          accept: 'application/json',
+          authorization: `Bearer ${granted.access_token}`,
+          'user-agent': USER_AGENT,
+        },
       });
       if (!profiled.ok) {
-        throw new HttpError(401, 'the authorization code is invalid or expired');
+        // The code was good enough to be exchanged, so this is the
+        // provider failing rather than the person's sign-in: saying
+        // "invalid code" here sends an operator to the wrong place.
+        throw new HttpError(
+          502,
+          'the provider would not say who is signing in',
+          'provider_unavailable',
+        );
       }
 
       const profile = (await profiled.json()) as Record<string, unknown>;

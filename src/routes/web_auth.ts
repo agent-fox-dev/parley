@@ -33,6 +33,17 @@ function overTls(c: Context): boolean {
   return url.protocol === 'https:' || c.req.header('x-forwarded-proto') === 'https';
 }
 
+/**
+ * Where the provider sends the browser back to. It is sent twice — to
+ * the authorize endpoint and again with the code — and a provider that
+ * holds a code to the address it was issued for, as the standard
+ * requires of one, refuses an exchange that names a different address
+ * or none.
+ */
+function callbackUrl(c: Context, provider: string): string {
+  return new URL(`/signin/${provider}/callback`, c.req.url).href;
+}
+
 function seeOther(location: string, cookie?: string): Response {
   return new Response(null, {
     status: 302,
@@ -47,9 +58,8 @@ async function begin(c: Context, config: WebAuthConfig): Promise<Response> {
   }
   // The provider's own authorize URL, with this deployment's
   // callback as the place to come back to.
-  const back = new URL('/signin/' + provider.name + '/callback', c.req.url).href;
   const sent = new URL(provider.authorizeUrl);
-  sent.searchParams.set('redirect_uri', back);
+  sent.searchParams.set('redirect_uri', callbackUrl(c, provider.name));
   return Promise.resolve(seeOther(sent.href));
 }
 
@@ -65,7 +75,7 @@ async function complete(c: Context, config: WebAuthConfig): Promise<Response> {
 
   // The same exchange and the same person the API would find — and
   // nothing else: no key is issued and none is revoked.
-  const identity = await provider.exchange(code);
+  const identity = await provider.exchange(code, callbackUrl(c, provider.name));
   const user = await signedInUser({ store: config.store }, identity, config.clock.now());
 
   const session = await openSession(config.store, config.clock, user.id);
