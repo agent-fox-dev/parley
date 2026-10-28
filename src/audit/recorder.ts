@@ -2,7 +2,7 @@ import type { Context } from 'hono';
 import { newIdentifier } from '../auth/credentials.js';
 import { type Identity, identityOf } from '../auth/middleware.js';
 import type { LogSink } from '../http/router.js';
-import type { Clock, MetricsSink, RelationalStore } from '../platform/index.js';
+import type { Clock, EventBus, MetricsSink, RelationalStore } from '../platform/index.js';
 import { shapeOf } from './events_table.js';
 
 /**
@@ -59,6 +59,8 @@ export interface RecorderDeps {
   clock: Clock;
   metrics?: MetricsSink;
   log?: LogSink;
+  /** Where a recorded event is published for the streams watching. */
+  bus?: EventBus;
 }
 
 /** How long one bound token's refusal event stands for the rest. */
@@ -129,6 +131,17 @@ export function eventRecorder(deps: RecorderDeps): EventRecorder {
       ],
     );
     counted(event.type);
+
+    // Published after it is stored, so a stream never carries an
+    // event a reader of the log could not then find.
+    await deps.bus?.publish({
+      id,
+      event_type: event.type,
+      source: 'hub',
+      timestamp: at,
+      workspace: event.workspace ?? null,
+      severity: event.severity ?? 'info',
+    });
   }
 
   return {

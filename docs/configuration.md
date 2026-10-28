@@ -42,9 +42,10 @@ empty and `POST /api/v1/auth/callback` refuses every provider name.
 
 ## Limits
 
-| Setting              | Default         | Description                                                                                                                                 |
-| -------------------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| maximum request body | 1,048,576 bytes | A request whose body exceeds it is answered `413` in the error envelope before any route handler runs. Set it with `PARLEY_MAX_BODY_BYTES`. |
+| Setting                  | Default         | Description                                                                                                                                                       |
+| ------------------------ | --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| maximum request body     | 1,048,576 bytes | A request whose body exceeds it is answered `413` in the error envelope before any route handler runs. Set it with `PARLEY_MAX_BODY_BYTES`.                       |
+| concurrent event streams | 100             | How many [event streams](api.md#the-live-event-stream) one component serves at once; the next connection is answered `503`. Set it with `AF_SSE_MAX_CONNECTIONS`. |
 
 ## The second target
 

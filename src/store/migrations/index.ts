@@ -443,6 +443,25 @@ export const MIGRATIONS: readonly Migration[] = [
        )`,
     ],
   },
+  {
+    // How a recorded event reaches the streams watching for it. A row
+    // is a delivery rather than a record: the log is hub_events and
+    // run_events, and these are swept once no stream could want them.
+    name: '016_event_bus',
+    statements: [
+      `CREATE TABLE event_bus (
+         id TEXT PRIMARY KEY,
+         event_id TEXT NOT NULL,
+         event_type TEXT NOT NULL,
+         source TEXT NOT NULL,
+         timestamp TEXT NOT NULL,
+         workspace TEXT,
+         severity TEXT NOT NULL DEFAULT 'info',
+         published_at TEXT NOT NULL
+       )`,
+      'CREATE INDEX event_bus_by_published ON event_bus (published_at, id)',
+    ],
+  },
 ];
 
 /**

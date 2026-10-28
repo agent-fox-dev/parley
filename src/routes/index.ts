@@ -1,6 +1,6 @@
 import type { RouteDefinition } from '../http/router.js';
 import type { ProviderDirectory } from '../auth/oauth.js';
-import type { Clock, Locks, MetricsSink, RelationalStore } from '../platform/index.js';
+import type { Clock, EventBus, Locks, MetricsSink, RelationalStore } from '../platform/index.js';
 import type { SecretStore } from '../platform/secrets.js';
 import type { RepositoryStore } from '../platform/repostore.js';
 import type { JobQueue } from '../platform/jobs.js';
@@ -31,6 +31,7 @@ import { postmortemRoutes } from './postmortem.js';
 import { runReadRoutes } from './run_reads.js';
 import { auditQueryRoutes } from './audit_query.js';
 import { transcriptRoutes } from './transcript.js';
+import { eventStreamRoutes } from './events_stream.js';
 import { rebaseRoutes } from './rebase.js';
 import { tokenPermissionRoutes } from './token_permissions.js';
 import { tokenRoutes } from './tokens.js';
@@ -64,6 +65,10 @@ export interface ServiceRouteConfig {
   decideRef?: Decider;
   /** Where the routes write down what they did. */
   events?: EventRecorder;
+  /** Where a recorded event is published for the streams watching. */
+  bus?: EventBus;
+  /** How many event streams this deployment serves at once. */
+  streamLimit?: number;
 }
 
 /**
@@ -135,6 +140,16 @@ export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
       locks: config.locks,
       ...(config.repos === undefined ? {} : { repos: config.repos }),
     }),
+    ...(config.bus === undefined
+      ? []
+      : eventStreamRoutes({
+          mountPoint: config.mountPoint,
+          store: config.store,
+          clock: config.clock,
+          bus: config.bus,
+          metrics: config.metrics,
+          ...(config.streamLimit === undefined ? {} : { limit: config.streamLimit }),
+        })),
     ...transcriptRoutes({
       mountPoint: config.mountPoint,
       store: config.store,
@@ -159,6 +174,7 @@ export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
       mountPoint: config.mountPoint,
       store: config.store,
       clock: config.clock,
+      ...(config.bus === undefined ? {} : { bus: config.bus }),
     }),
     ...costRoutes({
       mountPoint: config.mountPoint,

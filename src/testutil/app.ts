@@ -6,6 +6,7 @@ import { serviceRoutes } from '../routes/index.js';
 import { deploymentKey, openWith, sealWith, sealedSecrets } from '../secrets/store.js';
 import { storeLocks } from '../platform/store_lock.js';
 import { storeJobs } from '../platform/store_jobs.js';
+import { storeBus } from '../platform/store_bus.js';
 import type { Locks } from '../platform/lock.js';
 import type { SecretStore } from '../platform/secrets.js';
 import type { RepositoryStore } from '../platform/repostore.js';
@@ -65,6 +66,8 @@ export async function identityService(
     clock?: 'fixed' | 'ticking';
     /** A recorder of the suite's own, or 'raising' for one that fails. */
     events?: EventRecorder | 'raising';
+    /** How many event streams the service will serve at once. */
+    streamLimit?: number;
   } = {},
 ): Promise<Service> {
   const seeded = await freshStore();
@@ -75,13 +78,14 @@ export async function identityService(
   // The same locks the routes hold, so a suite can hold one itself.
   const locks = storeLocks(seeded.store, clock);
   const jobs = options.jobs === 'store' ? storeJobs(seeded.store, clock) : options.jobs;
+  const bus = storeBus(seeded.store, clock);
   const events: EventRecorder =
     options.events === 'raising'
       ? {
           record: () => Promise.reject(new Error('the recorder is broken')),
           refusal: () => Promise.reject(new Error('the recorder is broken')),
         }
-      : (options.events ?? eventRecorder({ store: seeded.store, clock }));
+      : (options.events ?? eventRecorder({ store: seeded.store, clock, bus }));
   const app = buildApp({
     routes: [
       ...serviceRoutes({
@@ -102,6 +106,8 @@ export async function identityService(
         adminToken: ADMIN_TOKEN,
         ...(options.decideRef === undefined ? {} : { decideRef: options.decideRef }),
         events,
+        bus,
+        ...(options.streamLimit === undefined ? {} : { streamLimit: options.streamLimit }),
       }),
       ...extra,
     ],

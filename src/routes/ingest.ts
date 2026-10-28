@@ -2,7 +2,7 @@ import type { Context } from 'hono';
 import { HttpError } from '../http/errors.js';
 import { jsonResponse } from '../http/json.js';
 import type { RouteDefinition } from '../http/router.js';
-import type { Clock, RelationalStore } from '../platform/index.js';
+import type { Clock, EventBus, RelationalStore } from '../platform/index.js';
 import { identityOf } from '../auth/middleware.js';
 import { accessLevel } from '../workspace/access.js';
 import { findWorkspace } from '../store/workspaces.js';
@@ -29,6 +29,32 @@ export interface IngestRouteConfig {
   mountPoint: string;
   store: RelationalStore;
   clock: Clock;
+  /** Where an ingested event is published for the streams watching. */
+  bus?: EventBus;
+}
+
+/**
+ * An agent's audit events reach the stream as the hub's own do. The
+ * other four kinds are a run's detail rather than events, and the
+ * reference streams neither of them.
+ */
+async function publishIngested(
+  config: IngestRouteConfig,
+  kind: RecordKind,
+  slug: string,
+  record: { id: string; at: string; values: Record<string, unknown> },
+): Promise<void> {
+  if (kind !== 'events' || config.bus === undefined) {
+    return;
+  }
+  await config.bus.publish({
+    id: record.id,
+    event_type: String(record.values['event_type'] ?? ''),
+    source: 'agent',
+    timestamp: record.at,
+    workspace: slug,
+    severity: String(record.values['severity'] ?? 'info'),
+  });
 }
 
 /** How many items one batch may carry. */
@@ -68,6 +94,9 @@ async function ingestOne(
   });
 
   const outcome = await storeRecord(config.store, kind, record);
+  if (outcome === 'stored') {
+    await publishIngested(config, kind, slug, record);
+  }
   return jsonResponse(
     await identityOfRecord(config.store, kind, record.id),
     outcome === 'stored' ? 201 : 200,
@@ -107,6 +136,7 @@ async function ingestBatch(
       const outcome = await storeRecord(config.store, kind, record);
       if (outcome === 'stored') {
         accepted += 1;
+        await publishIngested(config, kind, slug, record);
       } else {
         duplicates += 1;
       }
