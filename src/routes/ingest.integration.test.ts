@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { type Service, MOUNT, identityService, withJson } from '../testutil/app.js';
+import { type Service, MOUNT, as, identityService, withJson } from '../testutil/app.js';
 import { seedApiKey, seedUser, seedWorkspace } from '../testutil/identity.js';
 
 /**
@@ -26,19 +26,26 @@ const path = (route: string) => `${MOUNT}/workspaces/mine/runs/${RUN}/${route}`;
 
 /** The five kinds, with a body and the table each lands in. */
 const KINDS = [
-  ['events', { id: 'r-1', event_type: 'session.start' }, 'run_events'],
+  ['events', { id: 'r-1', event_type: 'session.start' }, 'run_events', 'events'],
   [
     'sessions/outcomes',
     { id: 'r-2', session_id: 's-1', status: 'completed', duration_ms: 12 },
     'run_session_outcomes',
+    'outcomes',
   ],
-  ['tools/calls', { id: 'r-3', tool_name: 'bash', input: { cmd: 'ls' } }, 'run_tool_calls'],
+  [
+    'tools/calls',
+    { id: 'r-3', tool_name: 'bash', input: { cmd: 'ls' } },
+    'run_tool_calls',
+    'calls',
+  ],
   [
     'tools/errors',
     { id: 'r-4', tool_name: 'bash', error_code: 'E1', error_msg: 'it failed' },
     'run_tool_errors',
+    'errors',
   ],
-  ['traces', { id: 'r-5', event_type: 'assistant.message', sequence: 1 }, 'run_traces'],
+  ['traces', { id: 'r-5', event_type: 'assistant.message', sequence: 1 }, 'run_traces', 'traces'],
 ] as const;
 
 async function count(held: Awaited<ReturnType<typeof world>>, table: string): Promise<number> {
@@ -47,18 +54,28 @@ async function count(held: Awaited<ReturnType<typeof world>>, table: string): Pr
 }
 
 describe('each kind of record an agent reports', () => {
-  it.each(KINDS)('is stored once however often %s is sent', async (route, body, table) => {
-    const held = await world();
+  it.each(KINDS)(
+    'is stored once however often %s is sent, and read back by its list',
+    async (route, body, table, named) => {
+      const held = await world();
 
-    const first = await held.app.request(path(route), withJson('POST', body, held.key));
-    const again = await held.app.request(path(route), withJson('POST', body, held.key));
+      const first = await held.app.request(path(route), withJson('POST', body, held.key));
+      const again = await held.app.request(path(route), withJson('POST', body, held.key));
 
-    expect(first.status).toBe(201);
-    expect(again.status).toBe(200);
-    expect(await count(held, table)).toBe(1);
-    // The repeat answered with what is stored, not with a second record.
-    expect(((await again.json()) as { id: string }).id).toBe(body.id);
-  });
+      expect(first.status).toBe(201);
+      expect(again.status).toBe(200);
+      expect(await count(held, table)).toBe(1);
+      // The repeat answered with what is stored, not with a second record.
+      expect(((await again.json()) as { id: string }).id).toBe(body.id);
+
+      // And the run's own list is where a client finds it afterwards.
+      const listed = (await (await held.app.request(path(route), as(held.key))).json()) as Record<
+        string,
+        Array<{ id: string }>
+      >;
+      expect(listed[named]?.map((one) => one.id)).toEqual([body.id]);
+    },
+  );
 
   it('gives a record with no id of its own one that is unique', async () => {
     const held = await world();
