@@ -233,7 +233,7 @@
         "`make check` passes with no network access and no deployment configured",
         "the session, usage and cost routes answer as docs/prd/api.md specifies against a running deployment, cursor paging included"
       ],
-      "state": "pending"
+      "state": "done"
     }
   ]
 }
