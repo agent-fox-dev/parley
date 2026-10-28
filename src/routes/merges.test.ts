@@ -2,13 +2,14 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { newIdentifier } from '../auth/credentials.js';
 import { localRepositoryStore } from '../platform/local/repostore.js';
 import type { RepositoryStore } from '../platform/repostore.js';
 import { repositoryOf } from '../repo/repository.js';
-import { mergeById } from '../merge/job.js';
+import { insertMerge, mergeById, updateMerge } from '../merge/job.js';
 import { type Service, identityService } from '../testutil/app.js';
 import { buildCommit } from '../testutil/history.js';
-import { seedApiKey, seedOrg, seedUser, seedWorkspace } from '../testutil/identity.js';
+import { SEED_NOW, seedApiKey, seedOrg, seedUser, seedWorkspace } from '../testutil/identity.js';
 
 /**
  * The merge routes. The submit's order is the notable part: the body
@@ -82,6 +83,33 @@ async function call(
     },
     ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
   });
+}
+
+/** A job in whatever state the suite needs to see refused. */
+let madeAt = SEED_NOW.getTime();
+
+async function jobIn(place: World, status: string, over: object = {}): Promise<string> {
+  const id = newIdentifier();
+  madeAt += 1000;
+  await insertMerge(
+    place.service.store,
+    {
+      id,
+      workspace_slug: place.slug,
+      target_branch: 'main',
+      source_ref: 'feature',
+      submitted_by: 'u-1',
+      ...over,
+    },
+    new Date(madeAt).toISOString(),
+  );
+  await updateMerge(
+    place.service.store,
+    id,
+    { status: status as 'queued' },
+    new Date(madeAt).toISOString(),
+  );
+  return id;
 }
 
 describe('submitting a merge', () => {
@@ -189,5 +217,80 @@ describe('submitting a merge', () => {
     });
 
     expect(second.status).toBe(202);
+  });
+});
+
+describe('following and undoing a merge', () => {
+  it('lists a workspace’s jobs newest first and reads one', async () => {
+    const place = await world();
+    const older = await jobIn(place, 'completed');
+    const newer = await jobIn(place, 'failed', { source_ref: 'another' });
+
+    const listed = (await (await call(place, '/merges')).json()) as Array<Record<string, unknown>>;
+    expect(listed.map((one) => one['id'])).toEqual([newer, older]);
+
+    const read = (await (await call(place, `/merges/${older}`)).json()) as Record<string, unknown>;
+    expect(read['id']).toBe(older);
+    expect(read['status']).toBe('completed');
+  });
+
+  it('answers 404 for an unknown job and for one of another workspace', async () => {
+    const place = await world();
+    const elsewhere = await world();
+    const theirs = await jobIn(elsewhere, 'completed');
+
+    expect((await call(place, '/merges/nobody')).status).toBe(404);
+    expect((await call(place, `/merges/${theirs}`)).status).toBe(404);
+  });
+
+  it('cancels a queued job and refuses every other status', async () => {
+    const place = await world();
+    const queued = await jobIn(place, 'queued');
+
+    const cancelled = await call(place, `/merges/${queued}`, { method: 'DELETE' });
+    expect(cancelled.status).toBe(200);
+    expect(((await cancelled.json()) as { status: string }).status).toBe('cancelled');
+    expect((await mergeById(place.service.store, queued))?.status).toBe('cancelled');
+
+    for (const status of ['running', 'completed', 'failed', 'cancelled']) {
+      const other = await jobIn(place, status, { source_ref: `source-${status}` });
+      expect((await call(place, `/merges/${other}`, { method: 'DELETE' })).status).toBe(409);
+    }
+  });
+
+  it('queues a dead-lettered job again, counting the retry', async () => {
+    const place = await world();
+    const dead = await jobIn(place, 'dead_letter', { source_ref: 'feature' });
+    await updateMerge(place.service.store, dead, { error: 'it stalled' }, SEED_NOW.toISOString());
+
+    const again = await call(place, `/merges/${dead}/requeue`, { method: 'POST' });
+    const body = (await again.json()) as Record<string, unknown>;
+
+    expect(again.status).toBe(200);
+    expect(body['status']).toBe('queued');
+    expect(body['error']).toBeNull();
+    expect(body['retry_count']).toBe(1);
+  });
+
+  it('refuses to queue a job again that is not dead-lettered', async () => {
+    const place = await world();
+    const completed = await jobIn(place, 'completed');
+
+    expect((await call(place, `/merges/${completed}/requeue`, { method: 'POST' })).status).toBe(
+      409,
+    );
+  });
+
+  it('refuses to queue one again while the same merge is already owed', async () => {
+    const place = await world();
+    const dead = await jobIn(place, 'dead_letter');
+    await jobIn(place, 'running');
+
+    const response = await call(place, `/merges/${dead}/requeue`, { method: 'POST' });
+
+    expect(response.status).toBe(409);
+    expect(((await response.json()) as { error: { error_type: string } }).error.error_type).toBe(
+      'duplicate_merge',
+    );
   });
 });
