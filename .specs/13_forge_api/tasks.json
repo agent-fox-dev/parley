@@ -62,7 +62,7 @@
         "src/forge/client.integration.test.ts",
         "docs/adr/"
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 2,

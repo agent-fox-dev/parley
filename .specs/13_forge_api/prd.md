@@ -4,7 +4,7 @@ spec_name: "forge_api"
 title: "Read and change a workspace's repository on its forge"
 status: "active"
 created_at: "2026-10-27T19:08:11Z"
-updated_at: "2026-10-27T19:13:56Z"
+updated_at: "2026-10-28T13:31:09Z"
 intent_hash: "6a07fdea6ce542a4259d66c3e8fbefe0f9ab9eef122b7792f6118eae98c2ed7d"
 schema_version: 2
 source: "docs/prd/01-port-af-hub-to-typescript-on-cloudflare.md"
