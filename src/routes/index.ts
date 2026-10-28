@@ -19,6 +19,7 @@ import { tokenPermissionRoutes } from './token_permissions.js';
 import { tokenRoutes } from './tokens.js';
 import { userRoutes } from './user.js';
 import { serverRoutes } from './server.js';
+import { gitRoutes } from '../git/routes.js';
 
 export interface ServiceRouteConfig {
   mountPoint: string;
@@ -39,6 +40,8 @@ export interface ServiceRouteConfig {
   jobs?: JobQueue;
   /** Injected so a test reaches a remote of its own. */
   fetch?: typeof fetch;
+  /** The deployment's admin token, which a git client may also present. */
+  adminToken?: string;
 }
 
 /**
@@ -48,6 +51,14 @@ export interface ServiceRouteConfig {
  */
 export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
   return [
+    // At the server root rather than under the mount point: a clone URL
+    // is what a person types, and /api/v1 has no business in it.
+    ...gitRoutes({
+      store: config.store,
+      clock: config.clock,
+      ...(config.adminToken === undefined ? {} : { adminToken: config.adminToken }),
+      ...(config.repos === undefined ? {} : { repos: config.repos }),
+    }),
     ...serverRoutes({
       mountPoint: config.mountPoint,
       buildTime: config.buildTime,

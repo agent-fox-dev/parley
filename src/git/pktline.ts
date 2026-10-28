@@ -94,3 +94,23 @@ export function decodePktLines(bytes: Uint8Array): PktLine[] {
 export function textOf(line: PktLine): string {
   return line.kind === 'data' ? decoder.decode(line.payload) : '';
 }
+
+/**
+ * A refusal in git's own framing. A git client shows the person the
+ * message of a pkt-line body; the service's JSON envelope it would
+ * report as an unreadable failure, so every git route answers this way.
+ */
+export function pktError(
+  status: number,
+  message: string,
+  headers: Record<string, string> = {},
+): Response {
+  return new Response(encodePkt(`ERR ${message}\n`) as BodyInit, {
+    status,
+    headers: {
+      'content-type': 'application/x-git-result',
+      'cache-control': 'no-cache',
+      ...headers,
+    },
+  });
+}

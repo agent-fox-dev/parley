@@ -31,7 +31,13 @@ export interface Service {
  */
 export async function identityService(
   extra: RouteDefinition[] = [],
-  options: { repos?: RepositoryStore; jobs?: JobQueue; fetch?: typeof fetch } = {},
+  options: {
+    repos?: RepositoryStore;
+    jobs?: JobQueue;
+    fetch?: typeof fetch;
+    /** Overridden where a suite serves the app at an address of its own. */
+    externalUrl?: string;
+  } = {},
 ): Promise<Service> {
   const seeded = await freshStore();
   const clock = seedClock();
@@ -50,11 +56,12 @@ export async function identityService(
         providers: stubDirectory({ codes: { 'a-code': providerIdentity() } }),
         secrets,
         secretCipher,
-        externalUrl: EXTERNAL_URL,
+        externalUrl: options.externalUrl ?? EXTERNAL_URL,
         ...(options.repos === undefined ? {} : { repos: options.repos }),
         ...(options.jobs === undefined ? {} : { jobs: options.jobs }),
         ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
         locks: storeLocks(seeded.store, clock),
+        adminToken: ADMIN_TOKEN,
       }),
       ...extra,
     ],

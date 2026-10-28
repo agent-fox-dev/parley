@@ -63,7 +63,7 @@
         "src/git/server.integration.test.ts",
         "src/workspace/serialise.ts"
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 2,

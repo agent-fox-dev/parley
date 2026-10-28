@@ -4,7 +4,7 @@ spec_name: "git_server"
 title: "Serve each workspace's repository over git smart HTTP"
 status: "active"
 created_at: "2026-10-27T18:36:40Z"
-updated_at: "2026-10-27T18:42:04Z"
+updated_at: "2026-10-28T08:13:31Z"
 intent_hash: "8e45a6a26ca6986c338ac597ae034541f730504d27dc65f43bbb5f2fa065bc11"
 schema_version: 2
 source: "docs/prd/01-port-af-hub-to-typescript-on-cloudflare.md"
