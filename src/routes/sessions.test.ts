@@ -185,3 +185,181 @@ describe('opening a session', () => {
     );
   });
 });
+
+/** A session opened by the owner, which is the usual starting point. */
+async function openedSession(place: World, credential?: string): Promise<string> {
+  const response = await open(place, { workspace_slug: place.slug }, credential);
+  return ((await response.json()) as { id: string }).id;
+}
+
+async function post(
+  place: World,
+  path: string,
+  body: unknown,
+  credential?: string,
+): Promise<Response> {
+  return place.service.app.request(`/api/v1/sessions/${path}`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${credential ?? place.owner}`,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+}
+
+describe('closing a session', () => {
+  it.each(['completed', 'failed', 'timeout'])('accepts the status %s', async (status) => {
+    const place = await world();
+    const id = await openedSession(place);
+
+    const response = await post(place, `${id}/complete`, {
+      status,
+      duration_ms: 3000,
+      cache_creation_input_tokens: 100,
+    });
+    const session = (await response.json()) as Record<string, unknown>;
+
+    expect(response.status).toBe(200);
+    expect(session['status']).toBe(status);
+    expect(session['duration_ms']).toBe(3000);
+    expect(session['cache_creation_input_tokens']).toBe(100);
+    expect(String(session['ended_at'])).not.toHaveLength(0);
+  });
+
+  it('answers a second close with the session as it stands', async () => {
+    const place = await world();
+    const id = await openedSession(place);
+    await post(place, `${id}/complete`, { status: 'completed' });
+
+    const again = await post(place, `${id}/complete`, { status: 'failed' });
+
+    expect(again.status).toBe(200);
+    expect(((await again.json()) as { status: string }).status).toBe('completed');
+  });
+
+  it.each([
+    ['a status nobody has', { status: 'wandering' }],
+    ['no status at all', {}],
+    ['terminated, which is the hub’s to set', { status: 'terminated' }],
+    ['a negative duration', { status: 'completed', duration_ms: -1 }],
+  ])('refuses %s', async (_what, body) => {
+    const place = await world();
+    const id = await openedSession(place);
+
+    expect((await post(place, `${id}/complete`, body)).status).toBe(400);
+  });
+
+  it('is for the session’s creator, not the workspace’s owner', async () => {
+    const place = await world();
+    // A second agent, with its own credential on the same workspace.
+    const owners = await place.service.store.all<{ owner_id: string }>(
+      'SELECT owner_id FROM workspaces WHERE slug = ?',
+      [place.slug],
+    );
+    const second = await seedApiKey(place.service.store, {
+      id: owners[0]?.owner_id ?? '',
+    } as never);
+    const id = await openedSession(place, second.presented);
+
+    // The workspace's owner holds a different credential, so it is
+    // not the one that opened this session.
+    const byOwner = await post(place, `${id}/complete`, { status: 'completed' }, place.owner);
+    expect(byOwner.status).toBe(403);
+
+    const byCreator = await post(
+      place,
+      `${id}/complete`,
+      { status: 'completed' },
+      second.presented,
+    );
+    expect(byCreator.status).toBe(200);
+  });
+
+  it('lets an admin token close any session', async () => {
+    const place = await world();
+    const id = await openedSession(place);
+
+    expect((await post(place, `${id}/complete`, { status: 'completed' }, ADMIN_TOKEN)).status).toBe(
+      200,
+    );
+  });
+
+  it('answers 404 for a session nobody has', async () => {
+    const place = await world();
+
+    expect((await post(place, 'nobody/complete', { status: 'completed' })).status).toBe(404);
+  });
+});
+
+describe('reporting what a session spent', () => {
+  it('records a model and its counts', async () => {
+    const place = await world();
+    const id = await openedSession(place);
+
+    const response = await post(place, `${id}/usage`, {
+      model: 'claude-3-5-sonnet',
+      input_tokens: 200,
+      output_tokens: 80,
+      cache_read_tokens: 10,
+    });
+    const record = (await response.json()) as Record<string, unknown>;
+
+    expect(response.status).toBe(201);
+    expect(record['session_id']).toBe(id);
+    expect(record['model']).toBe('claude-3-5-sonnet');
+    expect(record['input_tokens']).toBe(200);
+    expect(record['output_tokens']).toBe(80);
+    expect(record['cache_read_tokens']).toBe(10);
+  });
+
+  it('defaults the counts nobody reported to none', async () => {
+    const place = await world();
+    const id = await openedSession(place);
+
+    const record = (await (
+      await post(place, `${id}/usage`, { model: 'a-model' })
+    ).json()) as Record<string, unknown>;
+
+    expect(record['input_tokens']).toBe(0);
+    expect(record['output_tokens']).toBe(0);
+  });
+
+  it.each([
+    ['no model', {}],
+    ['an empty model', { model: '' }],
+  ])('refuses %s', async (_what, body) => {
+    const place = await world();
+    const id = await openedSession(place);
+
+    expect((await post(place, `${id}/usage`, body)).status).toBe(400);
+  });
+
+  it('refuses a count that is below none', async () => {
+    const place = await world();
+    const id = await openedSession(place);
+
+    const response = await post(place, `${id}/usage`, { model: 'a-model', input_tokens: -1 });
+
+    expect(response.status).toBe(422);
+  });
+
+  it('refuses a report for a session that has finished', async () => {
+    const place = await world();
+    const id = await openedSession(place);
+    await post(place, `${id}/complete`, { status: 'completed' });
+
+    const response = await post(place, `${id}/usage`, { model: 'a-model', input_tokens: 1 });
+
+    expect(response.status).toBe(409);
+  });
+
+  it('is for the session’s creator alone', async () => {
+    const place = await world();
+    const id = await openedSession(place);
+
+    expect((await post(place, `${id}/usage`, { model: 'a-model' }, place.stranger)).status).toBe(
+      403,
+    );
+  });
+});

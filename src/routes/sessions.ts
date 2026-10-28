@@ -7,6 +7,8 @@ import { newIdentifier } from '../auth/credentials.js';
 import { type Identity, identityOf } from '../auth/middleware.js';
 import { accessLevel } from '../workspace/access.js';
 import { findWorkspace } from '../store/workspaces.js';
+import { completeSession, ownedSession, readCompleteBody } from '../session/complete.js';
+import { readUsageBody, recordUsage } from '../session/usage.js';
 import {
   type SessionRecord,
   insertSession,
@@ -126,6 +128,28 @@ export function sessionRoutes(config: SessionRouteConfig): RouteDefinition[] {
       methods: ['POST'],
       scope: 'sessions:write',
       handler: async (c) => openSession(c, config),
+    },
+    {
+      path: `${config.mountPoint}/sessions/:id/complete`,
+      methods: ['POST'],
+      scope: 'sessions:write',
+      handler: async (c) => {
+        const asked = readCompleteBody(await c.req.json().catch(() => undefined));
+        const session = await ownedSession(config.store, c.req.param('id') ?? '', identityOf(c));
+        return jsonResponse(
+          serialiseSession(await completeSession(config.store, config.clock, session, asked)),
+        );
+      },
+    },
+    {
+      path: `${config.mountPoint}/sessions/:id/usage`,
+      methods: ['POST'],
+      scope: 'sessions:write',
+      handler: async (c) => {
+        const report = readUsageBody(await c.req.json().catch(() => undefined));
+        const session = await ownedSession(config.store, c.req.param('id') ?? '', identityOf(c));
+        return jsonResponse(await recordUsage(config.store, config.clock, session, report), 201);
+      },
     },
   ];
 }
