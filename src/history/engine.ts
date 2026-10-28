@@ -17,6 +17,13 @@ export interface MergeResult {
   conflicts?: string[];
 }
 
+/**
+ * Where the engine keeps the result of its last merge. A tree nothing
+ * points at is unreachable, and an unreachable object is one a store may
+ * drop before the caller has done anything with it.
+ */
+export const MERGE_RESULT_REF = 'refs/hub/engine/merge';
+
 export interface RebaseResult {
   /** The commits written, oldest first, when the rebase finished. */
   commits?: string[];
@@ -125,7 +132,8 @@ export function historyEngine(repos: RepositoryStore): HistoryEngine {
      * which is what a caller deciding whether to merge wants.
      */
     async threeWayMerge(request): Promise<MergeResult> {
-      const { fs, gitdir } = await open(repos, request.repository);
+      const session = await open(repos, request.repository);
+      const { fs, gitdir } = session;
       await git.writeRef({
         fs: fs as never,
         gitdir,
@@ -147,13 +155,21 @@ export function historyEngine(repos: RepositoryStore): HistoryEngine {
           gitdir,
           ours: TEMP_OURS,
           theirs: TEMP_THEIRS,
-          dryRun: true,
           noUpdateBranch: true,
           author: ENGINE,
           committer: ENGINE,
           message: 'three-way merge',
         });
-        return { tree: merged.tree ?? merged.oid };
+
+        // The merged tree is handed back to the store with a ref on the
+        // commit that holds it, so the caller can read it.
+        const oid = merged.oid;
+        await session.flush(
+          oid === undefined
+            ? []
+            : [{ name: MERGE_RESULT_REF, oldOid: null, newOid: oid, force: true }],
+        );
+        return { tree: merged.tree ?? oid };
       } catch (err) {
         const conflicts = conflictingPaths(err);
         if (conflicts === undefined) {
