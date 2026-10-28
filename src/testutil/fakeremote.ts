@@ -50,6 +50,42 @@ const V2 = [
  * repository of its own, records what it was asked and what credential it
  * was shown, and can be told to refuse or to be unreachable.
  */
+/** The push half: applies what it is sent, or refuses as it was told to. */
+async function receive(
+  store: RepositoryStore,
+  name: string,
+  options: FakeRemoteOptions,
+  body: Uint8Array,
+): Promise<Response> {
+  const { commands, pack } = commandsIn(body);
+
+  const answers = [encodePkt('unpack ok\n')];
+  for (const one of commands) {
+    if (options.refusesPush !== undefined) {
+      answers.push(encodePkt(`ng ${one.name} ${options.refusesPush}\n`));
+      continue;
+    }
+    const held = (await store.listRefs(name)).find((ref) => ref.name === one.name);
+    // Without force, a ref that moved under the pusher is refused.
+    if (held !== undefined && held.oid !== one.oldOid) {
+      answers.push(encodePkt(`ng ${one.name} non-fast-forward\n`));
+      continue;
+    }
+    if (pack.length > 0) {
+      await store.receivePack(name, pack, [
+        { name: one.name, oldOid: null, newOid: one.newOid, force: true },
+      ]);
+    } else {
+      await store.updateRefs(name, [
+        { name: one.name, oldOid: null, newOid: one.newOid, force: true },
+      ]);
+    }
+    answers.push(encodePkt(`ok ${one.name}\n`));
+  }
+  answers.push(encodeSpecial(FLUSH));
+  return new Response(concatBytes(answers) as BodyInit, { status: 200 });
+}
+
 export function fakeRemote(options: FakeRemoteOptions = {}): FakeRemote {
   const root = mkdtempSync(join(tmpdir(), 'parley-fake-remote-'));
   const store: RepositoryStore = localRepositoryStore(root);
@@ -78,38 +114,14 @@ export function fakeRemote(options: FakeRemoteOptions = {}): FakeRemote {
     }
 
     if (url.includes('/info/refs')) {
-      if (url.includes('git-receive-pack')) {
-        const refs = await store.listRefs(name);
-        const first = refs[0];
-        return new Response(
-          concatBytes([
-            encodePkt('# service=git-receive-pack\n'),
-            encodeSpecial(FLUSH),
-            encodePkt(
-              first === undefined
-                ? `${'0'.repeat(40)} capabilities^{}\u0000report-status delete-refs atomic\n`
-                : `${first.oid} ${first.name}\u0000report-status delete-refs atomic\n`,
-            ),
-            ...refs.slice(1).map((ref) => encodePkt(`${ref.oid} ${ref.name}\n`)),
-            encodeSpecial(FLUSH),
-          ]) as BodyInit,
-          { status: 200 },
-        );
-      }
-      return new Response(
-        concatBytes([
-          encodePkt('# service=git-upload-pack\n'),
-          encodeSpecial(FLUSH),
-          ...V2.map((line) => encodePkt(line)),
-          encodeSpecial(FLUSH),
-        ]) as BodyInit,
-        { status: 200 },
-      );
+      return url.includes('git-receive-pack')
+        ? receiveAdvertisement(await store.listRefs(name))
+        : uploadAdvertisement();
     }
 
     if (url.endsWith('/git-receive-pack')) {
       const body = new Uint8Array((init?.body ?? new Uint8Array()) as ArrayBuffer);
-      return receive(body);
+      return receive(store, name, options, body);
     }
 
     const body = new Uint8Array((init?.body ?? new Uint8Array()) as ArrayBuffer);
@@ -146,46 +158,6 @@ export function fakeRemote(options: FakeRemoteOptions = {}): FakeRemote {
     );
   }
 
-  /** The push half: applies what it is sent, or refuses as it was told to. */
-  async function receive(body: Uint8Array): Promise<Response> {
-    const flushAt = firstFlush(body);
-    const commands = decodePktLines(body.subarray(0, flushAt))
-      .filter((line) => line.kind === 'data')
-      .map((line) => textOf(line).split('\u0000')[0] ?? '')
-      .filter((line) => line.trim().length > 0)
-      .map((line) => {
-        const [oldOid, newOid, ref] = line.trim().split(' ');
-        return { oldOid: oldOid ?? '', newOid: newOid ?? '', name: ref ?? '' };
-      });
-    const pack = body.subarray(flushAt + 4);
-
-    const answers = [encodePkt('unpack ok\n')];
-    for (const one of commands) {
-      if (options.refusesPush !== undefined) {
-        answers.push(encodePkt(`ng ${one.name} ${options.refusesPush}\n`));
-        continue;
-      }
-      const held = (await store.listRefs(name)).find((ref) => ref.name === one.name);
-      // Without force, a ref that moved under the pusher is refused.
-      if (held !== undefined && held.oid !== one.oldOid) {
-        answers.push(encodePkt(`ng ${one.name} non-fast-forward\n`));
-        continue;
-      }
-      if (pack.length > 0) {
-        await store.receivePack(name, pack, [
-          { name: one.name, oldOid: null, newOid: one.newOid, force: true },
-        ]);
-      } else {
-        await store.updateRefs(name, [
-          { name: one.name, oldOid: null, newOid: one.newOid, force: true },
-        ]);
-      }
-      answers.push(encodePkt(`ok ${one.name}\n`));
-    }
-    answers.push(encodeSpecial(FLUSH));
-    return new Response(concatBytes(answers) as BodyInit, { status: 200 });
-  }
-
   return {
     url: 'https://forge.test/owner/repo.git',
     fetch: (async (input: string | URL | Request, init?: RequestInit) =>
@@ -209,6 +181,54 @@ export function fakeRemote(options: FakeRemoteOptions = {}): FakeRemote {
       rmSync(root, { recursive: true, force: true });
     },
   };
+}
+
+function uploadAdvertisement(): Response {
+  return new Response(
+    concatBytes([
+      encodePkt('# service=git-upload-pack\n'),
+      encodeSpecial(FLUSH),
+      ...V2.map((line) => encodePkt(line)),
+      encodeSpecial(FLUSH),
+    ]) as BodyInit,
+    { status: 200 },
+  );
+}
+
+function receiveAdvertisement(refs: ReadonlyArray<{ name: string; oid: string }>): Response {
+  const first = refs[0];
+  const capabilities = 'report-status delete-refs atomic';
+  return new Response(
+    concatBytes([
+      encodePkt('# service=git-receive-pack\n'),
+      encodeSpecial(FLUSH),
+      encodePkt(
+        first === undefined
+          ? `${'0'.repeat(40)} capabilities^{}\u0000${capabilities}\n`
+          : `${first.oid} ${first.name}\u0000${capabilities}\n`,
+      ),
+      ...refs.slice(1).map((ref) => encodePkt(`${ref.oid} ${ref.name}\n`)),
+      encodeSpecial(FLUSH),
+    ]) as BodyInit,
+    { status: 200 },
+  );
+}
+
+/** The commands a receive-pack body carries, before the pack itself. */
+export function commandsIn(body: Uint8Array): {
+  commands: Array<{ oldOid: string; newOid: string; name: string }>;
+  pack: Uint8Array;
+} {
+  const flushAt = firstFlush(body);
+  const commands = decodePktLines(body.subarray(0, flushAt))
+    .filter((line) => line.kind === 'data')
+    .map((line) => textOf(line).split('\u0000')[0] ?? '')
+    .filter((line) => line.trim().length > 0)
+    .map((line) => {
+      const [oldOid, newOid, ref] = line.trim().split(' ');
+      return { oldOid: oldOid ?? '', newOid: newOid ?? '', name: ref ?? '' };
+    });
+  return { commands, pack: body.subarray(flushAt + 4) };
 }
 
 /** Where the first flush packet sits, which is where a pack begins. */

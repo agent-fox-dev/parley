@@ -25,13 +25,72 @@ interface StoredRefs {
  * vocabulary as the Cloudflare store so that one contract suite holds
  * them both.
  */
+const refsPath = (repo: string) => join(repo, 'refs.json');
+const objectsPath = (repo: string) => join(repo, 'objects');
+
+function refsOf(repo: string): StoredRefs {
+  try {
+    return JSON.parse(readFileSync(refsPath(repo), 'utf8')) as StoredRefs;
+  } catch {
+    return {};
+  }
+}
+
+function writeRefs(repo: string, refs: StoredRefs): void {
+  writeFileSync(refsPath(repo), JSON.stringify(refs, null, 2));
+}
+
+function writeObject(repo: string, object: PackedObject): void {
+  writeFileSync(
+    join(objectsPath(repo), object.oid),
+    Buffer.concat([Buffer.from(`${object.type}\u0000`, 'latin1'), Buffer.from(object.data)]),
+  );
+}
+
+function readStored(repo: string, oid: string): PackedObject | undefined {
+  try {
+    const raw = readFileSync(join(objectsPath(repo), oid));
+    const split = raw.indexOf(0);
+    return {
+      oid,
+      type: raw.subarray(0, split).toString('latin1') as ObjectType,
+      data: new Uint8Array(raw.subarray(split + 1)),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Whether the store will make this change. A ref that did not exist or
+ * still holds what the caller expected moves freely; anything else is a
+ * rewind, which needs force and the capability behind it.
+ */
+function checkChange(capabilities: StoreCapabilities, refs: StoredRefs, change: RefChange): void {
+  if (!change.name.startsWith('refs/heads/') && !change.name.startsWith('refs/tags/')) {
+    requireCapability(capabilities, 'arbitraryRefNamespaces');
+  }
+  if (change.newOid === null) {
+    requireCapability(capabilities, 'refDeletion');
+  }
+
+  const held = refs[change.name];
+  if (change.oldOid !== null && held !== change.oldOid) {
+    if (change.force !== true) {
+      throw new HttpError(409, `${change.name} does not hold ${change.oldOid}`);
+    }
+    requireCapability(capabilities, 'nonFastForward');
+  }
+  if (change.oldOid === null && held !== undefined && change.force !== true) {
+    throw new HttpError(409, `${change.name} already exists`);
+  }
+}
+
 export function localRepositoryStore(
   root: string,
   capabilities: StoreCapabilities = LOCAL_CAPABILITIES,
 ): RepositoryStore {
   const repoPath = (name: string) => join(root, name);
-  const refsPath = (name: string) => join(repoPath(name), 'refs.json');
-  const objectsPath = (name: string) => join(repoPath(name), 'objects');
 
   function present(name: string): void {
     if (!existsSync(repoPath(name))) {
@@ -39,73 +98,13 @@ export function localRepositoryStore(
     }
   }
 
-  function refsOf(name: string): StoredRefs {
-    try {
-      return JSON.parse(readFileSync(refsPath(name), 'utf8')) as StoredRefs;
-    } catch {
-      return {};
-    }
-  }
-
-  function writeRefs(name: string, refs: StoredRefs): void {
-    writeFileSync(refsPath(name), JSON.stringify(refs, null, 2));
-  }
-
-  function writeObject(name: string, object: PackedObject): void {
-    writeFileSync(
-      join(objectsPath(name), object.oid),
-      Buffer.concat([Buffer.from(`${object.type}\u0000`, 'latin1'), Buffer.from(object.data)]),
-    );
-  }
-
-  function readStored(name: string, oid: string): PackedObject | undefined {
-    try {
-      const raw = readFileSync(join(objectsPath(name), oid));
-      const split = raw.indexOf(0);
-      return {
-        oid,
-        type: raw.subarray(0, split).toString('latin1') as ObjectType,
-        data: new Uint8Array(raw.subarray(split + 1)),
-      };
-    } catch {
-      return undefined;
-    }
-  }
-
-  /**
-   * Whether a change is a fast-forward, which here means the ref did not
-   * exist or still holds what the caller expected. The store cannot walk
-   * history without reading every commit, so the expected-value check is
-   * what it offers; a caller that means to rewind says force.
-   */
-  function checkChange(name: string, refs: StoredRefs, change: RefChange): void {
-    if (!change.name.startsWith('refs/heads/') && !change.name.startsWith('refs/tags/')) {
-      requireCapability(capabilities, 'arbitraryRefNamespaces');
-    }
-    if (change.newOid === null) {
-      requireCapability(capabilities, 'refDeletion');
-    }
-
-    const held = refs[change.name];
-    if (change.oldOid !== null && held !== change.oldOid) {
-      if (change.force !== true) {
-        throw new HttpError(409, `${change.name} does not hold ${change.oldOid}`);
-      }
-      requireCapability(capabilities, 'nonFastForward');
-    }
-    if (change.oldOid === null && held !== undefined && change.force !== true) {
-      throw new HttpError(409, `${change.name} already exists`);
-    }
-    void name;
-  }
-
   return {
     capabilities,
 
     async create(name: string): Promise<void> {
-      mkdirSync(objectsPath(name), { recursive: true });
-      if (!existsSync(refsPath(name))) {
-        writeRefs(name, {});
+      mkdirSync(objectsPath(repoPath(name)), { recursive: true });
+      if (!existsSync(refsPath(repoPath(name)))) {
+        writeRefs(repoPath(name), {});
       }
       await Promise.resolve();
     },
@@ -121,7 +120,7 @@ export function localRepositoryStore(
 
     async listRefs(name: string): Promise<StoredRef[]> {
       present(name);
-      const refs = refsOf(name);
+      const refs = refsOf(repoPath(name));
       return Promise.resolve(
         Object.keys(refs)
           .toSorted()
@@ -131,11 +130,11 @@ export function localRepositoryStore(
 
     async updateRefs(name: string, changes: readonly RefChange[]): Promise<void> {
       present(name);
-      const refs = refsOf(name);
+      const refs = refsOf(repoPath(name));
       // Checked first, every one of them, so a change the store refuses
       // leaves the refs exactly as they were.
       for (const change of changes) {
-        checkChange(name, refs, change);
+        checkChange(capabilities, refs, change);
       }
       for (const change of changes) {
         if (change.newOid === null) {
@@ -144,7 +143,7 @@ export function localRepositoryStore(
           refs[change.name] = change.newOid;
         }
       }
-      writeRefs(name, refs);
+      writeRefs(repoPath(name), refs);
       await Promise.resolve();
     },
 
@@ -154,12 +153,12 @@ export function localRepositoryStore(
       changes: readonly RefChange[],
     ): Promise<void> {
       present(name);
-      const refs = refsOf(name);
+      const refs = refsOf(repoPath(name));
       for (const change of changes) {
-        checkChange(name, refs, change);
+        checkChange(capabilities, refs, change);
       }
       for (const object of readPack(pack)) {
-        writeObject(name, object);
+        writeObject(repoPath(name), object);
       }
       await this.updateRefs(name, changes);
     },
@@ -170,15 +169,15 @@ export function localRepositoryStore(
       // asked for; narrowing it to what is reachable from the wants is
       // object-level work, and belongs to the history engine.
       void wants;
-      const objects = readdirSync(objectsPath(name))
-        .map((oid) => readStored(name, oid))
+      const objects = readdirSync(objectsPath(repoPath(name)))
+        .map((oid) => readStored(repoPath(name), oid))
         .filter((object): object is PackedObject => object !== undefined);
       return Promise.resolve(writePack(objects));
     },
 
     async readObject(name: string, oid: string): Promise<StoredObject | undefined> {
       present(name);
-      const object = readStored(name, oid);
+      const object = readStored(repoPath(name), oid);
       return Promise.resolve(
         object === undefined ? undefined : { type: object.type, data: object.data },
       );

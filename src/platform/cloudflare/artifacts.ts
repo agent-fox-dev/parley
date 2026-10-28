@@ -37,6 +37,42 @@ export interface ArtifactsRepoHandle {
  * and no write API, so refs and packs go over the git remote with that
  * token (ADR 6).
  */
+/**
+ * A remote for one repository. The token is minted per call and lives
+ * only inside this call: it reaches no response and no log.
+ */
+async function remoteOf(
+  binding: ArtifactsBinding,
+  name: string,
+  fetching?: typeof fetch,
+): Promise<Remote> {
+  const repo = await binding.get(name);
+  const [info, token] = await Promise.all([repo.info(), repo.createToken('write')]);
+  return {
+    url: info.remote.replace(/\/$/, ''),
+    headers: { authorization: `Bearer ${token.plaintext}` },
+    ...(fetching === undefined ? {} : { fetch: fetching }),
+  };
+}
+
+/** Sends the changes and the pack, and refuses loudly if the store did. */
+async function push(
+  remote: Remote,
+  changes: readonly RefChange[],
+  pack: Uint8Array,
+): Promise<void> {
+  const report = await pushPack(remote, { commands: commandsOf(changes), pack });
+  const refused = report.refs.filter((ref) => !ref.ok);
+  if (!report.unpacked || refused.length > 0) {
+    throw new HttpError(
+      409,
+      refused.length > 0
+        ? `the store refused ${refused.map((r) => `${r.name} (${r.reason ?? 'no reason'})`).join(', ')}`
+        : 'the store could not unpack what it was sent',
+    );
+  }
+}
+
 /** The ref commands a set of changes becomes, each checked against what the store can do. */
 function commandsOf(changes: readonly RefChange[]): RefCommand[] {
   for (const change of changes) {
@@ -61,34 +97,6 @@ export function artifactsRepositoryStore(
   binding: ArtifactsBinding,
   options: { fetch?: typeof fetch } = {},
 ): RepositoryStore {
-  /**
-   * A remote for one repository. The token is minted per call and lives
-   * only inside this function: it reaches no response and no log.
-   */
-  async function remoteOf(name: string): Promise<Remote> {
-    const repo = await binding.get(name);
-    const [info, token] = await Promise.all([repo.info(), repo.createToken('write')]);
-    return {
-      url: info.remote.replace(/\/$/, ''),
-      headers: { authorization: `Bearer ${token.plaintext}` },
-      ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
-    };
-  }
-
-  async function push(name: string, changes: readonly RefChange[], pack: Uint8Array) {
-    const commands = commandsOf(changes);
-    const report = await pushPack(await remoteOf(name), { commands, pack });
-    const refused = report.refs.filter((ref) => !ref.ok);
-    if (!report.unpacked || refused.length > 0) {
-      throw new HttpError(
-        409,
-        refused.length > 0
-          ? `the store refused ${refused.map((r) => `${r.name} (${r.reason ?? 'no reason'})`).join(', ')}`
-          : 'the store could not unpack what it was sent',
-      );
-    }
-  }
-
   return {
     capabilities: ARTIFACTS_CAPABILITIES,
 
@@ -123,7 +131,7 @@ export function artifactsRepositoryStore(
     },
 
     async listRefs(name: string): Promise<StoredRef[]> {
-      const refs = await lsRefs(await remoteOf(name));
+      const refs = await lsRefs(await remoteOf(binding, name, options.fetch));
       return refs
         .filter((ref) => ref.name !== 'HEAD')
         .map((ref) => ({ name: ref.name, oid: ref.oid }))
@@ -133,7 +141,7 @@ export function artifactsRepositoryStore(
     async updateRefs(name: string, changes: readonly RefChange[]): Promise<void> {
       // A ref change with nothing new to carry still needs a pack, and an
       // empty one is what git sends.
-      await push(name, changes, writePack([]));
+      await push(await remoteOf(binding, name, options.fetch), changes, writePack([]));
     },
 
     async receivePack(
@@ -141,7 +149,7 @@ export function artifactsRepositoryStore(
       pack: Uint8Array,
       changes: readonly RefChange[],
     ): Promise<void> {
-      await push(name, changes, pack);
+      await push(await remoteOf(binding, name, options.fetch), changes, pack);
     },
 
     async servePack(
@@ -149,7 +157,7 @@ export function artifactsRepositoryStore(
       wants: readonly string[],
       haves?: readonly string[],
     ): Promise<Uint8Array> {
-      return fetchPack(await remoteOf(name), {
+      return fetchPack(await remoteOf(binding, name, options.fetch), {
         wants,
         ...(haves === undefined ? {} : { haves }),
       });
