@@ -11,6 +11,7 @@ import { repositoryOf } from '../repo/repository.js';
 import { readSnapshot } from '../testutil/history.js';
 import { buildCommit } from '../testutil/history.js';
 import { SEED_NOW, freshStore, seedClock, seedWorkspace } from '../testutil/identity.js';
+import { sweepStalledMerges } from '../jobs/stall_sweep.js';
 import { insertMerge, mergeById } from './job.js';
 import { type MergeRunDeps, runMerge } from './run.js';
 
@@ -238,5 +239,144 @@ describe('a merge whose workspace is busy', () => {
 
     expect((await mergeById(place.store, id))?.status).toBe('cancelled');
     expect(await headOf(place, 'main')).toBe(place.base);
+  });
+});
+
+describe('a job whose runner went away', () => {
+  it('runs again when it is redelivered, rather than staying at running', async () => {
+    const place = await world();
+    await branch(place, 'feature', { 'base.txt': 'shared\n', 'f.txt': 'work\n' });
+    const id = await submit(place, 'main', 'feature');
+
+    // What a killed runner leaves behind: a record that says running.
+    await place.store.run("UPDATE merges SET status = 'running' WHERE id = ?", [id]);
+
+    expect(await runMerge(place.deps, id)).toBe('done');
+
+    const job = await mergeById(place.store, id);
+    expect(job?.status).toBe('completed');
+    expect(await headOf(place, 'main')).toBe(job?.merged_sha);
+  });
+
+  it('is not run twice over once it has finished', async () => {
+    const place = await world();
+    await branch(place, 'feature', { 'base.txt': 'shared\n', 'f.txt': 'work\n' });
+    const id = await submit(place, 'main', 'feature');
+    await runMerge(place.deps, id);
+    const first = await mergeById(place.store, id);
+
+    // The queue redelivers it; nothing should move.
+    await runMerge(place.deps, id);
+
+    expect(await mergeById(place.store, id)).toEqual(first);
+    expect(await headOf(place, 'main')).toBe(first?.merged_sha);
+  });
+});
+
+describe('a job that stopped making progress', () => {
+  it('is given up on, with its retry counted, and can be queued again', async () => {
+    const place = await world();
+    await branch(place, 'feature', { 'base.txt': 'shared\n', 'f.txt': 'work\n' });
+    const id = await submit(place, 'main', 'feature');
+
+    // Running, and silent for longer than it should be.
+    const longAgo = new Date(SEED_NOW.getTime() - 20 * 60 * 1000).toISOString();
+    await place.store.run(
+      "UPDATE merges SET status = 'running', started_at = ?, updated_at = ? WHERE id = ?",
+      [longAgo, longAgo, id],
+    );
+
+    expect(await sweepStalledMerges(place.store, place.clock)).toBe(1);
+
+    const given = await mergeById(place.store, id);
+    expect(given?.status).toBe('dead_letter');
+    expect(given?.retry_count).toBe(1);
+    expect(given?.error).toContain('progress');
+  });
+
+  it('leaves alone one that is still saying something', async () => {
+    const place = await world();
+    const id = await submit(place, 'main', 'feature');
+    await place.store.run("UPDATE merges SET status = 'running', updated_at = ? WHERE id = ?", [
+      SEED_NOW.toISOString(),
+      id,
+    ]);
+
+    expect(await sweepStalledMerges(place.store, place.clock)).toBe(0);
+    expect((await mergeById(place.store, id))?.status).toBe('running');
+  });
+});
+
+describe('the target branch while a merge is interrupted', () => {
+  it.each([
+    [
+      'before the rebase',
+      (place: World) => {
+        const original = place.repos.listRefs.bind(place.repos);
+        place.repos.listRefs = (() =>
+          Promise.reject(new Error('the store went away'))) as typeof place.repos.listRefs;
+        return () => {
+          place.repos.listRefs = original;
+        };
+      },
+    ],
+    [
+      'between the rebase and the fast-forward',
+      (place: World) => {
+        const original = place.repos.updateRefs.bind(place.repos);
+        place.repos.updateRefs = (async (name, changes) => {
+          if (changes.some((change) => change.name === 'refs/heads/main')) {
+            throw new Error('the store went away');
+          }
+          return original(name, changes);
+        }) as typeof place.repos.updateRefs;
+        return () => {
+          place.repos.updateRefs = original;
+        };
+      },
+    ],
+  ])(
+    'holds the head it had, when the merge is interrupted %s',
+    async (_what, breaking: (place: World) => () => void) => {
+      const place = await world();
+      await branch(place, 'feature', { 'base.txt': 'shared\n', 'f.txt': 'work\n' });
+      const id = await submit(place, 'main', 'feature');
+      const before = await headOf(place, 'main');
+
+      const mend = breaking(place);
+      await runMerge(place.deps, id);
+      mend();
+
+      expect(await headOf(place, 'main')).toBe(before);
+      expect((await mergeById(place.store, id))?.status).toBe('failed');
+    },
+  );
+
+  it('reaches the merged result once a requeued job runs', async () => {
+    const place = await world();
+    await branch(place, 'feature', { 'base.txt': 'shared\n', 'f.txt': 'work\n' });
+    const id = await submit(place, 'main', 'feature');
+    const before = await headOf(place, 'main');
+
+    const original = place.repos.updateRefs.bind(place.repos);
+    let broken = true;
+    place.repos.updateRefs = (async (name, changes) => {
+      if (broken && changes.some((change) => change.name === 'refs/heads/main')) {
+        throw new Error('the store went away');
+      }
+      return original(name, changes);
+    }) as typeof place.repos.updateRefs;
+
+    await runMerge(place.deps, id);
+    expect(await headOf(place, 'main')).toBe(before);
+
+    // Queued again, against a store that works.
+    broken = false;
+    await place.store.run("UPDATE merges SET status = 'queued' WHERE id = ?", [id]);
+    await runMerge(place.deps, id);
+
+    const job = await mergeById(place.store, id);
+    expect(job?.status).toBe('completed');
+    expect(await headOf(place, 'main')).toBe(job?.merged_sha);
   });
 });

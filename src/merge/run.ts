@@ -80,6 +80,14 @@ export async function runMerge(deps: MergeRunDeps, id: string): Promise<'done' |
     // A job cancelled while it waited never runs.
     return 'done';
   }
+  if (job.status === 'completed' || job.status === 'failed') {
+    // Already answered for: a redelivery of finished work changes
+    // nothing.
+    return 'done';
+  }
+  // A job that reads `running` is one whose runner went away before
+  // it could say otherwise. Running it again is safe, because a
+  // merge is a rebase of what the branches hold now.
 
   const workspace = await findWorkspace(deps.store, job.workspace_slug);
   if (workspace === undefined) {

@@ -15,6 +15,7 @@ import {
 } from '../../platform/cloudflare/artifacts.js';
 import { sweepBindings } from '../../store/bindings.js';
 import { expireStalledClones } from '../../jobs/copy_in.js';
+import { sweepStalledMerges } from '../../jobs/stall_sweep.js';
 import { drainJobs } from '../../jobs/drain.js';
 import { storeJobs } from '../../platform/store_jobs.js';
 import { deploymentKey, sealedSecrets } from '../../secrets/store.js';
@@ -94,6 +95,7 @@ export default {
     }
     await sweepBindings(platform.store, platform.clock.now().toISOString());
     await expireStalledClones(platform.store, platform.clock);
+    await sweepStalledMerges(platform.store, platform.clock);
 
     // The queued work runs here: a copy continues a batch at a time
     // until it is finished.
