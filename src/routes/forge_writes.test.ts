@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { workspaceScope } from '../platform/secrets.js';
-import { type Service, MOUNT, identityService, withJson } from '../testutil/app.js';
+import { type Service, MOUNT, identityService, recordedEvents, withJson } from '../testutil/app.js';
 import { type FakeForge, fakeForge } from '../testutil/fakeforge.js';
 import { seedApiKey, seedUser, seedWorkspace } from '../testutil/identity.js';
 
@@ -27,7 +27,7 @@ const ISSUE = {
 };
 
 async function world(which: 'github' | 'gitlab' = 'github') {
-  forge = fakeForge({ fallback: { status: 200, body: ISSUE } });
+  forge = fakeForge({ fallback: { status: 201, body: ISSUE } });
   service = await identityService([], { fetch: forge.fetch });
   const owner = await seedUser(service.store);
   await seedWorkspace(service.store, {
@@ -40,7 +40,7 @@ async function world(which: 'github' | 'gitlab' = 'github') {
         : 'https://gitlab.test/group/widgets.git',
   });
   await service.secrets.put(workspaceScope('mine'), 'GIT_PAT', 'a-token');
-  return { ...service, key: (await seedApiKey(service.store, owner)).presented };
+  return { ...service, owner, key: (await seedApiKey(service.store, owner)).presented };
 }
 
 const update = (held: Awaited<ReturnType<typeof world>>, body: unknown) =>
@@ -155,5 +155,93 @@ describe('a write body that breaks its route’s rules', () => {
 
     expect(response.status).toBe(400);
     expect(forge.calls().length).toBe(before);
+  });
+});
+
+describe('a body-like field over the forge’s limit', () => {
+  const TOO_LONG = 'x'.repeat(65_537);
+
+  it.each([
+    ['an issue’s body on create', 'issues', 'POST', { title: 'ok', body: TOO_LONG }],
+    ['an issue’s body on update', 'issues/12', 'PATCH', { body: TOO_LONG }],
+    ['a close’s comment', 'issues/12/close', 'POST', { comment: TOO_LONG }],
+    ['a comment’s body', 'issues/12/comments', 'POST', { body: TOO_LONG }],
+    ['a comment’s body on a pull request', 'pulls/5/comments', 'POST', { body: TOO_LONG }],
+    [
+      'a pull request’s body',
+      'pulls',
+      'POST',
+      { title: 'ok', head: 'f', base: 'main', body: TOO_LONG },
+    ],
+  ])(
+    'is refused for %s, with nothing sent and nothing recorded',
+    async (_what, path, method, body) => {
+      const held = await world();
+      const before = forge.calls().length;
+
+      const response = await held.app.request(
+        `${MOUNT}/workspaces/mine/${path}`,
+        withJson(method, body, held.key),
+      );
+      const answered = (await response.json()) as {
+        error: { message: string; error_type: string };
+      };
+
+      expect(response.status).toBe(413);
+      expect(answered.error.error_type).toBe('body_too_large');
+      expect(answered.error.message).toContain('65536');
+      expect(forge.calls().length).toBe(before);
+      expect(await recordedEvents(held.store)).toEqual([]);
+    },
+  );
+
+  it('leaves a title, a head, a base and a label name to the forge', async () => {
+    const held = await world();
+
+    const response = await held.app.request(
+      `${MOUNT}/workspaces/mine/issues`,
+      withJson('POST', { title: TOO_LONG, labels: ['x'.repeat(70_000)] }, held.key),
+    );
+
+    // The forge answered, so the service sent it: nothing here
+    // measured the title or the label.
+    expect(response.status).toBe(201);
+    expect((forge.last()?.body as { title?: string } | undefined)?.title).toHaveLength(65_537);
+  });
+
+  it('allows a body of exactly the limit, and counts characters not bytes', async () => {
+    const held = await world();
+
+    const exact = await held.app.request(
+      `${MOUNT}/workspaces/mine/issues`,
+      withJson('POST', { title: 'ok', body: 'x'.repeat(65_536) }, held.key),
+    );
+    const emoji = await held.app.request(
+      `${MOUNT}/workspaces/mine/issues`,
+      withJson('POST', { title: 'ok', body: '😀'.repeat(65_536) }, held.key),
+    );
+
+    expect([exact.status, emoji.status]).toEqual([201, 201]);
+  });
+
+  it('answers a workspace whose forge cannot be told 422, not 413', async () => {
+    const held = await world();
+    await seedWorkspace(held.store, {
+      slug: 'nameless',
+      owner_id: held.owner.id,
+      status: 'ready',
+      git_url: 'https://code.acme.test/acme/widgets.git',
+    });
+
+    const response = await held.app.request(
+      `${MOUNT}/workspaces/nameless/issues`,
+      withJson('POST', { title: 'ok', body: TOO_LONG }, held.key),
+    );
+    const answered = (await response.json()) as { error: { error_type: string } };
+
+    // The limit is the forge's, so a forge nobody can name is the
+    // answer even for a body that no forge would take.
+    expect(response.status).toBe(422);
+    expect(answered.error.error_type).toBe('forge_unknown');
   });
 });

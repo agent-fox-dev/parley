@@ -13,6 +13,7 @@ import {
   type NewPullRequest,
   isNotFound,
 } from '../forge/types.js';
+import { checkedBody } from '../forge/body_limits.js';
 import { type ForgeRouteConfig, forgeDeps } from './forge.js';
 import { apiFor } from './forge_reads.js';
 
@@ -167,6 +168,9 @@ export function forgeWriteRoutes(config: ForgeWriteConfig): RouteDefinition[] {
           : { assignees: names(asked['assignees'], 'assignees') }),
       };
       const reached = await reachedForge(forgeDeps(config), guarded);
+      // Last of all, because the limit is the forge's and the forge
+      // is only known now.
+      checkedBody(reached.target.forge, 'body', issue.body);
 
       const created = await writing(
         c,
@@ -222,6 +226,7 @@ export function forgeWriteRoutes(config: ForgeWriteConfig): RouteDefinition[] {
       if (changeable.length === 0) {
         throw new HttpError(400, 'nothing to update');
       }
+      checkedBody(reached.target.forge, 'body', changes.body);
 
       const updated = await writing(
         c,
@@ -249,6 +254,7 @@ export function forgeWriteRoutes(config: ForgeWriteConfig): RouteDefinition[] {
       const comment = optionalText(asked, 'comment') ?? '';
 
       const reached = await reachedForge(forgeDeps(config), guarded);
+      checkedBody(reached.target.forge, 'comment', comment.length === 0 ? undefined : comment);
       const api = apiFor(reached);
 
       // The comment first, and the close only if it worked: a close
@@ -284,6 +290,7 @@ export function forgeWriteRoutes(config: ForgeWriteConfig): RouteDefinition[] {
       const n = checkedNumber(c.req.param('n') ?? '');
       const said = required(body(await c.req.json().catch(() => undefined)), 'body');
 
+      checkedBody(reached.target.forge, 'body', said);
       const posted = await writing(
         c,
         config,
@@ -307,6 +314,7 @@ export function forgeWriteRoutes(config: ForgeWriteConfig): RouteDefinition[] {
       const n = checkedNumber(c.req.param('n') ?? '');
       const said = required(body(await c.req.json().catch(() => undefined)), 'body');
 
+      checkedBody(reached.target.forge, 'body', said);
       const posted = await writing(
         c,
         config,
@@ -460,6 +468,8 @@ export function forgeWriteRoutes(config: ForgeWriteConfig): RouteDefinition[] {
       };
 
       const reached = await reachedForge(forgeDeps(config), guarded);
+      checkedBody(reached.target.forge, 'body', pull.body);
+
       const opened = await writing(
         c,
         config,
