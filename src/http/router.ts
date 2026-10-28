@@ -132,9 +132,12 @@ export function buildApp(options: AppOptions = {}): Hono {
     });
   });
 
-  // Ahead of every route, so an over-sized body never reaches a handler.
+  // Ahead of every route, so an over-sized body never reaches a
+  // handler. The webhook ingress is outside it: a forge's delivery
+  // has a limit of its own, which the ingress enforces, and this
+  // one is the API's.
   app.use('*', async (c, next) => {
-    if (await bodyExceeds(c, maxBodyBytes)) {
+    if (!isIngressPath(new URL(c.req.url).pathname) && (await bodyExceeds(c, maxBodyBytes))) {
       return errorResponse(
         new HttpError(413, `the request body is larger than the ${maxBodyBytes} bytes accepted`),
       );
@@ -195,6 +198,11 @@ export function buildApp(options: AppOptions = {}): Hono {
   });
 
   return app;
+}
+
+/** The webhook ingress, which the API's limits do not apply to. */
+export function isIngressPath(path: string): boolean {
+  return path.startsWith('/hooks/');
 }
 
 /**

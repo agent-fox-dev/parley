@@ -36,6 +36,7 @@ import { forgeReadRoutes } from './forge_reads.js';
 import { forgeWriteRoutes } from './forge_writes.js';
 import { webhookRoutes } from './webhook.js';
 import { deliveryRoutes } from './deliveries.js';
+import { ingressRoutes } from './ingress.js';
 import { lastDeliveryAt } from '../webhook/log.js';
 import { eventStreamRoutes } from './events_stream.js';
 import { rebaseRoutes } from './rebase.js';
@@ -84,6 +85,14 @@ export interface ServiceRouteConfig {
  */
 export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
   return [
+    // At the server root, like the git routes: a forge is given this
+    // address to post to.
+    ...ingressRoutes({
+      store: config.store,
+      clock: config.clock,
+      ...(config.secrets === undefined ? {} : { secrets: config.secrets }),
+      ...(config.events === undefined ? {} : { events: config.events }),
+    }),
     // At the server root rather than under the mount point: a clone URL
     // is what a person types, and /api/v1 has no business in it.
     ...gitRoutes({
