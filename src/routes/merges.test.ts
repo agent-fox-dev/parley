@@ -294,3 +294,24 @@ describe('following and undoing a merge', () => {
     );
   });
 });
+
+describe('how a merge differs from every other operation', () => {
+  it('queues while a sync and an archive are refused, for the same busy workspace', async () => {
+    const place = await world();
+    const held = await place.service.locks.take(`workspace:${place.slug}`);
+
+    const merged = await call(place, '/merges', {
+      method: 'POST',
+      body: { target_branch: 'main', source_ref: 'feature' },
+    });
+    const synced = await call(place, '/sync', { method: 'POST' });
+    const archived = await call(place, '/archive', { method: 'POST' });
+    await held?.release();
+
+    // A queued job has somewhere to wait; the other two do not.
+    expect(merged.status).toBe(202);
+    expect(((await merged.json()) as { status: string }).status).toBe('queued');
+    expect(synced.status).toBe(409);
+    expect(archived.status).toBe(409);
+  });
+});
