@@ -8,7 +8,13 @@ import type { Row } from '../platform/store.js';
  * the request that asked for it: the client is given an id and reads
  * the results as they arrive.
  */
-export type RebuildStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+/**
+ * A job that failed for a reason worth retrying is dead-lettered
+ * rather than simply failed: the two are told apart because only one
+ * of them may be queued again.
+ */
+export type RebuildStatus =
+  'queued' | 'running' | 'completed' | 'failed' | 'dead_letter' | 'cancelled';
 export type RebuildStrategy = 'rebase' | 'merge';
 export type FailMode = 'fail_fast' | 'continue';
 
@@ -43,7 +49,14 @@ export interface RebuildRecord {
   finished_at: string | null;
 }
 
-export const SYSTEM = 'system';
+/**
+ * Who asked for a rebuild the hub asked itself for. The reference
+ * names the reason as well as the asker, because a follow-up and a
+ * push-triggered rebuild are both the system and a person reading the
+ * list wants to know which.
+ */
+export const STALE_SNAPSHOT = 'system:stale-snapshot';
+export const AFTER_PUSH = 'system:patch-push';
 
 const text = (value: unknown): string => (typeof value === 'string' ? value : '');
 const nullable = (value: unknown): string | null => (typeof value === 'string' ? value : null);

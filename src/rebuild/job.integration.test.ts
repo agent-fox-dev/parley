@@ -424,7 +424,7 @@ describe('what else may happen while a rebuild runs', () => {
       [],
     );
     expect(queued).toHaveLength(1);
-    expect(queued[0]?.submitted_by).toBe('system');
+    expect(queued[0]?.submitted_by).toBe('system:stale-snapshot');
     expect(queued[0]?.follow_up_of).toBe(job.id);
   });
 });

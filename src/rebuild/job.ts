@@ -17,7 +17,7 @@ import { withWorkspaceLock } from '../workspace/lock.js';
 import {
   type PatchOutcome,
   type RebuildRecord,
-  SYSTEM,
+  STALE_SNAPSHOT,
   insertRebuild,
   pendingRebuild,
   rebuildById,
@@ -356,7 +356,7 @@ async function queueFollowUp(
       workspace_slug: workspace.slug,
       strategy: (settings['rebuild_strategy'] as 'rebase' | 'merge') ?? 'rebase',
       fail_mode: (settings['rebuild_fail_mode'] as 'fail_fast' | 'continue') ?? 'fail_fast',
-      submitted_by: SYSTEM,
+      submitted_by: STALE_SNAPSHOT,
       follow_up_of: from,
     },
     deps.clock.now().toISOString(),

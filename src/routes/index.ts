@@ -19,6 +19,7 @@ import { syncRoutes } from './sync.js';
 import { recloneRoutes } from './reclone.js';
 import { branchPushRoutes } from './branch_push.js';
 import { patchRoutes } from './patches.js';
+import { rebuildRoutes } from './rebuilds.js';
 import { tokenPermissionRoutes } from './token_permissions.js';
 import { tokenRoutes } from './tokens.js';
 import { userRoutes } from './user.js';
@@ -107,6 +108,14 @@ export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
       mountPoint: config.mountPoint,
       store: config.store,
       clock: config.clock,
+    }),
+    ...rebuildRoutes({
+      mountPoint: config.mountPoint,
+      store: config.store,
+      clock: config.clock,
+      locks: config.locks,
+      ...(config.repos === undefined ? {} : { repos: config.repos }),
+      ...(config.jobs === undefined ? {} : { jobs: config.jobs }),
     }),
     ...patchRoutes({
       mountPoint: config.mountPoint,
