@@ -7,6 +7,7 @@ import { type GitAccessDeps, GitRefusal, NOT_AVAILABLE, gitAccess } from './acce
 import { negotiation, refusedService, uploadPackResponse } from './fetch.js';
 import { type Decider, type RefDecision, servePush } from './push.js';
 import { mirrorAfterPush, pushControl } from './push_control.js';
+import { protectedRefs } from './protected_refs.js';
 import { ZERO_OID } from './transport.js';
 import { FLUSH, concatBytes, encodePkt, encodeSpecial, pktError } from './pktline.js';
 
@@ -238,6 +239,7 @@ export function gitRoutes(config: GitRouteConfig): RouteDefinition[] {
           ...(config.log === undefined ? {} : { log: config.log }),
         };
         const controlled = pushControl(control);
+        const held = protectedRefs();
         const extra = config.decide;
 
         const report = await servePush({
@@ -245,11 +247,17 @@ export function gitRoutes(config: GitRouteConfig): RouteDefinition[] {
           repository: subject.repository,
           commands,
           pack,
-          // Both say their piece, and the first refusal wins: the
-          // protected namespace holds whatever the settings say.
+          // Each says its piece and the first refusal wins, so the
+          // protected namespace holds whatever the settings say and
+          // whoever is asking.
           decide: async (command): Promise<RefDecision> => {
-            const first = extra === undefined ? { accept: true as const } : await extra(command);
-            return first.accept ? controlled(command) : first;
+            for (const decider of [held, extra, controlled]) {
+              const decision = await decider?.(command);
+              if (decision !== undefined && !decision.accept) {
+                return decision;
+              }
+            }
+            return { accept: true };
           },
           afterward: mirrorAfterPush(control, commands),
         });

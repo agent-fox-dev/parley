@@ -87,6 +87,8 @@ export interface GitWorldOptions {
   decideRef?: Decider;
   /** Reaches a fork of the suite's own instead of the network. */
   fetch?: typeof fetch;
+  /** Wraps the store the service is given, to narrow what it will do. */
+  narrow?: (store: RepositoryStore) => RepositoryStore;
   /** Set on the workspace before it is served. */
   workspace?: Partial<WorkspaceRecord>;
   cleanups: Array<() => void | Promise<void>>;
@@ -98,7 +100,8 @@ export async function servedService(options: GitWorldOptions): Promise<GitWorld>
   options.cleanups.push(() => {
     rmSync(dir, { recursive: true, force: true });
   });
-  const repos = localRepositoryStore(dir);
+  const onDisk = localRepositoryStore(dir);
+  const repos = options.narrow === undefined ? onDisk : options.narrow(onDisk);
 
   // The address has to be settled before the service is built, because
   // hub_url is built from it.
