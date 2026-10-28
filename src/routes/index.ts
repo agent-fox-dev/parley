@@ -31,6 +31,7 @@ import { postmortemRoutes } from './postmortem.js';
 import { runReadRoutes } from './run_reads.js';
 import { auditQueryRoutes } from './audit_query.js';
 import { transcriptRoutes } from './transcript.js';
+import { forgeStatusRoutes } from './forge_status.js';
 import { eventStreamRoutes } from './events_stream.js';
 import { rebaseRoutes } from './rebase.js';
 import { tokenPermissionRoutes } from './token_permissions.js';
@@ -150,6 +151,15 @@ export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
           metrics: config.metrics,
           ...(config.streamLimit === undefined ? {} : { limit: config.streamLimit }),
         })),
+    ...forgeStatusRoutes({
+      mountPoint: config.mountPoint,
+      store: config.store,
+      clock: config.clock,
+      ...(config.secrets === undefined ? {} : { secrets: config.secrets }),
+      ...(config.externalUrl === undefined ? {} : { externalUrl: config.externalUrl }),
+      ...(config.fetch === undefined ? {} : { fetch: config.fetch }),
+      ...(config.events === undefined ? {} : { events: config.events }),
+    }),
     ...transcriptRoutes({
       mountPoint: config.mountPoint,
       store: config.store,

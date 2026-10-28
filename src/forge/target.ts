@@ -69,7 +69,7 @@ function urlParts(given: string): Record<string, string> | undefined {
 }
 
 /** The documented API URL of a host of each kind. */
-function defaultApiUrl(forge: ForgeName, host: string): string {
+export function defaultApiUrl(forge: ForgeName, host: string): string {
   if (forge === 'gitlab') {
     return `https://${host}/api/v4`;
   }
@@ -77,7 +77,7 @@ function defaultApiUrl(forge: ForgeName, host: string): string {
 }
 
 /** Which forge a name belongs to, where its spelling says so. */
-function named(value: string): ForgeName | undefined {
+export function named(value: string): ForgeName | undefined {
   const lowered = value.toLowerCase();
   if (lowered.includes('github')) {
     return 'github';
@@ -88,9 +88,11 @@ function named(value: string): ForgeName | undefined {
 /**
  * An API URL setting, checked as the reference requires. The value is
  * never in the refusal: it is a setting an operator typed, and the
- * rule is what they need told, not what they typed.
+ * rule is what they need told, not what they typed. The description
+ * route checks a setting without resolving a forge, so this is
+ * exported for it.
  */
-function checkedSetting(setting: string, settingName: string): URL {
+export function checkedSetting(setting: string, settingName: string): URL {
   let url: URL;
   try {
     url = new URL(setting);
