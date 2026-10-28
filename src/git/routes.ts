@@ -8,6 +8,7 @@ import { negotiation, refusedService, uploadPackResponse } from './fetch.js';
 import { type Decider, type RefDecision, servePush } from './push.js';
 import { mirrorAfterPush, pushControl } from './push_control.js';
 import { protectedRefs } from './protected_refs.js';
+import { headRef, refreshHead } from './after_push.js';
 import { ZERO_OID } from './transport.js';
 import { FLUSH, concatBytes, encodePkt, encodeSpecial, pktError } from './pktline.js';
 
@@ -46,8 +47,8 @@ const PUSH_CAPABILITIES = 'report-status delete-refs object-format=sha1 agent=pa
 /** The ref advertisement, as git's own server writes it. */
 export function advertisement(service: string, refs: readonly StoredRef[]): Uint8Array {
   const capabilities = service === RECEIVE_PACK ? PUSH_CAPABILITIES : FETCH_CAPABILITIES;
-  const branch = defaultBranch(refs);
-  const head = refs.find((ref) => ref.name === `refs/heads/${branch}`);
+  const head = headRef(refs);
+  const branch = head === undefined ? '' : head.name.slice('refs/heads/'.length);
   const lines: Uint8Array[] = [encodePkt(`# service=${service}\n`), encodeSpecial(FLUSH)];
 
   // HEAD is advertised for a fetch alone: a push needs no default
@@ -73,19 +74,6 @@ export function advertisement(service: string, refs: readonly StoredRef[]): Uint
   }
   lines.push(encodeSpecial(FLUSH));
   return concatBytes(lines);
-}
-
-/** Which branch HEAD follows: the repository's main, else its first. */
-function defaultBranch(refs: readonly StoredRef[]): string {
-  const heads = refs
-    .filter((ref) => ref.name.startsWith('refs/heads/'))
-    .map((ref) => ref.name.slice('refs/heads/'.length));
-  return (
-    heads.find((name) => name === 'main') ??
-    heads.find((name) => name === 'master') ??
-    heads[0] ??
-    ''
-  );
 }
 
 /**
@@ -259,7 +247,18 @@ export function gitRoutes(config: GitRouteConfig): RouteDefinition[] {
             }
             return { accept: true };
           },
-          afterward: mirrorAfterPush(control, commands),
+          afterward: async (outcomes) => {
+            // The refresh first, because a mirror is best effort and
+            // head_sha is what every client reads.
+            await refreshHead({
+              store: config.store,
+              repos: subject.repos,
+              repository: subject.repository,
+              slug: subject.workspace.slug,
+              clock: config.clock,
+            })(outcomes);
+            await mirrorAfterPush(control, commands)(outcomes);
+          },
         });
         return new Response(report as BodyInit, {
           headers: { 'content-type': served, 'cache-control': 'no-cache' },

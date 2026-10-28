@@ -128,3 +128,51 @@ describe.skipIf(missing.length > 0)(
     });
   },
 );
+
+describe.skipIf(missing.length > 0)(
+  `the workspace after a push${missing.length > 0 ? ` (needs ${missing.join(' and ')})` : ''}`,
+  () => {
+    it.each([
+      ['every ref accepted', ['welcome']],
+      ['one ref of two refused', ['welcome', 'no-thank-you']],
+      ['every ref refused', ['no-thank-you']],
+    ])('refreshes head_sha when %s', async (_what, branches) => {
+      const refused = 'refs/heads/no-thank-you';
+      const world = await servedService({
+        cleanups,
+        decideRef: (command) =>
+          Promise.resolve(
+            command.name === refused
+              ? { accept: false as const, reason: 'this branch is not wanted here' }
+              : { accept: true as const },
+          ),
+      });
+      const cloned = await gitClone(withCredential(world.url, world.credential), cleanups);
+
+      // The head moves, so a stale head_sha would be visible.
+      await gitRun('git', ['-C', cloned.dir, 'commit', '-q', '--allow-empty', '-m', 'on main'], {
+        env: { ...GIT_ENV, ...AUTHORED },
+      });
+      for (const branch of branches) {
+        await gitRun('git', ['-C', cloned.dir, 'checkout', '-q', '-B', branch, 'main'], {
+          env: GIT_ENV,
+        });
+        await gitRun('git', ['-C', cloned.dir, 'commit', '-q', '--allow-empty', '-m', branch], {
+          env: { ...GIT_ENV, ...AUTHORED },
+        });
+      }
+      await push(cloned.dir, ['main', ...branches]);
+
+      const read = await world.service.app.request(`/api/v1/workspaces/${world.workspace.slug}`, {
+        headers: { authorization: `Bearer ${world.credential}` },
+      });
+      const reported = (await read.json()) as { head_sha: string | null };
+      const stored = (await world.repos.listRefs(world.repository)).find(
+        (ref) => ref.name === 'refs/heads/main',
+      );
+
+      expect(reported.head_sha).toBe(stored?.oid);
+      expect(reported.head_sha).not.toBeNull();
+    });
+  },
+);
