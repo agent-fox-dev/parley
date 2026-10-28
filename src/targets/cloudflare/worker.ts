@@ -64,6 +64,7 @@ export default {
           metrics: platform.metrics,
           providers: configuredProviders(platform.config),
           locks: platform.locks,
+          ...(adminToken === undefined ? {} : { adminToken }),
           ...(env.ARTIFACTS === undefined
             ? {}
             : { repos: artifactsRepositoryStore(env.ARTIFACTS as ArtifactsBinding) }),

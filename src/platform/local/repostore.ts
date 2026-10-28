@@ -47,6 +47,68 @@ function writeObject(repo: string, object: PackedObject): void {
   );
 }
 
+/**
+ * Every object reachable from a set of starting points: the commits
+ * behind them, the trees those commits hold and the blobs in the trees.
+ * An object the repository does not hold ends that line of the walk,
+ * because a client may well name a commit this store never saw.
+ */
+function reachableFrom(
+  roots: readonly string[],
+  held: (oid: string) => PackedObject | undefined,
+): Set<string> {
+  const found = new Set<string>();
+  const pending = [...roots];
+
+  while (pending.length > 0) {
+    const oid = pending.pop() ?? '';
+    if (found.has(oid)) {
+      continue;
+    }
+    const object = held(oid);
+    if (object === undefined) {
+      continue;
+    }
+    found.add(oid);
+    pending.push(...referencedBy(object));
+  }
+  return found;
+}
+
+/** The object ids one object names: a commit's, a tree's or a tag's. */
+function referencedBy(object: PackedObject): string[] {
+  if (object.type === 'blob') {
+    return [];
+  }
+  if (object.type === 'tree') {
+    return treeEntries(object.data);
+  }
+
+  // A commit's and a tag's headers end at the first blank line.
+  const text: string = Buffer.from(object.data).toString('latin1');
+  const blank = text.indexOf('\n\n');
+  const header: string = blank === -1 ? text : text.slice(0, blank);
+  return header
+    .split('\n')
+    .map((line) => /^(?:tree|parent|object) ([0-9a-f]{40})$/.exec(line)?.[1])
+    .filter((oid): oid is string => oid !== undefined);
+}
+
+/** The object ids a tree holds, read from its binary entries. */
+function treeEntries(data: Uint8Array): string[] {
+  const oids: string[] = [];
+  let at = 0;
+  while (at < data.byteLength) {
+    const nul = data.indexOf(0, at);
+    if (nul === -1 || nul + 21 > data.byteLength) {
+      break;
+    }
+    oids.push(Buffer.from(data.subarray(nul + 1, nul + 21)).toString('hex'));
+    at = nul + 21;
+  }
+  return oids;
+}
+
 function readStored(repo: string, oid: string): PackedObject | undefined {
   try {
     const raw = readFileSync(join(objectsPath(repo), oid));
@@ -163,14 +225,29 @@ export function localRepositoryStore(
       await this.updateRefs(name, changes);
     },
 
-    async servePack(name: string, wants: readonly string[]): Promise<Uint8Array> {
+    async servePack(
+      name: string,
+      wants: readonly string[],
+      haves: readonly string[] = [],
+    ): Promise<Uint8Array> {
       present(name);
-      // Every object the repository holds. A pack may carry more than was
-      // asked for; narrowing it to what is reachable from the wants is
-      // object-level work, and belongs to the history engine.
-      void wants;
-      const objects = readdirSync(objectsPath(repoPath(name)))
-        .map((oid) => readStored(repoPath(name), oid))
+      const held = (oid: string) => readStored(repoPath(name), oid);
+
+      // With nothing asked for, everything: that is how a repository is
+      // read in whole, and what hydration wants.
+      if (wants.length === 0) {
+        const objects = readdirSync(objectsPath(repoPath(name)))
+          .map((oid) => held(oid))
+          .filter((object): object is PackedObject => object !== undefined);
+        return Promise.resolve(writePack(objects));
+      }
+
+      // What the client already has is not sent again, which is the
+      // whole point of the negotiation it just made.
+      const known = reachableFrom(haves, held);
+      const sending = [...reachableFrom(wants, held)].filter((oid) => !known.has(oid));
+      const objects = sending
+        .map((oid) => held(oid))
         .filter((object): object is PackedObject => object !== undefined);
       return Promise.resolve(writePack(objects));
     },

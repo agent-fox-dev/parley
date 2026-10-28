@@ -36,6 +36,15 @@ type IdentityContext = Context<{ Variables: { identity: Identity } }>;
 const UNAUTHENTICATED = 'authentication required';
 
 /** The routes served to a caller who presents nothing. */
+/**
+ * The git routes, which authenticate their own clients so that every
+ * refusal reaches the client as pkt-line rather than as the envelope a
+ * git client cannot read.
+ */
+export function isGitPath(path: string): boolean {
+  return path === '/git' || path.startsWith('/git/');
+}
+
 export function isPublicPath(path: string, mountPoint: string): boolean {
   return (
     (SERVER_ROUTE_PATHS as readonly string[]).includes(path) ||
@@ -52,8 +61,9 @@ export function isPublicPath(path: string, mountPoint: string): boolean {
  */
 export function authentication(options: AuthOptions): MiddlewareHandler {
   return async (c, next) => {
-    if (!isPublicPath(new URL(c.req.url).pathname, options.mountPoint)) {
-      const identity = await identify(c.req.header('authorization'), options);
+    const path = new URL(c.req.url).pathname;
+    if (!isPublicPath(path, options.mountPoint) && !isGitPath(path)) {
+      const identity = await identifyCredential(c.req.header('authorization'), options);
       if (identity === undefined) {
         record(options.log, c, 401);
         return errorResponse(new HttpError(401, UNAUTHENTICATED));
@@ -91,7 +101,12 @@ export function scopeRefusal(c: Context, scope: string, hidden = false): Respons
   );
 }
 
-async function identify(
+/**
+ * Who a credential belongs to, or nobody. The git routes identify their
+ * own clients, in git's framing rather than the JSON envelope, so they
+ * reach this directly rather than through the middleware.
+ */
+export async function identifyCredential(
   header: string | undefined,
   options: AuthOptions,
 ): Promise<Identity | undefined> {

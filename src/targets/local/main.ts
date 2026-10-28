@@ -50,6 +50,7 @@ export function buildLocalApp(env: Record<string, string | undefined>) {
       metrics: platform.metrics,
       providers: configuredProviders(platform.config),
       locks: platform.locks,
+      ...(adminToken === undefined ? {} : { adminToken }),
       repos: localRepositoryStore(platform.config.get('PARLEY_REPO_PATH') ?? 'repositories'),
     }),
     auth: {

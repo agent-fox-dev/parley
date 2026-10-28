@@ -34,6 +34,18 @@ function repos(): RepositoryStore {
 }
 
 /** The engine's merge, built over the same history the git harness builds. */
+/**
+ * Points a ref of this suite's own at a commit the engine made. The
+ * engine keeps its result under one ref, which the next operation
+ * overwrites, so a caller that goes on using a result keeps it itself.
+ */
+async function kept(store: RepositoryStore, oid: string): Promise<string> {
+  await store.updateRefs(REPO, [
+    { name: `refs/hub/fixtures/${oid}`, oldOid: null, newOid: oid, force: true },
+  ]);
+  return oid;
+}
+
 async function engineMergeTree(
   root: Snapshot,
   oursCommits: Snapshot[],
@@ -64,7 +76,7 @@ async function engineMergeTree(
       author: AUTHOR,
       message: 'cross into topic',
     });
-    theirs = intoTopic.commit ?? theirs;
+    theirs = await kept(store, intoTopic.commit ?? theirs);
     const earlier = theirsHistory.at(-2) ?? rootCommit.oid;
     const intoMain = await engine.mergeCommit({
       repository: REPO,
@@ -73,7 +85,7 @@ async function engineMergeTree(
       author: AUTHOR,
       message: 'cross into main',
     });
-    ours = intoMain.commit ?? ours;
+    ours = await kept(store, intoMain.commit ?? ours);
   }
 
   const result = await engine.mergeCommit({

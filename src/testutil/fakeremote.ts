@@ -33,6 +33,8 @@ export interface FakeRemote {
   put: (ref: string, content: string) => Promise<string>;
   /** Every ref the remote now holds. */
   refs: () => Promise<Array<{ name: string; oid: string }>>;
+  /** Every ref command the remote was pushed, in order. */
+  pushed: () => Array<{ oldOid: string; newOid: string; name: string }>;
   requests: () => number;
   dispose: () => void;
 }
@@ -91,6 +93,7 @@ export function fakeRemote(options: FakeRemoteOptions = {}): FakeRemote {
   const store: RepositoryStore = localRepositoryStore(root);
   const name = 'origin';
   const seen: string[] = [];
+  const pushed: Array<{ oldOid: string; newOid: string; name: string }> = [];
   let requests = 0;
   const ready = store.create(name);
 
@@ -121,6 +124,7 @@ export function fakeRemote(options: FakeRemoteOptions = {}): FakeRemote {
 
     if (url.endsWith('/git-receive-pack')) {
       const body = new Uint8Array((init?.body ?? new Uint8Array()) as ArrayBuffer);
+      pushed.push(...commandsIn(body).commands);
       return receive(store, name, options, body);
     }
 
@@ -177,6 +181,7 @@ export function fakeRemote(options: FakeRemoteOptions = {}): FakeRemote {
       ]);
       return oid;
     },
+    pushed: () => [...pushed],
     dispose: () => {
       rmSync(root, { recursive: true, force: true });
     },

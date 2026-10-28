@@ -8,6 +8,7 @@ import { storeLocks } from '../platform/store_lock.js';
 import type { SecretStore } from '../platform/secrets.js';
 import type { RepositoryStore } from '../platform/repostore.js';
 import type { JobQueue } from '../platform/jobs.js';
+import type { Decider } from '../git/push.js';
 import { freshStore, seedClock } from './identity.js';
 import { providerIdentity, stubDirectory } from './oauth.js';
 
@@ -31,7 +32,15 @@ export interface Service {
  */
 export async function identityService(
   extra: RouteDefinition[] = [],
-  options: { repos?: RepositoryStore; jobs?: JobQueue; fetch?: typeof fetch } = {},
+  options: {
+    repos?: RepositoryStore;
+    jobs?: JobQueue;
+    fetch?: typeof fetch;
+    /** Overridden where a suite serves the app at an address of its own. */
+    externalUrl?: string;
+    /** What the service makes of each ref of a git push. */
+    decideRef?: Decider;
+  } = {},
 ): Promise<Service> {
   const seeded = await freshStore();
   const clock = seedClock();
@@ -50,11 +59,13 @@ export async function identityService(
         providers: stubDirectory({ codes: { 'a-code': providerIdentity() } }),
         secrets,
         secretCipher,
-        externalUrl: EXTERNAL_URL,
+        externalUrl: options.externalUrl ?? EXTERNAL_URL,
         ...(options.repos === undefined ? {} : { repos: options.repos }),
         ...(options.jobs === undefined ? {} : { jobs: options.jobs }),
         ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
         locks: storeLocks(seeded.store, clock),
+        adminToken: ADMIN_TOKEN,
+        ...(options.decideRef === undefined ? {} : { decideRef: options.decideRef }),
       }),
       ...extra,
     ],

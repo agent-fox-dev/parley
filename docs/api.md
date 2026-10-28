@@ -26,6 +26,7 @@ implemented; routes appear here as they are built.
 - [Secrets](#secrets)
 - [Variables](#variables)
 - [Sandboxes](#sandboxes)
+- [Git Server](#git-server)
 - [Server Endpoints](#server-endpoints)
 
 ## Conventions
@@ -836,6 +837,79 @@ credential is the earlier answer, and it carries no `error_type`.
 The routes are registered rather than left unrouted, because an unrouted
 path answers `404` with no `error_type`, which clients tell apart from a
 deployment that has sandboxes switched off.
+
+## Git Server
+
+Each workspace's repository is served over git's smart HTTP protocol at the
+server root, outside the mount point, because a clone URL is what a person
+types:
+
+```
+<external_url>/git/<org-slug>/<workspace-slug>.git
+```
+
+That address is exactly what the workspace reports as its `hub_url`, and it
+is null for a workspace with no organization or a deployment with no
+external URL. The `.git` suffix is required.
+
+Three paths are served:
+
+| Route                                                    | What it is                                                 |
+| -------------------------------------------------------- | ---------------------------------------------------------- |
+| `GET /git/:org/:repo/info/refs?service=git-upload-pack`  | the ref advertisement for a fetch                          |
+| `GET /git/:org/:repo/info/refs?service=git-receive-pack` | the ref advertisement for a push, which needs write access |
+| `POST /git/:org/:repo/git-upload-pack`                   | a fetch                                                    |
+| `POST /git/:org/:repo/git-receive-pack`                  | a push                                                     |
+
+**Authentication is HTTP Basic.** The password is a hub credential — an API
+key, a personal access token or the admin token — and the username is
+ignored. A request with no credential is answered `401` with
+`WWW-Authenticate: Basic realm="Parley"`, which is what makes a git
+credential helper offer its key.
+
+**Every refusal is pkt-line**, not the JSON envelope, with `text/plain` as
+its content type: that is the shape in which a git client renders the
+message to the person. The refusals are:
+
+| Status | Message                                               |
+| ------ | ----------------------------------------------------- |
+| 401    | `authentication required`                             |
+| 403    | `org members have read-only access to this workspace` |
+| 403    | `invalid or missing service parameter`                |
+| 403    | `this token does not hold git:read` (or `git:write`)  |
+| 404    | `repository not found`                                |
+| 409    | `repository not available`                            |
+| 503    | `repository not available`                            |
+
+**Who may do what.** The owner and the admin token fetch and push; a member
+of the workspace's organization fetches and is refused a push; everyone
+else, and a token bound to another workspace, is told the repository was
+not found. The checks run in that order: the workspace and its
+organization, then whether the repository is ready, then access, then the
+token's git scopes — so a member's push is refused for being a member
+whatever scopes the token holds.
+
+**The protocol version is 0**, and a client that asks for version 2 falls
+back to it. Version 2's negotiation expects the server to remember what it
+acknowledged between one request and the next; see ADR 10 for the
+measurements. A gzip-encoded request body is accepted.
+
+**A push is decided one ref at a time**, before any of it reaches the
+store, and the client receives git's per-ref report covering every ref it
+sent. A ref may be refused while the rest of the same push lands:
+
+- Nothing under `refs/hub/replaced/` may be created, updated or deleted, on
+  any workspace, with any credential; the ref is reported
+  `ng <ref> refs/hub/replaced/ is maintained by the hub and cannot be
+pushed to`.
+- On a `carry_patch` workspace, an update of a registered patch branch
+  follows the workspace's `patch_branch_source` and
+  `push_patches_to_origin` settings: refused with the address to push to
+  instead, forwarded to the fork and taken only if the fork takes it, taken
+  and then mirrored to the fork, or simply taken.
+
+**After every push**, including one whose every ref was refused, the
+workspace's `head_sha` is refreshed from the repository.
 
 ## Server Endpoints
 

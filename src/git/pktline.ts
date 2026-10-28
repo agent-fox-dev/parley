@@ -94,3 +94,26 @@ export function decodePktLines(bytes: Uint8Array): PktLine[] {
 export function textOf(line: PktLine): string {
   return line.kind === 'data' ? decoder.decode(line.payload) : '';
 }
+
+/**
+ * A refusal in git's own framing.
+ *
+ * The content type is text/plain and not one of git's own, which was
+ * measured rather than guessed (ADR 10): git renders the body of a
+ * refusal as `remote:` lines only for text/plain, and shows nothing but
+ * the status code for its own content types.
+ */
+export function pktError(
+  status: number,
+  message: string,
+  headers: Record<string, string> = {},
+): Response {
+  return new Response(encodePkt(`ERR ${message}\n`) as BodyInit, {
+    status,
+    headers: {
+      'content-type': 'text/plain; charset=utf-8',
+      'cache-control': 'no-cache',
+      ...headers,
+    },
+  });
+}

@@ -185,6 +185,22 @@ export const MIGRATIONS: readonly Migration[] = [
       'CREATE INDEX resolutions_by_path ON resolutions (repository, path)',
     ],
   },
+  {
+    // What the git server needs to know a patch branch when it sees
+    // one. The patches themselves — their order, their status, whether
+    // they landed upstream — belong to the carry-patch package, which
+    // adds those columns when it needs them.
+    name: '009_patches',
+    statements: [
+      `CREATE TABLE patches (
+         workspace_slug TEXT NOT NULL,
+         name TEXT NOT NULL,
+         deleted_at TEXT,
+         created_at TEXT NOT NULL,
+         PRIMARY KEY (workspace_slug, name)
+       )`,
+    ],
+  },
 ];
 
 /**
