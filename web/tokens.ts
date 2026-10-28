@@ -1,4 +1,15 @@
-/*
+/**
+ * The one place the interface decides what anything looks like.
+ *
+ * It is TypeScript rather than a `.css` file because the Worker
+ * target has no file system to read one from and no bundler to
+ * inline it: the stylesheet is served by a route, from here (ADR
+ * 13). Every page draws its type, its spacing and its colours from
+ * these custom properties — a literal in a page is a value that
+ * drifts from the rest of the interface the first time anybody
+ * changes it.
+ */
+export const TOKENS = `/*
  * The one place the interface decides what anything looks like.
  *
  * Every page draws its type, its spacing and its colours from these
@@ -345,3 +356,4 @@ code,
     gap: var(--space-1) 0;
   }
 }
+`;

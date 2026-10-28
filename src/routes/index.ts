@@ -37,6 +37,7 @@ import { forgeWriteRoutes } from './forge_writes.js';
 import { webhookRoutes } from './webhook.js';
 import { deliveryRoutes } from './deliveries.js';
 import { ingressRoutes } from './ingress.js';
+import { webRoutes } from './web.js';
 import { lastDeliveryAt } from '../webhook/log.js';
 import { eventStreamRoutes } from './events_stream.js';
 import { rebaseRoutes } from './rebase.js';
@@ -85,6 +86,14 @@ export interface ServiceRouteConfig {
  */
 export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
   return [
+    // The web interface, at the server root: a person types an
+    // address, and /api/v1 has no business in it.
+    ...webRoutes({
+      store: config.store,
+      clock: config.clock,
+      providers: config.providers,
+      mountPoint: config.mountPoint,
+    }),
     // At the server root, like the git routes: a forge is given this
     // address to post to.
     ...ingressRoutes({

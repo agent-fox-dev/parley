@@ -8,7 +8,7 @@ import { describe, expect, it } from 'vitest';
  * from the rest the first time somebody changes either, so the
  * tokens are the only source and the pages are checked against it.
  */
-const tokens = readFileSync('web/tokens.css', 'utf8');
+const tokens = readFileSync('web/tokens.ts', 'utf8');
 
 /** Every custom property the token file defines. */
 function defined(): string[] {

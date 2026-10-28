@@ -46,6 +46,22 @@ export function isIngressPath(path: string): boolean {
   return path.startsWith('/hooks/');
 }
 
+/**
+ * The web interface, which a person reaches with a browser session
+ * rather than a bearer credential. Its own routes decide what a
+ * visitor without one is shown.
+ */
+export function isWebPath(path: string): boolean {
+  return (
+    path === '/' ||
+    path === '/dashboard' ||
+    path === '/signout' ||
+    path.startsWith('/web/') ||
+    path.startsWith('/signin') ||
+    path.startsWith('/workspaces/')
+  );
+}
+
 export function isGitPath(path: string): boolean {
   return path === '/git' || path.startsWith('/git/');
 }
@@ -67,7 +83,12 @@ export function isPublicPath(path: string, mountPoint: string): boolean {
 export function authentication(options: AuthOptions): MiddlewareHandler {
   return async (c, next) => {
     const path = new URL(c.req.url).pathname;
-    if (!isPublicPath(path, options.mountPoint) && !isGitPath(path) && !isIngressPath(path)) {
+    if (
+      !isPublicPath(path, options.mountPoint) &&
+      !isGitPath(path) &&
+      !isIngressPath(path) &&
+      !isWebPath(path)
+    ) {
       const identity = await identifyCredential(c.req.header('authorization'), options);
       if (identity === undefined) {
         record(options.log, c, 401);
