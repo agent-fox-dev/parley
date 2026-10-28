@@ -60,7 +60,7 @@
         "src/webhook/secret.ts",
         "docs/adr/"
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 2,
