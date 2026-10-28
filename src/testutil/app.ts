@@ -95,7 +95,12 @@ export async function identityService(
         store: seeded.store,
         clock,
         metrics: inMemoryMetrics(),
-        providers: stubDirectory({ codes: { 'a-code': providerIdentity() } }),
+        providers: stubDirectory({
+          codes: {
+            'a-code': providerIdentity(),
+            'b-code': providerIdentity({ username: 'bob', provider_id: '67890' }),
+          },
+        }),
         secrets,
         secretCipher,
         externalUrl: options.externalUrl ?? EXTERNAL_URL,

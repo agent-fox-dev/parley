@@ -38,6 +38,7 @@ import { webhookRoutes } from './webhook.js';
 import { deliveryRoutes } from './deliveries.js';
 import { ingressRoutes } from './ingress.js';
 import { webRoutes } from './web.js';
+import { webAuthRoutes } from './web_auth.js';
 import { lastDeliveryAt } from '../webhook/log.js';
 import { eventStreamRoutes } from './events_stream.js';
 import { rebaseRoutes } from './rebase.js';
@@ -88,6 +89,12 @@ export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
   return [
     // The web interface, at the server root: a person types an
     // address, and /api/v1 has no business in it.
+    ...webAuthRoutes({
+      mountPoint: config.mountPoint,
+      store: config.store,
+      clock: config.clock,
+      providers: config.providers,
+    }),
     ...webRoutes({
       store: config.store,
       clock: config.clock,

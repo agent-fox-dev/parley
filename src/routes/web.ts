@@ -3,6 +3,8 @@ import type { RouteDefinition } from '../http/router.js';
 import type { Clock, RelationalStore } from '../platform/index.js';
 import type { ProviderDirectory } from '../auth/oauth.js';
 import { renderLanding } from '../../web/render.js';
+import { sessionFrom, signedInUserId } from '../../web/session.js';
+import { findUser } from '../store/identity.js';
 import { TOKENS } from '../../web/tokens.js';
 
 /**
@@ -27,6 +29,28 @@ export function page(body: string, status = 200): Response {
     status,
     headers: { 'content-type': 'text/html; charset=UTF-8' },
   });
+}
+
+/**
+ * Who is reading, where anybody is. A session that has expired or
+ * been signed out is nobody, which is what makes the landing page
+ * the answer rather than an error.
+ */
+export async function viewer(
+  c: Context,
+  config: WebRouteConfig,
+): Promise<{ id: string; username: string } | undefined> {
+  // A request another site made carries the cookie but is not the
+  // person: a browser says so, and the interface takes its word.
+  if (c.req.header('sec-fetch-site') === 'cross-site') {
+    return undefined;
+  }
+  const userId = await signedInUserId(config.store, config.clock, sessionFrom(c.req.raw.headers));
+  if (userId === undefined) {
+    return undefined;
+  }
+  const user = await findUser(config.store, userId);
+  return user === undefined ? undefined : { id: user.id, username: user.username };
 }
 
 function landing(c: Context, config: WebRouteConfig): Response {

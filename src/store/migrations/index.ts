@@ -483,6 +483,22 @@ export const MIGRATIONS: readonly Migration[] = [
       'CREATE INDEX deliveries_by_received ON forge_deliveries (workspace_slug, received_at)',
     ],
   },
+  {
+    // A browser's session, which is not an API key: the API's own
+    // sign-in revokes every key a person holds, and opening a
+    // dashboard must not do that to the key an agent is using.
+    name: '018_web_sessions',
+    statements: [
+      `CREATE TABLE web_sessions (
+         id TEXT PRIMARY KEY,
+         user_id TEXT NOT NULL,
+         secret_hash TEXT NOT NULL UNIQUE,
+         created_at TEXT NOT NULL,
+         expires_at TEXT NOT NULL
+       )`,
+      'CREATE INDEX web_sessions_by_user ON web_sessions (user_id)',
+    ],
+  },
 ];
 
 /**
