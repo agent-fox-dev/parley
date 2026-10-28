@@ -26,6 +26,12 @@ export interface FakeRemoteOptions {
 
 export interface FakeRemote {
   url: string;
+  /** The repository behind it, so a suite can build real history in it. */
+  store: RepositoryStore;
+  /** What that repository is called in the store. */
+  repository: string;
+  /** Resolves once the repository exists. */
+  ready: Promise<void>;
   fetch: typeof fetch;
   /** Every Authorization header the remote was sent. */
   seen: () => string[];
@@ -164,6 +170,9 @@ export function fakeRemote(options: FakeRemoteOptions = {}): FakeRemote {
 
   return {
     url: 'https://forge.test/owner/repo.git',
+    store,
+    repository: name,
+    ready: ready.then(() => undefined),
     fetch: (async (input: string | URL | Request, init?: RequestInit) =>
       serve(String(input), init)) as unknown as typeof fetch,
     seen: () => [...seen],

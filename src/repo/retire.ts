@@ -25,6 +25,24 @@ export async function pushOutOnArchive(
   repos: RepositoryStore,
   request: PushOutRequest,
 ): Promise<'released' | 'kept'> {
+  const sent = await pushBranchesOut(repos, request);
+  if (sent === 'kept') {
+    return 'kept';
+  }
+  await repos.remove(request.repository);
+  return 'released';
+}
+
+/**
+ * Sends every branch origin does not already have, and says whether
+ * all of them arrived. It decides nothing about the repository itself:
+ * archiving lets a repository go only when everything reached origin,
+ * and a reclone discards it either way.
+ */
+export async function pushBranchesOut(
+  repos: RepositoryStore,
+  request: PushOutRequest,
+): Promise<'sent' | 'kept'> {
   if (request.credential === undefined) {
     request.log?.info?.('kept a repository because the workspace has no usable credential', {
       repository: request.repository,
@@ -36,7 +54,7 @@ export async function pushOutOnArchive(
     ref.name.startsWith('refs/heads/'),
   );
   if (branches.length === 0) {
-    return 'released';
+    return 'sent';
   }
 
   const authorization = authorizationFor(request.credential);
@@ -79,8 +97,7 @@ export async function pushOutOnArchive(
     return 'kept';
   }
 
-  await repos.remove(request.repository);
-  return 'released';
+  return 'sent';
 }
 
 /** Takes a workspace's repository away with the workspace itself. */

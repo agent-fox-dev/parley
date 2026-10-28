@@ -26,6 +26,7 @@ implemented; routes appear here as they are built.
 - [Secrets](#secrets)
 - [Variables](#variables)
 - [Sandboxes](#sandboxes)
+- [Keeping a workspace and its remote in step](#keeping-a-workspace-and-its-remote-in-step)
 - [Git Server](#git-server)
 - [Server Endpoints](#server-endpoints)
 
@@ -837,6 +838,80 @@ credential is the earlier answer, and it carries no `error_type`.
 The routes are registered rather than left unrouted, because an unrouted
 path answers `404` with no `error_type`, which clients tell apart from a
 deployment that has sandboxes switched off.
+
+## Keeping a workspace and its remote in step
+
+Three routes close the loop in both directions. All three take
+`workspaces:write` and write access, all three take the workspace lock
+without waiting — a held lock is `409` with `error_type`
+`workspace_busy` — and no answer of any of them carries the stored
+credential, the userinfo of `git_url` or the git library's own words.
+
+### POST /api/v1/workspaces/:slug/sync
+
+Brings origin's work in. The workspace must be `ready` with its
+`sync_enabled` setting true, or the answer is `400` and origin is not
+contacted.
+
+| Outcome                           | Status | What the workspace records                               |
+| --------------------------------- | ------ | -------------------------------------------------------- |
+| Up to date                        | 200    | `last_sync_at` moves; `head_sha` does not                |
+| Fast-forward                      | 200    | `head_sha` and `upstream_head_sha` move to origin's head |
+| Reset (`?reset_to_upstream=true`) | 200    | the same, whatever the ancestry                          |
+| Diverged                          | 409    | `sync_error` names `reset_to_upstream` as the recovery   |
+| Fetch failure                     | 502    | `sync_error` says what origin did                        |
+| Cancelled                         | 504    | `sync_error` says it was cancelled                       |
+
+`sync_error` is the workspace's present condition, not a log: the next
+successful sync clears it. A sync in progress is not a stored state —
+the status reads `ready` throughout, and a second sync is refused by
+the lock.
+
+A `carry_patch` workspace fetches upstream and works on its patch list
+instead; that is the carry-patch package's, and until it lands such a
+sync answers `501`.
+
+### POST /api/v1/workspaces/:slug/reclone
+
+Pushes out what the repository holds that origin does not, discards the
+repository and copies it again. The push is best effort: a repository
+too broken to read is what the route is for, and its failure is not the
+route's answer. The workspace returns to `pending` with `sync_error`
+and `upstream_head_sha` cleared, and follows the new copy.
+
+`400` for an archived workspace, `409` where a copy is already under
+way, `500` where the repository cannot be discarded or the workspace
+cannot be updated — and in that case nothing changes.
+
+### POST /api/v1/workspaces/:slug/branches/:name/push
+
+Sends exactly `refs/heads/<name>` to `refs/heads/<name>` on origin,
+fast-forward only unless `{"force": true}` is given. `:name` is one
+path segment with each `/` escaped, decoded exactly once: `fix%2F42`
+names `fix/42` and `a%2525b` names `a%25b`.
+
+The checks run in this order, and the order is the behaviour: the
+credential, then a PAT's scope before the workspace is looked up; the
+workspace and write access; the body, then the name; readiness; the
+branches this route will not send; the lock; then the protections that
+need the repository; then the push.
+
+A success is `200` with `branch`, `sha`, `remote`, `remote_url` without
+userinfo, and `result` — `up_to_date`, `forced` or `pushed`. The push is
+handed to the platform's execution context before it is awaited, so it
+finishes even where the caller goes away.
+
+Every refusal of this route repeats its own type at the start of the
+message, because the CLI shows the message and nothing else:
+
+| Status | `error_type`                                                                   |
+| ------ | ------------------------------------------------------------------------------ |
+| 400    | `integration_branch`, `patch_branch`, `protected_branch`                       |
+| 404    | `branch_not_found`, `forge_not_found`                                          |
+| 409    | `workspace_busy`, `non_fast_forward`                                           |
+| 422    | `forge_rejected`                                                               |
+| 502    | `forge_unauthenticated`, `forge_forbidden`, `forge_unreachable`, `forge_error` |
+| 504    | `forge_timeout`                                                                |
 
 ## Git Server
 
