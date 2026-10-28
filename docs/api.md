@@ -737,6 +737,23 @@ service did not expect cannot carry it into a log.
 
 The access needed is `secrets:read` to read and `secrets:write` to change.
 
+### Reserved secret names
+
+Four names at a **workspace's** scope are read by the service itself, for
+the git remotes a workspace follows. They are ordinary secrets in every
+other respect; nothing outside the workspace's own scope is consulted for
+them, so neither the owner's nor the organization's secret of the same
+name has any effect.
+
+| Remote                                                  | Looked for, in order                                                     |
+| ------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `origin` (the workspace's `git_url`)                    | `GIT_PAT`, else `GIT_USERNAME` with `GIT_PASSWORD`, else none            |
+| `upstream` (a `carry_patch` workspace's `upstream_url`) | `UPSTREAM_GIT_PAT`, else the upstream pair, else **origin's** credential |
+
+A pair with only one half stored is ignored and the service goes on as
+though neither half were there, saying so in its log by name and never by
+value.
+
 ### Rules both kinds obey
 
 | Rule         | Constraint                                                                                                         |
