@@ -354,6 +354,80 @@ export const MIGRATIONS: readonly Migration[] = [
        )`,
     ],
   },
+  {
+    // What an agent reports about one run. Five tables rather than one
+    // with a kind column: the fields differ, the reads differ, and a
+    // run's traces are read far more often than anything else here.
+    name: '015_run_records',
+    statements: [
+      `CREATE TABLE run_events (
+         id TEXT PRIMARY KEY,
+         workspace_slug TEXT NOT NULL,
+         run_id TEXT NOT NULL,
+         node_id TEXT,
+         session_id TEXT,
+         timestamp TEXT NOT NULL,
+         created_at TEXT NOT NULL,
+         event_type TEXT NOT NULL,
+         severity TEXT NOT NULL DEFAULT 'info',
+         payload TEXT
+       )`,
+      'CREATE INDEX run_events_by_run ON run_events (workspace_slug, run_id, timestamp)',
+      `CREATE TABLE run_session_outcomes (
+         id TEXT PRIMARY KEY,
+         workspace_slug TEXT NOT NULL,
+         run_id TEXT NOT NULL,
+         node_id TEXT,
+         session_id TEXT,
+         timestamp TEXT NOT NULL,
+         created_at TEXT NOT NULL,
+         status TEXT NOT NULL,
+         duration_ms INTEGER,
+         token_usage TEXT
+       )`,
+      'CREATE INDEX run_outcomes_by_run ON run_session_outcomes (workspace_slug, run_id, timestamp)',
+      `CREATE TABLE run_tool_calls (
+         id TEXT PRIMARY KEY,
+         workspace_slug TEXT NOT NULL,
+         run_id TEXT NOT NULL,
+         node_id TEXT,
+         session_id TEXT,
+         called_at TEXT NOT NULL,
+         created_at TEXT NOT NULL,
+         tool_name TEXT NOT NULL,
+         duration_ms INTEGER,
+         input TEXT,
+         output TEXT
+       )`,
+      'CREATE INDEX run_calls_by_run ON run_tool_calls (workspace_slug, run_id, called_at)',
+      `CREATE TABLE run_tool_errors (
+         id TEXT PRIMARY KEY,
+         workspace_slug TEXT NOT NULL,
+         run_id TEXT NOT NULL,
+         node_id TEXT,
+         session_id TEXT,
+         failed_at TEXT NOT NULL,
+         created_at TEXT NOT NULL,
+         tool_name TEXT NOT NULL,
+         error_code TEXT,
+         error_msg TEXT NOT NULL
+       )`,
+      'CREATE INDEX run_errors_by_run ON run_tool_errors (workspace_slug, run_id, failed_at)',
+      `CREATE TABLE run_traces (
+         id TEXT PRIMARY KEY,
+         workspace_slug TEXT NOT NULL,
+         run_id TEXT NOT NULL,
+         node_id TEXT,
+         session_id TEXT,
+         timestamp TEXT NOT NULL,
+         created_at TEXT NOT NULL,
+         event_type TEXT NOT NULL,
+         sequence INTEGER,
+         data TEXT
+       )`,
+      'CREATE INDEX run_traces_by_node ON run_traces (workspace_slug, run_id, node_id, timestamp)',
+    ],
+  },
 ];
 
 /**
