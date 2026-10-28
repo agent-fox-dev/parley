@@ -83,125 +83,144 @@ function common(context: DeliveryContext): Record<string, unknown> {
   return { forge: context.forge, delivery_id: context.deliveryId, actor: context.actor };
 }
 
+/** GitHub's issues, which carry their own labels. */
+function githubIssues(payload: Record<string, unknown>, context: DeliveryContext): MappedEvent[] {
+  const action = text(payload['action']);
+  const issue = object(payload['issue']);
+  const number = numbered(issue['number'], 'issue number');
+  const about = {
+    ...common(context),
+    number,
+    title: cut(text(issue['title']), TITLE_BYTES),
+    url: text(issue['html_url']),
+  };
+
+  if (['opened', 'edited', 'closed', 'reopened'].includes(action)) {
+    return [
+      {
+        type: `hub.forge.issue.${action}`,
+        resourceId: String(number),
+        metadata: { ...about, labels: labelNames(issue['labels']) },
+      },
+    ];
+  }
+  if (action === 'labeled' || action === 'unlabeled') {
+    const label = text(object(payload['label'])['name']);
+    if (label.length === 0) {
+      throw new HttpError(400, 'the delivery has no label name');
+    }
+    // A label change carries the label and the set it leaves
+    // behind; the title belongs to the events about the issue.
+    return [
+      {
+        type: `hub.forge.issue.${action}`,
+        resourceId: String(number),
+        metadata: {
+          ...common(context),
+          number,
+          label,
+          labels: labelNames(issue['labels']),
+          url: text(issue['html_url']),
+        },
+      },
+    ];
+  }
+  return [];
+}
+
+/** A comment, which GitHub reports on issues and pull requests alike. */
+function githubComment(payload: Record<string, unknown>, context: DeliveryContext): MappedEvent[] {
+  if (text(payload['action']) !== 'created') {
+    return [];
+  }
+  const issue = object(payload['issue']);
+  const number = numbered(issue['number'], 'issue number');
+  return [
+    {
+      type: 'hub.forge.comment.created',
+      resourceId: String(number),
+      metadata: {
+        ...common(context),
+        number,
+        comment_url: text(object(payload['comment'])['html_url']),
+        // GitHub answers a pull request from the issue routes and
+        // says so by carrying a pull_request block on the issue.
+        pull_request: issue['pull_request'] !== undefined,
+      },
+    },
+  ];
+}
+
+/** A pull request, whose close is a merge or not. */
+function githubPull(payload: Record<string, unknown>, context: DeliveryContext): MappedEvent[] {
+  const action = text(payload['action']);
+  const pull = object(payload['pull_request']);
+  const number = numbered(pull['number'], 'pull request number');
+  const merged = pull['merged'] === true;
+
+  const named =
+    action === 'closed'
+      ? merged
+        ? 'merged'
+        : 'closed'
+      : ['opened', 'reopened', 'synchronize'].includes(action)
+        ? action
+        : undefined;
+  if (named === undefined) {
+    return [];
+  }
+  return [
+    {
+      type: `hub.forge.pull_request.${named}`,
+      resourceId: String(number),
+      metadata: {
+        ...common(context),
+        number,
+        url: text(pull['html_url']),
+        head: text(object(pull['head'])['ref']),
+        base: text(object(pull['base'])['ref']),
+        merged,
+      },
+    },
+  ];
+}
+
+/** A push, which both forges report the same way. */
+function pushed(payload: Record<string, unknown>, context: DeliveryContext): MappedEvent[] {
+  const ref = text(payload['ref']);
+  if (ref.length === 0) {
+    throw new HttpError(400, 'the delivery has no ref');
+  }
+  return [
+    {
+      type: 'hub.forge.push',
+      resourceId: ref,
+      metadata: {
+        ...common(context),
+        ref,
+        before: text(payload['before']),
+        after: text(payload['after']),
+      },
+    },
+  ];
+}
+
 /** GitHub's table. */
 function fromGithub(
   event: string,
   payload: Record<string, unknown>,
   context: DeliveryContext,
 ): MappedEvent[] {
-  const action = text(payload['action']);
-  const issue = object(payload['issue']);
-  const pull = object(payload['pull_request']);
-
   if (event === 'issues') {
-    const number = numbered(issue['number'], 'issue number');
-    const base = {
-      ...common(context),
-      number,
-      title: cut(text(issue['title']), TITLE_BYTES),
-      url: text(issue['html_url']),
-    };
-    if (['opened', 'edited', 'closed', 'reopened'].includes(action)) {
-      return [
-        {
-          type: `hub.forge.issue.${action}`,
-          resourceId: String(number),
-          metadata: { ...base, labels: labelNames(issue['labels']) },
-        },
-      ];
-    }
-    if (action === 'labeled' || action === 'unlabeled') {
-      const label = text(object(payload['label'])['name']);
-      if (label.length === 0) {
-        throw new HttpError(400, 'the delivery has no label name');
-      }
-      // A label change carries the label and the set it leaves
-      // behind; the title belongs to the events about the issue.
-      return [
-        {
-          type: `hub.forge.issue.${action}`,
-          resourceId: String(number),
-          metadata: {
-            ...common(context),
-            number,
-            label,
-            labels: labelNames(issue['labels']),
-            url: text(issue['html_url']),
-          },
-        },
-      ];
-    }
-    return [];
+    return githubIssues(payload, context);
   }
-
-  if (event === 'issue_comment' && action === 'created') {
-    const number = numbered(issue['number'], 'issue number');
-    return [
-      {
-        type: 'hub.forge.comment.created',
-        resourceId: String(number),
-        metadata: {
-          ...common(context),
-          number,
-          comment_url: text(object(payload['comment'])['html_url']),
-          // GitHub answers a pull request from the issue routes and
-          // says so by carrying a pull_request block on the issue.
-          pull_request: issue['pull_request'] !== undefined,
-        },
-      },
-    ];
+  if (event === 'issue_comment') {
+    return githubComment(payload, context);
   }
-
   if (event === 'pull_request') {
-    const number = numbered(pull['number'], 'pull request number');
-    const merged = pull['merged'] === true;
-    const named =
-      action === 'closed'
-        ? merged
-          ? 'merged'
-          : 'closed'
-        : ['opened', 'reopened', 'synchronize'].includes(action)
-          ? action
-          : undefined;
-    if (named === undefined) {
-      return [];
-    }
-    return [
-      {
-        type: `hub.forge.pull_request.${named}`,
-        resourceId: String(number),
-        metadata: {
-          ...common(context),
-          number,
-          url: text(pull['html_url']),
-          head: text(object(pull['head'])['ref']),
-          base: text(object(pull['base'])['ref']),
-          merged,
-        },
-      },
-    ];
+    return githubPull(payload, context);
   }
-
-  if (event === 'push') {
-    const ref = text(payload['ref']);
-    if (ref.length === 0) {
-      throw new HttpError(400, 'the delivery has no ref');
-    }
-    return [
-      {
-        type: 'hub.forge.push',
-        resourceId: ref,
-        metadata: {
-          ...common(context),
-          ref,
-          before: text(payload['before']),
-          after: text(payload['after']),
-        },
-      },
-    ];
-  }
-
-  return [];
+  return event === 'push' ? pushed(payload, context) : [];
 }
 
 /** What a GitLab update changed about an issue's labels. */
@@ -215,143 +234,144 @@ function labelChanges(changes: Record<string, unknown>): { removed: string[]; ad
   };
 }
 
+/** GitLab's issues, including the update that is several events. */
+function gitlabIssue(payload: Record<string, unknown>, context: DeliveryContext): MappedEvent[] {
+  const attributes = object(payload['object_attributes']);
+  const action = text(attributes['action']);
+  const number = numbered(attributes['iid'], 'issue number');
+  const about = {
+    ...common(context),
+    number,
+    title: cut(text(attributes['title']), TITLE_BYTES),
+    url: text(attributes['url']),
+  };
+
+  const named = { open: 'opened', close: 'closed', reopen: 'reopened' }[action];
+  if (named !== undefined) {
+    return [
+      {
+        type: `hub.forge.issue.${named}`,
+        resourceId: String(number),
+        metadata: { ...about, labels: labelNames(payload['labels']) },
+      },
+    ];
+  }
+  if (action !== 'update') {
+    return [];
+  }
+
+  const changes = object(payload['changes']);
+  const events: MappedEvent[] = [];
+  if (changes['title'] !== undefined || changes['description'] !== undefined) {
+    events.push({
+      type: 'hub.forge.issue.edited',
+      resourceId: String(number),
+      metadata: { ...about, labels: labelNames(payload['labels']) },
+    });
+  }
+
+  // Removals before additions, each group sorted, and the whole lot
+  // capped: a hundred label events is already more than any
+  // consumer wanted from one delivery.
+  const { removed, added } = labelChanges(changes);
+  const labelEvents = [
+    ...removed.map((label) => ['unlabeled', label] as const),
+    ...added.map((label) => ['labeled', label] as const),
+  ].slice(0, MOST_LABEL_EVENTS);
+
+  for (const [what, label] of labelEvents) {
+    events.push({
+      type: `hub.forge.issue.${what}`,
+      resourceId: String(number),
+      metadata: {
+        ...common(context),
+        number,
+        label,
+        labels: labelNames(payload['labels']),
+        url: text(attributes['url']),
+      },
+    });
+  }
+  return events;
+}
+
+/** A note, which is a comment only where it is on an issue or a merge request. */
+function gitlabNote(payload: Record<string, unknown>, context: DeliveryContext): MappedEvent[] {
+  const attributes = object(payload['object_attributes']);
+  const action = text(attributes['action']);
+  const noteable = text(attributes['noteable_type']);
+
+  // A note on a commit or a snippet is nothing this relays.
+  if (noteable !== 'Issue' && noteable !== 'MergeRequest') {
+    return [];
+  }
+  if (action.length > 0 && action !== 'create') {
+    return [];
+  }
+
+  const about = object(noteable === 'Issue' ? payload['issue'] : payload['merge_request']);
+  const number = numbered(about['iid'], 'issue or merge request number');
+  return [
+    {
+      type: 'hub.forge.comment.created',
+      resourceId: String(number),
+      metadata: {
+        ...common(context),
+        number,
+        comment_url: text(attributes['url']),
+        pull_request: noteable === 'MergeRequest',
+      },
+    },
+  ];
+}
+
+/** A merge request, whose update is a synchronize only with a new revision. */
+function gitlabMergeRequest(
+  payload: Record<string, unknown>,
+  context: DeliveryContext,
+): MappedEvent[] {
+  const attributes = object(payload['object_attributes']);
+  const action = text(attributes['action']);
+  const number = numbered(attributes['iid'], 'merge request number');
+
+  const named =
+    { open: 'opened', close: 'closed', reopen: 'reopened', merge: 'merged' }[action] ??
+    (action === 'update' && attributes['oldrev'] !== undefined ? 'synchronize' : undefined);
+  if (named === undefined) {
+    return [];
+  }
+  return [
+    {
+      type: `hub.forge.pull_request.${named}`,
+      resourceId: String(number),
+      metadata: {
+        ...common(context),
+        number,
+        url: text(attributes['url']),
+        head: text(attributes['source_branch']),
+        base: text(attributes['target_branch']),
+        merged: named === 'merged',
+      },
+    },
+  ];
+}
+
 /** GitLab's table. */
 function fromGitlab(
   event: string,
   payload: Record<string, unknown>,
   context: DeliveryContext,
 ): MappedEvent[] {
-  const attributes = object(payload['object_attributes']);
-  const action = text(attributes['action']);
-
   if (event === 'Issue Hook') {
-    const number = numbered(attributes['iid'], 'issue number');
-    const base = {
-      ...common(context),
-      number,
-      title: cut(text(attributes['title']), TITLE_BYTES),
-      url: text(attributes['url']),
-    };
-    const named = { open: 'opened', close: 'closed', reopen: 'reopened' }[action];
-    if (named !== undefined) {
-      return [
-        {
-          type: `hub.forge.issue.${named}`,
-          resourceId: String(number),
-          metadata: { ...base, labels: labelNames(payload['labels']) },
-        },
-      ];
-    }
-    if (action !== 'update') {
-      return [];
-    }
-
-    const changes = object(payload['changes']);
-    const events: MappedEvent[] = [];
-    if (changes['title'] !== undefined || changes['description'] !== undefined) {
-      events.push({
-        type: 'hub.forge.issue.edited',
-        resourceId: String(number),
-        metadata: { ...base, labels: labelNames(payload['labels']) },
-      });
-    }
-
-    // Removals before additions, each group sorted, and the whole
-    // lot capped: a hundred label events is already more than any
-    // consumer wanted from one delivery.
-    const { removed, added } = labelChanges(changes);
-    const labelEvents = [
-      ...removed.map((label) => ['unlabeled', label] as const),
-      ...added.map((label) => ['labeled', label] as const),
-    ].slice(0, MOST_LABEL_EVENTS);
-
-    for (const [named_, label] of labelEvents) {
-      events.push({
-        type: `hub.forge.issue.${named_}`,
-        resourceId: String(number),
-        metadata: {
-          ...common(context),
-          number,
-          label,
-          labels: labelNames(payload['labels']),
-          url: text(attributes['url']),
-        },
-      });
-    }
-    return events;
+    return gitlabIssue(payload, context);
   }
-
   if (event === 'Note Hook') {
-    const kind = text(payload['object_kind']);
-    void kind;
-    const noteable = text(attributes['noteable_type']);
-    if (noteable !== 'Issue' && noteable !== 'MergeRequest') {
-      // A note on a commit or a snippet is nothing this relays.
-      return [];
-    }
-    if (action.length > 0 && action !== 'create') {
-      return [];
-    }
-    const about = object(noteable === 'Issue' ? payload['issue'] : payload['merge_request']);
-    const number = numbered(about['iid'], 'issue or merge request number');
-    return [
-      {
-        type: 'hub.forge.comment.created',
-        resourceId: String(number),
-        metadata: {
-          ...common(context),
-          number,
-          comment_url: text(attributes['url']),
-          pull_request: noteable === 'MergeRequest',
-        },
-      },
-    ];
+    return gitlabNote(payload, context);
   }
-
   if (event === 'Merge Request Hook') {
-    const number = numbered(attributes['iid'], 'merge request number');
-    const named =
-      { open: 'opened', close: 'closed', reopen: 'reopened', merge: 'merged' }[action] ??
-      (action === 'update' && attributes['oldrev'] !== undefined ? 'synchronize' : undefined);
-    if (named === undefined) {
-      return [];
-    }
-    return [
-      {
-        type: `hub.forge.pull_request.${named}`,
-        resourceId: String(number),
-        metadata: {
-          ...common(context),
-          number,
-          url: text(attributes['url']),
-          head: text(attributes['source_branch']),
-          base: text(attributes['target_branch']),
-          merged: named === 'merged',
-        },
-      },
-    ];
+    return gitlabMergeRequest(payload, context);
   }
-
-  if (event === 'Push Hook' || event === 'Tag Push Hook') {
-    const ref = text(payload['ref']);
-    if (ref.length === 0) {
-      throw new HttpError(400, 'the delivery has no ref');
-    }
-    return [
-      {
-        type: 'hub.forge.push',
-        resourceId: ref,
-        metadata: {
-          ...common(context),
-          ref,
-          before: text(payload['before']),
-          after: text(payload['after']),
-        },
-      },
-    ];
-  }
-
-  return [];
+  return event === 'Push Hook' || event === 'Tag Push Hook' ? pushed(payload, context) : [];
 }
 
 /** The repository a payload is about, which every delivery must name. */
