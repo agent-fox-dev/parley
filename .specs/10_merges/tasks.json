@@ -78,7 +78,7 @@
       "depends_on": [
         1
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 3,
@@ -107,7 +107,7 @@
       "depends_on": [
         2
       ],
-      "state": "pending"
+      "state": "in_progress"
     },
     {
       "id": 4,
