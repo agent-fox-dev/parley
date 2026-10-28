@@ -53,6 +53,22 @@ behaviour they check. Unit and integration suites are hermetic and run in
 `make check`; a `*.smoke.test.ts` needs a running deployment and runs in
 `make check-release`.
 
+## Serving git
+
+Parley is the git server, not a proxy in front of one. The advertisement
+is built from the repository store's ref list, a fetch is a pack the store
+serves for the wants and haves a client sent, and a push is parsed into
+ref commands, filtered, and handed to the store. ADR 10 records why: push
+control has to decide each ref before any of it is relayed, and only one
+of the two targets has a remote to proxy to at all.
+
+That puts three things in `src/git/`: the protocol itself (`pktline.ts`,
+`transport.ts` for the client side, `routes.ts` and `fetch.ts` for the
+server side), the decisions (`access.ts`, `push_control.ts`,
+`protected_refs.ts`), and what follows a push (`after_push.ts`). The
+decisions are deciders over one ref, composed in the route, so a push
+carrying a refused ref and an accepted one gets both answers.
+
 ## Two platform targets
 
 Every facility of the host platform is reached through a named interface, so

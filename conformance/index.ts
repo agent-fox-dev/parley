@@ -2,6 +2,7 @@ import { prepareAfc } from './afc.js';
 import { identityChecks } from './identity.js';
 import { entryChecks } from './entries.js';
 import { repositoryChecks } from './repository.js';
+import { gitServerChecks } from './git_server.js';
 import { workspaceChecks } from './workspaces.js';
 import { type Check, formatReport, runHarness } from './harness.js';
 
@@ -65,6 +66,7 @@ export async function main(): Promise<number> {
       ...workspaceChecks(),
       ...entryChecks(),
       ...repositoryChecks(),
+      ...gitServerChecks(),
     ],
   });
   console.log(formatReport(result));

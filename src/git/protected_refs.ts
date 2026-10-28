@@ -1,5 +1,4 @@
 import type { RefChange } from '../platform/repostore.js';
-import type { StoreCapabilities } from '../repo/capabilities.js';
 import type { Decider, RefDecision } from './push.js';
 
 /**
@@ -35,10 +34,10 @@ export function protectedRefs(): Decider {
 }
 
 /**
- * Whether the store will serve the namespace to a reader at all. Where
- * it will not, the refs cannot be listed or fetched; the refusal of a
- * push to them does not depend on the store and holds either way.
+ * Reading the namespace needs nothing of its own. The advertisement
+ * lists what the store holds, so a store that will not keep refs
+ * outside branches and tags lists none of them and a client cannot ask
+ * for what it was never offered. The refusal of a *push* to them
+ * depends on no store and holds either way, which is why the two are
+ * not decided together.
  */
-export function readableNamespace(capabilities: StoreCapabilities): boolean {
-  return capabilities.arbitraryRefNamespaces;
-}

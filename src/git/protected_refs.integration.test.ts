@@ -9,7 +9,7 @@ import {
   whatIsMissing,
   withCredential,
 } from '../testutil/gitserver.js';
-import { PROTECTED_MESSAGE, readableNamespace } from './protected_refs.js';
+import { PROTECTED_MESSAGE } from './protected_refs.js';
 
 /**
  * The namespace the hub keeps, held against the client that would
@@ -103,7 +103,7 @@ describe.skipIf(missing.length > 0)(
       const head = await withHeldRef(world);
       const url = withCredential(world.url, world.credential);
 
-      expect(readableNamespace(world.repos.capabilities)).toBe(true);
+      expect(world.repos.capabilities.arbitraryRefNamespaces).toBe(true);
       const listed = await gitRun('git', ['ls-remote', url], { env: GIT_ENV, timeout: 30_000 });
       expect(listed.stdout).toContain(HELD);
 
@@ -138,7 +138,7 @@ describe.skipIf(missing.length > 0)(
             ),
         }),
       });
-      expect(readableNamespace(world.repos.capabilities)).toBe(false);
+      expect(world.repos.capabilities.arbitraryRefNamespaces).toBe(false);
 
       const url = withCredential(world.url, world.credential);
       const cloned = await gitClone(url, cleanups);
