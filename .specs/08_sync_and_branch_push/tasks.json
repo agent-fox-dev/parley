@@ -254,7 +254,7 @@
         "`make check` passes with no network access and no deployment configured",
         "afc workspace sync, afc workspace reclone and afc workspace push behave as docs/prd/cli.md specifies against a running deployment, exit codes included"
       ],
-      "state": "pending"
+      "state": "done"
     }
   ]
 }

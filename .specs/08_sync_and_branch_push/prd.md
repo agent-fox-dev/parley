@@ -4,7 +4,7 @@ spec_name: "sync_and_branch_push"
 title: "Sync a workspace with its remote and push its branches back"
 status: "active"
 created_at: "2026-10-27T18:42:04Z"
-updated_at: "2026-10-28T09:39:48Z"
+updated_at: "2026-10-28T09:44:03Z"
 intent_hash: "7489002035f61aed999bd37ce77292846cc5b7d94d328f53a87fbe0b0ccdd0d1"
 schema_version: 2
 source: "docs/prd/01-port-af-hub-to-typescript-on-cloudflare.md"
