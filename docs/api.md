@@ -29,6 +29,7 @@ implemented; routes appear here as they are built.
 - [Keeping a workspace and its remote in step](#keeping-a-workspace-and-its-remote-in-step)
 - [Merging branches](#merging-branches)
 - [Carrying a patch stack](#carrying-a-patch-stack)
+- [Agent sessions and what they cost](#agent-sessions-and-what-they-cost)
 - [Git Server](#git-server)
 - [Server Endpoints](#server-endpoints)
 
@@ -1004,6 +1005,70 @@ by path, so the next occurrence is reported rather than settled.
 **`GET .../patch-status`** is the dashboard: the workspace, the latest
 rebuild, every patch with what that rebuild made of it, and counts
 derived from the same list it carries.
+
+## Agent sessions and what they cost
+
+A session records one agent run's use of a workspace: who opened it,
+when, against which model, what it spent and how it ended. Everything
+is reported in tokens. The service invents no currency, because the
+reference defines none and a price would be a guess at somebody's
+contract.
+
+**Opening.** `POST /api/v1/sessions` needs `sessions:write` **and
+write access** to `workspace_slug` — a member of the owning
+organization is refused, unlike every read here. The workspace's
+status does not matter: an agent that worked on an archived workspace
+still spent what it spent. An open that repeats an `id` the service
+already holds answers `200` with that session instead of opening a
+second one, so an agent that retried a request it never saw answered
+ends with one session, not two.
+
+**Reporting and closing.** `POST .../sessions/:id/usage` adds a usage
+record (`201`) and `POST .../sessions/:id/complete` ends the session
+(`200`). Both are for the session's **creator**, not the workspace's
+owner: several agents share one workspace, and an owner check would
+let any of them close another's session. Where the session recorded
+a credential, that credential is the whole test — two keys of one
+person are two agents. A session that is no longer active refuses
+further usage with `409`, and a negative token count is `422`.
+
+**Reading.** `GET /api/v1/sessions`, `GET .../sessions/:id` and
+`GET .../sessions/:id/usage` need `sessions:read`, read access **and
+an active workspace**: a session of an archived workspace answers
+`403 workspace access denied` rather than `404`. This is the one
+family of routes that prefers saying the workspace is inactive to
+hiding that it exists. The list takes `workspace_slug`, `run_id`,
+`status`, `credential_type` and `since`, and with no `workspace_slug`
+it lists the sessions of every workspace the caller can read. A
+session carries its `token_summary`; the usage list carries `totals`
+over **every** record of the session, whatever page was asked for,
+because a total of one page is not a total.
+
+**`GET /api/v1/workspaces/:slug/cost`** answers what the workspace's
+agents spent over a period: `since` and `until` (the last day by
+default, and `since` must be before `until`) and `group_by` of `day`,
+`session` or `model`. The totals and the breakdown are summed from
+one list of records, so they cannot disagree. A session that spans
+two days is counted once in `totals.sessions` and appears in both
+days' rows.
+
+**Retirement.** Archiving or deleting a workspace ends its active
+sessions with status `terminated`, inside the same lock as the rest
+of the operation, so no session is left reading "active" against a
+workspace that is gone.
+
+### Pagination
+
+The session and usage lists page with an opaque cursor. `limit`
+(sessions: 50, at most 500; usage: 100, at most 1000) and `order`
+(`desc` by default) say how much and which way; `cursor` says from
+where. The answer carries `next_cursor` and `has_more`, and
+`next_cursor` is `null` on the last page.
+
+A cursor holds the position of the last row served — its timestamp
+and its id — not an offset, so rows inserted while a caller pages are
+neither skipped nor served twice. It is the service's own string:
+anything else is `400 the cursor is not one this service issued`.
 
 ## Git Server
 

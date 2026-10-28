@@ -47,7 +47,7 @@
         "src/paging/cursor.test.ts",
         "src/paging/page.ts"
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 2,
@@ -79,7 +79,7 @@
       "depends_on": [
         1
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 3,
@@ -111,7 +111,7 @@
       "depends_on": [
         2
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 4,
@@ -143,7 +143,7 @@
       "depends_on": [
         3
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 5,
@@ -173,7 +173,7 @@
       "depends_on": [
         4
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 6,
@@ -200,7 +200,7 @@
       "depends_on": [
         3
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 7,
@@ -233,7 +233,7 @@
         "`make check` passes with no network access and no deployment configured",
         "the session, usage and cost routes answer as docs/prd/api.md specifies against a running deployment, cursor paging included"
       ],
-      "state": "pending"
+      "state": "done"
     }
   ]
 }

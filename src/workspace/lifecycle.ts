@@ -9,6 +9,7 @@ import type { LogSink } from '../http/router.js';
 import { resolveGitCredential } from '../repo/credentials.js';
 import { pushOutOnArchive, removeRepository } from '../repo/retire.js';
 import { repositoryOf } from '../repo/repository.js';
+import { terminateSessions } from '../session/terminate.js';
 import { withWorkspaceLock } from './lock.js';
 
 /**
@@ -58,6 +59,10 @@ export async function archiveWorkspace(
     }
 
     await updateWorkspace(store, workspace.slug, { status: 'archived' }, clock.now().toISOString());
+
+    // An agent whose workspace is archived under it will not report
+    // that it finished, so the hub records what happened to it.
+    await terminateSessions(store, clock, workspace.slug);
   });
 }
 
@@ -90,6 +95,10 @@ export async function deleteWorkspaceAndTokens(
   }
 
   const at = clock.now().toISOString();
+  // Ended before the record goes, so nothing is left pointing at a
+  // workspace that is not there.
+  await terminateSessions(store, clock, workspace.slug);
+
   await store.batch([
     ...retireBindingsOf(workspace.slug, at),
     {

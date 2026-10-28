@@ -284,6 +284,44 @@ export const MIGRATIONS: readonly Migration[] = [
       'CREATE INDEX merges_by_workspace ON merges (workspace_slug, created_at)',
     ],
   },
+  {
+    // One agent run against one workspace, and what it spent. A
+    // session is a cost record rather than an audit trail: what the
+    // agent did belongs to the audit package.
+    name: '013_sessions',
+    statements: [
+      `CREATE TABLE sessions (
+         id TEXT PRIMARY KEY,
+         workspace_slug TEXT NOT NULL,
+         credential_id TEXT,
+         credential_type TEXT NOT NULL,
+         created_by TEXT,
+         run_id TEXT,
+         node_id TEXT,
+         archetype TEXT,
+         model TEXT,
+         metadata TEXT,
+         status TEXT NOT NULL DEFAULT 'active',
+         error_message TEXT,
+         duration_ms INTEGER,
+         cache_creation_input_tokens INTEGER,
+         started_at TEXT NOT NULL,
+         ended_at TEXT
+       )`,
+      'CREATE INDEX sessions_by_workspace ON sessions (workspace_slug, started_at)',
+      'CREATE INDEX sessions_by_run ON sessions (run_id)',
+      `CREATE TABLE session_usage (
+         id TEXT PRIMARY KEY,
+         session_id TEXT NOT NULL,
+         model TEXT NOT NULL,
+         input_tokens INTEGER NOT NULL DEFAULT 0,
+         output_tokens INTEGER NOT NULL DEFAULT 0,
+         cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+         recorded_at TEXT NOT NULL
+       )`,
+      'CREATE INDEX usage_by_session ON session_usage (session_id, recorded_at)',
+    ],
+  },
 ];
 
 /**
