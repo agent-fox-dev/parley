@@ -11,7 +11,7 @@ import type { SecretStore } from '../platform/secrets.js';
 import type { RepositoryStore } from '../platform/repostore.js';
 import type { JobQueue } from '../platform/jobs.js';
 import type { Decider } from '../git/push.js';
-import { freshStore, seedClock } from './identity.js';
+import { freshStore, seedClock, tickingClock } from './identity.js';
 import { providerIdentity, stubDirectory } from './oauth.js';
 
 /**
@@ -57,10 +57,12 @@ export async function identityService(
     externalUrl?: string;
     /** What the service makes of each ref of a git push. */
     decideRef?: Decider;
+    /** 'ticking' for a clock that moves, where a suite needs order. */
+    clock?: 'fixed' | 'ticking';
   } = {},
 ): Promise<Service> {
   const seeded = await freshStore();
-  const clock = seedClock();
+  const clock = options.clock === 'ticking' ? tickingClock() : seedClock();
   const key = await deploymentKey(SECRET_KEY);
   const secrets = sealedSecrets(seeded.store, key as CryptoKey);
   const secretCipher = { seal: sealWith(key as CryptoKey), open: openWith(key as CryptoKey) };

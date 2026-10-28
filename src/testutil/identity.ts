@@ -31,6 +31,25 @@ export function seedClock(): Clock {
   return fixedClock(SEED_NOW);
 }
 
+/**
+ * A clock that moves a millisecond with every reading, starting from
+ * the same instant as the fixed one.
+ *
+ * A suite about order needs instants that differ: with a frozen
+ * clock every row is written at the same moment, "newest first"
+ * has nothing to sort by, and the test passes or fails on how the
+ * ids happen to compare.
+ */
+export function tickingClock(): Clock {
+  let at = SEED_NOW.getTime();
+  return {
+    now: () => {
+      at += 1;
+      return new Date(at);
+    },
+  };
+}
+
 export interface Seeded {
   store: RelationalStore;
   dispose: () => void;

@@ -7,7 +7,9 @@ import { newIdentifier } from '../auth/credentials.js';
 import { type Identity, identityOf } from '../auth/middleware.js';
 import { accessLevel } from '../workspace/access.js';
 import { findWorkspace } from '../store/workspaces.js';
+import { page, readPageRequest } from '../paging/page.js';
 import { completeSession, ownedSession, readCompleteBody } from '../session/complete.js';
+import { DENIED, listSessions, listUsage, mayReadSessions } from '../session/read.js';
 import { readUsageBody, recordUsage } from '../session/usage.js';
 import {
   type SessionRecord,
@@ -60,6 +62,23 @@ async function mayReadWorkspace(
     return false;
   }
   return (await accessLevel(config.store, identity, workspace)) !== undefined;
+}
+
+/**
+ * The session a read names, refused where its workspace is archived
+ * or out of reach. That refusal is a 403 rather than a 404: this is
+ * the one family of routes where the reference prefers saying the
+ * workspace is inactive to hiding that it exists.
+ */
+async function readableSession(c: Context, config: SessionRouteConfig): Promise<SessionRecord> {
+  const session = await sessionById(config.store, c.req.param('id') ?? '');
+  if (session === undefined) {
+    throw new HttpError(404, 'session not found');
+  }
+  if (!(await mayReadSessions(config.store, identityOf(c), session.workspace_slug))) {
+    throw new HttpError(403, DENIED);
+  }
+  return session;
 }
 
 async function openSession(c: Context, config: SessionRouteConfig): Promise<Response> {
@@ -128,6 +147,80 @@ export function sessionRoutes(config: SessionRouteConfig): RouteDefinition[] {
       methods: ['POST'],
       scope: 'sessions:write',
       handler: async (c) => openSession(c, config),
+    },
+    {
+      path: `${config.mountPoint}/sessions`,
+      scope: 'sessions:read',
+      handler: async (c) => {
+        const query = new URL(c.req.url).searchParams;
+        const request = readPageRequest(query, { fallback: 50, most: 500 });
+        const named = (name: string) => query.get(name) ?? undefined;
+
+        const found = await listSessions(
+          config.store,
+          identityOf(c),
+          {
+            ...(named('workspace_slug') === undefined
+              ? {}
+              : { workspace_slug: named('workspace_slug') as string }),
+            ...(named('run_id') === undefined ? {} : { run_id: named('run_id') as string }),
+            ...(named('status') === undefined ? {} : { status: named('status') as string }),
+            ...(named('credential_type') === undefined
+              ? {}
+              : { credential_type: named('credential_type') as string }),
+            ...(named('since') === undefined ? {} : { since: named('since') as string }),
+          },
+          request,
+        );
+        const served = page(found, request, (one) => ({ at: one.started_at, id: one.id }));
+
+        return jsonResponse({
+          sessions: await Promise.all(
+            served.rows.map(async (one) =>
+              serialiseSession(one, {
+                token_summary: await tokenSummary(config.store, one.id),
+              }),
+            ),
+          ),
+          next_cursor: served.next_cursor,
+          has_more: served.has_more,
+        });
+      },
+    },
+    {
+      path: `${config.mountPoint}/sessions/:id`,
+      scope: 'sessions:read',
+      handler: async (c) => {
+        const session = await readableSession(c, config);
+        return jsonResponse(
+          serialiseSession(session, {
+            token_summary: await tokenSummary(config.store, session.id),
+          }),
+        );
+      },
+    },
+    {
+      path: `${config.mountPoint}/sessions/:id/usage`,
+      scope: 'sessions:read',
+      handler: async (c) => {
+        const session = await readableSession(c, config);
+        const request = readPageRequest(new URL(c.req.url).searchParams, {
+          fallback: 100,
+          most: 1000,
+        });
+        const found = await listUsage(config.store, session.id, request);
+        const served = page(found, request, (one) => ({ at: one.recorded_at, id: one.id }));
+
+        return jsonResponse({
+          session_id: session.id,
+          records: served.rows,
+          // Over every record of the session, whatever the page: a
+          // total of one page is not a total.
+          totals: await tokenSummary(config.store, session.id),
+          next_cursor: served.next_cursor,
+          has_more: served.has_more,
+        });
+      },
     },
     {
       path: `${config.mountPoint}/sessions/:id/complete`,
