@@ -201,6 +201,35 @@ export const MIGRATIONS: readonly Migration[] = [
        )`,
     ],
   },
+  {
+    // The rest of a patch, now that there is a package that carries
+    // one: where it sits in the stack, how it is faring, what it
+    // relates to upstream and how it stood against the fork at the
+    // last sync. The table is rebuilt rather than altered column by
+    // column, because the id is a new primary key.
+    name: '010_patch_stack',
+    statements: [
+      'DROP TABLE patches',
+      `CREATE TABLE patches (
+         id TEXT PRIMARY KEY,
+         workspace_slug TEXT NOT NULL,
+         branch_name TEXT NOT NULL,
+         position INTEGER NOT NULL,
+         status TEXT NOT NULL DEFAULT 'active',
+         conflict_files TEXT,
+         upstream_pr_url TEXT,
+         description TEXT,
+         deleted_at TEXT,
+         added_at TEXT NOT NULL,
+         updated_at TEXT NOT NULL,
+         origin_sync_state TEXT,
+         origin_sha TEXT,
+         origin_synced_at TEXT
+       )`,
+      'CREATE UNIQUE INDEX patches_by_branch ON patches (workspace_slug, branch_name)',
+      'CREATE INDEX patches_by_position ON patches (workspace_slug, position)',
+    ],
+  },
 ];
 
 /**

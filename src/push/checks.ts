@@ -1,5 +1,6 @@
 import { HttpError } from '../http/errors.js';
-import { patchBranchOf } from '../patches/registry.js';
+
+import { patchBranchOf } from '../patch/list.js';
 import type { WorkspaceRecord } from '../store/workspaces.js';
 
 /**

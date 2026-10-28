@@ -64,7 +64,7 @@
         "src/patch/resolve_branch.ts",
         "src/store/migrations/"
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 2,

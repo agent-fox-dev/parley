@@ -4,13 +4,13 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { localRepositoryStore } from '../platform/local/repostore.js';
 import { workspaceScope } from '../platform/secrets.js';
-import { addPatch } from '../patches/registry.js';
+
 import { repositoryOf } from '../repo/repository.js';
 import { findWorkspace } from '../store/workspaces.js';
 import { identityService } from '../testutil/app.js';
 import { fakeRemote } from '../testutil/fakeremote.js';
 import { buildCommit } from '../testutil/history.js';
-import { SEED_NOW, seedApiKey, seedOrg, seedUser, seedWorkspace } from '../testutil/identity.js';
+import { seedApiKey, seedOrg, seedPatch, seedUser, seedWorkspace } from '../testutil/identity.js';
 import { FLUSH, concatBytes, encodePkt, encodeSpecial } from './pktline.js';
 import { ZERO_OID } from './transport.js';
 import { headRef } from './after_push.js';
@@ -61,7 +61,7 @@ describe('a push whose every ref was refused', () => {
       git_url: `${remote.url}/fork.git`,
       settings: { patch_branch_source: 'origin', push_patches_to_origin: false },
     });
-    await addPatch(service.store, workspace.slug, 'a-patch', SEED_NOW.toISOString());
+    await seedPatch(service.store, workspace.slug, 'a-patch');
     await service.secrets.put(workspaceScope(workspace.slug), 'GIT_PAT', 'a-token');
 
     const repository = repositoryOf(workspace);

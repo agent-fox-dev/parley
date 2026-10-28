@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { localRepositoryStore } from '../platform/local/repostore.js';
 import type { RepositoryStore } from '../platform/repostore.js';
 import { workspaceScope } from '../platform/secrets.js';
-import { addPatch } from '../patches/registry.js';
+
 import { repositoryOf } from '../repo/repository.js';
 import { addMember } from '../store/identity.js';
 import { type Service, identityService } from '../testutil/app.js';
@@ -18,6 +18,7 @@ import {
   seedPat,
   seedUser,
   seedWorkspace,
+  seedPatch,
 } from '../testutil/identity.js';
 
 /**
@@ -167,7 +168,7 @@ describe('the order the branch push checks run in', () => {
 
   it('answers the patch-branch refusal although the workspace is busy', async () => {
     const place = await world({ workspace_mode: 'carry_patch', integration_branch: 'integration' });
-    await addPatch(place.service.store, place.slug, 'feature', SEED_NOW.toISOString());
+    await seedPatch(place.service.store, place.slug, 'feature');
     const held = await place.service.locks.take(`workspace:${place.slug}`);
 
     const response = await push(place);
@@ -274,7 +275,7 @@ describe('the branches the route will not send', () => {
         workspace_mode: 'carry_patch',
         integration_branch: 'integration',
       });
-      await addPatch(place.service.store, place.slug, 'feature', SEED_NOW.toISOString());
+      await seedPatch(place.service.store, place.slug, 'feature');
       const held = lockHeld ? await place.service.locks.take(`workspace:${place.slug}`) : undefined;
 
       expect((await errorOf(await push(place))).error_type).toBe('patch_branch');

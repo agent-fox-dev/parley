@@ -18,6 +18,7 @@ import { workspaceRoutes } from './workspaces.js';
 import { syncRoutes } from './sync.js';
 import { recloneRoutes } from './reclone.js';
 import { branchPushRoutes } from './branch_push.js';
+import { patchRoutes } from './patches.js';
 import { tokenPermissionRoutes } from './token_permissions.js';
 import { tokenRoutes } from './tokens.js';
 import { userRoutes } from './user.js';
@@ -106,6 +107,15 @@ export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
       mountPoint: config.mountPoint,
       store: config.store,
       clock: config.clock,
+    }),
+    ...patchRoutes({
+      mountPoint: config.mountPoint,
+      store: config.store,
+      clock: config.clock,
+      locks: config.locks,
+      ...(config.secrets === undefined ? {} : { secrets: config.secrets }),
+      ...(config.repos === undefined ? {} : { repos: config.repos }),
+      ...(config.fetch === undefined ? {} : { fetch: config.fetch }),
     }),
     ...branchPushRoutes({
       mountPoint: config.mountPoint,

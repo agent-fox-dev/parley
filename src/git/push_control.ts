@@ -5,7 +5,8 @@ import type { SecretStore } from '../platform/secrets.js';
 import { workspaceScope } from '../platform/secrets.js';
 import { authorizationFor } from '../repo/copy_in.js';
 import { resolveGitCredential } from '../repo/credentials.js';
-import { patchBranchOf, registeredPatches } from '../patches/registry.js';
+import { patchBranchOf, registeredPatches } from '../patch/list.js';
+
 import { effectiveSettings } from '../workspace/settings.js';
 import type { WorkspaceRecord } from '../store/workspaces.js';
 import { ZERO_OID, pushPack } from './transport.js';

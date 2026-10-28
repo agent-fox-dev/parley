@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { workspaceScope } from '../platform/secrets.js';
-import { addPatch } from '../patches/registry.js';
-import { SEED_NOW } from '../testutil/identity.js';
+
+import { seedPatch } from '../testutil/identity.js';
 import { type FakeRemote, fakeRemote } from '../testutil/fakeremote.js';
 import {
   GIT_ENV,
@@ -61,7 +61,7 @@ async function carried(
       settings,
     },
   });
-  await addPatch(world.service.store, world.workspace.slug, PATCH, SEED_NOW.toISOString());
+  await seedPatch(world.service.store, world.workspace.slug, PATCH);
   if (options.credential !== false) {
     await world.service.secrets.put(
       workspaceScope(world.workspace.slug),
@@ -232,7 +232,7 @@ describe.skipIf(missing.length > 0)(
       const remote = fakeRemote();
       cleanups.push(remote.dispose);
       const world = await servedService({ cleanups, fetch: remote.fetch });
-      await addPatch(world.service.store, world.workspace.slug, PATCH, SEED_NOW.toISOString());
+      await seedPatch(world.service.store, world.workspace.slug, PATCH);
       const cloned = await gitClone(withCredential(world.url, world.credential), cleanups);
 
       const reported = await pushBranch(cloned.dir, PATCH);
