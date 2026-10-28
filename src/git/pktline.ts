@@ -96,9 +96,12 @@ export function textOf(line: PktLine): string {
 }
 
 /**
- * A refusal in git's own framing. A git client shows the person the
- * message of a pkt-line body; the service's JSON envelope it would
- * report as an unreadable failure, so every git route answers this way.
+ * A refusal in git's own framing.
+ *
+ * The content type is text/plain and not one of git's own, which was
+ * measured rather than guessed (ADR 10): git renders the body of a
+ * refusal as `remote:` lines only for text/plain, and shows nothing but
+ * the status code for its own content types.
  */
 export function pktError(
   status: number,
@@ -108,7 +111,7 @@ export function pktError(
   return new Response(encodePkt(`ERR ${message}\n`) as BodyInit, {
     status,
     headers: {
-      'content-type': 'application/x-git-result',
+      'content-type': 'text/plain; charset=utf-8',
       'cache-control': 'no-cache',
       ...headers,
     },
