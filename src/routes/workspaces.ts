@@ -381,7 +381,11 @@ export function workspaceRoutes(config: WorkspaceRouteConfig): RouteDefinition[]
       hideScopeFailure: hidesMissingScope('POST', '/workspaces/:slug/archive'),
       handler: async (c) => {
         const { workspace, level } = await workspaceAccess(c, config.store, 'write');
-        await archiveWorkspace(config.store, config.locks, config.clock, workspace);
+        await archiveWorkspace(config.store, config.locks, config.clock, workspace, {
+          ...(config.repos === undefined ? {} : { repos: config.repos }),
+          ...(config.secrets === undefined ? {} : { secrets: config.secrets }),
+          ...(config.fetch === undefined ? {} : { fetch: config.fetch }),
+        });
         return answerWithWorkspace(config, workspace.slug, level);
       },
     },
@@ -403,7 +407,12 @@ export function workspaceRoutes(config: WorkspaceRouteConfig): RouteDefinition[]
       hideScopeFailure: hidesMissingScope('DELETE', '/workspaces/:slug'),
       handler: async (c) => {
         const { workspace } = await workspaceAccess(c, config.store, 'write');
-        await deleteWorkspaceAndTokens(config.store, config.clock, workspace);
+        await deleteWorkspaceAndTokens(
+          config.store,
+          config.clock,
+          workspace,
+          config.repos === undefined ? {} : { repos: config.repos },
+        );
         return emptyResponse(204);
       },
     },
