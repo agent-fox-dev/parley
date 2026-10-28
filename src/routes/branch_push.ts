@@ -38,6 +38,19 @@ export interface BranchPushRouteConfig {
   log?: LogSink;
 }
 
+/**
+ * Asks the platform to let the work finish whatever the caller does.
+ * Not every runtime offers it, and the one that does not cancels
+ * nothing, so its absence is not a failure.
+ */
+function keepRunning(c: Context, work: Promise<unknown>): void {
+  try {
+    c.executionCtx.waitUntil(work.catch(() => undefined));
+  } catch {
+    // No execution context here: nothing cancels the work either.
+  }
+}
+
 async function push(c: Context, config: BranchPushRouteConfig): Promise<Response> {
   // 2. The workspace and write access. The scope came first, in the
   // router, which checks it before this handler is reached.
@@ -90,8 +103,14 @@ async function push(c: Context, config: BranchPushRouteConfig): Promise<Response
       throw protection;
     }
 
-    // 8. The push.
-    const result = await pushBranch(
+    // 8. The push, which outlives its caller.
+    //
+    // A platform that cancels work when a client disconnects would
+    // otherwise leave a branch half sent and nothing recorded, so the
+    // work is handed to the execution context first and awaited
+    // second: the answer is the same, and the push finishes either
+    // way.
+    const work = pushBranch(
       {
         repos,
         ...(config.secrets === undefined ? {} : { secrets: config.secrets }),
@@ -101,7 +120,8 @@ async function push(c: Context, config: BranchPushRouteConfig): Promise<Response
       workspace,
       { name, force: body.force },
     );
-    return jsonResponse(result);
+    keepRunning(c, work);
+    return jsonResponse(await work);
   });
 }
 
