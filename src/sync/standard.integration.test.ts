@@ -273,3 +273,78 @@ describe('a sync that cannot reach origin', () => {
     expect((await sync(place)).status).toBe(200);
   });
 });
+
+describe('when a sync may run at all', () => {
+  it.each([
+    ['pending', { status: 'pending' as const }],
+    ['cloning', { status: 'cloning' as const }],
+    ['failed', { status: 'failed' as const }],
+    ['archived', { status: 'archived' as const }],
+    ['ready with syncing switched off', { settings: { sync_enabled: false } }],
+  ])('refuses a workspace that is %s, and asks origin nothing', async (_what, over) => {
+    const place = await world();
+    await place.service.store.run(`UPDATE workspaces SET status = ?, settings = ? WHERE slug = ?`, [
+      (over as { status?: string }).status ?? 'ready',
+      JSON.stringify((over as { settings?: unknown }).settings ?? {}),
+      place.slug,
+    ]);
+    const before = await read(place);
+    const asked = place.remote.requests();
+
+    const response = await sync(place);
+
+    expect(response.status).toBe(400);
+    expect(place.remote.requests()).toBe(asked);
+    expect(await read(place)).toEqual(before);
+  });
+
+  it('refuses at once while another operation holds the workspace', async () => {
+    const place = await world();
+    const held = await place.service.locks.take(`workspace:${place.slug}`);
+    expect(held, 'the suite took the lock').toBeDefined();
+
+    const started = Date.now();
+    const refused = await sync(place);
+    const waited = Date.now() - started;
+
+    expect(refused.status).toBe(409);
+    expect(((await refused.json()) as { error: { error_type: string } }).error.error_type).toBe(
+      'workspace_busy',
+    );
+    // It did not queue behind the lock: it answered.
+    expect(waited).toBeLessThan(2000);
+
+    await held?.release();
+    expect((await sync(place)).status).toBe(200);
+  });
+
+  it('leaves the status at ready while it runs, so busy is the lock and not a state', async () => {
+    const place = await world();
+    await advanceOrigin(place, 1, place.local);
+
+    // Read the workspace from inside the sync, which is the only
+    // moment at which a stored "syncing" status could be seen.
+    let seen: unknown;
+    let second: Response | undefined;
+    const slow = new Promise<void>((resolve) => {
+      setTimeout(() => {
+        void (async () => {
+          seen = (await read(place))['status'];
+          second = await sync(place);
+          resolve();
+        })();
+      }, 0);
+    });
+
+    const [response] = await Promise.all([sync(place), slow]);
+
+    expect(response.status).toBe(200);
+    expect(seen).toBe('ready');
+    if (second !== undefined && second.status !== 200) {
+      expect(second.status).toBe(409);
+      expect(((await second.json()) as { error: { error_type: string } }).error.error_type).toBe(
+        'workspace_busy',
+      );
+    }
+  });
+});

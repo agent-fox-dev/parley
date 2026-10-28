@@ -10,7 +10,7 @@ import { findWorkspace } from '../store/workspaces.js';
 import { hidesMissingScope, workspaceAccess } from '../workspace/access.js';
 import { withWorkspaceLock } from '../workspace/lock.js';
 import { serialiseWorkspace } from '../workspace/serialise.js';
-import { effectiveSettings } from '../workspace/settings.js';
+import { syncRefusal } from '../sync/preconditions.js';
 import { jsonResponse } from '../http/json.js';
 import { syncStandard } from '../sync/standard.js';
 
@@ -38,11 +38,9 @@ export interface SyncRouteConfig {
 async function sync(c: Context, config: SyncRouteConfig): Promise<Response> {
   const { workspace, level } = await workspaceAccess(c, config.store, 'write');
 
-  if (workspace.status !== 'ready') {
-    throw new HttpError(400, 'this workspace is not ready to sync');
-  }
-  if (effectiveSettings(workspace.settings)['sync_enabled'] !== true) {
-    throw new HttpError(400, 'syncing is switched off for this workspace');
+  const refusal = syncRefusal(workspace);
+  if (refusal !== undefined) {
+    throw refusal;
   }
   if (config.repos === undefined) {
     throw new HttpError(503, 'this deployment holds no repositories');

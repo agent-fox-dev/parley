@@ -5,6 +5,7 @@ import type { RelationalStore } from '../platform/index.js';
 import { serviceRoutes } from '../routes/index.js';
 import { deploymentKey, openWith, sealWith, sealedSecrets } from '../secrets/store.js';
 import { storeLocks } from '../platform/store_lock.js';
+import type { Locks } from '../platform/lock.js';
 import type { SecretStore } from '../platform/secrets.js';
 import type { RepositoryStore } from '../platform/repostore.js';
 import type { JobQueue } from '../platform/jobs.js';
@@ -22,6 +23,8 @@ export interface Service {
   app: ReturnType<typeof buildApp>;
   store: RelationalStore;
   secrets: SecretStore;
+  /** The same locks the routes hold, so a suite can hold one itself. */
+  locks: Locks;
   dispose: () => void;
 }
 
@@ -47,6 +50,8 @@ export async function identityService(
   const key = await deploymentKey(SECRET_KEY);
   const secrets = sealedSecrets(seeded.store, key as CryptoKey);
   const secretCipher = { seal: sealWith(key as CryptoKey), open: openWith(key as CryptoKey) };
+  // The same locks the routes hold, so a suite can hold one itself.
+  const locks = storeLocks(seeded.store, clock);
   const app = buildApp({
     routes: [
       ...serviceRoutes({
@@ -63,7 +68,7 @@ export async function identityService(
         ...(options.repos === undefined ? {} : { repos: options.repos }),
         ...(options.jobs === undefined ? {} : { jobs: options.jobs }),
         ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
-        locks: storeLocks(seeded.store, clock),
+        locks,
         adminToken: ADMIN_TOKEN,
         ...(options.decideRef === undefined ? {} : { decideRef: options.decideRef }),
       }),
@@ -74,7 +79,7 @@ export async function identityService(
     auth: { store: seeded.store, clock, adminToken: ADMIN_TOKEN, mountPoint: MOUNT },
   });
 
-  return { app, store: seeded.store, secrets, dispose: seeded.dispose };
+  return { app, store: seeded.store, secrets, locks, dispose: seeded.dispose };
 }
 
 /** A request as a client makes it: the credential in the usual header. */
