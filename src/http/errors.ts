@@ -11,12 +11,24 @@ export interface ErrorEnvelope {
 export class HttpError extends Error {
   readonly status: number;
   readonly errorType: string | undefined;
+  /**
+   * Headers the answer must carry. Only a refusal that is itself an
+   * instruction has any — a rate limit's Retry-After — and the
+   * envelope is the same either way.
+   */
+  readonly headers: Readonly<Record<string, string>> | undefined;
 
-  constructor(status: number, message: string, errorType?: string) {
+  constructor(
+    status: number,
+    message: string,
+    errorType?: string,
+    headers?: Readonly<Record<string, string>>,
+  ) {
     super(message);
     this.name = 'HttpError';
     this.status = status;
     this.errorType = errorType;
+    this.headers = headers;
   }
 }
 
@@ -31,6 +43,6 @@ export function renderErrorEnvelope(err: HttpError): ErrorEnvelope {
 export function errorResponse(err: HttpError): Response {
   return new Response(JSON.stringify(renderErrorEnvelope(err)), {
     status: err.status,
-    headers: { 'content-type': 'application/json; charset=UTF-8' },
+    headers: { 'content-type': 'application/json; charset=UTF-8', ...err.headers },
   });
 }

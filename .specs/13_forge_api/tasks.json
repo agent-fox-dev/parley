@@ -62,7 +62,7 @@
         "src/forge/client.integration.test.ts",
         "docs/adr/"
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 2,
@@ -92,7 +92,7 @@
       "depends_on": [
         1
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 3,
@@ -121,7 +121,7 @@
       "depends_on": [
         2
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 4,
@@ -155,7 +155,7 @@
       "depends_on": [
         2
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 5,
@@ -192,7 +192,7 @@
       "depends_on": [
         4
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 6,
@@ -219,7 +219,7 @@
       "depends_on": [
         5
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 7,
@@ -251,7 +251,7 @@
       "depends_on": [
         5
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 8,
@@ -285,7 +285,7 @@
         "`make check` passes with no network access and no deployment configured",
         "afc forge status, afc issue, afc pr and afc label behave as docs/prd/cli.md specifies against a running deployment"
       ],
-      "state": "pending"
+      "state": "done"
     }
   ]
 }

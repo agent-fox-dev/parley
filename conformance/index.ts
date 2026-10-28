@@ -8,6 +8,7 @@ import { carryPatchChecks } from './carry_patch.js';
 import { mergeChecks } from './merges.js';
 import { sessionChecks } from './sessions.js';
 import { auditChecks } from './audit.js';
+import { forgeChecks } from './forge.js';
 import { workspaceChecks } from './workspaces.js';
 import { type Check, formatReport, runHarness } from './harness.js';
 
@@ -77,6 +78,7 @@ export async function main(): Promise<number> {
       ...mergeChecks(),
       ...sessionChecks(),
       ...auditChecks(),
+      ...forgeChecks(),
     ],
   });
   console.log(formatReport(result));
