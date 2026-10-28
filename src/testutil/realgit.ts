@@ -194,3 +194,85 @@ export function realGitRebase(
     rmSync(dir, { recursive: true, force: true });
   }
 }
+
+/**
+ * The tree of the merge commit the real git binary makes, so the engine's
+ * can be compared with it. A criss-cross history is built when two base
+ * commits are given for each side.
+ */
+export function realGitMergeTree(
+  root: Files,
+  oursCommits: Files[],
+  theirsCommits: Files[],
+  crissCross = false,
+): { tree?: string; conflicts?: string[] } {
+  const dir = mkdtempSync(join(tmpdir(), 'parley-realgit-tree-'));
+  const run = (...args: string[]) =>
+    execFileSync('git', args, {
+      cwd: dir,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: 'Fixture',
+        GIT_AUTHOR_EMAIL: 'fixture@parley.test',
+        GIT_COMMITTER_NAME: 'Fixture',
+        GIT_COMMITTER_EMAIL: 'fixture@parley.test',
+        GIT_AUTHOR_DATE: '2023-11-14T22:13:20Z',
+        GIT_COMMITTER_DATE: '2023-11-14T22:13:20Z',
+      },
+    });
+
+  function write(files: Files): void {
+    for (const entry of run('ls-files').split('\n').filter(Boolean)) {
+      rmSync(join(dir, entry), { force: true });
+    }
+    run('rm', '-rq', '--cached', '--ignore-unmatch', '.');
+    for (const [path, content] of Object.entries(files)) {
+      mkdirSync(dirname(join(dir, path)), { recursive: true });
+      writeFileSync(join(dir, path), content);
+      run('add', '--', path);
+    }
+  }
+
+  try {
+    run('init', '-q', '-b', 'main');
+    run('config', 'user.name', 'Fixture');
+    run('config', 'user.email', 'fixture@parley.test');
+    write(root);
+    run('commit', '-q', '-m', 'root', '--allow-empty');
+    run('branch', 'topic');
+
+    for (const [i, files] of oursCommits.entries()) {
+      write(files);
+      run('commit', '-q', '-m', `ours ${String(i + 1)}`, '--allow-empty');
+    }
+    run('checkout', '-q', 'topic');
+    for (const [i, files] of theirsCommits.entries()) {
+      write(files);
+      run('commit', '-q', '-m', `theirs ${String(i + 1)}`, '--allow-empty');
+    }
+
+    if (crissCross) {
+      // Each side takes the other's earlier work, so the two share two
+      // merge bases rather than one.
+      run('merge', '--no-edit', '-m', 'cross into topic', 'main');
+      run('checkout', '-q', 'main');
+      run('merge', '--no-edit', '-m', 'cross into main', 'topic~1');
+    } else {
+      run('checkout', '-q', 'main');
+    }
+
+    try {
+      run('merge', '--no-edit', '-m', 'merge', 'topic');
+    } catch {
+      const conflicts = run('diff', '--name-only', '--diff-filter=U')
+        .split('\n')
+        .filter(Boolean)
+        .toSorted();
+      return { conflicts };
+    }
+    return { tree: run('rev-parse', 'HEAD^{tree}').trim() };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}

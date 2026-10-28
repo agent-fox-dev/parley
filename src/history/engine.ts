@@ -76,8 +76,7 @@ interface Session {
 /** The conflicting paths a thrown merge failure names. */
 export function conflictingPaths(err: unknown): string[] | undefined {
   const data = (err as { code?: string; data?: { filepaths?: string[] } }).data;
-  const code = (err as { code?: string }).code;
-  if (code !== 'MergeConflictError' && code !== 'MergeNotSupportedError') {
+  if ((err as { code?: string }).code !== 'MergeConflictError') {
     return undefined;
   }
   return [...(data?.filepaths ?? [])].toSorted();
@@ -127,6 +126,51 @@ async function open(repos: RepositoryStore, repository: string): Promise<Session
 const TEMP_OURS = 'refs/hub/engine/ours';
 const TEMP_THEIRS = 'refs/hub/engine/theirs';
 
+/**
+ * The base a three-way merge should use. Two commits usually share one
+ * merge base, and that is it; where they share several — a history that
+ * crossed over — git merges the bases into a virtual one and merges
+ * against that. The library does neither, so this does.
+ */
+async function mergeBaseOf(
+  options: { fs: never; gitdir: string },
+  ours: string,
+  theirs: string,
+): Promise<string> {
+  const bases = (await git.findMergeBase({ ...options, oids: [ours, theirs] })) as string[];
+  const first = bases[0];
+  if (first === undefined) {
+    throw new Error('these two commits share no history');
+  }
+  if (bases.length === 1) {
+    return first;
+  }
+
+  let base = first;
+  for (const next of bases.slice(1)) {
+    // Each pair of bases is merged as any other pair would be, which is
+    // where the recursion is: their own base may itself be several.
+    const merged = await mergeOverBase(options, {
+      base: await mergeBaseOf(options, base, next),
+      ours: base,
+      theirs: next,
+    });
+    base = await git.writeCommit({
+      ...options,
+      commit: {
+        // A region the bases disagree on is left as the conflict wrote
+        // it, which is what git's own virtual base does.
+        tree: merged.tree ?? (await git.readCommit({ ...options, oid: base })).commit.tree,
+        parent: [base, next],
+        author: ENGINE,
+        committer: ENGINE,
+        message: 'a virtual base, merged from two',
+      },
+    });
+  }
+  return base;
+}
+
 /** The commits a branch has that a base does not, oldest first. */
 async function commitsNotIn(
   options: { fs: never; gitdir: string },
@@ -158,19 +202,23 @@ async function mergeOverBase(
 ): Promise<MergeResult> {
   const treeOf = async (oid: string) => (await git.readCommit({ ...options, oid })).commit.tree;
 
-  const ourSide = await git.writeCommit({
-    ...options,
-    commit: {
-      tree: await treeOf(oids.ours),
-      parent: [oids.base],
-      author: ENGINE,
-      committer: ENGINE,
-      message: 'the side a replay is landing on',
-    },
-  });
+  const sideOn = async (oid: string, what: string) =>
+    git.writeCommit({
+      ...options,
+      commit: {
+        tree: await treeOf(oid),
+        parent: [oids.base],
+        author: ENGINE,
+        committer: ENGINE,
+        message: what,
+      },
+    });
+
+  const ourSide = await sideOn(oids.ours, 'one side of a merge over a stated base');
+  const theirSide = await sideOn(oids.theirs, 'the other side of a merge over a stated base');
 
   await git.writeRef({ ...options, ref: TEMP_OURS, value: ourSide, force: true });
-  await git.writeRef({ ...options, ref: TEMP_THEIRS, value: oids.theirs, force: true });
+  await git.writeRef({ ...options, ref: TEMP_THEIRS, value: theirSide, force: true });
 
   try {
     const merged = await git.merge({
@@ -312,8 +360,42 @@ export function historyEngine(repos: RepositoryStore): HistoryEngine {
       return { commits: written };
     },
 
-    async mergeCommit(): Promise<CommitResult> {
-      return Promise.resolve({ conflicts: [] });
+    /**
+     * One merge commit, with the base first and the branch second, and
+     * the three-way merge of the two as its tree. A merge that
+     * conflicts writes nothing: no commit, and no ref pointing at one.
+     */
+    async mergeCommit(request): Promise<CommitResult> {
+      const session = await open(repos, request.repository);
+      const { fs, gitdir } = session;
+      const options = { fs: fs as never, gitdir };
+
+      const merged = await mergeOverBase(options, {
+        base: await mergeBaseOf(options, request.ours, request.theirs),
+        ours: request.ours,
+        theirs: request.theirs,
+      });
+      if (merged.conflicts !== undefined) {
+        return { conflicts: merged.conflicts };
+      }
+      const tree = merged.tree ?? '';
+
+      // Written here rather than taken from the library's own merge, so
+      // the parents are in the order the reference fixes and the author
+      // is the caller's rather than the engine's.
+      const commit = await git.writeCommit({
+        ...options,
+        commit: {
+          tree,
+          parent: [request.ours, request.theirs],
+          author: request.author,
+          committer: request.author,
+          message: request.message ?? 'merge',
+        },
+      });
+
+      await session.flush([{ name: MERGE_RESULT_REF, oldOid: null, newOid: commit, force: true }]);
+      return { commit };
     },
   };
 }
