@@ -70,6 +70,7 @@ export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
       ...(config.repos === undefined ? {} : { repos: config.repos }),
       ...(config.decideRef === undefined ? {} : { decide: config.decideRef }),
       ...(config.secrets === undefined ? {} : { secrets: config.secrets }),
+      ...(config.jobs === undefined ? {} : { jobs: config.jobs }),
       ...(config.fetch === undefined ? {} : { fetch: config.fetch }),
     }),
     ...serverRoutes({

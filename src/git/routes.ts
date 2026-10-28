@@ -1,5 +1,6 @@
 import type { Context } from 'hono';
 import type { LogSink, RouteDefinition } from '../http/router.js';
+import type { JobQueue } from '../platform/jobs.js';
 import type { SecretStore } from '../platform/secrets.js';
 import type { StoredRef } from '../platform/repostore.js';
 import type { RefChange } from '../platform/repostore.js';
@@ -32,6 +33,8 @@ export interface GitRouteConfig extends GitAccessDeps {
   decide?: Decider;
   /** Where the fork's credentials are read from, for a forward. */
   secrets?: SecretStore;
+  /** Where a rebuild is queued after a patch branch is pushed. */
+  jobs?: JobQueue;
   /** Injected so a suite reaches a fork of its own. */
   fetch?: typeof fetch;
   log?: LogSink;
@@ -256,6 +259,8 @@ export function gitRoutes(config: GitRouteConfig): RouteDefinition[] {
               repository: subject.repository,
               slug: subject.workspace.slug,
               clock: config.clock,
+              workspace: subject.workspace,
+              ...(config.jobs === undefined ? {} : { jobs: config.jobs }),
             })(outcomes);
             await mirrorAfterPush(control, commands)(outcomes);
           },

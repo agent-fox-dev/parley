@@ -1,5 +1,8 @@
 import type { Clock, RelationalStore } from '../platform/index.js';
+import type { JobQueue } from '../platform/jobs.js';
 import type { RepositoryStore, StoredRef } from '../platform/repostore.js';
+import { afterPatchBranchPush } from '../rebuild/trigger.js';
+import type { WorkspaceRecord } from '../store/workspaces.js';
 import type { RefOutcome } from './push.js';
 
 /**
@@ -10,10 +13,10 @@ import type { RefOutcome } from './push.js';
  * every ref was refused, because a refusal is still a moment at which
  * the service looked at the repository and can say what it holds.
  *
- * Nothing else happens here. Queuing a rebuild for an accepted patch
- * branch is the carry-patch package's, and this is the place it goes:
- * the outcomes say which refs were taken, and the workspace's
- * `auto_rebuild_after_push` setting says whether to.
+ * A push that moved a registered patch branch also leaves the stack
+ * out of date, so it queues a rebuild. That happens after the refresh
+ * and never blocks the push's answer: the client has its report
+ * already, and the rebuild is a job.
  */
 export interface AfterPushDeps {
   store: RelationalStore;
@@ -21,6 +24,9 @@ export interface AfterPushDeps {
   repository: string;
   slug: string;
   clock: Clock;
+  /** Where a rebuild is queued, for a workspace that carries patches. */
+  jobs?: JobQueue;
+  workspace?: WorkspaceRecord;
 }
 
 /**
@@ -46,11 +52,26 @@ export function headRef(refs: readonly StoredRef[]): StoredRef | undefined {
 export function refreshHead(
   deps: AfterPushDeps,
 ): (outcomes: readonly RefOutcome[]) => Promise<void> {
-  return async () => {
+  return async (outcomes) => {
     const head = headRef(await deps.repos.listRefs(deps.repository));
     await deps.store.run('UPDATE workspaces SET head_sha = ? WHERE slug = ?', [
       head?.oid ?? null,
       deps.slug,
     ]);
+
+    // A push that moved a registered patch branch leaves the stack
+    // out of date, so the workspace owes a rebuild.
+    if (deps.workspace === undefined) {
+      return;
+    }
+    await afterPatchBranchPush(
+      {
+        store: deps.store,
+        clock: deps.clock,
+        ...(deps.jobs === undefined ? {} : { jobs: deps.jobs }),
+      },
+      deps.workspace,
+      outcomes.filter((one) => one.ok).map((one) => one.name),
+    );
   };
 }
