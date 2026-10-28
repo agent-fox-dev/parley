@@ -45,7 +45,7 @@ const ISSUES_BY_DEFAULT = 30;
  * give is left out entirely, so the forge's own default applies
  * rather than one this service invented.
  */
-export function readIssueQuery(c: Context): IssueQuery {
+function readIssueQuery(c: Context): IssueQuery {
   const named = (name: string, allowed: string[]): string | undefined => {
     const given = once(c, name);
     if (given === undefined) {

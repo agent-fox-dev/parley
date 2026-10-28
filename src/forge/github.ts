@@ -32,7 +32,7 @@ import {
 const PER_PAGE = 100;
 
 /** How many comments one read brings back before the thread is cut short. */
-export const COMMENT_PAGE = 100;
+const COMMENT_PAGE = 100;
 
 function issueFrom(raw: Record<string, unknown>): ForgeIssue {
   const author = object(raw['user']);
@@ -93,7 +93,7 @@ function pullFrom(raw: Record<string, unknown>): ForgePullRequest {
 }
 
 /** The repository's path, as GitHub spells it in a URL. */
-export function repoPath(repository: Repository): string {
+function repoPath(repository: Repository): string {
   return `/repos/${repository.owner}/${repository.name}`;
 }
 
@@ -221,7 +221,7 @@ export function githubApi(client: ForgeClient, repository: Repository): ForgeApi
 }
 
 /** The write half of GitHub's API, in the reference's own shapes. */
-export function githubWrites(client: ForgeClient, repository: Repository) {
+function githubWrites(client: ForgeClient, repository: Repository) {
   const at = repoPath(repository);
 
   return {

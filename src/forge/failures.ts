@@ -33,7 +33,7 @@ export function scrubbed(message: string, token?: string): string {
 }
 
 /** The hint a username and password earn when the forge refuses them. */
-export const TOKEN_HINT = 'The forge API needs a token: store one as GIT_PAT, or as GIT_PASSWORD.';
+const TOKEN_HINT = 'The forge API needs a token: store one as GIT_PAT, or as GIT_PASSWORD.';
 
 /**
  * Whether a refusal is the forge rate limiting. GitHub answers 403

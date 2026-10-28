@@ -62,7 +62,7 @@ export interface Reached {
 export const USER_AGENT = 'af-hub/parley';
 
 /** How long one call has, its retries included. */
-export const DEADLINE_MS = 30_000;
+const DEADLINE_MS = 30_000;
 
 /** How many same-host redirects a request will follow before giving up. */
 const MOST_REDIRECTS = 3;
@@ -145,7 +145,7 @@ export interface ClientDeps {
 }
 
 /** The longest backoff the hub will sit through before giving up. */
-export const MOST_BACKOFF_MS = 120_000;
+const MOST_BACKOFF_MS = 120_000;
 
 /** The address a request goes to, with its query. */
 function addressOf(apiUrl: string, request: ForgeRequest): string {

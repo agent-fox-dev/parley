@@ -245,3 +245,29 @@ describe('a body-like field over the forge’s limit', () => {
     expect(answered.error.error_type).toBe('forge_unknown');
   });
 });
+
+describe('every write that reached the forge', () => {
+  it('records exactly one event, and a refusal before it records none', async () => {
+    const held = await world();
+
+    // Reached the forge: refused by it, so one event all the same.
+    forge.answerWith({ 'POST /repos/acme/widgets/issues': { status: 500, body: {} } } as never);
+    expect(
+      (
+        await held.app.request(
+          `${MOUNT}/workspaces/mine/issues`,
+          withJson('POST', { title: 'ok' }, held.key),
+        )
+      ).status,
+    ).toBe(502);
+
+    const afterReaching = await recordedEvents(held.store);
+    expect(afterReaching).toHaveLength(1);
+    expect(afterReaching[0]?.metadata).toMatchObject({ ok: false, error_type: 'forge_error' });
+
+    // Refused here: the body breaks the route's own rule.
+    await held.app.request(`${MOUNT}/workspaces/mine/issues`, withJson('POST', {}, held.key));
+
+    expect(await recordedEvents(held.store)).toHaveLength(1);
+  });
+});

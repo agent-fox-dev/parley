@@ -31,6 +31,7 @@ implemented; routes appear here as they are built.
 - [Carrying a patch stack](#carrying-a-patch-stack)
 - [Agent sessions and what they cost](#agent-sessions-and-what-they-cost)
 - [Audit and events](#audit-and-events)
+- [The forge](#the-forge)
 - [Git Server](#git-server)
 - [Server Endpoints](#server-endpoints)
 
@@ -1191,6 +1192,156 @@ every 30 seconds. `workspace` narrows it to one workspace and
   starts, and the configured limit of concurrent streams
   (`AF_SSE_MAX_CONNECTIONS`, 100) is `503`. Neither leaves a half-open
   stream.
+
+## The forge
+
+A workspace's repository lives on GitHub or GitLab. These routes read
+and change it **with the credential the workspace holds**, never the
+caller's: an agent that can open a pull request through Parley needs no
+forge token of its own, which is the whole point. No answer shows the
+credential, only its kind.
+
+### Which forge, and whose credential
+
+The repository is read from the remote URL — `https://`, `ssh://` or
+`git@host:owner/name` — with `.git` and any userinfo removed and a
+GitLab subgroup path kept whole, so `…/group/subgroup/widgets` has the
+owner `group/subgroup`.
+
+Which forge it is comes from the host's name or from an API URL setting
+containing one of the two words. Without a setting the API URL is
+`https://api.github.com` for `github.com`, `https://<host>/api/v3` for
+another GitHub host and `https://<host>/api/v4` for a GitLab host; a
+GitLab setting gains `/api/v4` when it lacks it. **When neither the host
+nor a setting says which forge it is, the answer is `422
+forge_unknown`** and nothing is sent.
+
+`?target=upstream` works on a `carry_patch` workspace's `upstream_url`,
+with the upstream credential and `upstream_forge_api_url` — which does
+**not** fall back to `forge_api_url`, the two being different
+repositories. Any other value is `400`.
+
+Nothing is cached: a rotated secret or a changed setting applies to the
+next call. Every request carries the hub's user agent, refuses a
+redirect to another host, port or scheme, and has 30 seconds including
+its retries.
+
+### The order of checks
+
+A read checks the credential, then a token's `forge:read` scope
+**before the workspace is looked up**, then the workspace, then the
+target, then the path and query parameters, then the forge. A write
+checks the credential, then `forge:write`, then the workspace with a
+member refused `403 forbidden`, then that it is not archived, then the
+request, then the forge, and **last** the body limit — so an oversized
+body on a workspace whose forge cannot be identified is `422
+forge_unknown` rather than `413`. A request refused at any step sends
+nothing to the forge and records no event.
+
+### GET /api/v1/workspaces/:slug/forge
+
+How the hub reaches the forge, **without contacting it** — the route to
+run when another answers `forge_unknown`. It reports the forge (or
+`unknown` for a host it cannot classify, rather than refusing), the API
+URL, the repository, the credential's kind, the upstream's equivalent,
+and a webhook block saying whether the secret is stored, where the
+forge should post and when the last delivery arrived. It never carries
+the secret, and it answers for an archived workspace.
+
+An API URL setting that is not an absolute `https` URL with a host and
+without userinfo, query or fragment is `422 forge_api_url_invalid`,
+naming the setting and the rule but never the value. A store that
+cannot be read is `500` with no partial answer.
+
+### The reads
+
+`forge/repository`, `issues`, `issues/:n`, `issues/:n/comments`,
+`pulls/:n`, `pulls/:n/state`, `pulls/:n/files`, `pulls/:n/checks` and
+`pulls/:n/reviews`, each `forge:read` with read access and any workspace
+status. Every list is a bare array, empty rather than null.
+
+`GET .../issues` takes `state`, `labels`, `assignee`, `sort`,
+`direction` and `limit` (1 to 100, 30 by default). **A parameter the
+caller did not give is not sent**, so the forge's own default applies;
+empty items are dropped from `labels`. A bad, empty or repeated value is
+`400` naming the parameter, and `:n` must be a positive decimal integer.
+
+An issue thread carries `truncated` where more comments exist than were
+read, and where the issue was read but its comments were not it answers
+`200` with the issue and the comments' error in `comments_err`.
+
+GitLab has neither reviews nor check runs; its approvals and its
+pipelines are what those two routes answer with. See
+[ADR 11](adr/11-what-the-two-forges-really-answer.md) for every such
+divergence.
+
+### The writes
+
+`POST .../issues`, `PATCH .../issues/:n`, `POST .../issues/:n/close`,
+`POST .../issues/:n/comments`, `POST .../issues/:n/labels`,
+`DELETE .../issues/:n/labels/:name`, `POST .../labels`,
+`POST .../pulls` and `POST .../pulls/:n/comments`, each `forge:write`
+with write access on a workspace that is not archived.
+
+Three of them make more than one request, and their ordering is the
+contract:
+
+- **A close with a comment** posts the comment first and closes only if
+  that worked. A refused comment leaves the issue open; a close that
+  fails afterwards leaves the comment in place and records its URL in
+  the event.
+- **A label removal** answers `204` whether or not the issue had the
+  label. The forge says "not found" for both, so the issue is read once
+  to tell them apart, and only an issue that is really gone is
+  `404 forge_not_found`. The name is the last path segment decoded
+  exactly once: `type%2Fbug` removes `type/bug` and `af:fix` is itself.
+- **A label create** never changes a label that exists (`200`), creates
+  one that does not (`201`), and reads once more where a concurrent
+  call won the race.
+
+An issue update changes only the fields it names; `labels` and
+`assignees` replace the whole set, `body: ""` clears the body, and a
+body that sets nothing is `400 nothing to update` — as is one that sets
+only `assignees` on GitLab, which takes user ids rather than names. A
+pull request's `head` is sent exactly as given, so `owner:branch` opens
+from a fork, and nothing is deduplicated: a retried create can create
+twice.
+
+**Body limits.** An issue's body on create and update, a close's
+comment, a comment's body and a pull request's body are measured in
+Unicode code points — 65,536 on GitHub, 1,000,000 on GitLab — and one
+over it is `413 body_too_large` with nothing sent. Titles, heads, bases,
+label names and descriptions and assignee names are not measured.
+
+**Audit.** A write that reached the forge records exactly one
+`hub.forge.*` event, successful or not; one refused before it reached
+the forge records none.
+
+### When the forge says no
+
+| What happened                                              | Answer                      |
+| ---------------------------------------------------------- | --------------------------- |
+| the forge answered 404                                     | `404 forge_not_found`       |
+| it answered 401                                            | `502 forge_unauthenticated` |
+| it answered a 403 that is not a rate limit                 | `502 forge_forbidden`       |
+| a rate limit the hub could not wait out                    | `429 forge_rate_limited`    |
+| it answered another 4xx                                    | `422 forge_rejected`        |
+| it answered 5xx, unreadably, or redirected to another host | `502 forge_error`           |
+| the connection failed                                      | `502 forge_unreachable`     |
+| the 30-second deadline passed                              | `504 forge_timeout`         |
+
+The statuses are deliberately not the forge's own: its `401` means the
+**workspace's** credential was refused, not the caller's. The forge's
+message is carried through as `the forge answered <status>: <message>`
+with the token replaced, URL userinfo removed and the text cut to 1024
+bytes, and a `401` for a stored username and password adds that the
+forge API needs a token.
+
+One rate-limit backoff of up to two minutes is waited out and the
+request made again. A wait the 30-second deadline cannot contain is
+`504 forge_timeout`, and a refusal carries `Retry-After` in whole
+seconds where the forge said how long. A write with no credential
+configured is `502 forge_error` with nothing sent.
 
 ## Git Server
 

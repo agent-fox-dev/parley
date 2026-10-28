@@ -32,10 +32,10 @@ import {
  * with its approvals and its pipelines.
  */
 /** How many comments one read brings back before the thread is cut short. */
-export const NOTE_PAGE = 100;
+const NOTE_PAGE = 100;
 
 /** The project, as GitLab wants it in a path: one encoded segment. */
-export function projectPath(repository: Repository): string {
+function projectPath(repository: Repository): string {
   return `/projects/${encodeURIComponent(`${repository.owner}/${repository.name}`)}`;
 }
 
@@ -46,7 +46,7 @@ function stateFrom(raw: unknown): string {
 }
 
 /** And the other way round, for a filter the caller gave. */
-export function stateFor(given: string): string {
+function stateFor(given: string): string {
   return given === 'open' ? 'opened' : given;
 }
 
@@ -237,7 +237,7 @@ export function gitlabApi(client: ForgeClient, repository: Repository): ForgeApi
 const joined = (names: string[]) => names.join(',');
 
 /** The write half of GitLab's API, in the reference's own shapes. */
-export function gitlabWrites(client: ForgeClient, repository: Repository) {
+function gitlabWrites(client: ForgeClient, repository: Repository) {
   const at = projectPath(repository);
 
   return {

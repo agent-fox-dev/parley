@@ -285,7 +285,7 @@
         "`make check` passes with no network access and no deployment configured",
         "afc forge status, afc issue, afc pr and afc label behave as docs/prd/cli.md specifies against a running deployment"
       ],
-      "state": "pending"
+      "state": "done"
     }
   ]
 }
