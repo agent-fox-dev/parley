@@ -49,7 +49,7 @@
         "src/jobs/merge.ts",
         "src/store/migrations/"
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 2,
@@ -78,7 +78,7 @@
       "depends_on": [
         1
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 3,
@@ -107,7 +107,7 @@
       "depends_on": [
         2
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 4,
@@ -139,7 +139,7 @@
       "depends_on": [
         1
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 5,
@@ -168,7 +168,7 @@
       "depends_on": [
         1
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 6,
@@ -202,7 +202,7 @@
         "`make check` passes with no network access and no deployment configured",
         "afc merge submit, list, status, cancel and requeue and afc rebase submit behave as docs/prd/cli.md specifies against a running deployment"
       ],
-      "state": "pending"
+      "state": "done"
     }
   ]
 }

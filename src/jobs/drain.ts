@@ -3,6 +3,7 @@ import type { JobQueue } from '../platform/jobs.js';
 import type { Locks } from '../platform/lock.js';
 import { COPY_IN, type CopyInDeps, type CopyInPayload, runCopyIn } from './copy_in.js';
 import { REBUILD, type RebuildPayload, runRebuildJob } from './rebuild.js';
+import { MERGE, type MergePayload, runMergeJob } from './merge.js';
 
 /** How many jobs one drain takes on before leaving the rest for the next. */
 const DEFAULT_BUDGET = 10;
@@ -39,6 +40,22 @@ export async function drainJobs(
         }
         await runRebuildJob({ ...deps, locks: deps.locks }, job.payload as RebuildPayload);
         await queue.complete(job.id);
+        continue;
+      }
+      if (job.kind === MERGE) {
+        if (deps.locks === undefined) {
+          await queue.fail(job.id, 'this deployment has no workspace lock to merge under');
+          continue;
+        }
+        const payload = job.payload as MergePayload;
+        const outcome = await runMergeJob({ ...deps, locks: deps.locks }, payload);
+        if (outcome === 'more') {
+          // The workspace was busy: the job keeps its place in the
+          // queue rather than failing for somebody else's work.
+          await queue.release(job.id, payload);
+        } else {
+          await queue.complete(job.id);
+        }
         continue;
       }
       if (job.kind !== COPY_IN) {

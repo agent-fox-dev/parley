@@ -4,7 +4,7 @@ spec_name: "merges"
 title: "Merge agent branches into a target through a queue"
 status: "active"
 created_at: "2026-10-27T18:55:01Z"
-updated_at: "2026-10-27T18:58:10Z"
+updated_at: "2026-10-28T11:19:52Z"
 intent_hash: "3e7df3fb4ac9c7955be85bbf3a418796d3e9fd6a1b30138042f0e18d489c310c"
 schema_version: 2
 source: "docs/prd/01-port-af-hub-to-typescript-on-cloudflare.md"

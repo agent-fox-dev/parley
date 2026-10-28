@@ -258,6 +258,32 @@ export const MIGRATIONS: readonly Migration[] = [
       'CREATE INDEX rebuilds_by_workspace ON rebuilds (workspace_slug, queued_at)',
     ],
   },
+  {
+    // A merge job, which is a rebase of a source onto a target and a
+    // fast-forward of the target. It waits its turn for the
+    // workspace rather than being refused, so unlike every other
+    // operation it has somewhere to wait: this table.
+    name: '012_merges',
+    statements: [
+      `CREATE TABLE merges (
+         id TEXT PRIMARY KEY,
+         workspace_slug TEXT NOT NULL,
+         target_branch TEXT NOT NULL,
+         source_ref TEXT NOT NULL,
+         status TEXT NOT NULL,
+         base_sha TEXT,
+         merged_sha TEXT,
+         conflict_files TEXT NOT NULL DEFAULT '[]',
+         error TEXT,
+         retry_count INTEGER NOT NULL DEFAULT 0,
+         submitted_by TEXT NOT NULL,
+         started_at TEXT,
+         created_at TEXT NOT NULL,
+         updated_at TEXT NOT NULL
+       )`,
+      'CREATE INDEX merges_by_workspace ON merges (workspace_slug, created_at)',
+    ],
+  },
 ];
 
 /**

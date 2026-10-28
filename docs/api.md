@@ -27,6 +27,7 @@ implemented; routes appear here as they are built.
 - [Variables](#variables)
 - [Sandboxes](#sandboxes)
 - [Keeping a workspace and its remote in step](#keeping-a-workspace-and-its-remote-in-step)
+- [Merging branches](#merging-branches)
 - [Carrying a patch stack](#carrying-a-patch-stack)
 - [Git Server](#git-server)
 - [Server Endpoints](#server-endpoints)
@@ -913,6 +914,44 @@ message, because the CLI shows the message and nothing else:
 | 422    | `forge_rejected`                                                               |
 | 502    | `forge_unauthenticated`, `forge_forbidden`, `forge_unreachable`, `forge_error` |
 | 504    | `forge_timeout`                                                                |
+
+## Merging branches
+
+A merge job rebases a source branch onto a target and fast-forwards
+the target to the result, so the history it leaves is the source's
+commits on top of the target's with no merge commit.
+
+**`POST .../merges`** answers `202` with a queued job. Both branch
+names are required, both follow git's rules and both must exist, and
+**the body is checked before the workspace is looked up** — the
+opposite of the anti-enumeration rule elsewhere, and deliberate: a
+name that breaks git's rules is the caller's mistake whatever
+workspace it names. The same source into the same target twice is
+`409 duplicate_merge`.
+
+A merge **waits its turn** for the workspace rather than being
+refused. Every other operation answers `409 workspace_busy` when the
+workspace is taken; a queued job has somewhere to wait.
+
+`GET .../merges` lists them (at most 200), `GET .../merges/:id` reads
+one, `DELETE .../merges/:id` cancels a queued one, and
+`POST .../merges/:id/requeue` queues a dead-lettered one again with
+its retry counted.
+
+A job that stops making progress for fifteen minutes is dead-lettered
+rather than left reading "running" with nothing running it, and a job
+whose runner went away is simply run again — a merge is a rebase of
+whatever the branches hold now, so running it twice is safe. The
+target branch holds either the head it had or the merged result, never
+anything between the two.
+
+**`POST .../rebase`** is the same arithmetic offered synchronously, for
+the question "which of these still apply": up to 20 branches rebased
+onto a target in the order given, one result each — `ok` with the new
+head, `conflict` with the paths, or `error`. A branch that conflicts
+does not stop the others and is left where it was. Unlike a merge job
+this is refused at once for a busy workspace, because a synchronous
+request has nowhere to wait.
 
 ## Carrying a patch stack
 
