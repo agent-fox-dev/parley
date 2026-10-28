@@ -26,7 +26,7 @@ function once(c: Context, name: string): string | undefined {
   return given[0];
 }
 
-export function readDeliveryQuery(c: Context): { since?: string; limit: number } {
+function readDeliveryQuery(c: Context): { since?: string; limit: number } {
   const asked = once(c, 'limit');
   let limit = BY_DEFAULT;
   if (asked !== undefined) {

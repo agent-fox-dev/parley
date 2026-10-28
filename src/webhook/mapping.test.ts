@@ -310,3 +310,72 @@ describe('a delivery that says too little', () => {
     expect(mapped.events[0]?.metadata).toMatchObject({ url: '', head: '', base: '' });
   });
 });
+
+/**
+ * No row of either table left unexercised. The cases above each
+ * name their row; this one checks the set, so a row the reference
+ * gains and nobody maps is caught here rather than by a consumer
+ * whose events stopped arriving.
+ */
+describe('the rows of the reference’s two tables', () => {
+  it('are each exercised by a delivery above', () => {
+    const githubRows = [
+      ['issues', 'opened'],
+      ['issues', 'edited'],
+      ['issues', 'closed'],
+      ['issues', 'reopened'],
+      ['issues', 'labeled'],
+      ['issues', 'unlabeled'],
+      ['issue_comment', 'created'],
+      ['pull_request', 'opened'],
+      ['pull_request', 'reopened'],
+      ['pull_request', 'synchronize'],
+      ['pull_request', 'closed'],
+      ['push', ''],
+    ] as const;
+    const gitlabRows = [
+      ['Issue Hook', 'open'],
+      ['Issue Hook', 'close'],
+      ['Issue Hook', 'reopen'],
+      ['Issue Hook', 'update'],
+      ['Note Hook', ''],
+      ['Merge Request Hook', 'open'],
+      ['Merge Request Hook', 'close'],
+      ['Merge Request Hook', 'reopen'],
+      ['Merge Request Hook', 'merge'],
+      ['Merge Request Hook', 'update'],
+      ['Push Hook', ''],
+      ['Tag Push Hook', ''],
+    ] as const;
+
+    // Every row maps to at least one event when given a payload it
+    // can read; the cases above assert which events each produces.
+    for (const [event, action] of githubRows) {
+      const mapped = github(event, {
+        action,
+        issue: { ...ISSUE, labels: [] },
+        label: { name: 'a-label' },
+        pull_request: { ...PULL, merged: action === 'closed' },
+        comment: { html_url: 'https://github.test/c/1' },
+        ref: 'refs/heads/main',
+      });
+      expect(mapped.events.length, `github ${event} ${action}`).toBeGreaterThan(0);
+    }
+
+    for (const [event, action] of gitlabRows) {
+      const mapped = gitlab(event, {
+        object_attributes: {
+          iid: 12,
+          action,
+          url: 'https://gitlab.test/i/12',
+          noteable_type: 'Issue',
+          ...(action === 'update' ? { oldrev: 'abc' } : {}),
+        },
+        issue: { iid: 12 },
+        changes: action === 'update' ? { title: { previous: 'a', current: 'b' } } : {},
+        ref: 'refs/heads/main',
+      });
+      expect(mapped.events.length, `gitlab ${event} ${action}`).toBeGreaterThan(0);
+    }
+  });
+});

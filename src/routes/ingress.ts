@@ -91,7 +91,7 @@ async function bodyOf(c: Context): Promise<Uint8Array> {
  * Everything up to the point where the hub believes the delivery.
  * The caller then decides what to make of its body.
  */
-export async function acceptDelivery(c: Context, config: IngressConfig): Promise<AcceptedDelivery> {
+async function acceptDelivery(c: Context, config: IngressConfig): Promise<AcceptedDelivery> {
   const { workspace, secret } = await senderOf(c, config);
   const headers = c.req.raw.headers;
   const forge = schemeOf(headers);

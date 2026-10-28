@@ -233,7 +233,7 @@
         "afc forge webhook set, afc forge webhook unset and afc forge deliveries behave as docs/prd/cli.md specifies against a running deployment",
         "a signed delivery posted to a running deployment is relayed to the event stream and appears in the delivery log"
       ],
-      "state": "pending"
+      "state": "done"
     }
   ]
 }
