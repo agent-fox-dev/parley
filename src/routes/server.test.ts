@@ -89,6 +89,18 @@ describe('the liveness probe', () => {
   });
 });
 
+describe('the readiness probe of a deployment with no store', () => {
+  it('answers 503, because nothing that reads or writes can work', async () => {
+    // A deployment whose store binding is missing answered "ready"
+    // while every route that touches data answered 500. Readiness
+    // that stays green through that is worse than none.
+    const response = await buildApp({ store: noStore() }).request('/readyz');
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({ error: { code: 503 } });
+  });
+});
+
 describe('the server routes and credentials', () => {
   it.each(
     SERVER_ROUTE_PATHS.flatMap((path) =>
