@@ -334,3 +334,197 @@ describe('a batch of patches', () => {
     ]);
   });
 });
+
+/** Everything the suite does to a list, for the contiguity property. */
+async function change(place: World, id: string, body: unknown): Promise<Response> {
+  return place.service.app.request(`/api/v1/workspaces/${place.slug}/patches/${id}`, {
+    method: 'PATCH',
+    headers: {
+      authorization: `Bearer ${place.credential}`,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+}
+
+async function readOne(place: World, id: string): Promise<Response> {
+  return place.service.app.request(`/api/v1/workspaces/${place.slug}/patches/${id}`, {
+    headers: { authorization: `Bearer ${place.credential}` },
+  });
+}
+
+async function listAll(place: World): Promise<Array<Record<string, unknown>>> {
+  const response = await place.service.app.request(`/api/v1/workspaces/${place.slug}/patches`, {
+    headers: { authorization: `Bearer ${place.credential}` },
+  });
+  return (await response.json()) as Array<Record<string, unknown>>;
+}
+
+/** Three patches, so the list has an order worth disturbing. */
+async function three(place: World): Promise<string[]> {
+  const ids: string[] = [];
+  for (const branch of ['one', 'two', 'three']) {
+    const response = await add(place, { branch_name: branch, skip_branch_check: true });
+    ids.push(((await response.json()) as { id: string }).id);
+  }
+  return ids;
+}
+
+describe('the list a client reads', () => {
+  it('is in position order, without the deleted ones', async () => {
+    const place = await world();
+    const ids = await three(place);
+    await place.service.store.run('UPDATE patches SET status = ? WHERE id = ?', [
+      'deleted',
+      ids[1],
+    ]);
+
+    const listed = await listAll(place);
+
+    expect(listed.map((patch) => patch['branch_name'])).toEqual(['one', 'three']);
+  });
+
+  it('is empty for a standard workspace', async () => {
+    const place = await world({ workspace_mode: 'standard' });
+
+    expect(await listAll(place)).toEqual([]);
+  });
+});
+
+describe('one patch read on its own', () => {
+  it('is readable even once it is deleted', async () => {
+    const place = await world();
+    const [id] = await three(place);
+    await place.service.store.run('UPDATE patches SET status = ? WHERE id = ?', ['deleted', id]);
+
+    const response = await readOne(place, id ?? '');
+
+    expect(response.status).toBe(200);
+    expect(((await response.json()) as Record<string, unknown>)['status']).toBe('deleted');
+  });
+
+  it('carries the tip the hub kept when it replaced the branch', async () => {
+    const place = await world();
+    const response = await add(place, { branch_name: 'here' });
+    const id = ((await response.json()) as { id: string }).id;
+    const kept = (await place.repos.listRefs(place.repository))[0]?.oid ?? '';
+    await place.repos.updateRefs(place.repository, [
+      { name: 'refs/hub/replaced/here', oldOid: null, newOid: kept, force: true },
+    ]);
+
+    const read = (await (await readOne(place, id)).json()) as Record<string, unknown>;
+
+    expect(read['replaced_sha']).toBe(kept);
+    expect(String(read['replaced_sha'])).toMatch(/^[0-9a-f]{40}$/);
+  });
+
+  it('omits it where there is none, and where the lookup fails', async () => {
+    const place = await world();
+    const id = ((await (await add(place, { branch_name: 'here' })).json()) as { id: string }).id;
+
+    expect(
+      ((await (await readOne(place, id)).json()) as Record<string, unknown>)['replaced_sha'],
+    ).toBeUndefined();
+
+    // A store that cannot answer is not a reason to fail the read.
+    const original = place.repos.listRefs.bind(place.repos);
+    place.repos.listRefs = (() =>
+      Promise.reject(new Error('the store is unavailable'))) as typeof place.repos.listRefs;
+    const response = await readOne(place, id);
+    place.repos.listRefs = original;
+
+    expect(response.status).toBe(200);
+    expect(((await response.json()) as Record<string, unknown>)['replaced_sha']).toBeUndefined();
+  });
+
+  it('answers 404 for a patch nobody has', async () => {
+    const place = await world();
+
+    expect((await readOne(place, 'no-such-patch')).status).toBe(404);
+  });
+});
+
+describe('a change to one patch', () => {
+  it('changes what it names and leaves the rest alone', async () => {
+    const place = await world();
+    const [id] = await three(place);
+
+    const response = await change(place, id ?? '', {
+      description: 'what this patch is for',
+      upstream_pr_url: 'https://example.test/pull/42',
+      status: 'disabled',
+      branch_name: 'something-else',
+    });
+    const patch = (await response.json()) as Record<string, unknown>;
+
+    expect(response.status).toBe(200);
+    expect(patch['description']).toBe('what this patch is for');
+    expect(patch['upstream_pr_url']).toBe('https://example.test/pull/42');
+    expect(patch['status']).toBe('disabled');
+    // The branch is not a thing a change may change.
+    expect(patch['branch_name']).toBe('one');
+  });
+
+  it('moves a patch and keeps the positions 1 to n', async () => {
+    const place = await world();
+    const ids = await three(place);
+
+    await change(place, ids[2] ?? '', { position: 1 });
+
+    const listed = await listAll(place);
+    expect(listed.map((patch) => patch['branch_name'])).toEqual(['three', 'one', 'two']);
+    expect(listed.map((patch) => patch['position'])).toEqual([1, 2, 3]);
+  });
+
+  it.each([
+    ['a status nobody has', { status: 'wandering' }, 400],
+    ['the deleted status', { status: 'deleted' }, 400],
+    ['a position below one', { position: 0 }, 400],
+    ['a position past the end', { position: 9 }, 400],
+    ['a description that is a number', { description: 7 }, 400],
+  ])('is refused for %s', async (_what, body, expected) => {
+    const place = await world();
+    const ids = await three(place);
+    const before = await listAll(place);
+
+    expect((await change(place, ids[0] ?? '', body)).status).toBe(expected);
+    expect(await listAll(place)).toEqual(before);
+  });
+
+  it('answers 404 for an unknown patch and 409 for a deleted one', async () => {
+    const place = await world();
+    const [id] = await three(place);
+
+    expect((await change(place, 'nobody', { status: 'disabled' })).status).toBe(404);
+
+    await place.service.store.run('UPDATE patches SET status = ? WHERE id = ?', ['deleted', id]);
+    expect((await change(place, id ?? '', { status: 'disabled' })).status).toBe(409);
+  });
+});
+
+describe('the positions of a list under any sequence of operations', () => {
+  it('are always 1 to n, with none repeated and none skipped', async () => {
+    const place = await world();
+    const ids = await three(place);
+
+    // A deterministic walk over the operations that can disturb an
+    // order: inserts at every position, moves, a disable, a delete.
+    const operations: Array<() => Promise<unknown>> = [
+      () => add(place, { branch_name: 'four', position: 2, skip_branch_check: true }),
+      () => change(place, ids[0] ?? '', { position: 3 }),
+      () => add(place, { branch_name: 'five', position: 1, skip_branch_check: true }),
+      () => change(place, ids[2] ?? '', { position: 1 }),
+      () => change(place, ids[1] ?? '', { status: 'disabled' }),
+      () => add(place, { branch_name: 'six', position: 99, skip_branch_check: true }),
+      () => change(place, ids[2] ?? '', { position: 4 }),
+    ];
+
+    for (const [index, operation] of operations.entries()) {
+      await operation();
+      const held = (await listAll(place)).map((patch) => patch['position']);
+      expect(held, `after operation ${String(index)}`).toEqual(
+        Array.from({ length: held.length }, (_unused, at) => at + 1),
+      );
+    }
+  });
+});

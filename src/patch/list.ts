@@ -198,6 +198,70 @@ export function patchBranchOf(
   return branch;
 }
 
+/**
+ * The fields of a patch a client may change. The branch is not among
+ * them: a patch is the same patch however it is otherwise amended,
+ * and a branch_name in a body is ignored rather than refused.
+ */
+export interface PatchChanges {
+  position?: number;
+  status?: PatchStatus;
+  description?: string | null;
+  upstream_pr_url?: string | null;
+}
+
+/**
+ * Applies a change and then closes any gap it left, so the list is
+ * contiguous after every operation rather than only after the ones
+ * that remembered to tidy up.
+ */
+export async function changePatch(
+  store: RelationalStore,
+  slug: string,
+  patch: PatchRecord,
+  changes: PatchChanges,
+  at: string,
+): Promise<PatchRecord> {
+  const live = await livePatches(store, slug);
+  const assignments: string[] = [];
+  const params: unknown[] = [];
+
+  for (const [column, value] of Object.entries(changes)) {
+    if (value === undefined || column === 'position') {
+      continue;
+    }
+    assignments.push(`${column} = ?`);
+    params.push(value);
+  }
+
+  // A move is the other patches shifting around this one, so it is
+  // done by rewriting the order rather than by arithmetic on one row.
+  if (changes.position !== undefined) {
+    const without = live.filter((one) => one.id !== patch.id);
+    const to = Math.min(Math.max(changes.position, 1), without.length + 1);
+    const order = [...without.slice(0, to - 1), patch, ...without.slice(to - 1)];
+    await store.batch(
+      order.map((one, index) => ({
+        sql: 'UPDATE patches SET position = ?, updated_at = ? WHERE id = ?',
+        params: [index + 1, at, one.id],
+      })),
+    );
+  }
+
+  if (assignments.length > 0) {
+    assignments.push('updated_at = ?');
+    params.push(at, patch.id);
+    await store.run(`UPDATE patches SET ${assignments.join(', ')} WHERE id = ?`, params);
+  }
+
+  await closePositions(store, slug, at);
+  const changed = await patchById(store, slug, patch.id);
+  if (changed === undefined) {
+    throw new HttpError(500, 'the patch could not be read back after it changed');
+  }
+  return changed;
+}
+
 /** The patch as every route that returns one returns it. */
 export function serialisePatch(
   patch: PatchRecord,

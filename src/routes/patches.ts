@@ -8,12 +8,17 @@ import type { SecretStore } from '../platform/secrets.js';
 import { newIdentifier } from '../auth/credentials.js';
 import {
   type NewPatch,
+  type PatchChanges,
   type PatchRecord,
+  type PatchStatus,
+  changePatch,
   insertPatch,
   livePatches,
   patchByBranch,
+  patchById,
   serialisePatch,
 } from '../patch/list.js';
+import { repositoryOf } from '../repo/repository.js';
 import { type BranchResolution, resolveBranch } from '../patch/resolve_branch.js';
 import { workspaceAccess } from '../workspace/access.js';
 import { withWorkspaceLock } from '../workspace/lock.js';
@@ -218,6 +223,110 @@ async function listPatches(c: Context, config: PatchRouteConfig): Promise<Respon
   return jsonResponse(patches.map((patch) => serialisePatch(patch)));
 }
 
+/**
+ * The tip the hub kept when it replaced this patch's branch, where it
+ * kept one. Reading it is best effort: a workspace with no repository
+ * and a store that cannot answer both mean "no backup to offer", and
+ * neither is worth failing the read over.
+ */
+async function replacedTip(
+  config: PatchRouteConfig,
+  workspace: WorkspaceRecord,
+  branch: string,
+): Promise<string | undefined> {
+  if (config.repos === undefined) {
+    return undefined;
+  }
+  try {
+    const refs = await config.repos.listRefs(repositoryOf(workspace));
+    return refs.find((ref) => ref.name === `refs/hub/replaced/${branch}`)?.oid;
+  } catch {
+    return undefined;
+  }
+}
+
+async function readPatch(c: Context, config: PatchRouteConfig): Promise<Response> {
+  const { workspace } = await carryPatchWorkspace(c, config, 'read');
+  const patch = await patchById(config.store, workspace.slug, c.req.param('id') ?? '');
+  if (patch === undefined) {
+    throw new HttpError(404, 'patch not found');
+  }
+  const replaced = await replacedTip(config, workspace, patch.branch_name);
+  return jsonResponse(
+    serialisePatch(patch, replaced === undefined ? {} : { replaced_sha: replaced }),
+  );
+}
+
+const STATUSES: readonly PatchStatus[] = ['active', 'merged_upstream', 'conflict', 'disabled'];
+
+/** What a change asks for, with anything it may not change left out. */
+function readChanges(raw: unknown, held: number): PatchChanges {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    throw new HttpError(400, 'the request body must be a JSON object');
+  }
+  const body = raw as Record<string, unknown>;
+  const changes: PatchChanges = {};
+
+  if (body['position'] !== undefined) {
+    const position = body['position'];
+    if (typeof position !== 'number' || !Number.isInteger(position) || position < 1) {
+      throw new HttpError(400, 'position must be a whole number of at least 1');
+    }
+    if (position > held) {
+      throw new HttpError(400, `position must be no more than ${String(held)}`);
+    }
+    changes.position = position;
+  }
+
+  if (body['status'] !== undefined) {
+    const status = body['status'];
+    if (status === 'deleted') {
+      throw new HttpError(400, 'a patch is deleted by removing it, not by setting its status');
+    }
+    if (typeof status !== 'string' || !STATUSES.includes(status as PatchStatus)) {
+      throw new HttpError(400, `status must be one of ${STATUSES.join(', ')}`);
+    }
+    changes.status = status as PatchStatus;
+  }
+
+  for (const name of ['description', 'upstream_pr_url'] as const) {
+    const value = body[name];
+    if (value === undefined) {
+      continue;
+    }
+    if (value !== null && typeof value !== 'string') {
+      throw new HttpError(400, `${name} must be a string or null`);
+    }
+    changes[name] = value;
+  }
+
+  // branch_name is ignored rather than refused: a patch is the same
+  // patch whatever else about it changes.
+  return changes;
+}
+
+async function changeOnePatch(c: Context, config: PatchRouteConfig): Promise<Response> {
+  const { workspace } = await carryPatchWorkspace(c, config, 'write');
+  const patch = await patchById(config.store, workspace.slug, c.req.param('id') ?? '');
+  if (patch === undefined) {
+    throw new HttpError(404, 'patch not found');
+  }
+  if (patch.status === 'deleted') {
+    throw new HttpError(409, 'this patch was removed; restore it before changing it');
+  }
+
+  const live = await livePatches(config.store, workspace.slug);
+  const changes = readChanges(await c.req.json().catch(() => undefined), live.length);
+  const changed = await changePatch(
+    config.store,
+    workspace.slug,
+    patch,
+    changes,
+    config.clock.now().toISOString(),
+  );
+  return jsonResponse(serialisePatch(changed));
+}
+
 export function patchRoutes(config: PatchRouteConfig): RouteDefinition[] {
   return [
     {
@@ -230,6 +339,17 @@ export function patchRoutes(config: PatchRouteConfig): RouteDefinition[] {
       path: `${config.mountPoint}/workspaces/:slug/patches`,
       scope: 'patches:read',
       handler: async (c) => listPatches(c, config),
+    },
+    {
+      path: `${config.mountPoint}/workspaces/:slug/patches/:id`,
+      scope: 'patches:read',
+      handler: async (c) => readPatch(c, config),
+    },
+    {
+      path: `${config.mountPoint}/workspaces/:slug/patches/:id`,
+      methods: ['PATCH'],
+      scope: 'patches:write',
+      handler: async (c) => changeOnePatch(c, config),
     },
   ];
 }
