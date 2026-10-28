@@ -5,15 +5,14 @@ import type { JobQueue } from '../platform/jobs.js';
 import type { RepositoryStore } from '../platform/repostore.js';
 import type { SecretStore } from '../platform/secrets.js';
 import { workspaceScope } from '../platform/secrets.js';
-import { newIdentifier } from '../auth/credentials.js';
 import { descendsFrom } from '../git/ancestry.js';
 import { type Remote, fetchPack, lsRefs } from '../git/transport.js';
-import { queueRebuild } from '../jobs/rebuild.js';
 import { livePatches } from '../patch/list.js';
 import { authorizationFor } from '../repo/copy_in.js';
 import { resolveGitCredential } from '../repo/credentials.js';
 import { repositoryOf } from '../repo/repository.js';
-import { insertRebuild, pendingRebuild } from '../rebuild/record.js';
+import { AFTER_SYNC } from '../rebuild/record.js';
+import { triggerRebuild } from '../rebuild/trigger.js';
 import { type WorkspaceRecord, updateWorkspace } from '../store/workspaces.js';
 import { effectiveSettings } from '../workspace/settings.js';
 import {
@@ -281,8 +280,9 @@ async function treeOf(
 }
 
 /**
- * Queues the one rebuild a sync may owe. Never a second: a rebuild
- * already queued or running will see whatever this sync did.
+ * Queues the one rebuild a sync may owe, through the trigger every
+ * other caller uses: a workspace owes at most one at a time whatever
+ * asked for it.
  */
 async function maybeQueueRebuild(
   deps: CarryPatchDeps,
@@ -290,28 +290,18 @@ async function maybeQueueRebuild(
   worth: boolean,
   at: string,
 ): Promise<{ rebuild_triggered: boolean; rebuild_job_id?: string }> {
-  const settings = effectiveSettings(workspace.settings);
-  if (!worth || settings['auto_rebuild_after_sync'] !== true) {
+  void at;
+  if (!worth || effectiveSettings(workspace.settings)['auto_rebuild_after_sync'] !== true) {
     return { rebuild_triggered: false };
   }
-  if ((await pendingRebuild(deps.store, workspace.slug)) !== undefined) {
-    return { rebuild_triggered: false };
-  }
-
-  const id = newIdentifier();
-  await insertRebuild(
-    deps.store,
+  return triggerRebuild(
     {
-      id,
-      workspace_slug: workspace.slug,
-      strategy: (settings['rebuild_strategy'] as 'rebase' | 'merge') ?? 'rebase',
-      fail_mode: (settings['rebuild_fail_mode'] as 'fail_fast' | 'continue') ?? 'fail_fast',
-      submitted_by: 'system:sync',
+      store: deps.store,
+      clock: deps.clock,
+      ...(deps.jobs === undefined ? {} : { jobs: deps.jobs }),
+      ...(deps.log === undefined ? {} : { log: deps.log }),
     },
-    at,
+    workspace,
+    AFTER_SYNC,
   );
-  if (deps.jobs !== undefined) {
-    await queueRebuild(deps.jobs, id);
-  }
-  return { rebuild_triggered: true, rebuild_job_id: id };
 }

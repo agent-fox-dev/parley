@@ -57,6 +57,8 @@ export interface RebuildRecord {
  */
 export const STALE_SNAPSHOT = 'system:stale-snapshot';
 export const AFTER_PUSH = 'system:patch-push';
+export const AFTER_SYNC = 'system:sync';
+export const AFTER_RESET = 'system:reset-to-origin';
 
 const text = (value: unknown): string => (typeof value === 'string' ? value : '');
 const nullable = (value: unknown): string | null => (typeof value === 'string' ? value : null);

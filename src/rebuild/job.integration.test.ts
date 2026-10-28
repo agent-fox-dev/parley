@@ -460,3 +460,28 @@ describe('the rebuilt branch and the fork', () => {
     expect(place.remote.pushed()).toHaveLength(before);
   });
 });
+
+describe('what runs beside a rebuild', () => {
+  it('lets a sync and a branch push through while patches are applied', async () => {
+    const place = await world({ one: { files: { 'one.txt': 'first\n' } } });
+    await seedPatch(place.store, place.slug, 'one');
+
+    // Both of these take the workspace lock, so both prove the lock
+    // is free while the middle of the rebuild runs.
+    const took: string[] = [];
+    duringTheRun(place, async () => {
+      for (const what of ['a sync', 'a branch push']) {
+        const held = await place.locks.take(`workspace:${place.slug}`);
+        if (held !== undefined) {
+          took.push(what);
+          await held.release();
+        }
+      }
+    });
+
+    const job = await rebuild(place);
+
+    expect(job.status).toBe('completed');
+    expect(took).toEqual(['a sync', 'a branch push']);
+  });
+});

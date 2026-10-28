@@ -5,14 +5,13 @@ import type { JobQueue } from '../platform/jobs.js';
 import type { RepositoryStore } from '../platform/repostore.js';
 import type { SecretStore } from '../platform/secrets.js';
 import { workspaceScope } from '../platform/secrets.js';
-import { newIdentifier } from '../auth/credentials.js';
 import { descendsFrom } from '../git/ancestry.js';
 import { fetchPack, lsRefs } from '../git/transport.js';
-import { queueRebuild } from '../jobs/rebuild.js';
 import { authorizationFor } from '../repo/copy_in.js';
 import { resolveGitCredential } from '../repo/credentials.js';
 import { repositoryOf } from '../repo/repository.js';
-import { AFTER_PUSH, insertRebuild, pendingRebuild } from '../rebuild/record.js';
+import { AFTER_RESET } from '../rebuild/record.js';
+import { triggerRebuild } from '../rebuild/trigger.js';
 import type { PatchRecord } from './list.js';
 import type { WorkspaceRecord } from '../store/workspaces.js';
 import { effectiveSettings } from '../workspace/settings.js';
@@ -167,40 +166,27 @@ export async function resetToOrigin(
 
   const moved = action !== 'none';
   const worthRebuilding = patch.status === 'active' || patch.status === 'conflict';
-  if (!moved || !worthRebuilding || settings['auto_rebuild_after_sync'] !== true) {
-    return {
-      action,
-      ...(replaced === undefined ? {} : { replaced_sha: replaced }),
-      rebuild_triggered: false,
-    };
-  }
-  if ((await pendingRebuild(deps.store, workspace.slug)) !== undefined) {
-    return {
-      action,
-      ...(replaced === undefined ? {} : { replaced_sha: replaced }),
-      rebuild_triggered: false,
-    };
-  }
-
-  const id = newIdentifier();
-  await insertRebuild(
-    deps.store,
-    {
-      id,
-      workspace_slug: workspace.slug,
-      strategy: (settings['rebuild_strategy'] as 'rebase' | 'merge') ?? 'rebase',
-      fail_mode: (settings['rebuild_fail_mode'] as 'fail_fast' | 'continue') ?? 'fail_fast',
-      submitted_by: AFTER_PUSH,
-    },
-    at,
-  );
-  if (deps.jobs !== undefined) {
-    await queueRebuild(deps.jobs, id);
-  }
-  return {
+  const settled = {
     action,
     ...(replaced === undefined ? {} : { replaced_sha: replaced }),
-    rebuild_triggered: true,
-    rebuild_job_id: id,
+  };
+  if (!moved || !worthRebuilding || settings['auto_rebuild_after_sync'] !== true) {
+    return { ...settled, rebuild_triggered: false };
+  }
+
+  // The same trigger the push and the sync use: a workspace owes at
+  // most one rebuild at a time, whatever asked for it.
+  return {
+    ...settled,
+    ...(await triggerRebuild(
+      {
+        store: deps.store,
+        clock: deps.clock,
+        ...(deps.jobs === undefined ? {} : { jobs: deps.jobs }),
+        ...(deps.log === undefined ? {} : { log: deps.log }),
+      },
+      workspace,
+      AFTER_RESET,
+    )),
   };
 }

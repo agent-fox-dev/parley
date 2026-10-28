@@ -407,7 +407,7 @@
         "`make check` passes with no network access and no deployment configured",
         "afc patch, afc rebuild, afc rerere and afc workspace patch-status behave as docs/prd/cli.md specifies against a running deployment"
       ],
-      "state": "pending"
+      "state": "done"
     }
   ]
 }
