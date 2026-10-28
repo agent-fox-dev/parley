@@ -6,6 +6,7 @@ import { workspaceScope } from '../platform/secrets.js';
 import { resolveGitCredential } from '../repo/credentials.js';
 import { effectiveSettings } from '../workspace/settings.js';
 import type { WorkspaceRecord } from '../store/workspaces.js';
+import { forgeFailure } from './failures.js';
 import { type ForgeTarget, forgeFor } from './target.js';
 
 /**
@@ -200,7 +201,17 @@ export function forgeClient(deps: ClientDeps): ForgeClient {
         const moved = answer.status >= 300 && answer.status < 400;
         const location = answer.headers.get('location');
         if (!moved || location === null) {
-          return { status: answer.status, body: await parsed(answer), headers: answer.headers };
+          const body = await parsed(answer);
+          if (answer.status >= 400) {
+            // A forge that refused is not a caller who did: the
+            // mapping says whose fault the caller is told it was.
+            throw forgeFailure(
+              answer.status,
+              body,
+              deps.token === undefined ? {} : { token: deps.token },
+            );
+          }
+          return { status: answer.status, body, headers: answer.headers };
         }
         if (!sameOrigin(address, location)) {
           throw new HttpError(
