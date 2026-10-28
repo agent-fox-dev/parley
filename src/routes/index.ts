@@ -16,6 +16,7 @@ import { secretRoutes } from './secrets.js';
 import { varRoutes } from './vars.js';
 import { workspaceRoutes } from './workspaces.js';
 import { syncRoutes } from './sync.js';
+import { recloneRoutes } from './reclone.js';
 import { tokenPermissionRoutes } from './token_permissions.js';
 import { tokenRoutes } from './tokens.js';
 import { userRoutes } from './user.js';
@@ -104,6 +105,17 @@ export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
       mountPoint: config.mountPoint,
       store: config.store,
       clock: config.clock,
+    }),
+    ...recloneRoutes({
+      mountPoint: config.mountPoint,
+      store: config.store,
+      clock: config.clock,
+      locks: config.locks,
+      ...(config.secrets === undefined ? {} : { secrets: config.secrets }),
+      ...(config.repos === undefined ? {} : { repos: config.repos }),
+      ...(config.jobs === undefined ? {} : { jobs: config.jobs }),
+      ...(config.externalUrl === undefined ? {} : { externalUrl: config.externalUrl }),
+      ...(config.fetch === undefined ? {} : { fetch: config.fetch }),
     }),
     ...syncRoutes({
       mountPoint: config.mountPoint,
