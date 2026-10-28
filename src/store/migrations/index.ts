@@ -426,6 +426,21 @@ export const MIGRATIONS: readonly Migration[] = [
          data TEXT
        )`,
       'CREATE INDEX run_traces_by_node ON run_traces (workspace_slug, run_id, node_id, timestamp)',
+      // A run has at most one, which the primary key is what enforces.
+      `CREATE TABLE run_postmortems (
+         run_id TEXT NOT NULL,
+         workspace_slug TEXT NOT NULL,
+         schema_version INTEGER NOT NULL DEFAULT 1,
+         run_status TEXT NOT NULL,
+         started_at TEXT NOT NULL,
+         completed_at TEXT NOT NULL,
+         task_summary TEXT NOT NULL,
+         cost_summary TEXT NOT NULL,
+         blocked_tasks TEXT NOT NULL DEFAULT '[]',
+         session_history TEXT NOT NULL DEFAULT '[]',
+         ingested_at TEXT NOT NULL,
+         PRIMARY KEY (workspace_slug, run_id)
+       )`,
     ],
   },
 ];
