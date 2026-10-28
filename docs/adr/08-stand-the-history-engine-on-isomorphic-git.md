@@ -54,6 +54,16 @@ because the library has none. That is the one piece of history arithmetic
 written here, and it is the reason the differential corpus against the
 real git binary exists.
 
+**The library detects no renames.** Where one side moves a file and the
+other edits it where it was, git follows the move and merges the edit;
+isomorphic-git sees an edit to a file that was deleted and conflicts. The
+engine therefore does the rename pass itself, before the merge: a path
+dropped on one side whose blob turns up at a path that side added is a
+rename, and the file is moved to that path in the base tree and in the
+other side's tree, so the library is given a plain modification. That is
+git's exact-rename pass; a path both sides moved is left alone, and the
+merge reports the conflict as git does. The corpus covers it.
+
 **Objects are deflated with `CompressionStream`**, which both Node and
 Workers have, so the adapter needs neither `node:zlib` nor pako of its own.
 
@@ -67,6 +77,10 @@ Workers have, so the adapter needs neither `node:zlib` nor pako of its own.
   git fails the build.
 - The merge arithmetic is isomorphic-git's, so a bug there is a bug here.
   The corpus is what would catch it.
+- Rename detection is the hub's own, matched to git by the corpus. It
+  matches on identical content, not on similarity, so a file moved and
+  edited in the same commit reads as a delete and an add, as it does for
+  git without `-M`'s similarity scoring.
 - A tag object is not reconstructable from the Cloudflare binding's
   decoded reads, so the adapter reads commits, trees and blobs and refuses
   a tag object with a clear error. Nothing in the hub's contract merges a

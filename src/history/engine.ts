@@ -1,6 +1,7 @@
 import git from 'isomorphic-git';
 import type { RefChange, RepositoryStore } from '../platform/repostore.js';
 import { type FsLike, hydrate, storeBackedFs } from './adapter.js';
+import { applyRename, buildTree, flatten, renamesBetween } from './trees.js';
 import type { ResolutionStore } from './resolutions.js';
 
 export interface Identity {
@@ -204,20 +205,43 @@ async function mergeOverBase(
 ): Promise<MergeResult> {
   const treeOf = async (oid: string) => (await git.readCommit({ ...options, oid })).commit.tree;
 
-  const sideOn = async (oid: string, what: string) =>
+  const trees = await alignRenames(options, {
+    base: await treeOf(oids.base),
+    ours: await treeOf(oids.ours),
+    theirs: await treeOf(oids.theirs),
+  });
+
+  // The base the two sides are merged over. Where a rename was aligned
+  // it carries the adjusted tree, so the merge sees a modification at
+  // the path the file moved to rather than an edit to a file that went.
+  const baseCommit =
+    trees.base === (await treeOf(oids.base))
+      ? oids.base
+      : await git.writeCommit({
+          ...options,
+          commit: {
+            tree: trees.base,
+            parent: [],
+            author: ENGINE,
+            committer: ENGINE,
+            message: 'the base of a merge, with renames aligned',
+          },
+        });
+
+  const sideOn = async (tree: string, what: string) =>
     git.writeCommit({
       ...options,
       commit: {
-        tree: await treeOf(oid),
-        parent: [oids.base],
+        tree,
+        parent: [baseCommit],
         author: ENGINE,
         committer: ENGINE,
         message: what,
       },
     });
 
-  const ourSide = await sideOn(oids.ours, 'one side of a merge over a stated base');
-  const theirSide = await sideOn(oids.theirs, 'the other side of a merge over a stated base');
+  const ourSide = await sideOn(trees.ours, 'one side of a merge over a stated base');
+  const theirSide = await sideOn(trees.theirs, 'the other side of a merge over a stated base');
 
   await git.writeRef({ ...options, ref: TEMP_OURS, value: ourSide, force: true });
   await git.writeRef({ ...options, ref: TEMP_THEIRS, value: theirSide, force: true });
@@ -241,6 +265,55 @@ async function mergeOverBase(
     }
     return { conflicts };
   }
+}
+
+/**
+ * Moves a file the other side left alone to the path one side renamed
+ * it to, in the base and in that other side. The library detects no
+ * renames, so a side that edits a file the other side moved would
+ * otherwise read as an edit to a file that was deleted; git follows the
+ * rename and merges the edit, and so does this.
+ *
+ * A path both sides moved is left where it is: that is a conflict, and
+ * the merge reports it as one.
+ */
+async function alignRenames(
+  options: { fs: never; gitdir: string },
+  trees: { base: string; ours: string; theirs: string },
+): Promise<{ base: string; ours: string; theirs: string }> {
+  let base = await flatten(options, trees.base);
+  let ours = await flatten(options, trees.ours);
+  let theirs = await flatten(options, trees.theirs);
+
+  const ourRenames = renamesBetween(base, ours);
+  const theirRenames = renamesBetween(base, theirs);
+  let moved = false;
+
+  for (const [from, to] of ourRenames) {
+    if (theirRenames.has(from) || !theirs.has(from)) {
+      continue;
+    }
+    base = applyRename(base, from, to);
+    theirs = applyRename(theirs, from, to);
+    moved = true;
+  }
+  for (const [from, to] of theirRenames) {
+    if (ourRenames.has(from) || !ours.has(from)) {
+      continue;
+    }
+    base = applyRename(base, from, to);
+    ours = applyRename(ours, from, to);
+    moved = true;
+  }
+
+  if (!moved) {
+    return trees;
+  }
+  return {
+    base: await buildTree(options, base),
+    ours: await buildTree(options, ours),
+    theirs: await buildTree(options, theirs),
+  };
 }
 
 /**
