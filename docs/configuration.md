@@ -69,13 +69,18 @@ The smoke suites (`make test-smoke`) and the conformance harness
 Each check says what it needs and skips naming it rather than passing on
 nothing.
 
-| Variable                      | Needed by                              | Description                                                                                                           |
-| ----------------------------- | -------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| `PARLEY_BASE_URL`             | both                                   | The deployment to exercise, for example `https://parley.example.com`.                                                 |
-| `PARLEY_SMOKE_OAUTH_CODE`     | the sign-in, token and blocking suites | An authorization code the deployment's provider accepts, which a stub authorization server supplies.                  |
-| `PARLEY_SMOKE_OAUTH_PROVIDER` | the same                               | The provider name to sign in with. Defaults to `github`.                                                              |
-| `PARLEY_ADMIN_TOKEN`          | the blocking suite                     | The deployment's admin token, so the suite can block and unblock.                                                     |
-| `PARLEY_SMOKE_API_KEY`        | two conformance checks                 | An API key of any user, to check that a listing carries no secret and that administration refuses an ordinary caller. |
+| Variable                         | Needed by                              | Description                                                                                                           |
+| -------------------------------- | -------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `PARLEY_BASE_URL`                | both                                   | The deployment to exercise, for example `https://parley.example.com`.                                                 |
+| `PARLEY_SMOKE_OAUTH_CODE`        | the sign-in, token and blocking suites | An authorization code the deployment's provider accepts, which a stub authorization server supplies.                  |
+| `PARLEY_SMOKE_OAUTH_PROVIDER`    | the same                               | The provider name to sign in with. Defaults to `github`.                                                              |
+| `PARLEY_ADMIN_TOKEN`             | the blocking suite                     | The deployment's admin token, so the suite can block and unblock.                                                     |
+| `PARLEY_SMOKE_API_KEY`           | two conformance checks                 | An API key of any user, to check that a listing carries no secret and that administration refuses an ordinary caller. |
+| `PARLEY_SMOKE_BROWSER`           | the web interface suite                | A Chromium with its debugging port open, for example `http://127.0.0.1:9222`. Without it the browser checks skip.     |
+| `PARLEY_SMOKE_WORKSPACE`         | several suites                         | A workspace slug the key's owner may read.                                                                            |
+| `PARLEY_SMOKE_PATCH_WORKSPACE`   | the web interface and rebuild suites   | A `carry_patch` workspace, whose patch stack the browser reads.                                                       |
+| `PARLEY_SMOKE_ORG_WORKSPACE`     | the web interface suite                | A workspace the person reaches as a member of an organization.                                                        |
+| `PARLEY_SMOKE_FOREIGN_WORKSPACE` | the same                               | A workspace the person may not read, whose address must say only that it is not available.                            |
 
 ## Local development
 

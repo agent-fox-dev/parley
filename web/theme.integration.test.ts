@@ -1,14 +1,8 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { renderDashboard, renderLanding, renderNotAvailable, renderWorkspace } from './render.js';
-import {
-  CONTRAST_NORMAL_TEXT,
-  THEME_KEY,
-  contrast,
-  paletteOf,
-  themeAttribute,
-  toggled,
-} from './theme.js';
+import { CONTRAST_NORMAL_TEXT, contrast, paletteOf } from '../src/testutil/contrast.js';
+import { THEME_KEY } from './theme.js';
 
 /**
  * Both themes, and whether a person can read them.
@@ -42,29 +36,20 @@ const pages = (): Array<{ name: string; html: string }> => [
 ];
 
 describe('the theme a page is read in', () => {
-  it('follows the viewer’s system setting when they have chosen nothing', () => {
-    expect(themeAttribute(null)).toBeUndefined();
-    expect(themeAttribute('')).toBeUndefined();
-    expect(themeAttribute('something-else')).toBeUndefined();
-  });
-
-  it('is the viewer’s choice where they have made one', () => {
-    expect(themeAttribute('dark')).toBe('dark');
-    expect(themeAttribute('light')).toBe('light');
-  });
-
-  it.each([
-    ['dark, showing dark', 'dark' as const, false, 'light'],
-    ['light, showing light', 'light' as const, true, 'dark'],
-    ['nothing, with a dark system', undefined, true, 'light'],
-    ['nothing, with a light system', undefined, false, 'dark'],
-  ])('asks for the other one from %s', (_what, current, systemIsDark, expected) => {
-    expect(toggled(current, systemIsDark)).toBe(expected);
+  it('is the viewer’s system setting until they choose, and their choice after', () => {
+    // The stylesheet answers the system setting with a media query,
+    // and the script applies a stored choice over it.
+    expect(tokens).toContain('prefers-color-scheme: dark');
+    expect(tokens).toContain(":root[data-theme='dark']");
+    expect(tokens).toContain(":root:not([data-theme='light'])");
   });
 
   it('is applied by every page before the first paint, and remembered', () => {
     for (const { name, html } of pages()) {
       expect(html, `${name} applies a stored theme`).toContain(THEME_KEY);
+      expect(html, `${name} applies it before the body`).toMatch(
+        /<script[^>]*>[\s\S]*localStorage[\s\S]*<\/script>[\s\S]*<body/,
+      );
       expect(html, `${name} offers the control`).toContain('data-theme-toggle');
     }
   });

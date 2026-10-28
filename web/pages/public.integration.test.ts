@@ -34,6 +34,7 @@ async function world() {
 
 const WITHOUT_A_SESSION = [
   '/',
+  '/signin',
   '/dashboard',
   `/workspaces/${SECRETS.workspace}`,
   '/workspaces/nothing-here',
@@ -66,4 +67,20 @@ describe('a visitor who has not signed in', () => {
       expect(html).not.toMatch(/\b1 workspace\b/);
     },
   );
+});
+
+describe('every way into the interface', () => {
+  it('leads somewhere that offers a way to sign in', async () => {
+    const held = await world();
+
+    const html = await (await held.app.request('/')).text();
+    const offered = [...html.matchAll(/href="([^"]+)"/g)].map((found) => found[1] as string);
+
+    // A link on the landing page that answered 404 would be the one
+    // thing a visitor who has not signed in can try, and broken.
+    for (const href of offered.filter((link) => link.startsWith('/'))) {
+      const reached = await held.app.request(href);
+      expect(reached.status, `${href} is served`).toBeLessThan(400);
+    }
+  });
 });

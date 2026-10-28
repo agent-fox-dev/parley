@@ -37,7 +37,7 @@ export interface WebRouteConfig {
  * person signed in. The session value is their credential, so a
  * page is given exactly what their own key would be given.
  */
-export function readerFor(config: WebRouteConfig, session: string) {
+function readerFor(config: WebRouteConfig, session: string) {
   const app = config.holder?.app;
   if (app === undefined) {
     throw new HttpError(500, 'the interface has no API to read');
@@ -175,6 +175,9 @@ async function dashboardPage(c: Context, config: WebRouteConfig): Promise<Respon
 export function webRoutes(config: WebRouteConfig): RouteDefinition[] {
   return [
     { path: '/', handler: (c) => landing(c, config) },
+    // The masthead offers "Sign in" from every page, and a person who
+    // has to choose a provider chooses one on the landing page.
+    { path: '/signin', handler: (c) => landing(c, config) },
     { path: '/dashboard', handler: async (c) => dashboardPage(c, config) },
     { path: '/workspaces/:slug', handler: async (c) => workspacePage(c, config) },
     {

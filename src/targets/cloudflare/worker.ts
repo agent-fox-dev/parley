@@ -1,9 +1,9 @@
 import { eventRecorder } from '../../audit/recorder.js';
 import { storeBus } from '../../platform/store_bus.js';
-import { signedInUserId } from '../../../web/session.js';
+import { signedInUserId, sweepSessions } from '../../../web/session.js';
 import { pruneDeliveries } from '../../jobs/delivery_prune.js';
 import { DEFAULT_MOUNT_POINT } from '../../config.js';
-import { buildApp } from '../../http/router.js';
+import { type AppHolder, buildApp } from '../../http/router.js';
 import { envConfig } from '../../platform/cloudflare/config.js';
 import { d1Store } from '../../platform/cloudflare/store.js';
 import { noStore } from '../../platform/store.js';
@@ -60,7 +60,11 @@ export default {
         bus,
       });
       const streamLimit = Number(platform.config.get('AF_SSE_MAX_CONNECTIONS') ?? '');
+      // The pages of the web interface read the service's own API,
+      // so they are handed the application the moment it exists.
+      const holder: AppHolder = {};
       app = buildApp({
+        appHolder: holder,
         store: platform.store,
         clock: platform.clock,
         metrics: platform.metrics,
@@ -69,6 +73,7 @@ export default {
         buildTime: platform.config.get('PARLEY_BUILD_TIME') ?? '',
         commit: platform.config.get('PARLEY_COMMIT') ?? '',
         routes: serviceRoutes({
+          appHolder: holder,
           mountPoint: mountPoint ?? DEFAULT_MOUNT_POINT,
           buildTime: platform.config.get('PARLEY_BUILD_TIME') ?? '',
           commit: platform.config.get('PARLEY_COMMIT') ?? '',
@@ -112,6 +117,7 @@ export default {
     }
     await sweepBindings(platform.store, platform.clock.now().toISOString());
     await pruneDeliveries(platform.store, platform.clock);
+    await sweepSessions(platform.store, platform.clock);
     await expireStalledClones(platform.store, platform.clock);
     await sweepStalledMerges(platform.store, platform.clock);
 

@@ -278,7 +278,7 @@
         "a real browser signs in, reads the dashboard and opens a workspace against a running deployment",
         "the contrast, responsive and keyboard checks pass for every page in both themes"
       ],
-      "state": "pending"
+      "state": "done"
     }
   ]
 }

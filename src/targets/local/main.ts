@@ -1,6 +1,6 @@
 import { serve } from '@hono/node-server';
 import { DEFAULT_MOUNT_POINT } from '../../config.js';
-import { buildApp } from '../../http/router.js';
+import { type AppHolder, buildApp } from '../../http/router.js';
 import { systemClock } from '../../platform/local/clock.js';
 import { processConfig } from '../../platform/local/config.js';
 import { inMemoryMetrics } from '../../platform/local/metrics.js';
@@ -19,7 +19,7 @@ import { deploymentKey, sealedSecrets } from '../../secrets/store.js';
 import { migrate } from '../../store/migrations/index.js';
 import { eventRecorder } from '../../audit/recorder.js';
 import { storeBus } from '../../platform/store_bus.js';
-import { signedInUserId } from '../../../web/session.js';
+import { signedInUserId, sweepSessions } from '../../../web/session.js';
 import { pruneDeliveries } from '../../jobs/delivery_prune.js';
 
 /**
@@ -46,7 +46,11 @@ export function buildLocalApp(env: Record<string, string | undefined>) {
     bus,
   });
   const streamLimit = Number(platform.config.get('AF_SSE_MAX_CONNECTIONS') ?? '');
+  // The pages of the web interface read the service's own API,
+  // so they are handed the application the moment it exists.
+  const holder: AppHolder = {};
   return buildApp({
+    appHolder: holder,
     store: platform.store,
     clock: platform.clock,
     metrics: platform.metrics,
@@ -55,6 +59,7 @@ export function buildLocalApp(env: Record<string, string | undefined>) {
     buildTime: platform.config.get('PARLEY_BUILD_TIME') ?? '',
     commit: platform.config.get('PARLEY_COMMIT') ?? '',
     routes: serviceRoutes({
+      appHolder: holder,
       mountPoint: mountPoint ?? DEFAULT_MOUNT_POINT,
       buildTime: platform.config.get('PARLEY_BUILD_TIME') ?? '',
       commit: platform.config.get('PARLEY_COMMIT') ?? '',
@@ -95,12 +100,15 @@ export async function startLocalTarget(
   // At start and every hour after, as the reference asks.
   await sweepBindings(platform.store, platform.clock.now().toISOString());
   await pruneDeliveries(platform.store, platform.clock);
+  await sweepSessions(platform.store, platform.clock);
   const sweeping = setInterval(
     () => {
       void sweepBindings(platform.store, platform.clock.now().toISOString());
       // A delivery is of use while somebody is working out why a
       // webhook did not do what they expected, and of none a week on.
       void pruneDeliveries(platform.store, platform.clock);
+      // And a session nobody can use any more is just a row.
+      void sweepSessions(platform.store, platform.clock);
     },
     60 * 60 * 1000,
   );

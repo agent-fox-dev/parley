@@ -8,6 +8,7 @@ the boundaries fall where they do. It is for people changing the service.
 - [Shape](#shape)
 - [The layout](#the-layout)
 - [Two platform targets](#two-platform-targets)
+- [The web interface](#the-web-interface)
 
 ## Shape
 
@@ -93,3 +94,35 @@ implementation rather than two, is
 | configuration source | the Worker's bindings                                                                                                               | the process environment   |
 | clock                | the host's own clock, shared by both targets                                                                                        |                           |
 | metrics sink         | an in-memory registry, shared by both targets                                                                                       |                           |
+
+## The web interface
+
+`web/` holds the pages a person reads in a browser: the landing page, the
+dashboard of their workspaces, and one workspace's state. They are server
+components rendered to a string by `web/render.tsx`, with no bundler, no
+client framework and the one script that applies a chosen theme before the
+first paint ([ADR
+13](adr/13-render-the-web-interface-on-the-server-with-no-build-of-its-own.md)).
+`src/routes/web.ts` serves them and `src/routes/web_auth.ts` signs a person
+in; both are part of the same application, so both targets serve the
+interface.
+
+Two boundaries hold it in place. A page reads nothing from the store: it
+asks the service's own API, as the person signed in, through
+`web/api_client.ts` — which is why the dashboard shows exactly what that
+person's own key would be shown, and why a workspace they may not read is
+one answer the interface does not have to decide for itself. And a browser
+session (`web/session.ts`) is a credential kind of its own: signing in
+issues no API key and revokes none, so opening the dashboard cannot
+interrupt an agent that is running.
+
+```
+browser → /dashboard (src/routes/web.ts)
+            → the session names the person (web/session.ts)
+            → the API, as that person (web/api_client.ts)
+                 → the same routes an API key reaches
+            → the page, rendered to a string (web/render.tsx)
+```
+
+The interface only reads; everything that changes anything stays with the
+API and `afc`.
