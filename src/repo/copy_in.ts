@@ -23,6 +23,8 @@ export interface CopyProgress {
   brought: string[];
   /** Where HEAD points on the remote, once it is known. */
   head?: string;
+  /** The commit HEAD resolves to, once the copy has finished. */
+  headOid?: string;
 }
 
 /** How many refs one unit of platform work takes on by default. */
@@ -87,6 +89,19 @@ export async function copyIn(repos: RepositoryStore, request: CopyRequest): Prom
   const head = advertised.find((ref) => ref.name === 'HEAD');
   const refs = advertised.filter((ref) => ref.name !== 'HEAD');
   const brought = new Set(request.brought ?? []);
+
+  // A ref the repository already holds at the advertised commit needs no
+  // transfer. That is what makes a reactivated workspace reuse the
+  // repository it kept instead of copying the remote again.
+  const held = new Map(
+    (await repos.listRefs(request.repository)).map((ref) => [ref.name, ref.oid]),
+  );
+  for (const ref of refs) {
+    if (held.get(ref.name) === ref.oid) {
+      brought.add(ref.name);
+    }
+  }
+
   const remaining = refs.filter((ref) => !brought.has(ref.name));
 
   if (remaining.length === 0) {
@@ -94,6 +109,7 @@ export async function copyIn(repos: RepositoryStore, request: CopyRequest): Prom
       done: true,
       brought: [...brought],
       ...(head?.target === undefined ? {} : { head: head.target }),
+      ...(head?.oid === undefined ? {} : { headOid: head.oid }),
     };
   }
 
@@ -129,5 +145,6 @@ export async function copyIn(repos: RepositoryStore, request: CopyRequest): Prom
     done: remaining.length === batch.length,
     brought: [...brought],
     ...(head?.target === undefined ? {} : { head: head.target }),
+    ...(head?.oid === undefined ? {} : { headOid: head.oid }),
   };
 }

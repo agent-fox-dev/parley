@@ -100,8 +100,45 @@ export async function runCopyIn(
   await updateWorkspace(
     deps.store,
     workspace.slug,
-    { status: 'ready' },
+    {
+      status: 'ready',
+      ...(progress.headOid === undefined ? {} : { head_sha: progress.headOid }),
+      clone_error: null,
+    },
     deps.clock.now().toISOString(),
   );
   return 'done';
+}
+
+/** How long a copy may stay in cloning before it is given up on. */
+export const CLONING_DEADLINE_MS = 30 * 60 * 1000;
+
+/**
+ * Gives up on copies that stopped without saying so. A workspace left in
+ * cloning is one nobody can archive or reclone, so after the deadline it
+ * is moved to failed with the reason, and becomes usable again.
+ */
+export async function expireStalledClones(
+  store: RelationalStore,
+  clock: Clock,
+  deadlineMs: number = CLONING_DEADLINE_MS,
+): Promise<number> {
+  const cutoff = new Date(clock.now().getTime() - deadlineMs).toISOString();
+  const stalled = await store.all<{ slug: string }>(
+    "SELECT slug FROM workspaces WHERE status = 'cloning' AND updated_at <= ?",
+    [cutoff],
+  );
+
+  for (const row of stalled) {
+    await updateWorkspace(
+      store,
+      row.slug,
+      {
+        status: 'failed',
+        clone_error: `the copy timed out after ${String(Math.round(deadlineMs / 60000))} minutes`,
+      },
+      clock.now().toISOString(),
+    );
+  }
+  return stalled.length;
 }

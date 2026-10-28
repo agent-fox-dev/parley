@@ -14,6 +14,7 @@ import {
   artifactsRepositoryStore,
 } from '../../platform/cloudflare/artifacts.js';
 import { sweepBindings } from '../../store/bindings.js';
+import { expireStalledClones } from '../../jobs/copy_in.js';
 import { migrate } from '../../store/migrations/index.js';
 
 export interface Env {
@@ -86,6 +87,7 @@ export default {
     const platform = cloudflarePlatform(env);
     if (env.DB !== undefined) {
       await sweepBindings(platform.store, platform.clock.now().toISOString());
+      await expireStalledClones(platform.store, platform.clock);
     }
   },
 };

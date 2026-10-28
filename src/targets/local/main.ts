@@ -11,6 +11,7 @@ import { serviceRoutes } from '../../routes/index.js';
 import { storeLocks } from '../../platform/store_lock.js';
 import { localRepositoryStore } from '../../platform/local/repostore.js';
 import { sweepBindings } from '../../store/bindings.js';
+import { expireStalledClones } from '../../jobs/copy_in.js';
 import { migrate } from '../../store/migrations/index.js';
 
 /**
@@ -78,6 +79,15 @@ export async function startLocalTarget(
     60 * 60 * 1000,
   );
   sweeping.unref();
+  // A copy that stopped without saying so leaves a workspace nobody can
+  // archive, so it is given up on rather than left.
+  const expiring = setInterval(
+    () => {
+      void expireStalledClones(platform.store, platform.clock);
+    },
+    5 * 60 * 1000,
+  );
+  expiring.unref();
 
   return new Promise((resolve, reject) => {
     const server = serve({ fetch: buildLocalApp(env).fetch, port: requested }, (info) => {

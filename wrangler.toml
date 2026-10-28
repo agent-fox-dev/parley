@@ -13,6 +13,7 @@ PARLEY_MOUNT_POINT = "/api/v1"
 binding = "ARTIFACTS"
 namespace = "parley-dev"
 
-# The hourly sweep over token bindings a deletion left behind.
+# The hourly sweep over token bindings a deletion left behind, and the
+# more frequent one that gives up on copies which stopped saying anything.
 [triggers]
-crons = ["0 * * * *"]
+crons = ["0 * * * *", "*/5 * * * *"]
