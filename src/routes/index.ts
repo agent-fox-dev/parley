@@ -23,6 +23,7 @@ import { rebuildRoutes } from './rebuilds.js';
 import { rerereRoutes } from './rerere.js';
 import { patchStatusRoutes } from './patch_status.js';
 import { mergeRoutes } from './merges.js';
+import { rebaseRoutes } from './rebase.js';
 import { tokenPermissionRoutes } from './token_permissions.js';
 import { tokenRoutes } from './tokens.js';
 import { userRoutes } from './user.js';
@@ -112,6 +113,13 @@ export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
       mountPoint: config.mountPoint,
       store: config.store,
       clock: config.clock,
+    }),
+    ...rebaseRoutes({
+      mountPoint: config.mountPoint,
+      store: config.store,
+      clock: config.clock,
+      locks: config.locks,
+      ...(config.repos === undefined ? {} : { repos: config.repos }),
     }),
     ...mergeRoutes({
       mountPoint: config.mountPoint,
