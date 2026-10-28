@@ -154,6 +154,7 @@ export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
       locks: config.locks,
       ...(config.secrets === undefined ? {} : { secrets: config.secrets }),
       ...(config.repos === undefined ? {} : { repos: config.repos }),
+      ...(config.jobs === undefined ? {} : { jobs: config.jobs }),
       ...(config.externalUrl === undefined ? {} : { externalUrl: config.externalUrl }),
       ...(config.fetch === undefined ? {} : { fetch: config.fetch }),
     }),
