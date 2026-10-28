@@ -3,6 +3,12 @@ import type { Clock, Locks, RelationalStore } from '../platform/index.js';
 import { retireBindingsOf } from '../store/bindings.js';
 import { type WorkspaceRecord, updateWorkspace } from '../store/workspaces.js';
 import { workspaceScope } from '../platform/secrets.js';
+import type { RepositoryStore } from '../platform/repostore.js';
+import type { SecretStore } from '../platform/secrets.js';
+import type { LogSink } from '../http/router.js';
+import { resolveGitCredential } from '../repo/credentials.js';
+import { pushOutOnArchive, removeRepository } from '../repo/retire.js';
+import { repositoryOf } from '../repo/repository.js';
 import { withWorkspaceLock } from './lock.js';
 
 /**
@@ -10,11 +16,19 @@ import { withWorkspaceLock } from './lock.js';
  * operations that work on the repository; a workspace another operation is
  * using answers 409 workspace_busy at once. Bound tokens are left alone.
  */
+export interface RetirementDeps {
+  repos?: RepositoryStore;
+  secrets?: SecretStore;
+  fetch?: typeof fetch;
+  log?: LogSink;
+}
+
 export async function archiveWorkspace(
   store: RelationalStore,
   locks: Locks,
   clock: Clock,
   workspace: WorkspaceRecord,
+  deps: RetirementDeps = {},
 ): Promise<void> {
   if (workspace.status === 'archived') {
     throw new HttpError(400, 'this workspace is already archived');
@@ -24,6 +38,25 @@ export async function archiveWorkspace(
   }
 
   await withWorkspaceLock(locks, workspace.slug, async () => {
+    // Branches pushed to this service exist only here, so they go out to
+    // origin before the repository is let go. A push that cannot be made
+    // keeps the repository; the workspace is archived either way.
+    if (deps.repos !== undefined && deps.secrets !== undefined) {
+      const credential = await resolveGitCredential(
+        deps.secrets,
+        workspaceScope(workspace.slug),
+        'origin',
+        deps.log,
+      );
+      await pushOutOnArchive(deps.repos, {
+        repository: repositoryOf(workspace),
+        gitUrl: workspace.git_url,
+        ...(credential === undefined ? {} : { credential }),
+        ...(deps.fetch === undefined ? {} : { fetch: deps.fetch }),
+        ...(deps.log === undefined ? {} : { log: deps.log }),
+      });
+    }
+
     await updateWorkspace(store, workspace.slug, { status: 'archived' }, clock.now().toISOString());
   });
 }
@@ -50,6 +83,7 @@ export async function deleteWorkspaceAndTokens(
   store: RelationalStore,
   clock: Clock,
   workspace: WorkspaceRecord,
+  deps: RetirementDeps = {},
 ): Promise<void> {
   if (workspace.status !== 'archived') {
     throw new HttpError(409, 'this workspace is not archived; archive it first');
@@ -63,5 +97,15 @@ export async function deleteWorkspaceAndTokens(
       params: [workspaceScope(workspace.slug)],
     },
     { sql: 'DELETE FROM workspaces WHERE slug = ?', params: [workspace.slug] },
+    {
+      sql: 'DELETE FROM repository_usage WHERE repository = ?',
+      params: [repositoryOf(workspace)],
+    },
   ]);
+
+  // The record is gone, so the repository goes too. It happens after the
+  // transaction: a store that cannot answer must not keep the workspace.
+  if (deps.repos !== undefined) {
+    await removeRepository(deps.repos, repositoryOf(workspace));
+  }
 }

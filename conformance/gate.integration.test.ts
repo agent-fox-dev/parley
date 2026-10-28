@@ -33,5 +33,7 @@ describe.skipIf(process.env[INNER] === '1')('the fast gate', () => {
 
     expect(output).toContain('passed');
     expect(output).not.toContain('failed');
-  });
+    // The inner run is the whole suite, so it needs the subprocess's own
+    // budget rather than the default for a unit test.
+  }, 180_000);
 });

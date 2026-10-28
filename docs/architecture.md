@@ -73,6 +73,7 @@ implementation rather than two, is
 | relational store     | D1                                                                                                                                  | SQLite on the host's disk |
 | workspace lock       | a lease row in the relational store, shared by both targets ([ADR 5](adr/05-hold-the-workspace-lock-as-a-lease-in-the-store.md))    |                           |
 | secret store         | sealed values in the relational store, shared by both targets ([ADR 4](adr/04-seal-secrets-with-aes-gcm-under-a-deployment-key.md)) |                           |
+| repository store     | Cloudflare Artifacts                                                                                                                | a bare repository on disk |
 | configuration source | the Worker's bindings                                                                                                               | the process environment   |
 | clock                | the host's own clock, shared by both targets                                                                                        |                           |
 | metrics sink         | an in-memory registry, shared by both targets                                                                                       |                           |

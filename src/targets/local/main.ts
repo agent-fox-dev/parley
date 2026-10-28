@@ -9,7 +9,12 @@ import { maxBodyBytesFrom, type Platform } from '../../platform/index.js';
 import { configuredProviders } from '../../auth/oauth.js';
 import { serviceRoutes } from '../../routes/index.js';
 import { storeLocks } from '../../platform/store_lock.js';
+import { localRepositoryStore } from '../../platform/local/repostore.js';
 import { sweepBindings } from '../../store/bindings.js';
+import { expireStalledClones } from '../../jobs/copy_in.js';
+import { drainJobs } from '../../jobs/drain.js';
+import { storeJobs } from '../../platform/store_jobs.js';
+import { deploymentKey, sealedSecrets } from '../../secrets/store.js';
 import { migrate } from '../../store/migrations/index.js';
 
 /**
@@ -45,6 +50,7 @@ export function buildLocalApp(env: Record<string, string | undefined>) {
       metrics: platform.metrics,
       providers: configuredProviders(platform.config),
       locks: platform.locks,
+      repos: localRepositoryStore(platform.config.get('PARLEY_REPO_PATH') ?? 'repositories'),
     }),
     auth: {
       store: platform.store,
@@ -76,6 +82,32 @@ export async function startLocalTarget(
     60 * 60 * 1000,
   );
   sweeping.unref();
+  // A copy that stopped without saying so leaves a workspace nobody can
+  // archive, so it is given up on rather than left.
+  const expiring = setInterval(
+    () => {
+      void expireStalledClones(platform.store, platform.clock);
+    },
+    5 * 60 * 1000,
+  );
+  expiring.unref();
+
+  // The queued work — copying repositories in — runs here, outside the
+  // request that asked for it.
+  const key = await deploymentKey(platform.config.get('PARLEY_SECRET_KEY'));
+  if (key !== undefined) {
+    const deps = {
+      store: platform.store,
+      repos: localRepositoryStore(platform.config.get('PARLEY_REPO_PATH') ?? 'repositories'),
+      secrets: sealedSecrets(platform.store, key),
+      jobs: storeJobs(platform.store, platform.clock),
+      clock: platform.clock,
+    };
+    const draining = setInterval(() => {
+      void drainJobs(deps);
+    }, 5000);
+    draining.unref();
+  }
 
   return new Promise((resolve, reject) => {
     const server = serve({ fetch: buildLocalApp(env).fetch, port: requested }, (info) => {

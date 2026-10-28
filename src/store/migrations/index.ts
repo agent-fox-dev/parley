@@ -121,6 +121,33 @@ export const MIGRATIONS: readonly Migration[] = [
     ],
   },
   {
+    name: '006_jobs',
+    statements: [
+      `CREATE TABLE jobs (
+         id TEXT PRIMARY KEY,
+         kind TEXT NOT NULL,
+         payload TEXT NOT NULL,
+         state TEXT NOT NULL,
+         attempts INTEGER NOT NULL DEFAULT 0,
+         reason TEXT,
+         created_at TEXT NOT NULL,
+         updated_at TEXT NOT NULL,
+         claimed_until TEXT
+       )`,
+      'CREATE INDEX jobs_by_state ON jobs (state, created_at)',
+    ],
+  },
+  {
+    name: '007_repository_usage',
+    statements: [
+      `CREATE TABLE repository_usage (
+         repository TEXT PRIMARY KEY,
+         bytes INTEGER NOT NULL DEFAULT 0,
+         updated_at TEXT NOT NULL
+       )`,
+    ],
+  },
+  {
     name: '005_entries',
     statements: [
       // One table for both kinds, so the key, size, count and ordering

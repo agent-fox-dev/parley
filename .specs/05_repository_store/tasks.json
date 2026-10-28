@@ -44,7 +44,7 @@
         "wrangler.toml",
         "docs/adr/"
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 2,
@@ -83,7 +83,7 @@
       "depends_on": [
         1
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 3,
@@ -115,7 +115,7 @@
       "depends_on": [
         2
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 4,
@@ -145,7 +145,7 @@
       "depends_on": [
         2
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 5,
@@ -184,7 +184,7 @@
         3,
         4
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 6,
@@ -213,7 +213,7 @@
       "depends_on": [
         5
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 7,
@@ -241,7 +241,7 @@
       "depends_on": [
         5
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 8,
@@ -271,7 +271,7 @@
         5,
         6
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 9,
@@ -305,7 +305,7 @@
         "afc workspace create --wait reaches ready against a running deployment for a private repository",
         "the ADR recording the store's three capabilities exists and the code reads the capability report rather than repeating its conclusions"
       ],
-      "state": "pending"
+      "state": "done"
     }
   ]
 }

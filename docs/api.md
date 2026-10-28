@@ -602,6 +602,14 @@ reactivated; writes to it are refused.
 **Access:** `workspaces:write` (a token without it gets `404`); write
 access. Archiving takes the [workspace lock](#the-workspace-lock).
 
+**Behaviour.** Branches pushed to this service exist only here, so before
+the repository is let go every branch is pushed to `origin` with the
+workspace's stored credential. The push does **not** force: pushing a
+workspace out is no licence to rewrite history on somebody else's forge.
+If origin refuses a branch, the push fails, or the workspace has no
+usable credential, the workspace is archived anyway and **the repository
+is kept**, so no commit is lost and reactivating reuses it.
+
 **Response:** `200 OK` with the workspace, `status` `archived`. Bound
 tokens are left alone and keep working.
 
@@ -629,9 +637,20 @@ access.
 **Behaviour:** in one transaction, every live token bound to the workspace
 is revoked, every binding removed, the workspace's secrets deleted and the
 record itself removed. A failure part way leaves all of them as they were,
-so tokens are never revoked for a workspace that is still there.
+so tokens are never revoked for a workspace that is still there. The
+workspace's repository is removed from the store afterwards, so a store
+that cannot answer never leaves the record behind.
 
 **Response:** `204 No Content`. `409` when the workspace is not archived.
+
+### Repository size
+
+A workspace's repository may hold at most **1 GB**. The service counts
+the bytes it writes, because the store reports no storage error of its
+own, and a write that would take a repository past the cap is answered
+`507` with a message naming the limit. Nothing is written, so everything
+the repository already holds is still readable and its refs are
+unchanged. See [ADR 7](adr/07-account-for-repository-bytes-and-what-the-sizes-cost.md).
 
 ### The workspace lock
 
@@ -736,6 +755,23 @@ route that reads a value registers it with the request, so a failure the
 service did not expect cannot carry it into a log.
 
 The access needed is `secrets:read` to read and `secrets:write` to change.
+
+### Reserved secret names
+
+Four names at a **workspace's** scope are read by the service itself, for
+the git remotes a workspace follows. They are ordinary secrets in every
+other respect; nothing outside the workspace's own scope is consulted for
+them, so neither the owner's nor the organization's secret of the same
+name has any effect.
+
+| Remote                                                  | Looked for, in order                                                     |
+| ------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `origin` (the workspace's `git_url`)                    | `GIT_PAT`, else `GIT_USERNAME` with `GIT_PASSWORD`, else none            |
+| `upstream` (a `carry_patch` workspace's `upstream_url`) | `UPSTREAM_GIT_PAT`, else the upstream pair, else **origin's** credential |
+
+A pair with only one half stored is ignored and the service goes on as
+though neither half were there, saying so in its log by name and never by
+value.
 
 ### Rules both kinds obey
 

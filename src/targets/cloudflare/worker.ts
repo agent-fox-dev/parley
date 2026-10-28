@@ -9,7 +9,15 @@ import { maxBodyBytesFrom, type Platform } from '../../platform/index.js';
 import { configuredProviders } from '../../auth/oauth.js';
 import { serviceRoutes } from '../../routes/index.js';
 import { storeLocks } from '../../platform/store_lock.js';
+import {
+  type ArtifactsBinding,
+  artifactsRepositoryStore,
+} from '../../platform/cloudflare/artifacts.js';
 import { sweepBindings } from '../../store/bindings.js';
+import { expireStalledClones } from '../../jobs/copy_in.js';
+import { drainJobs } from '../../jobs/drain.js';
+import { storeJobs } from '../../platform/store_jobs.js';
+import { deploymentKey, sealedSecrets } from '../../secrets/store.js';
 import { migrate } from '../../store/migrations/index.js';
 
 export interface Env {
@@ -18,6 +26,7 @@ export interface Env {
   PARLEY_COMMIT?: string;
   PARLEY_ADMIN_TOKEN?: string;
   DB?: D1Database;
+  ARTIFACTS?: unknown;
 }
 
 /** Assembles the platform a Worker is deployed with. */
@@ -55,6 +64,9 @@ export default {
           metrics: platform.metrics,
           providers: configuredProviders(platform.config),
           locks: platform.locks,
+          ...(env.ARTIFACTS === undefined
+            ? {}
+            : { repos: artifactsRepositoryStore(env.ARTIFACTS as ArtifactsBinding) }),
         }),
         auth: {
           store: platform.store,
@@ -76,8 +88,23 @@ export default {
    */
   async scheduled(_event: ScheduledController, env: Env): Promise<void> {
     const platform = cloudflarePlatform(env);
-    if (env.DB !== undefined) {
-      await sweepBindings(platform.store, platform.clock.now().toISOString());
+    if (env.DB === undefined) {
+      return;
+    }
+    await sweepBindings(platform.store, platform.clock.now().toISOString());
+    await expireStalledClones(platform.store, platform.clock);
+
+    // The queued work runs here: a copy continues a batch at a time
+    // until it is finished.
+    const key = await deploymentKey(platform.config.get('PARLEY_SECRET_KEY'));
+    if (key !== undefined && env.ARTIFACTS !== undefined) {
+      await drainJobs({
+        store: platform.store,
+        repos: artifactsRepositoryStore(env.ARTIFACTS as ArtifactsBinding),
+        secrets: sealedSecrets(platform.store, key),
+        jobs: storeJobs(platform.store, platform.clock),
+        clock: platform.clock,
+      });
     }
   },
 };

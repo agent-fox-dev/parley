@@ -145,6 +145,8 @@ export interface WorkspaceChanges {
   org_id?: string | null;
   status?: WorkspaceStatus;
   settings?: Record<string, unknown>;
+  head_sha?: string | null;
+  clone_error?: string | null;
 }
 
 export async function updateWorkspace(
