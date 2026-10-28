@@ -73,7 +73,7 @@ export const RECORD_SHAPES: Readonly<Record<RecordKind, RecordShape>> = {
 };
 
 /** The trace event types the reference names, and no others. */
-export const TRACE_TYPES: readonly string[] = [
+const TRACE_TYPES: readonly string[] = [
   'session.init',
   'assistant.message',
   'tool.use',
@@ -95,7 +95,7 @@ const SEVERITY_BY_TYPE: Readonly<Record<string, string>> = {
 /** A date, a time and six lowercase hex characters. */
 const RUN_ID = /^\d{8}_\d{6}_[0-9a-f]{6}$/;
 
-export function isRunId(value: string): boolean {
+function isRunId(value: string): boolean {
   return RUN_ID.test(value);
 }
 

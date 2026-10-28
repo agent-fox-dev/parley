@@ -1,7 +1,13 @@
 import type { Context } from 'hono';
 import { HttpError } from '../http/errors.js';
 import type { RouteDefinition } from '../http/router.js';
-import type { Clock, EventBus, MetricsSink, RelationalStore } from '../platform/index.js';
+import type {
+  Clock,
+  EventBus,
+  MetricsSink,
+  RelationalStore,
+  Subscription,
+} from '../platform/index.js';
 import { identityOf } from '../auth/middleware.js';
 import { accessLevel } from '../workspace/access.js';
 import { findWorkspace } from '../store/workspaces.js';
@@ -36,7 +42,7 @@ export interface EventStreamConfig {
   wait?: (ms: number) => Promise<void>;
 }
 
-export const DEFAULT_STREAM_LIMIT = 100;
+const DEFAULT_STREAM_LIMIT = 100;
 const HEARTBEAT_MS = 30_000;
 const IDLE_MS = 60_000;
 const TICK_MS = 250;
@@ -77,28 +83,12 @@ export function eventStreamRoutes(config: EventStreamConfig): RouteDefinition[] 
   let open = 0;
   const counted = () => config.metrics?.gauge('afhub_sse_connections').set({}, open);
 
-  async function serve(c: Context): Promise<Response> {
-    const category = new URL(c.req.url).searchParams.get('category');
-    if (category !== null && category !== 'hub' && category !== 'agent') {
-      throw new HttpError(400, 'category must be hub or agent');
-    }
-
-    // Everything that can refuse the connection happens before a
-    // byte of the stream exists.
-    const seen = await visibleTo(c, config);
-    if (open >= limit) {
-      throw new HttpError(503, 'this deployment is serving as many event streams as it can');
-    }
-
-    const subscription = await config.bus.subscribe({
-      workspaces: seen.workspaces,
-      ...(seen.workspace === undefined ? {} : { workspace: seen.workspace }),
-      ...(category === null ? {} : { category }),
-    });
-
-    open += 1;
-    counted();
-
+  /**
+   * The stream itself, once the connection has been admitted: a
+   * heartbeat, then whatever the bus carries, until the client goes
+   * away or stops reading.
+   */
+  function frames(subscription: Subscription, release: () => void): ReadableStream<Uint8Array> {
     const encoder = new TextEncoder();
     const begun = config.clock.now().getTime();
     let held: ReadableStreamDefaultController<Uint8Array> | undefined;
@@ -112,8 +102,7 @@ export function eventStreamRoutes(config: EventStreamConfig): RouteDefinition[] 
       }
       closed = true;
       subscription.close();
-      open -= 1;
-      counted();
+      release();
       try {
         held?.close();
       } catch {
@@ -130,7 +119,8 @@ export function eventStreamRoutes(config: EventStreamConfig): RouteDefinition[] 
       }
     };
 
-    /** Everything the stream does after its first frame. */
+    const beat = () => send(frame('heartbeat', { timestamp: config.clock.now().toISOString() }));
+
     const run = async (): Promise<void> => {
       for (;;) {
         await wait(tickMs);
@@ -154,7 +144,7 @@ export function eventStreamRoutes(config: EventStreamConfig): RouteDefinition[] 
 
         if (now - lastBeat >= heartbeatMs) {
           lastBeat = now;
-          send(frame('heartbeat', { timestamp: config.clock.now().toISOString() }));
+          beat();
         }
         // A client that has read nothing for a minute is gone,
         // whatever its socket still says.
@@ -165,12 +155,12 @@ export function eventStreamRoutes(config: EventStreamConfig): RouteDefinition[] 
       }
     };
 
-    const body = new ReadableStream<Uint8Array>({
+    return new ReadableStream<Uint8Array>({
       start: (controller) => {
         held = controller;
         // At once, so a client knows it is connected before anything
         // has happened.
-        send(frame('heartbeat', { timestamp: config.clock.now().toISOString() }));
+        beat();
         void run();
       },
       // Reading is what keeps the connection alive, so a consumer
@@ -182,14 +172,44 @@ export function eventStreamRoutes(config: EventStreamConfig): RouteDefinition[] 
         finish();
       },
     });
+  }
 
-    return new Response(body, {
-      headers: {
-        'content-type': 'text/event-stream',
-        'cache-control': 'no-cache',
-        connection: 'keep-alive',
-      },
+  async function serve(c: Context): Promise<Response> {
+    const category = new URL(c.req.url).searchParams.get('category');
+    if (category !== null && category !== 'hub' && category !== 'agent') {
+      throw new HttpError(400, 'category must be hub or agent');
+    }
+
+    // Everything that can refuse the connection happens before a byte
+    // of the stream exists: a client handed a stream and an error
+    // frame would have to parse the stream to learn it was refused.
+    const seen = await visibleTo(c, config);
+    if (open >= limit) {
+      throw new HttpError(503, 'this deployment is serving as many event streams as it can');
+    }
+
+    const subscription = await config.bus.subscribe({
+      workspaces: seen.workspaces,
+      ...(seen.workspace === undefined ? {} : { workspace: seen.workspace }),
+      ...(category === null ? {} : { category }),
     });
+
+    open += 1;
+    counted();
+
+    return new Response(
+      frames(subscription, () => {
+        open -= 1;
+        counted();
+      }),
+      {
+        headers: {
+          'content-type': 'text/event-stream',
+          'cache-control': 'no-cache',
+          connection: 'keep-alive',
+        },
+      },
+    );
   }
 
   return [

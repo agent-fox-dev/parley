@@ -169,6 +169,76 @@ function places(values: readonly string[]): string {
  * the same columns in the same order from both, so the union is one
  * list the database orders rather than two the service merges.
  */
+/** What one source contributes to the union, and how it is narrowed. */
+interface Half {
+  /** The columns, in the order both halves must agree on. */
+  select: string;
+  table: string;
+  /** The column holding the workspace, which the two tables spell differently. */
+  workspace: string;
+  /** The filters only this source answers. */
+  own: readonly string[];
+}
+
+const HUB: Half = {
+  select: `id, event_type, 'hub' AS source, timestamp, severity, workspace,
+              actor_id, actor_type, resource_type, resource_id, action,
+              NULL AS run_id, NULL AS node_id, NULL AS session_id`,
+  table: 'hub_events',
+  workspace: 'workspace',
+  own: HUB_ONLY,
+};
+
+const AGENT: Half = {
+  select: `id, event_type, 'agent' AS source, timestamp, severity, workspace_slug AS workspace,
+              NULL AS actor_id, NULL AS actor_type, NULL AS resource_type, NULL AS resource_id,
+              NULL AS action, run_id, node_id, session_id`,
+  table: 'run_events',
+  workspace: 'workspace_slug',
+  own: ['run_id'],
+};
+
+/** One half of the union: its columns, its narrowing and its values. */
+function half(
+  source: Half,
+  visible: string[] | 'every',
+  filters: AuditFilters,
+  after: { sql: string; params: unknown[] },
+): { sql: string; params: unknown[] } {
+  const { where, params } = common(filters, { type: 'event_type', at: 'timestamp' });
+
+  for (const name of [...source.own, 'severity'] as const) {
+    const value = filters[name as keyof AuditFilters];
+    if (value !== undefined) {
+      where.push(`${name} = ?`);
+      params.push(value);
+    }
+  }
+
+  if (filters.workspace !== undefined) {
+    where.push(`${source.workspace} = ?`);
+    params.push(filters.workspace);
+  } else if (visible !== 'every') {
+    // An event of no workspace belongs to the deployment, and only an
+    // admin token is shown one.
+    where.push(visible.length === 0 ? '1 = 0' : `${source.workspace} IN (${places(visible)})`);
+    params.push(...visible);
+  }
+
+  return {
+    sql: `SELECT ${source.select}
+         FROM ${source.table}
+        WHERE ${[...where, '1 = 1'].join(' AND ')}${after.sql}`,
+    params: [...params, ...after.params],
+  };
+}
+
+/**
+ * One page of the two sources together. Both halves are selected with
+ * the same columns in the same order, so the union is one list the
+ * database orders rather than two the service merges — which is what
+ * makes paging to the end yield every event exactly once.
+ */
 export async function queryEvents(
   store: RelationalStore,
   visible: string[] | 'every',
@@ -176,84 +246,22 @@ export async function queryEvents(
   request: PageRequest,
 ): Promise<AuditEvent[]> {
   const take = wanted(filters);
-  const parts: string[] = [];
-  const params: unknown[] = [];
   const after = afterClause(request, { at: 'timestamp', id: 'id' });
+  const halves = [
+    ...(take.hub ? [half(HUB, visible, filters, after)] : []),
+    ...(take.agent ? [half(AGENT, visible, filters, after)] : []),
+  ];
 
-  if (take.hub) {
-    const { where, params: held } = common(filters, { type: 'event_type', at: 'timestamp' });
-    const clauses = [...where];
-    const values = [...held];
-    for (const name of HUB_ONLY) {
-      if (filters[name] !== undefined) {
-        clauses.push(`${name} = ?`);
-        values.push(filters[name]);
-      }
-    }
-    if (filters.severity !== undefined) {
-      clauses.push('severity = ?');
-      values.push(filters.severity);
-    }
-    if (filters.workspace !== undefined) {
-      clauses.push('workspace = ?');
-      values.push(filters.workspace);
-    } else if (visible !== 'every') {
-      // An event of no workspace belongs to the deployment, and only
-      // an admin token is shown one.
-      clauses.push(visible.length === 0 ? '1 = 0' : `workspace IN (${places(visible)})`);
-      values.push(...visible);
-    }
-
-    parts.push(
-      `SELECT id, event_type, 'hub' AS source, timestamp, severity, workspace,
-              actor_id, actor_type, resource_type, resource_id, action,
-              NULL AS run_id, NULL AS node_id, NULL AS session_id
-         FROM hub_events
-        WHERE ${[...clauses, '1 = 1'].join(' AND ')}${after.sql}`,
-    );
-    params.push(...values, ...after.params);
-  }
-
-  if (take.agent) {
-    const { where, params: held } = common(filters, { type: 'event_type', at: 'timestamp' });
-    const clauses = [...where];
-    const values = [...held];
-    if (filters.severity !== undefined) {
-      clauses.push('severity = ?');
-      values.push(filters.severity);
-    }
-    if (filters.run_id !== undefined) {
-      clauses.push('run_id = ?');
-      values.push(filters.run_id);
-    }
-    if (filters.workspace !== undefined) {
-      clauses.push('workspace_slug = ?');
-      values.push(filters.workspace);
-    } else if (visible !== 'every') {
-      clauses.push(visible.length === 0 ? '1 = 0' : `workspace_slug IN (${places(visible)})`);
-      values.push(...visible);
-    }
-
-    parts.push(
-      `SELECT id, event_type, 'agent' AS source, timestamp, severity, workspace_slug AS workspace,
-              NULL AS actor_id, NULL AS actor_type, NULL AS resource_type, NULL AS resource_id,
-              NULL AS action, run_id, node_id, session_id
-         FROM run_events
-        WHERE ${[...clauses, '1 = 1'].join(' AND ')}${after.sql}`,
-    );
-    params.push(...values, ...after.params);
-  }
-
-  if (parts.length === 0) {
+  if (halves.length === 0) {
     return [];
   }
 
   const direction = request.order === 'asc' ? 'ASC' : 'DESC';
   const rows = await store.all<Row>(
-    `${parts.join(' UNION ALL ')}
+    `${halves.map((one) => one.sql).join(' UNION ALL ')}
       ORDER BY timestamp ${direction}, id ${direction}
       LIMIT ?`,
-    [...params, request.limit + 1],
+    [...halves.flatMap((one) => one.params), request.limit + 1],
   );
 
   return rows.map((row) => ({ ...row, archetype: null }) as AuditEvent);

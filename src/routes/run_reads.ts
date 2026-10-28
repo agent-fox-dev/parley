@@ -61,7 +61,7 @@ const LISTS: readonly ListShape[] = [
 ];
 
 /** The lower and upper bounds a read may ask for, checked as a pair. */
-export function readPeriod(query: URLSearchParams): { since?: string; until?: string } {
+function readPeriod(query: URLSearchParams): { since?: string; until?: string } {
   const bounds: { since?: string; until?: string } = {};
   for (const name of ['since', 'until'] as const) {
     const given = query.get(name);
