@@ -1,5 +1,6 @@
 import { eventRecorder } from '../../audit/recorder.js';
 import { storeBus } from '../../platform/store_bus.js';
+import { pruneDeliveries } from '../../jobs/delivery_prune.js';
 import { DEFAULT_MOUNT_POINT } from '../../config.js';
 import { buildApp } from '../../http/router.js';
 import { envConfig } from '../../platform/cloudflare/config.js';
@@ -108,6 +109,7 @@ export default {
       return;
     }
     await sweepBindings(platform.store, platform.clock.now().toISOString());
+    await pruneDeliveries(platform.store, platform.clock);
     await expireStalledClones(platform.store, platform.clock);
     await sweepStalledMerges(platform.store, platform.clock);
 

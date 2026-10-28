@@ -35,6 +35,8 @@ import { forgeStatusRoutes } from './forge_status.js';
 import { forgeReadRoutes } from './forge_reads.js';
 import { forgeWriteRoutes } from './forge_writes.js';
 import { webhookRoutes } from './webhook.js';
+import { deliveryRoutes } from './deliveries.js';
+import { lastDeliveryAt } from '../webhook/log.js';
 import { eventStreamRoutes } from './events_stream.js';
 import { rebaseRoutes } from './rebase.js';
 import { tokenPermissionRoutes } from './token_permissions.js';
@@ -154,6 +156,11 @@ export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
           metrics: config.metrics,
           ...(config.streamLimit === undefined ? {} : { limit: config.streamLimit }),
         })),
+    ...deliveryRoutes({
+      mountPoint: config.mountPoint,
+      store: config.store,
+      clock: config.clock,
+    }),
     ...webhookRoutes({
       mountPoint: config.mountPoint,
       store: config.store,
@@ -182,6 +189,7 @@ export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
       mountPoint: config.mountPoint,
       store: config.store,
       clock: config.clock,
+      lastDeliveryAt: async (slug) => lastDeliveryAt(config.store, slug),
       ...(config.secrets === undefined ? {} : { secrets: config.secrets }),
       ...(config.externalUrl === undefined ? {} : { externalUrl: config.externalUrl }),
       ...(config.fetch === undefined ? {} : { fetch: config.fetch }),
