@@ -60,7 +60,7 @@
         "Makefile",
         "docs/adr/"
       ],
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 2,

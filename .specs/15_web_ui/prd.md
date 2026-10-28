@@ -4,7 +4,7 @@ spec_name: "web_ui"
 title: "Show a workspace's state in the browser"
 status: "active"
 created_at: "2026-10-27T19:08:11Z"
-updated_at: "2026-10-27T19:21:27Z"
+updated_at: "2026-10-28T15:03:17Z"
 intent_hash: "9edf9cddd75b400c65b7681d8d4fc74d158fdee8573ad6d318dbcf1e52c2f436"
 schema_version: 2
 source: "docs/prd/01-port-af-hub-to-typescript-on-cloudflare.md"
