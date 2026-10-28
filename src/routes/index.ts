@@ -3,6 +3,7 @@ import type { ProviderDirectory } from '../auth/oauth.js';
 import type { Clock, Locks, MetricsSink, RelationalStore } from '../platform/index.js';
 import type { SecretStore } from '../platform/secrets.js';
 import type { RepositoryStore } from '../platform/repostore.js';
+import type { JobQueue } from '../platform/jobs.js';
 import type { Cipher } from '../entries/store.js';
 import { adminOrgRoutes } from './admin_orgs.js';
 import { adminUserRoutes } from './admin_users.js';
@@ -35,6 +36,9 @@ export interface ServiceRouteConfig {
   locks: Locks;
   /** Absent where the deployment was given no repository store. */
   repos?: RepositoryStore;
+  jobs?: JobQueue;
+  /** Injected so a test reaches a remote of its own. */
+  fetch?: typeof fetch;
 }
 
 /**
@@ -90,6 +94,8 @@ export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
       ...(config.secrets === undefined ? {} : { secrets: config.secrets }),
       ...(config.externalUrl === undefined ? {} : { externalUrl: config.externalUrl }),
       ...(config.repos === undefined ? {} : { repos: config.repos }),
+      ...(config.jobs === undefined ? {} : { jobs: config.jobs }),
+      ...(config.fetch === undefined ? {} : { fetch: config.fetch }),
       locks: config.locks,
     }),
     ...adminUserRoutes({

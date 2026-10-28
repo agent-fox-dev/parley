@@ -4,7 +4,7 @@ spec_name: "repository_store"
 title: "Hold each workspace's repository in Cloudflare Artifacts"
 status: "active"
 created_at: "2026-10-27T18:26:21Z"
-updated_at: "2026-10-28T06:04:26Z"
+updated_at: "2026-10-28T06:09:42Z"
 intent_hash: "4714795fa465485eed31dddff33212ff5963250db0132806b594e5cfb5035334"
 schema_version: 2
 source: "docs/prd/01-port-af-hub-to-typescript-on-cloudflare.md"

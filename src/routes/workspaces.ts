@@ -8,6 +8,9 @@ import { workspaceScope } from '../platform/secrets.js';
 import type { Clock, Locks, RelationalStore } from '../platform/index.js';
 import type { RepositoryStore } from '../platform/repostore.js';
 import { ensureRepository } from '../repo/repository.js';
+import { checkRemoteCredential } from '../repo/copy_in.js';
+import { queueCopyIn } from '../jobs/copy_in.js';
+import type { JobQueue } from '../platform/jobs.js';
 import { findOrg, findUser, isMember, orgsOfUser } from '../store/identity.js';
 import type { OrgRecord } from '../store/identity.js';
 import {
@@ -38,6 +41,9 @@ export interface WorkspaceRouteConfig {
   locks: Locks;
   /** Absent where the deployment was given no repository store. */
   repos?: RepositoryStore;
+  jobs?: JobQueue;
+  /** Injected so a test reaches a remote of its own. */
+  fetch?: typeof fetch;
 }
 
 /**
@@ -93,6 +99,32 @@ async function createWorkspace(c: Context, config: WorkspaceRouteConfig): Promis
   if ((await findWorkspace(config.store, request.slug)) !== undefined) {
     throw new HttpError(409, 'a workspace with this slug exists');
   }
+
+  // The remote is asked about the credential before anything is written.
+  // Only a refusal stops the create: a forge having a bad day is not a
+  // bad request, and the copy will record what it finds.
+  if (config.repos !== undefined) {
+    const credential =
+      request.credentials['GIT_PAT'] !== undefined
+        ? ({ kind: 'token', token: request.credentials['GIT_PAT'] } as const)
+        : request.credentials['GIT_USERNAME'] !== undefined &&
+            request.credentials['GIT_PASSWORD'] !== undefined
+          ? ({
+              kind: 'basic',
+              username: request.credentials['GIT_USERNAME'],
+              password: request.credentials['GIT_PASSWORD'],
+            } as const)
+          : undefined;
+
+    const answer = await checkRemoteCredential({
+      gitUrl: request.git_url,
+      ...(credential === undefined ? {} : { credential }),
+      ...(config.fetch === undefined ? {} : { fetch: config.fetch }),
+    });
+    if (answer === 'refused') {
+      throw new HttpError(400, 'the repository refused the credentials given');
+    }
+  }
   if (Object.keys(request.credentials).length > 0 && config.secrets === undefined) {
     throw new HttpError(500, 'this deployment cannot store repository credentials');
   }
@@ -131,6 +163,9 @@ async function createWorkspace(c: Context, config: WorkspaceRouteConfig): Promis
   // the remote into it is the next task's work and moves the status on.
   if (config.repos !== undefined) {
     await ensureRepository(config.repos, workspace);
+    if (config.jobs !== undefined) {
+      await queueCopyIn(config.jobs, workspace.slug);
+    }
   }
 
   return jsonResponse(
