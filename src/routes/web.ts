@@ -81,6 +81,37 @@ function landing(c: Context, config: WebRouteConfig): Response {
   return page(renderLanding(named.map((provider) => ({ name: provider.name }))));
 }
 
+/** How many recent jobs and events a workspace's page shows. */
+const RECENT = 10;
+
+/** One kind of job, in the words the page shows. */
+function jobsOf(
+  kind: string,
+  rows: Array<Record<string, unknown>> | undefined,
+): Array<{ kind: string; status: string; at: string }> {
+  return (rows ?? []).map((row) => ({
+    kind,
+    status: String(row['status'] ?? ''),
+    at: String(row['completed_at'] ?? row['created_at'] ?? ''),
+  }));
+}
+
+/**
+ * The jobs of both kinds as one list, newest first. A person asks
+ * "what has been happening", not "what merges have been happening".
+ */
+function jobsFrom(
+  merges: { ok: boolean; value?: Array<Record<string, unknown>> },
+  rebuilds: { ok: boolean; value?: Array<Record<string, unknown>> },
+): Array<{ kind: string; status: string; at: string }> | undefined {
+  if (!merges.ok || !rebuilds.ok) {
+    return undefined;
+  }
+  return [...jobsOf('merge', merges.value), ...jobsOf('rebuild', rebuilds.value)]
+    .toSorted((left, right) => right.at.localeCompare(left.at))
+    .slice(0, RECENT);
+}
+
 /**
  * One workspace, or the one answer every workspace a person cannot
  * open shares. The page itself is task 6's; what is settled here is
@@ -94,16 +125,40 @@ async function workspacePage(c: Context, config: WebRouteConfig): Promise<Respon
   }
 
   const session = sessionFrom(c.req.raw.headers) ?? '';
-  const read = await readerFor(config, session).read<Record<string, unknown>>(
-    `/workspaces/${encodeURIComponent(c.req.param('slug') ?? '')}`,
-  );
+  const reader = readerFor(config, session);
+  const slug = encodeURIComponent(c.req.param('slug') ?? '');
+
+  const read = await reader.read<Record<string, unknown>>(`/workspaces/${slug}`);
   if (!read.ok) {
     // A workspace of somebody else's, one they may not see and an
     // address naming nothing are one answer: anything else would
     // let a person learn which slugs exist by trying them.
     return page(renderNotAvailable(who.username), 404);
   }
-  return page(renderWorkspace(who.username, read.value));
+
+  // Each section is read on its own, so one that cannot be read
+  // costs its own section and not the page.
+  const workspace = read.value;
+  const carries = workspace['workspace_mode'] === 'carry_patch';
+  const [patchStatus, merges, rebuilds, events] = await Promise.all([
+    carries
+      ? reader.read<Record<string, unknown>>(`/workspaces/${slug}/patch-status`)
+      : Promise.resolve(undefined),
+    reader.read<Array<Record<string, unknown>>>(`/workspaces/${slug}/merges`),
+    reader.read<Array<Record<string, unknown>>>(`/workspaces/${slug}/rebuilds`),
+    reader.read<{ events: Array<Record<string, unknown>> }>(
+      `/audit?workspace=${slug}&limit=${String(RECENT)}`,
+    ),
+  ]);
+
+  return page(
+    renderWorkspace(who.username, {
+      workspace,
+      ...(carries ? { patchStatus: patchStatus?.ok === true ? patchStatus.value : undefined } : {}),
+      jobs: jobsFrom(merges, rebuilds),
+      events: events.ok ? events.value.events.slice(0, RECENT) : undefined,
+    }),
+  );
 }
 
 async function dashboardPage(c: Context, config: WebRouteConfig): Promise<Response> {

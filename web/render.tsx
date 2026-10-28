@@ -1,7 +1,7 @@
 import { Landing } from './pages/landing.js';
 import { Dashboard, type DashboardWorkspace } from './pages/dashboard.js';
 import { NotAvailable } from './pages/not_available.js';
-import { Workspace } from './pages/workspace.js';
+import { Workspace, type WorkspaceSections } from './pages/workspace.js';
 
 /**
  * Where JSX ends and the service begins.
@@ -35,17 +35,9 @@ export function renderDashboard(
   return `<!doctype html>${String(<Dashboard signedInAs={signedInAs} {...(rows === undefined ? {} : { workspaces: rows })} />)}`;
 }
 
-/** One workspace, as the person signed in may read it. */
-export function renderWorkspace(signedInAs: string, workspace: Record<string, unknown>): string {
-  const display = workspace['display_name'];
+/** One workspace, with whichever of its sections could be read. */
+export function renderWorkspace(signedInAs: string, sections: Record<string, unknown>): string {
   return `<!doctype html>${String(
-    <Workspace
-      signedInAs={signedInAs}
-      workspace={{
-        slug: String(workspace['slug'] ?? ''),
-        status: String(workspace['status'] ?? ''),
-        ...(typeof display === 'string' ? { display_name: display } : {}),
-      }}
-    />,
+    <Workspace signedInAs={signedInAs} sections={sections as unknown as WorkspaceSections} />,
   )}`;
 }
