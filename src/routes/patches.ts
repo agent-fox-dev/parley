@@ -3,6 +3,7 @@ import { HttpError } from '../http/errors.js';
 import type { LogSink, RouteDefinition } from '../http/router.js';
 import { jsonResponse } from '../http/json.js';
 import type { Clock, Locks, RelationalStore } from '../platform/index.js';
+import type { JobQueue } from '../platform/jobs.js';
 import type { RepositoryStore } from '../platform/repostore.js';
 import type { SecretStore } from '../platform/secrets.js';
 import { newIdentifier } from '../auth/credentials.js';
@@ -21,6 +22,7 @@ import {
 } from '../patch/list.js';
 import { repositoryOf } from '../repo/repository.js';
 import { type BranchResolution, resolveBranch } from '../patch/resolve_branch.js';
+import { resetRefusal, resetToOrigin } from '../patch/reset_to_origin.js';
 import { workspaceAccess } from '../workspace/access.js';
 import { withWorkspaceLock } from '../workspace/lock.js';
 import { effectiveSettings } from '../workspace/settings.js';
@@ -42,6 +44,7 @@ export interface PatchRouteConfig {
   locks: Locks;
   secrets?: SecretStore;
   repos?: RepositoryStore;
+  jobs?: JobQueue;
   fetch?: typeof fetch;
   log?: LogSink;
 }
@@ -427,6 +430,50 @@ async function reorderPatches(c: Context, config: PatchRouteConfig): Promise<Res
   return jsonResponse(ordered.map((patch) => serialisePatch(patch)));
 }
 
+async function resetPatch(c: Context, config: PatchRouteConfig): Promise<Response> {
+  const { workspace } = await carryPatchWorkspace(c, config, 'write');
+  const patch = await patchById(config.store, workspace.slug, c.req.param('id') ?? '');
+
+  const refusal = resetRefusal(workspace, patch);
+  if (refusal !== undefined) {
+    throw refusal;
+  }
+  if (config.repos === undefined) {
+    throw new HttpError(503, 'this deployment holds no repositories');
+  }
+  const repos = config.repos;
+
+  const outcome = await withWorkspaceLock(config.locks, workspace.slug, async () =>
+    resetToOrigin(
+      {
+        store: config.store,
+        repos,
+        clock: config.clock,
+        ...(config.jobs === undefined ? {} : { jobs: config.jobs }),
+        ...(config.secrets === undefined ? {} : { secrets: config.secrets }),
+        ...(config.fetch === undefined ? {} : { fetch: config.fetch }),
+        ...(config.log === undefined ? {} : { log: config.log }),
+      },
+      workspace,
+      patch as PatchRecord,
+    ),
+  );
+
+  const after = await patchById(config.store, workspace.slug, (patch as PatchRecord).id);
+  if (after === undefined) {
+    throw new HttpError(500, 'failed to fetch updated patch');
+  }
+  return jsonResponse({
+    ...serialisePatch(
+      after,
+      outcome.replaced_sha === undefined ? {} : { replaced_sha: outcome.replaced_sha },
+    ),
+    action: outcome.action,
+    rebuild_triggered: outcome.rebuild_triggered,
+    ...(outcome.rebuild_job_id === undefined ? {} : { rebuild_job_id: outcome.rebuild_job_id }),
+  });
+}
+
 export function patchRoutes(config: PatchRouteConfig): RouteDefinition[] {
   return [
     {
@@ -462,6 +509,12 @@ export function patchRoutes(config: PatchRouteConfig): RouteDefinition[] {
       methods: ['POST'],
       scope: 'patches:write',
       handler: async (c) => restorePatch(c, config),
+    },
+    {
+      path: `${config.mountPoint}/workspaces/:slug/patches/:id/reset-to-origin`,
+      methods: ['POST'],
+      scope: 'patches:write',
+      handler: async (c) => resetPatch(c, config),
     },
     {
       path: `${config.mountPoint}/workspaces/:slug/patches/reorder`,

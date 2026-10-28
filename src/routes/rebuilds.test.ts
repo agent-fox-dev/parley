@@ -109,9 +109,16 @@ async function patch(place: World, branch: string, files: Record<string, string>
   await seedPatch(place.service.store, place.slug, branch);
 }
 
-/** A job record in whatever state the suite needs to see refused. */
+/**
+ * A job record in whatever state the suite needs to see refused.
+ * Each one is queued a second after the last, because "newest first"
+ * needs them to have been queued at different times to mean anything.
+ */
+let queuedAt = SEED_NOW.getTime();
+
 async function jobIn(place: World, status: string, over: object = {}): Promise<string> {
   const id = newIdentifier();
+  queuedAt += 1000;
   await insertRebuild(
     place.service.store,
     {
@@ -121,7 +128,7 @@ async function jobIn(place: World, status: string, over: object = {}): Promise<s
       fail_mode: 'fail_fast',
       submitted_by: 'u-1',
     },
-    SEED_NOW.toISOString(),
+    new Date(queuedAt).toISOString(),
   );
   await updateRebuild(place.service.store, id, { status: status as 'queued', ...over });
   return id;
