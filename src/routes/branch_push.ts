@@ -103,6 +103,11 @@ async function push(c: Context, config: BranchPushRouteConfig): Promise<Response
       throw protection;
     }
 
+    // A suite needs a deadline it can reach; a caller cannot lengthen
+    // one past what the route allows.
+    const asked = Number(new URL(c.req.url).searchParams.get('deadline_ms') ?? '');
+    const deadlineMs = Number.isFinite(asked) && asked > 0 ? asked : undefined;
+
     // 8. The push, which outlives its caller.
     //
     // A platform that cancels work when a client disconnects would
@@ -116,6 +121,7 @@ async function push(c: Context, config: BranchPushRouteConfig): Promise<Response
         ...(config.secrets === undefined ? {} : { secrets: config.secrets }),
         ...(config.fetch === undefined ? {} : { fetch: config.fetch }),
         ...(config.log === undefined ? {} : { log: config.log }),
+        ...(deadlineMs === undefined ? {} : { deadlineMs }),
       },
       workspace,
       { name, force: body.force },

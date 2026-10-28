@@ -87,6 +87,51 @@ async function world(over: object = {}): Promise<World> {
   };
 }
 
+/** The same world, against a remote that behaves as the suite says. */
+async function worldWith(
+  options: Parameters<typeof fakeRemote>[0],
+  instead?: FakeRemote,
+): Promise<World> {
+  const remote = instead ?? fakeRemote({ requires: `Bearer ${TOKEN}`, ...options });
+  cleanups.push(remote.dispose);
+  await remote.ready;
+
+  const dir = mkdtempSync(join(tmpdir(), 'parley-push-'));
+  cleanups.push(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const repos = localRepositoryStore(dir);
+  const service = await identityService([], { repos, fetch: remote.fetch });
+  cleanups.push(service.dispose);
+
+  const owner = await seedUser(service.store);
+  const org = await seedOrg(service.store, owner);
+  const workspace = await seedWorkspace(service.store, {
+    owner_id: owner.id,
+    org_id: org.id,
+    status: 'ready',
+    git_url: `${remote.url}/origin.git`,
+  });
+
+  const repository = repositoryOf(workspace);
+  await repos.create(repository);
+  const first = await buildCommit(repos, repository, { 'a.txt': 'hello\n' }, [], 'first');
+  await repos.updateRefs(repository, [
+    { name: 'refs/heads/feature', oldOid: null, newOid: first.oid, force: true },
+  ]);
+  await service.secrets.put(workspaceScope(workspace.slug), 'GIT_PAT', TOKEN);
+
+  return {
+    service,
+    remote,
+    repos,
+    slug: workspace.slug,
+    repository,
+    credential: (await seedApiKey(service.store, owner)).presented,
+    tip: first.oid,
+  };
+}
+
 async function push(place: World, branch = 'feature', body?: unknown): Promise<Response> {
   return place.service.app.request(`/api/v1/workspaces/${place.slug}/branches/${branch}/push`, {
     method: 'POST',
@@ -243,5 +288,132 @@ describe('what the platform is asked to keep running', () => {
     expect(kept, 'the push was handed to the platform').toHaveLength(1);
     await Promise.all(kept);
     expect(await onOrigin(place, 'feature')).toBe(place.tip);
+  });
+});
+
+describe('a push origin will not take', () => {
+  it('refuses a non-fast-forward and says to use force', async () => {
+    const place = await world();
+    const theirs = await buildCommit(
+      place.remote.store,
+      place.remote.repository,
+      { 'a.txt': 'origin wrote this\n' },
+      [],
+      'origin only',
+    );
+    await place.remote.store.updateRefs(place.remote.repository, [
+      { name: 'refs/heads/feature', oldOid: null, newOid: theirs.oid, force: true },
+    ]);
+
+    const response = await push(place);
+    const error = ((await response.json()) as { error: { error_type: string; message: string } })
+      .error;
+
+    expect(response.status).toBe(409);
+    expect(error.error_type).toBe('non_fast_forward');
+    expect(error.message).toContain(theirs.oid);
+    expect(error.message.endsWith('push with force to overwrite it')).toBe(true);
+    expect(await onOrigin(place, 'feature')).toBe(theirs.oid);
+  });
+
+  it("tells the owner of the workspace's own branch to sync instead", async () => {
+    const place = await world({ branch: 'feature' });
+    const theirs = await buildCommit(
+      place.remote.store,
+      place.remote.repository,
+      { 'a.txt': 'origin wrote this\n' },
+      [],
+      'origin only',
+    );
+    await place.remote.store.updateRefs(place.remote.repository, [
+      { name: 'refs/heads/feature', oldOid: null, newOid: theirs.oid, force: true },
+    ]);
+
+    const error = (
+      (await (await push(place)).json()) as { error: { error_type: string; message: string } }
+    ).error;
+
+    expect(error.error_type).toBe('non_fast_forward');
+    expect(error.message.endsWith('sync the workspace to bring it up to date')).toBe(true);
+  });
+
+  it.each([
+    ['one that answers not found', { fails: 404 }, 404, 'forge_not_found'],
+    ['one that refuses the credential', { fails: 401 }, 502, 'forge_unauthenticated'],
+    ['one that forbids it', { fails: 403 }, 502, 'forge_forbidden'],
+    ['one nobody can reach', { unreachable: true }, 502, 'forge_unreachable'],
+    ['one that answers unreadably', { fails: 500 }, 502, 'forge_error'],
+  ])('maps origin to its own answer: %s', async (_what, options, status, type) => {
+    const place = await worldWith(options);
+
+    const response = await push(place);
+
+    expect(response.status).toBe(status);
+    expect(((await response.json()) as { error: { error_type: string } }).error.error_type).toBe(
+      type,
+    );
+  });
+
+  it("carries origin's reason when it refuses the ref", async () => {
+    const place = await worldWith({ refusesPush: 'this branch is protected' });
+
+    const response = await push(place);
+    const error = ((await response.json()) as { error: { error_type: string; message: string } })
+      .error;
+
+    expect(response.status).toBe(422);
+    expect(error.error_type).toBe('forge_rejected');
+    expect(error.message).toContain('this branch is protected');
+  });
+
+  it('answers forge_timeout when the push runs past its deadline', async () => {
+    const base = fakeRemote({ requires: `Bearer ${TOKEN}` });
+    const place = await worldWith(
+      {},
+      {
+        ...base,
+        fetch: (async (input: string | URL | Request, init?: RequestInit) => {
+          await new Promise((resolve) => setTimeout(resolve, 60));
+          return base.fetch(input, init);
+        }) as unknown as typeof fetch,
+      },
+    );
+
+    const response = await place.service.app.request(
+      `/api/v1/workspaces/${place.slug}/branches/feature/push?deadline_ms=10`,
+      { method: 'POST', headers: { authorization: `Bearer ${place.credential}` } },
+    );
+
+    expect(response.status).toBe(504);
+    expect(((await response.json()) as { error: { error_type: string } }).error.error_type).toBe(
+      'forge_timeout',
+    );
+  });
+});
+
+describe('what no answer of these routes carries', () => {
+  it('never carries the credential, the userinfo or the transport’s own words', async () => {
+    const place = await worldWith({ fails: 401 });
+    await place.service.store.run('UPDATE workspaces SET git_url = ? WHERE slug = ?', [
+      `${place.remote.url.replace('http://', 'http://someone:a-very-secret-userinfo@')}/origin.git`,
+      place.slug,
+    ]);
+
+    const asOwner = { method: 'POST', headers: { authorization: `Bearer ${place.credential}` } };
+    const answers = [
+      await (await push(place)).text(),
+      await (
+        await place.service.app.request(`/api/v1/workspaces/${place.slug}/sync`, asOwner)
+      ).text(),
+      await (
+        await place.service.app.request(`/api/v1/workspaces/${place.slug}/reclone`, asOwner)
+      ).text(),
+    ];
+
+    for (const body of answers) {
+      expect(body).not.toContain(TOKEN);
+      expect(body).not.toContain('a-very-secret-userinfo');
+      expect(body).not.toContain('the remote answered');
+    }
   });
 });

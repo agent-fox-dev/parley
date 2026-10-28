@@ -1,4 +1,4 @@
-import { HttpError } from '../http/errors.js';
+import { refusal } from './checks.js';
 import type { LogSink } from '../http/router.js';
 import type { RepositoryStore } from '../platform/repostore.js';
 import type { SecretStore } from '../platform/secrets.js';
@@ -7,6 +7,8 @@ import { authorizationFor } from '../repo/copy_in.js';
 import { resolveGitCredential } from '../repo/credentials.js';
 import { repositoryOf } from '../repo/repository.js';
 import { ZERO_OID, lsRefs, pushPack } from '../git/transport.js';
+import { descendsFrom } from '../git/ancestry.js';
+import { nonFastForward, pushFailure, refusedRef } from './failures.js';
 import type { WorkspaceRecord } from '../store/workspaces.js';
 
 /**
@@ -59,14 +61,15 @@ export async function pushBranch(
 ): Promise<BranchPushResult> {
   const repository = repositoryOf(workspace);
   const ref = `refs/heads/${request.name}`;
+  const answered = {
+    branch: request.name,
+    remote: 'origin' as const,
+    remote_url: withoutUserinfo(workspace.git_url),
+  };
 
   const here = (await deps.repos.listRefs(repository)).find((one) => one.name === ref)?.oid;
   if (here === undefined) {
-    throw new HttpError(
-      404,
-      `branch_not_found: branch "${request.name}" does not exist`,
-      'branch_not_found',
-    );
+    throw refusal(404, 'branch_not_found', `branch "${request.name}" does not exist`);
   }
 
   const credential =
@@ -78,6 +81,11 @@ export async function pushBranch(
           'origin',
           deps.log,
         );
+  const context = {
+    branch: request.name,
+    gitUrl: workspace.git_url,
+    ...(credential === undefined ? {} : { credential }),
+  };
   const authorization = authorizationFor(credential);
   const remote = {
     url: workspace.git_url.replace(/\/$/, ''),
@@ -85,37 +93,94 @@ export async function pushBranch(
     ...(deps.fetch === undefined ? {} : { fetch: deps.fetch }),
   };
 
-  const theirs = (await lsRefs(remote)).find((one) => one.name === ref)?.oid;
-  if (theirs === here) {
-    return {
-      branch: request.name,
-      sha: here,
-      remote: 'origin',
-      remote_url: withoutUserinfo(workspace.git_url),
-      result: 'up_to_date',
-    };
+  return within(
+    (async (): Promise<BranchPushResult> => {
+      let theirs: string | undefined;
+      let listed = true;
+      try {
+        theirs = (await lsRefs(remote)).find((one) => one.name === ref)?.oid;
+      } catch (err) {
+        // A remote that will not say what it holds may still take the
+        // push; only an answer about this workspace's standing is lost.
+        if (!(err instanceof Error) || err.name === 'RemoteError') {
+          throw pushFailure(err, context);
+        }
+        listed = false;
+      }
+
+      if (theirs === here) {
+        return { ...answered, sha: here, result: 'up_to_date' };
+      }
+
+      const pack = await deps.repos.servePack(
+        repository,
+        [here],
+        theirs === undefined ? [] : [theirs],
+      );
+
+      // Whether this is a fast-forward is answerable from the pack,
+      // before origin is asked to take it.
+      if (theirs !== undefined && !descendsFrom(pack, here, theirs)) {
+        if (!request.force) {
+          throw nonFastForward(context, {
+            force: false,
+            ...(listed ? { origin: theirs } : {}),
+            own: workspace.branch === request.name,
+          });
+        }
+      }
+
+      let report;
+      try {
+        report = await pushPack(remote, {
+          commands: [{ name: ref, oldOid: theirs ?? ZERO_OID, newOid: here }],
+          pack,
+        });
+      } catch (err) {
+        throw pushFailure(err, context);
+      }
+
+      const refused = report.refs.find((one) => !one.ok);
+      if (!report.unpacked) {
+        throw refusal(502, 'forge_error', 'origin could not unpack what it was sent');
+      }
+      if (refused !== undefined) {
+        throw refusedRef(refused.reason ?? 'origin gave no reason', context, {
+          force: request.force,
+          ...(theirs === undefined ? {} : { theirs }),
+        });
+      }
+
+      return {
+        ...answered,
+        sha: here,
+        result: request.force && theirs !== undefined ? 'forced' : 'pushed',
+      };
+    })(),
+    deps.deadlineMs ?? PUSH_DEADLINE_MS,
+    context,
+  );
+}
+
+/** Gives up when the push takes longer than it may. */
+async function within<T>(
+  work: Promise<T>,
+  deadlineMs: number,
+  context: { branch: string; gitUrl: string },
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          reject(
+            refusal(504, 'forge_timeout', `the push of ${context.branch} did not finish in time`),
+          );
+        }, deadlineMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
   }
-
-  const pack = await deps.repos.servePack(repository, [here], theirs === undefined ? [] : [theirs]);
-  const report = await pushPack(remote, {
-    commands: [{ name: ref, oldOid: theirs ?? ZERO_OID, newOid: here }],
-    pack,
-  });
-
-  const refused = report.refs.find((one) => !one.ok);
-  if (!report.unpacked || refused !== undefined) {
-    throw new HttpError(
-      422,
-      `forge_rejected: origin refused ${request.name}: ${refused?.reason ?? 'the remote could not unpack what it was sent'}`,
-      'forge_rejected',
-    );
-  }
-
-  return {
-    branch: request.name,
-    sha: here,
-    remote: 'origin',
-    remote_url: withoutUserinfo(workspace.git_url),
-    result: request.force && theirs !== undefined ? 'forced' : 'pushed',
-  };
 }

@@ -50,9 +50,27 @@ function send(remote: Remote): typeof fetch {
   return remote.fetch ?? fetch;
 }
 
+/**
+ * A remote that answered something other than success. The status is
+ * carried rather than only described, because a caller has to tell
+ * "not found" from "not allowed" to say the right thing about it.
+ */
+export class RemoteError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'RemoteError';
+  }
+}
+
 async function bodyOf(response: Response, what: string): Promise<Uint8Array> {
   if (!response.ok) {
-    throw new Error(`the remote answered ${String(response.status)} to ${what}`);
+    throw new RemoteError(
+      response.status,
+      `the remote answered ${String(response.status)} to ${what}`,
+    );
   }
   return new Uint8Array(await response.arrayBuffer());
 }

@@ -1,13 +1,14 @@
 import { HttpError } from '../http/errors.js';
 import type { LogSink } from '../http/router.js';
 import type { Clock, RelationalStore } from '../platform/index.js';
-import { readPack } from '../platform/local/pack.js';
 import type { RepositoryStore } from '../platform/repostore.js';
 import type { SecretStore } from '../platform/secrets.js';
 import { workspaceScope } from '../platform/secrets.js';
 import { authorizationFor } from '../repo/copy_in.js';
 import { resolveGitCredential } from '../repo/credentials.js';
 import { repositoryOf } from '../repo/repository.js';
+import { descendsFrom } from '../git/ancestry.js';
+import { remoteReason } from '../push/failures.js';
 import { type Remote, fetchPack, lsRefs } from '../git/transport.js';
 import { type WorkspaceRecord, updateWorkspace } from '../store/workspaces.js';
 
@@ -75,51 +76,6 @@ export function trackedBranch(
   return branches.find((name) => name === 'main') ?? branches[0] ?? 'main';
 }
 
-/**
- * Whether origin's head descends from the commit the workspace is at.
- *
- * It is answered from the pack origin just sent. A pack fetched with
- * the local head as a `have` carries the commits between the two, and
- * the local head shows up as the parent of the oldest of them; a pack
- * that never names it is a history origin rewrote.
- */
-export function descendsFrom(pack: Uint8Array, head: string, ancestor: string): boolean {
-  if (head === ancestor) {
-    return true;
-  }
-  const commits = new Map<string, string[]>();
-  for (const object of readPack(pack)) {
-    if (object.type !== 'commit') {
-      continue;
-    }
-    const text: string = Buffer.from(object.data).toString('latin1');
-    const blank = text.indexOf('\n\n');
-    const header: string = blank === -1 ? text : text.slice(0, blank);
-    commits.set(
-      object.oid,
-      header
-        .split('\n')
-        .map((line) => /^parent ([0-9a-f]{40})$/.exec(line)?.[1])
-        .filter((oid): oid is string => oid !== undefined),
-    );
-  }
-
-  const seen = new Set<string>();
-  const pending = [head];
-  while (pending.length > 0) {
-    const oid = pending.pop() ?? '';
-    if (oid === ancestor) {
-      return true;
-    }
-    if (seen.has(oid)) {
-      continue;
-    }
-    seen.add(oid);
-    pending.push(...(commits.get(oid) ?? []));
-  }
-  return false;
-}
-
 /** Origin, as something to fetch from, or the refusal to try. */
 async function origin(deps: SyncDeps, workspace: WorkspaceRecord): Promise<Remote> {
   if (deps.secrets === undefined) {
@@ -183,11 +139,9 @@ export async function syncStandard(
       const branch = trackedBranch(workspace, refs);
       const theirs = refs.find((ref) => ref.name === `refs/heads/${branch}`)?.oid;
       if (theirs === undefined) {
-        throw await fetchFailure(
-          deps,
-          workspace,
-          new Error(`origin has no branch named ${branch}`),
-        );
+        const why = `origin has no branch named ${branch}`;
+        await recordFailure(deps, workspace, why);
+        throw new HttpError(502, why);
       }
 
       const here = (await deps.repos.listRefs(repository)).find(
@@ -260,24 +214,9 @@ async function fetchFailure(
   workspace: WorkspaceRecord,
   err: unknown,
 ): Promise<HttpError> {
-  const why = `the fetch from origin failed: ${scrub(err, workspace.git_url)}`;
+  // Said in the same vocabulary the branch push uses, which carries
+  // nothing of the credential, the address or the transport's words.
+  const why = `the fetch from origin failed: ${remoteReason(err)}`;
   await recordFailure(deps, workspace, why);
   return new HttpError(502, why);
-}
-
-/** What may be said about a failure: no credential, no userinfo. */
-export function scrub(err: unknown, gitUrl: string): string {
-  const said = err instanceof Error ? err.message : 'the remote could not be reached';
-  const url = (() => {
-    try {
-      const parsed = new URL(gitUrl);
-      return `${parsed.username}${parsed.password}`;
-    } catch {
-      return '';
-    }
-  })();
-  return said
-    .replaceAll(/(Bearer|Basic) [A-Za-z0-9+/=._-]+/g, '$1 <redacted>')
-    .replaceAll(/[^\s/@]+:[^\s/@]+@/g, '')
-    .replaceAll(url.length > 0 ? url : '\u0000', '');
 }
