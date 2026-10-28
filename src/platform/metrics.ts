@@ -3,6 +3,11 @@ export interface CounterHandle {
   increment(labels: Readonly<Record<string, string>>): void;
 }
 
+export interface GaugeHandle {
+  /** Sets the series carrying these label values to this value. */
+  set(labels: Readonly<Record<string, string>>, value: number): void;
+}
+
 export interface HistogramHandle {
   /** Records one observation against the series carrying these label values. */
   observe(labels: Readonly<Record<string, string>>, value: number): void;
@@ -11,6 +16,7 @@ export interface HistogramHandle {
 /** Where the service records what it measured. */
 export interface MetricsSink {
   counter(name: string): CounterHandle;
+  gauge(name: string): GaugeHandle;
   histogram(name: string): HistogramHandle;
   /** Every series recorded so far, for the exposition to render. */
   snapshot(): MetricSeries[];

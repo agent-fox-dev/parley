@@ -1,3 +1,4 @@
+import { type EventRecorder, actorIn, record } from '../audit/recorder.js';
 import type { Context } from 'hono';
 import { identityOf } from '../auth/middleware.js';
 import { HttpError } from '../http/errors.js';
@@ -44,6 +45,8 @@ export interface WorkspaceRouteConfig {
   jobs?: JobQueue;
   /** Injected so a test reaches a remote of its own. */
   fetch?: typeof fetch;
+  /** Where this group writes down what it did. */
+  events?: EventRecorder;
 }
 
 /**
@@ -167,6 +170,14 @@ async function createWorkspace(c: Context, config: WorkspaceRouteConfig): Promis
       await queueCopyIn(config.jobs, workspace.slug);
     }
   }
+
+  await record(config.events, {
+    type: 'hub.workspace.create',
+    workspace: workspace.slug,
+    resourceId: workspace.slug,
+    actor: actorIn(c),
+    metadata: { git_url: workspace.git_url, branch: workspace.branch ?? undefined },
+  });
 
   return jsonResponse(
     serialiseWorkspace(workspace, {
@@ -312,6 +323,14 @@ async function changeWorkspace(c: Context, config: WorkspaceRouteConfig): Promis
 
   await updateWorkspace(config.store, workspace.slug, changes, config.clock.now().toISOString());
 
+  await record(config.events, {
+    type: 'hub.workspace.update',
+    workspace: workspace.slug,
+    resourceId: workspace.slug,
+    actor: actorIn(c),
+    metadata: { fields: Object.keys(changes).toSorted() },
+  });
+
   const updated = await findWorkspace(config.store, workspace.slug);
   const org =
     updated?.org_id === null || updated?.org_id === undefined
@@ -385,6 +404,14 @@ export function workspaceRoutes(config: WorkspaceRouteConfig): RouteDefinition[]
           ...(config.repos === undefined ? {} : { repos: config.repos }),
           ...(config.secrets === undefined ? {} : { secrets: config.secrets }),
           ...(config.fetch === undefined ? {} : { fetch: config.fetch }),
+          ...(config.events === undefined ? {} : { events: config.events }),
+        });
+        await record(config.events, {
+          type: 'hub.workspace.archive',
+          workspace: workspace.slug,
+          resourceId: workspace.slug,
+          actor: actorIn(c),
+          metadata: { head_sha: workspace.head_sha ?? undefined },
         });
         return answerWithWorkspace(config, workspace.slug, level);
       },
@@ -397,6 +424,12 @@ export function workspaceRoutes(config: WorkspaceRouteConfig): RouteDefinition[]
       handler: async (c) => {
         const { workspace, level } = await workspaceAccess(c, config.store, 'write');
         await reactivateWorkspace(config.store, config.clock, workspace);
+        await record(config.events, {
+          type: 'hub.workspace.reactivate',
+          workspace: workspace.slug,
+          resourceId: workspace.slug,
+          actor: actorIn(c),
+        });
         return answerWithWorkspace(config, workspace.slug, level);
       },
     },
@@ -407,12 +440,17 @@ export function workspaceRoutes(config: WorkspaceRouteConfig): RouteDefinition[]
       hideScopeFailure: hidesMissingScope('DELETE', '/workspaces/:slug'),
       handler: async (c) => {
         const { workspace } = await workspaceAccess(c, config.store, 'write');
-        await deleteWorkspaceAndTokens(
-          config.store,
-          config.clock,
-          workspace,
-          config.repos === undefined ? {} : { repos: config.repos },
-        );
+        const revoked = await deleteWorkspaceAndTokens(config.store, config.clock, workspace, {
+          ...(config.repos === undefined ? {} : { repos: config.repos }),
+          ...(config.events === undefined ? {} : { events: config.events }),
+        });
+        await record(config.events, {
+          type: 'hub.workspace.delete',
+          workspace: workspace.slug,
+          resourceId: workspace.slug,
+          actor: actorIn(c),
+          metadata: { revoked_tokens: revoked },
+        });
         return emptyResponse(204);
       },
     },

@@ -12,6 +12,8 @@ import { readSnapshot } from '../testutil/history.js';
 import { buildCommit } from '../testutil/history.js';
 import { SEED_NOW, freshStore, seedClock, seedWorkspace } from '../testutil/identity.js';
 import { sweepStalledMerges } from '../jobs/stall_sweep.js';
+import { eventRecorder } from '../audit/recorder.js';
+import { recordedEvents } from '../testutil/app.js';
 import { insertMerge, mergeById } from './job.js';
 import { type MergeRunDeps, runMerge } from './run.js';
 
@@ -67,7 +69,14 @@ async function world(): Promise<World> {
     clock,
     slug: workspace.slug,
     repository,
-    deps: { store: seeded.store, repos, locks, clock, waitMs: 200 },
+    deps: {
+      store: seeded.store,
+      repos,
+      locks,
+      clock,
+      waitMs: 200,
+      events: eventRecorder({ store: seeded.store, clock }),
+    },
     base: base.oid,
   };
 }
@@ -148,6 +157,12 @@ describe('a merge that applies', () => {
     const merged = await place.repos.readObject(place.repository, job?.merged_sha ?? '');
     const text = new TextDecoder().decode(merged?.data ?? new Uint8Array());
     expect(text.split('\n').filter((line) => line.startsWith('parent '))).toHaveLength(1);
+
+    // Nobody waited on this job, so its event is the only account of
+    // how it went.
+    const [recorded] = await recordedEvents(place.store, 'hub.merge.complete');
+    expect(recorded?.actor_type).toBe('system');
+    expect(recorded?.metadata).toEqual({ base_sha: onMain.oid, merged_sha: job?.merged_sha });
   });
 
   it('leaves base_sha and merged_sha unset until it has finished', async () => {
@@ -194,6 +209,9 @@ describe('a merge that conflicts', () => {
     expect(job?.status).toBe('failed');
     expect(job?.conflict_files).toEqual(['base.txt']);
     expect(await headOf(place, 'main')).toBe(onMain.oid);
+
+    const [recorded] = await recordedEvents(place.store, 'hub.merge.fail');
+    expect(Object.keys(recorded?.metadata ?? {})).toEqual(['reason']);
   });
 
   it('fails plainly where a branch it names is not there', async () => {

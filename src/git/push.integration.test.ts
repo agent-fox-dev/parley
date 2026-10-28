@@ -1,3 +1,4 @@
+import { recordedEvents } from '../testutil/app.js';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   GIT_ENV,
@@ -80,6 +81,14 @@ describe.skipIf(missing.length > 0)(
       expect(stored.get('refs/heads/main')).toBe(await local('refs/heads/main'));
       expect(stored.get('refs/heads/a-new-branch')).toBe(await local('refs/heads/a-new-branch'));
       expect(stored.get('refs/tags/a-tag')).toBe(await local('refs/tags/a-tag'));
+
+      // A push that moved something is written down, with the head the
+      // workspace now reports and the refs it took.
+      const [recorded] = await recordedEvents(world.service.store, 'hub.git.push');
+      expect(recorded?.metadata).toEqual({
+        head_sha: stored.get('refs/heads/main'),
+        refs_updated: ['refs/heads/a-new-branch', 'refs/heads/main', 'refs/tags/a-tag'],
+      });
     });
 
     it('changes exactly the refs it reported as taken', async () => {

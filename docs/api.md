@@ -30,6 +30,7 @@ implemented; routes appear here as they are built.
 - [Merging branches](#merging-branches)
 - [Carrying a patch stack](#carrying-a-patch-stack)
 - [Agent sessions and what they cost](#agent-sessions-and-what-they-cost)
+- [Audit and events](#audit-and-events)
 - [Git Server](#git-server)
 - [Server Endpoints](#server-endpoints)
 
@@ -1069,6 +1070,127 @@ A cursor holds the position of the last row served — its timestamp
 and its id — not an offset, so rows inserted while a caller pages are
 neither skipped nor served twice. It is the service's own string:
 anything else is `400 the cursor is not one this service issued`.
+
+## Audit and events
+
+Every operation worth remembering records an event, agents report what
+they did for each run, one query reads across both, and a stream carries
+them live.
+
+### The hub's own events
+
+Each significant operation records one event with an `event_type`, an
+actor (by default the calling credential's user and type), the
+`workspace`, a `resource_type`, a `resource_id`, an `action` and
+metadata. The types and the metadata keys of each are the two tables of
+[the hub's reference](prd/api.md#hub-audit-events); the service records
+from one declaration of those tables, so an event carries exactly the
+keys the reference lists and no others.
+
+**Recording never changes the answer of the request that caused it.** A
+recorder that fails leaves the operation's status and body exactly as
+they would have been, which is why every call site goes through a
+recorder that swallows and logs.
+
+**A bound token's refusals** are recorded at most once per token per
+minute. The event is written at the first refusal and the refusals held
+back since are counted into its `suppressed`, so twenty refusals inside
+a minute leave one event reading nineteen suppressed.
+
+Events of operations this service does not perform yet — the forge
+writes and deliveries, the sandbox leases — are declared and recorded by
+nobody until the packages that perform them land.
+
+### What an agent reports
+
+The per-run routes live under `/api/v1/workspaces/:slug/runs/:run_id/`:
+`events`, `sessions/outcomes`, `tools/calls`, `tools/errors`, `traces`,
+`events/batch`, `traces/batch` and `postmortem`.
+
+A `run_id` is `YYYYMMDD_HHMMSS_` and six lowercase hex characters;
+anything else is `400`. Every record is **idempotent by `id`**: a repeat
+answers `200` with what is stored and writes nothing, which is what
+keeps a retried request from counting a run's work twice. Client
+timestamps are RFC 3339.
+
+**The access rule runs the other way round from the rest of the
+service**, and deliberately: the workspace must exist (`404`), then it
+must not be archived (`409 workspace_archived`, answered **before**
+anybody's access is considered, so a member of an archived workspace is
+told `409` and not `403`), and only then must the caller own it
+(`403 workspace_access_denied`, where every other route would answer
+`404`). A refused request stores nothing. The reads are open to anyone
+who may read the workspace, whatever its status.
+
+**A batch** carries 1 to 1000 items and answers `200` with `accepted`,
+`duplicates` and an `errors` entry per failing item naming its index;
+an item's failure does not stop the others. An empty array is `400` and
+more than 1000 items is `413`.
+
+**A run has at most one postmortem**, and it is the first submitted: a
+second submit answers `200` with the one already stored. A schema
+version other than 1 is `422 unknown_schema_version` — the request is
+well formed and this service simply does not read that version. Reading
+a run that has none is `404 postmortem_not_found`.
+
+**The lists** page with `order`, `limit` (50, at most 500), `cursor`,
+`since` (inclusive) and `until` (exclusive), and each answers with its
+own collection, `next_cursor` and `has_more`. The JSON an agent sent
+comes back as JSON.
+
+### GET /api/v1/audit
+
+Hub events and agent events as one timeline, newest first. Both halves
+are selected with the same columns and joined, so the database orders
+one list rather than the service merging two — which is what makes
+paging to the end yield every event exactly once.
+
+Times are compared as instants: every timestamp is stored through
+`toISOString`, so one precision everywhere and no event sorts by its
+spelling.
+
+The filters are `source`, `workspace`, `event_type`,
+`event_type_prefix`, `severity`, `actor_id`, `actor_type`,
+`resource_type`, `action`, `run_id`, `since`, `until`, `limit` (100, at
+most 1000) and `cursor`. **A filter only hub events carry leaves the
+agent events out** rather than matching none of them, and `run_id`
+leaves the hub events out.
+
+A caller sees every workspace they own or share an organization with,
+archived ones included; an event belonging to no workspace is the
+deployment's own business and reaches an admin token alone. A workspace
+the caller may not read is answered exactly as one that does not exist.
+
+### The transcript
+
+`GET .../runs/:run_id/transcript?node_id=` rebuilds one node's
+conversation from its trace events. `session.init` becomes a `system`
+message, `assistant.message` an `assistant` message, `tool.use` a
+`tool_use` message with its tool, and `tool.error` a `tool_error`
+message; every other trace type produces no message. A request without
+a node is `400`, because a run's traces are several conversations
+interleaved.
+
+### The live event stream
+
+`GET /api/v1/events` is a `text/event-stream` with two kinds of frame,
+`heartbeat` and `audit_event`. A heartbeat is sent at once and then
+every 30 seconds. `workspace` narrows it to one workspace and
+`category` to `hub` or `agent`.
+
+- **The workspaces a stream may see are fixed when it opens**, so
+  joining or leaving an organization takes effect on the next
+  connection.
+- A connection with no reads for 60 seconds is closed, and a client
+  that falls behind keeps the most recent 256 events and loses the
+  oldest rather than stalling the stream.
+- An event recorded by **any** component of the deployment reaches the
+  subscriber: events are published to a table every component shares,
+  the same substrate as the workspace lock and the job queue.
+- A workspace the caller may not read is `404` before the stream
+  starts, and the configured limit of concurrent streams
+  (`AF_SSE_MAX_CONNECTIONS`, 100) is `503`. Neither leaves a half-open
+  stream.
 
 ## Git Server
 

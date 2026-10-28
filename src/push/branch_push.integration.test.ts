@@ -6,7 +6,7 @@ import { localRepositoryStore } from '../platform/local/repostore.js';
 import type { RepositoryStore } from '../platform/repostore.js';
 import { workspaceScope } from '../platform/secrets.js';
 import { repositoryOf } from '../repo/repository.js';
-import { type Service, identityService } from '../testutil/app.js';
+import { type Service, identityService, recordedEvents } from '../testutil/app.js';
 import { type FakeRemote, fakeRemote } from '../testutil/fakeremote.js';
 import { buildCommit } from '../testutil/history.js';
 import { seedApiKey, seedOrg, seedUser, seedWorkspace } from '../testutil/identity.js';
@@ -166,6 +166,23 @@ describe('a branch pushed to origin', () => {
 
     // And origin really holds it.
     expect(await onOrigin(place, 'feature')).toBe(place.tip);
+
+    // The attempt is written down with what was offered and where.
+    expect(await recordedEvents(place.service.store, 'hub.branch.push')).toEqual([
+      expect.objectContaining({
+        action: 'push',
+        resource_id: 'feature',
+        metadata: {
+          branch: 'feature',
+          sha: place.tip,
+          force: false,
+          ok: true,
+          remote: 'origin',
+          remote_url: `${place.remote.url}/origin.git`,
+          result: 'pushed',
+        },
+      }),
+    ]);
   });
 
   it('reports up_to_date when origin already had the commit, with force and without', async () => {
@@ -314,6 +331,11 @@ describe('a push origin will not take', () => {
     expect(error.message).toContain(theirs.oid);
     expect(error.message.endsWith('push with force to overwrite it')).toBe(true);
     expect(await onOrigin(place, 'feature')).toBe(theirs.oid);
+
+    // A push the fork would not take is still a push attempt, and is
+    // recorded as one that did not work.
+    const [recorded] = await recordedEvents(place.service.store, 'hub.branch.push');
+    expect(recorded?.metadata).toMatchObject({ ok: false, error_type: 'non_fast_forward' });
   });
 
   it("tells the owner of the workspace's own branch to sync instead", async () => {

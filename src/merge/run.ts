@@ -1,3 +1,4 @@
+import { type EventRecorder, record } from '../audit/recorder.js';
 import type { LogSink } from '../http/router.js';
 import type { Clock, Locks, RelationalStore } from '../platform/index.js';
 import type { RepositoryStore } from '../platform/repostore.js';
@@ -27,6 +28,8 @@ export interface MergeRunDeps {
   locks: Locks;
   clock: Clock;
   log?: LogSink;
+  /** Where the job writes down how it ended. */
+  events?: EventRecorder;
   /** How long to wait for the workspace before giving up its turn. */
   waitMs?: number;
 }
@@ -198,5 +201,29 @@ async function finish(
       ...(outcome.error === undefined ? {} : { error: outcome.error }),
     },
     deps.clock.now().toISOString(),
+  );
+
+  // The job has no caller to answer to, so the record of how it went
+  // is the only account of it. The system is the actor for the same
+  // reason: nobody was waiting on this.
+  await record(
+    deps.events,
+    outcome.status === 'completed'
+      ? {
+          type: 'hub.merge.complete',
+          workspace: job.workspace_slug,
+          resourceId: job.id,
+          actor: { id: '', type: 'system' },
+          metadata: { base_sha: outcome.base_sha, merged_sha: outcome.merged_sha },
+        }
+      : {
+          type: 'hub.merge.fail',
+          workspace: job.workspace_slug,
+          resourceId: job.id,
+          actor: { id: '', type: 'system' },
+          severity: 'error',
+          metadata: { reason: outcome.error ?? 'the merge failed' },
+        },
+    deps.log,
   );
 }

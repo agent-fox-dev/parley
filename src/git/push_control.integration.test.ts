@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { workspaceScope } from '../platform/secrets.js';
 
 import { seedPatch } from '../testutil/identity.js';
+import { recordedEvents } from '../testutil/app.js';
 import { type FakeRemote, fakeRemote } from '../testutil/fakeremote.js';
 import {
   GIT_ENV,
@@ -200,6 +201,11 @@ describe.skipIf(missing.length > 0)(
 
       expect(reported).not.toContain('rejected');
       expect(await holds(place.world, PATCH)).toBe(true);
+
+      // The hub's copy is the one that counts, so the mirror that
+      // failed is written down rather than answered with.
+      const [recorded] = await recordedEvents(place.world.service.store, 'hub.patch.mirror_failed');
+      expect(recorded?.metadata).toMatchObject({ branch_name: PATCH });
     });
 
     it.each([

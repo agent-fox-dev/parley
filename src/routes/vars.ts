@@ -1,3 +1,4 @@
+import { type EventRecorder, actorIn, record } from '../audit/recorder.js';
 import type { Context } from 'hono';
 import { emptyResponse, jsonResponse, readJsonObject } from '../http/json.js';
 import type { RouteDefinition } from '../http/router.js';
@@ -19,6 +20,8 @@ export interface VarRouteConfig {
   mountPoint: string;
   store: RelationalStore;
   clock: Clock;
+  /** Where this group writes down what it did. */
+  events?: EventRecorder;
 }
 
 const FAMILIES: ReadonlyArray<{ family: ScopeFamily; path: string }> = [
@@ -41,6 +44,25 @@ async function listVars(c: Context, config: VarRouteConfig, family: ScopeFamily)
   return jsonResponse(entries.map(asVariable));
 }
 
+/** One event per key, as a secret records one, by scope and key. */
+async function recordKeys(
+  c: Context,
+  config: VarRouteConfig,
+  family: ScopeFamily,
+  action: 'create' | 'update' | 'delete',
+  keys: readonly string[],
+): Promise<void> {
+  for (const key of keys) {
+    await record(config.events, {
+      type: `hub.variable.${action}`,
+      workspace: family === 'workspace' ? (c.req.param('slug') ?? null) : null,
+      resourceId: key,
+      actor: actorIn(c),
+      metadata: { scope: family, key },
+    });
+  }
+}
+
 async function createVars(c: Context, config: VarRouteConfig, family: ScopeFamily) {
   const scope = await entryScope(c, config.store, family, WRITING);
   const inputs = checkedEntries(await readJsonObject(c));
@@ -51,6 +73,13 @@ async function createVars(c: Context, config: VarRouteConfig, family: ScopeFamil
     inputs,
     config.clock.now().toISOString(),
     plainCipher,
+  );
+  await recordKeys(
+    c,
+    config,
+    family,
+    'create',
+    created.map((one) => one.key),
   );
   return jsonResponse(created.map(asVariable), 201);
 }
@@ -67,12 +96,14 @@ async function replaceVar(c: Context, config: VarRouteConfig, family: ScopeFamil
     config.clock.now().toISOString(),
     plainCipher,
   );
+  await recordKeys(c, config, family, 'update', [replaced.key]);
   return jsonResponse(asVariable(replaced));
 }
 
 async function removeVar(c: Context, config: VarRouteConfig, family: ScopeFamily) {
   const scope = await entryScope(c, config.store, family, WRITING);
   await deleteEntry(config.store, scope, 'variable', c.req.param('key') ?? '');
+  await recordKeys(c, config, family, 'delete', [c.req.param('key') ?? '']);
   return emptyResponse(204);
 }
 

@@ -1,3 +1,4 @@
+import { type EventRecorder, actorIn, record } from '../audit/recorder.js';
 import type { Context } from 'hono';
 import { HttpError } from '../http/errors.js';
 import type { LogSink, RouteDefinition } from '../http/router.js';
@@ -47,6 +48,8 @@ export interface PatchRouteConfig {
   jobs?: JobQueue;
   fetch?: typeof fetch;
   log?: LogSink;
+  /** Where this group writes down what it did. */
+  events?: EventRecorder;
 }
 
 interface AddRequest extends NewPatch {
@@ -207,6 +210,23 @@ async function addPatches(c: Context, config: PatchRouteConfig): Promise<Respons
     added.push(await insertPatch(config.store, workspace.slug, element, at, newIdentifier()));
   }
 
+  // One event for a single add alone: the reference records neither a
+  // batch nor an add that found the patch already there.
+  if (!batch) {
+    const one = added[0] as PatchRecord;
+    await record(config.events, {
+      type: 'hub.patch.create',
+      workspace: workspace.slug,
+      resourceId: one.id,
+      actor: actorIn(c),
+      metadata: {
+        branch_name: one.branch_name,
+        position: one.position,
+        branch_resolution: resolutions[0] ?? 'skipped',
+      },
+    });
+  }
+
   const body = batch
     ? added.map((patch) => serialisePatch(patch))
     : serialisePatch(added[0] as PatchRecord, {});
@@ -351,6 +371,14 @@ async function removePatch(c: Context, config: PatchRouteConfig): Promise<Respon
   );
   await closePositions(config.store, workspace.slug, at);
 
+  await record(config.events, {
+    type: 'hub.patch.delete',
+    workspace: workspace.slug,
+    resourceId: patch.id,
+    actor: actorIn(c),
+    metadata: { branch_name: patch.branch_name },
+  });
+
   if (config.repos !== undefined) {
     try {
       await config.repos.updateRefs(repositoryOf(workspace), [
@@ -381,6 +409,14 @@ async function restorePatch(c: Context, config: PatchRouteConfig): Promise<Respo
     ['active', live.length + 1, at, patch.id],
   );
   await closePositions(config.store, workspace.slug, at);
+
+  await record(config.events, {
+    type: 'hub.patch.delete',
+    workspace: workspace.slug,
+    resourceId: patch.id,
+    actor: actorIn(c),
+    metadata: { branch_name: patch.branch_name },
+  });
 
   const restored = await patchById(config.store, workspace.slug, patch.id);
   return jsonResponse(serialisePatch(restored as PatchRecord));
@@ -459,7 +495,38 @@ async function resetPatch(c: Context, config: PatchRouteConfig): Promise<Respons
     ),
   );
 
-  const after = await patchById(config.store, workspace.slug, (patch as PatchRecord).id);
+  const reset = patch as PatchRecord;
+  await record(config.events, {
+    type: 'hub.patch.reset',
+    workspace: workspace.slug,
+    resourceId: reset.branch_name,
+    actor: actorIn(c),
+    metadata: {
+      branch_name: reset.branch_name,
+      action: outcome.action,
+      local_sha: outcome.local_sha,
+      origin_sha: outcome.origin_sha,
+      replaced_sha: outcome.replaced_sha,
+    },
+  });
+  // A reset that dropped a tip is also a replacement, and says which
+  // of the two causes it was.
+  if (outcome.action === 'replaced') {
+    await record(config.events, {
+      type: 'hub.patch.replace',
+      workspace: workspace.slug,
+      resourceId: reset.branch_name,
+      actor: actorIn(c),
+      metadata: {
+        branch_name: reset.branch_name,
+        replaced_sha: outcome.replaced_sha,
+        origin_sha: outcome.origin_sha,
+        trigger: 'reset_to_origin',
+      },
+    });
+  }
+
+  const after = await patchById(config.store, workspace.slug, reset.id);
   if (after === undefined) {
     throw new HttpError(500, 'failed to fetch updated patch');
   }

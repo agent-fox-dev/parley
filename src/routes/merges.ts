@@ -1,3 +1,4 @@
+import { type EventRecorder, actorIn, record } from '../audit/recorder.js';
 import type { Context } from 'hono';
 import { HttpError } from '../http/errors.js';
 import type { RouteDefinition } from '../http/router.js';
@@ -36,6 +37,8 @@ export interface MergeRouteConfig {
   locks: Locks;
   repos?: RepositoryStore;
   jobs?: JobQueue;
+  /** Where this group writes down what it did. */
+  events?: EventRecorder;
 }
 
 /** Both names a submit must carry, checked for syntax alone. */
@@ -111,6 +114,18 @@ async function submit(c: Context, config: MergeRouteConfig): Promise<Response> {
   if (config.jobs !== undefined) {
     await queueMerge(config.jobs, id);
   }
+
+  await record(config.events, {
+    type: 'hub.merge.enqueue',
+    workspace: workspace.slug,
+    resourceId: id,
+    actor: actorIn(c),
+    metadata: {
+      target_branch: asked.target_branch,
+      source_ref: asked.source_ref,
+      job_id: id,
+    },
+  });
 
   return jsonResponse(serialiseMerge((await mergeById(config.store, id)) as MergeRecord), 202);
 }

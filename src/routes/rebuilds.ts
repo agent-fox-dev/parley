@@ -1,3 +1,4 @@
+import { type EventRecorder, actorIn, record as auditEvent } from '../audit/recorder.js';
 import type { Context } from 'hono';
 import { HttpError } from '../http/errors.js';
 import type { LogSink, RouteDefinition } from '../http/router.js';
@@ -40,6 +41,8 @@ export interface RebuildRouteConfig {
   repos?: RepositoryStore;
   jobs?: JobQueue;
   log?: LogSink;
+  /** Where this group writes down what it did. */
+  events?: EventRecorder;
 }
 
 /** The job as a client reads it. */
@@ -132,6 +135,14 @@ async function submit(c: Context, config: RebuildRouteConfig): Promise<Response>
   if (config.jobs !== undefined) {
     await queueRebuild(config.jobs, id);
   }
+
+  await auditEvent(config.events, {
+    type: 'hub.rebuild.enqueue',
+    workspace: workspace.slug,
+    resourceId: id,
+    actor: actorIn(c),
+    metadata: { job_id: id, patch_count: patches.length },
+  });
 
   return jsonResponse(
     {

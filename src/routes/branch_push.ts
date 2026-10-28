@@ -1,3 +1,4 @@
+import { type EventRecorder, actorIn, record } from '../audit/recorder.js';
 import type { Context } from 'hono';
 import { HttpError } from '../http/errors.js';
 import type { LogSink, RouteDefinition } from '../http/router.js';
@@ -18,7 +19,7 @@ import {
   readinessRefusal,
   unpushableRefusal,
 } from '../push/checks.js';
-import { pushBranch } from '../push/branch_push.js';
+import { pushBranch, withoutUserinfo } from '../push/branch_push.js';
 
 /**
  * Pushing one branch of the hub's copy to origin.
@@ -37,6 +38,8 @@ export interface BranchPushRouteConfig {
   repos?: RepositoryStore;
   fetch?: typeof fetch;
   log?: LogSink;
+  /** Where this group writes down what it did. */
+  events?: EventRecorder;
 }
 
 /**
@@ -127,8 +130,53 @@ async function push(c: Context, config: BranchPushRouteConfig): Promise<Response
       workspace,
       { name, force: body.force },
     );
-    keepRunning(c, work);
-    return jsonResponse(await work);
+    // Recorded for the attempt, not for the answer: a push that the
+    // fork refused is as much a push attempt as one it took. A
+    // refusal decided above records nothing, because it never
+    // reached the fork, and nor does a failure nobody expected.
+    const written = work.then(
+      async (outcome) => {
+        await record(config.events, {
+          type: 'hub.branch.push',
+          workspace: workspace.slug,
+          resourceId: outcome.branch,
+          actor: actorIn(c),
+          metadata: {
+            branch: outcome.branch,
+            sha: outcome.sha,
+            force: body.force,
+            ok: true,
+            remote: outcome.remote,
+            remote_url: outcome.remote_url,
+            result: outcome.result,
+          },
+        });
+        return outcome;
+      },
+      async (err: unknown) => {
+        if (err instanceof HttpError && err.status !== 500) {
+          await record(config.events, {
+            type: 'hub.branch.push',
+            workspace: workspace.slug,
+            resourceId: name,
+            actor: actorIn(c),
+            severity: 'warning',
+            metadata: {
+              branch: name,
+              sha: head ?? '',
+              force: body.force,
+              ok: false,
+              remote: 'origin',
+              remote_url: withoutUserinfo(workspace.git_url),
+              error_type: err.errorType,
+            },
+          });
+        }
+        throw err;
+      },
+    );
+    keepRunning(c, written);
+    return jsonResponse(await written);
   });
 }
 

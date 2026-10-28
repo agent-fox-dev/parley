@@ -322,6 +322,146 @@ export const MIGRATIONS: readonly Migration[] = [
       'CREATE INDEX usage_by_session ON session_usage (session_id, recorded_at)',
     ],
   },
+  {
+    // What the service itself did. The columns are the fields the
+    // reference's event envelope names, so a query answers from the
+    // row rather than from the metadata it happens to carry.
+    name: '014_audit',
+    statements: [
+      `CREATE TABLE hub_events (
+         id TEXT PRIMARY KEY,
+         event_type TEXT NOT NULL,
+         timestamp TEXT NOT NULL,
+         severity TEXT NOT NULL DEFAULT 'info',
+         workspace TEXT,
+         actor_id TEXT NOT NULL DEFAULT '',
+         actor_type TEXT NOT NULL DEFAULT '',
+         resource_type TEXT NOT NULL DEFAULT '',
+         resource_id TEXT NOT NULL DEFAULT '',
+         action TEXT NOT NULL DEFAULT '',
+         metadata TEXT NOT NULL DEFAULT '{}'
+       )`,
+      'CREATE INDEX hub_events_by_time ON hub_events (timestamp, id)',
+      'CREATE INDEX hub_events_by_workspace ON hub_events (workspace, timestamp)',
+      'CREATE INDEX hub_events_by_type ON hub_events (event_type, timestamp)',
+      // One row per bound token, holding the window its last refusal
+      // event opened and how many refusals that event now covers.
+      `CREATE TABLE bound_token_refusals (
+         token_id TEXT PRIMARY KEY,
+         event_id TEXT NOT NULL,
+         window_started_at TEXT NOT NULL,
+         suppressed INTEGER NOT NULL DEFAULT 0
+       )`,
+    ],
+  },
+  {
+    // What an agent reports about one run. Five tables rather than one
+    // with a kind column: the fields differ, the reads differ, and a
+    // run's traces are read far more often than anything else here.
+    name: '015_run_records',
+    statements: [
+      `CREATE TABLE run_events (
+         id TEXT PRIMARY KEY,
+         workspace_slug TEXT NOT NULL,
+         run_id TEXT NOT NULL,
+         node_id TEXT,
+         session_id TEXT,
+         timestamp TEXT NOT NULL,
+         created_at TEXT NOT NULL,
+         event_type TEXT NOT NULL,
+         severity TEXT NOT NULL DEFAULT 'info',
+         payload TEXT
+       )`,
+      'CREATE INDEX run_events_by_run ON run_events (workspace_slug, run_id, timestamp)',
+      `CREATE TABLE run_session_outcomes (
+         id TEXT PRIMARY KEY,
+         workspace_slug TEXT NOT NULL,
+         run_id TEXT NOT NULL,
+         node_id TEXT,
+         session_id TEXT,
+         timestamp TEXT NOT NULL,
+         created_at TEXT NOT NULL,
+         status TEXT NOT NULL,
+         duration_ms INTEGER,
+         token_usage TEXT
+       )`,
+      'CREATE INDEX run_outcomes_by_run ON run_session_outcomes (workspace_slug, run_id, timestamp)',
+      `CREATE TABLE run_tool_calls (
+         id TEXT PRIMARY KEY,
+         workspace_slug TEXT NOT NULL,
+         run_id TEXT NOT NULL,
+         node_id TEXT,
+         session_id TEXT,
+         called_at TEXT NOT NULL,
+         created_at TEXT NOT NULL,
+         tool_name TEXT NOT NULL,
+         duration_ms INTEGER,
+         input TEXT,
+         output TEXT
+       )`,
+      'CREATE INDEX run_calls_by_run ON run_tool_calls (workspace_slug, run_id, called_at)',
+      `CREATE TABLE run_tool_errors (
+         id TEXT PRIMARY KEY,
+         workspace_slug TEXT NOT NULL,
+         run_id TEXT NOT NULL,
+         node_id TEXT,
+         session_id TEXT,
+         failed_at TEXT NOT NULL,
+         created_at TEXT NOT NULL,
+         tool_name TEXT NOT NULL,
+         error_code TEXT,
+         error_msg TEXT NOT NULL
+       )`,
+      'CREATE INDEX run_errors_by_run ON run_tool_errors (workspace_slug, run_id, failed_at)',
+      `CREATE TABLE run_traces (
+         id TEXT PRIMARY KEY,
+         workspace_slug TEXT NOT NULL,
+         run_id TEXT NOT NULL,
+         node_id TEXT,
+         session_id TEXT,
+         timestamp TEXT NOT NULL,
+         created_at TEXT NOT NULL,
+         event_type TEXT NOT NULL,
+         sequence INTEGER,
+         data TEXT
+       )`,
+      'CREATE INDEX run_traces_by_node ON run_traces (workspace_slug, run_id, node_id, timestamp)',
+      // A run has at most one, which the primary key is what enforces.
+      `CREATE TABLE run_postmortems (
+         run_id TEXT NOT NULL,
+         workspace_slug TEXT NOT NULL,
+         schema_version INTEGER NOT NULL DEFAULT 1,
+         run_status TEXT NOT NULL,
+         started_at TEXT NOT NULL,
+         completed_at TEXT NOT NULL,
+         task_summary TEXT NOT NULL,
+         cost_summary TEXT NOT NULL,
+         blocked_tasks TEXT NOT NULL DEFAULT '[]',
+         session_history TEXT NOT NULL DEFAULT '[]',
+         ingested_at TEXT NOT NULL,
+         PRIMARY KEY (workspace_slug, run_id)
+       )`,
+    ],
+  },
+  {
+    // How a recorded event reaches the streams watching for it. A row
+    // is a delivery rather than a record: the log is hub_events and
+    // run_events, and these are swept once no stream could want them.
+    name: '016_event_bus',
+    statements: [
+      `CREATE TABLE event_bus (
+         id TEXT PRIMARY KEY,
+         event_id TEXT NOT NULL,
+         event_type TEXT NOT NULL,
+         source TEXT NOT NULL,
+         timestamp TEXT NOT NULL,
+         workspace TEXT,
+         severity TEXT NOT NULL DEFAULT 'info',
+         published_at TEXT NOT NULL
+       )`,
+      'CREATE INDEX event_bus_by_published ON event_bus (published_at, id)',
+    ],
+  },
 ];
 
 /**

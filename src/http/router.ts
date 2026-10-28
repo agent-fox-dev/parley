@@ -1,3 +1,4 @@
+import type { EventRecorder } from '../audit/recorder.js';
 import { Hono } from 'hono';
 import type { Context } from 'hono';
 import { type AuthOptions, authentication, scopeRefusal } from '../auth/middleware.js';
@@ -48,6 +49,8 @@ export interface AppOptions {
   maxBodyBytes?: number;
   /** The store the readiness probe queries. */
   store?: RelationalStore;
+  /** Where a refusal the middleware makes is written down. */
+  events?: EventRecorder;
   /** Where measurements are recorded. Defaults to an in-memory sink. */
   metrics?: MetricsSink;
   /** Read to time a request. Defaults to the host's own clock. */
@@ -144,7 +147,13 @@ export function buildApp(options: AppOptions = {}): Hono {
     app.use('*', authentication({ ...options.auth, log }));
     // Straight after the credential is known, so a bound token is confined
     // before any scope, existence or status check runs.
-    app.use('*', confinement(options.auth.mountPoint));
+    app.use(
+      '*',
+      confinement(
+        options.auth.mountPoint,
+        options.events === undefined ? {} : { events: options.events },
+      ),
+    );
   }
 
   for (const route of routes) {

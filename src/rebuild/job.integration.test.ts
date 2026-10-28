@@ -1,3 +1,5 @@
+import { eventRecorder } from '../audit/recorder.js';
+import { recordedEvents } from '../testutil/app.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -129,6 +131,7 @@ async function world(
     clock,
     secrets,
     fetch: remote.fetch,
+    events: eventRecorder({ store: seeded.store, clock }),
   };
   return {
     store: seeded.store,
@@ -186,6 +189,10 @@ describe('a rebuild of a patch stack', () => {
     expect(job.results.map((one) => one.branch_name)).toEqual(['patch-one', 'patch-two']);
     expect(job.results.every((one) => one.outcome === 'applied')).toBe(true);
     expect(await branchAt(place, 'integration')).toBe(job.new_integration_head);
+
+    const [recorded] = await recordedEvents(place.store, 'hub.rebuild.complete');
+    expect(recorded?.actor_type).toBe('system');
+    expect(recorded?.metadata).toEqual({ patches_applied: 2 });
   });
 
   it('skips the patches it must, each with its reason', async () => {
@@ -277,7 +284,7 @@ async function conflicting(mode: 'fail_fast' | 'continue') {
 
 describe('a patch that will not apply', () => {
   it('ends the job under fail_fast, naming the patch and its files', async () => {
-    const { job } = await conflicting('fail_fast');
+    const { place, job } = await conflicting('fail_fast');
 
     expect(job.status).toBe('failed');
     const conflicted = job.results.find((one) => one.outcome === 'conflict');
@@ -285,6 +292,9 @@ describe('a patch that will not apply', () => {
     expect(conflicted?.conflict_files).toEqual(['base.txt']);
     // Nothing after it was attempted.
     expect(job.results.map((one) => one.branch_name)).toEqual(['first', 'second']);
+
+    const [recorded] = await recordedEvents(place.store, 'hub.rebuild.fail');
+    expect(Object.keys(recorded?.metadata ?? {})).toEqual(['reason']);
   });
 
   it('marks the patch and carries on under continue', async () => {
@@ -426,6 +436,12 @@ describe('what else may happen while a rebuild runs', () => {
     expect(queued).toHaveLength(1);
     expect(queued[0]?.submitted_by).toBe('system:stale-snapshot');
     expect(queued[0]?.follow_up_of).toBe(job.id);
+
+    const [recorded] = await recordedEvents(place.store, 'hub.rebuild.followup');
+    expect(recorded?.metadata).toEqual({
+      submitted_by: 'system:stale-snapshot',
+      workspace: place.slug,
+    });
   });
 });
 
@@ -447,6 +463,11 @@ describe('the rebuilt branch and the fork', () => {
     expect(job.error).toBeNull();
     expect(job.status).toBe('completed');
     expect(job.integration_branch_pushed).toBe(expected);
+
+    // A fork that refused it is reported, because the job's own status
+    // says nothing about a push that is best effort.
+    const failed = await recordedEvents(place.store, 'hub.rebuild.push_failed');
+    expect(failed).toHaveLength(expected ? 0 : 1);
   });
 
   it('pushes nothing where the setting is off', async () => {

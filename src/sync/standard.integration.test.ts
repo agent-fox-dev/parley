@@ -6,7 +6,7 @@ import { localRepositoryStore } from '../platform/local/repostore.js';
 import type { RepositoryStore } from '../platform/repostore.js';
 import { workspaceScope } from '../platform/secrets.js';
 import { repositoryOf } from '../repo/repository.js';
-import { type Service, identityService } from '../testutil/app.js';
+import { type Service, identityService, recordedEvents } from '../testutil/app.js';
 import { type FakeRemote, fakeRemote } from '../testutil/fakeremote.js';
 import { buildCommit } from '../testutil/history.js';
 import { seedApiKey, seedOrg, seedUser, seedWorkspace } from '../testutil/identity.js';
@@ -188,6 +188,14 @@ describe('a sync of a standard workspace', () => {
     expect(after['sync_error']).toBeNull();
     // The repository moved, not only the record.
     expect(await branchHere(place)).toBe(head);
+    // And the hub wrote down what it did, with the result it reached.
+    expect(await recordedEvents(place.service.store, 'hub.workspace.sync')).toEqual([
+      expect.objectContaining({
+        action: 'sync',
+        workspace: place.slug,
+        metadata: { result: 'fast_forward' },
+      }),
+    ]);
   });
 
   it('refuses a diverged origin and says how to recover', async () => {
@@ -199,6 +207,8 @@ describe('a sync of a standard workspace', () => {
     const after = await read(place);
 
     expect(response.status).toBe(409);
+    // A sync that was refused did nothing, so it recorded nothing.
+    expect(await recordedEvents(place.service.store, 'hub.workspace.sync')).toEqual([]);
     expect(String(after['sync_error'])).toContain('reset_to_upstream');
     expect(after['head_sha']).toBe(before['head_sha']);
     expect(await branchHere(place)).toBe(place.local);

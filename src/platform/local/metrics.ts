@@ -1,4 +1,10 @@
-import type { CounterHandle, HistogramHandle, MetricSeries, MetricsSink } from '../metrics.js';
+import type {
+  CounterHandle,
+  GaugeHandle,
+  HistogramHandle,
+  MetricSeries,
+  MetricsSink,
+} from '../metrics.js';
 
 interface Cell {
   name: string;
@@ -36,6 +42,13 @@ export function inMemoryMetrics(): MetricsSink {
       return {
         increment(labels) {
           cell(name, labels).value += 1;
+        },
+      };
+    },
+    gauge(name: string): GaugeHandle {
+      return {
+        set(labels, value) {
+          cell(name, labels).value = value;
         },
       };
     },

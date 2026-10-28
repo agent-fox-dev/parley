@@ -1,3 +1,5 @@
+import { eventRecorder } from '../../audit/recorder.js';
+import { storeBus } from '../../platform/store_bus.js';
 import { DEFAULT_MOUNT_POINT } from '../../config.js';
 import { buildApp } from '../../http/router.js';
 import { envConfig } from '../../platform/cloudflare/config.js';
@@ -48,6 +50,14 @@ export default {
       const platform = cloudflarePlatform(env);
       const mountPoint = platform.config.get('PARLEY_MOUNT_POINT');
       const adminToken = platform.config.get('PARLEY_ADMIN_TOKEN');
+      const bus = storeBus(platform.store, platform.clock);
+      const events = eventRecorder({
+        store: platform.store,
+        clock: platform.clock,
+        metrics: platform.metrics,
+        bus,
+      });
+      const streamLimit = Number(platform.config.get('AF_SSE_MAX_CONNECTIONS') ?? '');
       app = buildApp({
         store: platform.store,
         clock: platform.clock,
@@ -69,7 +79,11 @@ export default {
           ...(env.ARTIFACTS === undefined
             ? {}
             : { repos: artifactsRepositoryStore(env.ARTIFACTS as ArtifactsBinding) }),
+          events,
+          bus,
+          ...(Number.isInteger(streamLimit) && streamLimit > 0 ? { streamLimit } : {}),
         }),
+        events,
         auth: {
           store: platform.store,
           clock: platform.clock,
@@ -108,6 +122,12 @@ export default {
         jobs: storeJobs(platform.store, platform.clock),
         clock: platform.clock,
         locks: platform.locks,
+        events: eventRecorder({
+          store: platform.store,
+          clock: platform.clock,
+          metrics: platform.metrics,
+          bus: storeBus(platform.store, platform.clock),
+        }),
       });
     }
   },

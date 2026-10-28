@@ -1,3 +1,4 @@
+import { type EventRecorder, record as auditEvent } from '../audit/recorder.js';
 import type { LogSink } from '../http/router.js';
 import type { Clock, Locks, RelationalStore } from '../platform/index.js';
 import type { RepositoryStore } from '../platform/repostore.js';
@@ -43,6 +44,29 @@ export interface RebuildDeps {
   secrets?: SecretStore;
   fetch?: typeof fetch;
   log?: LogSink;
+  /** Where the job writes down how it went. */
+  events?: EventRecorder;
+}
+
+/** What the job writes down about itself, under the system's name. */
+async function recordRebuild(
+  deps: RebuildDeps,
+  slug: string,
+  id: string,
+  event: { type: string; metadata: Record<string, unknown>; severity?: 'error' },
+): Promise<void> {
+  await auditEvent(
+    deps.events,
+    {
+      type: event.type,
+      workspace: slug,
+      resourceId: id,
+      actor: { id: '', type: 'system' },
+      ...(event.severity === undefined ? {} : { severity: event.severity }),
+      metadata: event.metadata,
+    },
+    deps.log,
+  );
 }
 
 /** Where a rebuild keeps the head it is building, so it stays reachable. */
@@ -110,6 +134,11 @@ export async function runRebuild(deps: RebuildDeps, id: string): Promise<Rebuild
       status: 'failed',
       error: 'the workspace was deleted while its rebuild was queued',
       finished_at: deps.clock.now().toISOString(),
+    });
+    await recordRebuild(deps, job.workspace_slug, id, {
+      type: 'hub.rebuild.fail',
+      severity: 'error',
+      metadata: { reason: 'the workspace was deleted while its rebuild was queued' },
     });
     return (await rebuildById(deps.store, id)) as RebuildRecord;
   }
@@ -242,6 +271,11 @@ export async function runRebuild(deps: RebuildDeps, id: string): Promise<Rebuild
       results,
       finished_at: deps.clock.now().toISOString(),
     });
+    await recordRebuild(deps, workspace.slug, id, {
+      type: 'hub.rebuild.fail',
+      severity: 'error',
+      metadata: { reason: failed },
+    });
     return (await rebuildById(deps.store, id)) as RebuildRecord;
   }
 
@@ -274,6 +308,22 @@ export async function runRebuild(deps: RebuildDeps, id: string): Promise<Rebuild
     integration_branch_pushed: pushed,
     finished_at: deps.clock.now().toISOString(),
   });
+  await recordRebuild(deps, workspace.slug, id, {
+    type: 'hub.rebuild.complete',
+    metadata: { patches_applied: results.filter((one) => one.outcome === 'applied').length },
+  });
+  // The push to the fork is best effort, so its failure is reported
+  // here rather than in the job's own status.
+  if (settings['rebuild_push_integration_branch'] === true && !pushed) {
+    await recordRebuild(deps, workspace.slug, id, {
+      type: 'hub.rebuild.push_failed',
+      severity: 'error',
+      metadata: {
+        integration_branch: integration,
+        reason: 'the fork did not take the rebuilt integration branch',
+      },
+    });
+  }
 
   await queueFollowUp(deps, workspace, started.tips, id);
   return (await rebuildById(deps.store, id)) as RebuildRecord;
@@ -349,10 +399,11 @@ async function queueFollowUp(
   }
 
   const settings = effectiveSettings(workspace.settings);
+  const followUp = newIdentifier();
   await insertRebuild(
     deps.store,
     {
-      id: newIdentifier(),
+      id: followUp,
       workspace_slug: workspace.slug,
       strategy: (settings['rebuild_strategy'] as 'rebase' | 'merge') ?? 'rebase',
       fail_mode: (settings['rebuild_fail_mode'] as 'fail_fast' | 'continue') ?? 'fail_fast',
@@ -361,4 +412,8 @@ async function queueFollowUp(
     },
     deps.clock.now().toISOString(),
   );
+  await recordRebuild(deps, workspace.slug, followUp, {
+    type: 'hub.rebuild.followup',
+    metadata: { submitted_by: STALE_SNAPSHOT, workspace: workspace.slug },
+  });
 }

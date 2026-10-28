@@ -1,4 +1,5 @@
 import type { Context, MiddlewareHandler } from 'hono';
+import { type EventRecorder, recordRefusal } from '../audit/recorder.js';
 import { HttpError, errorResponse } from '../http/errors.js';
 import { identityOf } from './middleware.js';
 
@@ -59,18 +60,36 @@ export function confinementRefusal(
   return new HttpError(403, `this token is bound to workspace ${boundTo}`, BOUND);
 }
 
+/** The workspace a path names, for the refusal's record of what was asked. */
+function workspaceIn(path: string, mountPoint: string): string | undefined {
+  const prefix = `${mountPoint}/workspaces/`;
+  return path.startsWith(prefix)
+    ? (path.slice(prefix.length).split('/')[0] ?? undefined)
+    : undefined;
+}
+
 /** Confines a bound token to its workspace, ahead of every other check. */
-export function confinement(mountPoint: string): MiddlewareHandler {
+export function confinement(
+  mountPoint: string,
+  deps: { events?: EventRecorder } = {},
+): MiddlewareHandler {
   return async (c, next) => {
-    const boundTo = identityOf(c)?.boundTo;
+    const identity = identityOf(c);
+    const boundTo = identity?.boundTo;
     if (boundTo !== undefined) {
-      const refusal = confinementRefusal(
-        new URL(c.req.url).pathname,
-        mountPoint,
-        c.req.method,
-        boundTo,
-      );
+      const path = new URL(c.req.url).pathname;
+      const refusal = confinementRefusal(path, mountPoint, c.req.method, boundTo);
       if (refusal !== undefined) {
+        const asked = workspaceIn(path, mountPoint);
+        await recordRefusal(deps.events, {
+          tokenId: identity?.credentialId ?? '',
+          boundWorkspace: boundTo,
+          ...(asked === undefined ? {} : { requestedWorkspace: asked }),
+          method: c.req.method,
+          route: path,
+          status: refusal.status,
+          surface: 'api',
+        });
         return errorResponse(refusal);
       }
     }

@@ -43,6 +43,10 @@ export interface ResetOutcome {
   action: ResetAction;
   /** The tip the hub kept, where the move discarded one. */
   replaced_sha?: string;
+  /** What the branch held here, absent where there was no local branch. */
+  local_sha?: string;
+  /** What the fork holds, which is what the branch was set to. */
+  origin_sha?: string;
   rebuild_triggered: boolean;
   rebuild_job_id?: string;
 }
@@ -169,6 +173,8 @@ export async function resetToOrigin(
   const settled = {
     action,
     ...(replaced === undefined ? {} : { replaced_sha: replaced }),
+    ...(here === undefined ? {} : { local_sha: here }),
+    origin_sha: theirs,
   };
   if (!moved || !worthRebuilding || settings['auto_rebuild_after_sync'] !== true) {
     return { ...settled, rebuild_triggered: false };

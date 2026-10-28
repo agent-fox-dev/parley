@@ -7,7 +7,7 @@ import { workspaceScope } from '../platform/secrets.js';
 
 import { repositoryOf } from '../repo/repository.js';
 import { findWorkspace } from '../store/workspaces.js';
-import { identityService } from '../testutil/app.js';
+import { identityService, recordedEvents } from '../testutil/app.js';
 import { fakeRemote } from '../testutil/fakeremote.js';
 import { buildCommit } from '../testutil/history.js';
 import { seedApiKey, seedOrg, seedPatch, seedUser, seedWorkspace } from '../testutil/identity.js';
@@ -103,5 +103,8 @@ describe('a push whose every ref was refused', () => {
     // And the refused ref is not there.
     const refs = await repos.listRefs(repository);
     expect(refs.some((ref) => ref.name === 'refs/heads/a-patch')).toBe(false);
+
+    // A push that moved nothing is not a push the reference records.
+    expect(await recordedEvents(service.store, 'hub.git.push')).toEqual([]);
   });
 });
