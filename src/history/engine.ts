@@ -2,6 +2,7 @@ import git from 'isomorphic-git';
 import type { RefChange, RepositoryStore } from '../platform/repostore.js';
 import { type FsLike, hydrate, storeBackedFs } from './adapter.js';
 import { applyRename, buildTree, flatten, renamesBetween } from './trees.js';
+import { ENGINE_LIMITS, type EngineLimits, withinLimits } from './limits.js';
 import type { ResolutionStore } from './resolutions.js';
 
 export interface Identity {
@@ -29,12 +30,42 @@ export const MERGE_RESULT_REF = 'refs/hub/engine/merge';
 /** Where the engine keeps the tip of its last rebase, for the same reason. */
 export const REBASE_RESULT_REF = 'refs/hub/engine/rebase';
 
+/**
+ * What one unit of platform work may spend on an operation. A Worker
+ * invocation is bounded, so an operation larger than one unit stops at
+ * the boundary and hands back the means to take it up again.
+ */
+export interface Budget {
+  /** The most patches one unit of work replays. */
+  patches?: number;
+  /** When this unit of work must be given up, in epoch milliseconds. */
+  deadline?: number;
+  now?: () => number;
+}
+
+/**
+ * An operation that ran out of its unit of work. It holds everything
+ * written so far, which reaches the store only when the operation
+ * finishes: a continuation nobody takes up leaves the repository as it
+ * was.
+ */
+export interface Continuation {
+  /** How many units of work have carried this operation so far. */
+  slices: number;
+  /** Carries it on in another unit. */
+  resume(): Promise<RebaseResult>;
+}
+
 export interface RebaseResult {
   /** The commits written, oldest first, when the rebase finished. */
   commits?: string[];
   /** Where it stopped, when a commit conflicted. */
   stoppedAt?: string;
   conflicts?: string[];
+  /** Set when the unit of work ran out before the rebase did. */
+  continuation?: Continuation;
+  /** How many units of work carried it. */
+  slices?: number;
 }
 
 export interface CommitResult {
@@ -52,25 +83,37 @@ export interface HistoryEngine {
     repository: string;
     ours: string;
     theirs: string;
+    /** The sizes this operation may work at; the engine's by default. */
+    limits?: Partial<EngineLimits>;
   }): Promise<MergeResult>;
   rebase(request: {
     repository: string;
     branch: string;
     onto: string;
     committer: Identity;
+    /** What one unit of platform work may spend; one unit by default. */
+    budget?: Budget;
+    /** The sizes this operation may work at; the engine's by default. */
+    limits?: Partial<EngineLimits>;
   }): Promise<RebaseResult>;
+  /** Takes up an operation that ran out of its unit of work. */
+  carryOn(continuation: Continuation): Promise<RebaseResult>;
   mergeCommit(request: {
     repository: string;
     ours: string;
     theirs: string;
     author: Identity;
     message?: string;
+    /** The sizes this operation may work at; the engine's by default. */
+    limits?: Partial<EngineLimits>;
   }): Promise<CommitResult>;
 }
 
 interface Session {
   fs: FsLike;
   gitdir: string;
+  /** What the repository's objects weighed, packed, when it was read. */
+  packedBytes: number;
   /** Hands everything written back to the store under these refs. */
   flush(changes: readonly RefChange[]): Promise<void>;
 }
@@ -98,7 +141,7 @@ async function open(repos: RepositoryStore, repository: string): Promise<Session
   // The objects come across as a pack rather than one at a time: a store
   // that cannot hand back an object's raw bytes can still serve a pack,
   // and a pack is what git itself reads (see ADR 8).
-  await hydrate(repos, repository, backed);
+  const packedBytes = await hydrate(repos, repository, backed);
 
   for (const ref of await repos.listRefs(repository)) {
     await git.writeRef({ fs: fs as never, gitdir, ref: ref.name, value: ref.oid, force: true });
@@ -107,6 +150,7 @@ async function open(repos: RepositoryStore, repository: string): Promise<Session
   return {
     fs,
     gitdir,
+    packedBytes,
     flush: async (changes: readonly RefChange[]) => {
       const oids = [...backed.written().keys()]
         .map((path) => /\/objects\/([0-9a-f]{2})\/([0-9a-f]{38})$/.exec(path))
@@ -170,6 +214,57 @@ async function mergeBaseOf(
       },
     });
   }
+  return base;
+}
+
+/**
+ * How large the change one commit made is: the paths whose content it
+ * added, removed or altered, and what those paths weigh on the new
+ * side. It is the measure the size limits are stated in, and it is
+ * taken before the patch is replayed rather than during it.
+ */
+async function patchSize(
+  options: { fs: never; gitdir: string },
+  base: string,
+  oid: string,
+): Promise<{ changedFiles: number; diffBytes: number }> {
+  const treeOf = async (commit: string) =>
+    flatten(options, (await git.readCommit({ ...options, oid: commit })).commit.tree);
+  const before = await treeOf(base);
+  const after = await treeOf(oid);
+
+  const changed = [...new Set([...before.keys(), ...after.keys()])].filter(
+    (path) => before.get(path)?.oid !== after.get(path)?.oid,
+  );
+
+  let diffBytes = 0;
+  for (const path of changed) {
+    const entry = after.get(path);
+    if (entry === undefined) {
+      continue;
+    }
+    const { blob } = await git.readBlob({ ...options, oid: entry.oid });
+    diffBytes += blob.byteLength;
+  }
+  return { changedFiles: changed.length, diffBytes };
+}
+
+/**
+ * The base of a merge, refused before any of it is done when the
+ * repository or either side is larger than an operation may work at. A
+ * merge is two patches over that base, so each side is measured as one.
+ */
+async function sizedMerge(
+  options: { fs: never; gitdir: string },
+  session: { packedBytes: number },
+  request: { ours: string; theirs: string; limits?: Partial<EngineLimits> },
+): Promise<string> {
+  const limits = { ...ENGINE_LIMITS, ...request.limits };
+  withinLimits({ repositoryBytes: session.packedBytes }, limits);
+
+  const base = await mergeBaseOf(options, request.ours, request.theirs);
+  withinLimits(await patchSize(options, base, request.ours), limits);
+  withinLimits(await patchSize(options, base, request.theirs), limits);
   return base;
 }
 
@@ -368,11 +463,12 @@ export function historyEngine(repos: RepositoryStore, deps: EngineDeps = {}): Hi
     async threeWayMerge(request): Promise<MergeResult> {
       const session = await open(repos, request.repository);
       const options = { fs: session.fs as never, gitdir: session.gitdir };
+      const base = await sizedMerge(options, session, request);
 
       const merged = await mergeOverBase(
         options,
         {
-          base: await mergeBaseOf(options, request.ours, request.theirs),
+          base,
           ours: request.ours,
           theirs: request.theirs,
         },
@@ -410,62 +506,106 @@ export function historyEngine(repos: RepositoryStore, deps: EngineDeps = {}): Hi
      * commit would have written is reachable.
      */
     async rebase(request): Promise<RebaseResult> {
+      const limits = { ...ENGINE_LIMITS, ...request.limits };
       const session = await open(repos, request.repository);
       const { fs, gitdir } = session;
       const options = { fs: fs as never, gitdir };
+      withinLimits({ repositoryBytes: session.packedBytes }, limits);
 
       const own = await commitsNotIn(options, request.branch, request.onto);
-      let parent = request.onto;
-      const written: string[] = [];
+      withinLimits({ patches: own.length }, limits);
 
-      for (const oid of own) {
-        const { commit } = await git.readCommit({ ...options, oid });
-        const base = commit.parent[0];
-        if (base === undefined) {
-          throw new Error('a rebase cannot replay a commit with no parent');
+      /**
+       * One unit of work: it replays patches until the budget is spent
+       * or there are none left. Nothing reaches the store until the
+       * last patch is in, so an operation abandoned between units
+       * leaves the repository exactly as it was.
+       */
+      const slice = async (
+        remaining: string[],
+        from: string,
+        written: string[],
+        slices: number,
+      ): Promise<RebaseResult> => {
+        const budget = request.budget ?? {};
+        const now = budget.now ?? Date.now;
+        let parent = from;
+        let spent = 0;
+
+        while (remaining.length > 0) {
+          if (
+            (budget.patches !== undefined && spent >= budget.patches) ||
+            (budget.deadline !== undefined && now() >= budget.deadline)
+          ) {
+            const left = [...remaining];
+            const soFar = [...written];
+            const at = parent;
+            return {
+              slices,
+              continuation: {
+                slices,
+                resume: () => slice(left, at, soFar, slices + 1),
+              },
+            };
+          }
+
+          const oid = remaining.shift() ?? '';
+          spent += 1;
+          const { commit } = await git.readCommit({ ...options, oid });
+          const base = commit.parent[0];
+          if (base === undefined) {
+            throw new Error('a rebase cannot replay a commit with no parent');
+          }
+          withinLimits(await patchSize(options, base, oid), limits);
+
+          // The change this commit made, replayed on what the rebase has
+          // built so far: its own parent is the base of the merge between
+          // it and the new parent.
+          const merged = await mergeOverBase(
+            options,
+            { base, ours: parent, theirs: oid },
+            replayFor(request.repository),
+          );
+          if (merged.conflicts !== undefined) {
+            return { conflicts: merged.conflicts, stoppedAt: oid, commits: written, slices };
+          }
+
+          // A replay that changes nothing is a commit git drops, because
+          // its content is already in the base. Keeping it would leave an
+          // empty commit the real rebase never makes.
+          const parentTree = (await git.readCommit({ ...options, oid: parent })).commit.tree;
+          if (merged.tree === parentTree) {
+            continue;
+          }
+
+          parent = await git.writeCommit({
+            ...options,
+            commit: {
+              tree: merged.tree ?? '',
+              parent: [parent],
+              // The author is the person who wrote the change; the
+              // committer is whoever moved it, which is this service.
+              author: commit.author,
+              committer: request.committer,
+              message: commit.message,
+            },
+          });
+          written.push(parent);
         }
 
-        // The change this commit made, replayed on what the rebase has
-        // built so far: its own parent is the base of the merge between
-        // it and the new parent.
-        const merged = await mergeOverBase(
-          options,
-          { base, ours: parent, theirs: oid },
-          replayFor(request.repository),
+        await session.flush(
+          written.length === 0
+            ? []
+            : [{ name: REBASE_RESULT_REF, oldOid: null, newOid: parent, force: true }],
         );
-        if (merged.conflicts !== undefined) {
-          return { conflicts: merged.conflicts, stoppedAt: oid, commits: written };
-        }
+        return { commits: written, slices };
+      };
 
-        // A replay that changes nothing is a commit git drops, because
-        // its content is already in the base. Keeping it would leave an
-        // empty commit the real rebase never makes.
-        const parentTree = (await git.readCommit({ ...options, oid: parent })).commit.tree;
-        if (merged.tree === parentTree) {
-          continue;
-        }
+      return slice([...own], request.onto, [], 1);
+    },
 
-        parent = await git.writeCommit({
-          ...options,
-          commit: {
-            tree: merged.tree ?? '',
-            parent: [parent],
-            // The author is the person who wrote the change; the
-            // committer is whoever moved it, which is this service.
-            author: commit.author,
-            committer: request.committer,
-            message: commit.message,
-          },
-        });
-        written.push(parent);
-      }
-
-      await session.flush(
-        written.length === 0
-          ? []
-          : [{ name: REBASE_RESULT_REF, oldOid: null, newOid: parent, force: true }],
-      );
-      return { commits: written };
+    carryOn(continuation): Promise<RebaseResult> {
+      return continuation.resume();
     },
 
     /**
@@ -477,11 +617,12 @@ export function historyEngine(repos: RepositoryStore, deps: EngineDeps = {}): Hi
       const session = await open(repos, request.repository);
       const { fs, gitdir } = session;
       const options = { fs: fs as never, gitdir };
+      const base = await sizedMerge(options, session, request);
 
       const merged = await mergeOverBase(
         options,
         {
-          base: await mergeBaseOf(options, request.ours, request.theirs),
+          base,
           ours: request.ours,
           theirs: request.theirs,
         },

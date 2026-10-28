@@ -82,6 +82,9 @@ export async function looseObject(type: string, data: Uint8Array): Promise<Uint8
  * Brings a repository's objects into a filesystem as one pack, which is
  * how git itself reads them. A store that cannot hand back an object's
  * raw bytes one at a time can still serve a pack.
+ *
+ * It answers how many bytes that pack held, which is what an operation
+ * measures a repository's size as.
  */
 export async function hydrate(
   repos: RepositoryStore,
@@ -105,7 +108,7 @@ export async function hydrate(
     gitdir: backed.gitdir,
     filepath,
   });
-  return refs.length;
+  return pack.byteLength;
 }
 
 export interface StoreBackedFs {

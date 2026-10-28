@@ -194,3 +194,119 @@ describe('the engine and the environment it runs in', () => {
     expect(after.tree).toBe(before.tree);
   });
 });
+
+/** A stack of patches on top of a base, each adding one file. */
+async function stack(repos: RepositoryStore, depth: number) {
+  await repos.create(REPO);
+  const root = await buildCommit(repos, REPO, { 'a.txt': 'root\n' }, [], 'root');
+  const onto = await buildCommit(
+    repos,
+    REPO,
+    { 'a.txt': 'root\n', 'base.txt': 'moved on\n' },
+    [root.oid],
+    'the base moved on',
+  );
+
+  let parent = root.oid;
+  const carried: Record<string, string> = { 'a.txt': 'root\n' };
+  for (let i = 0; i < depth; i += 1) {
+    carried[`patch-${String(i)}.txt`] = `patch ${String(i)}\n`;
+    const built = await buildCommit(repos, REPO, { ...carried }, [parent], `patch ${String(i)}`);
+    parent = built.oid;
+  }
+  return { onto: onto.oid, branch: parent };
+}
+
+const COMMITTER = {
+  name: 'Parley',
+  email: 'parley@parley.test',
+  timestamp: 1_700_000_100,
+  timezoneOffset: 0,
+};
+
+describe.each(candidates)('an operation larger than one unit of work, over $name', ({ make }) => {
+  it('is carried on until it finishes, with the result of one that fits', async () => {
+    const repos = make();
+    const { onto, branch } = await stack(repos, 9);
+    const engine = historyEngine(repos);
+    const request = { repository: REPO, branch, onto, committer: COMMITTER };
+
+    const whole = await engine.rebase(request);
+
+    // Three patches to a unit of work, so the same rebase has to be
+    // taken up again twice before it is finished.
+    let slice = await engine.rebase({ ...request, budget: { patches: 3 } });
+    let continuations = 0;
+    while (slice.continuation !== undefined) {
+      continuations += 1;
+      slice = await engine.carryOn(slice.continuation);
+    }
+
+    expect(continuations).toBeGreaterThanOrEqual(1);
+    expect(slice.conflicts).toBeUndefined();
+    expect(slice.commits).toEqual(whole.commits);
+    expect(await readSnapshot(repos, REPO, slice.commits?.at(-1) ?? '')).toEqual(
+      await readSnapshot(repos, REPO, whole.commits?.at(-1) ?? ''),
+    );
+  });
+
+  it('leaves every ref where it was when it is abandoned part way', async () => {
+    const repos = make();
+    const { onto, branch } = await stack(repos, 9);
+    const engine = historyEngine(repos);
+    const before = await repos.listRefs(REPO);
+
+    const started = await engine.rebase({
+      repository: REPO,
+      branch,
+      onto,
+      committer: COMMITTER,
+      budget: { patches: 2 },
+    });
+
+    expect(started.continuation).toBeDefined();
+    // Abandoned: nothing takes the continuation up, and the engine is
+    // let go of.
+    expect(await repos.listRefs(REPO)).toEqual(before);
+  });
+
+  it('leaves every ref where it was when it fails part way', async () => {
+    const repos = make();
+    const { onto, branch } = await stack(repos, 4);
+    const before = await repos.listRefs(REPO);
+    const failing: RepositoryStore = {
+      ...repos,
+      receivePack: () => Promise.reject(new Error('the store went away')),
+      updateRefs: () => Promise.reject(new Error('the store went away')),
+    };
+
+    await expect(
+      historyEngine(failing).rebase({
+        repository: REPO,
+        branch,
+        onto,
+        committer: COMMITTER,
+      }),
+    ).rejects.toThrow('the store went away');
+
+    expect(await repos.listRefs(REPO)).toEqual(before);
+  });
+
+  it('refuses a stack past the patch limit before it writes anything', async () => {
+    const repos = make();
+    const { onto, branch } = await stack(repos, 4);
+    const before = await repos.listRefs(REPO);
+
+    await expect(
+      historyEngine(repos).rebase({
+        repository: REPO,
+        branch,
+        onto,
+        committer: COMMITTER,
+        limits: { patches: 3 },
+      }),
+    ).rejects.toThrow(/patches/);
+
+    expect(await repos.listRefs(REPO)).toEqual(before);
+  });
+});
