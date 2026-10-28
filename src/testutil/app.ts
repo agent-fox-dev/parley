@@ -6,6 +6,7 @@ import { serviceRoutes } from '../routes/index.js';
 import { deploymentKey, openWith, sealWith, sealedSecrets } from '../secrets/store.js';
 import { storeLocks } from '../platform/store_lock.js';
 import type { SecretStore } from '../platform/secrets.js';
+import type { RepositoryStore } from '../platform/repostore.js';
 import { freshStore, seedClock } from './identity.js';
 import { providerIdentity, stubDirectory } from './oauth.js';
 
@@ -27,7 +28,10 @@ export interface Service {
  * real authentication, a provider that answers from a table. A suite that
  * tests one route still reaches it the way a client does.
  */
-export async function identityService(extra: RouteDefinition[] = []): Promise<Service> {
+export async function identityService(
+  extra: RouteDefinition[] = [],
+  options: { repos?: RepositoryStore } = {},
+): Promise<Service> {
   const seeded = await freshStore();
   const clock = seedClock();
   const key = await deploymentKey(SECRET_KEY);
@@ -46,6 +50,7 @@ export async function identityService(extra: RouteDefinition[] = []): Promise<Se
         secrets,
         secretCipher,
         externalUrl: EXTERNAL_URL,
+        ...(options.repos === undefined ? {} : { repos: options.repos }),
         locks: storeLocks(seeded.store, clock),
       }),
       ...extra,

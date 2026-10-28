@@ -51,10 +51,11 @@ empty and `POST /api/v1/auth/callback` refuses every provider name.
 The non-Cloudflare target reads the same settings from the process
 environment, and two of its own.
 
-| Variable         | Default     | Description                                                 |
-| ---------------- | ----------- | ----------------------------------------------------------- |
-| `PARLEY_PORT`    | `8787`      | The port the host process listens on.                       |
-| `PARLEY_DB_PATH` | `parley.db` | Where SQLite keeps the relational store on the host's disk. |
+| Variable           | Default        | Description                                                      |
+| ------------------ | -------------- | ---------------------------------------------------------------- |
+| `PARLEY_PORT`      | `8787`         | The port the host process listens on.                            |
+| `PARLEY_DB_PATH`   | `parley.db`    | Where SQLite keeps the relational store on the host's disk.      |
+| `PARLEY_REPO_PATH` | `repositories` | Where the second target keeps one bare repository per workspace. |
 
 Both targets apply the same schema migrations to their store before serving
 a request, so a deployment on Cloudflare and one on a host hold the same

@@ -6,6 +6,8 @@ import type { RouteDefinition } from '../http/router.js';
 import type { SecretStore } from '../platform/secrets.js';
 import { workspaceScope } from '../platform/secrets.js';
 import type { Clock, Locks, RelationalStore } from '../platform/index.js';
+import type { RepositoryStore } from '../platform/repostore.js';
+import { ensureRepository } from '../repo/repository.js';
 import { findOrg, findUser, isMember, orgsOfUser } from '../store/identity.js';
 import type { OrgRecord } from '../store/identity.js';
 import {
@@ -34,6 +36,8 @@ export interface WorkspaceRouteConfig {
   secrets?: SecretStore;
   externalUrl?: string;
   locks: Locks;
+  /** Absent where the deployment was given no repository store. */
+  repos?: RepositoryStore;
 }
 
 /**
@@ -121,6 +125,12 @@ async function createWorkspace(c: Context, config: WorkspaceRouteConfig): Promis
 
   for (const [name, value] of Object.entries(request.credentials)) {
     await config.secrets?.put(workspaceScope(workspace.slug), name, value);
+  }
+
+  // The repository exists from the moment the workspace does. Copying
+  // the remote into it is the next task's work and moves the status on.
+  if (config.repos !== undefined) {
+    await ensureRepository(config.repos, workspace);
   }
 
   return jsonResponse(

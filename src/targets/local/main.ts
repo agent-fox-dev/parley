@@ -9,6 +9,7 @@ import { maxBodyBytesFrom, type Platform } from '../../platform/index.js';
 import { configuredProviders } from '../../auth/oauth.js';
 import { serviceRoutes } from '../../routes/index.js';
 import { storeLocks } from '../../platform/store_lock.js';
+import { localRepositoryStore } from '../../platform/local/repostore.js';
 import { sweepBindings } from '../../store/bindings.js';
 import { migrate } from '../../store/migrations/index.js';
 
@@ -45,6 +46,7 @@ export function buildLocalApp(env: Record<string, string | undefined>) {
       metrics: platform.metrics,
       providers: configuredProviders(platform.config),
       locks: platform.locks,
+      repos: localRepositoryStore(platform.config.get('PARLEY_REPO_PATH') ?? 'repositories'),
     }),
     auth: {
       store: platform.store,

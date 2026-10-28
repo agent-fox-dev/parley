@@ -9,6 +9,10 @@ import { maxBodyBytesFrom, type Platform } from '../../platform/index.js';
 import { configuredProviders } from '../../auth/oauth.js';
 import { serviceRoutes } from '../../routes/index.js';
 import { storeLocks } from '../../platform/store_lock.js';
+import {
+  type ArtifactsBinding,
+  artifactsRepositoryStore,
+} from '../../platform/cloudflare/artifacts.js';
 import { sweepBindings } from '../../store/bindings.js';
 import { migrate } from '../../store/migrations/index.js';
 
@@ -18,6 +22,7 @@ export interface Env {
   PARLEY_COMMIT?: string;
   PARLEY_ADMIN_TOKEN?: string;
   DB?: D1Database;
+  ARTIFACTS?: unknown;
 }
 
 /** Assembles the platform a Worker is deployed with. */
@@ -55,6 +60,9 @@ export default {
           metrics: platform.metrics,
           providers: configuredProviders(platform.config),
           locks: platform.locks,
+          ...(env.ARTIFACTS === undefined
+            ? {}
+            : { repos: artifactsRepositoryStore(env.ARTIFACTS as ArtifactsBinding) }),
         }),
         auth: {
           store: platform.store,

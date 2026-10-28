@@ -2,6 +2,7 @@ import type { RouteDefinition } from '../http/router.js';
 import type { ProviderDirectory } from '../auth/oauth.js';
 import type { Clock, Locks, MetricsSink, RelationalStore } from '../platform/index.js';
 import type { SecretStore } from '../platform/secrets.js';
+import type { RepositoryStore } from '../platform/repostore.js';
 import type { Cipher } from '../entries/store.js';
 import { adminOrgRoutes } from './admin_orgs.js';
 import { adminUserRoutes } from './admin_users.js';
@@ -32,6 +33,8 @@ export interface ServiceRouteConfig {
   /** The deployment's own URL, for the clone URLs it advertises. */
   externalUrl?: string;
   locks: Locks;
+  /** Absent where the deployment was given no repository store. */
+  repos?: RepositoryStore;
 }
 
 /**
@@ -86,6 +89,7 @@ export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
       clock: config.clock,
       ...(config.secrets === undefined ? {} : { secrets: config.secrets }),
       ...(config.externalUrl === undefined ? {} : { externalUrl: config.externalUrl }),
+      ...(config.repos === undefined ? {} : { repos: config.repos }),
       locks: config.locks,
     }),
     ...adminUserRoutes({
