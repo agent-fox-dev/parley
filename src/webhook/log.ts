@@ -74,10 +74,21 @@ export async function recordDelivery(
         delivery.received_at,
       ],
     );
-  } catch {
-    // The primary key refused it, so another copy of this delivery
-    // got there first. That is the duplicate rule, not a failure.
-    return 'duplicate';
+  } catch (err) {
+    // A primary key that refused it is another copy of this
+    // delivery getting there first, which is the duplicate rule. A
+    // store that failed is not, and the caller must hear about it:
+    // answering 202 would lose a delivery for good.
+    const now = await store
+      .all<{ delivery_id: string }>(
+        'SELECT delivery_id FROM forge_deliveries WHERE workspace_slug = ? AND delivery_id = ?',
+        [delivery.workspace_slug, delivery.delivery_id],
+      )
+      .catch(() => []);
+    if (now.length > 0) {
+      return 'duplicate';
+    }
+    throw err;
   }
   return 'recorded';
 }

@@ -7,6 +7,7 @@ import { workspaceScope } from '../platform/secrets.js';
 import type { SecretStore } from '../platform/secrets.js';
 import type { EventRecorder } from '../audit/recorder.js';
 import { findWorkspace } from '../store/workspaces.js';
+import { claimDelivery } from '../webhook/dedupe.js';
 import { SECRET_NAME } from '../webhook/secret.js';
 import {
   type DeliveryIdentity,
@@ -117,7 +118,21 @@ export function ingressRoutes(config: IngressConfig): RouteDefinition[] {
       handler: async (c) => {
         try {
           const accepted = await acceptDelivery(c, config);
-          return jsonResponse({ outcome: 'ignored', delivery_id: accepted.identity.id }, 202);
+
+          // The row before anything else: it is the claim, and a
+          // copy that loses the race for it is the duplicate.
+          const claim = await claimDelivery(config.store, {
+            workspace_slug: accepted.workspace.slug,
+            delivery_id: accepted.identity.id,
+            forge: accepted.identity.forge,
+            event: accepted.identity.event,
+            received_at: config.clock.now().toISOString(),
+          });
+          if (claim === 'duplicate') {
+            return jsonResponse({ outcome: 'duplicate' }, 202);
+          }
+
+          return jsonResponse({ outcome: 'ignored' }, 202);
         } catch (err) {
           if (err instanceof HttpError) {
             return errorResponse(err);

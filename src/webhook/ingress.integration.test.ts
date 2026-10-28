@@ -151,3 +151,84 @@ describe('a signed delivery', () => {
     expect(response.status).toBe(404);
   });
 });
+
+/** The headers GitHub would send for this payload and this id. */
+const headersFor = async (id: string) => ({
+  'x-hub-signature-256': await signatureOf(SPACED),
+  'x-github-delivery': id,
+  'x-github-event': 'issues',
+});
+
+describe('a delivery that arrives more than once', () => {
+  it('is recorded once and answered as a duplicate thereafter', async () => {
+    const held = await world();
+
+    const first = await held.app.request('/hooks/forge/mine', {
+      method: 'POST',
+      headers: await headersFor('d-once'),
+      body: SPACED,
+    });
+    const again = await held.app.request('/hooks/forge/mine', {
+      method: 'POST',
+      headers: await headersFor('d-once'),
+      body: SPACED,
+    });
+
+    expect(first.status).toBe(202);
+    expect(again.status).toBe(202);
+    expect((await again.json()) as { outcome: string }).toEqual({ outcome: 'duplicate' });
+    expect(
+      await held.store.all('SELECT delivery_id FROM forge_deliveries WHERE delivery_id = ?', [
+        'd-once',
+      ]),
+    ).toHaveLength(1);
+  });
+
+  it('is processed once however many copies arrive together', async () => {
+    const held = await world();
+    const headers = await headersFor('d-together');
+
+    const answers = await Promise.all(
+      Array.from({ length: 5 }, async () =>
+        held.app.request('/hooks/forge/mine', { method: 'POST', headers, body: SPACED }),
+      ),
+    );
+    const outcomes = await Promise.all(
+      answers.map(async (one) => ((await one.json()) as { outcome: string }).outcome),
+    );
+
+    expect(outcomes.filter((outcome) => outcome === 'duplicate')).toHaveLength(4);
+    expect(
+      await held.store.all('SELECT delivery_id FROM forge_deliveries WHERE delivery_id = ?', [
+        'd-together',
+      ]),
+    ).toHaveLength(1);
+  });
+
+  it('is its own delivery for another workspace', async () => {
+    const held = await world();
+    await seedWorkspace(held.store, {
+      slug: 'theirs',
+      owner_id: 'u-1',
+      status: 'ready',
+      git_url: 'https://github.com/acme/other.git',
+    });
+    await held.secrets.put(workspaceScope('theirs'), 'FORGE_WEBHOOK_SECRET', SECRET);
+    const headers = await headersFor('d-shared');
+
+    const mine = await held.app.request('/hooks/forge/mine', {
+      method: 'POST',
+      headers,
+      body: SPACED,
+    });
+    const theirs = await held.app.request('/hooks/forge/theirs', {
+      method: 'POST',
+      headers,
+      body: SPACED,
+    });
+
+    for (const response of [mine, theirs]) {
+      expect(((await response.json()) as { outcome: string }).outcome).not.toBe('duplicate');
+    }
+  });
+});
