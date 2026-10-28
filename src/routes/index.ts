@@ -1,4 +1,4 @@
-import type { RouteDefinition } from '../http/router.js';
+import type { AppHolder, RouteDefinition } from '../http/router.js';
 import type { ProviderDirectory } from '../auth/oauth.js';
 import type { Clock, EventBus, Locks, MetricsSink, RelationalStore } from '../platform/index.js';
 import type { SecretStore } from '../platform/secrets.js';
@@ -72,6 +72,8 @@ export interface ServiceRouteConfig {
   adminToken?: string;
   /** What the service makes of each ref of a git push. */
   decideRef?: Decider;
+  /** Where the built application appears, for the pages that read it. */
+  appHolder?: AppHolder;
   /** Where the routes write down what they did. */
   events?: EventRecorder;
   /** Where a recorded event is published for the streams watching. */
@@ -100,6 +102,7 @@ export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
       clock: config.clock,
       providers: config.providers,
       mountPoint: config.mountPoint,
+      ...(config.appHolder === undefined ? {} : { holder: config.appHolder }),
     }),
     // At the server root, like the git routes: a forge is given this
     // address to post to.

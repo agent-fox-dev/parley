@@ -36,7 +36,19 @@ export interface RouteDefinition {
   hideScopeFailure?: boolean;
 }
 
+/**
+ * Where the built application is put, for the parts of the service
+ * that read it as a client. The web interface reads the API through
+ * the same app rather than over a socket to itself, and the app
+ * cannot be handed to its own routes before it exists.
+ */
+export interface AppHolder {
+  app?: { request: (path: string, init?: RequestInit) => Promise<Response> };
+}
+
 export interface AppOptions {
+  /** Filled with the application once it has been built. */
+  appHolder?: AppHolder;
   /** The prefix the versioned routes live under. Defaults to /api/v1. */
   mountPoint?: string;
   /** Build information, empty where the build did not supply it. */
@@ -181,6 +193,10 @@ export function buildApp(options: AppOptions = {}): Hono {
   }
 
   app.notFound(() => errorResponse(new HttpError(404, 'not found')));
+
+  if (options.appHolder !== undefined) {
+    options.appHolder.app = app as unknown as AppHolder['app'];
+  }
 
   app.onError((err, c) => {
     // A route that refused the request said what to answer; anything else

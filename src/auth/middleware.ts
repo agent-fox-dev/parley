@@ -22,6 +22,12 @@ export interface Identity {
 }
 
 export interface AuthOptions {
+  /**
+   * Whose browser session a presented value is, where it is one.
+   * The web interface reads the API as the person signed into it,
+   * and this is how the credential it presents is recognised.
+   */
+  sessions?: (value: string) => Promise<string | undefined>;
   store: RelationalStore;
   clock: Clock;
   /** The deployment's admin token, where one is configured. */
@@ -143,6 +149,16 @@ export async function identifyCredential(
 
   if (options.adminToken !== undefined && sameDigest(presented, options.adminToken)) {
     return { kind: 'admin_token', permissions: [] };
+  }
+
+  // A browser's session is a credential of the person signed in,
+  // holding what their own key would hold and bound to nothing.
+  const session = await options.sessions?.(presented);
+  if (session !== undefined) {
+    const person = await findUser(options.store, session);
+    return person === undefined || person.status === 'blocked'
+      ? undefined
+      : { kind: 'web_session', userId: person.id, permissions: [] };
   }
 
   const parsed = parseCredential(presented);

@@ -1,5 +1,6 @@
 import { eventRecorder } from '../../audit/recorder.js';
 import { storeBus } from '../../platform/store_bus.js';
+import { signedInUserId } from '../../../web/session.js';
 import { pruneDeliveries } from '../../jobs/delivery_prune.js';
 import { DEFAULT_MOUNT_POINT } from '../../config.js';
 import { buildApp } from '../../http/router.js';
@@ -89,6 +90,7 @@ export default {
           store: platform.store,
           clock: platform.clock,
           mountPoint: mountPoint ?? DEFAULT_MOUNT_POINT,
+          sessions: async (value) => signedInUserId(platform.store, platform.clock, value),
           ...(adminToken === undefined ? {} : { adminToken }),
         },
       });

@@ -1,5 +1,5 @@
 import { buildApp } from '../http/router.js';
-import type { RouteDefinition } from '../http/router.js';
+import type { AppHolder, RouteDefinition } from '../http/router.js';
 import { inMemoryMetrics } from '../platform/local/metrics.js';
 import type { RelationalStore } from '../platform/index.js';
 import { serviceRoutes } from '../routes/index.js';
@@ -14,6 +14,7 @@ import type { JobQueue } from '../platform/jobs.js';
 import type { Decider } from '../git/push.js';
 import { eventRecorder } from '../audit/recorder.js';
 import type { EventRecorder } from '../audit/recorder.js';
+import { signedInUserId } from '../../web/session.js';
 import { freshStore, seedClock, tickingClock } from './identity.js';
 import { providerIdentity, stubDirectory } from './oauth.js';
 
@@ -86,7 +87,9 @@ export async function identityService(
           refusal: () => Promise.reject(new Error('the recorder is broken')),
         }
       : (options.events ?? eventRecorder({ store: seeded.store, clock, bus }));
+  const holder: AppHolder = {};
   const app = buildApp({
+    appHolder: holder,
     routes: [
       ...serviceRoutes({
         mountPoint: MOUNT,
@@ -110,6 +113,7 @@ export async function identityService(
         locks,
         adminToken: ADMIN_TOKEN,
         ...(options.decideRef === undefined ? {} : { decideRef: options.decideRef }),
+        appHolder: holder,
         events,
         bus,
         ...(options.streamLimit === undefined ? {} : { streamLimit: options.streamLimit }),
@@ -118,7 +122,13 @@ export async function identityService(
     ],
     store: seeded.store,
     clock,
-    auth: { store: seeded.store, clock, adminToken: ADMIN_TOKEN, mountPoint: MOUNT },
+    auth: {
+      store: seeded.store,
+      clock,
+      adminToken: ADMIN_TOKEN,
+      mountPoint: MOUNT,
+      sessions: async (value) => signedInUserId(seeded.store, clock, value),
+    },
     events,
   });
 

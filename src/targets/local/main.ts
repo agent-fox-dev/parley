@@ -19,6 +19,7 @@ import { deploymentKey, sealedSecrets } from '../../secrets/store.js';
 import { migrate } from '../../store/migrations/index.js';
 import { eventRecorder } from '../../audit/recorder.js';
 import { storeBus } from '../../platform/store_bus.js';
+import { signedInUserId } from '../../../web/session.js';
 import { pruneDeliveries } from '../../jobs/delivery_prune.js';
 
 /**
@@ -73,6 +74,7 @@ export function buildLocalApp(env: Record<string, string | undefined>) {
       store: platform.store,
       clock: platform.clock,
       mountPoint: mountPoint ?? DEFAULT_MOUNT_POINT,
+      sessions: async (value) => signedInUserId(platform.store, platform.clock, value),
       ...(adminToken === undefined ? {} : { adminToken }),
     },
   });

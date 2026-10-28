@@ -1,8 +1,15 @@
 import type { Context } from 'hono';
-import type { RouteDefinition } from '../http/router.js';
+import { HttpError } from '../http/errors.js';
+import type { AppHolder, RouteDefinition } from '../http/router.js';
 import type { Clock, RelationalStore } from '../platform/index.js';
 import type { ProviderDirectory } from '../auth/oauth.js';
-import { renderLanding } from '../../web/render.js';
+import { apiReader } from '../../web/api_client.js';
+import {
+  renderDashboard,
+  renderLanding,
+  renderNotAvailable,
+  renderWorkspace,
+} from '../../web/render.js';
 import { sessionFrom, signedInUserId } from '../../web/session.js';
 import { findUser } from '../store/identity.js';
 import { TOKENS } from '../../web/tokens.js';
@@ -19,8 +26,23 @@ export interface WebRouteConfig {
   store: RelationalStore;
   clock: Clock;
   providers?: ProviderDirectory;
-  /** Where the pages are served from, for the links they write. */
+  /** Where the API is served, which is what every page reads. */
   mountPoint: string;
+  /** Where the app appears once it is built; the pages read through it. */
+  holder?: AppHolder;
+}
+
+/**
+ * The reader a page uses: the service's own API, asked as the
+ * person signed in. The session value is their credential, so a
+ * page is given exactly what their own key would be given.
+ */
+export function readerFor(config: WebRouteConfig, session: string) {
+  const app = config.holder?.app;
+  if (app === undefined) {
+    throw new HttpError(500, 'the interface has no API to read');
+  }
+  return apiReader({ app: app as never, mountPoint: config.mountPoint, credential: session });
 }
 
 /** An HTML answer, which is what every page of the interface is. */
@@ -59,15 +81,47 @@ function landing(c: Context, config: WebRouteConfig): Response {
   return page(renderLanding(named.map((provider) => ({ name: provider.name }))));
 }
 
+/**
+ * One workspace, or the one answer every workspace a person cannot
+ * open shares. The page itself is task 6's; what is settled here is
+ * who may see one at all, and that is the API's decision rather
+ * than a second rule of the interface's own.
+ */
+async function workspacePage(c: Context, config: WebRouteConfig): Promise<Response> {
+  const who = await viewer(c, config);
+  if (who === undefined) {
+    return landing(c, config);
+  }
+
+  const session = sessionFrom(c.req.raw.headers) ?? '';
+  const read = await readerFor(config, session).read<Record<string, unknown>>(
+    `/workspaces/${encodeURIComponent(c.req.param('slug') ?? '')}`,
+  );
+  if (!read.ok) {
+    // A workspace of somebody else's, one they may not see and an
+    // address naming nothing are one answer: anything else would
+    // let a person learn which slugs exist by trying them.
+    return page(renderNotAvailable(who.username), 404);
+  }
+  return page(renderWorkspace(who.username, read.value));
+}
+
+async function dashboardPage(c: Context, config: WebRouteConfig): Promise<Response> {
+  const who = await viewer(c, config);
+  if (who === undefined) {
+    return landing(c, config);
+  }
+
+  const session = sessionFrom(c.req.raw.headers) ?? '';
+  const read = await readerFor(config, session).read<Array<Record<string, unknown>>>('/workspaces');
+  return page(renderDashboard(who.username, read.ok ? read.value : undefined));
+}
+
 export function webRoutes(config: WebRouteConfig): RouteDefinition[] {
   return [
-    // Every page of the interface, until a session exists, is the
-    // landing page: a visitor who guesses an address learns nothing
-    // from the guess.
-    ...['/', '/dashboard', '/workspaces/:slug'].map((path) => ({
-      path,
-      handler: (c: Context) => landing(c, config),
-    })),
+    { path: '/', handler: (c) => landing(c, config) },
+    { path: '/dashboard', handler: async (c) => dashboardPage(c, config) },
+    { path: '/workspaces/:slug', handler: async (c) => workspacePage(c, config) },
     {
       path: '/web/tokens.css',
       handler: () =>

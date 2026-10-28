@@ -1,4 +1,9 @@
-export type CredentialKind = 'api_key' | 'pat' | 'admin_token';
+/**
+ * What a caller presented. `web_session` is a person reading
+ * through the web interface: it holds every scope, as an API key of
+ * theirs would, and is bound to nothing.
+ */
+export type CredentialKind = 'api_key' | 'pat' | 'admin_token' | 'web_session';
 
 export interface ParsedCredential {
   kind: 'api_key' | 'pat';
