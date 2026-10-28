@@ -6,6 +6,13 @@ compatibility_flags = ["nodejs_compat"]
 [vars]
 PARLEY_MOUNT_POINT = "/api/v1"
 
+# One repository per workspace lives here. The binding offers the
+# repository lifecycle and object reads; refs and packs go over the git
+# remote with a token minted per repository (see docs/adr/06-what-cloudflare-artifacts-does-with-refs.md).
+[[artifacts]]
+binding = "ARTIFACTS"
+namespace = "parley-dev"
+
 # The hourly sweep over token bindings a deletion left behind.
 [triggers]
 crons = ["0 * * * *"]
