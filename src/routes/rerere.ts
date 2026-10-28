@@ -83,7 +83,10 @@ export function rerereRoutes(config: RerereRouteConfig): RouteDefinition[] {
   return [
     {
       path: `${config.mountPoint}/workspaces/:slug/rerere`,
-      scope: 'rebuilds:read',
+      // The reference puts the listing under the workspace's own read
+      // scope rather than the rebuilds' one, and forgetting under its
+      // write scope.
+      scope: 'workspaces:read',
       handler: async (c) => listResolutions(c, config),
     },
     {
@@ -92,7 +95,7 @@ export function rerereRoutes(config: RerereRouteConfig): RouteDefinition[] {
       // src/config.go, and that is what a person deletes.
       path: `${config.mountPoint}/workspaces/:slug/rerere/:pathspec{.+}`,
       methods: ['DELETE'],
-      scope: 'rebuilds:write',
+      scope: 'workspaces:write',
       handler: async (c) => forgetResolution(c, config),
     },
   ];

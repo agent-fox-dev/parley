@@ -21,6 +21,7 @@ import { branchPushRoutes } from './branch_push.js';
 import { patchRoutes } from './patches.js';
 import { rebuildRoutes } from './rebuilds.js';
 import { rerereRoutes } from './rerere.js';
+import { patchStatusRoutes } from './patch_status.js';
 import { tokenPermissionRoutes } from './token_permissions.js';
 import { tokenRoutes } from './tokens.js';
 import { userRoutes } from './user.js';
@@ -109,6 +110,12 @@ export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
       mountPoint: config.mountPoint,
       store: config.store,
       clock: config.clock,
+    }),
+    ...patchStatusRoutes({
+      mountPoint: config.mountPoint,
+      store: config.store,
+      clock: config.clock,
+      ...(config.repos === undefined ? {} : { repos: config.repos }),
     }),
     ...rerereRoutes({
       mountPoint: config.mountPoint,

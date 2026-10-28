@@ -4,7 +4,7 @@ spec_name: "carry_patch"
 title: "Carry a patch stack on top of an upstream and rebuild it"
 status: "active"
 created_at: "2026-10-27T18:46:58Z"
-updated_at: "2026-10-28T10:37:54Z"
+updated_at: "2026-10-28T10:40:56Z"
 intent_hash: "11c56eb674e65f449b483b348d1fb0cc0f58b0e7077fd0883e6bc44ad486ed86"
 schema_version: 2
 source: "docs/prd/01-port-af-hub-to-typescript-on-cloudflare.md"
