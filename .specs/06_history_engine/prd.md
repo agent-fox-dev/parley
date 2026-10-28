@@ -4,7 +4,7 @@ spec_name: "history_engine"
 title: "Compute rebases, merges and recorded resolutions in TypeScript"
 status: "active"
 created_at: "2026-10-27T18:31:36Z"
-updated_at: "2026-10-28T06:46:30Z"
+updated_at: "2026-10-28T06:48:22Z"
 intent_hash: "886fcd0fe7ba4ebccdc302ca1247676b4dc3cffc7fc6c6f09c5e0cf88b8fd71e"
 schema_version: 2
 source: "docs/prd/01-port-af-hub-to-typescript-on-cloudflare.md"
