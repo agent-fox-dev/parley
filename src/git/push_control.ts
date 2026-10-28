@@ -1,3 +1,4 @@
+import { type EventRecorder, record } from '../audit/recorder.js';
 import type { LogSink } from '../http/router.js';
 import type { RelationalStore } from '../platform/index.js';
 import type { RefChange } from '../platform/repostore.js';
@@ -29,6 +30,8 @@ export interface PushControlDeps {
   secrets?: SecretStore;
   fetch?: typeof fetch;
   log?: LogSink;
+  /** Where a mirror that failed is written down. */
+  events?: EventRecorder;
 }
 
 const SYNCED = (gitUrl: string) => `branch is synced from origin; push to ${gitUrl} instead`;
@@ -183,6 +186,20 @@ export function mirrorAfterPush(
           ref: command.name,
           reason: sent.reason,
         });
+        await record(
+          deps.events,
+          {
+            type: 'hub.patch.mirror_failed',
+            workspace: deps.workspace.slug,
+            resourceId: command.name.replace('refs/heads/', ''),
+            severity: 'warning',
+            metadata: {
+              branch_name: command.name.replace('refs/heads/', ''),
+              error: sent.reason,
+            },
+          },
+          deps.log,
+        );
       }
     }
   };

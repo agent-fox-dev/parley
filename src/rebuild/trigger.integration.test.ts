@@ -7,7 +7,7 @@ import type { RepositoryStore } from '../platform/repostore.js';
 import { repositoryOf } from '../repo/repository.js';
 import { FLUSH, concatBytes, encodePkt, encodeSpecial } from '../git/pktline.js';
 import { ZERO_OID } from '../git/transport.js';
-import { type Service, identityService } from '../testutil/app.js';
+import { type Service, identityService, recordedEvents } from '../testutil/app.js';
 import { buildCommit } from '../testutil/history.js';
 import { seedApiKey, seedOrg, seedPatch, seedUser, seedWorkspace } from '../testutil/identity.js';
 
@@ -118,6 +118,13 @@ describe('a push to a patch branch', () => {
     expect(jobs).toHaveLength(1);
     expect(jobs[0]?.submitted_by).toBe('system:patch-push');
     expect(jobs[0]?.status).toBe('queued');
+
+    // The push itself is written down with the refs it moved.
+    const [recorded] = await recordedEvents(place.service.store, 'hub.git.push');
+    expect(recorded?.metadata).toEqual({
+      head_sha: place.base,
+      refs_updated: ['refs/heads/a-patch'],
+    });
   });
 
   it('queues none for an ordinary branch', async () => {

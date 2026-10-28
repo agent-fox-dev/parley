@@ -4,7 +4,7 @@ spec_name: "audit_and_events"
 title: "Record what happened and let it be queried and streamed"
 status: "active"
 created_at: "2026-10-27T19:01:45Z"
-updated_at: "2026-10-27T19:05:59Z"
+updated_at: "2026-10-28T12:33:47Z"
 intent_hash: "58ea00925ebb37a555870d27e13cb443dc2045935db0c24e33b23f7ecf12a69b"
 schema_version: 2
 source: "docs/prd/01-port-af-hub-to-typescript-on-cloudflare.md"

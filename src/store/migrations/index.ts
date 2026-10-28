@@ -322,6 +322,38 @@ export const MIGRATIONS: readonly Migration[] = [
       'CREATE INDEX usage_by_session ON session_usage (session_id, recorded_at)',
     ],
   },
+  {
+    // What the service itself did. The columns are the fields the
+    // reference's event envelope names, so a query answers from the
+    // row rather than from the metadata it happens to carry.
+    name: '014_audit',
+    statements: [
+      `CREATE TABLE hub_events (
+         id TEXT PRIMARY KEY,
+         event_type TEXT NOT NULL,
+         timestamp TEXT NOT NULL,
+         severity TEXT NOT NULL DEFAULT 'info',
+         workspace TEXT,
+         actor_id TEXT NOT NULL DEFAULT '',
+         actor_type TEXT NOT NULL DEFAULT '',
+         resource_type TEXT NOT NULL DEFAULT '',
+         resource_id TEXT NOT NULL DEFAULT '',
+         action TEXT NOT NULL DEFAULT '',
+         metadata TEXT NOT NULL DEFAULT '{}'
+       )`,
+      'CREATE INDEX hub_events_by_time ON hub_events (timestamp, id)',
+      'CREATE INDEX hub_events_by_workspace ON hub_events (workspace, timestamp)',
+      'CREATE INDEX hub_events_by_type ON hub_events (event_type, timestamp)',
+      // One row per bound token, holding the window its last refusal
+      // event opened and how many refusals that event now covers.
+      `CREATE TABLE bound_token_refusals (
+         token_id TEXT PRIMARY KEY,
+         event_id TEXT NOT NULL,
+         window_started_at TEXT NOT NULL,
+         suppressed INTEGER NOT NULL DEFAULT 0
+       )`,
+    ],
+  },
 ];
 
 /**

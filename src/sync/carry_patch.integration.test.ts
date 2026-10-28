@@ -6,7 +6,7 @@ import { localRepositoryStore } from '../platform/local/repostore.js';
 import type { RepositoryStore } from '../platform/repostore.js';
 import { workspaceScope } from '../platform/secrets.js';
 import { repositoryOf } from '../repo/repository.js';
-import { type Service, identityService } from '../testutil/app.js';
+import { type Service, identityService, recordedEvents } from '../testutil/app.js';
 import { type FakeRemote, fakeRemote } from '../testutil/fakeremote.js';
 import { buildCommit } from '../testutil/history.js';
 import { seedApiKey, seedOrg, seedPatch, seedUser, seedWorkspace } from '../testutil/identity.js';
@@ -328,6 +328,25 @@ describe('refreshing the patch branches from the fork', () => {
     // The tip the hub dropped is still recoverable.
     const refs = await place.repos.listRefs(place.repository);
     expect(refs.find((ref) => ref.name === 'refs/hub/replaced/diverged')?.oid).toBe(diverged.here);
+
+    // One event for the sync, naming the branches in each state, and
+    // one for the branch whose tip it discarded.
+    const [recorded] = await recordedEvents(place.service.store, 'hub.patch.sync');
+    expect(recorded?.metadata).toEqual({
+      origin_fetched: true,
+      created: ['only-there'],
+      fast_forwarded: [],
+      replaced: ['diverged'],
+      diverged: [],
+      missing_on_origin: ['only-here'],
+    });
+    const [replaced] = await recordedEvents(place.service.store, 'hub.patch.replace');
+    expect(replaced?.metadata).toMatchObject({
+      branch_name: 'diverged',
+      replaced_sha: diverged.here,
+    });
+    // A sync is not a reset, and says so by setting no trigger.
+    expect(replaced?.metadata['trigger']).toBeUndefined();
   });
 
   it('leaves a diverged branch alone and names it under the report policy', async () => {

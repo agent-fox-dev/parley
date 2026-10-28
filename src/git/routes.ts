@@ -1,3 +1,5 @@
+import { type EventRecorder, actorIn, record } from '../audit/recorder.js';
+import { findWorkspace } from '../store/workspaces.js';
 import type { Context } from 'hono';
 import type { LogSink, RouteDefinition } from '../http/router.js';
 import type { JobQueue } from '../platform/jobs.js';
@@ -38,6 +40,8 @@ export interface GitRouteConfig extends GitAccessDeps {
   /** Injected so a suite reaches a fork of its own. */
   fetch?: typeof fetch;
   log?: LogSink;
+  /** Where a push writes down what it moved. */
+  events?: EventRecorder;
 }
 
 export const UPLOAD_PACK = 'git-upload-pack';
@@ -228,6 +232,7 @@ export function gitRoutes(config: GitRouteConfig): RouteDefinition[] {
           ...(config.secrets === undefined ? {} : { secrets: config.secrets }),
           ...(config.fetch === undefined ? {} : { fetch: config.fetch }),
           ...(config.log === undefined ? {} : { log: config.log }),
+          ...(config.events === undefined ? {} : { events: config.events }),
         };
         const controlled = pushControl(control);
         const held = protectedRefs();
@@ -263,6 +268,27 @@ export function gitRoutes(config: GitRouteConfig): RouteDefinition[] {
               ...(config.jobs === undefined ? {} : { jobs: config.jobs }),
             })(outcomes);
             await mirrorAfterPush(control, commands)(outcomes);
+
+            // A push with nothing accepted moved nothing, and the
+            // reference records the pushes that moved something.
+            const moved = outcomes.filter((one) => one.ok);
+            if (moved.length > 0) {
+              const refreshed = await findWorkspace(config.store, subject.workspace.slug);
+              await record(
+                config.events,
+                {
+                  type: 'hub.git.push',
+                  workspace: subject.workspace.slug,
+                  resourceId: subject.workspace.slug,
+                  actor: actorIn(c),
+                  metadata: {
+                    head_sha: refreshed?.head_sha ?? undefined,
+                    refs_updated: moved.map((one) => one.name).toSorted(),
+                  },
+                },
+                config.log,
+              );
+            }
           },
         });
         return new Response(report as BodyInit, {

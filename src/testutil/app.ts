@@ -11,6 +11,8 @@ import type { SecretStore } from '../platform/secrets.js';
 import type { RepositoryStore } from '../platform/repostore.js';
 import type { JobQueue } from '../platform/jobs.js';
 import type { Decider } from '../git/push.js';
+import { eventRecorder } from '../audit/recorder.js';
+import type { EventRecorder } from '../audit/recorder.js';
 import { freshStore, seedClock, tickingClock } from './identity.js';
 import { providerIdentity, stubDirectory } from './oauth.js';
 
@@ -38,6 +40,8 @@ export interface Service {
   locks: Locks;
   /** The queue the routes enqueue onto, where the suite asked for one. */
   jobs?: JobQueue;
+  /** The recorder the routes write their events to. */
+  events: EventRecorder;
   dispose: () => void;
 }
 
@@ -59,6 +63,8 @@ export async function identityService(
     decideRef?: Decider;
     /** 'ticking' for a clock that moves, where a suite needs order. */
     clock?: 'fixed' | 'ticking';
+    /** A recorder of the suite's own, or 'raising' for one that fails. */
+    events?: EventRecorder | 'raising';
   } = {},
 ): Promise<Service> {
   const seeded = await freshStore();
@@ -69,6 +75,13 @@ export async function identityService(
   // The same locks the routes hold, so a suite can hold one itself.
   const locks = storeLocks(seeded.store, clock);
   const jobs = options.jobs === 'store' ? storeJobs(seeded.store, clock) : options.jobs;
+  const events: EventRecorder =
+    options.events === 'raising'
+      ? {
+          record: () => Promise.reject(new Error('the recorder is broken')),
+          refusal: () => Promise.reject(new Error('the recorder is broken')),
+        }
+      : (options.events ?? eventRecorder({ store: seeded.store, clock }));
   const app = buildApp({
     routes: [
       ...serviceRoutes({
@@ -88,15 +101,60 @@ export async function identityService(
         locks,
         adminToken: ADMIN_TOKEN,
         ...(options.decideRef === undefined ? {} : { decideRef: options.decideRef }),
+        events,
       }),
       ...extra,
     ],
     store: seeded.store,
     clock,
     auth: { store: seeded.store, clock, adminToken: ADMIN_TOKEN, mountPoint: MOUNT },
+    events,
   });
 
-  return { app, store: seeded.store, secrets, locks, jobs, dispose: seeded.dispose };
+  return { app, store: seeded.store, secrets, locks, jobs, events, dispose: seeded.dispose };
+}
+
+/** One event the service recorded, as a suite reads it back. */
+export interface RecordedEvent {
+  event_type: string;
+  action: string;
+  workspace: string | null;
+  actor_type: string;
+  resource_id: string;
+  metadata: Record<string, unknown>;
+}
+
+/**
+ * What the service wrote down, oldest first. Suites of the routes that
+ * record an event read it back from here rather than each writing the
+ * same query.
+ */
+export async function recordedEvents(
+  store: RelationalStore,
+  type?: string,
+): Promise<RecordedEvent[]> {
+  const rows = await store.all<{
+    event_type: string;
+    action: string;
+    workspace: string | null;
+    actor_type: string;
+    resource_id: string;
+    metadata: string;
+    timestamp: string;
+  }>(
+    `SELECT event_type, action, workspace, actor_type, resource_id, metadata, timestamp
+       FROM hub_events ${type === undefined ? '' : 'WHERE event_type = ?'}
+      ORDER BY timestamp, id`,
+    type === undefined ? [] : [type],
+  );
+  return rows.map((row) => ({
+    event_type: row.event_type,
+    action: row.action,
+    workspace: row.workspace,
+    actor_type: row.actor_type,
+    resource_id: row.resource_id,
+    metadata: JSON.parse(row.metadata) as Record<string, unknown>,
+  }));
 }
 
 /** A request as a client makes it: the credential in the usual header. */

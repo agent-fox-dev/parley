@@ -1,3 +1,4 @@
+import { type EventRecorder, actorIn, record } from '../audit/recorder.js';
 import type { Context } from 'hono';
 import { identityOf } from '../auth/middleware.js';
 import { HttpError } from '../http/errors.js';
@@ -13,6 +14,8 @@ export interface BoundTokenRouteConfig {
   mountPoint: string;
   store: RelationalStore;
   clock: Clock;
+  /** Where this group writes down what it did. */
+  events?: EventRecorder;
 }
 
 /** A bound token can neither mint nor list bound tokens, whatever its scopes. */
@@ -58,6 +61,21 @@ async function mintBoundToken(c: Context, config: BoundTokenRouteConfig): Promis
     await revokeCredential(config.store, minted.token.id, config.clock.now().toISOString());
     throw new HttpError(500, 'failed to bind the token to the workspace');
   }
+
+  // Recorded only for a token that is really bound: a mint rolled back
+  // above left nothing behind, and nor does it leave an event.
+  await record(config.events, {
+    type: 'hub.token.bind',
+    workspace: workspace.slug,
+    resourceId: minted.token.id,
+    actor: actorIn(c),
+    metadata: {
+      token_id: minted.token.id,
+      workspace: workspace.slug,
+      permissions: minted.token.permissions,
+      expires_at: minted.token.expires_at,
+    },
+  });
 
   return jsonResponse(
     {

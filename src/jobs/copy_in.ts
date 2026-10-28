@@ -1,3 +1,4 @@
+import type { EventRecorder } from '../audit/recorder.js';
 import type { Clock } from '../platform/clock.js';
 import type { JobQueue } from '../platform/jobs.js';
 import type { RelationalStore } from '../platform/index.js';
@@ -38,6 +39,8 @@ export interface CopyInDeps {
   clock: Clock;
   fetch?: typeof fetch;
   log?: LogSink;
+  /** Carried through to the jobs this deployment drains. */
+  events?: EventRecorder;
 }
 
 /** Queues the copy of a workspace's repository, to run outside the request. */

@@ -17,6 +17,7 @@ import { drainJobs } from '../../jobs/drain.js';
 import { storeJobs } from '../../platform/store_jobs.js';
 import { deploymentKey, sealedSecrets } from '../../secrets/store.js';
 import { migrate } from '../../store/migrations/index.js';
+import { eventRecorder } from '../../audit/recorder.js';
 
 /**
  * The second target: the same service on one host, with the non-Cloudflare
@@ -34,6 +35,11 @@ export function buildLocalApp(env: Record<string, string | undefined>) {
   const platform = localPlatform(env);
   const mountPoint = platform.config.get('PARLEY_MOUNT_POINT');
   const adminToken = platform.config.get('PARLEY_ADMIN_TOKEN');
+  const events = eventRecorder({
+    store: platform.store,
+    clock: platform.clock,
+    metrics: platform.metrics,
+  });
   return buildApp({
     store: platform.store,
     clock: platform.clock,
@@ -53,7 +59,9 @@ export function buildLocalApp(env: Record<string, string | undefined>) {
       locks: platform.locks,
       ...(adminToken === undefined ? {} : { adminToken }),
       repos: localRepositoryStore(platform.config.get('PARLEY_REPO_PATH') ?? 'repositories'),
+      events,
     }),
+    events,
     auth: {
       store: platform.store,
       clock: platform.clock,
@@ -108,6 +116,11 @@ export async function startLocalTarget(
       jobs: storeJobs(platform.store, platform.clock),
       clock: platform.clock,
       locks: platform.locks,
+      events: eventRecorder({
+        store: platform.store,
+        clock: platform.clock,
+        metrics: platform.metrics,
+      }),
     };
     const draining = setInterval(() => {
       void drainJobs(deps);

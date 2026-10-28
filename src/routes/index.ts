@@ -5,6 +5,7 @@ import type { SecretStore } from '../platform/secrets.js';
 import type { RepositoryStore } from '../platform/repostore.js';
 import type { JobQueue } from '../platform/jobs.js';
 import type { Cipher } from '../entries/store.js';
+import type { EventRecorder } from '../audit/recorder.js';
 import { adminOrgRoutes } from './admin_orgs.js';
 import { adminUserRoutes } from './admin_users.js';
 import { authRoutes } from './auth.js';
@@ -56,6 +57,8 @@ export interface ServiceRouteConfig {
   adminToken?: string;
   /** What the service makes of each ref of a git push. */
   decideRef?: Decider;
+  /** Where the routes write down what they did. */
+  events?: EventRecorder;
 }
 
 /**
@@ -70,6 +73,7 @@ export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
     ...gitRoutes({
       store: config.store,
       clock: config.clock,
+      ...(config.events === undefined ? {} : { events: config.events }),
       ...(config.adminToken === undefined ? {} : { adminToken: config.adminToken }),
       ...(config.repos === undefined ? {} : { repos: config.repos }),
       ...(config.decideRef === undefined ? {} : { decide: config.decideRef }),
@@ -102,17 +106,20 @@ export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
     ...sandboxRoutes(config.mountPoint),
     ...secretRoutes({
       mountPoint: config.mountPoint,
+      ...(config.events === undefined ? {} : { events: config.events }),
       store: config.store,
       clock: config.clock,
       ...(config.secretCipher === undefined ? {} : { cipher: config.secretCipher }),
     }),
     ...varRoutes({
       mountPoint: config.mountPoint,
+      ...(config.events === undefined ? {} : { events: config.events }),
       store: config.store,
       clock: config.clock,
     }),
     ...boundTokenRoutes({
       mountPoint: config.mountPoint,
+      ...(config.events === undefined ? {} : { events: config.events }),
       store: config.store,
       clock: config.clock,
     }),
@@ -135,6 +142,7 @@ export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
     }),
     ...mergeRoutes({
       mountPoint: config.mountPoint,
+      ...(config.events === undefined ? {} : { events: config.events }),
       store: config.store,
       clock: config.clock,
       locks: config.locks,
@@ -155,6 +163,7 @@ export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
     }),
     ...rebuildRoutes({
       mountPoint: config.mountPoint,
+      ...(config.events === undefined ? {} : { events: config.events }),
       store: config.store,
       clock: config.clock,
       locks: config.locks,
@@ -163,6 +172,7 @@ export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
     }),
     ...patchRoutes({
       mountPoint: config.mountPoint,
+      ...(config.events === undefined ? {} : { events: config.events }),
       store: config.store,
       clock: config.clock,
       locks: config.locks,
@@ -173,6 +183,7 @@ export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
     }),
     ...branchPushRoutes({
       mountPoint: config.mountPoint,
+      ...(config.events === undefined ? {} : { events: config.events }),
       store: config.store,
       clock: config.clock,
       locks: config.locks,
@@ -193,6 +204,7 @@ export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
     }),
     ...syncRoutes({
       mountPoint: config.mountPoint,
+      ...(config.events === undefined ? {} : { events: config.events }),
       store: config.store,
       clock: config.clock,
       locks: config.locks,
@@ -204,6 +216,7 @@ export function serviceRoutes(config: ServiceRouteConfig): RouteDefinition[] {
     }),
     ...workspaceRoutes({
       mountPoint: config.mountPoint,
+      ...(config.events === undefined ? {} : { events: config.events }),
       store: config.store,
       clock: config.clock,
       ...(config.secrets === undefined ? {} : { secrets: config.secrets }),

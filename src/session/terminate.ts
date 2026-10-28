@@ -12,14 +12,14 @@ export async function terminateSessions(
   store: RelationalStore,
   clock: Clock,
   slug: string,
-): Promise<number> {
+): Promise<string[]> {
   const at = clock.now().toISOString();
   const active = await store.all<{ id: string }>(
     "SELECT id FROM sessions WHERE workspace_slug = ? AND status = 'active'",
     [slug],
   );
   if (active.length === 0) {
-    return 0;
+    return [];
   }
 
   await store.run(
@@ -27,5 +27,5 @@ export async function terminateSessions(
      WHERE workspace_slug = ? AND status = 'active'`,
     [at, slug],
   );
-  return active.length;
+  return active.map((one) => one.id);
 }

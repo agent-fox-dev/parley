@@ -1,3 +1,4 @@
+import { type EventRecorder, actorIn, record } from '../audit/recorder.js';
 import type { Context } from 'hono';
 import { HttpError } from '../http/errors.js';
 import { emptyResponse, jsonResponse, readJsonObject } from '../http/json.js';
@@ -21,6 +22,8 @@ export interface SecretRouteConfig {
   clock: Clock;
   /** Absent where the deployment configured no key to seal values with. */
   cipher?: Cipher;
+  /** Where this group writes down what it did. */
+  events?: EventRecorder;
 }
 
 /** The three scopes a secret can live at, and the path each is served under. */
@@ -39,6 +42,29 @@ function cipherOf(config: SecretRouteConfig): Cipher {
 
 /** A workspace's secrets are private: a member of its organization is refused. */
 const NEED = 'private' as const;
+
+/**
+ * One event per key, by scope and key and never by value. The workspace
+ * is set only for the workspace family: a user's secret belongs to no
+ * workspace, which is what keeps it out of everyone else's reading.
+ */
+async function recordKeys(
+  c: Context,
+  config: SecretRouteConfig,
+  family: ScopeFamily,
+  action: 'create' | 'update' | 'delete',
+  keys: readonly string[],
+): Promise<void> {
+  for (const key of keys) {
+    await record(config.events, {
+      type: `hub.secret.${action}`,
+      workspace: family === 'workspace' ? (c.req.param('slug') ?? null) : null,
+      resourceId: key,
+      actor: actorIn(c),
+      metadata: { scope: family, key },
+    });
+  }
+}
 
 async function listSecrets(
   c: Context,
@@ -74,6 +100,13 @@ async function createSecrets(
     config.clock.now().toISOString(),
     cipherOf(config),
   );
+  await recordKeys(
+    c,
+    config,
+    family,
+    'create',
+    created.map((one) => one.key),
+  );
   return jsonResponse(created.map(asSecret), 201);
 }
 
@@ -97,6 +130,7 @@ async function replaceSecret(
     config.clock.now().toISOString(),
     cipherOf(config),
   );
+  await recordKeys(c, config, family, 'update', [replaced.key]);
   return jsonResponse(asSecret(replaced));
 }
 
@@ -107,6 +141,7 @@ async function removeSecret(
 ): Promise<Response> {
   const scope = await entryScope(c, config.store, family, NEED);
   await deleteEntry(config.store, scope, 'secret', c.req.param('key') ?? '');
+  await recordKeys(c, config, family, 'delete', [c.req.param('key') ?? '']);
   return emptyResponse(204);
 }
 

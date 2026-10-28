@@ -9,6 +9,7 @@ import type { LogSink } from '../http/router.js';
 import { resolveGitCredential } from '../repo/credentials.js';
 import { pushOutOnArchive, removeRepository } from '../repo/retire.js';
 import { repositoryOf } from '../repo/repository.js';
+import { type EventRecorder, record } from '../audit/recorder.js';
 import { terminateSessions } from '../session/terminate.js';
 import { withWorkspaceLock } from './lock.js';
 
@@ -22,6 +23,33 @@ export interface RetirementDeps {
   secrets?: SecretStore;
   fetch?: typeof fetch;
   log?: LogSink;
+  /** Where the end of each session the retirement forced is written. */
+  events?: EventRecorder;
+}
+
+/**
+ * One event per session the hub ended under its agent. The actor is
+ * the system: nobody asked for these, the retirement did.
+ */
+async function recordForcedEnds(
+  deps: RetirementDeps,
+  slug: string,
+  sessions: readonly string[],
+  reason: string,
+): Promise<void> {
+  for (const session of sessions) {
+    await record(
+      deps.events,
+      {
+        type: 'hub.session.force_closed',
+        workspace: slug,
+        resourceId: session,
+        actor: { id: '', type: 'system' },
+        metadata: { session_id: session, reason },
+      },
+      deps.log,
+    );
+  }
 }
 
 export async function archiveWorkspace(
@@ -62,7 +90,8 @@ export async function archiveWorkspace(
 
     // An agent whose workspace is archived under it will not report
     // that it finished, so the hub records what happened to it.
-    await terminateSessions(store, clock, workspace.slug);
+    const ended = await terminateSessions(store, clock, workspace.slug);
+    await recordForcedEnds(deps, workspace.slug, ended, 'workspace_archived');
   });
 }
 
@@ -89,7 +118,7 @@ export async function deleteWorkspaceAndTokens(
   clock: Clock,
   workspace: WorkspaceRecord,
   deps: RetirementDeps = {},
-): Promise<void> {
+): Promise<string[]> {
   if (workspace.status !== 'archived') {
     throw new HttpError(409, 'this workspace is not archived; archive it first');
   }
@@ -97,7 +126,21 @@ export async function deleteWorkspaceAndTokens(
   const at = clock.now().toISOString();
   // Ended before the record goes, so nothing is left pointing at a
   // workspace that is not there.
-  await terminateSessions(store, clock, workspace.slug);
+  const ended = await terminateSessions(store, clock, workspace.slug);
+  await recordForcedEnds(deps, workspace.slug, ended, 'workspace_deleted');
+
+  // Read before the batch revokes them: afterwards the bindings are
+  // gone and nothing could say which tokens this deletion took with it.
+  const revoked = (
+    await store.all<{ token_id: string }>(
+      `SELECT token_id FROM token_bindings
+        WHERE workspace_slug = ?
+          AND token_id IN (SELECT id FROM credentials WHERE revoked_at IS NULL)`,
+      [workspace.slug],
+    )
+  )
+    .map((row) => row.token_id)
+    .toSorted();
 
   await store.batch([
     ...retireBindingsOf(workspace.slug, at),
@@ -117,4 +160,6 @@ export async function deleteWorkspaceAndTokens(
   if (deps.repos !== undefined) {
     await removeRepository(deps.repos, repositoryOf(workspace));
   }
+
+  return revoked;
 }

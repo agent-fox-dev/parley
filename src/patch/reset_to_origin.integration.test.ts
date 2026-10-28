@@ -6,7 +6,7 @@ import { localRepositoryStore } from '../platform/local/repostore.js';
 import type { RepositoryStore } from '../platform/repostore.js';
 import { workspaceScope } from '../platform/secrets.js';
 import { repositoryOf } from '../repo/repository.js';
-import { type Service, identityService } from '../testutil/app.js';
+import { type Service, identityService, recordedEvents } from '../testutil/app.js';
 import { type FakeRemote, fakeRemote } from '../testutil/fakeremote.js';
 import { buildCommit } from '../testutil/history.js';
 import { seedApiKey, seedOrg, seedPatch, seedUser, seedWorkspace } from '../testutil/identity.js';
@@ -209,6 +209,24 @@ describe('resetting a patch to the fork', () => {
     // The dropped tip is recoverable.
     const refs = await place.repos.listRefs(place.repository);
     expect(refs.find((ref) => ref.name === `refs/hub/replaced/${PATCH}`)?.oid).toBe(mine);
+
+    // Two events: the reset, and the replacement it made, which says
+    // which of the two causes of a replacement this was.
+    const [wasReset] = await recordedEvents(place.service.store, 'hub.patch.reset');
+    expect(wasReset?.metadata).toEqual({
+      branch_name: PATCH,
+      action: 'replaced',
+      local_sha: mine,
+      origin_sha: theirs,
+      replaced_sha: mine,
+    });
+    const [replaced] = await recordedEvents(place.service.store, 'hub.patch.replace');
+    expect(replaced?.metadata).toEqual({
+      branch_name: PATCH,
+      replaced_sha: mine,
+      origin_sha: theirs,
+      trigger: 'reset_to_origin',
+    });
   });
 
   it('supersedes an earlier backup with the newer one', async () => {
