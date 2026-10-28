@@ -1,5 +1,5 @@
 import type { LogSink } from '../http/router.js';
-import { type Remote, fetchPack, lsRefs } from '../git/transport.js';
+import { type Remote, RemoteError, fetchPack, lsRefs } from '../git/transport.js';
 import type { RefChange, RepositoryStore } from '../platform/repostore.js';
 import type { GitCredential } from './credentials.js';
 
@@ -75,8 +75,12 @@ export async function checkRemoteCredential(request: {
     await lsRefs(remoteFor(request));
     return 'accepted';
   } catch (err) {
-    const message = (err as Error).message;
-    return /\b40[13]\b/.test(message) ? 'refused' : 'unreachable';
+    // Read from the status the remote answered, not from the words
+    // of an error: a message is prose, and prose that happens to
+    // contain "403" — a URL, a commit id — would read as a refusal.
+    return err instanceof RemoteError && (err.status === 401 || err.status === 403)
+      ? 'refused'
+      : 'unreachable';
   }
 }
 
