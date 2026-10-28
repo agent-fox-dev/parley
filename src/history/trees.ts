@@ -78,15 +78,64 @@ export async function buildTree(
 }
 
 /**
- * The paths one side moved a file to, found by content: a path the side
- * dropped whose blob turns up at a path it added. That is git's exact
- * rename pass, and it is what lets an edit on one side land on the file
- * the other side renamed.
+ * How alike two blobs are, between 0 and 1: the bytes they hold in
+ * common, as a share of the larger of the two. Content is counted a
+ * line at a time, which is the granularity git's own rename detection
+ * works at; a file with no newlines is one line and so matches only
+ * itself.
  */
-export function renamesBetween(
+function similarity(left: Uint8Array, right: Uint8Array): number {
+  const largest = Math.max(left.byteLength, right.byteLength);
+  if (largest === 0) {
+    return 1;
+  }
+
+  const counts = new Map<string, number>();
+  for (const line of lines(left)) {
+    counts.set(line, (counts.get(line) ?? 0) + 1);
+  }
+
+  let common = 0;
+  for (const line of lines(right)) {
+    const held = counts.get(line) ?? 0;
+    if (held > 0) {
+      counts.set(line, held - 1);
+      common += line.length + 1;
+    }
+  }
+  return Math.min(common, largest) / largest;
+}
+
+/** A blob's lines, as strings that compare byte for byte. */
+function lines(content: Uint8Array): string[] {
+  return Buffer.from(content).toString('latin1').split('\n');
+}
+
+/** How alike two files must be to count as one moved. git's own default. */
+const RENAME_THRESHOLD = 0.5;
+
+/**
+ * The most pairs the similarity pass will score. Past it the work grows
+ * faster than the answer is worth, and git gives up on rename detection
+ * at a limit of its own for the same reason.
+ */
+const RENAME_LIMIT = 1000;
+
+/**
+ * The paths one side moved a file to. A path the side dropped whose
+ * blob turns up at a path it added is a move, and so is one whose
+ * content is mostly there: git pairs by similarity, not by identity, so
+ * a file moved and edited in the same commit is still a move, and the
+ * other side's edit has to land on it.
+ *
+ * Identical content is matched first, because that pairing is certain
+ * and it keeps the scoring pass small.
+ */
+export async function renamesBetween(
+  options: { fs: never; gitdir: string },
   base: ReadonlyMap<string, FlatEntry>,
   side: ReadonlyMap<string, FlatEntry>,
-): Map<string, string> {
+): Promise<Map<string, string>> {
   const dropped = [...base].filter(([path]) => !side.has(path));
   const added = [...side].filter(([path]) => !base.has(path));
   const renames = new Map<string, string>();
@@ -100,6 +149,43 @@ export function renamesBetween(
       renames.set(from, match[0]);
       taken.add(match[0]);
     }
+  }
+
+  const unmatched = dropped.filter(([path]) => !renames.has(path));
+  const free = added.filter(([path]) => !taken.has(path));
+  if (unmatched.length * free.length > RENAME_LIMIT) {
+    return renames;
+  }
+
+  const content = new Map<string, Uint8Array>();
+  const blobOf = async (oid: string) => {
+    const held = content.get(oid);
+    if (held !== undefined) {
+      return held;
+    }
+    const { blob } = await git.readBlob({ ...options, oid });
+    content.set(oid, blob);
+    return blob;
+  };
+
+  // Every pair that could be a move, best first, so the strongest
+  // pairing wins a path that two of them want.
+  const scored: Array<{ from: string; to: string; score: number }> = [];
+  for (const [from, entry] of unmatched) {
+    for (const [to, candidate] of free) {
+      const score = similarity(await blobOf(entry.oid), await blobOf(candidate.oid));
+      if (score >= RENAME_THRESHOLD) {
+        scored.push({ from, to, score });
+      }
+    }
+  }
+
+  for (const pair of scored.toSorted((left, right) => right.score - left.score)) {
+    if (renames.has(pair.from) || taken.has(pair.to)) {
+      continue;
+    }
+    renames.set(pair.from, pair.to);
+    taken.add(pair.to);
   }
   return renames;
 }

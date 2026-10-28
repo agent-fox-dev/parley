@@ -380,8 +380,8 @@ async function alignRenames(
   let ours = await flatten(options, trees.ours);
   let theirs = await flatten(options, trees.theirs);
 
-  const ourRenames = renamesBetween(base, ours);
-  const theirRenames = renamesBetween(base, theirs);
+  const ourRenames = await renamesBetween(options, base, ours);
+  const theirRenames = await renamesBetween(options, base, theirs);
   let moved = false;
 
   for (const [from, to] of ourRenames) {

@@ -146,6 +146,23 @@ export function corpus(): CorpusCase[] {
     });
   }
 
+  // A file moved and altered in the one commit, which is a move to git
+  // as long as enough of it is still there, and a delete and an add
+  // once too little is.
+  for (let i = 0; i < 12; i += 1) {
+    const content = lines(12, next);
+    const kept = content.split('\n').slice(0, 12 - i);
+    const quiet = lines(2, next);
+    cases.push({
+      name: `rename ${String(i)} that also rewrote ${String(i)} of twelve lines`,
+      shapes: ['rename', 'clean'],
+      root: { 'old.txt': content, 'other.txt': quiet },
+      base: [{ 'new.txt': `${kept.join('\n')}\n${lines(i, next)}`, 'other.txt': quiet }],
+      branch: [{ 'old.txt': `a first line\n${content}`, 'other.txt': quiet }],
+      operation: i % 3 === 0 ? 'rebase' : 'merge',
+    });
+  }
+
   // Binary files, changed on one side and on both.
   for (let i = 0; i < 16; i += 1) {
     const both = i % 2 === 0;

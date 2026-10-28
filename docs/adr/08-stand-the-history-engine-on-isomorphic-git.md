@@ -58,11 +58,15 @@ real git binary exists.
 other edits it where it was, git follows the move and merges the edit;
 isomorphic-git sees an edit to a file that was deleted and conflicts. The
 engine therefore does the rename pass itself, before the merge: a path
-dropped on one side whose blob turns up at a path that side added is a
+dropped on one side that turns up at a path that side added is a
 rename, and the file is moved to that path in the base tree and in the
-other side's tree, so the library is given a plain modification. That is
-git's exact-rename pass; a path both sides moved is left alone, and the
-merge reports the conflict as git does. The corpus covers it.
+other side's tree, so the library is given a plain modification.
+Identical content pairs first, and what is left is paired by
+similarity at git's own default of half the larger file, because a file
+moved and edited in the one commit is still a move to git. A path both
+sides moved is left alone, and the merge reports the conflict as git
+does. The corpus covers it, from a move that changed nothing to one
+that rewrote all twelve lines.
 
 **Objects are deflated with `CompressionStream`**, which both Node and
 Workers have, so the adapter needs neither `node:zlib` nor pako of its own.
@@ -78,9 +82,12 @@ Workers have, so the adapter needs neither `node:zlib` nor pako of its own.
 - The merge arithmetic is isomorphic-git's, so a bug there is a bug here.
   The corpus is what would catch it.
 - Rename detection is the hub's own, matched to git by the corpus. It
-  matches on identical content, not on similarity, so a file moved and
-  edited in the same commit reads as a delete and an add, as it does for
-  git without `-M`'s similarity scoring.
+  scores a line at a time rather than with git's sliding hash, so a pair
+  near the threshold could in principle fall the other side of it; the
+  corpus walks a file across the whole range to hold that honest.
+- Scoring every dropped path against every added one is quadratic, so
+  past a thousand pairs the engine stops looking, as git does at a
+  rename limit of its own.
 - A tag object is not reconstructable from the Cloudflare binding's
   decoded reads, so the adapter reads commits, trees and blobs and refuses
   a tag object with a clear error. Nothing in the hub's contract merges a
