@@ -14,6 +14,16 @@ import type { Decider } from '../git/push.js';
 import { freshStore, seedClock } from './identity.js';
 import { providerIdentity, stubDirectory } from './oauth.js';
 
+/**
+ * What a suite that passed no fetch gets. Nothing in the fast gate
+ * may reach the network: a suite that does is not hermetic, and its
+ * result depends on whatever a proxy or a forge is doing at the time
+ * — which is how a passing suite becomes an intermittent one.
+ */
+const noNetwork: typeof fetch = () => {
+  throw new TypeError('this suite reached the network; give identityService a fetch of its own');
+};
+
 export const MOUNT = '/api/v1';
 export const ADMIN_TOKEN = 'af_admin_deployment_secret';
 export const EXTERNAL_URL = 'https://parley.test';
@@ -72,7 +82,7 @@ export async function identityService(
         externalUrl: options.externalUrl ?? EXTERNAL_URL,
         ...(options.repos === undefined ? {} : { repos: options.repos }),
         ...(jobs === undefined ? {} : { jobs }),
-        ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
+        fetch: options.fetch ?? noNetwork,
         locks,
         adminToken: ADMIN_TOKEN,
         ...(options.decideRef === undefined ? {} : { decideRef: options.decideRef }),
