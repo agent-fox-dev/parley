@@ -88,6 +88,9 @@ func (s *Server) pipeline(w http.ResponseWriter, r *http.Request, rt *Route) err
 			return err
 		}
 	}
+	if rt.Create && r.Method == http.MethodPost {
+		return s.runCreate(w, r, rt)
+	}
 	return rt.Handler(w, r)
 }
 

@@ -43,6 +43,9 @@ type Options struct {
 	// LogHealthProbes writes access-log lines, at debug level, for
 	// /healthz and /readyz.
 	LogHealthProbes bool
+	// IdempotencyStore keeps the records of create routes' answers for 24
+	// hours; nil means an in-memory store.
+	IdempotencyStore IdempotencyStore
 }
 
 // DefaultOptions returns the options with the product's defaults: listen on
@@ -66,6 +69,9 @@ type Server struct {
 	limiter *Limiter
 	logger  *slog.Logger
 
+	idem      IdempotencyStore
+	idemGates keyGates
+
 	routes []*compiledRoute
 	auth   Authenticator
 	guard  Check
@@ -85,6 +91,10 @@ func New(opts Options) *Server {
 	s.logger = opts.Logger
 	if s.logger == nil {
 		s.logger = slog.Default()
+	}
+	s.idem = opts.IdempotencyStore
+	if s.idem == nil {
+		s.idem = NewMemoryIdempotencyStore()
 	}
 	s.HandleFunc("GET /healthz", s.healthz)
 	s.HandleFunc("GET /readyz", s.readyz)
