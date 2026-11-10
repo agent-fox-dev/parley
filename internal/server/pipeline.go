@@ -56,18 +56,20 @@ func (s *Server) runPipeline(w http.ResponseWriter, r *http.Request, m *Match) {
 }
 
 func (s *Server) pipeline(w http.ResponseWriter, r *http.Request, rt *Route) error {
+	var caller *Caller
 	if !rt.Public {
-		if s.auth == nil {
-			return Unauthenticated("authentication is required")
-		}
-		caller, err := s.auth(r)
+		var err error
+		caller, err = s.authenticate(r)
 		if err != nil {
+			// A refused request still counts against its client address,
+			// but the authenticator's answer is the request's answer.
+			s.limiter.Allow(rateKey(r, nil))
 			return err
 		}
-		if caller == nil {
-			return Unauthenticated("authentication is required")
-		}
 		r = r.WithContext(context.WithValue(r.Context(), keyCaller, caller))
+	}
+	if err := s.checkRate(w, r, caller); err != nil {
+		return err
 	}
 	r, err := s.checkBody(r, rt)
 	if err != nil {
@@ -87,6 +89,22 @@ func (s *Server) pipeline(w http.ResponseWriter, r *http.Request, rt *Route) err
 		}
 	}
 	return rt.Handler(w, r)
+}
+
+// authenticate runs the installed authenticator; without one, every request
+// is refused.
+func (s *Server) authenticate(r *http.Request) (*Caller, error) {
+	if s.auth == nil {
+		return nil, Unauthenticated("authentication is required")
+	}
+	caller, err := s.auth(r)
+	if err != nil {
+		return nil, err
+	}
+	if caller == nil {
+		return nil, Unauthenticated("authentication is required")
+	}
+	return caller, nil
 }
 
 // writeFailure answers err: an *Error as its envelope, anything else as

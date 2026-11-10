@@ -128,3 +128,113 @@ func TestPipeline_ARequestBlockedInItsHandlerDoesNotHoldUpAnother(t *testing.T) 
 		t.Errorf("first request = %d, want 200", st)
 	}
 }
+
+func TestPipeline_TheFirstFailingCheckDecidesTheAnswer(t *testing.T) {
+	order := []string{"authentication", "feature check", "binding guard", "scope", "access", "handler"}
+	tests := []struct {
+		failing    string
+		status     int
+		errorType  string
+		body       []byte
+		exhaust    bool
+		wantPrefix int // how many entries of order ran
+	}{
+		{"authentication", 401, "unauthenticated", nil, false, 1},
+		{"rate limit", 429, "rate_limited", nil, true, 1},
+		{"body", 413, "payload_too_large", jsonOfSize(2 << 20), false, 1},
+		{"feature check", 503, "unavailable", nil, false, 2},
+		{"binding guard", 403, "token_bound", nil, false, 3},
+		{"scope", 403, "insufficient_scope", nil, false, 4},
+		{"access", 404, "not_found", nil, false, 5},
+		{"handler", 400, "invalid_request", nil, false, 6},
+		{"nothing", 201, "", nil, false, 6},
+	}
+	for _, tt := range tests {
+		t.Run(tt.failing, func(t *testing.T) {
+			log := &callLog{}
+			fail := func(name string, e *Error) error {
+				if tt.failing == name {
+					return e
+				}
+				return nil
+			}
+			opts := DefaultOptions()
+			opts.RequestsPerMinute = 1000
+			if tt.exhaust {
+				opts.RequestsPerMinute = 1
+			}
+			s := New(opts)
+			s.SetAuthenticator(func(r *http.Request) (*Caller, error) {
+				log.add("authentication")
+				if err := fail("authentication", Unauthenticated("no")); err != nil {
+					return nil, err
+				}
+				return &Caller{CredentialID: "k1", UserID: "u1"}, nil
+			})
+			s.SetBindingGuard(recordingCheck(log, "binding guard", fail("binding guard", TokenBound("bound"))))
+			s.SetScopeCheck(recordingCheck(log, "scope", fail("scope", InsufficientScope("scope"))))
+			s.AddAccessCheck(recordingCheck(log, "access", fail("access", NotFound("nope"))))
+			s.Register(Route{
+				Method: "POST", Pattern: "/things",
+				Feature: recordingCheck(log, "feature check", fail("feature check", Unavailable("off"))),
+				Handler: func(w http.ResponseWriter, r *http.Request) error {
+					log.add("handler")
+					if err := fail("handler", InvalidRequest("bad")); err != nil {
+						return err
+					}
+					WriteJSON(w, 201, map[string]any{})
+					return nil
+				},
+			})
+			h := s.Handler()
+			body := tt.body
+			if body == nil {
+				body = []byte("{}")
+			}
+			if tt.exhaust {
+				do(t, h, "POST", "/api/v1/things", bearer("a"), withBody(body))
+				log.reset()
+			}
+			r := do(t, h, "POST", "/api/v1/things", bearer("a"), withBody(body))
+			if r.status != tt.status {
+				t.Fatalf("status = %d, want %d: %s", r.status, tt.status, r.body)
+			}
+			if tt.errorType != "" && r.errorType(t) != tt.errorType {
+				t.Errorf("error_type = %q, want %q", r.errorType(t), tt.errorType)
+			}
+			if got, want := log.get(), order[:tt.wantPrefix]; fmt.Sprint(got) != fmt.Sprint(want) {
+				t.Errorf("calls = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+func TestPipeline_APublicRouteSkipsTheCallerChecksButKeepsLimits(t *testing.T) {
+	log := &callLog{}
+	opts := DefaultOptions()
+	opts.RequestsPerMinute = 2
+	s := New(opts)
+	s.SetAuthenticator(func(*http.Request) (*Caller, error) {
+		log.add("authentication")
+		return &Caller{CredentialID: "x"}, nil
+	})
+	s.SetBindingGuard(recordingCheck(log, "binding guard", nil))
+	s.SetScopeCheck(recordingCheck(log, "scope", nil))
+	s.AddAccessCheck(recordingCheck(log, "access", nil))
+	handler := &countingHandler{status: 200}
+	s.Register(Route{Method: "POST", Pattern: "/open", Public: true, Handler: handler.handle})
+	h := s.Handler()
+
+	if r := do(t, h, "POST", "/api/v1/open", jsonBody("{}")); r.status != 200 || handler.calls.Load() != 1 {
+		t.Fatalf("public POST = %d, want the handler's 200", r.status)
+	}
+	if calls := log.get(); len(calls) != 0 {
+		t.Errorf("checks ran on a public route: %v", calls)
+	}
+	if r := do(t, h, "POST", "/api/v1/open", withBody(jsonOfSize(int(DefaultBodyLimit)+1))); r.status != 413 {
+		t.Errorf("over-limit body = %d, want 413", r.status)
+	}
+	if r := do(t, h, "POST", "/api/v1/open", jsonBody("{}")); r.status != 429 {
+		t.Errorf("third request from the address = %d, want 429", r.status)
+	}
+}

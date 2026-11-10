@@ -31,12 +31,32 @@ type Options struct {
 	// BodyLimit is the largest request body in bytes a REST route accepts
 	// unless the route states its own; 0 or less means DefaultBodyLimit.
 	BodyLimit int64
+	// RequestsPerMinute is the rate limit per credential, or per client
+	// address without one; 0 turns the limit off. DefaultOptions sets 600.
+	RequestsPerMinute int
+	// Now is the server's clock; nil means time.Now.
+	Now func() time.Time
+}
+
+// DefaultOptions returns the options with the product's defaults: listen on
+// 0.0.0.0:8080, a shutdown grace of 15 seconds, a body limit of 1 MiB and
+// 600 requests per minute. The zero Options has no rate limit.
+func DefaultOptions() Options {
+	return Options{
+		Addr:              "0.0.0.0:8080",
+		ShutdownGrace:     15 * time.Second,
+		BodyLimit:         DefaultBodyLimit,
+		RequestsPerMinute: DefaultRequestsPerMinute,
+	}
 }
 
 // Server is parleyd's HTTP server.
 type Server struct {
 	opts Options
 	mux  *http.ServeMux
+
+	now     func() time.Time
+	limiter *Limiter
 
 	routes []*compiledRoute
 	auth   Authenticator
@@ -48,7 +68,12 @@ type Server struct {
 // New builds a server from its options and registers the health, readiness
 // and version routes.
 func New(opts Options) *Server {
-	s := &Server{opts: opts, mux: http.NewServeMux()}
+	now := opts.Now
+	if now == nil {
+		now = time.Now
+	}
+	s := &Server{opts: opts, mux: http.NewServeMux(), now: now}
+	s.limiter = NewLimiter(opts.RequestsPerMinute, now)
 	s.HandleFunc("GET /healthz", s.healthz)
 	s.HandleFunc("GET /readyz", s.readyz)
 	s.HandleFunc("GET /version", s.version)
