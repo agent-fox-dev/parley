@@ -317,3 +317,49 @@ func TestRun_ADuplicateMaintenanceTaskStopsTheStart(t *testing.T) {
 		t.Error("the hub listened")
 	}
 }
+
+func TestMaintenance_APassWithAFailingTaskKeepsTheHubRunning(t *testing.T) {
+	compose := withCompose(func(c *Composition) {
+		c.AddStep(store.Step{Name: "test.done", Target: store.Main, Apply: func(ctx context.Context, tx *sql.Tx) error {
+			_, err := tx.ExecContext(ctx, `CREATE TABLE done (task TEXT)`)
+			return err
+		}})
+		insert := func(name string) func(context.Context, *Runtime) error {
+			return func(ctx context.Context, rt *Runtime) error {
+				return rt.Store.Tx(ctx, func(tx *sql.Tx) error {
+					_, err := tx.ExecContext(ctx, `INSERT INTO done VALUES (?)`, name)
+					return err
+				})
+			}
+		}
+		c.AddTask("retention", insert("retention"))
+		c.AddTask("claim_cleanup", func(context.Context, *Runtime) error { return errors.New("cleanup failed at https://u:p@h/x") })
+		c.AddTask("fork_expiry", insert("fork_expiry"))
+	})
+	h := startHub(t, hubDir(t, loopbackConfig), nil, compose, func(o *Options) { o.MaintenanceInterval = 100 * time.Millisecond })
+	time.Sleep(350 * time.Millisecond)
+	db := h.rt.Load().Store.DB()
+	for _, task := range []string{"retention", "fork_expiry"} {
+		var n int
+		if err := db.QueryRow(`SELECT count(*) FROM done WHERE task = ?`, task).Scan(&n); err != nil || n < 3 {
+			t.Errorf("%s ran %d times, want at least 3 (%v)", task, n, err)
+		}
+	}
+	var failures int
+	for _, rec := range records(t, h.stderr.String()) {
+		if rec["level"] != "ERROR" {
+			continue
+		}
+		failures++
+		errText, _ := rec["error"].(string)
+		if rec["task"] != "claim_cleanup" || !strings.Contains(errText, "https://h/x") || strings.Contains(errText, "u:p") {
+			t.Errorf("error line %v", rec)
+		}
+	}
+	if failures < 3 {
+		t.Errorf("%d error lines, want at least 3", failures)
+	}
+	if code, _ := h.get("/healthz"); code != 200 {
+		t.Errorf("/healthz = %d", code)
+	}
+}
