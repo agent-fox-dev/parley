@@ -187,6 +187,10 @@ func parseArgs(args []string, stdout, stderr io.Writer) (flags, *int) {
 		fmt.Fprintf(stderr, "parleyd: backup takes exactly one directory\n\n%s", usage)
 		return f, exit(2)
 	}
+	if f.adminEmail != "" || f.resetToken {
+		fmt.Fprintf(stderr, "parleyd: --admin-email and --reset-admin-token cannot be used with backup\n\n%s", usage)
+		return f, exit(2)
+	}
 	f.backup = rest[1]
 	return f, nil
 }
@@ -219,7 +223,7 @@ func Run(ctx context.Context, opts Options) int {
 	}
 	r.logger = NewLogger(opts.Stderr, "info", r.scrubber)
 	if r.flags.backup != "" {
-		return r.fail(errors.New("parleyd backup is not available in this build"))
+		return r.backup(ctx)
 	}
 	return r.serve(ctx)
 }
