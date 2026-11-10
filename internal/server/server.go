@@ -34,6 +34,12 @@ type Options struct {
 type Server struct {
 	opts Options
 	mux  *http.ServeMux
+
+	routes []*compiledRoute
+	auth   Authenticator
+	guard  Check
+	scope  Check
+	access []Check
 }
 
 // New builds a server from its options and registers the health, readiness
@@ -46,8 +52,9 @@ func New(opts Options) *Server {
 	return s
 }
 
-// Handle registers a handler for a method-and-pattern route on the server's
-// router, as net/http.ServeMux reads patterns ("GET /healthz").
+// Handle registers a handler for a method-and-pattern route outside the REST
+// API on the server's router, as net/http.ServeMux reads patterns
+// ("GET /healthz"). REST routes are registered with Register.
 func (s *Server) Handle(pattern string, h http.Handler) { s.mux.Handle(pattern, h) }
 
 // HandleFunc registers a handler function for a method-and-pattern route.
@@ -55,8 +62,17 @@ func (s *Server) HandleFunc(pattern string, h func(http.ResponseWriter, *http.Re
 	s.mux.HandleFunc(pattern, h)
 }
 
-// Handler returns the server's HTTP handler.
-func (s *Server) Handler() http.Handler { return s.mux }
+// Handler returns the server's HTTP handler: the REST API under APIPrefix and
+// every other surface registered with Handle.
+func (s *Server) Handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isAPIPath(r.URL.Path) {
+			s.serveAPI(w, r)
+			return
+		}
+		s.serveSurface(w, r)
+	})
+}
 
 // connTracker records the state of every connection the server holds.
 type connTracker struct {
