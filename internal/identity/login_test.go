@@ -474,7 +474,10 @@ func TestCallback_AFailingProviderIsAnUpstreamErrorThatLeaksNothing(t *testing.T
 	}{
 		{"token 503", func(f *fakeProvider) { f.set("/token", 503, `boom-body`) }, time.Second},
 		{"token too slow", func(f *fakeProvider) { answerIdentity(f); f.delayed("/token", 500*time.Millisecond) }, 50 * time.Millisecond},
-		{"user 500", func(f *fakeProvider) { f.set("/token", 200, `{"access_token":"at-1"}`); f.set("/user", 500, `boom-body`) }, time.Second},
+		{"user 500", func(f *fakeProvider) {
+			f.set("/token", 200, `{"access_token":"at-1"}`)
+			f.set("/user", 500, `boom-body`)
+		}, time.Second},
 		{"user without id", func(f *fakeProvider) {
 			f.set("/token", 200, `{"access_token":"at-1"}`)
 			f.set("/user", 200, `{"login":"x","email":"x@y"}`)
