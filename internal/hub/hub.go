@@ -16,7 +16,6 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/config"
@@ -53,6 +52,9 @@ type Options struct {
 	OnRuntime func(*Runtime)
 	// MaintenanceInterval replaces maintenance.Interval between passes.
 	MaintenanceInterval time.Duration
+	// TotalGrace replaces DefaultTotalGrace, LoopGrace DefaultLoopGrace.
+	TotalGrace time.Duration
+	LoopGrace  time.Duration
 }
 
 // Option changes Options; cmd/parleyd's tests pass them through its run
@@ -68,6 +70,8 @@ type Runtime struct {
 	Logger   *slog.Logger
 	Scrubber *scrub.Scrubber
 	Now      func() time.Time
+
+	shutdown chan struct{}
 }
 
 // StartHook is a piece of durable work resumed at start, before the
@@ -91,6 +95,7 @@ type Composition struct {
 	steps   []store.Step
 	hooks   []StartHook
 	tasks   []Task
+	work    []Work
 	servers []func(*Runtime, *server.Server) error
 }
 
@@ -266,7 +271,7 @@ func (r *hubRun) serve(ctx context.Context) int {
 		return r.fail(err)
 	}
 	r.st = st
-	r.rt = &Runtime{Config: r.cfg, Store: st, Logger: r.logger, Scrubber: r.scrubber, Now: r.now}
+	r.rt = &Runtime{Config: r.cfg, Store: st, Logger: r.logger, Scrubber: r.scrubber, Now: r.now, shutdown: make(chan struct{})}
 	if r.opts.OnRuntime != nil {
 		r.opts.OnRuntime(r.rt)
 	}
@@ -284,27 +289,48 @@ func (r *hubRun) serve(ctx context.Context) int {
 
 	workCtx, stopWork := context.WithCancel(context.WithoutCancel(ctx))
 	defer stopWork()
-	maintenance := r.startMaintenance(workCtx)
+	pieces := []running{r.startMaintenance(workCtx)}
+	pieces = append(pieces, r.startWork(workCtx)...)
 
 	srv, err := r.buildServer()
 	if err != nil {
 		stopWork()
-		maintenance.Wait()
+		r.waitStopped(time.Now(), pieces)
 		return r.fail(err)
 	}
-	r.rt.Server = srv
-	err = srv.Serve(ctx, func(bound net.Addr) {
+
+	// The signal (ctx) fires the shutdown notification, cancels the
+	// background work and the loop, and then stops the server, which stops
+	// accepting connections and gives requests their grace.
+	serveCtx, stopServe := context.WithCancel(context.WithoutCancel(ctx))
+	defer stopServe()
+	signalled := make(chan time.Time, 1)
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-serveCtx.Done():
+			return
+		}
+		at := time.Now()
+		close(r.rt.shutdown)
+		stopWork()
+		stopServe()
+		signalled <- at
+	}()
+	err = srv.Serve(serveCtx, func(bound net.Addr) {
 		_, port, _ := net.SplitHostPort(bound.String())
 		r.logger.Info("listening",
 			"addr", net.JoinHostPort(r.cfg.Server.Bind, port),
 			"config", r.cfg.Path,
 			"data_dir", r.cfg.DataDir())
 	})
-	stopWork()
-	maintenance.Wait()
 	if err != nil {
+		stopServe()
+		stopWork()
+		r.waitStopped(time.Now(), pieces)
 		return r.fail(fmt.Errorf("cannot listen on %s: %w", listenAddr(r.cfg), err))
 	}
+	r.waitStopped(<-signalled, pieces)
 	r.closeStore()
 	return 0
 }
@@ -318,20 +344,19 @@ func (r *hubRun) closeStore() {
 
 // startMaintenance starts the maintenance loop in the background, after the
 // start hooks and without waiting for its first pass.
-func (r *hubRun) startMaintenance(ctx context.Context) *sync.WaitGroup {
+func (r *hubRun) startMaintenance(ctx context.Context) running {
 	interval := maintenance.Interval
 	if r.opts.MaintenanceInterval > 0 {
 		interval = r.opts.MaintenanceInterval
 	}
 	ticker := time.NewTicker(interval)
-	var wg sync.WaitGroup
-	wg.Add(1)
+	loop := running{name: "maintenance", grace: r.loopGrace(), done: make(chan struct{})}
 	go func() {
-		defer wg.Done()
+		defer close(loop.done)
 		defer ticker.Stop()
 		maintenance.New(r.tasks, r.logger).Run(ctx, ticker.C)
 	}()
-	return &wg
+	return loop
 }
 
 // registerTasks puts the composition's tasks into the loop's registry; a
@@ -369,10 +394,7 @@ func ServerOptions(cfg *config.Config, st *store.Store) server.Options {
 // mount its routes and checks.
 func (r *hubRun) buildServer() (*server.Server, error) {
 	opts := ServerOptions(r.cfg, r.st)
-	opts.ShutdownGrace = DefaultRequestGrace
-	if r.opts.RequestGrace > 0 {
-		opts.ShutdownGrace = r.opts.RequestGrace
-	}
+	opts.ShutdownGrace = r.requestGrace()
 	opts.Now = r.now
 	opts.Logger = r.logger
 	opts.IdempotencyStore = idempotencyStore{st: r.st}

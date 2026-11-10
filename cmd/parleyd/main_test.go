@@ -408,3 +408,38 @@ func TestRun_HelpNamesTheFlagsAndTheBackupCommand(t *testing.T) {
 		t.Errorf("created %v", names)
 	}
 }
+
+func TestRun_ASecondSignalDoesNotRestartTheShutdown(t *testing.T) {
+	block := make(chan struct{})
+	defer close(block)
+	stubborn := func(o *phub.Options) {
+		o.RequestGrace, o.TotalGrace = 150*time.Millisecond, 300*time.Millisecond
+		o.Compose = func(c *phub.Composition) {
+			c.AddWork("stubborn", 200*time.Millisecond, func(context.Context, *phub.Runtime) { <-block })
+		}
+	}
+	stderr := &syncBuffer{}
+	code := make(chan int, 1)
+	go func() { code <- run(context.Background(), nil, noEnv, configDir(t, 0), io.Discard, stderr, stubborn) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(stderr.String(), `"msg":"listening"`) {
+		if time.Now().After(deadline) {
+			t.Fatalf("no listening line: %s", stderr.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t0 := time.Now()
+	if err := syscall.Kill(syscall.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if err := syscall.Kill(syscall.Getpid(), syscall.SIGINT); err != nil {
+		t.Fatal(err)
+	}
+	if c := waitCode(t, code, 2*time.Second); c != 0 {
+		t.Fatalf("exit %d, want 0", c)
+	}
+	if d := time.Since(t0); d < 200*time.Millisecond || d >= 1200*time.Millisecond {
+		t.Errorf("exit after %v, want within [200 ms, 1200 ms)", d)
+	}
+}

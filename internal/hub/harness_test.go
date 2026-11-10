@@ -134,7 +134,14 @@ func (h *runningHub) wait(within time.Duration) int {
 // listening line.
 func startHub(t *testing.T, dir string, env map[string]string, opts ...Option) *runningHub {
 	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
+	return startHubWith(t, context.Background(), dir, env, opts...)
+}
+
+// startHubWith is startHub with a parent context (one that a signal
+// cancels, for instance).
+func startHubWith(t *testing.T, parent context.Context, dir string, env map[string]string, opts ...Option) *runningHub {
+	t.Helper()
+	ctx, cancel := context.WithCancel(parent)
 	h := &runningHub{t: t, stdout: &syncBuffer{}, stderr: &syncBuffer{}, done: make(chan struct{}), cancel: cancel}
 	o := Options{Env: config.MapEnv(env), WorkDir: dir, Stdout: h.stdout, Stderr: h.stderr,
 		OnRuntime: func(rt *Runtime) { h.rt.Store(rt) }}
