@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/buildinfo"
@@ -57,6 +58,35 @@ func (s *Server) HandleFunc(pattern string, h func(http.ResponseWriter, *http.Re
 
 // Handler returns the server's HTTP handler.
 func (s *Server) Handler() http.Handler { return s.mux }
+
+// connTracker records the state of every connection the server holds.
+type connTracker struct {
+	mu     sync.Mutex
+	states map[net.Conn]http.ConnState
+}
+
+func (c *connTracker) track(conn net.Conn, state http.ConnState) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch state {
+	case http.StateClosed, http.StateHijacked:
+		delete(c.states, conn)
+	default:
+		c.states[conn] = state
+	}
+}
+
+// closeUnused closes every connection that has not read a byte of a request.
+func (c *connTracker) closeUnused() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for conn, state := range c.states {
+		if state == http.StateNew {
+			// A failed close leaves a connection Shutdown ends at its grace.
+			_ = conn.Close()
+		}
+	}
+}
 
 type statusDoc struct {
 	Status string `json:"status"`
@@ -111,7 +141,8 @@ func (s *Server) Serve(ctx context.Context, onListen func(net.Addr)) error {
 		onListen(ln.Addr())
 	}
 
-	hs := &http.Server{Handler: s.Handler(), ReadHeaderTimeout: 30 * time.Second}
+	conns := &connTracker{states: map[net.Conn]http.ConnState{}}
+	hs := &http.Server{Handler: s.Handler(), ReadHeaderTimeout: 30 * time.Second, ConnState: conns.track}
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- hs.Serve(ln) }()
 
@@ -123,11 +154,26 @@ func (s *Server) Serve(ctx context.Context, onListen func(net.Addr)) error {
 
 	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.opts.ShutdownGrace)
 	defer cancel()
-	if err := hs.Shutdown(shutdownCtx); err != nil {
-		// The grace passed with requests still running: close their
-		// connections. Close only fails with the listener's close error,
-		// and the listener is already closed by Shutdown.
-		_ = hs.Close()
+	shutdownErr := make(chan error, 1)
+	go func() { shutdownErr <- hs.Shutdown(shutdownCtx) }()
+	// Shutdown waits for connections that have not read a byte yet (a
+	// client's spare keep-alive dial) as if they were requests; they carry
+	// none, so close them while it runs.
+	sweep := time.NewTicker(10 * time.Millisecond)
+	defer sweep.Stop()
+	for done := false; !done; {
+		conns.closeUnused()
+		select {
+		case err := <-shutdownErr:
+			done = true
+			if err != nil {
+				// The grace passed with requests still running: close their
+				// connections. Close only fails with the listener's close
+				// error, and Shutdown already closed the listener.
+				_ = hs.Close()
+			}
+		case <-sweep.C:
+		}
 	}
 	// After Shutdown or Close, Serve returns http.ErrServerClosed.
 	if err := <-serveErr; !errors.Is(err, http.ErrServerClosed) {

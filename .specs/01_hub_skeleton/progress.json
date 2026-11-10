@@ -3,7 +3,7 @@
   "spec_id": "01",
   "spec_name": "hub_skeleton",
   "schema_version": 3,
-  "updated_at": "2026-11-10T21:01:15Z",
+  "updated_at": "2026-11-10T21:03:00Z",
   "tasks": [
     {
       "id": 1,
@@ -19,7 +19,7 @@
     },
     {
       "id": 4,
-      "state": "pending"
+      "state": "done"
     }
   ]
 }

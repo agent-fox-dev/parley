@@ -340,3 +340,27 @@ func TestServe_ClosesARequestStillRunningWhenTheGracePasses(t *testing.T) {
 		t.Error("the stuck request's connection was not closed")
 	}
 }
+
+func TestServe_AConnectionWithoutARequestDoesNotHoldTheStop(t *testing.T) {
+	addr, cancel, done := startServer(t, New(Options{Addr: "127.0.0.1:0", ShutdownGrace: 5 * time.Second}))
+	idle, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idle.Close()
+	time.Sleep(20 * time.Millisecond) // let the server accept it
+
+	t0 := time.Now()
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve returned %v, want nil", err)
+		}
+	case <-time.After(6 * time.Second):
+		t.Fatal("Serve did not return")
+	}
+	if elapsed := time.Since(t0); elapsed >= time.Second {
+		t.Errorf("Serve took %v to stop with no request in flight, want under 1 s", elapsed)
+	}
+}

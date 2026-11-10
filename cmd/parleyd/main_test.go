@@ -8,12 +8,15 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/cli"
 	"github.com/agent-fox-dev/parley/internal/server"
 )
 
@@ -251,5 +254,61 @@ func TestRun_ExitsZeroWhenTheGracePassesWithARequestInFlight(t *testing.T) {
 	}
 	if c := waitCode(t, hub.code, 1100*time.Millisecond); c != 0 {
 		t.Fatalf("run returned %d after the grace passed, want 0", c)
+	}
+}
+
+func TestHub_StartReadVersionAndStop(t *testing.T) {
+	t.Setenv("PARLEY_ENDPOINT_URL", "")
+	hub := startHub(t, time.Second)
+	base := "http://" + hub.addr
+
+	for _, path := range []string{"/healthz", "/readyz"} {
+		resp, err := http.Get(base + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s status = %d, want 200", path, resp.StatusCode)
+		}
+	}
+
+	resp, err := http.Get(base + "/version")
+	if err != nil {
+		t.Fatalf("GET /version: %v", err)
+	}
+	var want map[string]any
+	err = json.NewDecoder(resp.Body).Decode(&want)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatalf("GET /version body: %v", err)
+	}
+
+	var stdout, cliStderr bytes.Buffer
+	if code := cli.Run(context.Background(), []string{"version", "--endpoint-url", base}, &stdout, &cliStderr); code != 0 {
+		t.Fatalf("parley version returned %d; stderr: %s", code, cliStderr.String())
+	}
+	var doc struct {
+		Server map[string]any `json:"server"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &doc); err != nil {
+		t.Fatalf("parley version printed %q: %v", stdout.String(), err)
+	}
+	if !reflect.DeepEqual(doc.Server, want) {
+		t.Errorf("server = %v, want the body GET /version returned: %v", doc.Server, want)
+	}
+	if doc.Server["go_version"] != runtime.Version() {
+		t.Errorf("server.go_version = %v, want %s", doc.Server["go_version"], runtime.Version())
+	}
+
+	if err := syscall.Kill(syscall.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	if c := waitCode(t, hub.code, time.Second); c != 0 {
+		t.Fatalf("run returned %d after SIGTERM, want 0", c)
+	}
+	if c, err := net.Dial("tcp", hub.addr); err == nil {
+		c.Close()
+		t.Fatalf("a connection to %s was accepted after the hub stopped", hub.addr)
 	}
 }
