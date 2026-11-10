@@ -1,0 +1,17 @@
+coverage.txt
+
+# Build output
+/build/
+bin/
+
+# own stuff
+hack/
+prompts.md
+stuff.md
+docs/prd/proposals/*
+
+# local test files and secrets
+admin_token
+**/config.toml
+.env
+/secrets/

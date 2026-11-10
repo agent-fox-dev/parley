@@ -1,0 +1,34 @@
+version: "2"
+
+linters:
+  settings:
+    errcheck:
+      exclude-functions:
+        - (net/http.ResponseWriter).Write
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - os.RemoveAll
+        # Repository-specific: cleanup calls whose error has no recovery.
+        - (*database/sql.Rows).Close
+        - (*database/sql.Tx).Rollback
+        - (*database/sql.DB).Close
+        - (*os.File).Close
+    staticcheck:
+      checks:
+        - "all"
+        - "-QF*"
+        - "-ST*"
+
+  exclusions:
+    rules:
+      - linters: [errcheck]
+        source: "defer "
+      - linters: [errcheck]
+        path: "_test\\.go"
+        source: "\\.Close\\(\\)"
+      # Repository-specific: the test code predates the linter and ignores
+      # errors and leaves helpers unused in many places. Production code is held
+      # to the full rule set above.
+      - linters: [errcheck, unused]
+        path: "_test\\.go"
