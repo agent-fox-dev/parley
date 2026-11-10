@@ -93,3 +93,21 @@ func TestProviders_AConfiguredAuthorizeURLReplacesThePublicOne(t *testing.T) {
 		t.Errorf("items = %v", r.doc["items"])
 	}
 }
+
+func TestPublicRoutes_AnswerWhateverCredentialIsSent(t *testing.T) {
+	h := newTestHub(t)
+	alice := h.seedUser("alice")
+	revoked, revokedID := h.issueKey(alice.ID)
+	h.exec(`UPDATE api_keys SET revoked_at = 1 WHERE key_id = ?`, revokedID)
+	h.withRoutes(nil, config.Provider{Name: "github", ClientID: "gh-id", ClientSecret: "s"})
+	plain := h.get("/api/v1/auth/providers", "")
+	for _, auth := range []string{"", "Bearer hello", bearer(revoked), "Basic x"} {
+		r := h.get("/api/v1/auth/providers", auth)
+		if r.status != 200 || r.body != plain.body {
+			t.Errorf("%q: %d %s", auth, r.status, r.body)
+		}
+	}
+	if r := h.do("POST", "/api/v1/auth/callback", "Bearer hello", `{}`); r.status != 400 {
+		t.Errorf("callback with a bad credential: %d %s", r.status, r.body)
+	}
+}

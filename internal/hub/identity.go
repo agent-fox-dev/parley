@@ -19,10 +19,11 @@ func composeIdentity(c *Composition) {
 		srv.SetAuthenticator(identity.NewAuthenticator(rt.Store, rt.Now))
 		providers := identity.ProvidersFrom(rt.Config.OAuth.Providers)
 		routes := &identity.Routes{
-			Providers: providers,
-			Store:     rt.Store,
-			Reader:    identity.NewOAuthClient(providers, http.DefaultClient, identity.DefaultProviderTimeout),
-			Now:       rt.Now,
+			Providers:   providers,
+			Store:       rt.Store,
+			Reader:      identity.NewOAuthClient(providers, http.DefaultClient, identity.DefaultProviderTimeout),
+			Now:         rt.Now,
+			ExternalURL: rt.Config.Server.ExternalURL,
 		}
 		routes.Register(srv)
 		return nil

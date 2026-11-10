@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -353,5 +354,159 @@ func TestCallback_ARefreshedEmailOfAnotherUserIsAConflict(t *testing.T) {
 	}
 	if r := l.get("/api/v1/test/whoami", bearer(l.key)); r.status != 200 {
 		t.Errorf("alice's key: %d", r.status)
+	}
+}
+
+// withProviderLogin mounts the routes with the real OAuth client against
+// the fake provider, configured as github.
+func (h *testHub) withProviderLogin(f *fakeProvider, timeout time.Duration, externalURL string) {
+	h.t.Helper()
+	providers := ProvidersFrom([]config.Provider{f.provider("github")})
+	rs := &Routes{Providers: providers, Store: h.st, Reader: NewOAuthClient(providers, nil, timeout), Now: h.clock.Now, ExternalURL: externalURL}
+	rs.Register(h.srv)
+}
+
+// answerIdentity makes the fake answer a complete, new identity per code.
+func answerIdentity(f *fakeProvider) {
+	f.set("/token", 200, `{"access_token":"at-1"}`)
+	f.set("/user", 200, `{"id":123,"login":"alice","email":"a@x"}`)
+}
+
+func TestCallback_AnInvalidBodyIsRefusedBeforeTheProvider(t *testing.T) {
+	bodies := []struct {
+		body string
+		ok   bool
+	}{
+		{`{"code":"c","redirect_uri":"http://127.0.0.1:5000/callback"}`, false},
+		{`{"provider":"github","redirect_uri":"http://127.0.0.1:5000/callback"}`, false},
+		{`{"provider":"github","code":"c"}`, false},
+		{`{"provider":"github","code":"","redirect_uri":"http://127.0.0.1:5000/callback"}`, false},
+		{`{"provider":"gitlab","code":"c","redirect_uri":"http://127.0.0.1:5000/callback"}`, false},
+		{`{"provider":"google","code":"c","redirect_uri":"http://127.0.0.1:5000/callback"}`, false},
+		{`{"provider":7,"code":"c","redirect_uri":"http://127.0.0.1:5000/callback"}`, false},
+		{`{"provider":"github","code":"c","redirect_uri":"http://127.0.0.1:5000/callback","expires":45}`, false},
+		{`{"provider":"github","code":"c","redirect_uri":"http://127.0.0.1:5000/callback","expires":-1}`, false},
+		{`{"provider":"github","code":"c","redirect_uri":"http://127.0.0.1:5000/callback","expires":"90"}`, false},
+		{`{"provider":"github","code":"c","redirect_uri":"http://127.0.0.1:5000/callback","expires":1.5}`, false},
+		{`{"provider":"github","code":"c","redirect_uri":"http://127.0.0.1:5000/callback","expires":null}`, true},
+	}
+	for _, b := range bodies {
+		h := newTestHub(t)
+		f := newFakeProvider(t)
+		answerIdentity(f)
+		h.withProviderLogin(f, time.Second, "")
+		r := h.callback(b.body)
+		if b.ok {
+			if r.status != 200 {
+				t.Errorf("%s: %d %s", b.body, r.status, r.body)
+			}
+			continue
+		}
+		if r.status != 400 || r.errorMember("error_type") != "invalid_request" {
+			t.Errorf("%s: %d %s", b.body, r.status, r.body)
+		}
+		if n := len(f.requests()); n != 0 {
+			t.Errorf("%s: the provider got %d requests", b.body, n)
+		}
+		if c := h.counts(); c[0] != 0 || c[3] != 0 {
+			t.Errorf("%s: counts %v", b.body, c)
+		}
+	}
+}
+
+func TestCallback_OnlyLoopbackAndTheHubsOwnRedirectsAreAllowed(t *testing.T) {
+	accepted := []string{"http://127.0.0.1:5000/callback", "http://localhost:8123/x/y", "http://localhost/callback",
+		"https://hub.example.com/cli/done", "https://hub.example.com:443/x"}
+	refused := []string{"https://127.0.0.1:5000/callback", "https://localhost/x", "http://hub.example.com/x", "https://hub.example.com:8443/x",
+		"https://evil.example/x", "http://127.0.0.1.evil.example/x", "http://localhost@evil.example/x", "http://[::1]:5000/callback",
+		"callback", "", "://"}
+	check := func(externalURL, uri string, ok bool) {
+		t.Helper()
+		h := newTestHub(t)
+		f := newFakeProvider(t)
+		answerIdentity(f)
+		h.withProviderLogin(f, time.Second, externalURL)
+		r := h.callback(fmt.Sprintf(`{"provider":"github","code":"c","redirect_uri":%q}`, uri))
+		calls := f.requests()
+		if ok {
+			if r.status != 200 || len(calls) == 0 || calls[0].form.Get("redirect_uri") != uri {
+				t.Errorf("%q with %q: %d %s", uri, externalURL, r.status, r.body)
+			}
+			return
+		}
+		if r.status != 400 || r.errorMember("error_type") != "invalid_request" || len(calls) != 0 {
+			t.Errorf("%q with %q: %d %s, %d provider calls", uri, externalURL, r.status, r.body, len(calls))
+		}
+	}
+	for _, u := range accepted {
+		check("https://hub.example.com", u, true)
+	}
+	for _, u := range refused {
+		check("https://hub.example.com", u, false)
+	}
+	check("", "https://hub.example.com/x", false)
+	check("", "http://127.0.0.1:1/c", true)
+}
+
+func TestCallback_ACodeTheProviderRejectsIsUnauthenticated(t *testing.T) {
+	h := newTestHub(t)
+	alice := h.seedUser("alice")
+	_, k1 := h.issueKey(alice.ID)
+	f := newFakeProvider(t)
+	f.set("/token", 200, `{"error":"bad_verification_code"}`)
+	h.withProviderLogin(f, time.Second, "")
+	r := h.callback(loginBody)
+	if r.status != 401 || r.errorMember("error_type") != "unauthenticated" {
+		t.Fatalf("%d %s", r.status, r.body)
+	}
+	var revoked sql.NullInt64
+	h.st.DB().QueryRow(`SELECT revoked_at FROM api_keys WHERE key_id = ?`, k1).Scan(&revoked)
+	if c := h.counts(); c[0] != 1 || revoked.Valid {
+		t.Errorf("counts %v, k1 revoked %v", c, revoked.Valid)
+	}
+}
+
+func TestCallback_AFailingProviderIsAnUpstreamErrorThatLeaksNothing(t *testing.T) {
+	cases := []struct {
+		name    string
+		arrange func(f *fakeProvider)
+		timeout time.Duration
+	}{
+		{"token 503", func(f *fakeProvider) { f.set("/token", 503, `boom-body`) }, time.Second},
+		{"token too slow", func(f *fakeProvider) { answerIdentity(f); f.delayed("/token", 500*time.Millisecond) }, 50 * time.Millisecond},
+		{"user 500", func(f *fakeProvider) { f.set("/token", 200, `{"access_token":"at-1"}`); f.set("/user", 500, `boom-body`) }, time.Second},
+		{"user without id", func(f *fakeProvider) {
+			f.set("/token", 200, `{"access_token":"at-1"}`)
+			f.set("/user", 200, `{"login":"x","email":"x@y"}`)
+		}, time.Second},
+		{"hidden e-mail without a primary verified one", func(f *fakeProvider) {
+			f.set("/token", 200, `{"access_token":"at-1"}`)
+			f.set("/user", 200, `{"id":9,"login":"x","email":null}`)
+			f.set("/user/emails", 200, `[{"email":"x@y","primary":true,"verified":false}]`)
+		}, time.Second},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			h := newTestHub(t)
+			alice := h.seedUser("alice")
+			_, k1 := h.issueKey(alice.ID)
+			f := newFakeProvider(t)
+			c.arrange(f)
+			h.withProviderLogin(f, c.timeout, "")
+			r := h.callback(`{"provider":"github","code":"code-1","redirect_uri":"http://127.0.0.1:5000/callback"}`)
+			if r.status != 502 || r.errorMember("error_type") != "upstream_error" {
+				t.Fatalf("%d %s", r.status, r.body)
+			}
+			for _, secret := range []string{"code-1", "gh-secret", "at-1", "boom-body"} {
+				if strings.Contains(r.body, secret) {
+					t.Errorf("the answer carries %s: %s", secret, r.body)
+				}
+			}
+			var revoked sql.NullInt64
+			h.st.DB().QueryRow(`SELECT revoked_at FROM api_keys WHERE key_id = ?`, k1).Scan(&revoked)
+			if n := h.counts(); n[0] != 1 || revoked.Valid {
+				t.Errorf("counts %v, k1 revoked %v", n, revoked.Valid)
+			}
+		})
 	}
 }
