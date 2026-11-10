@@ -69,6 +69,10 @@ func (s *Server) pipeline(w http.ResponseWriter, r *http.Request, rt *Route) err
 		}
 		r = r.WithContext(context.WithValue(r.Context(), keyCaller, caller))
 	}
+	r, err := s.checkBody(r, rt)
+	if err != nil {
+		return err
+	}
 	checks := []Check{rt.Feature}
 	if !rt.Public {
 		checks = append(checks, s.guard, s.scope)

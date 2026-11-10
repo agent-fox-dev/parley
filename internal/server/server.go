@@ -28,6 +28,9 @@ type Options struct {
 	// ReadinessProbes are called on every GET /readyz; the hub is ready when
 	// all of them return nil, and when none is registered.
 	ReadinessProbes []Probe
+	// BodyLimit is the largest request body in bytes a REST route accepts
+	// unless the route states its own; 0 or less means DefaultBodyLimit.
+	BodyLimit int64
 }
 
 // Server is parleyd's HTTP server.

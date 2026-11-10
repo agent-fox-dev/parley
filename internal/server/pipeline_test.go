@@ -128,4 +128,3 @@ func TestPipeline_ARequestBlockedInItsHandlerDoesNotHoldUpAnother(t *testing.T) 
 		t.Errorf("first request = %d, want 200", st)
 	}
 }
-
