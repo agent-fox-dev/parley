@@ -51,6 +51,9 @@ type Call struct {
 	Args   map[string]string
 	Stdout io.Writer
 	Stderr io.Writer
+	// Client sends the command's requests; nil for a command whose auth is
+	// none.
+	Client *Client
 }
 
 // The keys of a declaration in the cobra command's Annotations.
@@ -105,6 +108,15 @@ func Declare(s Spec) *cobra.Command {
 			call := &Call{Ctx: cmd.Context(), Cmd: cmd, Args: map[string]string{}, Stdout: cmd.OutOrStdout(), Stderr: cmd.ErrOrStderr()}
 			for i, v := range args {
 				call.Args[s.Args[i].Name] = v
+			}
+			if s.Auth == AuthUser || s.Auth == AuthAdmin {
+				hub, cred, err := resolveSettings(cmd)
+				if err != nil {
+					return err
+				}
+				if call.Client, err = newClient(hub, cred); err != nil {
+					return err
+				}
 			}
 			if s.Run == nil {
 				return nil

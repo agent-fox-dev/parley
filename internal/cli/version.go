@@ -46,7 +46,7 @@ func newVersionCommand(flags *globalFlags) *cobra.Command {
 		Run: func(c *Call) error {
 			info := buildinfo.Get()
 			doc := versionDoc{CLI: clientBuild{Version: info.Version, Commit: info.Commit}}
-			if hub := hubURL(flags); hub != "" {
+			if hub := versionHubURL(flags, c.Stderr); hub != "" {
 				server, err := fetchServerBuild(c.Ctx, hub)
 				if err != nil {
 					fmt.Fprintf(c.Stderr, "warning: cannot read the hub's version from %s: %v\n", hub, err)
@@ -59,13 +59,19 @@ func newVersionCommand(flags *globalFlags) *cobra.Command {
 	})
 }
 
-// hubURL is the first non-empty value of --endpoint-url and
-// PARLEY_ENDPOINT_URL.
-func hubURL(flags *globalFlags) string {
-	if flags.endpointURL != "" {
-		return flags.endpointURL
+// versionHubURL is the first non-empty value of --endpoint-url,
+// PARLEY_ENDPOINT_URL and the configuration file's endpoint_url. A file that
+// cannot be read is one warning, and the command goes on without it.
+func versionHubURL(flags *globalFlags, stderr io.Writer) string {
+	if hub := firstNonEmpty(flags.endpointURL, os.Getenv("PARLEY_ENDPOINT_URL")); hub != "" {
+		return hub
 	}
-	return os.Getenv("PARLEY_ENDPOINT_URL")
+	file, err := readConfig()
+	if err != nil {
+		fmt.Fprintf(stderr, "warning: %v\n", err)
+		return ""
+	}
+	return file.EndpointURL
 }
 
 // fetchServerBuild sends GET <hub>/version without a credential and decodes

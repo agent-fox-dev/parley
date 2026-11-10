@@ -98,17 +98,29 @@ func runCLI(t *testing.T, stdin string, args ...string) cliResult {
 	return cliResult{code, out.String(), errb.String()}
 }
 
-// envelope parses the error envelope on stderr (the last JSON document).
+// envelope parses the error envelope on stderr: the last JSON document,
+// after any plain text lines.
 func (r cliResult) envelope(t *testing.T) map[string]any {
 	t.Helper()
-	lines := strings.Split(strings.TrimSpace(r.stderr), "\n")
-	var doc struct {
-		Error map[string]any `json:"error"`
+	text := r.stderr
+	if i := strings.Index(text, "{"); i >= 0 {
+		text = text[i:]
 	}
-	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &doc); err != nil || doc.Error == nil {
-		t.Fatalf("stderr %q is not an error envelope", r.stderr)
+	dec := json.NewDecoder(strings.NewReader(text))
+	var last map[string]any
+	for {
+		var doc struct {
+			Error map[string]any `json:"error"`
+		}
+		if err := dec.Decode(&doc); err != nil {
+			break
+		}
+		last = doc.Error
 	}
-	return doc.Error
+	if last == nil {
+		t.Fatalf("stderr %q holds no error envelope", r.stderr)
+	}
+	return last
 }
 
 func readTOML(t *testing.T, path string) map[string]any {

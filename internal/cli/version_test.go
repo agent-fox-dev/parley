@@ -7,6 +7,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -59,6 +61,7 @@ func (h *fakeHub) requests() []recordedRequest {
 }
 
 func TestVersion_PrintsClientAndHubBuilds(t *testing.T) {
+	t.Setenv("PARLEY_CONFIG_DIR", t.TempDir())
 	a := newFakeHub(t, "1.0.0-a")
 	b := newFakeHub(t, "2.0.0-b")
 	unset := "\x00unset"
@@ -124,6 +127,7 @@ func TestVersion_PrintsClientAndHubBuilds(t *testing.T) {
 }
 
 func TestVersion_WithoutAHubURLPrintsTheClientAlone(t *testing.T) {
+	t.Setenv("PARLEY_CONFIG_DIR", t.TempDir())
 	setBuild(t, "1.4.0", "3f2a1bc")
 	tests := []struct {
 		name   string
@@ -154,6 +158,7 @@ func TestVersion_WithoutAHubURLPrintsTheClientAlone(t *testing.T) {
 }
 
 func TestVersion_WarnsAndOmitsTheServerWhenTheHubCannotBeRead(t *testing.T) {
+	t.Setenv("PARLEY_CONFIG_DIR", t.TempDir())
 	if versionTimeout != 5*time.Second {
 		t.Errorf("default version timeout = %v, want 5 s", versionTimeout)
 	}
@@ -218,5 +223,50 @@ func TestVersion_WarnsAndOmitsTheServerWhenTheHubCannotBeRead(t *testing.T) {
 				t.Errorf("stderr = %q, want one warning line naming %s", stderr.String(), tt.hub)
 			}
 		})
+	}
+}
+
+func TestVersion_TheConfigurationFileIsTheThirdSourceOfTheHubURL(t *testing.T) {
+	fileHub := newFakeHub(t, "3.0.0-file")
+	otherHub := newFakeHub(t, "4.0.0-other")
+	dir := t.TempDir()
+	t.Setenv("PARLEY_CONFIG_DIR", dir)
+	t.Setenv("PARLEY_ENDPOINT_URL", "")
+	os.WriteFile(filepath.Join(dir, "config.toml"), []byte("endpoint_url = \""+fileHub.URL+"/\"\napi_key = \"k\"\n"), 0o600)
+	var stdout, stderr bytes.Buffer
+	if code := Run(context.Background(), []string{"version"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr.String())
+	}
+	var doc map[string]any
+	json.Unmarshal(stdout.Bytes(), &doc)
+	if !reflect.DeepEqual(doc["server"], fileHub.body) {
+		t.Errorf("server = %v", doc["server"])
+	}
+	reqs := fileHub.requests()
+	if len(reqs) != 1 || reqs[0].path != "/version" || len(reqs[0].authorization) != 0 {
+		t.Errorf("file hub saw %+v", reqs)
+	}
+	stdout.Reset()
+	if code := Run(context.Background(), []string{"version", "--endpoint-url", otherHub.URL}, &stdout, &stderr); code != 0 || len(otherHub.requests()) != 1 || len(fileHub.requests()) != 1 {
+		t.Errorf("with a flag: exit %d, other hub %d, file hub %d", code, len(otherHub.requests()), len(fileHub.requests()))
+	}
+}
+
+func TestVersion_AnUnreadableFileIsOneWarning(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PARLEY_CONFIG_DIR", dir)
+	t.Setenv("PARLEY_ENDPOINT_URL", "")
+	os.WriteFile(filepath.Join(dir, "config.toml"), []byte("not = [toml"), 0o600)
+	var stdout, stderr bytes.Buffer
+	if code := Run(context.Background(), []string{"version"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &doc); err != nil || len(doc) != 1 || doc["cli"] == nil {
+		t.Errorf("stdout %q", stdout.String())
+	}
+	lines := strings.Split(strings.TrimRight(stderr.String(), "\n"), "\n")
+	if len(lines) != 1 || !strings.HasPrefix(lines[0], "warning: ") || !strings.Contains(lines[0], filepath.Join(dir, "config.toml")) {
+		t.Errorf("stderr %q", stderr.String())
 	}
 }

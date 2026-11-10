@@ -117,3 +117,28 @@ func TestRun_AUsageErrorStopsBeforeAnything(t *testing.T) {
 		t.Errorf("a run step ran %d times", runs)
 	}
 }
+
+func TestRun_GlobalFlagsGoAnywhereAndJSONChangesNothing(t *testing.T) {
+	hub := newRecordingHub(t, 200, `{"name":"x"}`)
+	orders := [][]string{
+		{"--endpoint-url", hub.URL, "--api-key", "k", "probe", "get", "x"},
+		{"probe", "--api-key", "k", "get", "x", "--endpoint-url", hub.URL},
+		{"probe", "get", "x", "--endpoint-url=" + hub.URL, "--api-key=k"},
+		{"--endpoint-url", hub.URL, "--api-key", "k", "probe", "get", "x", "--json"},
+	}
+	var first string
+	for i, args := range orders {
+		cliEnv(t)
+		before := len(hub.all())
+		r := runProbe(t, []*cobra.Command{probeGet()}, args...)
+		got := hub.all()[before:]
+		if r.code != 0 || len(got) != 1 || got[0].raw != "/api/v1/things/x" || got[0].header.Get("Authorization") != "Bearer k" {
+			t.Fatalf("%v: exit %d %s %+v", args, r.code, r.stderr, got)
+		}
+		if i == 0 {
+			first = r.stdout
+		} else if r.stdout != first {
+			t.Errorf("%v: stdout %q, want %q", args, r.stdout, first)
+		}
+	}
+}

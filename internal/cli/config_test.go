@@ -9,6 +9,8 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	"github.com/spf13/cobra"
 )
 
 func mode(t *testing.T, p string) os.FileMode {
@@ -253,5 +255,213 @@ func TestSaveSettings_AFailedSaveChangesNothing(t *testing.T) {
 				t.Errorf("changed: %q -> %q", before, after)
 			}
 		})
+	}
+}
+
+func TestSettings_FlagThenEnvironmentThenFile(t *testing.T) {
+	a, b, c := newRecordingHub(t, 200, `{}`), newRecordingHub(t, 200, `{}`), newRecordingHub(t, 200, `{}`)
+	const absent, unset = "\x00absent", "\x00unset"
+	tests := []struct {
+		flagURL, envURL, fileURL, flagKey, envKey, fileKey string
+		hub                                                *recordingHub
+		key                                                string
+	}{
+		{a.URL, b.URL, c.URL, "k1", "k2", "k3", a, "k1"},
+		{absent, b.URL, c.URL, absent, "k2", "k3", b, "k2"},
+		{absent, unset, c.URL, absent, unset, "k3", c, "k3"},
+		{"", b.URL, c.URL, "", "k2", "k3", b, "k2"},
+		{absent, "", c.URL, absent, "", "k3", c, "k3"},
+		{a.URL, unset, c.URL, absent, unset, "k3", a, "k3"},
+	}
+	for i, tt := range tests {
+		dir := cliEnv(t)
+		os.MkdirAll(dir, 0o700)
+		os.WriteFile(filepath.Join(dir, "config.toml"), []byte(fmt.Sprintf("endpoint_url = %q\napi_key = %q\n", tt.fileURL, tt.fileKey)), 0o600)
+		args := []string{"probe", "get", "x"}
+		for _, f := range []struct{ name, val string }{{"--endpoint-url", tt.flagURL}, {"--api-key", tt.flagKey}} {
+			if f.val != absent {
+				args = append(args, f.name, f.val)
+			}
+		}
+		for _, e := range []struct{ name, val string }{{"PARLEY_ENDPOINT_URL", tt.envURL}, {"PARLEY_API_KEY", tt.envKey}} {
+			if e.val == unset {
+				os.Unsetenv(e.name)
+			} else {
+				t.Setenv(e.name, e.val)
+			}
+		}
+		before := map[*recordingHub]int{a: len(a.all()), b: len(b.all()), c: len(c.all())}
+		if r := runProbe(t, []*cobra.Command{probeGet()}, args...); r.code != 0 {
+			t.Fatalf("case %d: exit %d %s", i, r.code, r.stderr)
+		}
+		for _, h := range []*recordingHub{a, b, c} {
+			got := h.all()[before[h]:]
+			if h == tt.hub && (len(got) != 1 || got[0].header.Get("Authorization") != "Bearer "+tt.key) {
+				t.Errorf("case %d: wanted hub got %+v", i, got)
+			} else if h != tt.hub && len(got) != 0 {
+				t.Errorf("case %d: another hub got %d requests", i, len(got))
+			}
+		}
+	}
+}
+
+func TestSettings_AMissingSettingFailsBeforeAnyRequest(t *testing.T) {
+	hub := newRecordingHub(t, 200, `{}`)
+	for _, withFile := range []bool{false, true} {
+		for _, missing := range []string{"url", "key", "both"} {
+			dir := cliEnv(t)
+			if withFile {
+				os.MkdirAll(dir, 0o700)
+				os.WriteFile(filepath.Join(dir, "config.toml"), []byte("user_id = \"u1\"\n"), 0o600)
+			}
+			args := []string{"probe", "get", "x"}
+			if missing != "url" && missing != "both" {
+				args = append(args, "--endpoint-url", hub.URL)
+			}
+			if missing != "key" && missing != "both" {
+				args = append(args, "--api-key", "k")
+			}
+			r := runProbe(t, []*cobra.Command{probeGet()}, args...)
+			if r.code != 2 || r.stdout != "" {
+				t.Fatalf("%s: exit %d stdout %q", missing, r.code, r.stdout)
+			}
+			e := r.envelope(t)
+			msg, _ := e["message"].(string)
+			path := filepath.Join(dir, "config.toml")
+			if e["code"] != float64(0) || e["error_type"] != "client_error" || !strings.Contains(msg, path) {
+				t.Errorf("%s: %v", missing, e)
+			}
+			urlNamed := strings.Contains(msg, "--endpoint-url") && strings.Contains(msg, "PARLEY_ENDPOINT_URL")
+			keyNamed := strings.Contains(msg, "--api-key") && strings.Contains(msg, "PARLEY_API_KEY")
+			if urlNamed != (missing != "key") || keyNamed != (missing != "url") {
+				t.Errorf("%s: message %q", missing, msg)
+			}
+		}
+	}
+	if n := len(hub.all()); n != 0 {
+		t.Errorf("%d requests", n)
+	}
+}
+
+func TestSettings_AHubURLMustBeAnAbsoluteHTTPURL(t *testing.T) {
+	for _, u := range []string{"localhost:8080", "ftp://host", "http://", "/api", "host"} {
+		cliEnv(t)
+		r := runProbe(t, []*cobra.Command{probeGet()}, "probe", "get", "x", "--endpoint-url", u, "--api-key", "k")
+		e := r.envelope(t)
+		if r.code != 2 || r.stdout != "" || e["error_type"] != "client_error" || !strings.Contains(e["message"].(string), u) {
+			t.Errorf("%q: exit %d %v", u, r.code, e)
+		}
+	}
+}
+
+func TestSettings_FlagsAndEnvironmentAloneNeverReadTheFile(t *testing.T) {
+	hub := newRecordingHub(t, 200, `{}`)
+	for _, how := range []string{"flags", "variables", "mixed"} {
+		dir := cliEnv(t)
+		os.MkdirAll(dir, 0o700)
+		os.WriteFile(filepath.Join(dir, "config.toml"), []byte("not = [toml"), 0o600)
+		args := []string{"probe", "get", "x"}
+		switch how {
+		case "flags":
+			args = append(args, "--endpoint-url", hub.URL, "--api-key", "k")
+		case "variables":
+			t.Setenv("PARLEY_ENDPOINT_URL", hub.URL)
+			t.Setenv("PARLEY_API_KEY", "k")
+		case "mixed":
+			args = append(args, "--endpoint-url", hub.URL)
+			t.Setenv("PARLEY_API_KEY", "k")
+		}
+		before := len(hub.all())
+		if r := runProbe(t, []*cobra.Command{probeGet()}, args...); r.code != 0 || r.stderr != "" || len(hub.all()) != before+1 {
+			t.Errorf("%s: exit %d stderr %q", how, r.code, r.stderr)
+		}
+	}
+}
+
+func TestSettings_WithoutAFileOrHomeNothingIsCreated(t *testing.T) {
+	hub := newRecordingHub(t, 200, `{}`)
+	tmp := t.TempDir()
+	for _, c := range []struct {
+		dir, home string
+		unsetDir  bool
+		unsetHome bool
+	}{
+		{filepath.Join(tmp, "missing"), "", false, false},
+		{"", filepath.Join(tmp, "nohome"), true, false},
+		{"", "", true, true},
+	} {
+		cliEnv(t)
+		t.Setenv("PARLEY_CONFIG_DIR", c.dir)
+		t.Setenv("HOME", c.home)
+		if c.unsetDir {
+			os.Unsetenv("PARLEY_CONFIG_DIR")
+		}
+		if c.unsetHome {
+			os.Unsetenv("HOME")
+		}
+		t.Setenv("PARLEY_ENDPOINT_URL", hub.URL)
+		t.Setenv("PARLEY_API_KEY", "k")
+		if r := runProbe(t, []*cobra.Command{probeGet()}, "probe", "get", "x"); r.code != 0 {
+			t.Errorf("%+v: exit %d %s", c, r.code, r.stderr)
+		}
+		os.Unsetenv("PARLEY_API_KEY")
+		r := runProbe(t, []*cobra.Command{probeGet()}, "probe", "get", "x")
+		if r.code != 2 || r.envelope(t)["error_type"] != "client_error" {
+			t.Errorf("%+v: missing key: exit %d %s", c, r.code, r.stderr)
+		}
+	}
+	for _, p := range []string{filepath.Join(tmp, "missing"), filepath.Join(tmp, "nohome", ".parley")} {
+		if _, err := os.Stat(p); err == nil {
+			t.Errorf("%s was created", p)
+		}
+	}
+}
+
+func TestSettings_AnUnparseableFileIsAClientErrorWhenNeeded(t *testing.T) {
+	hub := newRecordingHub(t, 200, `{}`)
+	states := []func(dir string){
+		func(dir string) { os.WriteFile(filepath.Join(dir, "config.toml"), []byte("not = [toml"), 0o600) },
+		func(dir string) { os.WriteFile(filepath.Join(dir, "config.toml"), []byte("endpoint_url = 5"), 0o600) },
+		func(dir string) { os.WriteFile(filepath.Join(dir, "config.toml"), []byte(`api_key = ["a"]`), 0o600) },
+		func(dir string) { os.MkdirAll(filepath.Join(dir, "config.toml"), 0o700) },
+	}
+	if os.Geteuid() != 0 {
+		states = append(states, func(dir string) {
+			os.WriteFile(filepath.Join(dir, "config.toml"), []byte(`api_key = "k"`), 0o000)
+		})
+	}
+	for i, arrange := range states {
+		dir := cliEnv(t)
+		os.MkdirAll(dir, 0o700)
+		arrange(dir)
+		t.Setenv("PARLEY_ENDPOINT_URL", hub.URL)
+		r := runProbe(t, []*cobra.Command{probeGet()}, "probe", "get", "x")
+		e := r.envelope(t)
+		if r.code != 2 || r.stdout != "" || e["code"] != float64(0) || e["error_type"] != "client_error" || !strings.Contains(e["message"].(string), filepath.Join(dir, "config.toml")) {
+			t.Errorf("state %d: exit %d %v", i, r.code, e)
+		}
+	}
+	if n := len(hub.all()); n != 0 {
+		t.Errorf("%d requests", n)
+	}
+}
+
+func TestSettings_AFileUnderHomeAndASavedFileAreUsed(t *testing.T) {
+	hub := newRecordingHub(t, 200, `{}`)
+	home := t.TempDir()
+	cliEnv(t)
+	os.Unsetenv("PARLEY_CONFIG_DIR")
+	t.Setenv("HOME", home)
+	os.MkdirAll(filepath.Join(home, ".parley"), 0o700)
+	os.WriteFile(filepath.Join(home, ".parley", "config.toml"), []byte(fmt.Sprintf("endpoint_url = %q\napi_key = \"home-key\"\n", hub.URL)), 0o600)
+	if r := runProbe(t, []*cobra.Command{probeGet()}, "probe", "get", "x"); r.code != 0 || hub.all()[0].header.Get("Authorization") != "Bearer home-key" {
+		t.Fatalf("file under HOME: exit %d %s", r.code, r.stderr)
+	}
+	t.Setenv("PARLEY_CONFIG_DIR", filepath.Join(t.TempDir(), "new", "dir"))
+	if err := saveSettings(Settings{EndpointURL: hub.URL, APIKey: "saved", UserID: "u1"}); err != nil {
+		t.Fatal(err)
+	}
+	if r := runProbe(t, []*cobra.Command{probeGet()}, "probe", "get", "x"); r.code != 0 || hub.all()[1].header.Get("Authorization") != "Bearer saved" {
+		t.Fatalf("saved file: exit %d %s", r.code, r.stderr)
 	}
 }

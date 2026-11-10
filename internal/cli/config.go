@@ -5,8 +5,10 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/BurntSushi/toml"
+	"github.com/spf13/cobra"
 )
 
 // The keys of the client configuration file the CLI knows.
@@ -126,4 +128,52 @@ func replaceFile(dir, path string, data []byte) error {
 		return errors.Join(err, os.Remove(tmp.Name()))
 	}
 	return nil
+}
+
+// flagValue reads a global flag the command inherited.
+func flagValue(cmd *cobra.Command, name string) string {
+	if f := cmd.Flag(name); f != nil {
+		return f.Value.String()
+	}
+	return ""
+}
+
+// resolveSettings takes the hub URL and the credential each from the first
+// non-empty value of its flag, its variable and the configuration file,
+// reading the file only when a flag and the environment leave one empty. A
+// missing setting is a client error naming, for each one missing, its
+// flag, its variable and the file's path.
+func resolveSettings(cmd *cobra.Command) (hubURL, credential string, err error) {
+	hubURL = firstNonEmpty(flagValue(cmd, "endpoint-url"), os.Getenv("PARLEY_ENDPOINT_URL"))
+	credential = firstNonEmpty(flagValue(cmd, "api-key"), os.Getenv("PARLEY_API_KEY"))
+	if hubURL != "" && credential != "" {
+		return hubURL, credential, nil
+	}
+	file, err := readConfig()
+	if err != nil {
+		return "", "", err
+	}
+	hubURL = firstNonEmpty(hubURL, file.EndpointURL)
+	credential = firstNonEmpty(credential, file.APIKey)
+	path, _ := configPath()
+	var missing []string
+	if hubURL == "" {
+		missing = append(missing, "no hub URL: give --endpoint-url, set PARLEY_ENDPOINT_URL or set endpoint_url in "+path)
+	}
+	if credential == "" {
+		missing = append(missing, "no credential: give --api-key, set PARLEY_API_KEY or set api_key in "+path)
+	}
+	if len(missing) > 0 {
+		return "", "", ClientError("%s", strings.Join(missing, "; "))
+	}
+	return hubURL, credential, nil
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
