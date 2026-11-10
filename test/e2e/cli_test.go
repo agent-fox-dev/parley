@@ -22,11 +22,33 @@ import (
 
 // recordedHub is the hub's real handler (the conventions of package 02 and
 // the authenticator of package 04 over a store) behind a handler that
-// records each request's path and Authorization header.
+// records each request's path, Authorization header and answered status.
 type recordedHub struct {
 	*httptest.Server
 	mu   sync.Mutex
-	seen []struct{ path, auth string }
+	seen []seenRequest
+}
+
+type seenRequest struct {
+	path, auth string
+	status     int
+}
+
+// statusRecorder keeps the status a handler answers with.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(status int) {
+	r.status = status
+	r.ResponseWriter.WriteHeader(status)
+}
+
+func (h *recordedHub) requests() []seenRequest {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]seenRequest(nil), h.seen...)
 }
 
 func newRecordedHub(t *testing.T) *recordedHub {
@@ -45,10 +67,11 @@ func newRecordedHub(t *testing.T) *recordedHub {
 	h := &recordedHub{}
 	inner := srv.Handler()
 	h.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		inner.ServeHTTP(rec, r)
 		h.mu.Lock()
-		h.seen = append(h.seen, struct{ path, auth string }{r.URL.Path, r.Header.Get("Authorization")})
+		h.seen = append(h.seen, seenRequest{r.URL.Path, r.Header.Get("Authorization"), rec.status})
 		h.mu.Unlock()
-		inner.ServeHTTP(w, r)
 	}))
 	t.Cleanup(h.Close)
 	return h
@@ -86,6 +109,16 @@ func TestCLI_VersionFindsTheHubThroughTheConfigurationFile(t *testing.T) {
 	if !bytes.Equal(before, after) || fi.Mode().Perm() != 0o600 {
 		t.Error("the configuration file changed")
 	}
+	// The test's own GET /version and the CLI's: neither carries a credential.
+	seen := hub.requests()
+	if len(seen) != 2 {
+		t.Errorf("hub saw %+v", seen)
+	}
+	for _, r := range seen {
+		if r.path != "/version" || r.auth != "" {
+			t.Errorf("request %+v, want GET /version without a credential", r)
+		}
+	}
 }
 
 func TestCLI_TheHubsRefusalReachesStderr(t *testing.T) {
@@ -109,14 +142,12 @@ func TestCLI_TheHubsRefusalReachesStderr(t *testing.T) {
 	if err := json.Unmarshal(stderr.Bytes(), &doc); err != nil {
 		t.Fatalf("stderr %q", stderr.String())
 	}
-	hub.mu.Lock()
-	seen := append([]struct{ path, auth string }(nil), hub.seen...)
-	hub.mu.Unlock()
+	seen := hub.requests()
 	if len(seen) != 1 || !strings.HasPrefix(seen[0].path, "/api/v1/") || seen[0].auth != "Bearer "+key {
-		t.Errorf("hub saw %+v", seen)
+		t.Fatalf("hub saw %+v", seen)
 	}
-	if doc.Error.Code < 400 || (doc.Error.ErrorType != "unauthenticated" && doc.Error.ErrorType != "not_found") {
-		t.Errorf("envelope %+v", doc.Error)
+	if doc.Error.Code != seen[0].status || doc.Error.Code < 400 || (doc.Error.ErrorType != "unauthenticated" && doc.Error.ErrorType != "not_found") {
+		t.Errorf("envelope %+v, hub answered %d", doc.Error, seen[0].status)
 	}
 	if _, err := os.Stat(dir); err == nil {
 		t.Error("the configuration directory was created")
