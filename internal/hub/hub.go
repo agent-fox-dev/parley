@@ -21,6 +21,7 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/config"
 	"github.com/agent-fox-dev/parley/internal/identity"
+	"github.com/agent-fox-dev/parley/internal/maintenance"
 	"github.com/agent-fox-dev/parley/internal/scrub"
 	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/store"
@@ -50,6 +51,8 @@ type Options struct {
 	RequestGrace time.Duration
 	// OnRuntime is called once the stores are open, before the bootstrap.
 	OnRuntime func(*Runtime)
+	// MaintenanceInterval replaces maintenance.Interval between passes.
+	MaintenanceInterval time.Duration
 }
 
 // Option changes Options; cmd/parleyd's tests pass them through its run
@@ -105,7 +108,9 @@ func (c *Composition) AddStartHook(name string, fn func(ctx context.Context, rt 
 	c.hooks = append(c.hooks, StartHook{Name: name, Run: fn})
 }
 
-// AddTask registers a maintenance task.
+// AddTask registers a maintenance task under one of the names of
+// maintenance.Order, or another name that then runs after them; a name
+// registered twice stops the start.
 func (c *Composition) AddTask(name string, fn func(ctx context.Context, rt *Runtime) error) {
 	c.tasks = append(c.tasks, Task{Name: name, Run: fn})
 }
@@ -191,6 +196,7 @@ type hubRun struct {
 	cfg      *config.Config
 	st       *store.Store
 	rt       *Runtime
+	tasks    *maintenance.Registry
 	now      func() time.Time
 }
 
@@ -228,6 +234,9 @@ func (r *hubRun) setUp() error {
 	compose(r.comp)
 	if r.opts.Compose != nil {
 		r.opts.Compose(r.comp)
+	}
+	if err := r.registerTasks(); err != nil {
+		return err
 	}
 	cfg, err := r.comp.Config.Load(r.opts.Env, r.opts.WorkDir)
 	if err != nil {
@@ -307,23 +316,35 @@ func (r *hubRun) closeStore() {
 	}
 }
 
-// startMaintenance runs every registered task once, in the background,
-// after the start hooks.
+// startMaintenance starts the maintenance loop in the background, after the
+// start hooks and without waiting for its first pass.
 func (r *hubRun) startMaintenance(ctx context.Context) *sync.WaitGroup {
+	interval := maintenance.Interval
+	if r.opts.MaintenanceInterval > 0 {
+		interval = r.opts.MaintenanceInterval
+	}
+	ticker := time.NewTicker(interval)
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		for _, t := range r.comp.tasks {
-			if ctx.Err() != nil {
-				return
-			}
-			if err := t.Run(ctx, r.rt); err != nil {
-				r.logger.Error("maintenance task failed", "task", t.Name, "error", err.Error())
-			}
-		}
+		defer ticker.Stop()
+		maintenance.New(r.tasks, r.logger).Run(ctx, ticker.C)
 	}()
 	return &wg
+}
+
+// registerTasks puts the composition's tasks into the loop's registry; a
+// refused registration is a start error.
+func (r *hubRun) registerTasks() error {
+	r.tasks = maintenance.NewRegistry()
+	for _, t := range r.comp.tasks {
+		run := t.Run
+		if err := r.tasks.Register(t.Name, func(ctx context.Context) error { return run(ctx, r.rt) }); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func listenAddr(cfg *config.Config) string {

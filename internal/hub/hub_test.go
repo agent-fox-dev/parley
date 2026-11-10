@@ -300,3 +300,20 @@ func TestRun_AFailedStartKeepsConfiguredSecretsOutOfItsLine(t *testing.T) {
 		t.Errorf("stderr = %s, want the secret replaced by [redacted]", stderr)
 	}
 }
+
+func TestRun_ADuplicateMaintenanceTaskStopsTheStart(t *testing.T) {
+	compose := withCompose(func(c *Composition) {
+		c.AddTask("retention", func(context.Context, *Runtime) error { return nil })
+		c.AddTask("retention", func(context.Context, *Runtime) error { return nil })
+	})
+	code, _, stderr := runHub(t, hubDir(t, loopbackConfig), nil, nil, compose)
+	if code != 1 {
+		t.Fatalf("exit %d, want 1", code)
+	}
+	if lines := nonEmptyLines(stderr); len(lines) != 1 || !strings.Contains(lines[0], "retention") {
+		t.Errorf("stderr = %s, want one line naming retention", stderr)
+	}
+	if strings.Contains(stderr, "listening") {
+		t.Error("the hub listened")
+	}
+}
