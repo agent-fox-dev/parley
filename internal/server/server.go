@@ -5,7 +5,10 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"net"
 	"net/http"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/buildinfo"
 )
@@ -16,6 +19,12 @@ type Probe func(ctx context.Context) error
 
 // Options configure a Server.
 type Options struct {
+	// Addr is the listen address, host:port; port 0 asks the operating
+	// system for a free port.
+	Addr string
+	// ShutdownGrace is how long in-flight requests get to finish once the
+	// serving context is cancelled.
+	ShutdownGrace time.Duration
 	// ReadinessProbes are called on every GET /readyz; the hub is ready when
 	// all of them return nil, and when none is registered.
 	ReadinessProbes []Probe
@@ -85,4 +94,44 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	w.Write(body)
+}
+
+// Serve binds the listen address, calls onListen with the address it bound
+// (so that port 0 yields the chosen port) and serves until ctx is cancelled.
+// It then stops accepting connections and waits for in-flight requests for at
+// most the shutdown grace; connections still open when the grace passes are
+// closed. A stop by ctx returns nil whether or not the grace passed; an
+// address that cannot be bound returns the bind error.
+func (s *Server) Serve(ctx context.Context, onListen func(net.Addr)) error {
+	ln, err := net.Listen("tcp", s.opts.Addr)
+	if err != nil {
+		return err
+	}
+	if onListen != nil {
+		onListen(ln.Addr())
+	}
+
+	hs := &http.Server{Handler: s.Handler(), ReadHeaderTimeout: 30 * time.Second}
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- hs.Serve(ln) }()
+
+	select {
+	case err := <-serveErr:
+		return err
+	case <-ctx.Done():
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.opts.ShutdownGrace)
+	defer cancel()
+	if err := hs.Shutdown(shutdownCtx); err != nil {
+		// The grace passed with requests still running: close their
+		// connections. Close only fails with the listener's close error,
+		// and the listener is already closed by Shutdown.
+		_ = hs.Close()
+	}
+	// After Shutdown or Close, Serve returns http.ErrServerClosed.
+	if err := <-serveErr; !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
 }

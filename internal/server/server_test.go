@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/buildinfo"
 )
@@ -182,5 +184,159 @@ func TestVersion_ReportsBuildValuesAndToolchain(t *testing.T) {
 				t.Errorf("body = %v, want %v", doc, want)
 			}
 		})
+	}
+}
+
+// startServer serves srv on 127.0.0.1:0 until the returned cancel is called
+// and returns the bound address and a channel that receives Serve's result.
+func startServer(t *testing.T, srv *Server) (addr string, cancel context.CancelFunc, done <-chan error) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	bound := make(chan string, 1)
+	result := make(chan error, 1)
+	go func() { result <- srv.Serve(ctx, func(a net.Addr) { bound <- a.String() }) }()
+	select {
+	case addr = <-bound:
+	case err := <-result:
+		cancel()
+		t.Fatalf("Serve returned before listening: %v", err)
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("server did not report its address within 5 s")
+	}
+	t.Cleanup(cancel)
+	return addr, cancel, result
+}
+
+func TestServe_ReportsTheBoundPortAndServes(t *testing.T) {
+	addr, cancel, done := startServer(t, New(Options{Addr: "127.0.0.1:0", ShutdownGrace: time.Second}))
+	if _, port, _ := net.SplitHostPort(addr); port == "0" {
+		t.Fatalf("bound address %q still carries port 0", addr)
+	}
+	resp, err := http.Get("http://" + addr + "/healthz")
+	if err != nil {
+		t.Fatalf("GET /healthz: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Serve returned %v after cancel, want nil", err)
+	}
+}
+
+func TestServe_ReturnsTheBindError(t *testing.T) {
+	held, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	err = New(Options{Addr: held.Addr().String()}).Serve(context.Background(), func(net.Addr) {
+		t.Error("onListen called for an address that cannot be bound")
+	})
+	if err == nil {
+		t.Fatal("Serve returned nil for an address in use")
+	}
+}
+
+func TestServe_LetsAnInFlightRequestFinishWithinTheGrace(t *testing.T) {
+	srv := New(Options{Addr: "127.0.0.1:0", ShutdownGrace: 2 * time.Second})
+	started := make(chan struct{})
+	srv.HandleFunc("GET /slow", func(w http.ResponseWriter, _ *http.Request) {
+		close(started)
+		time.Sleep(200 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, "done")
+	})
+	addr, cancel, done := startServer(t, srv)
+
+	type result struct {
+		status int
+		body   string
+		err    error
+	}
+	got := make(chan result, 1)
+	go func() {
+		resp, err := http.Get("http://" + addr + "/slow")
+		if err != nil {
+			got <- result{err: err}
+			return
+		}
+		defer resp.Body.Close()
+		b, err := io.ReadAll(resp.Body)
+		got <- result{status: resp.StatusCode, body: string(b), err: err}
+	}()
+	<-started
+	t0 := time.Now()
+	cancel()
+
+	refused := false
+	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+		c, err := net.Dial("tcp", addr)
+		if err != nil {
+			refused = true
+			break
+		}
+		c.Close()
+	}
+	if !refused {
+		t.Error("new connections were still accepted after the stop began")
+	}
+
+	r := <-got
+	if r.err != nil || r.status != http.StatusOK || r.body != "done" {
+		t.Fatalf("slow request = (%d, %q, %v), want (200, done, nil)", r.status, r.body, r.err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve returned %v, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve did not return within the grace")
+	}
+	if elapsed := time.Since(t0); elapsed >= 2*time.Second {
+		t.Errorf("Serve took %v after the stop, want under 2 s", elapsed)
+	}
+}
+
+func TestServe_ClosesARequestStillRunningWhenTheGracePasses(t *testing.T) {
+	srv := New(Options{Addr: "127.0.0.1:0", ShutdownGrace: 100 * time.Millisecond})
+	started := make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
+	srv.HandleFunc("GET /stuck", func(w http.ResponseWriter, _ *http.Request) {
+		close(started)
+		<-release
+	})
+	addr, cancel, done := startServer(t, srv)
+
+	clientErr := make(chan error, 1)
+	go func() {
+		resp, err := http.Get("http://" + addr + "/stuck")
+		if err == nil {
+			resp.Body.Close()
+		}
+		clientErr <- err
+	}()
+	<-started
+	t0 := time.Now()
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Serve returned %v, want nil", err)
+	}
+	elapsed := time.Since(t0)
+	if elapsed < 100*time.Millisecond || elapsed >= 1100*time.Millisecond {
+		t.Errorf("Serve returned %v after the stop, want between 100 ms and 1.1 s", elapsed)
+	}
+	select {
+	case err := <-clientErr:
+		if err == nil {
+			t.Error("the stuck request got a response, want a closed connection")
+		}
+	case <-time.After(time.Second):
+		t.Error("the stuck request's connection was not closed")
 	}
 }
