@@ -107,7 +107,7 @@ An agent takes a task. It gets its own fork and a token that works only there:
 ```sh
 parley fork create demo --name greeting --token-permissions git:write,changes:write \
     --purpose "Add a greeting endpoint"
-# → { "workspace": { "slug": "demo--greeting", … }, "remote": "http://localhost:8080/git/acme/demo--greeting.git", "token": "parley_pat_…" }
+# → { "workspace": { "slug": "demo--greeting", … }, "remote": "http://localhost:8080/git/acme/demo--greeting.git", "token": { "token_id": "…", "token": "parley_pat_…", … } }
 
 parley activity demo --paths 'api/**'                      # is anyone else working here?
 
@@ -116,7 +116,7 @@ git switch -c greeting && …commit…
 git push -u origin greeting \
     -o parley.title="Add greeting endpoint" \
     -o parley.intent="Issue #41 asks for a health-style greeting route"
-# remote: change demo#12 version 1 opened, landing: ready
+# remote: change demo#12 version 1 (opened)
 ```
 
 The change lands when policy allows it. If someone else landed first and the two changes do not conflict, nothing waits:
@@ -191,7 +191,7 @@ Parley deliberately does not take Scion's storage engine, AgentHub's branchless 
 | **Operator** | Runs and administers the hub | Admin token (written at first boot) | Deploy and configure the hub; manage users, orgs, keys and tokens; define sandbox profiles; watch metrics and the audit log |
 | **Developer** | A person who registers repositories and directs agents | API key, from `parley login` | Create workspaces; write landing policy; approve the changes that need a person; maintain carry-patch workspaces; manage secrets; mint scoped tokens for agents |
 | **Agent** | An AI coding agent running on a developer's behalf | PAT bound to one workspace or task fork, often limited to paths | Fork, read and write code through git or the API; open changes and state their intent; fix conflicts; land; report sessions, usage and telemetry; lease a sandbox |
-| **Review agent / check runner** | Automation that reacts to changes | PAT with `changes:read` and `checks:write`, possibly `changes:approve` | Follow the event stream; report check results; approve or reject versions where policy allows |
+| **Review agent / check runner** | Automation that reacts to changes | PAT with `changes:read`, `audit:read` and `checks:write`, possibly `changes:approve`; to report checks it belongs to a user with write access to the workspace (§8) | Follow the event stream; report check results; approve or reject versions where policy allows |
 | **Org member** | A user who belongs to the organization that owns a workspace | API key or PAT | Read the org's workspaces; contribute through a task fork and a change |
 | **Forge** | GitHub or GitLab | Webhook secret | Deliver webhooks that the hub turns into hub events |
 | **Sandbox client** | An AgentKit client that holds a sandbox lease | Lease token | Create and drive exactly one sandbox through the gateway |
@@ -223,9 +223,9 @@ Parley deliberately does not take Scion's storage engine, AgentHub's branchless 
 | Integration branch | For a carry-patch workspace, the branch the hub rebuilds as upstream plus the ordered patches |
 | Patch | A carry-patch entry: a branch with a position in the patch order and a status |
 | Rebuild | A durable job that recreates the integration branch |
-| Durable job | Background work that survives restarts and is retried with backoff (rebuilds, clones) |
+| Durable job | Background work that is recorded before its request returns, survives restarts and is retried with backoff. Rebuilds are the only durable jobs (§10). Clone work, restacks and land attempts are also durable but follow their own rules and are not retried with backoff (§4, §7, §8) |
 | Scope / permission | A string carried by a PAT that grants read or write access to an area |
-| Bound token | A PAT confined to one workspace (and the forks created with it) |
+| Bound token | A PAT confined to one workspace (and the forks created with it). A token bound to a fork also reaches its own changes, and the awareness and policy reads, on the fork's parent (§3) |
 | Path-scoped token | A PAT whose writes are limited to files matching a list of globs |
 | Lease | A short-lived right to create and use one sandbox, shaped by a profile |
 | Profile | An operator-defined sandbox template |
@@ -312,7 +312,7 @@ Out of scope: the per-feature routes that apply the access rule (§4–§14), th
 
 Parley runs as one `parleyd` process. Running two processes against the same data is not supported. The hub is built for a team, not for hyperscale (§15).
 
-`parleyd` needs a `git` binary on its `PATH`. The minimum version is stated in §5.
+`parleyd` needs a `git` binary on its `PATH`. The minimum version is stated in §15 (NFR-004).
 
 #### 3.3.2 Credential types
 
@@ -401,7 +401,7 @@ A scope is `resource:action`. The registry is fixed:
 | `orgs` | `orgs:read` | org reads |
 | `keys` | `keys:read`, `keys:manage` | API key list; API key revoke |
 | `tokens` | `tokens:read`, `tokens:write`, `tokens:manage` | PAT reads; PAT permission changes; PAT create and revoke |
-| `workspaces` | `workspaces:read`, `workspaces:write` | §4 |
+| `workspaces` | `workspaces:read`, `workspaces:write` | §4; replacing the policy (§8); remembered resolutions and the patch-status summary (§10) |
 | `git` | `git:read`, `git:write` | git protocol (§5) and source control API (§6) |
 | `changes` | `changes:read`, `changes:write`, `changes:approve` | §7, §8, §9 |
 | `checks` | `checks:write` | §8 |
@@ -427,9 +427,9 @@ Implication rules:
 
 | Level | Who | May |
 |---|---|---|
-| `admin` | the admin token | everything |
+| `admin` | the admin token | everything that does not need a user: it cannot create workspaces, forks or tokens (§4, PLAT-FR-082), use `/user` routes or user-scope secrets and variables (§11), or record a verdict (§8) |
 | `owner` | the user who owns the workspace; for a task fork, also the owner of its parent | everything |
-| `member` | a member of the workspace's org, while the org is `active` | read; create task forks; open changes from an own fork |
+| `member` | a member of the workspace's org, while the org is `active` | read; create task forks; open changes from an own fork and edit, land and revert them where §7 and §8 allow the author to; record verdicts (§8); make claims (§9) |
 | none | everyone else | nothing; the workspace does not exist for them |
 
 Each workspace route declares one **need**: `read`, `write` or `owner`. `owner` marks routes that are not writes but are still private to the owner, such as listing bound tokens or secrets. Every workspace object carries the caller's level as `access`.
@@ -455,7 +455,7 @@ An API key of an admin-role user is **not** `admin` here. The admin role governs
 #### Server start, bootstrap and shutdown
 
 - **PLAT-FR-001 (flags).** `parleyd` takes two flags: `--admin-email <string>` and `--reset-admin-token`. `--help` prints usage and exits 0. An unknown flag prints usage and exits 2. There are no subcommands.
-- **PLAT-FR-002 (start).** The server loads and validates its configuration (§3.9), opens its data, runs the bootstrap (PLAT-FR-003), resumes durable work, starts the maintenance loop (PLAT-FR-005) and then listens on `[server].bind:[server].port`. Any failure before listening stops the process with exit status 1 and one error line on stderr. Durable work that is resumed at start includes clones left `pending` or `cloning` (§4) and queued jobs (§10, §12). When it starts listening, the server logs the address, the configuration path and the data directory.
+- **PLAT-FR-002 (start).** The server loads and validates its configuration (§3.9), opens its data, runs the bootstrap (PLAT-FR-003), resumes durable work, starts the maintenance loop (PLAT-FR-005) and then listens on `[server].bind:[server].port`. Any failure before listening stops the process with exit status 1 and one error line on stderr. Durable work that is resumed at start includes clones left `pending` or `cloning` (§4) , pending restacks (§7), running land attempts (§8) and rebuild jobs (§10). When it starts listening, the server logs the address, the configuration path and the data directory.
 - **PLAT-FR-003 (bootstrap).** The hub is **bootstrapped** once an admin token hash is stored. The token file is `<config dir>/admin_token`, where `<config dir>` is the directory of `config.toml` (§3.9).
 
   | Situation | Behaviour |
@@ -467,13 +467,14 @@ An API key of an admin-role user is **not** `admin` here. The admin role governs
   | bootstrapped, no token file | start normally; `--admin-email` is ignored |
 
   The token file has mode 0600 and holds the token with no trailing newline. After writing it, the server logs the file's absolute path at warn level, tells the operator to save the token and delete the file, and exits with status 0 without serving. The token itself is never logged.
-- **PLAT-FR-004 (shutdown).** On SIGTERM or SIGINT the server stops accepting connections and gives in-flight requests 15 seconds to finish. Event streams are closed. Background work stops; anything durable resumes at the next start. A clean shutdown exits 0. A failure to bind the listener exits 1.
+- **PLAT-FR-004 (shutdown).** On SIGTERM or SIGINT the server stops accepting connections and gives in-flight requests 15 seconds to finish. Event streams are closed. Background work stops within the grace its section sets (running rebuild jobs: 30 s, §10; sandbox teardown: 20 s, §13). The process exits when requests and background work have ended or their grace has passed, at most 30 s after the signal. Anything durable resumes at the next start. A clean shutdown exits 0. A failure to bind the listener exits 1.
 - **PLAT-FR-005 (maintenance loop).** The loop runs once right after start and then every hour. A pass runs these tasks in order:
 
   | Task | Defined in |
   |---|---|
-  | audit retention | §14 |
-  | event-log retention | §14 |
+  | retention: sessions, run telemetry, hub events and the event log (one task, steps of §14.7.2) | §14 |
+  | secret re-encryption under the current key | §11 |
+  | claim cleanup | §9 |
   | forge delivery pruning | §12 |
   | token binding sweep | PLAT-FR-086 |
   | patch purge | §10 |
@@ -493,7 +494,7 @@ An API key of an admin-role user is **not** `admin` here. The admin role governs
   - `code` equals the HTTP status.
   - `error_type` is always present. It is the machine contract, together with the status.
   - `message` is for people. Clients MUST NOT parse it.
-  - An error may carry extra members inside `error` when a section says so (for example `oldest_seq` with `cursor_expired`).
+  - An error may carry extra members inside `error` when a section says so: a named member (for example `oldest_seq` with `cursor_expired`) or a `details` object (for example the conflict report with `rebase_conflict`, the land attempt with `land_conflict` and `policy_blocked`, `current_sha` with `ref_moved`).
   - The content type is `application/json; charset=utf-8`.
 
   Exceptions: `/healthz` and `/readyz` answer plain status JSON, and git routes answer in git's own text conventions where a git client reads the response (§5).
@@ -524,7 +525,7 @@ An API key of an admin-role user is **not** `admin` here. The admin role governs
   | `path_not_allowed` | 403 | a path-scoped token tried to write outside its `paths` (raised in §5–§8) |
   | `workspace_archived` | 409 | the route needs a workspace that is not archived |
 
-  Specific types that several sections share, defined where noted: `workspace_busy` (409, §4), `fork_has_no_origin` (400, §4), `ref_moved` (409, §6), `land_conflict` (409, §8), `policy_blocked` (409, §8), `cursor_expired` (410, §14).
+  Specific types that several sections share, defined where noted: `workspace_busy` (409, §4), `workspace_not_ready` (409, §4), `fork_has_no_origin` (400, §4), `unknown_session` (400, §14), `ref_moved` (409, §6), `land_conflict` (409, §8), `policy_blocked` (409, §8), `cursor_expired` (410, §14).
 - **PLAT-FR-013 (check order).** Every request is checked in this order. The first failing check decides the answer.
 
   | # | Check | Failure |
@@ -540,7 +541,7 @@ An API key of an admin-role user is **not** `admin` here. The admin role governs
   | 9 | State preconditions | `409` or `400` |
   | 10 | Act | |
 
-  Consequences: a PAT without the scope gets 403 whether or not the workspace exists, so the answer leaks nothing. A member's write to an archived workspace is 403, not 409. Steps 1–4 on public routes skip authentication.
+  Consequences: a PAT without the scope gets 403 whether or not the workspace exists, so the answer leaks nothing. A member's write to an archived workspace is 403, not 409. Steps 1–4 on public routes skip authentication. One section inserts a step of its own: the sandbox feature check runs after step 4 and before step 5 (§13).
 - **PLAT-FR-014 (lists).** Every list endpoint answers
 
   ```json
@@ -548,7 +549,7 @@ An API key of an admin-role user is **not** `admin` here. The admin role governs
   ```
 
   - `items` is always an array, never null. `next_cursor` is null on the last page.
-  - `limit` defaults to 50. A value outside 1–200 is `400 invalid_request`.
+  - `limit` defaults to 50 and a value outside 1–200 is `400 invalid_request`, unless a route states other bounds (the tree listing of §6).
   - `cursor` is the `next_cursor` of the previous page. It is opaque. A cursor that is malformed or belongs to another query is `400 invalid_request`.
   - Each endpoint states its order. The order is total, so paging neither repeats nor skips an item that existed throughout.
 - **PLAT-FR-015 (idempotency).** Every `POST` that creates a resource accepts an optional `Idempotency-Key` header of 1–255 characters.
@@ -562,14 +563,14 @@ An API key of an admin-role user is **not** `admin` here. The admin role governs
   - `POST /auth/callback` does not take the header, because an OAuth code is single-use.
 - **PLAT-FR-016 (timestamps).** Timestamps are RFC 3339 in UTC with whole seconds (`2026-01-02T03:04:05Z`) unless a field says otherwise. Durations in requests and configuration use a number with a unit suffix (`30s`, `15m`, `24h`, `30d`).
 - **PLAT-FR-017 (bodies).**
-  - Request and response bodies on the REST API are JSON.
+  - Request and response bodies on the REST API are JSON, unless a route states another content type: raw file content and patch text (§6), a conflicted file as text (§8) and the event stream (§14).
   - A request body larger than `[server].max_body_size` (default 1 MiB) is `413 payload_too_large`, whether or not it declares its length. Git routes, the webhook ingress and routes that carry file content set their own limits (§5, §6, §12).
   - A `POST`, `PUT` or `PATCH` with a body whose `Content-Type` is not `application/json` is `415 unsupported_media_type`. A request without a body is exempt.
   - A body that is not valid JSON, or not an object where one is expected, is `400 invalid_request`. Unknown members are ignored.
 - **PLAT-FR-018 (request id and headers).**
   - An incoming `X-Request-ID` that is a valid UUID is reused; otherwise the hub generates one. Every response carries `X-Request-ID`, and every access-log line carries it.
   - Every response carries `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and `Referrer-Policy: no-referrer`.
-  - API responses carry `Cache-Control: no-store`. Exceptions: `GET /auth/providers` and `GET /version` carry `public, max-age=300`; `/healthz` and `/readyz` carry `no-cache`.
+  - API responses carry `Cache-Control: no-store`. Exceptions: `GET /auth/providers` and `GET /version` carry `public, max-age=300`; `/healthz` and `/readyz` carry `no-cache`; source control reads set their own caching headers (§6, SCM-FR-002); the event stream carries `no-cache` (§14).
 - **PLAT-FR-019 (concurrency).** No request fails only because another operation is running. Ref updates are compare-and-swap. `409 workspace_busy` remains only while a workspace is in an exclusive maintenance operation (§4).
 
 #### Authentication and rate limits
@@ -667,30 +668,34 @@ An API key of an admin-role user is **not** `admin` here. The admin role governs
 #### Workspace access rule
 
 - **PLAT-FR-060 (decision).** Every route that names a workspace by slug decides access as follows, after authentication, the binding guard and the scope check:
-  1. Resolve the caller's level (§3.3.6): `admin` for the admin token; `owner` for the workspace's owner and, for a task fork, the owner of its parent; `member` for a member of the workspace's active org; otherwise none.
+  1. Resolve the caller's level (§3.3.6): `admin` for the admin token; `owner` for the workspace's owner and, for a task fork, the owner of its parent; `member` for a member of the workspace's active org; otherwise none. A task fork never grants more than its parent: a caller whose level on the parent is none has level none on the fork too, even as the fork's creator.
   2. Level none, or no such workspace: `404 not_found` with the message `workspace not found`.
   3. Level `member` on a `write` or `owner` route: `403 forbidden` with the message `org members have read-only access to this workspace`.
   4. Otherwise access is granted.
 
   A failure while deciding is `500 internal`, never a grant.
 - **PLAT-FR-061 (anti-enumeration).** A caller with no read access gets exactly the same response for an existing workspace as for a nonexistent slug: same status, same body. This holds on every surface, including git, and in every state of the workspace. A member's 403 is not a leak, because the member can already read the workspace.
-- **PLAT-FR-062 (member contributions).** Two routes are open to members although they change state:
+- **PLAT-FR-062 (member contributions).** These routes are open to members although they change state. The owning sections declare them with need `read` plus the stated condition:
   - creating a task fork of a workspace the member can read (§4). The member owns the fork;
-  - opening a change from a fork the member owns into the fork's parent, and updating or abandoning that change (§7).
+  - opening a change from a fork the member owns into the fork's parent, and editing, restacking, abandoning or restoring that change (§7);
+  - landing and reverting a change the member authored, while the workspace setting `land.by_author` is true, always under the parent's policy and never with an override (§8);
+  - recording a verdict on a change (§8); whether it counts is decided by policy;
+  - creating, renewing and releasing the member's own claims (§9).
 
-  Nothing else in the parent is writable by a member. Landing follows the parent's policy (§8).
-- **PLAT-FR-063 (readable set).** Cross-workspace reads (the workspace list, events, audit) use one set: all workspaces for the admin token; otherwise the workspaces the user owns, the forks of those workspaces, and the workspaces of the user's active orgs. Ownership wins over membership when both apply. For a bound PAT the set is cut down to the workspaces its binding covers (PLAT-FR-081).
+  Nothing else in the parent is writable by a member. In particular, reporting a check needs write access (§8).
+- **PLAT-FR-063 (readable set).** Cross-workspace reads (the workspace list, events, audit) use one set: all workspaces for the admin token; otherwise the workspaces the user owns, the forks of those workspaces, and the workspaces of the user's active orgs. Ownership wins over membership when both apply. For a bound PAT the set is cut down to the workspaces its binding covers (PLAT-FR-081). For events and audit, a token bound to a task fork also sees the events of the fork's parent whose resource is a change with that fork as its source (§14).
 
 #### Workspace-bound tokens
 
-- **PLAT-FR-080 (binding).** A PAT may be bound to exactly one workspace. The binding is set at creation and never changes. A bound token is an ordinary PAT of the minting user, with that user's access, restricted further by the binding. There are two ways to mint one:
+- **PLAT-FR-080 (binding).** A PAT may be bound to exactly one workspace. The binding is set at creation and never changes. A bound token is an ordinary PAT of the minting user, with that user's access, restricted further by the binding. There are two ways for a caller to mint one, and one way for the hub:
   - `POST /workspaces/:slug/tokens` binds a new token to that workspace;
-  - the fork-create call can mint a token bound to the new fork (§4).
+  - the fork-create call can mint a token bound to the new fork (§4);
+  - the hub itself mints a short-lived token bound to a task fork when it injects a git credential into a sandbox (§13). It is owned by the user who issued the lease, never exceeds the scopes and `paths` of the issuing credential, is returned by no route, and emits `hub.token.bind`.
 - **PLAT-FR-081 (coverage).** A token bound to workspace W is valid on:
   - W;
   - every task fork of W that was created by a request authenticated with this token. The hub records the creating token on the fork.
 
-  A token bound to a task fork F is valid on F. On F's parent it is valid only for the routes a contributor needs: the change routes for changes whose source is F (§7) and the awareness read routes (§9). Those sections list the routes.
+  A token bound to a task fork F is valid on F. On F's parent P it is valid only for the routes a contributor needs: the change routes (§7) and the landing routes (§8) for changes whose source is F, the policy read routes (§8), and the awareness read routes (§9). CHG-FR-040, LAND-FR-003 and AWR-FR-001 list them. Every other route on P answers `403 token_bound`. Routes addressed with F's own slug that act on P's data (awareness and claims §9, forge §12, resolved variables §11) are routes of F and pass the guard; the access of the token's user on P still applies.
 - **PLAT-FR-082 (minting).** `POST /workspaces/:slug/tokens` takes the same body as `POST /user/tokens` and applies the same rules, including `tokens:manage` and the subset rule for PAT callers. In addition:
   - the route's need is `owner`;
   - the admin token is refused (`403 forbidden`), because a bound token needs a user as its owner;
@@ -703,6 +708,7 @@ An API key of an admin-role user is **not** `admin` here. The admin role governs
   | Request | Answer |
   |---|---|
   | names a workspace the binding covers | passes to the route's own checks |
+  | names the parent of the fork the token is bound to | the routes listed under PLAT-FR-081 pass to their own checks; every other route is `403 token_bound` |
   | names any other workspace, existing or not | `404 not_found`, `workspace not found` |
   | names no workspace and is on the allowlist | passes; the route confines its result to the covered workspaces |
   | anything else, including every identity route | `403 token_bound` |
@@ -727,7 +733,7 @@ An API key of an admin-role user is **not** `admin` here. The admin role governs
   A missing value fails before any request, with exit status 2 and a message that names the flag, the variable and the file.
 - **PLAT-FR-091 (requests).** Requests go to `<hub URL without trailing slash>/api/v1<path>` with `Authorization: Bearer <credential>`. Each request times out after 30 seconds unless a command states otherwise. Every user-supplied path segment is percent-encoded as one segment, so a `/` inside an argument becomes `%2F`.
 - **PLAT-FR-092 (output).**
-  - **stdout** carries the result and nothing else: one JSON document, indented by 2 spaces, followed by a newline. A command whose route answers `204` prints `{}`.
+  - **stdout** carries the result and nothing else: one JSON document, indented by 2 spaces, followed by a newline. A command whose route answers `204` prints `{}`, unless its entry states a confirmation document (for example `{"status":"deleted","slug":"<slug>"}`).
   - **stderr** carries errors, warnings, hints and progress.
   - An error is printed on stderr as the error envelope (PLAT-FR-011). A hub error is printed as received, including `error_type`. An error raised by the CLI itself uses `code: 0` and one of these types:
 
@@ -1251,10 +1257,10 @@ Events are stored and streamed by §14 and carry the common fields listed there 
 
 | Event | When | Actor | Resource / action / workspace | `metadata` |
 |---|---|---|---|---|
-| `hub.token.bind` | once per bound token minted, by `POST /workspaces/:slug/tokens` or by fork-create | the minting user; `api_key` or `pat` | `token` / token id / `bind` / the bound slug | `token_id`, `workspace`, `permissions`, `paths` (or null), `expires_at` (or null). Never the token value. |
-| `hub.token.bound_refused` | the binding guard refused a request, rate-limited (PLAT-FR-087) | the token's user; `pat` | `token` / token id / `refuse` / the bound slug | `token_id`, `bound_workspace`, `requested_workspace` (when the request named one), `method`, `route`, `status` (403 or 404), `surface` (`api` or `git`), `suppressed` (int) |
+| `hub.token.bind` | once per bound token minted, by `POST /workspaces/:slug/tokens`, by fork-create, or by the hub for a sandbox git credential (§13) | the minting user; `api_key` or `pat` | `token` / token id / `bind` / the bound slug | `token_id`, `workspace`, `permissions`, `paths` (or null), `expires_at` (or null). Never the token value. |
+| `hub.token.bound_refused` | the binding guard refused a request, rate-limited (PLAT-FR-087) | the token's user; `pat` | `token` / token id / `bound_refused` / the bound slug | `token_id`, `bound_workspace`, `requested_workspace` (when the request named one), `method`, `route`, `status` (403 or 404), `surface` (`api` or `git`), `suppressed` (int) |
 
-`hub.token.bound_refused` is visible to the owner of the bound workspace even when the requested workspace is not. `requested_workspace` is the slug as the caller typed it and says nothing about whether it exists.
+`hub.token.*` events are visible only to callers with level `owner` or `admin` on the bound workspace (§14.3.7). `hub.token.bound_refused` is visible to them even when the requested workspace is not. `requested_workspace` is the slug as the caller typed it and says nothing about whether it exists.
 
 User, org, API key and unbound PAT operations emit no events.
 
@@ -1316,7 +1322,7 @@ Logs are JSON lines on stderr. Each request produces one access-log line with `m
 
 | Section | Defined in | Covers |
 |---|---|---|
-| `[forks]` | §4 | task fork TTLs and limits (`default_ttl`, `max_ttl`, `max_per_workspace`) |
+| `[forks]` | §4 | task fork TTLs and limits (`default_ttl`, `max_ttl`, `max_per_workspace`, `expire_on_land`) |
 | `[limits]` (other keys) | the section that owns each limit | size and quantity limits |
 | `[events]`, `[audit]`, `[sessions]` | §14 | event-log retention and stream limits, audit and session retention |
 | `[git]` | §5 | git server timeouts and push size |
@@ -1329,7 +1335,7 @@ Logs are JSON lines on stderr. Each request produces one access-log line with `m
 
 #### Server flags
 
-`--admin-email <string>` and `--reset-admin-token` (PLAT-FR-001, PLAT-FR-003).
+`--admin-email <string>` and `--reset-admin-token` (PLAT-FR-001, PLAT-FR-003). The subcommand `parleyd backup <directory>` writes a consistent snapshot of the data directory while the hub runs (NFR-007); it exits 1 when the directory is not empty.
 
 #### Environment variables
 
@@ -1339,12 +1345,13 @@ Logs are JSON lines on stderr. Each request produces one access-log line with `m
 | `XDG_DATA_HOME` | `parleyd` | base directory for `database.path` and `workspace.path` |
 | any `${NAME}` referenced in `config.toml` | `parleyd` | substituted into the configuration (for example OAuth client secrets) |
 | `PATH` | `parleyd` | locates `git` and, with sandboxes, the container engine |
+| `PARLEY_SECRETS_KEY`, `PARLEY_SECRETS_KEY_PREVIOUS` | `parleyd` | secret encryption key and the former key during rotation (§11) |
 | `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY` | `parleyd` | standard proxy behaviour for outgoing calls (identity providers, origins, forges) |
 | `PARLEY_CONFIG_DIR` | `parley` | CLI config directory; default `~/.parley` |
 | `PARLEY_ENDPOINT_URL` | `parley` | hub URL |
 | `PARLEY_API_KEY` | `parley` | credential |
 
-Retention settings read from the environment are listed in §14. The hub never reads forge tokens from its environment (§12).
+Retention is configured only through the `[events]`, `[audit]` and `[sessions]` keys of the configuration file (§14); no environment variable sets it. The hub never reads forge tokens from its environment (§12).
 
 ### 3.10 Edge cases and error handling
 
@@ -1359,7 +1366,7 @@ Retention settings read from the environment are listed in §14. The hub never r
   - `paths` on a token without any write scope is accepted and has no effect.
   - A fork-create call by a path-scoped token can mint only tokens with covered `paths`; omitting `paths` in the request is refused, not defaulted.
 - **Admin token.**
-  - It is not a user: `/user…` routes and the bound-token mint answer `403 forbidden`.
+  - It is not a user: `/user…` routes and the bound-token mint answer `403 forbidden`. So do workspace and fork creation (§4), user-scope secrets and variables (§11) and recording a verdict (§8).
   - It passes every scope check and has `admin` access on every workspace.
   - It may list bound tokens of any workspace.
 - **OAuth.**
@@ -1428,7 +1435,7 @@ Out of scope, with hand-off points only: the git protocol and `hub.git.push` (§
 
 **WS-US-10: Contribute without write access (Org member).** As a member with read-only access to a workspace, I want to fork it, push to my fork and have a change opened against the parent.
 - A member may fork any workspace they can read and is the owner of the fork.
-- With `auto_change`, the first push of a new branch opens a change that targets the parent (§7).
+- With `auto_change`, a push to a fork branch that has no open change (normally the first push of a new branch) opens a change that targets the parent (§5, §7).
 
 **WS-US-11: Forks clean up after themselves (Operator, Developer).** As an operator, I want forks to disappear without anyone deleting them.
 - A fork is deleted when its `expires_at` passes.
@@ -1464,7 +1471,7 @@ Out of scope, with hand-off points only: the git protocol and `hub.git.push` (§
 | `parent_slug` | string or null | null | Fork only: the slug of the parent. Immutable. |
 | `fork_point` | object or null | null | Fork only: `{ "ref": "<branch>", "sha": "<40 hex>" }`, the parent branch the fork was taken from and its head at that moment. Immutable. |
 | `expires_at` | timestamp or null | null | Fork only: when the fork is deleted. |
-| `auto_change` | bool or null | null | Fork only: whether the first push of a new branch opens a change. |
+| `auto_change` | bool or null | null | Fork only: whether a push or API commit to an own branch that has no `draft` or `open` change opens one (§5, §6). |
 | `purpose` | string or null | null | Fork only: free text that says what the fork is for. At most 1024 characters. |
 | `session_id` | string or null | null | Fork only: the agent session (§14) that created the fork. |
 | `settings` | object | defaults | Settings document (4.3.3). |
@@ -1510,7 +1517,7 @@ Settings are a flat document of named keys. A key that was never set has its def
 | `rebuild_push_integration_branch` | bool | | `false` | §10 |
 | `squash_merge_detection` | enum | `ancestry_only`, `content_based`, `both` | `both` | §10 |
 
-This section defines the keys, their types, defaults and validation. What `protected_branches`, the `land.*` keys and `changes.require_intent` do is defined in §7 and §8.
+This section defines the keys, their types, defaults and validation. What `protected_branches`, the `land.*` keys, `changes.require_intent` and `changes.auto_restack` do is defined in §7 and §8.
 
 The default of `protected_branches` follows the workspace's `default_branch`. While `default_branch` is still `null` the effective value is `[]`. Once the key is set explicitly, including to `[]`, the stored list is used as it is.
 
@@ -1574,21 +1581,21 @@ A task fork is a workspace with `kind: "fork"` and a `parent_slug`.
 - **Tracking branches.** Every branch that exists in the parent when the fork is created appears in the fork as a tracking branch. A tracking branch is read-only in the fork and always equals the parent's branch of the same name: when the parent's branch moves, the fork's view moves with it, with no sync call. If the parent's branch is deleted, the tracking branch disappears. Branches created in the parent later do not appear in the fork. The parent's tags are visible in the fork under the same rules.
 - **Own branches.** Agents push their work to new branch names. Own branches belong to the fork alone and are not visible in the parent.
 - **No copy.** Creating a fork copies no history. All commits of the parent that are reachable from its branches and tags can be fetched from the fork.
-- **Automatic change.** With `auto_change` (default true), the first push of a new branch to the fork opens a change (§7) in the parent, with the fork branch as source and the fork's base branch as target.
+- **Automatic change.** With `auto_change` (default true), a push or API commit that creates or moves an own branch which is not the source of a `draft` or `open` change opens a change (§7) in the parent, with the fork branch as source and the fork's base branch as target. Normally that is the first push of a new branch.
 - **Lifetime.** A fork has an `expires_at` and is deleted when it passes. It can also be deleted early by the hub once its work has landed (WS-FR-070).
 - **Ownership and access.** The caller owns the fork. The fork is in the parent's organization. Every reader of the parent can read the fork.
-- **Configuration data.** Variables and secrets resolve in the order fork → parent workspace → organization → user (§11).
+- **Configuration data.** Variables and secrets resolve in the order fork → parent workspace → organization → user (§11). For secrets the parent step applies only when the fork's owner has write access to the parent, so a fork owned by a read-only org member never receives the parent's secrets (§11.3).
 - **Carry-patch parents.** A fork of a carry-patch workspace is a plain fork. It has no patches, no upstream and no integration branch of its own. The parent's integration branch and patch branches are ordinary tracking branches in it.
 
 ### 4.4 Functional requirements
 
 **Authentication and access**
 
-- WS-FR-001 Every route follows the global check order (§3): authenticate (`401`), PAT scope (`403`), workspace access (`404` or `403`), validation (`400`), state (`409` or `400`), act.
+- WS-FR-001 Every route follows the global check order (§3): authenticate (`401`), binding guard for bound PATs (`404` or `403 token_bound`), PAT scope (`403 insufficient_scope`), workspace access (`404` or `403`), validation (`400`), state (`409` or `400`), act.
 - WS-FR-002 Scopes are `workspaces:read` and `workspaces:write`. A read check accepts either. Only PATs are scope-checked.
 - WS-FR-003 Access to a repository workspace: an admin token has `admin`; the owner has `owner`; a member of the workspace's organization has `member`. Anyone else gets `404 workspace not found`, identical to an unknown slug. A `member` is read-only: a write route answers `403 forbidden`. Two routes are open to members on purpose: fork creation and fork listing.
-- WS-FR-004 Access to a fork: the user who created it has `owner`. The owner of the parent also has `owner`, so that they can inspect and remove forks of their workspace. Members of the organization have `member`. Admin tokens have `admin`.
-- WS-FR-005 A token bound to workspace W (§3) is valid on the routes of W and of the forks that this token created. On any other workspace it gets `404 workspace not found`. `GET /workspaces` shows it W and those forks. `POST /workspaces` answers `403`, `error_type: token_bound`.
+- WS-FR-004 Access to a fork: the user who created it has `owner`. The owner of the parent also has `owner`, so that they can inspect and remove forks of their workspace. Members of the organization have `member`. Admin tokens have `admin`. A caller with no access to the parent has none on the fork either, even as its creator (§3): a member who leaves the organization loses the forks they created in it. Such a fork stays until it expires or the parent's owner deletes it.
+- WS-FR-005 A token bound to workspace W (§3) is valid on the routes of W and of the forks that this token created. On any other workspace it gets `404 workspace not found`, with one exception defined in §3: a token bound to a fork may use, on the fork's parent, the change and landing routes for changes whose source is the fork (§7, §8), the policy read routes (§8) and the awareness read routes (§9); every other route on the parent answers `403 token_bound`. `GET /workspaces` shows it W and those forks. `POST /workspaces` answers `403`, `error_type: token_bound`.
 - WS-FR-006 An admin token cannot create a workspace or a fork, because both need a user as owner: `403 forbidden`.
 
 **State preconditions**
@@ -1633,7 +1640,7 @@ A task fork is a workspace with `kind: "fork"` and a `parent_slug`.
 
 **List and get**
 
-- WS-FR-028 The list holds the workspaces the caller can read: own workspaces as `owner`, workspaces of the caller's organizations as `member` (ownership wins), and every workspace as `admin` for an admin token. A bound token sees the set of WS-FR-005.
+- WS-FR-028 The list holds the workspaces the caller can read: own workspaces and the forks of own workspaces as `owner`, workspaces of the caller's active organizations as `member` (ownership wins), and every workspace as `admin` for an admin token. A bound token sees the set of WS-FR-005.
 - WS-FR-029 Archived workspaces are left out unless `include_archived=true`. Forks are left out unless `include_forks=true` or `parent` is given. Order is `created_at` descending, then `slug` ascending.
 
 **Update**
@@ -1669,15 +1676,15 @@ A task fork is a workspace with `kind: "fork"` and a `parent_slug`.
 - WS-FR-045 A sync that cannot fetch (credential, network, origin refusal) moves nothing, sets `sync_error` and answers `502 upstream_error`. No event is emitted.
 - WS-FR-046 A sync runs to completion when the caller disconnects.
 - WS-FR-047 A branch that sync moves and that is the source of an open change gets a new version, as for any new head (§7).
-- WS-FR-048 For a carry-patch workspace, sync also fetches the upstream, refreshes patches and may start a rebuild. This and the extra response fields are defined in §10.
+- WS-FR-048 For a carry-patch workspace, sync also fetches the upstream, refreshes patches and may start a rebuild. The per-branch pass leaves out the integration branch and the branches of registered patches. This and the extra response fields are defined in §10.
 
 **Push to origin**
 
 - WS-FR-049 Push to origin sends exactly one branch of the hub, `refs/heads/<name>`, to the same branch on origin with the origin credential. It needs a repository workspace in `ready` status.
 - WS-FR-050 Without `force`, the push is fast-forward only: origin accepts it only if its branch is an ancestor of the hub's.
 - WS-FR-051 With `force`, the push uses force-with-lease. The lease is the origin head of that branch that the hub last saw (or "no such branch" if it never saw one). Origin's branch is replaced only if it still has that value. If origin moved since, nothing is overwritten and the answer is `409`, `error_type: origin_moved`. The hub never sends a blind force.
-- WS-FR-052 A forced push of a protected branch (§8) is refused with `400`, `error_type: protected_branch`. The landed history of a protected branch only ever goes to origin as a fast-forward.
-- WS-FR-053 On a carry-patch workspace, the integration branch and registered patch branches are refused (`400`, `error_type: integration_branch` or `patch_branch`). They reach origin through the settings of §10.
+- WS-FR-052 A forced push of a protected branch (§8) is refused with `403`, `error_type: protected_branch`. The landed history of a protected branch only ever goes to origin as a fast-forward.
+- WS-FR-053 On a carry-patch workspace, the integration branch and registered patch branches are refused (`403`, `error_type: integration_branch` or `patch_branch`). They reach origin through the settings of §10.
 - WS-FR-054 The push has a 2-minute deadline. It runs to completion or to its deadline when the caller disconnects.
 - WS-FR-055 After a successful push the hub records the pushed commit as the origin head of that branch.
 - WS-FR-056 Each push handed to origin emits exactly one `hub.workspace.push` event, on success and on failure. Refusals before the push emit none.
@@ -1685,24 +1692,25 @@ A task fork is a workspace with `kind: "fork"` and a `parent_slug`.
 
 **Archive, reactivate, reclone, delete**
 
-- WS-FR-058 Archive applies to a repository workspace in `ready` or `failed`. It first tries to push every branch to origin, fast-forward only, as a safety copy. The outcome of that push never blocks the archive. The hub keeps its copy of the repository, so unpushed branches and change versions survive.
+- WS-FR-058 Archive applies to a repository workspace in `ready` or `failed`. It first tries to push every branch to origin, fast-forward only, as a safety copy. On a carry-patch workspace the integration branch is left out, because the hub rebuilds it; patch branches are included. The outcome of that push never blocks the archive. The hub keeps its copy of the repository, so unpushed branches and change versions survive.
 - WS-FR-059 An archived workspace is not served over git (§5), accepts no writes, and is hidden from the default list. It can still be read with `GET`.
 - WS-FR-060 Archive force-closes every active agent session of the workspace and of its forks with reason `workspace archived` (§14). A failure to close a session does not fail the archive. Tokens, secrets, variables, patches and changes are untouched.
 - WS-FR-061 Operations that do not apply to a fork are refused with `400` and one of these types:
 
   | Operation on a fork | `error_type` |
   |---|---|
-  | sync, reclone, push to origin | `fork_has_no_origin` |
-  | archive, reactivate, change of `org_id` or `settings`, creating a fork of it | `not_supported_on_fork` |
+  | sync, reclone, push to origin, the forge webhook `PUT` and `DELETE` and the forge deliveries list (§12) | `fork_has_no_origin` |
+  | every carry-patch route of §10 | `workspace_mode_mismatch` |
+  | archive, reactivate, change of `org_id` or `settings`, creating a fork of it, replacing the policy (§8) | `not_supported_on_fork` |
 
-- WS-FR-062 Reactivate applies to an `archived` workspace, else `409 conflict`. It sets `pending` and records clone work, which finds the kept copy (WS-FR-026).
-- WS-FR-063 Reclone applies to a repository workspace in `ready` or `failed`. It is refused with `409`, `error_type: has_forks`, while the workspace has forks, because forks depend on the parent's copy. It first tries to push every branch to origin, fast-forward only; a failure of that push does not stop it. It then discards the hub's copy, clears `sync_error`, `origin_head_sha` and all origin heads, sets `pending` and records clone work. Whatever did not reach origin is lost, including refs under `refs/hub/`. Change records stay; what a change does when its commits are gone is defined in §7.
+- WS-FR-062 Reactivate applies to an `archived` workspace, else `409 workspace_not_archived`. It sets `pending` and records clone work, which finds the kept copy (WS-FR-026).
+- WS-FR-063 Reclone applies to a repository workspace in `ready` or `failed`. It is refused with `409`, `error_type: has_forks`, while the workspace has forks, because forks depend on the parent's copy. It first tries to push every branch to origin, fast-forward only (on a carry-patch workspace: every branch except the integration branch); a failure of that push does not stop it. It then discards the hub's copy, clears `sync_error`, `origin_head_sha` and all origin heads, sets `pending` and records clone work. Whatever did not reach origin is lost, including refs under `refs/hub/`. Change records stay; what a change does when its commits are gone is defined in §7.
 - WS-FR-064 Delete of a repository workspace applies only when it is `archived`, else `409`, `error_type: workspace_not_archived`.
-- WS-FR-065 Delete is transactional. In one step it removes the workspace and its forks, revokes every token bound to any of them, and removes everything they own: workspace secrets and variables, patches, changes, policy, claims and settings. If the step fails the answer is `500` and nothing has changed. Only after it succeeded does the hub force-close remaining active sessions (reason `workspace deleted`) and discard the repository data. The slug is free again. Audit records and the event log are kept.
+- WS-FR-065 Delete is transactional. In one step it removes the workspace and its forks, revokes every token bound to any of them, and removes everything they own: workspace secrets and variables, patches, changes, policy, claims and settings. If the step fails the answer is `500` and nothing has changed. The same step force-closes the remaining active sessions of the workspace and its forks (reason `workspace deleted`, §14). Only after it succeeded does the hub discard the repository data. The slug is free again. Audit records and the event log are kept.
 
 **Task forks**
 
-- WS-FR-066 A fork is writable only while its parent is `ready`. While the parent is `archived`, every write to the fork (git push, source control API, update of the fork) answers `409`, `error_type: parent_archived`. Reads and fetches keep working, and delete and expiry keep working. While the parent is in a reclone, archive or delete, the fork answers `409 workspace_busy`.
+- WS-FR-066 A fork is writable only while its parent is `ready`. While the parent is `archived`, every write to the fork (git push, source control API, update of the fork) answers `409`, `error_type: parent_archived`. Reads and fetches keep working, and delete and expiry keep working. While the parent is in an archive or delete call, or is `pending` or `cloning` after a reactivate, the fork answers `409 workspace_busy`.
 - WS-FR-067 Fork creation is synchronous. The answer is `201` with the fork in `status: "ready"`, and the fork is usable over git and the API from that moment.
 - WS-FR-068 Fork creation copies no history. Its duration and the storage it adds MUST NOT depend on the size of the parent repository (number of commits, files, branches of history, or bytes). The target is under one second for any repository; the measured bound is set in §15. The storage a fork uses grows only with what is pushed to it.
 - WS-FR-069 `ttl` defaults to `[forks].default_ttl` and may not exceed `[forks].max_ttl`. The shortest `ttl` is 5 minutes. `expires_at` is the creation time plus `ttl`.
@@ -1711,15 +1719,15 @@ A task fork is a workspace with `kind: "fork"` and a `parent_slug`.
 - WS-FR-072 A parent may have at most `[forks].max_per_workspace` forks at one time. A create beyond that answers `429`, `error_type: fork_limit_reached`. Forks that were deleted or expired do not count.
 - WS-FR-073 A tracking branch cannot be written in the fork by any means (git push, API ref update, API commit, delete). The refusal is `403`, `error_type: tracking_branch`; over git it is a per-ref rejection (§5). A fork cannot create a branch with the name of a tracking branch.
 - WS-FR-074 A fork's `head_sha` is the parent's current head of the fork's base branch. `fork_point.sha` does not change.
-- WS-FR-075 With `auto_change` true, the first push that creates a branch in the fork opens a change in the parent with that branch as source and the fork's base branch as target. Title, intent, session and draft state come from push options or defaults (§7). Later pushes to the same branch add versions. With `auto_change` false, nothing is opened unless the push asks for it (§7).
+- WS-FR-075 With `auto_change` true, a push (§5) or API commit (§6) that creates or moves an own branch of the fork which is not the source of a `draft` or `open` change opens a change in the parent with that branch as source and the fork's base branch as target. Normally that is the first push of a new branch; a push after the earlier change landed or was abandoned opens a new change. Title, intent, session and draft state come from push options or defaults (§7). Later pushes to the same branch add versions. With `auto_change` false, nothing is opened unless the push asks for it (§7).
 - WS-FR-076 Fork creation may mint a token. When the body has `token`, the hub creates a PAT owned by the caller and bound to the fork, and returns its secret once, in this response only.
-  - `permissions` is a non-empty list of scopes. If the caller authenticates with a PAT, the list must be a subset of that PAT's scopes, else `403 forbidden`.
-  - `paths` is an optional list of path globs that limits what the token may write (§8). If the caller's own token is path-limited, `paths` is required and may not be wider.
+  - `permissions` is a non-empty list of registered scopes. If the caller authenticates with a PAT, it needs `tokens:manage` and is held to the subset rule of §3 (PLAT-FR-051): it must hold every requested scope exactly, else `403 insufficient_scope`.
+  - `paths` is an optional list of path globs that limits what the token may write (§3, PLAT-FR-057). If the caller's own token is path-limited, `paths` is required and every glob must be covered by one of the caller's (PLAT-FR-059), else `403 insufficient_scope`.
   - `expires` is an optional duration. Without it the token lives as long as the fork.
   - `name` defaults to `fork:<fork slug>`.
   - The token is revoked when the fork is deleted or expires.
-- WS-FR-077 `session_id` at creation must name an active agent session that the caller may use (§14), else `400`. It is stored on the fork and carried on the fork's events.
-- WS-FR-078 Deleting a fork needs no archive first. It removes the fork, its own branches, its variables and secrets, and revokes the tokens bound to it, in one transactional step, then force-closes its active sessions (reason `workspace deleted`, or `fork expired`).
+- WS-FR-077 `session_id` at creation must satisfy the session-linking rule of §14 (the session's status is not checked), else `400`, `error_type: unknown_session`. It is stored on the fork and carried on the fork's events.
+- WS-FR-078 Deleting a fork needs no archive first. It removes the fork, its own branches, its variables and secrets, and revokes the tokens bound to it, and force-closes its active sessions (reason `workspace deleted`, or `fork expired` when the sweep deletes it), all in one transactional step.
 - WS-FR-079 Deleting or expiring a fork does not delete changes. Changes that have the fork as source belong to the parent and their versions stay fetchable there (§7). What an open change does when its source is gone is defined in §7.
 - WS-FR-080 Deleting a parent deletes all its forks in the same step (WS-FR-065). One `hub.workspace.delete` is emitted for each fork and one for the parent.
 - WS-FR-081 A fork never changes its parent's branches. The only path from a fork into the parent is a change that lands (§7, §8).
@@ -1749,7 +1757,7 @@ All paths are relative to `/api/v1`. Errors use the error envelope (§3). Every 
 | `git_username`, `git_password` | string | no | | WS-FR-015 |
 
 - **Response:** `201` workspace object with `status: "pending"`, `access: "owner"`.
-- **Errors:** `400 invalid_request`; `400 credential_check_failed`; `403 forbidden` (admin token, or not a member of the organization); `403 token_bound`; `409 conflict` (slug in use).
+- **Errors:** `400 invalid_request`; `400 credential_check_failed`; `403 forbidden` (admin token, or not a member of the organization); `403 token_bound`; `409 conflict` (slug in use); `503 secrets_unavailable` (a credential was given and no encryption key is configured, §11).
 - **Side effects:** credential secrets stored; clone work recorded; `hub.workspace.create`.
 
 #### `GET /workspaces`
@@ -1798,7 +1806,7 @@ All paths are relative to `/api/v1`. Errors use the error envelope (§3). Every 
 - **Purpose:** bring an archived workspace back.
 - **Scope:** `workspaces:write`. Write access. No body.
 - **Response:** `200` workspace object with `status: "pending"`.
-- **Errors:** `400 not_supported_on_fork`; `409 conflict` (not archived).
+- **Errors:** `400 not_supported_on_fork`; `409 workspace_not_archived`.
 - **Side effects:** clone work recorded; `hub.workspace.reactivate`.
 
 #### `POST /workspaces/:slug/sync`
@@ -1892,14 +1900,15 @@ All paths are relative to `/api/v1`. Errors use the error envelope (§3). Every 
 {
   "workspace": { "slug": "my-project--k3f9x2ab", "kind": "fork", "status": "ready", "…": "…" },
   "remote": "https://hub.example.com/git/acme/my-project--k3f9x2ab.git",
-  "token": { "id": "tok-91", "name": "fork:my-project--k3f9x2ab", "secret": "parley_pat_…",
+  "token": { "token_id": "k3x9q2mz", "user_id": "uuid", "name": "fork:my-project--k3f9x2ab", "token": "parley_pat_…",
              "permissions": ["git:read", "git:write", "changes:write"], "paths": ["src/loader/**"],
-             "expires_at": null }
+             "workspace": "my-project--k3f9x2ab", "expires_at": null, "revoked_at": null,
+             "created_at": "2026-01-01T00:00:00Z" }
 }
 ```
 
-  `workspace` is the fork's workspace object with `access: "owner"`. `remote` equals its `hub_url`. `token` is present only when it was requested; `secret` is never shown again.
-- **Errors:** `400 invalid_request` (bad `name`, `ttl`, `token`, `session_id`); `400 ref_not_found` (`ref` is not a branch of the parent); `400 not_supported_on_fork` (the parent is itself a fork); `403 forbidden` (admin token; token permissions or paths wider than the caller's); `409` per WS-FR-007 (parent not `ready`); `409 conflict` (fork name in use); `429 fork_limit_reached`.
+  `workspace` is the fork's workspace object with `access: "owner"`. `remote` equals its `hub_url`. `token` is present only when it was requested. It is the `Token` object of §3 with its value in the member `token`; the value is never shown again, and an idempotent replay omits it (§3).
+- **Errors:** `400 invalid_request` (bad `name`, `ttl`, `token`, malformed `session_id`); `400 unknown_session` (`session_id` fails the session-linking rule of §14); `400`, `error_type: fork_ref_not_found` (`ref` is not a branch of the parent); `400 not_supported_on_fork` (the parent is itself a fork); `403 forbidden` (admin token); `403 insufficient_scope` (a PAT caller without `tokens:manage`, or token permissions or paths beyond the caller's); `409` per WS-FR-007 (parent not `ready`); `409 conflict` (fork name in use); `429 fork_limit_reached`.
 - **Side effects:** fork created; optional token created; `hub.workspace.fork`.
 
 #### `GET /workspaces/:slug/forks`
@@ -1950,7 +1959,7 @@ The commands use the global connection and credential flags and the conventions 
 
 - **Flags:** `--reset-to-origin`, `--fail-on-diverged`, `--wait`, `--timeout`, `--poll-interval`.
 - **Calls:** `POST /workspaces/:slug/sync`, with a 3-minute request timeout. With `--wait`, if the answer names a rebuild job (§10), polls that job until it is final.
-- **Output:** the sync answer. With `--wait` and a rebuild, then the final job record.
+- **Output:** one document: the sync answer. With `--wait` and a rebuild, the same answer with one more member, `rebuild`, holding the final job record (§3: stdout carries exactly one document).
 - **`--fail-on-diverged`:** after printing, if any entry of `branches` has `result: "diverged"`, or the carry-patch field `patches_diverged` (§10) is not empty, the command names the diverged branches on stderr and exits **3**. A failed wait (exit 1) takes precedence. Without the flag, divergence does not change the exit code.
 - **Exit codes:** 0, 1, 2, 3.
 
@@ -2022,7 +2031,7 @@ A sweep runs at least once a minute. It deletes, as in WS-FR-078:
 - every fork whose `expires_at` has passed (reason `ttl`);
 - when `[forks].expire_on_land` is true, every fork that has met the conditions of WS-FR-070 for one hour (reason `landed`).
 
-Each deletion emits `hub.fork.expire`. A fork stays usable until the sweep removes it, so a fork may live up to a minute past `expires_at`. Forks of an archived parent expire as usual. A deletion that fails is retried by the next sweep.
+Each deletion emits `hub.fork.expire`. A fork stays usable until the sweep removes it, so a fork may live up to a minute past `expires_at`. Forks of an archived parent expire as usual. A deletion that fails is retried by the next sweep. The number of forks that exist is exported as `parley_forks_active` (§14).
 
 #### 4.7.3 Carry-patch hand-off points
 
@@ -2075,7 +2084,7 @@ Fixed values: credential check deadline 10 seconds; push-to-origin deadline 2 mi
 - **Branch name with `%` in the path.** It is decoded once: `fix%2F42` is `fix/42`, and `a%2525b` is `a%25b`.
 - **Fork of a branch that is deleted in the parent later.** The fork stays. Its base branch no longer resolves, so `head_sha` is `null` and a new change cannot target it. Existing own branches stay readable.
 - **Parent branch created after the fork, with a name the fork already uses.** Nothing happens in the fork. The fork's branch stays an own branch.
-- **Fork request with a commit id or a tag as `ref`.** Refused with `400 ref_not_found`. A fork needs a base branch that a change can target.
+- **Fork request with a commit id or a tag as `ref`.** Refused with `400`, `error_type: fork_ref_not_found`. A fork needs a base branch that a change can target.
 - **Extending a fork after `expires_at` but before the sweep.** Allowed. The fork lives on.
 - **Fork with work that has no change.** With `auto_change` false and no change opened by hand, early expiry never applies. Unlanded work in a fork is lost at `expires_at`; the fork's owner is expected to extend it or open a change.
 - **Parent archived with live forks.** Forks become read-only, their sessions are closed, and they still expire on time. Reactivating the parent makes the remaining forks writable again.
@@ -2134,7 +2143,7 @@ Out of scope: SSH transport and the dumb HTTP protocol (not offered); change sem
 
 A PAT bound to a workspace is valid only on that workspace and on the forks it created (§4). On any other repository it is answered like a stranger, and the refusal is reported as `hub.token.bound_refused` with `surface: "git"` (§3).
 
-**Hub-owned refs.** Everything under `refs/hub/` is written only by the hub. Two families are defined elsewhere: `refs/hub/changes/<number>/<version>` (every version of every change, §7) and `refs/hub/replaced/<name>` (backups of branch heads the hub replaced, §4 and §10). Hub-owned refs are listed and fetchable by name. A default clone does not fetch them, because git's default refspec covers only branches and tags.
+**Hub-owned refs.** Everything under `refs/hub/` is written only by the hub. Two families are defined elsewhere: `refs/hub/changes/<number>/<version>` (every version of every change, §7) and `refs/hub/replaced/<name>` (backups of patch branch tips the hub replaced, §10). Hub-owned refs are listed and fetchable by name. A default clone does not fetch them, because git's default refspec covers only branches and tags.
 
 **Ref update.** One command of a push: `{ref, before, after}`. `before` is the all-zero id for a create, `after` is the all-zero id for a delete. An update is **forced** when it is neither a create nor a delete and `before` is not an ancestor of `after`.
 
@@ -2146,11 +2155,11 @@ The git server has no entities of its own. It reads workspaces, tokens, settings
 
 - **GIT-FR-001** Exactly three routes exist, outside `/api/v1`: `GET /git/:org/:slug.git/info/refs`, `POST /git/:org/:slug.git/git-upload-pack` and `POST /git/:org/:slug.git/git-receive-pack`.
 - **GIT-FR-002** The REST body size limit (`[server].max_body_size`) does not apply to git routes. `[git].max_push_size` applies instead.
-- **GIT-FR-003** Checks run in the order of §3: authenticate (`401`) → PAT scope (`403`) → repository resolution and access (`404`, or `403` for a read-only member on a push route) → request validation (`400`) → workspace state (`409`) → act.
-- **GIT-FR-004** A request with missing, malformed or wrong credentials, or from a blocked user, is answered `401` with `WWW-Authenticate: Basic realm="parley"`, so that git can ask its credential helper. The Basic username is never consulted.
+- **GIT-FR-003** Checks run in the order of §3: authenticate (`401`; `403` for a blocked user) → rate limit (`429`) → binding guard for a bound PAT (`404`) → PAT scope (`403`) → repository resolution and access (`404`, or `403` for a read-only member on a push route) → request validation (`400`) → workspace state (`409`) → act.
+- **GIT-FR-004** A request with missing, malformed or wrong credentials is answered `401` with `WWW-Authenticate: Basic realm="parley"`, so that git can ask its credential helper. A valid credential of a blocked user is answered `403` with the body `user is blocked`, as §3 requires. The Basic username is never consulted.
 - **GIT-FR-005** Need is derived from the route: `git-receive-pack`, and `info/refs` with `service=git-receive-pack`, need write and `git:write`. Everything else needs read and `git:read`.
 - **GIT-FR-006** The repository resolves only when the slug names a workspace, the workspace has an organization, and `:org` is that organization's slug. A path segment that does not end in `.git`, an unknown slug, a wrong org and a caller without read access all get the same answer: `404 repository not found`. The answer does not depend on the workspace's status, so a workspace that is not ready does not reveal its existence to callers without access.
-- **GIT-FR-007** A caller with read access who addresses a workspace that is not `ready` gets `409` with the message `repository not available: workspace is <status>`.
+- **GIT-FR-007** A caller with read access who addresses a workspace that is not `ready` gets `409` with the message `repository not available: workspace is <status>`. A push to a task fork whose parent is `archived` gets `409` with the message `repository is read-only: parent workspace is archived` (§4, `parent_archived`); fetches from that fork keep working. A fork whose parent is in exclusive maintenance gets `409` with `repository not available: parent workspace is busy`.
 - **GIT-FR-008** Membership and token bindings are read on every request. A removed member is a stranger on the next request.
 - **GIT-FR-009** Errors before the git exchange starts are answered with the HTTP status and a one-line `text/plain` body, which git prints as `remote: <message>`. The statuses and messages are listed in §5.5. Errors after the exchange has started are in-band: `ERR` packets on fetch, the status report and `remote:` lines on push, with HTTP `200`.
 
@@ -2161,7 +2170,7 @@ The git server has no entities of its own. It reads workspaces, tokens, settings
 - **GIT-FR-012** Shallow fetch MUST work: `--depth`, `--deepen`, `--shallow-since`, `--shallow-exclude` and `--unshallow`.
 - **GIT-FR-013** Incremental fetch negotiates haves and wants and sends only missing objects. Gzip-compressed request bodies are accepted. Progress is streamed over the side band.
 - **GIT-FR-014** Every ref is advertised, including `refs/hub/**`. Under version 2 the client's ref-prefix filter keeps the listing small. A client may also request by object id any commit that is reachable from an advertised ref.
-- **GIT-FR-015** In a task fork, tracking branches are advertised at the parent's current heads (§4).
+- **GIT-FR-015** In a task fork, tracking branches are advertised at the parent's current heads (§4). The fork also advertises, read-only, the version refs `refs/hub/changes/<number>/<version>` of the changes whose source is the fork, under the same names as in the parent, so that the holder of a fork token can fetch every version of its own changes (§7).
 - **GIT-FR-016** The push advertisement offers at least `report-status`, `side-band-64k`, `delete-refs`, `ofs-delta`, `atomic` and `push-options`. Thin packs are accepted.
 
 #### Push processing
@@ -2202,7 +2211,7 @@ The git server has no entities of its own. It reads workspaces, tokens, settings
 
   Forwarding to origin is the only rule with an outside effect. It runs last, only when every ref of the push has passed every other rule, with a 120 s timeout per branch. If a forward fails, the whole push is refused; branches already forwarded in the same push stay on origin and return through the next sync.
 
-- **GIT-FR-032** Path check for a path-scoped token. The checked commits are those reachable from the pushed heads and not reachable from any ref the repository had before the push (in a fork this includes the parent's refs). For each such commit the changed files are its differences against its first parent, or its whole tree for a root commit; a rename counts with both its old and its new path. If any changed path matches none of the token's globs, the whole push is refused and the message names the first offending path in commit order, then path order. Tag and note pushes are checked the same way. Deletes and updates that add no new commits change no files and pass. Path limits never restrict fetch.
+- **GIT-FR-032** Path check for a path-scoped token. The checked commits are those reachable from the pushed heads and not reachable from any ref the repository had before the push (in a fork this includes the parent's refs). For each such commit the changed files are its differences against its first parent, or its whole tree for a root commit; a rename counts with both its old and its new path. If any changed path matches none of the token's globs, the whole push is refused and the message names the first offending path in commit order, then path order. Tag and note pushes are checked the same way. Deletes pass. An update that adds no new commits passes too, unless the branch is the source of a `draft` or `open` change or the push opens one: then the files of the resulting version against its base are checked (LAND-FR-080). Path limits never restrict fetch.
 - **GIT-FR-033** If a rule cannot be evaluated because of an internal failure, the push is refused with `internal error; try again`. Rules never fail open.
 
 #### Push to change mapping
@@ -2219,7 +2228,7 @@ The git server has no entities of its own. It reads workspaces, tokens, settings
 | New version of an existing change | `change <workspace>#<number> version <n>` |
 | Change opened | `change <workspace>#<number> version 1 (opened)` |
 | Change opened as draft | `change <workspace>#<number> version 1 (opened, draft)` |
-| Change not opened or version not recorded | `warning: no change for <branch>: <reason>` |
+| Change not opened | `warning: no change for <branch>: <reason>` |
 
   `<workspace>` is the slug of the workspace the change belongs to. The lines carry no URL. Example:
 
@@ -2230,7 +2239,7 @@ To https://hub.example/git/acme/demo.git
  * [new branch]      fix-retry -> fix-retry
 ```
 
-- **GIT-FR-043** A failure in the mapping never fails the push: the refs stay updated, `hub.git.push` is emitted, and the reason is reported on the `warning:` line. Reasons include: the target branch does not exist, the branch is its own target, the branch has no commits ahead of the target, and a PAT without `changes:write` asking to open a change. Recording a version on an existing change needs only `git:write`.
+- **GIT-FR-043** A failure in the mapping never fails the push: the refs stay updated, `hub.git.push` is emitted, and the reason is reported on the `warning:` line. Reasons include: the target branch does not exist, the branch is its own target, the branch has no commits ahead of the target, a merge commit among the commits ahead of the target (`merge_commits_unsupported`, §7), a PAT without `changes:write` asking to open a change, and an empty intent when the workspace setting `changes.require_intent` is true and `parley.draft` was not given (`intent_required`, §7). Recording a version on an existing change needs only `git:write`.
 
 #### Push options
 
@@ -2241,7 +2250,7 @@ To https://hub.example/git/acme/demo.git
 | `parley.change` | none | Open a change for every pushed branch that is not already the source of an open or draft change |
 | `parley.target=<branch>` | branch name | Target branch of the changes this push opens. Implies `parley.change` |
 | `parley.title=<text>` | 1–200 characters | Title of the changes this push opens. Default: the subject line of the branch's head commit |
-| `parley.intent=<text>` | up to 1,024 bytes | Intent of the changes this push opens. Default: the body of the head commit's message |
+| `parley.intent=<text>` | up to 1,024 bytes | Intent of the changes this push opens. Default: the body of the head commit's message, then the `purpose` of the source fork (CHG-FR-004) |
 | `parley.draft` | none | Open the changes in state `draft` instead of `open` |
 | `parley.session=<id>` | session id (§14) | Session recorded on the push events, on new versions and on opened changes |
 
@@ -2254,7 +2263,7 @@ To https://hub.example/git/acme/demo.git
 
 - **GIT-FR-060** One `hub.git.push` event is emitted per updated ref (§5.8). Event delivery problems never fail a push.
 - **GIT-FR-061** On a carry-patch workspace, an accepted update of a registered patch branch triggers the post-push behaviour of §10 (rebuild of the integration branch, optional mirror to origin). It runs in the background and never delays the answer.
-- **GIT-FR-062** Every git request is counted in `parley_git_requests_total{service,result}` with `service` ∈ `upload-pack`, `receive-pack` and `result` ∈ `ok`, `refused` (a push refused by a rule or an invalid option), `denied` (`401`, `403`, `404`), `error`.
+- **GIT-FR-062** Every git request is counted in `parley_git_requests_total{service,result}` with `service` ∈ `info-refs`, `upload-pack`, `receive-pack` and `result` ∈ `ok`, `refused` (`401`, `403`, `404`, and a push refused by a rule or an invalid option), `error` (§14).
 
 #### Credential helper
 
@@ -2271,12 +2280,16 @@ Common refusals, in check order:
 
 | Status | Body | Condition |
 |---|---|---|
-| `401` + `WWW-Authenticate: Basic realm="parley"` | `authentication required` | No, malformed or non-Basic `Authorization`; unknown, revoked or expired credential; blocked user |
+| `401` + `WWW-Authenticate: Basic realm="parley"` | `authentication required` | No, malformed or non-Basic `Authorization`; unknown, revoked or expired credential |
+| `403` | `user is blocked` | Valid credential of a blocked user |
+| `429` + `Retry-After` | `rate limit exceeded` | Over the request rate limit (§3) |
+| `404` | `repository not found` | Bound PAT on a repository its binding does not cover |
 | `403` | `token lacks scope git:read` / `token lacks scope git:write` | PAT without the needed scope |
-| `404` | `repository not found` | Unknown slug, no org, wrong org, missing `.git`, caller without read access, PAT bound elsewhere |
+| `404` | `repository not found` | Unknown slug, no org, wrong org, missing `.git`, caller without read access |
 | `403` | `org members have read-only access to this workspace; create a task fork to contribute` | Read-only member on a push route |
 | `400` | `invalid or missing service parameter` | `info/refs` without `service=git-upload-pack` or `service=git-receive-pack` |
 | `409` | `repository not available: workspace is <status>` | Caller has access, workspace not `ready` |
+| `409` | `repository is read-only: parent workspace is archived` | Push route on a task fork whose parent is `archived` |
 | `500` | `internal error` | Lookup or repository failure before the exchange starts |
 
 #### `GET /git/:org/:slug.git/info/refs`
@@ -2322,10 +2335,10 @@ Common refusals, in check order:
 
 | Event type | When | Fields |
 |---|---|---|
-| `hub.git.push` | Once per updated ref of an accepted push, in command order | `resource_type: "workspace"`, `resource_id: <slug>`, `action: "push"`, `session_id` from `parley.session` (else null); metadata `ref` (full name), `before`, `after` (40-hex; all-zero for create and delete respectively), `created`, `deleted`, `forced` (booleans), `via` (`git` here; the same event is emitted with `api` for ref updates through the source control API, §6, and with `land` when a land moves the target, §8) |
+| `hub.git.push` | Once per updated ref of an accepted push, in command order | `resource_type: "ref"`, `resource_id: <full ref name>`, `action: "push"`, `session_id` from `parley.session` (else null); metadata `ref` (full name), `before`, `after` (40-hex; null on the side that does not exist: `before` for a create, `after` for a delete), `created`, `deleted`, `forced` (booleans), `via` (`git` here; the same event is emitted with `api` for ref updates through the source control API, §6, and with `land` when a land moves the target, §8) |
 | `hub.git.fetch` | Once per served upload-pack request that sends a pack, only when the workspace setting `audit_fetches` is true | `resource_type: "workspace"`, `resource_id: <slug>`, `action: "fetch"`; metadata `shallow` (boolean), `filter` (string or null) |
 
-Actor fields follow the credential: `actor_type` is `pat`, `api_key` or `admin_token`. For a push to a fork, `workspace` is the fork's slug. Events of the same push have consecutive `seq` values. `hub.token.bound_refused` is specified in §3; the change events that follow a push in §7; the rebuild and mirror events in §10.
+Actor fields follow the credential: `actor_type` is `pat`, `api_key` or `admin_token`. For a push to a fork, `workspace` is the fork's slug. Events of the same push are written together and have consecutive positions among the workspace's events (§14); their `seq` values need not be contiguous. `hub.token.bound_refused` is specified in §3; the change events that follow a push in §7; the rebuild and mirror events in §10.
 
 ### 5.9 Configuration
 
@@ -2342,7 +2355,7 @@ Fixed values: Basic realm `parley`; forward-to-origin timeout 120 s per branch; 
 
 ### 5.10 Edge cases and error handling
 
-- A PAT without any git scope gets `403` on every git URL, whether or not the repository exists, because the scope check precedes resolution. This reveals nothing.
+- A PAT without any git scope gets `403` on every git URL, whether or not the repository exists, because the scope check precedes resolution. This reveals nothing. A bound PAT on a repository outside its binding gets `404` first, because the binding guard precedes the scope check (§3).
 - `info/refs?service=git-upload-pack&service=git-receive-pack` is treated as upload-pack.
 - Two concurrent pushes to the same branch: one wins, the other is refused with `ref changed since it was read; fetch and try again`. Pushes to different refs do not interfere.
 - A force-push that rebases a branch onto a newer target does not trip the path check for the target's commits: they are already in the repository, so only the agent's own commits are checked.
@@ -2451,17 +2464,17 @@ Reading
 
 Writing
 
-- **SCM-FR-020** All write routes need `git:write` for PATs and write access to the workspace. They are refused on an archived workspace (`409`, `error_type: workspace_archived`).
-- **SCM-FR-021** Every write obeys the push rules of §5 exactly as a git push would: hub-owned refs, protected branches, tracking branches of forks, carry-patch push control and path-scoped tokens. A refusal is `403` with the same `error_type` the rule defines (`hub_owned_ref`, `protected_branch`, `tracking_branch`, `integration_branch`, `patch_branch`, `path_not_allowed`), and for `path_not_allowed` the offending `path`.
+- **SCM-FR-020** All write routes need `git:write` for PATs and write access to the workspace. They are refused on an archived workspace (`409`, `error_type: workspace_archived`) and on a fork whose parent is archived (`409`, `error_type: parent_archived`, §4).
+- **SCM-FR-021** Every write obeys the push rules of §5 exactly as a git push would: hub-owned refs, protected branches, tracking branches of forks, carry-patch push control and path-scoped tokens. A refusal is `403` with the rule's message from GIT-FR-030 and the `error_type` that this section assigns to the rule (`hub_owned_ref`, `protected_branch`, `default_branch`, `tracking_branch`, `integration_branch`, `patch_branch`, `path_not_allowed`), and for `path_not_allowed` the offending `path`.
 - **SCM-FR-022 (commit creation).** `POST …/scm/commits` builds one commit and moves one branch:
   1. Resolve the parent. If the branch exists, the parent is its head and `expected_head_sha` is required and MUST equal it; otherwise `409 ref_moved`. If the branch does not exist, `base_ref` is required and the parent is the commit it resolves to.
   2. Apply the operations in order to the parent's tree. An operation that cannot apply (deleting a missing path, moving onto an existing path, a path used as both file and directory) fails the whole request with `400`, `error_type: invalid_operation`, naming the operation's index.
   3. A commit whose tree equals its parent's tree is refused with `400`, `error_type: empty_commit`, unless `allow_empty` is true.
   4. Create the commit with the given `message`, `author` (default: the caller's name and e-mail) and the hub as committer.
   5. Move the branch from the parent to the new commit with a compare-and-swap. A lost race answers `409 ref_moved` and creates nothing visible.
-- **SCM-FR-023** A successful commit has the same consequences as a push of that commit (§5): `hub.git.push` and `hub.scm.commit` are emitted, a new version is recorded when the branch is the source of a change, and a change is opened when the request carries a `change` object or the workspace is a fork with `auto_change` on (§7).
+- **SCM-FR-023** A successful commit has the same consequences as a push of that commit (§5): `hub.git.push` and `hub.scm.commit` are emitted, a new version is recorded when the branch is the source of a change, and a change is opened when the request carries a `change` object or the workspace is a fork with `auto_change` on (§7). Opening needs `changes:write` and passes the validation of CHG-FR-003. With an explicit `change` object, a failed check refuses the whole request with that check's error (`403 insufficient_scope`, or the `400`/`409` of CHG-FR-003) before anything is written. In an `auto_change` fork without a `change` object, the commit is kept, the response has `change: null`, and `change_error: {error_type, message}` says why no change was opened, as the `warning:` line does over git (GIT-FR-043).
 - **SCM-FR-024** `session_id`, when given, MUST satisfy the session-linking rule of §14; otherwise `400`, `error_type: unknown_session`, and nothing is written. It is recorded on the commit, the events and any version created.
-- **SCM-FR-025 (refs).** Creating a ref needs `name` and `sha` or `ref`. Moving a ref needs `expected_sha` and is a compare-and-swap. Deleting a ref takes an optional `expected_sha`. Only `refs/heads/*` and `refs/tags/*` can be written. Moving a branch backwards or sideways is allowed on unprotected branches, as with a forced push. Deleting the default branch is refused.
+- **SCM-FR-025 (refs).** Creating a ref needs `name` and `sha` or `ref`. Moving a ref needs `expected_sha` and is a compare-and-swap. Deleting a ref takes an optional `expected_sha`. Only `refs/heads/*` and `refs/tags/*` can be written. Moving a branch backwards or sideways is allowed on unprotected branches, as with a forced push. Deleting the default branch is refused (push rule 2a: `403`, `error_type: default_branch`).
 - **SCM-FR-026 (server-side rebase).** `POST …/scm/rebase` replays the commits of `branch` that are not in `onto` on top of `onto` and moves `branch` to the result with a compare-and-swap guarded by `expected_head_sha`. Nothing changes on conflict: the answer is `409`, `error_type: rebase_conflict`, with a conflict report (§8.3). A branch already based on `onto` answers `200` with `status: "up_to_date"`. Merge commits in the range are refused (`400`, `error_type: merge_commits_unsupported`). Rebasing the source branch of a change creates a new version of kind `rebase`.
 - **SCM-FR-027** Write routes accept `Idempotency-Key` (§3). A replayed commit creation returns the commit made the first time.
 
@@ -2493,7 +2506,7 @@ All routes are under `/workspaces/:slug/scm`. The conventions of §3 apply. Comm
 #### `DELETE /workspaces/:slug/scm/refs/*name`
 - **Purpose:** delete a branch or tag.
 - **Query:** `expected_sha` (optional).
-- **Response:** `204`. **Errors:** `409 ref_moved`; `409`, `error_type: ref_in_use` when the branch is the source of an open change (abandon the change first); push-rule refusals.
+- **Response:** `204`. **Errors:** `409 ref_moved`; `409`, `error_type: ref_in_use` when the branch is the source of a `draft` or `open` change (abandon the change first; a git push that deletes the branch is accepted and abandons the change, CHG-FR-013); push-rule refusals.
 - **Side effects:** `hub.git.push` with `deleted: true`.
 
 #### `GET /workspaces/:slug/scm/commits`
@@ -2526,8 +2539,8 @@ All routes are under `/workspaces/:slug/scm`. The conventions of §3 apply. Comm
     "change": {"target_branch": "main", "title": "…", "intent": "…", "draft": false}
   }
   ```
-- **Response:** `201 {"commit": <commit object>, "branch": <ref object>, "change": {"workspace_slug","number","version"} | null}`.
-- **Errors:** `400` validation (`invalid_request`, `invalid_operation`, `empty_commit`); `403` push-rule refusals; `409 ref_moved`; `413`.
+- **Response:** `201 {"commit": <commit object>, "branch": <ref object>, "change": {"workspace_slug","number","version"} | null, "change_error": {"error_type","message"} | null}`. `change_error` is set only when an `auto_change` fork could not open the change (SCM-FR-023).
+- **Errors:** `400` validation (`invalid_request`, `invalid_operation`, `empty_commit`); `403` push-rule refusals; `409 ref_moved`; `413`; with a `change` object, also the errors of opening a change (SCM-FR-023).
 - **Side effects:** SCM-FR-023.
 
 #### `GET /workspaces/:slug/scm/tree`
@@ -2583,7 +2596,7 @@ The CLI covers the calls a person or a script needs most. The remaining routes (
 - **Flags:** `--ref`, `--recursive`. **Calls:** `GET …/scm/tree`.
 
 #### `parley scm cat <slug> <path>`
-- **Flags:** `--ref`, `--output <file>` (default: stdout, raw bytes). **Calls:** `GET …/scm/file`. This is the one command whose stdout is not JSON.
+- **Flags:** `--ref`, `--output <file>` (default: stdout, raw bytes). **Calls:** `GET …/scm/file`. With the default output this command's stdout is raw bytes, not JSON.
 
 #### `parley scm diff <slug> <base> <head>`
 - **Flags:** `--mode merge_base|direct`, `--path` (repeatable), `--patch` (print unified diff text instead of JSON), `--name-only`. **Calls:** `GET …/scm/diff`.
@@ -2619,8 +2632,8 @@ Reads emit no events. They are counted in `parley_scm_requests_total{op,result}`
 
 | Key | Type | Default | Effect |
 |---|---|---|---|
-| `[scm].max_file_size` | size | `32MiB` | Largest file the file route returns |
-| `[scm].max_commit_size` | size | `32MiB` | Largest commit-creation request body |
+| `[scm].max_file_size` | size | `32MB` | Largest file the file route returns |
+| `[scm].max_commit_size` | size | `32MB` | Largest commit-creation request body |
 | `[scm].read_timeout` | duration | `30s` | Deadline of a read request |
 
 ### 6.9 Edge cases and error handling
@@ -2632,7 +2645,7 @@ Reads emit no events. They are counted in `parley_scm_requests_total{op,result}`
 - Committing to a branch of a fork that is a tracking branch is refused with `tracking_branch`; the response names the fork's base so the client can create its own branch.
 - A request that names both `expected_head_sha` and `base_ref` for an existing branch ignores `base_ref`.
 - A rebase where every commit of the branch is already contained in `onto` moves the branch to `onto` and reports `rebased` with zero replayed commits.
-- Reads at a commit that is reachable only from a deleted branch still succeed by full commit id while the object exists. The hub keeps every commit that a change version or a land attempt refers to.
+- Reads at a commit that is reachable only from a deleted branch still succeed by full commit id while the object exists. The hub keeps every commit that a change version or a land attempt refers to, until the workspace is recloned or deleted (§4).
 - A workspace in `pending` or `cloning` status answers every source control route with `409 workspace_busy`.
 
 ---
@@ -2692,10 +2705,11 @@ A change belongs to the workspace that holds its target branch. Its source branc
 | `sessions` | string[] | Every session that contributed a version |
 | `mergeable` | enum | `clean`, `conflict` or `unknown` (not yet computed against the current target head) |
 | `conflict` | object or null | Conflict report (§8.3) when `mergeable` is `conflict` |
-| `needs_restack` | bool | True when the change below moved and the automatic restack failed |
+| `needs_restack` | bool | True when the change is not built on the current head of the change below it (or on the target, once that change landed): the automatic restack conflicted, `changes.auto_restack` is false, or the stack is too deep |
+| `restack_reason` | enum or null | Why `needs_restack` is true: `conflict`, `auto_restack_off` or `stack_too_deep`. Null otherwise |
 | `stats` | object | `{commits, files_changed, insertions, deletions}` of the current version against `base_sha` |
 | `paths` | string[] | Files touched by the current version, at most 2,000; `paths_truncated` says whether there were more |
-| `landing` | object | Policy evaluation (§8): `{status, requirements[]}` |
+| `landing` | object | Policy evaluation (§8): `{status, reason, requirements[]}`. `status` is `ready`, `pending` or `blocked`. `reason` is null unless the block is structural (`nothing_to_land`, `target_not_found`, `draft`, `merge_commits`) |
 | `auto_land` | bool | Land automatically when `landing.status` is `ready` and `mergeable` is `clean` (§8) |
 | `labels` | string[] | Free-form, at most 20, each matching `^[a-z0-9][a-z0-9_.:/-]{0,62}$` |
 | `landed` | object or null | `{sha, at, by, land_id, commits: [{version_sha, landed_sha}]}` once landed |
@@ -2712,8 +2726,8 @@ A change belongs to the workspace that holds its target branch. Its source branc
 | `draft` | `open` | marked ready (`PATCH state: "open"`), provided title and intent rules hold |
 | `open` | `draft` | `PATCH state: "draft"` |
 | `open` | `landed` | a land attempt succeeds (§8) |
-| `draft`, `open` | `abandoned` | abandon; or the source workspace (a fork) is deleted |
-| `abandoned` | `open` | restore, while the source branch or the last version's commit still exists |
+| `draft`, `open` | `abandoned` | abandon; or the source branch is deleted by a git push (CHG-FR-013); or the source workspace (a fork) is deleted |
+| `abandoned` | `open` | restore, while the source workspace exists and the source branch or the last version's commit still exists |
 
 `landed` is terminal. A draft is never landed and is never restacked onto by `auto_land`.
 
@@ -2726,14 +2740,14 @@ One source branch is the source of at most one change in state `draft` or `open`
 | `number` | int | 1, 2, 3 … within the change |
 | `head_sha` | string | Head commit of this version |
 | `base_sha` | string | What this version was built on |
-| `kind` | enum | `push` (git push), `commit` (API commit), `ref` (API ref move), `rebase` (server-side rebase requested by a client), `restack` (hub restack in a stack), `revert` (generated by a revert) |
+| `kind` | enum | `push` (git push), `commit` (API commit), `ref` (API ref move), `rebase` (server-side rebase requested by a client), `restack` (hub restack in a stack), `revert` (generated by a revert), `sync` (the source branch was moved by a sync from origin, §4) |
 | `patch_equivalent_to` | int or null | An earlier version whose diff against its own base is identical to this one's. A pure rebase is patch-equivalent to its predecessor |
 | `created_by` | object | `{actor_type, actor_id, username}`; `actor_type: "system"` for hub restacks |
 | `session_id` | string or null | |
 | `stats` | object | As on the change |
 | `created_at` | timestamp | |
 
-- Every version's head stays fetchable at `refs/hub/changes/<number>/<version>` in the target workspace for as long as the change exists, whatever happens to the source branch. These refs are hub-owned (§5).
+- Every version's head stays fetchable at `refs/hub/changes/<number>/<version>` in the target workspace for as long as the change exists, whatever happens to the source branch. The one exception is a reclone of the workspace (§7.10). These refs are hub-owned (§5).
 - A new version is recorded whenever the source branch's head changes while the change is `draft` or `open`, by any means. Moving the branch to a commit that is already the head of the current version records nothing.
 - Versions are immutable.
 
@@ -2742,7 +2756,7 @@ One source branch is the source of at most one change in state `draft` or `open`
 - A change **depends on** another when its commits sit on top of that change's commits. `depends_on` is set:
   - explicitly, at open or by `PATCH`; or
   - automatically at open and on every new version: if the nearest ancestor of the head that is the current head of another `draft` or `open` change with the same target branch exists, that change becomes `depends_on`; if none exists, `depends_on` is cleared.
-- The **stack** of a change is the chain of `depends_on` links down to a change with none. A stack is at most 20 changes deep; a version that would make it deeper is still recorded, and the change gets `needs_restack: true` with `error_type: stack_too_deep` in its status.
+- The **stack** of a change is the chain of `depends_on` links down to a change with none. A stack is at most `[changes].max_stack_depth` changes deep (default 20); a version that would make it deeper is still recorded, and the change gets `needs_restack: true` with `restack_reason: "stack_too_deep"`.
 - A dependent change's `base_sha` is the head of the change below. Its diff, stats, paths and policy evaluation cover only its own commits.
 - All changes of a stack have the same target branch. They may come from different source workspaces.
 
@@ -2759,39 +2773,39 @@ Opening
 
 - **CHG-FR-001** A change is opened in three ways, all with the same result: `POST /workspaces/:slug/changes`; a git push with change options or into an `auto_change` fork (§5); an API commit with a `change` object or into an `auto_change` fork (§6).
 - **CHG-FR-002 (who may open).** The caller needs `changes:write` (PATs), write access to the source workspace and at least read access to the target workspace. This lets an org member open a change from their fork into a workspace they can only read.
-- **CHG-FR-003 (validation at open).** In this order: target branch exists in the target workspace (`400`, `error_type: target_not_found`); source workspace is the target workspace or a fork of it (`400`, `error_type: source_not_related`); source branch exists (`400`, `error_type: source_not_found`); source and target are not the same branch of the same workspace (`400`); source has at least one commit that the target does not contain (`400`, `error_type: nothing_to_land`); no other `draft` or `open` change has this source (`409 change_exists`); title rules; intent rule unless `draft`.
+- **CHG-FR-003 (validation at open).** In this order: target branch exists in the target workspace (`400`, `error_type: target_not_found`); source workspace is the target workspace or a fork of it (`400`, `error_type: source_not_related`); source branch exists (`400`, `error_type: source_not_found`); source and target are not the same branch of the same workspace (`400`); source has at least one commit that the target does not contain (`400`, `error_type: nothing_to_land`); none of those commits is a merge commit (`400`, `error_type: merge_commits_unsupported`); no other `draft` or `open` change has this source (`409 change_exists`); title rules; intent rule unless `draft`.
 - **CHG-FR-004 (defaults at open).** `title` defaults to the subject of the head commit. `intent` defaults to the body of the head commit, then to the `purpose` of the source fork. `target_branch` defaults to the fork's base branch for a fork source, otherwise to the workspace's default branch. `session_id` defaults to the session given on the push or commit that triggered the open, then to the session recorded on the source fork.
-- **CHG-FR-005** A change may target any branch of the workspace, protected or not. In a carry-patch workspace it may target a patch branch but never the integration branch (`400`, `error_type: hub_owned_ref`).
+- **CHG-FR-005** A change may target any branch of the workspace, protected or not. In a carry-patch workspace it may target a patch branch but never the integration branch (`403`, `error_type: integration_branch`).
 - **CHG-FR-006** Opening records version 1, computes the stack link (§7.3.3), evaluates policy (§8), schedules the mergeability check and emits `hub.change.version` for version 1. `hub.change.open` is emitted when the change enters `open`: at once for a change created open, and when a draft is marked ready.
 
 Versions
 
 - **CHG-FR-010** A version is recorded by the hub as a consequence of the ref update, in the same transaction, so that a change never misses a head. The client does nothing extra.
 - **CHG-FR-011** A new version: updates `head_sha`, `base_sha`, `stats`, `paths`, `session_id`; recomputes the stack link; re-evaluates policy; resets `mergeable` to `unknown` and schedules the check; carries approvals over only when it is patch-equivalent to the approved version (§8); marks earlier check results as belonging to their own version; emits `hub.change.version`.
-- **CHG-FR-012** A version created with a path-scoped token (§3) is refused before the ref moves when it touches a path outside the token's `paths`; the refusal is the push rule of §5.
+- **CHG-FR-012** A version created with a path-scoped token (§3) is refused before the ref moves when it touches a path outside the token's `paths`; the refusal is the push rule of §5. Opening a change, a ref move onto existing commits and a restack are checked the same way, against the files of the resulting version (LAND-FR-080).
 - **CHG-FR-013** When the source branch is deleted while the change is `draft` or `open`, the change is abandoned with reason `source_deleted`. The API refuses such a delete (§6); a git push that deletes the branch is accepted and has this effect.
 - **CHG-FR-014 (interdiff).** The difference between two versions of a change is the difference between their diffs, with rebases factored out: a version that is patch-equivalent to another has an empty interdiff. The response lists per file whether it changed between the versions and gives the patch of that difference.
 
 Editing and lifecycle
 
-- **CHG-FR-020** `title`, `intent`, `labels`, `auto_land`, `state` (`draft` ⇄ `open`), `target_branch` and `depends_on` can be edited by the author, by anyone with write access to the target workspace, and by the admin token. Editing needs `changes:write`.
+- **CHG-FR-020** `title`, `intent`, `labels`, `auto_land`, `state` (`draft` ⇄ `open`), `target_branch` and `depends_on` can be edited by the author, by anyone with write access to the target workspace, and by the admin token. Editing needs `changes:write`. The same callers, with the same scope, may abandon, restore and restack the change (CHG-FR-022, CHG-FR-023, CHG-FR-034); any other reader gets `403 forbidden`. "Author" means the user behind the credential that opened the change (`author.actor_id`), with any credential of that user, within the limits of a bound token (§3).
 - **CHG-FR-021** Retargeting (`target_branch`) is allowed while `draft` or `open` and when the change has no `depends_on` and no dependants. It re-evaluates policy and mergeability and emits `hub.change.version` with `kind: "retarget"` in the metadata without creating a version.
 - **CHG-FR-022 (abandon).** Abandoning a change with dependants needs `dependants=reparent` (the dependants are restacked onto the change below, or onto the target, without the abandoned change's commits) or `dependants=abandon` (they are abandoned too). Without the parameter the answer is `409`, `error_type: has_dependants`. Abandon never deletes the source branch or any version.
-- **CHG-FR-023 (restore).** Restoring an abandoned change moves it to `open` at its last version. If the source branch no longer exists it is recreated at that version's head. If another `draft` or `open` change now uses that source, the answer is `409 change_exists`.
+- **CHG-FR-023 (restore).** Restoring an abandoned change moves it to `open` at its last version. If the source branch no longer exists it is recreated at that version's head. If another `draft` or `open` change now uses that source, the answer is `409 change_exists`. If the source workspace (a fork) no longer exists, the answer is `409`, `error_type: source_workspace_gone`; the versions stay fetchable and a new change can be opened from a branch at the last version's head.
 - **CHG-FR-024** A landed change is read-only except for `labels`.
 
 Stacks and restack
 
 - **CHG-FR-030 (restack on a new version below).** When a change with dependants gets a new version, the hub rebases each direct dependant's own commits onto the new head, moves the dependant's source branch with a compare-and-swap, and records a version of kind `restack`. This continues up the stack. It runs in the background shortly after the triggering version and is not part of the push or commit that caused it.
 - **CHG-FR-031 (restack on landing below).** When a change lands, each direct dependant is rebased onto the landed commit on the target, its `depends_on` is cleared, and a `restack` version is recorded. Changes further up keep depending on the change directly below them and are restacked in turn.
-- **CHG-FR-032 (restack failure).** If the rebase conflicts, nothing moves for that change or anything above it. The change gets `needs_restack: true`, `mergeable: conflict` and a conflict report, and `hub.change.conflict` is emitted. A later version pushed by the author that sits on the new head below clears the flag.
+- **CHG-FR-032 (restack failure).** If the rebase conflicts, nothing moves for that change or anything above it. The change gets `needs_restack: true` with `restack_reason: "conflict"`, `mergeable: conflict` and a conflict report, and `hub.change.conflict` is emitted. A later version pushed by the author that sits on the new head below clears the flag.
 - **CHG-FR-033 (restack and the author's branch).** A restack moves the source branch on the hub. The author's local branch is then behind; a `git pull --rebase` or a fetch of `refs/hub/changes/<number>/<version>` brings it up to date. If the source branch moved between the hub reading it and the compare-and-swap, the restack is retried on the new head.
 - **CHG-FR-034 (manual restack).** `POST …/changes/:number/restack` asks for the same operation on demand and returns its result synchronously: the new version, or `409 rebase_conflict` with the report. For a change with no `depends_on` it rebases onto the current target head.
-- **CHG-FR-035** `auto_restack` is a workspace setting (`changes.auto_restack`, default true). When false, CHG-FR-030 and CHG-FR-031 only set `needs_restack` and leave the rebase to the manual call.
+- **CHG-FR-035** `auto_restack` is a workspace setting (`changes.auto_restack`, default true). When false, CHG-FR-030 and CHG-FR-031 only set `needs_restack` (with `restack_reason: "auto_restack_off"`) and leave the rebase to the manual call.
 
 Reading
 
-- **CHG-FR-040** Reading changes needs `changes:read` and read access to the target workspace. A caller with access only to a fork sees the changes whose source is that fork: through the fork's slug (`GET /workspaces/<fork>/changes` lists changes whose source workspace is the fork), and, with a token bound to the fork, through the parent's change routes for exactly those changes (§3). The same token may edit, restack, land (§8) and abandon them where this section and §8 allow the author to.
+- **CHG-FR-040** Reading changes needs `changes:read` and read access to the target workspace. On a fork's slug, `GET /workspaces/<fork>/changes` lists the changes whose source workspace is the fork. A token bound to a fork F (§3) reaches these routes of this section on F's parent, and only for changes whose source workspace is F: `POST …/changes` (with `source.workspace_slug` = F); `GET …/changes` (confined to those changes); `GET …/changes/:number`, `…/versions`, `…/versions/:version`, `…/diff`, `…/stack` and `GET …/changes/by-commit/:sha`; `PATCH …/changes/:number`; `POST …/abandon`, `…/restore` and `…/restack`. A change with another source answers `404 change_not_found`. Within these routes the token has the access of its user (CHG-FR-020). The routes of §8 and §9 it reaches are listed in LAND-FR-003 and AWR-FR-001.
 - **CHG-FR-041** List filters: `state` (repeatable; default `draft` and `open`), `target_branch`, `source_workspace`, `author` (user id or `me`), `session_id`, `label`, `path` (glob; changes touching a matching file), `mergeable`, `landing_status`, `stack_of=<number>` (every change in that change's stack, bottom first). Order: `updated_at` descending, or `number` ascending with `sort=number`.
 - **CHG-FR-042** `GET /workspaces/:slug/scm/commits/:sha` (§6) names the change of any commit that is a version head or was landed by a change. `GET …/changes/by-commit/:sha` returns that change directly.
 - **CHG-FR-043 (session link).** A session record (§14) lists the changes it contributed versions to. A change lists every session that contributed. A `session_id` on a change or version MUST satisfy the session-linking rule of §14; otherwise the triggering request is refused with `400`, `error_type: unknown_session`.
@@ -2802,7 +2816,7 @@ Retention
 
 ### 7.5 REST API
 
-All routes are under `/workspaces/:slug`. The conventions of §3 apply. Common errors: `401`; `403` missing scope or read-only member on a write; `404 workspace not found`; `404`, `error_type: change_not_found`.
+All routes are under `/workspaces/:slug`. The conventions of §3 apply. Unless a route says otherwise, `GET` routes need `changes:read` and read access (CHG-FR-040); `PATCH`, abandon, restore and restack need `changes:write` and the caller rule of CHG-FR-020. Common errors: `401`; `403 insufficient_scope`; `403 forbidden` (a caller who may read the change but not modify it); `404 workspace not found`; `404`, `error_type: change_not_found`.
 
 #### `POST /workspaces/:slug/changes`
 - **Purpose:** open a change targeting a branch of `:slug`.
@@ -2829,7 +2843,7 @@ All routes are under `/workspaces/:slug`. The conventions of §3 apply. Common e
 - **Purpose:** edit a change (CHG-FR-020, CHG-FR-021).
 - **Body:** any of `title`, `intent`, `labels`, `auto_land`, `state` (`draft` or `open`), `target_branch`, `depends_on` (int or null).
 - **Response:** `200` change object.
-- **Errors:** `400 intent_required`; `400`, `error_type: invalid_dependency` (unknown change, different target, would form a cycle, not `draft` or `open`); `409`, `error_type: change_closed` for a landed or abandoned change.
+- **Errors:** `400 intent_required`; `400`, `error_type: invalid_dependency` (unknown change, different target, would form a cycle, not `draft` or `open`); `409`, `error_type: change_closed` for an abandoned change, and for a landed change when the body has any field other than `labels` (CHG-FR-024).
 
 #### `POST /workspaces/:slug/changes/:number/abandon`
 - **Purpose:** abandon a change (CHG-FR-022).
@@ -2839,7 +2853,7 @@ All routes are under `/workspaces/:slug`. The conventions of §3 apply. Common e
 
 #### `POST /workspaces/:slug/changes/:number/restore`
 - **Purpose:** restore an abandoned change (CHG-FR-023).
-- **Response:** `200` change object. **Errors:** `409 change_exists`; `409`, `error_type: change_not_abandoned`.
+- **Response:** `200` change object. **Errors:** `409 change_exists`; `409`, `error_type: change_not_abandoned`; `409`, `error_type: source_workspace_gone`.
 - **Side effects:** `hub.change.restore`.
 
 #### `POST /workspaces/:slug/changes/:number/restack`
@@ -2864,7 +2878,7 @@ All routes are under `/workspaces/:slug`. The conventions of §3 apply. Common e
 
 #### `GET /workspaces/:slug/changes/:number/stack`
 - **Purpose:** the whole stack the change is part of.
-- **Response:** `200 {"target_branch", "changes": [<change summary>…]}`, bottom first. A summary has `number`, `title`, `state`, `version`, `head_sha`, `mergeable`, `needs_restack`, `landing.status`.
+- **Response:** `200 {"target_branch", "changes": [<change summary>…]}`, bottom first. A summary has `number`, `title`, `state`, `version`, `head_sha`, `mergeable`, `needs_restack`, `restack_reason`, `landing.status`.
 
 ### 7.6 CLI
 
@@ -2916,7 +2930,7 @@ All routes are under `/workspaces/:slug`. The conventions of §3 apply. Common e
 #### `parley change wait <slug> <number>`
 - **Purpose:** block until the change reaches a condition.
 - **Flags:** `--for landed|ready|mergeable` (default `landed`), `--timeout`, `--poll-interval`.
-- **Exit codes:** 0 when the condition holds; 1 when the change is abandoned, or on timeout; 3 when waiting for `ready` or `mergeable` and the change becomes `blocked` or `conflict`.
+- **Exit codes:** 0 when the condition holds; 1 with `wait_failed` when the change is abandoned, or when waiting for `ready` or `mergeable` and the change becomes `blocked` or `conflict`; 1 with `wait_timeout` on timeout (§3).
 
 ### 7.7 Background behaviour
 
@@ -2924,6 +2938,7 @@ All routes are under `/workspaces/:slug`. The conventions of §3 apply. Common e
 - **Restacks** (CHG-FR-030, CHG-FR-031) are durable: one that was pending at shutdown is run after the next start.
 - **Start-up reconciliation.** At start the hub compares each `draft` or `open` change's current version with its source branch head and records a version for any head it missed, so that a crash between a ref update and its bookkeeping cannot lose a version.
 - **Fork deletion and expiry** abandon the fork's `draft` and `open` changes (CHG-FR-050).
+- **Metric.** `parley_changes_open{workspace}` counts the changes in state `draft` or `open` (§14).
 
 ### 7.8 Events
 
@@ -2953,14 +2968,15 @@ Workspace settings (§4): `changes.require_intent` (default true), `changes.auto
 ### 7.10 Edge cases and error handling
 
 - **A push that rewrites the branch completely** (unrelated history) is still a new version of the same change. Its interdiff against the previous version is simply large.
-- **A push that makes the source equal to or behind the target** (nothing left to land) records the version and sets `landing.status` to `blocked` with reason `nothing_to_land`. The change stays open so that the next push can revive it.
+- **A push that makes the source equal to or behind the target** (nothing left to land) records the version and sets `landing.status` to `blocked` with reason `nothing_to_land`. The change stays open so that the next push can revive it. This reason is derived only when a version is recorded or the change is retargeted, from the pushed head and the target at that moment. It is not derived again when the target moves, so a change whose commits reach the target later through another change is not blocked and lands as a no-op (§8).
 - **The target branch is deleted.** The change stays `open` with `mergeable: unknown` and `landing.status: blocked`, reason `target_not_found`. It can be retargeted.
 - **Two changes with the same commits** (one branch pushed under two names) are two changes. The second to land finds its commits already in the target and lands as a no-op (§8).
 - **Stack links and force pushes.** If a dependant is force-pushed onto the target directly, its `depends_on` is cleared by the automatic rule. If the lower change is force-pushed to an unrelated head, dependants are restacked onto it by patch replay; this may conflict and set `needs_restack`.
 - **Cycles** cannot arise from the automatic rule. An explicit `depends_on` that would create one is refused with `invalid_dependency`.
-- **A change from a fork whose owner loses read access to the target workspace** stays open. The author can no longer read or edit it through the target's slug; the workspace owner can abandon it.
+- **A change from a fork whose owner loses read access to the target workspace** stays open. The author can no longer read or edit it, through the target's slug or through the fork's (§3); the workspace owner can abandon it.
 - **Number allocation** is gap-free under normal operation, but a failed open may consume a number. Clients MUST NOT assume numbers are contiguous.
 - **Very large changes.** `paths` is capped at 2,000 entries; policy (§8) is still evaluated over every touched path.
+- **Reclone of the workspace (§4).** A reclone discards the version refs and every commit that did not reach origin. Change records, versions, approvals and land attempts stay as records. A `draft` or `open` change whose source branch does not exist after the reclone is abandoned with reason `source_lost`. One whose branch came back from origin with another head gets a new version of kind `sync`. Reading the diff or the ref of a version whose commit is gone answers `404 ref_not_found`, and a change whose last version is gone cannot be restored.
 
 ---
 
@@ -2988,7 +3004,7 @@ In scope: land attempts, the landing algorithm, conflict reports and server-side
 
 **LAND-US-05** As a Developer, I want to approve a version of a change, and have my approval survive a pure rebase but not a content change.
 
-**LAND-US-06** As a Check runner, I want to report `passed` or `failed` for a named check on a version using a token that can do nothing else.
+**LAND-US-06** As a Check runner, I want to report `passed` or `failed` for a named check on a version using a token that can do nothing else: a PAT of a user with write access to the workspace that carries only `checks:write`.
 
 **LAND-US-07** As an Agent, I want to set `auto_land` and walk away: the change lands as soon as policy is satisfied.
 
@@ -3005,6 +3021,7 @@ In scope: land attempts, the landing algorithm, conflict reports and server-side
 #### 8.3.1 Protected branches
 
 - The workspace setting `protected_branches` (§4) is a list of branch globs. Its default is the default branch.
+- **Branch globs.** A glob is matched against the whole branch name (without `refs/heads/`). `*` matches any run of characters except `/`. `**` matches any run of characters including `/`. Every other character matches itself, so a glob without wildcards names exactly one branch. A branch is protected when at least one glob matches it. `rules[].targets` (8.3.4) uses the same matching.
 - A protected branch moves in exactly two ways: a successful land, and a sync from origin (§4). Pushes, API commits, API ref moves and deletes are refused for every caller, including the owner (§5, §6).
 - Changes may also target unprotected branches. They land the same way; the branch can additionally be pushed directly.
 
@@ -3026,7 +3043,7 @@ In scope: land attempts, the landing algorithm, conflict reports and server-side
 | `commits` | object[] | `{change, version_sha, landed_sha}` for each landed commit; with `squash`, one entry per change |
 | `conflict` | object or null | Conflict report when `status` is `conflict` |
 | `blocked` | object or null | `{change, status, requirements[]}` when `status` is `blocked` |
-| `error` | string or null | Reason when `failed` (`contention`, `timeout`, `internal`) |
+| `error` | string or null | Reason when `failed` (`contention`, `timeout`, `origin_rejected`, `internal`) |
 | `override` | object or null | `{reason}` when policy was overridden |
 | `policy_revision` | int | Revision of the policy that was evaluated |
 | `requested_by` | object | `{actor_type, actor_id, username}` |
@@ -3099,7 +3116,7 @@ Limits: at most 200 rules; the document is at most 64 KiB. A workspace that neve
 3. Each distinct selected rule (and `default`, if selected) yields one **requirement** on the change: `{rule, paths (the change's files it was selected for, at most 50), approvals: {required, counted, approvers}, checks: [{name, status}], block, satisfied}`.
 4. A requirement is satisfied when it does not block, its counted approvals reach `required`, no counted rejection is outstanding, and every named check is `passed`.
 5. `landing.status` is:
-   - `blocked` when any requirement blocks, or the change cannot land for a structural reason (`reason`: `nothing_to_land`, `target_not_found`, `draft`);
+   - `blocked` when any requirement blocks, or the change cannot land for a structural reason (`reason`: `nothing_to_land`, `target_not_found`, `draft`, `merge_commits`);
    - `pending` when no requirement blocks and at least one is unsatisfied;
    - `ready` when all are satisfied.
 
@@ -3119,7 +3136,7 @@ Policy is evaluated against the change's own commits only. In a stack, each chan
 | `created_at` | timestamp | |
 
 - A user has at most one verdict per change version. A new verdict replaces the earlier one.
-- **Counting.** An approval counts toward a requirement when its user is among the requirement's approvers and it was **not** given with the same credential that created the approved version. A person approving their agent's work with their own API key counts. An agent approving the version it just pushed does not.
+- **Counting.** An approval counts toward a requirement when its user is among the requirement's approvers and it was **not** given with a credential that created any version of the change, the approved one or an earlier one. Versions created by the hub (`restack`, `sync`) do not reset this. A person approving their agent's work with their own API key counts. An agent approving the version it just pushed does not.
 - **Carry-over.** When a new version is patch-equivalent to an approved or rejected version (§7), the verdicts are carried to it. Any other new version starts with none.
 - A counted `reject` keeps its requirement unsatisfied until its author replaces or withdraws it, or a version that is not patch-equivalent arrives.
 
@@ -3144,8 +3161,9 @@ Checks are reported on a version, not on the rebased result of a land. This is d
 
 Who may land
 
-- **LAND-FR-001** Landing needs `changes:write` (PATs) and one of: write access to the target workspace; or being the change's author while the workspace setting `land.by_author` is true (default). The second case is what lets an agent holding only a fork token land its own change once policy is satisfied.
-- **LAND-FR-002** Nobody lands past policy, with one exception: the workspace owner or the admin token may pass `override: {"reason": "<text>"}`. Overrides skip unmet approvals and checks, never `block` rules, are recorded on the land attempt and in `hub.change.land`, and can be disabled per workspace with `land.allow_override: false`.
+- **LAND-FR-001** Landing needs `changes:write` (PATs) and one of: write access to the target workspace; or being the change's author while the workspace setting `land.by_author` is true (default). The second case is what lets an org member land their own change from their fork once policy is satisfied (§17.3, decision 11). "Author" means the user behind the credential that opened the change. A fork-bound token lands under whichever case applies to its user; the binding only confines it to changes whose source is its fork (LAND-FR-003).
+- **LAND-FR-002** Nobody lands past policy, with one exception: the workspace owner, with an API key or an unbound PAT, or the admin token may pass `override: {"reason": "<text>"}`. A workspace-bound PAT can never override, whoever its user is (`403`, `error_type: override_not_allowed`), so an agent holding a fork or workspace token cannot land past policy. Overrides skip unmet approvals and checks, never `block` rules, are recorded on the land attempt and in `hub.change.land`, and can be disabled per workspace with `land.allow_override: false`.
+- **LAND-FR-003 (fork-bound tokens).** A token bound to a fork F (§3) reaches these routes of this section on F's parent, and only for changes whose source workspace is F: `POST …/changes/:number/land` (never with `override`; with `stack: true` only when every change of the stack has source F); `GET …/changes/:number/lands`, and `GET …/lands/:id` for an attempt that lands such a change; `GET …/changes/:number/conflict` and `…/conflict/file`; `GET …/changes/:number/approvals` and `GET …/changes/:number/checks`. It also reaches `GET …/policy` and `POST …/policy/evaluate`. Every other route of this section on the parent answers it `403 token_bound`: the workspace-wide `GET …/lands`, `PUT …/policy`, recording or withdrawing a verdict, reporting a check, and revert. A fork token therefore cannot certify or revert its own work; review agents and check runners use their own tokens.
 
 The landing algorithm
 
@@ -3155,18 +3173,18 @@ The landing algorithm
   - With `rebase`, each commit is replayed in order. Authors and messages are kept. The committer is the hub's landing identity. When the version already sits directly on *T*, the commits are used as they are and nothing is rewritten.
   - With `squash`, one commit is created per change. Its message is the change title, a blank line, the intent, and the trailers `Parley-Change: <slug>#<number>` and, when known, `Parley-Session: <id>`. Its author is the author of the version's head commit; other authors are listed as `Co-authored-by` trailers.
   - Commits whose content is already in *T* are dropped. If nothing is left, the attempt ends `landed` with `noop: true`, `landed_sha` = *T*, and the target is not moved.
-  - Merge commits in the change are refused when the change is opened into a protected branch (`400`, `error_type: merge_commits_unsupported`), so they do not occur here.
+  - Merge commits are refused when the change is opened (CHG-FR-003: `400`, `error_type: merge_commits_unsupported`). A later version that brings one in is recorded, and the change's `landing.status` becomes `blocked` with reason `merge_commits` until a version without merge commits arrives. So they do not occur here.
 - **LAND-FR-013 (conflict).** If a commit does not apply, the attempt ends `conflict` with a conflict report. The target is untouched. The change stays `open` with `mergeable: conflict`. The HTTP answer is `409`, `error_type: land_conflict`.
 - **LAND-FR-014 (compare-and-swap).** Move the target from *T* to the new head only if it still is *T*. If it moved, go back to LAND-FR-012 with the new head. After `[land].max_attempts` tries (default 10) the attempt ends `failed` with `error: "contention"`; the caller may simply try again.
 - **LAND-FR-015 (atomic bookkeeping).** The ref move, the change's transition to `landed`, the commit mapping, the land attempt's final status and the `hub.change.land` event are one atomic step. After a crash, the hub is in exactly one of two states: not landed, or landed with all of these recorded.
 - **LAND-FR-016 (stack landing).** With `stack: true` the attempt covers the change and every unlanded change below it. All of them are replayed bottom first onto *T* and the target moves once, to the top. It is all or nothing: one conflict or one policy miss stops the whole attempt, and the report names the change.
 - **LAND-FR-017 (after landing).** After a successful land, outside the atomic step and each best effort:
-  1. delete the source branch when `land.delete_source` is true and no other `draft` or `open` change uses it;
+  1. delete the source branch when `land.delete_source` is true, its head is still the head of the landed version (a compare-and-swap, so commits pushed later are never discarded) and no other `draft` or `open` change uses it;
   2. restack the change's dependants (§7);
   3. schedule mergeability checks for the other changes on the target (§7);
   4. start the early expiry clock of the source fork when all its changes are landed or abandoned (§4);
   5. in a carry-patch workspace, when the target is a patch branch, trigger a rebuild (§10).
-- **LAND-FR-018 (no publication).** Landing changes only the hub's repository. Nothing is pushed to origin or to a forge. Publishing is the explicit branch push of §4.
+- **LAND-FR-018 (no publication).** Landing changes only the hub's repository. Nothing is pushed to origin or to a forge. Publishing is the explicit branch push of §4. The one exception is a patch branch of a carry-patch workspace whose settings forward or mirror it to origin (CP-FR-086, CP-FR-088); a forward that origin refuses ends the attempt `failed` with `error: "origin_rejected"`.
 - **LAND-FR-019 (durability and time).** A land attempt is durable. An attempt that was `running` when the hub stopped is run again from LAND-FR-010 at the next start; LAND-FR-015 makes this safe. One attempt is bounded by `[land].timeout` (default 5 min) and then ends `failed` with `error: "timeout"`.
 - **LAND-FR-020 (answering the caller).** The land call waits for the attempt up to `wait` seconds (default 30, max 60). A final attempt is answered `200` when `landed` and with the `409` forms above for `conflict` and `blocked`; `failed` is `503`, `error_type: land_failed`. An attempt still running is answered `202` with the attempt, to be polled.
 - **LAND-FR-021 (no waiting on others).** Land attempts for different changes MUST run concurrently, including on the same target branch. The only point of mutual exclusion is the compare-and-swap of LAND-FR-014.
@@ -3180,21 +3198,21 @@ Conflict resolution without a clone
 Policy
 
 - **LAND-FR-040** Reading the policy needs read access to the workspace and `changes:read`. Replacing it needs `workspaces:write` and owner or admin access. A fork has no policy of its own: changes are governed by the policy of their target workspace.
-- **LAND-FR-041** `PUT` replaces the whole document, validates it (names, globs, limits, known approver forms, existing usernames), increases `revision`, and takes an optional `If-Match: <revision>` that fails with `412` when the stored revision differs. The last 50 revisions are kept and readable.
+- **LAND-FR-041** `PUT` replaces the whole document, validates it (names, globs, limits, known approver forms, existing usernames), increases `revision`, and takes an optional `If-Match: <revision>` that fails with `412`, `error_type: revision_mismatch`, when the stored revision differs. The last 50 revisions are kept and readable.
 - **LAND-FR-042** After a policy update the hub re-evaluates every `draft` and `open` change of the workspace. Changes whose status changes emit `hub.change.ready` or get their new requirements silently; no approval or check is discarded.
 - **LAND-FR-043 (evaluate).** `POST …/policy/evaluate` answers what a set of paths would need, without a change: input `{paths, target_branch?}` or `{change: <number>}`, optionally with a candidate `policy` document to try; output the requirements and the resulting status as they would be with no approvals and no checks.
 - **LAND-FR-044** Policy is re-evaluated on: a new version, a retarget, an approval or its withdrawal, a check report, a policy update. The result is stored on the change as `landing`.
 
 Approvals and checks
 
-- **LAND-FR-050** Recording a verdict needs `changes:approve` (PATs) and read access to the target workspace. `changes:approve` is never implied by another scope. Anyone who can read the change may record a verdict; whether it counts is decided by §8.3.5.
+- **LAND-FR-050** Recording a verdict needs `changes:approve` (PATs) and read access to the target workspace. `changes:approve` is never implied by another scope. Any user who can read the change may record a verdict; whether it counts is decided by §8.3.5. The admin token has no user and is refused (`403 forbidden`); it may still withdraw a verdict and override (LAND-FR-002).
 - **LAND-FR-051** A verdict is given on the current version unless `version` names another. A verdict on a version that is neither current nor patch-equivalent to the current one is recorded and has no effect on landing.
-- **LAND-FR-052** Reporting a check needs `checks:write` (PATs) and read access to the target workspace. `checks:write` is never implied by another scope. A report on an unknown version is `404`.
+- **LAND-FR-052** Reporting a check needs `checks:write` (PATs) and write access to the target workspace: check runners are the owner's automation. A read-only member gets `403 forbidden`. `checks:write` is never implied by another scope. A report on an unknown version is `404`.
 - **LAND-FR-053** Verdicts and checks cannot be given on `landed` or `abandoned` changes (`409 change_closed`), and can be given on drafts.
 
 Automatic landing
 
-- **LAND-FR-060** When a change with `auto_land: true` becomes `ready` and `clean`, the hub starts a land attempt with `trigger: "auto_land"`, acting as the user who set the flag. That user must be allowed to land at that moment (LAND-FR-001); otherwise the flag is cleared and `hub.change.land_fail` is emitted with reason `not_permitted`.
+- **LAND-FR-060** When a change with `auto_land: true` becomes `ready` and `clean`, the hub starts a land attempt with `trigger: "auto_land"`. Permission is checked as the user who set the flag; the attempt's events have actor `system` (§14). That user must be allowed to land at that moment (LAND-FR-001); otherwise the flag is cleared and `hub.change.land_fail` is emitted with reason `not_permitted`.
 - **LAND-FR-061** An automatic attempt that ends `conflict` or `blocked` leaves `auto_land` on; the next transition to `ready` and `clean` tries again. One that ends `failed` is retried with backoff (2 s doubling to 5 min) up to 10 times, then `auto_land` is cleared.
 - **LAND-FR-062** In a stack, automatic landing proceeds bottom up: a change is landed automatically only when the change below it is landed.
 
@@ -3206,20 +3224,20 @@ Revert
 
 Path-scoped tokens
 
-- **LAND-FR-080** A PAT with `paths` (§3) can create a version only if every file that version changes matches one of its globs. This is enforced where the version is created: at git push (§5), at API commit and ref move (§6), and for `resolutions` in a restack. It is not re-checked at landing.
-- **LAND-FR-081** A path-scoped token can land and revert changes only when every file of the change matches its globs.
+- **LAND-FR-080** A PAT with `paths` (§3) can create a version only if every file that version changes matches one of its globs. This is enforced where the version is created: at git push (§5), at API commit, ref move and rebase (§6), when a change is opened (§7), and at a restack, with or without `resolutions`. Where the update adds no new commit (a ref move or an open onto existing commits), the files checked are those of the resulting version against its base, so a path-scoped token cannot adopt out-of-path commits made with another credential. This check concerns the credential that creates the version; LAND-FR-081 is the separate check on the credential that lands.
+- **LAND-FR-081** A path-scoped token can land and revert changes, and set `auto_land` on them, only when every file of the change matches its globs; otherwise `403 path_not_allowed`. An automatic land started for a flag set with such a token is checked the same way when it starts.
 - **LAND-FR-082** Path limits and policy are independent. A token limited to `services/search/**` still needs whatever policy requires for those paths.
 
 ### 8.5 REST API
 
-All routes are under `/workspaces/:slug`, where `:slug` is the target workspace. The conventions of §3 apply. Common errors: `401`; `403`; `404 workspace not found`; `404 change_not_found`.
+All routes are under `/workspaces/:slug`, where `:slug` is the target workspace. The conventions of §3 apply. Unless a route says otherwise, `GET` routes need `changes:read` and read access to the workspace. `POST …/revert` needs `changes:write` and LAND-FR-072. Recording a verdict and `DELETE …/approvals/:id` need `changes:approve` and read access (LAND-FR-050). Reporting a check needs `checks:write` and write access (LAND-FR-052). Common errors: `401`; `403 insufficient_scope`; `403 forbidden`; `403 token_bound` (LAND-FR-003); `404 workspace not found`; `404 change_not_found`.
 
 #### `POST /workspaces/:slug/changes/:number/land`
 - **Purpose:** land a change, or its stack.
 - **Auth / scope:** `changes:write`; LAND-FR-001.
 - **Body:** `{"expected_version"?: int, "stack"?: bool, "override"?: {"reason": string}, "session_id"?: string}`. **Query:** `wait` (seconds, 0–60, default 30).
 - **Response:** `200` land attempt (`landed`); `202` land attempt (`running`).
-- **Errors:** `409 change_not_open`, `version_mismatch`, `land_in_progress`, `depends_on_unlanded`, `policy_blocked`, `land_conflict` (each with the land attempt in `details` where one was created); `403`, `error_type: override_not_allowed`; `503 land_failed`.
+- **Errors:** `409 change_not_open`, `version_mismatch`, `land_in_progress`, `depends_on_unlanded`, `policy_blocked`, `land_conflict` (each with the land attempt in `details` where one was created); `403`, `error_type: override_not_allowed`; `400 unknown_session` (`session_id` fails the session-linking rule of §14); `503 land_failed`.
 - **Side effects:** LAND-FR-015, LAND-FR-017; `hub.change.land` or `hub.change.land_fail`.
 
 #### `GET /workspaces/:slug/changes/:number/lands`
@@ -3252,7 +3270,7 @@ All routes are under `/workspaces/:slug`, where `:slug` is the target workspace.
 - **Auth / scope:** `workspaces:write`; owner or admin.
 - **Body:** `{"default": requirement, "rules": [...]}`.
 - **Response:** `200` policy document with the new `revision`.
-- **Errors:** `400`, `error_type: invalid_policy`, naming the rule and field; `412` revision mismatch; `400` on a fork (`error_type: not_supported_on_fork`).
+- **Errors:** `400`, `error_type: invalid_policy`, naming the rule and field; `412 revision_mismatch`; `400` on a fork (`error_type: not_supported_on_fork`).
 - **Side effects:** `hub.policy.update`; re-evaluation of open changes.
 
 #### `POST /workspaces/:slug/policy/evaluate`
@@ -3278,7 +3296,7 @@ All routes are under `/workspaces/:slug`, where `:slug` is the target workspace.
 
 #### `PUT /workspaces/:slug/changes/:number/checks/:name`
 - **Purpose:** report a check result.
-- **Auth / scope:** `checks:write`.
+- **Auth / scope:** `checks:write`; write access to the workspace (LAND-FR-052).
 - **Body:** `{"status": "pending" | "passed" | "failed", "version"?: int, "summary"?: string, "url"?: string, "details"?: object}`.
 - **Response:** `200` check.
 - **Side effects:** `hub.change.check`; policy re-evaluation.
@@ -3352,10 +3370,11 @@ All routes are under `/workspaces/:slug`, where `:slug` is the target workspace.
 - **Recovery.** At start, every `running` attempt is run again (LAND-FR-019).
 - **Automatic landing** reacts to `hub.change.ready` transitions (LAND-FR-060 to LAND-FR-062).
 - **Retention.** Land attempts are kept for the life of the workspace. Policy revisions beyond the last 50 are dropped.
+- **Metrics.** Every land attempt that reaches a final status is counted in `parley_lands_total{result}` and observed in `parley_land_attempts` and `parley_land_duration_seconds` (§14).
 
 ### 8.8 Events
 
-All have `resource_type: "change"` and `resource_id: "<number>"` except `hub.policy.update` (`resource_type: "policy"`, `resource_id: "<revision>"`).
+All have `resource_type: "change"` and `resource_id: "<number>"` except `hub.policy.update` (`resource_type: "policy"`, `resource_id: "<slug>"`; the revision is in the metadata).
 
 | Event type | When | Metadata |
 |---|---|---|
@@ -3385,7 +3404,7 @@ Workspace settings (§4): `protected_branches`, `land.strategy` (`rebase`), `lan
 - **Two lands race on one target, no conflict.** Both end `landed`. The second has `attempts: 2` and its commits sit on top of the first's.
 - **Two lands race and conflict.** One ends `landed`. The other ends `conflict`, and its report's `landed_changes` names the first.
 - **The same change is landed twice at once.** The second call gets `409 land_in_progress`. After the first finished, a further call gets `409 change_not_open`.
-- **A new version arrives during a land.** The attempt lands the version it started with. The new version finds the change `landed`; it is recorded on the source branch only, and the push output says the change has already landed. Callers that must not land a stale version pass `expected_version`.
+- **A new version arrives during a land.** The attempt lands the version it started with. A push that arrives after the change is `landed` records no version on it. The branch is no longer the source of an open change, so the push is mapped like any other (GIT-FR-040): in an `auto_change` fork, or with `parley.change`, it opens a new change for the commits the target does not contain; otherwise the branch just moves. Callers that must not land a stale version pass `expected_version`.
 - **Policy changes during a land.** The attempt uses the revision read at LAND-FR-011 and records it.
 - **Approval withdrawn during a land.** As above: the gate was passed.
 - **The target branch is deleted or unprotected mid-attempt.** A deleted target ends the attempt `failed`. Protection is read once at the start.
@@ -3456,7 +3475,7 @@ In scope: the activity query, overlaps between changes, claims, and the events t
 
 ### 9.4 Functional requirements
 
-- **AWR-FR-001** All awareness reads need `changes:read` and read access to the workspace. Creating, renewing and releasing claims needs `changes:write`. Through a fork's slug, awareness routes act on the fork's parent, so an agent holding only a fork token can use them; they then need the access the fork-bound token has by §3.
+- **AWR-FR-001** All awareness reads need `changes:read` and read access to the workspace. Creating, renewing and releasing claims needs `changes:write` and read access to the workspace: claims are advisory and change nothing in the repository, so an org member may make them (§3, PLAT-FR-062). Through a fork's slug, awareness routes act on the fork's parent and need access to the fork only, so an agent holding only a fork token can use them. A fork-bound token may also call the awareness read routes on the parent's own slug: `GET …/activity`, `GET …/changes/:number/overlaps`, `GET …/claims` and `GET …/claims/:id`. Claim writes with such a token go through the fork's slug; with the parent's slug they answer `403 token_bound` (§3).
 - **AWR-FR-002 (activity).** `GET …/activity` takes one or more `paths` globs and an optional `target` branch and returns:
   - `changes`: `draft` and `open` changes with a touched file matching any glob, as overlap entries;
   - `claims`: `active` claims with a glob that can match the same files as a requested glob. Two globs are treated as matching when either one matches the other's literal prefix; this errs on the side of reporting;
@@ -3489,7 +3508,7 @@ All routes are under `/workspaces/:slug`. The conventions of §3 apply.
 - **Purpose:** announce intended work (AWR-FR-007).
 - **Body:** `{"paths": string[], "intent": string, "target_branch"?: string, "ttl"?: duration, "session_id"?: string}`.
 - **Response:** `201 {"claim": <claim>, "activity": <activity answer for the claim's paths, excluding the claim itself>}`.
-- **Errors:** `400` validation; `429` limits.
+- **Errors:** `400` validation; `400 unknown_session` (`session_id` fails the session-linking rule of §14); `429` limits.
 - **Side effects:** `hub.claim.create`.
 
 #### `GET /workspaces/:slug/claims`
@@ -3534,7 +3553,7 @@ All routes are under `/workspaces/:slug`. The conventions of §3 apply.
 
 - **Overlap index.** The hub keeps, per workspace and target branch, which `draft` and `open` changes touch which files. It is updated after each new version, retarget, land, abandon and restore.
 - **Claim expiry** runs every minute: `active` claims past `expires_at` become `expired` and emit `hub.claim.expire`.
-- **Claim cleanup** (AWR-FR-008) runs hourly.
+- **Claim cleanup** (AWR-FR-008) runs in the hourly maintenance loop (§3).
 
 ### 9.8 Events
 
@@ -3620,9 +3639,9 @@ A carry-patch workspace is a workspace (§4) with these extra fields.
 | `upstream_url` | string, nullable | Required for `carry_patch`, refused for `standard`. Same validation as `git_url` (§4). Immutable. |
 | `integration_branch` | string, nullable | `carry_patch` only. Default `deploy`. Valid branch name. Immutable. |
 | `upstream_head_sha` | string, nullable | Upstream base recorded by the last sync that saw upstream move. |
-| `last_sync_at` | timestamp, nullable | Time of the last completed carry-patch sync. |
+| `last_sync_at` | timestamp, nullable | The §4 field. On a carry-patch workspace it is written only when the whole sync, including the carry-patch part, completed (CP-FR-071, CP-FR-073). |
 
-**Upstream base.** The commit every rebuild starts from: the head of the upstream's default branch as of the last upstream fetch. If the upstream's default branch is unknown, the hub uses the upstream branch with the same name as the workspace's `branch`. If neither resolves, there is no upstream base and operations that need one fail (CP-FR-045, CP-FR-063).
+**Upstream base.** The commit every rebuild starts from: the head of the upstream's default branch as of the last upstream fetch. If the upstream's default branch is unknown, the hub uses the upstream branch with the same name as the workspace's `default_branch`. If neither resolves, there is no upstream base and operations that need one fail (CP-FR-045, CP-FR-063).
 
 **Task forks.** A task fork (§4) of a carry-patch workspace is a plain fork. It has `workspace_mode: standard`, no patch list, no integration branch of its own and no rebuilds. The parent's patch branches and integration branch appear in the fork as read-only tracking branches. An agent in a fork contributes to a patch by pushing a new branch and opening a change that targets the patch branch in the parent (CP-FR-085).
 
@@ -3750,7 +3769,7 @@ Every rebuild route that returns a job returns this object.
 
 #### 10.3.6 Conflict report
 
-A rebuild conflict is reported in the shape landing uses (§8.3), plus the patch id:
+A rebuild conflict is reported in the shape landing uses (§8.3.3), with every field of that shape present, plus the patch id. The example is abbreviated:
 
 ```json
 {
@@ -3761,7 +3780,7 @@ A rebuild conflict is reported in the shape landing uses (§8.3), plus the patch
 }
 ```
 
-`target_sha` is the integration head under construction at the moment the patch was applied: the upstream base for the first patch, otherwise the result of the patches before it. `head_sha` is the patch's `source_sha`. `files[].kind` takes the values defined in §8.3. The report lists only the paths still in conflict after remembered resolutions were applied.
+`target_sha` is the integration head under construction at the moment the patch was applied: the upstream base for the first patch, otherwise the result of the patches before it. `head_sha` is the patch's `source_sha`. `base_sha` is the merge base of the patch branch and `target_sha`. `commit_sha` is the first commit of the patch that did not apply (with strategy `merge`: the patch tip). `landed_changes` is `[]` and `change` is `null`. Each `files[]` entry has all fields of §8.3.3: `path`, `kind`, `base`, `ours` (the state under construction), `theirs` (the patch) and `landed_by` (`[]`). The report lists only the paths still in conflict after remembered resolutions were applied.
 
 #### 10.3.7 Remembered resolutions
 
@@ -3781,20 +3800,20 @@ The hub records how a conflict was resolved and replays the resolution when the 
 - CP-FR-001: `POST /workspaces` (§4) accepts `workspace_mode`. A missing, null or empty value means `standard`. Any other value than `standard` or `carry_patch` is `400`.
 - CP-FR-002: In carry-patch mode `upstream_url` is required and validated like `git_url`; `integration_branch` defaults to `deploy` and must be a valid branch name. In standard mode the presence of either field is `400`. The three fields cannot be changed by `PATCH /workspaces/:slug`.
 - CP-FR-003: Upstream credentials are workspace secrets (§11), not part of the create request. The hub uses, in this order: `UPSTREAM_GIT_PAT`; `UPSTREAM_GIT_USERNAME` with `UPSTREAM_GIT_PASSWORD`; the origin credentials of the workspace; no credentials. A username without a password is skipped. Credentials are resolved on every use, so a rotated secret takes effect without a restart.
-- CP-FR-004: After the first clone of a carry-patch workspace and before it becomes `ready`, the hub fetches upstream, turns on remembered resolutions, and creates the integration branch at the upstream base, or at the head of origin's default branch when the upstream fetch failed. A failure of any of these steps is logged and does not prevent `ready`. The next sync or rebuild repeats what is missing.
+- CP-FR-004: After every fresh clone of a carry-patch workspace (the first clone and each reclone, §4.7.1) and before it becomes `ready`, the hub fetches upstream, turns on remembered resolutions, and creates the integration branch at the upstream base, or at the head of origin's default branch when the upstream fetch failed. A failure of any of these steps is logged and does not prevent `ready`. The next sync or rebuild repeats what is missing.
 - CP-FR-005: The integration branch is created by the hub only. A workspace whose origin already has a branch with the integration branch's name is still created; the hub's integration branch does not follow origin's.
 
 **Access, scopes and common preconditions**
 
 - CP-FR-006: Every route in this section follows the global check order (§3). Read routes need read access to the workspace, all other routes need write access.
 - CP-FR-007: PAT scopes are `patches:read` / `patches:write` for the patch list, `rebuilds:read` / `rebuilds:write` for rebuild jobs, preview and rollback, and `workspaces:read` / `workspaces:write` for remembered resolutions and the patch-status summary. 10.5 gives the scope of each route.
-- CP-FR-008: After request validation, every route in this section checks, in order: the workspace is in carry-patch mode, else `400` `workspace_mode_mismatch`; for write routes and for preview, the workspace is `ready`, else `409` `workspace_not_ready`; the workspace is not in an exclusive maintenance operation, else `409` `workspace_busy`. Read routes other than preview work in every workspace state.
+- CP-FR-008: After request validation, every route in this section checks, in order: the workspace is in carry-patch mode, else `400` `workspace_mode_mismatch`; for write routes and for preview, the workspace's status allows it, else the answer of WS-FR-007: `409` `workspace_busy` for `pending`, `cloning` or a running reclone, archive or delete; `409` `workspace_not_ready` for `failed`; `409` `workspace_archived` for `archived`. Read routes other than preview work in every workspace state.
 
 **Patch add**
 
 - CP-FR-009: The body is one patch object or an array of them (a batch). An empty array is `400`.
-- CP-FR-010: `branch_name` is required, must be a valid git branch name (§5), and must not be the integration branch. `position`, when given, must be at least 1. `if_not_exists` is refused in a batch. A branch named twice in one batch is `400`. All of this is validated before anything else happens; in a batch the message is prefixed `patch[<i>]: `.
-- CP-FR-011: **Branch resolution.** Unless `skip_branch_check` is true, the branch must exist. The hub looks, in order, for: (1) the branch in the hub's copy; (2) the branch on origin as of the last origin fetch, in which case the hub creates the branch at that commit; (3) when `patch_branch_source` is `origin`, the branch on origin now, by fetching that one branch, and creates it. If none is found the answer is `400` `branch_not_found`. A failed origin fetch is `502` `origin_fetch_failed`. A branch created by resolution stays even if the request then fails. The way the branch was found is reported as `branch_resolution` in the event: `local`, `origin_tracking`, `origin_fetch` or `skipped`.
+- CP-FR-010: `branch_name` is required, must be a valid git branch name (WS-FR-011), and must not be the integration branch. `position`, when given, must be at least 1. `if_not_exists` is refused in a batch. A branch named twice in one batch is `400`. All of this is validated before anything else happens; in a batch the message is prefixed `patch[<i>]: `.
+- CP-FR-011: **Branch resolution.** Unless `skip_branch_check` is true, the branch must exist. The hub looks, in order, for: (1) the branch in the hub's copy; (2) the branch on origin as of the last origin fetch, in which case the hub creates the branch at that commit; (3) when `patch_branch_source` is `origin`, the branch on origin now, by fetching that one branch, and creates it. If none is found the answer is `404` `branch_not_found`. A failed origin fetch is `502` `origin_fetch_failed`. A branch created by resolution stays even if the request then fails. The way the branch was found is reported as `branch_resolution` in the event: `local`, `origin_tracking`, `origin_fetch` or `skipped`.
 - CP-FR-012: A branch that is already registered as a non-deleted patch is `409` `patch_exists`. In a single add with `if_not_exists: true` the answer is `200` with the existing patch instead, and nothing changes.
 - CP-FR-013: A soft-deleted patch with the same branch does not count as existing. It is purged as part of the add, together with its backup ref, and a new patch is created.
 - CP-FR-014: **Position.** An omitted `position`, or one greater than N+1, appends the patch. Otherwise the patch takes that position and the patches at and after it move down by one. In a batch, elements with an explicit position are placed first, in array order, each into the list as it then stands; the others are appended in array order.
@@ -3875,8 +3894,8 @@ The hub records how a conflict was resolved and replays the resolution when the 
 - CP-FR-050: If `rebuild_push_integration_branch` is true, the hub then pushes the integration branch to origin with force-with-lease against the value it last saw there. Success sets `integration_branch_pushed`. A failure emits `hub.rebuild.push_failed` and does not fail the rebuild.
 - CP-FR-051: **Stale-input check.** After a publish and after a `fail_fast` conflict, the hub compares its inputs with the present. A patch is stale when its branch tip differs from the recorded `source_sha`. Upstream is stale when the upstream base differs from the one the run used. Stale patches are ignored when `auto_rebuild_after_push` is false; stale upstream is ignored when `auto_rebuild_after_sync` is false. If anything stale remains, the hub queues one follow-up rebuild with the same strategy and fail mode and emits `hub.rebuild.followup`. This follow-up is what makes it safe to skip triggers while a rebuild runs.
 - CP-FR-052: A completed rebuild emits `hub.rebuild.complete`. Every failed attempt emits `hub.rebuild.fail`, with `will_retry` telling whether the job waits to retry or is dead-lettered.
-- CP-FR-053: A rebuild does not block other work. Pushes, API commits, landing, sync, preview and rollback all proceed while it runs. Archive, reclone and delete of the workspace wait for a running rebuild to end or answer `409` `workspace_busy` (§4).
-- CP-FR-054: A job whose workspace was deleted or is no longer in a usable state is dead-lettered without retry.
+- CP-FR-053: A rebuild does not block other work. Pushes, API commits, landing, sync, preview and rollback all proceed while it runs. Archive, reclone and delete of the workspace neither wait for a running rebuild nor are refused because of one (WS-FR-008). The running attempt fails at its next step and is handled per CP-FR-054; it has published nothing (CP-FR-048).
+- CP-FR-054: A job whose workspace is `archived` or `failed` when an attempt starts is dead-lettered without retry. A workspace in `pending` or `cloning` is a retryable failure. The jobs of a deleted workspace are removed with it (10.3.4).
 - CP-FR-055: A rebuild with no applicable patch still publishes: the integration branch moves to the upstream base. This happens when an automatic trigger fires while every patch is disabled or merged.
 
 **Rebuild list, get, cancel, requeue**
@@ -3901,9 +3920,9 @@ The hub records how a conflict was resolved and replays the resolution when the 
 
 **Sync (carry-patch part)**
 
-`POST /workspaces/:slug/sync` is defined in §4. Its authentication, scope, access, `ready` and `sync_enabled` checks apply first. On a carry-patch workspace the rest of the call behaves as follows. `reset_to_upstream` has no meaning here and is `400`.
+`POST /workspaces/:slug/sync` is defined in §4. Its authentication, scope, access, `ready` and `sync_enabled` checks apply first. On a carry-patch workspace the origin fetch and the per-branch pass of §4 (WS-FR-037 to WS-FR-047) run as usual, with one difference: the integration branch and the branches of non-deleted patches are left out of that pass and of its `branches` list. The integration branch never follows origin (CP-FR-005), and patch branches are moved only by the origin refresh below (CP-FR-069). `reset_to_origin` therefore applies to the other branches only; a diverged patch branch is governed by `patch_divergence_policy` or reset with `POST …/patches/:id/reset-to-origin`. The rest of the call behaves as follows.
 
-- CP-FR-067: The hub fetches upstream. When `patch_branch_source` is `origin` it also fetches all branches of origin, pruning branches origin no longer has. A credential failure or a fetch failure is `502` (`origin_fetch_failed` for origin, `upstream_error` for upstream) and nothing else changes.
+- CP-FR-067: The hub fetches origin (§4) and upstream before it moves anything. A credential failure or a fetch failure of either remote is `502` `upstream_error` (WS-FR-045): `sync_error` is set, the message names the remote, and nothing is moved.
 - CP-FR-068: `upstream_advanced` is true when the upstream base differs from the stored `upstream_head_sha`; it is true on the first sync. `force_push_detected` is true when upstream advanced and the stored head is not an ancestor of the new base.
 - CP-FR-069: **Origin refresh** (only when `patch_branch_source` is `origin`). For every patch in `active`, `conflict` or `disabled`, in position order, the first rule that applies:
 
@@ -3935,26 +3954,26 @@ The hub records how a conflict was resolved and replays the resolution when the 
 
 **Push control**
 
-These rules apply to every way a client can write a ref: git push (§5) and the source control API (§6). Over git a refusal is per ref, in git's own format, and the other refs of the same push proceed. Over the API it is `403` with the `error_type` given.
+These rules apply to every way a client can write a ref: git push (§5) and the source control API (§6). Over git a refusal is reported per ref, in git's own format, and the whole push is refused: no ref of that push is updated (GIT-FR-021). Over the API it is `403` with the `error_type` given.
 
-- CP-FR-077: **Integration branch.** A create, update or delete of `refs/heads/<integration_branch>` on a carry-patch workspace is always refused (`integration_branch_protected`), whatever the settings, with `integration branch <name> is maintained by the hub; push a patch branch and rebuild instead`. The integration branch cannot be the target of a change.
+- CP-FR-077: **Integration branch.** A create, update or delete of `refs/heads/<integration_branch>` on a carry-patch workspace is always refused (`integration_branch`), whatever the settings, with `integration branch <name> is maintained by the hub; push a patch branch and rebuild instead`. The integration branch cannot be the target of a change (`403` `integration_branch`, CHG-FR-005).
 - CP-FR-078: **Backup refs.** `refs/hub/replaced/*` cannot be written by clients (§5).
 - CP-FR-079: The rules below apply to the branch of a non-deleted patch.
 - CP-FR-080: `patch_branch_source: hub`: the update is accepted, subject to branch protection (CP-FR-084).
-- CP-FR-081: `patch_branch_source: origin` and `push_patches_to_origin: false`: every create, update and delete is refused (`patch_branch_from_origin`) with `branch is synced from origin; push to <git_url> instead`. The URL is shown without credentials.
-- CP-FR-082: `patch_branch_source: origin` and `push_patches_to_origin: true`: the hub forwards the update to origin before accepting it, as a non-forced push with a 120 s limit. If origin accepts, the update is accepted on the hub. If origin refuses or cannot be reached, the update is refused with `origin rejected push: <reason>` (credentials removed). A delete is refused with `branch is synced from origin; delete it on origin instead`.
+- CP-FR-081: `patch_branch_source: origin` and `push_patches_to_origin: false`: every create, update and delete is refused (`patch_branch`) with `branch is synced from origin; push to <git_url> instead`. The URL is shown without credentials.
+- CP-FR-082: `patch_branch_source: origin` and `push_patches_to_origin: true`: the hub forwards the update to origin before accepting it, as a non-forced push with a 120 s limit. If origin accepts, the update is accepted on the hub. If origin refuses or cannot be reached, the update is refused (`patch_branch`) with `origin rejected push: <reason>` (credentials removed), or with `failed to resolve origin credentials` when the origin credential cannot be read. A delete is refused (`patch_branch`) with `branch is synced from origin; delete it on origin instead`. Over git the forward runs last, and a failed forward refuses the whole push (GIT-FR-031).
 - CP-FR-083: If the hub cannot decide (for example the patch list cannot be read), the update is refused with a retryable error. Push control never lets an update through unchecked.
 
 **Protected patch branches and changes**
 
 - CP-FR-084: A patch branch may be listed in the workspace's `protected_branches` (§8). A direct update of it is then refused by §5 and §8, before the rules above are consulted.
 - CP-FR-085: A change (§7) may target a patch branch, from the same workspace or from a task fork. It follows the normal change life cycle: versions, policy, approvals, checks.
-- CP-FR-086: Landing a change on a patch branch (§8) updates the patch branch and has the same consequences as an accepted push to it: the triggers of CP-FR-087 and CP-FR-088 run. When `patch_branch_source` is `origin`, landing obeys CP-FR-081 and CP-FR-082: it is refused without forwarding, and with forwarding the new head is forwarded to origin before the target moves, and a refusal by origin fails the landing.
+- CP-FR-086: Landing a change on a patch branch (§8) updates the patch branch and has the same consequences as an accepted push to it: the triggers of CP-FR-087 and CP-FR-088 run. When `patch_branch_source` is `origin`, landing obeys CP-FR-081 and CP-FR-082: without forwarding the land attempt ends `blocked` with that reason (§8), and with forwarding the new head is forwarded to origin before the target moves; if origin refuses or cannot be reached, the attempt ends `failed` with `error: "origin_rejected"` and the target does not move.
 
 **Triggers after an update of a patch branch**
 
 - CP-FR-087: After any accepted update of the branch of a non-deleted patch that is not a delete, and when `auto_rebuild_after_push` is true, the hub queues a rebuild (CP-FR-039). The trigger runs after the client has its answer and never changes the outcome of the push, commit or landing.
-- CP-FR-088: **Mirror.** When `patch_branch_source` is `hub` and `push_patches_to_origin` is true, the hub then pushes each updated patch branch to origin, with force-with-lease against the value it last saw there and a 120 s limit. A failure emits `hub.patch.mirror_failed` for that branch and does not stop the others. The mirror does not depend on `auto_rebuild_after_push`.
+- CP-FR-088: **Mirror.** When `patch_branch_source` is `hub` and `push_patches_to_origin` is true, the hub then pushes each updated patch branch to origin, with force-with-lease against the value it last saw there and a 120 s limit. A failure emits `hub.patch.mirror_failed` for that branch and does not stop the others. The mirror does not depend on `auto_rebuild_after_push`. Forwarding, the mirror and `rebuild_push_integration_branch` (CP-FR-050) are the only ways these branches reach origin: `POST /workspaces/:slug/branches/:name/push` refuses the integration branch and registered patch branches with `403` `integration_branch` or `patch_branch` (WS-FR-053).
 
 **Remembered resolutions**
 
@@ -3979,7 +3998,7 @@ These rules apply to every way a client can write a ref: git push (§5) and the 
 
 ### 10.5 REST API
 
-All paths are relative to `/api/v1`. Errors use the error envelope (§3). The errors below are common to every route and are not repeated: `401`; `403` (scope, or a read-only member on a write route); `404` `workspace not found`; `400` `workspace_mode_mismatch`; `409` `workspace_not_ready` (write routes and preview); `409` `workspace_busy`.
+All paths are relative to `/api/v1`. Errors use the error envelope (§3). The errors below are common to every route and are not repeated: `401`; `403` (scope, or a read-only member on a write route); `404` `workspace not found`; `400` `workspace_mode_mismatch`; on write routes and preview the status answers of WS-FR-007 (`409` `workspace_busy`, `workspace_not_ready` or `workspace_archived`).
 
 #### `POST /workspaces/:slug/patches`
 - **Purpose:** register one patch or a batch.
@@ -3996,7 +4015,7 @@ All paths are relative to `/api/v1`. Errors use the error envelope (§3). The er
   | `if_not_exists` | boolean | Default false. Single add only. |
 
 - **Response:** `201` with the patch (single) or `{"items":[patch,…]}` in request order (batch). `200` with the existing patch when `if_not_exists` matched.
-- **Errors:** `400` `invalid_request` (CP-FR-009, CP-FR-010); `400` `branch_not_found`; `409` `patch_exists`; `502` `origin_fetch_failed`.
+- **Errors:** `400` `invalid_request` (CP-FR-009, CP-FR-010); `404` `branch_not_found`; `409` `patch_exists`; `502` `origin_fetch_failed`.
 
 #### `GET /workspaces/:slug/patches`
 - **Scope:** `patches:read`.
@@ -4113,18 +4132,18 @@ All paths are relative to `/api/v1`. Errors use the error envelope (§3). The er
   |---|---|---|
   | `upstream_advanced` | boolean | |
   | `force_push_detected` | boolean | |
-  | `origin_fetched` | boolean | True only when `patch_branch_source` is `origin`. |
+  | `origin_fetched` | boolean | Always `true`: every sync fetches origin (§4). Kept for clients that test it. |
   | `patches_merged` | string[] | Branch names detected as merged in this sync. |
   | `patches_synced` | object[] | One entry per refreshed candidate: `branch_name`, `action`, `state`, `local_sha`, `origin_sha`, `replaced_sha` (nullable). `[]` when `patch_branch_source` is `hub`. |
   | `patches_diverged` | string[] | Branch names with state `diverged`. |
   | `rebuild_triggered` | boolean | |
   | `rebuild_job_id` | string, nullable | Set when a job was queued. |
 
-- **Errors added:** `400` `invalid_request` (`reset_to_upstream`); `502` `upstream_error`; `502` `origin_fetch_failed`; `500` `internal` (refresh failure, CP-FR-071).
+- **Errors added:** `502` `upstream_error` also when the upstream fetch fails; `500` `internal` (refresh failure, CP-FR-071).
 
 ### 10.6 CLI
 
-The global CLI conventions apply (§2): JSON on stdout, the error envelope on stderr, exit codes 0, 1, 2 and 3. Unless stated, a command prints the hub's response.
+The global CLI conventions apply (§3): JSON on stdout, the error envelope on stderr, exit codes 0, 1, 2 and 3. Unless stated, a command prints the hub's response.
 
 #### `parley patch add <workspace-slug>`
 - **Flags:** `--branch` (required), `--position <int>`, `--upstream-pr <url>`, `--description <text>`, `--skip-branch-check`, `--if-not-exists`.
@@ -4153,7 +4172,7 @@ The global CLI conventions apply (§2): JSON on stdout, the error envelope on st
 - **Calls:** `POST /workspaces/:slug/patches/reorder`.
 
 #### `parley patch reset-to-origin <workspace-slug> <patch-id>`
-- **Flags:** `--wait`, `--timeout`, `--poll-interval`. With `--wait`, and when the response names a `rebuild_job_id`, the command waits for that job as `parley rebuild submit --wait` does.
+- **Flags:** `--wait`, `--timeout`, `--poll-interval`. With `--wait`, and when the response names a `rebuild_job_id`, the command waits for that job as `parley rebuild submit --wait` does, and prints one document: the response with one more member, `rebuild`, holding the final job record.
 - **Calls:** `POST /workspaces/:slug/patches/:id/reset-to-origin`.
 
 #### `parley rebuild submit <workspace-slug>`
@@ -4200,10 +4219,11 @@ Two commands defined in §4 carry carry-patch options: `parley workspace create 
 - **Workers.** Durable jobs are executed by the hub itself; there is no separate worker process. A queued job starts within a few seconds when a worker is free. Up to 4 jobs run at once across the hub, at most one per workspace.
 - **Triggers.** After every accepted update of a patch branch: the rebuild trigger, then the mirror (CP-FR-087, CP-FR-088). After a publish or a `fail_fast` conflict: the stale-input check (CP-FR-051).
 - **No schedule.** The hub does not sync a carry-patch workspace on its own. A scheduler or a forge webhook consumer calls `POST /workspaces/:slug/sync`.
+- **Metric.** `parley_jobqueue_depth{type,status}` (§14) is the number of durable jobs per job type (`type`: `rebuild`, the only job type in this version) and per job status (`status`: `queued`, `running`, `failed`, `completed`, `dead_letter`, `cancelled`).
 
 ### 10.8 Events
 
-All events follow the envelope of §14. Rebuild events have `resource_type: rebuild` and the job id as `resource_id`. Patch events have `resource_type: patch` and the patch id as `resource_id`. The actor is the caller, or `system` for work the hub does on its own. A failure to record an event never changes the outcome of the operation.
+All events follow the envelope of §14. Rebuild events have `resource_type: rebuild` and the job id as `resource_id`. Patch events have `resource_type: patch` and the patch id as `resource_id`. The actor is the caller, or `system` for work the hub does on its own. Each event is written with the state change it reports (§14).
 
 | Event | When | Actor | Metadata |
 |---|---|---|---|
@@ -4246,7 +4266,7 @@ Updates of a patch branch and of the integration branch also produce the general
 
 **Secrets** (§11): `UPSTREAM_GIT_PAT`, `UPSTREAM_GIT_USERNAME`, `UPSTREAM_GIT_PASSWORD` for upstream; the origin credentials of the workspace for origin and as the fallback for upstream.
 
-**Server.** The identity on commits the hub creates is `parleyd <parleyd@localhost>` unless the server process is started with `GIT_COMMITTER_NAME` and `GIT_COMMITTER_EMAIL`.
+**Server.** The committer of the commits a rebuild creates is the hub's landing identity, `[land].committer_name` and `[land].committer_email` (§8; default `Parley <parley@localhost>`). It is not taken from the process environment (NFR-023).
 
 **Fixed values.** The retry policy, the job concurrency, the shutdown grace period, the git and push time limits, the 7-day retention of deleted patches and the 50-commit window of merge detection are not configurable in this version.
 
@@ -4261,7 +4281,7 @@ Updates of a patch branch and of the integration branch also produce the general
 - **Setup incomplete.** If the upstream fetch failed during creation, the integration branch sits at origin's default branch head until the first successful rebuild moves it to "upstream base plus patches".
 - **Origin has an integration branch of its own.** The hub does not read it. With `rebuild_push_integration_branch` the hub pushes with force-with-lease; if someone else moved the branch on origin since the hub last saw it, the push fails with `hub.rebuild.push_failed` and the hub's integration branch is still correct.
 - **Task fork of a carry-patch workspace.** Every route in this section answers `400` `workspace_mode_mismatch` on the fork. The fork's tracking copies of the patch branches and of the integration branch follow the parent.
-- **Workspace archived, recloned or deleted.** Write routes answer `409` `workspace_not_ready` or `workspace_busy`. A queued job for a workspace that is archived or deleted is dead-lettered without retry. After a reclone, patches, jobs and settings remain; remembered resolutions and backup refs do not survive the reclone.
+- **Workspace archived, recloned or deleted.** Write routes answer `409` `workspace_archived` on an archived workspace and `409` `workspace_busy` while a reclone, an archive or a delete runs (WS-FR-007). A queued job for an archived workspace is dead-lettered without retry; the jobs of a deleted workspace are removed with it (10.3.4). After a reclone, patches, jobs and settings remain; remembered resolutions and backup refs do not survive the reclone.
 - **One hub process.** Dedup and "one rebuild per workspace" are guaranteed for one `parleyd` process on a data directory (§15). Running two processes on the same data directory is not supported.
 
 ---
@@ -4342,13 +4362,13 @@ The user is always the workspace owner, never the caller. For a fork, the owner 
 - **Variables** resolve by merge: for each key, compared case-insensitively, the entry of the highest-priority scope that has it wins entirely (its key casing, value, timestamps and `origin`).
 - **Secrets** resolve by name for sandbox injection (§13): the first scope in the chain that has the name wins. Values are read when the sandbox is created and go only into the sandbox environment. For secrets, step 2 applies only when the fork's owner has write access to the parent workspace (the parent's owner). The test is on the fork's owner, never on the caller: an admin token acts as the fork owner here. In a fork owned by a read-only org member, step 2 is skipped for secrets, so the parent's secrets never reach that fork's sandboxes. Reserved names are skipped in step 2 for everyone, so no fork's sandbox receives the parent's origin, upstream or webhook credentials.
 
-Resolution is use, not read access. A fork owner who is only an org member of the parent gets the parent's variables in the fork's resolved set, and nothing of the parent's secrets: no value, no injection, and no secret names (SEC-FR-006). No route returns a secret value to anyone.
+Resolution is use, not read access. A fork owner who is only an org member of the parent gets the parent's variables in the fork's resolved set, and nothing of the parent's secrets: no value, no injection, and no secret names (SEC-FR-006). No route returns a stored secret value to anyone. The only value the hub ever shows is a webhook secret it generated itself, once, in the response that creates it (§12).
 
 ### 11.4 Functional requirements
 
-- **SEC-FR-001** Every route follows the global check order (§3): authenticate → PAT scope → scope access → request validation → state → act. PAT scopes are `secrets:read`, `secrets:write`, `vars:read`, `vars:write`; a read accepts either, a write only `write`. API keys and admin tokens are not scope-checked.
+- **SEC-FR-001** Every route follows the global check order (§3): authenticate → binding guard (bound PATs) → PAT scope → scope access → request validation → state → act. PAT scopes are `secrets:read`, `secrets:write`, `vars:read`, `vars:write`; a read accepts either, a write only `write`. API keys and admin tokens are not scope-checked.
 - **SEC-FR-002** A workspace-bound token may use only the `workspace` scope of a workspace it is valid on (its workspace and the forks it created, §3). On `/user/…` and `/orgs/…` routes it gets `403 token_bound`; on another workspace `404 workspace not found`.
-- **SEC-FR-003** Secret values are returned by no route, event, log line or error message. Only credential resolution, webhook verification and sandbox injection read them.
+- **SEC-FR-003** Secret values are returned by no route, event, log line or error message, except the webhook secret the hub generates, which `PUT …/forge/webhook` shows once (§12). Only credential resolution, webhook verification and sandbox injection read them.
 - **SEC-FR-004** User scope: a credential without a user identity (admin token) gets `403 forbidden`, message `user-scoped endpoints require a user credential`.
 - **SEC-FR-005** Org scope: an unknown org and a non-member both get `404 not_found` with the same body. Admin tokens bypass membership.
 - **SEC-FR-006** Workspace scope uses the workspace access rule (§3):
@@ -4356,11 +4376,11 @@ Resolution is use, not read access. A fork owner who is only an org member of th
   | Caller | Secrets (all operations) | Variables read (list, resolved) | Variables write |
   |---|---|---|---|
   | owner, admin token | allowed | allowed | allowed |
-  | org member | `404 workspace not found` | allowed | `403 forbidden` |
+  | org member | `403 forbidden` | allowed | `403 forbidden` |
   | anyone else, or unknown slug | `404 workspace not found` | `404` | `404` |
 
-  A member's `404` on a secret route is identical to the answer for a nonexistent workspace. This holds on a parent workspace for the owner of one of its forks. The workspace's status (for example `archived`) does not matter; an exclusive maintenance operation does not block these routes.
-- **SEC-FR-007** Create takes `{"entries":[{"key","value"}, …]}` and is all-or-nothing. A missing `value` is the empty string. Checks, in order: `entries` non-empty; each key valid; each value within the size limit; no two keys of the request equal ignoring case (all `400 invalid_request`, the message names the key); the scope's count plus the new entries within the limit (`400 invalid_request`, `maximum of 100 entries per scope exceeded`); no key already present ignoring case (`409 conflict`, `key "<k>" already exists`). All entries get the same `created_at`.
+  Secret routes have need `owner` (§3): a member's `403` on a secret route is the answer of PLAT-FR-060 and leaks nothing, because the member can already read the workspace. This holds on a parent workspace for the owner of one of its forks. The workspace's status (for example `archived`) does not matter; an exclusive maintenance operation does not block these routes.
+- **SEC-FR-007** Create takes `{"entries":[{"key","value"}, …]}` and is all-or-nothing. A missing `value` is the empty string. Checks, in order: `entries` non-empty; each key valid; each value within the size limit; no two keys of the request equal ignoring case (all `400 invalid_request`, the message names the key); the scope's count plus the new entries within the limit (`429`, `error_type: secret_limit_reached`, `maximum of 100 entries per scope exceeded`); no key already present ignoring case (`409 conflict`, `key "<k>" already exists`). All entries get the same `created_at`.
 - **SEC-FR-008** Update takes `{"value": string}`. An absent or `null` value is `400`; `""` is valid. The key is matched ignoring case; no match is `404 not_found`, `key "<k>" not found`. The stored key casing and `created_at` are kept; `updated_at` becomes now.
 - **SEC-FR-009** Delete matches the key ignoring case. No match is `404 not_found`. Success is `204` with no body.
 - **SEC-FR-010** Lists are ordered by key, ascending, case-insensitive, and follow the list convention (§3). Secret lists carry no value.
@@ -4376,13 +4396,13 @@ Resolution is use, not read access. A fork owner who is only an org member of th
 
 All paths are under `/api/v1`. Errors use the envelope and types of §3. The scopes differ only in access (SEC-FR-004 to SEC-FR-006), so each operation is specified once on the user secret route and the others refer to it.
 
-Errors common to all routes: `401 unauthenticated`; `403 forbidden` (PAT scope, admin token on user scope, member on a workspace variable write); `403 token_bound`; `404` (org, workspace); `415`; `413`; `500 internal` (the cause is never sent).
+Errors common to all routes: `401 unauthenticated`; `403 insufficient_scope` (PAT scope); `403 forbidden` (admin token on user scope, member on a workspace secret route or variable write); `403 token_bound`; `404` (org, workspace); `415`; `413`; `500 internal` (the cause is never sent).
 
 #### `POST /user/secrets`
 - **Scope:** `secrets:write`.
 - **Body:** `{"entries":[{"key": string, "value": string}, …]}`, validated per SEC-FR-007. Accepts `Idempotency-Key`.
 - **Response:** `201`, `{"items":[{key, created_at, updated_at}, …]}` in request order.
-- **Errors:** `400 invalid_request`; `409 conflict`; `503 secrets_unavailable`.
+- **Errors:** `400 invalid_request`; `429 secret_limit_reached` (scope full); `409 conflict`; `503 secrets_unavailable`.
 - **Side effects:** one `hub.secret.create` per entry.
 
 #### `GET /user/secrets`
@@ -4471,7 +4491,7 @@ As `DELETE /user/vars/:key`, in the workspace scope. An org member gets `403 for
 `parley secrets` and `parley vars` follow the global CLI conventions (§3). Specific to these commands:
 
 - **Scope flags:** `--user`, `--org <slug>`, `--workspace <slug>`. Without a flag the scope is the user. `list`, `update` and `delete` accept at most one (more is a usage error, exit 2).
-- **Multi-scope create:** `create` accepts several scope flags. One request is sent per scope, in the order user → org → workspace, and each result is printed in turn. A failing scope does not stop the others. Each failed scope's error envelope is printed exactly once, on stderr, and the command exits 1 if any scope failed.
+- **Multi-scope create:** `create` accepts several scope flags. One request is sent per scope, in the order user → org → workspace, and the results are printed as one document, `{"results":[{"scope":"user"|"org"|"workspace","items":[…]}, …]}`, holding the scopes that succeeded. A failing scope does not stop the others. Each failed scope's error envelope is printed exactly once, on stderr, and the command exits 1 if any scope failed.
 - **Values:** `KEY=VALUE` is split at the first `=`, so a value may contain `=`. A comma separates entries, so a value with a comma needs `--from-stdin`. `--from-stdin` takes one bare `KEY` and reads the value from standard input, dropping one trailing line ending.
 - Key naming rules are checked by the hub. Malformed arguments are usage errors (exit 2) and nothing is sent.
 
@@ -4534,12 +4554,12 @@ To rotate: set the new key as `PARLEY_SECRETS_KEY` and the old one as `PARLEY_SE
 
 ### 11.10 Edge cases and error handling
 
-- A full scope answers `400` on create even when a key of the request also conflicts.
+- A full scope answers `429 secret_limit_reached` on create even when a key of the request also conflicts.
 - An empty `GIT_PAT` counts as no credential.
 - No key configured: secret create and update answer `503 secrets_unavailable`; git and forge operations that need a stored credential fail with an error that says the secret is unreadable; public repositories keep working; a sandbox whose profile requires an unreadable secret fails as for a store error (§13).
 - A fork with a variable of the same name as its parent's wins over the parent; deleting the fork's entry exposes the parent's again.
 - A fork owner who loses write access to the parent loses the parent step for secrets at the next resolution; sandboxes already created keep what they were given. The parent step for variables is unaffected.
-- A fork owner who leaves the org loses the org step of the fork's chain; the parent step stays.
+- A fork owner who leaves the org loses access to the fork (§3). Until the fork expires or is deleted, its chain has no org step; the parent step for variables stays for the callers who can still reach the fork (the parent's owner, admin tokens).
 
 ---
 
@@ -4639,7 +4659,7 @@ A fifth outcome, `duplicate`, is only ever answered to the forge. It is never re
 - **FRG-FR-001** Read routes need `forge:read`; write routes and the webhook `PUT` and `DELETE` need `forge:write` (§3). Read routes need read access to the workspace; write and webhook routes need write access, so a read-only org member gets `403 forbidden`.
 - **FRG-FR-002** Every forge route follows the check order of §3. Within it, the steps specific to this section run in this order: (1) `target`; (2) path and query parameters and the request body, as far as they do not depend on the forge kind; (3) the archived check; (4) forge configuration (FRG-FR-005); (5) checks that depend on the forge kind (FRG-FR-017, FRG-FR-024); (6) for writes, the credential check (FRG-FR-025); (7) the call. A request refused before step 7 sends nothing to the forge and records no event.
 - **FRG-FR-003** `target` may be given at most once. `origin` or absent selects origin. `upstream` selects upstream when the workspace is a carry-patch workspace with an `upstream_url`; otherwise the answer is `400`, `error_type: workspace_mode_mismatch`. Any other value is `400 invalid_request`. The diagnostic route, the deliveries route and the webhook routes take no `target`.
-- **FRG-FR-004** Writes and the webhook `PUT` are refused on an archived workspace with the archived-workspace error of §4. Reads, the deliveries list and the webhook `DELETE` work in any workspace state. No forge route needs the hub's copy of the repository, and none is affected by `workspace_busy`.
+- **FRG-FR-004** Writes and the webhook `PUT` are refused on an archived workspace with the archived-workspace error of §4 (`409` `workspace_archived`). A write through a task fork whose parent is archived is refused with `409` `parent_archived` (WS-FR-066). Reads, the deliveries list and the webhook `DELETE` work in any workspace state. No forge route needs the hub's copy of the repository, and none is affected by `workspace_busy`.
 - **FRG-FR-005** Forge configuration is resolved in a fixed order, and the first failure wins: the API URL setting is not a valid URL → `422`, `error_type: forge_api_url_invalid`; the remote URL names no repository → `422`, `error_type: forge_unknown`; the forge kind is unknown → `422`, `error_type: forge_unknown`, with a message that names the setting to set.
 - **FRG-FR-006** A `:number` path parameter is a positive decimal integer: digits only, no sign, no leading zero, at most 2,147,483,647. Anything else is `400 invalid_request` with the message `number must be a positive decimal integer`. The rule is the same on every route, read or write, and in the CLI.
 - **FRG-FR-007** **Task forks.** A task fork (§4) has no forge of its own. Every forge route called with a fork's slug, except the webhook and deliveries routes, acts on the parent's forge repository with the parent's credential and the parent's settings, including `target=upstream`. The caller must have, on the parent, the access the route needs: read access for reads, write access for writes. A caller without it gets `403 forbidden`. A token bound to the fork is accepted for this purpose; the access that counts is that of the user behind it. The webhook `PUT` and `DELETE` and the deliveries list are refused on a fork with `400`, `error_type: fork_has_no_origin`.
@@ -4825,7 +4845,7 @@ Write route (FRG-FR-023). Body: `{"title": string, "head": string, "base": strin
 Write route (FRG-FR-019); the comment goes to the pull request's conversation. Body: `{"body": string}`. Answers `201` with `{"url": string}`. Records `hub.forge.pull_request.comment`.
 
 #### `PUT /workspaces/:slug/forge/webhook`
-Sets or rotates the webhook secret (FRG-FR-032). Needs `forge:write` and write access; refused on an archived workspace and on a task fork. Body: optional `{"secret"?: string}`. Answers `200` with `{"configured": true, "url": string|null, "secret"?: string}`; `secret` is present only when the hub generated it. `400` for a bad secret, or when the workspace's secret scope is full (§11). Records `hub.forge.webhook.set`.
+Sets or rotates the webhook secret (FRG-FR-032). Needs `forge:write` and write access; refused on an archived workspace and on a task fork. Body: optional `{"secret"?: string}`. Answers `200` with `{"configured": true, "url": string|null, "secret"?: string}`; `secret` is present only when the hub generated it. `400` for a bad secret; `429 secret_limit_reached` when the workspace's secret scope is full (§11). `503 secrets_unavailable` when no encryption key is configured (§11). Records `hub.forge.webhook.set`.
 
 #### `DELETE /workspaces/:slug/forge/webhook`
 Removes the webhook secret (FRG-FR-033). Needs `forge:write` and write access; works in any workspace state; refused on a task fork. Answers `204`. Records `hub.forge.webhook.unset`.
@@ -4931,14 +4951,14 @@ All events carry the common fields of §14. No forge event ever carries a title 
 
 | Event | `resource_type` | `resource_id` | `action` | Extra metadata |
 |---|---|---|---|---|
-| `hub.forge.issue.create` | `issue` | the new number; empty on failure | `create` | none |
+| `hub.forge.issue.create` | `issue` | the new number; `none` on failure | `create` | none |
 | `hub.forge.issue.update` | `issue` | number | `update` | `fields` (names of the fields sent, sorted) |
 | `hub.forge.issue.close` | `issue` | number | `close` | `comment_url` (when a comment was posted) |
 | `hub.forge.comment.create` | `comment` | issue number | `create` | none |
 | `hub.forge.label.add` | `label` | issue number | `add` | `labels` |
 | `hub.forge.label.remove` | `label` | issue number | `remove` | `label` |
 | `hub.forge.label.create` | `label` | label name | `create` | `label`, `created` (true only when this call created it) |
-| `hub.forge.pull_request.create` | `pull_request` | the new number; empty on failure | `create` | `head`, `base`, `draft` |
+| `hub.forge.pull_request.create` | `pull_request` | the new number; `none` on failure | `create` | `head`, `base`, `draft` |
 | `hub.forge.pull_request.comment` | `pull_request` | number | `comment` | none |
 
 **Webhook events.** The actor is the caller; `resource_type` is `webhook` and `resource_id` is the slug.
@@ -4948,7 +4968,7 @@ All events carry the common fields of §14. No forge event ever carries a title 
 | `hub.forge.webhook.set` | `set` | `generated` (boolean) |
 | `hub.forge.webhook.unset` | `unset` | `existed` (boolean) |
 
-**Delivery events.** `actor_type` is `forge` and `actor_id` is empty. `action` is the last segment of the type. Common metadata: `forge`, `target`, `delivery_id` and `actor` (the forge login that caused the delivery, `""` when the payload names none).
+**Delivery events.** `actor_type` is `forge` and `actor_id` is null. `action` is the last segment of the type. Common metadata: `forge`, `target`, `delivery_id` and `actor` (the forge login that caused the delivery, `""` when the payload names none).
 
 | Event | `resource_type` | `resource_id` | Extra metadata |
 |---|---|---|---|
@@ -4956,7 +4976,7 @@ All events carry the common fields of §14. No forge event ever carries a title 
 | `hub.forge.issue.labeled`, `.unlabeled` | `issue` | number | `number`, `label`, `labels` (the current set, at most 100), `url` |
 | `hub.forge.comment.created` | `comment` | issue or pull request number | `number`, `comment_url`, `pull_request` (boolean) |
 | `hub.forge.pull_request.opened`, `.closed`, `.merged`, `.reopened`, `.synchronize` | `pull_request` | number | `number`, `url`, `head`, `base`, `merged` (boolean) |
-| `hub.forge.push` | `repository` | the ref | `ref`, `before`, `after` |
+| `hub.forge.push` | `ref` | the ref | `ref`, `before`, `after` |
 
 A merged pull request yields `.merged` and never also `.closed`. `hub.forge.push` reports a push that the forge received. It is unrelated to `hub.git.push` (§5), which reports a push that the hub received.
 
@@ -4965,8 +4985,8 @@ A merged pull request yields `.merged` and never also `.closed`. `hub.forge.push
 | Key | Type | Default | Effect |
 |---|---|---|---|
 | `server.external_url` | string | `""` | base of the webhook URL. When empty, the URL is reported as `null`; a secret can still be set |
-| workspace setting `forge_api_url` | URL | unset | API URL of the origin's forge; also decides the forge kind |
-| workspace setting `upstream_forge_api_url` | URL | unset | the same for the upstream |
+| workspace setting `forge_api_url` | URL | `""` | API URL of the origin's forge; also decides the forge kind. `""` means the default for the host |
+| workspace setting `upstream_forge_api_url` | URL | `""` | the same for the upstream |
 | workspace secret `FORGE_WEBHOOK_SECRET` | string | unset | the webhook secret |
 | `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY` (environment) | | unset | proxying of forge calls |
 
@@ -5115,7 +5135,7 @@ Rules:
 
 - SBX-FR-001: The feature is on when the configuration has a `[sandbox]` section, and off otherwise. When off, the hub logs once that sandboxes are disabled, runs no sandbox background work and binds no gateway. Stored leases are left as they are.
 - SBX-FR-002: An unknown key anywhere under `[sandbox]` is an error that names the key by its full path (for example `sandbox.profiles[1].memroy_mb`).
-- SBX-FR-003: `${NAME}` in any string value of the section is replaced by the value of that environment variable, or by an empty string when it is unset. Map keys are not expanded. Replacements are not expanded again.
+- SBX-FR-003: `${NAME}` in any string value of the section is replaced by the value of that environment variable, as everywhere in the configuration (§3); a reference to an unset variable is a start error. Map keys are not expanded. Replacements are not expanded again.
 - SBX-FR-004: Static validation (§13.9) collects every failure and reports them together, one per line. A profile is named by its `name`, or by its index when it has none. No message contains an `env` value or any part of `gateway_token`. The provider is not contacted for a statically invalid section.
 - SBX-FR-005: Keys that belong to one provider are refused under the other (§13.9).
 - SBX-FR-006: After static validation the hub probes the provider once, within 10 s:
@@ -5130,32 +5150,32 @@ Rules:
 
 **Authorization**
 
-- SBX-FR-020: Check order on every sandbox route: authenticate (`401`) → feature enabled (`404 sandboxes_disabled`) → PAT scope (`403`) → workspace access → validation → state. From the scope check on, the order is the global one (§3). The feature check comes early so that a disabled hub answers every authenticated caller the same way.
+- SBX-FR-020: Check order on every sandbox route: steps 1–4 of the global order (§3: path and method, authentication `401`, rate limit, body) → feature enabled (`404 sandboxes_disabled`) → binding guard → PAT scope (`403`) → workspace access → validation → state. From the binding guard on, the order is the global one (§3). The feature check comes early so that a disabled hub answers every authenticated caller the same way.
 - SBX-FR-021: Reads need `sandboxes:read` or `sandboxes:write`. Issuing and ending a lease need `sandboxes:write`. Only PATs are scope-checked.
 - SBX-FR-022: Workspace access follows §3: reads need read access; issuing and ending need write access. A caller without read access gets `404 workspace not found`. A read-only member gets `403 forbidden` on a write route.
 - SBX-FR-023: `GET /sandbox-profiles` needs no workspace access, and a workspace-bound token may call it. `GET /sandboxes` needs the admin token: any other credential gets `403 forbidden`, and a workspace-bound token gets `403 token_bound`.
 
 **Issuing a lease**
 
-- SBX-FR-030: A lease request on an archived workspace is refused with the archived-workspace error of §4. Reading and ending leases work on archived workspaces.
+- SBX-FR-030: A lease request on an archived workspace is refused with the archived-workspace error of §4 (`409` `workspace_archived`). A lease request on a task fork whose parent is archived is refused with `409` `parent_archived` (WS-FR-066). Reading and ending leases work on archived workspaces.
 - SBX-FR-031: The body is an optional JSON object. An empty body counts as `{}`. Accepted fields are `profile`, `purpose`, `ttl`, `labels` and `session_id`; any other field is a `400` that names it. A `null` value counts as absent.
 - SBX-FR-032: `profile` defaults to the profile marked `default`. Without a default, an absent `profile` is a `400` that lists the known profile names. A given name must match exactly, else `400` with the same list.
-- SBX-FR-033: `ttl` defaults to the profile's TTL. When given, it is a duration string (`30m`, `1h30m`) of at least 1 minute and at most the profile's TTL. The effective TTL is cut to whole seconds.
+- SBX-FR-033: `ttl` defaults to the profile's TTL. When given, it is a duration string (`30m`, `90m`) of at least 1 minute and at most the profile's TTL. The effective TTL is cut to whole seconds.
 - SBX-FR-034: `purpose` is at most 64 characters and has no control characters. It defaults to `""`.
 - SBX-FR-035: `labels` holds at most 16 entries. A key is 1 to 63 characters of letters, digits, `.`, `_` and `-`, starting and ending with a letter or digit. The keys `lease` and `workspace` (any case) are reserved. A value is a string of at most 256 bytes without control characters; it may be empty. Violations are `400` and name the key.
 - SBX-FR-036: `session_id` is optional and is validated like every session reference (§14). When it is absent and the workspace is a task fork that has a `session_id`, the lease takes the fork's.
-- SBX-FR-037: Required secrets are checked before the lease is stored. The hub looks up the names in the profile's `secrets` along the resolution chain of §11 for the lease's workspace (for a fork: fork → parent workspace → org → user, with the reserved names of §11 skipped at the parent). The user scope is the workspace owner's, never the caller's. Names match without regard to case. Values are not read. If any name is missing the answer is `422`, `error_type: secret_missing`, with a message that lists the missing names and the scopes searched. Optional secrets are not checked.
+- SBX-FR-037: Required secrets are checked before the lease is stored. The hub looks up the names in the profile's `secrets` along the resolution chain of §11 for the lease's workspace (for a fork: fork → parent workspace → org → user, exactly as §11.3 defines it: the parent step is used for secrets only when the fork's owner has write access to the parent, the reserved names of §11 are always skipped at the parent, and the org step applies only while the workspace owner is a member of the org). The user scope is the workspace owner's, never the caller's. Names match without regard to case. Values are not read. If any name is missing the answer is `422`, `error_type: secret_missing`, with a message that lists the missing names and the scopes searched. Optional secrets are not checked.
 - SBX-FR-038: Capacity. A lease counts as live for capacity while it is `leased` and before `lease_expires_at`, or `active` and before `expires_at`. If the hub-wide count has reached `max_sandboxes`, the answer is `429`, `error_type: sandbox_capacity`. The count and the insert are atomic: concurrent requests never exceed the limit.
-- SBX-FR-039: On success the hub stores the lease in state `leased` with a full snapshot of the profile and answers `201` with the lease plus `token`. `hub.sandbox.lease` is emitted after the lease is stored. A failure to emit does not undo the lease.
+- SBX-FR-039: On success the hub stores the lease in state `leased` with a full snapshot of the profile and answers `201` with the lease plus `token`. `hub.sandbox.lease` is written in the same transaction that stores the lease (§14).
 - SBX-FR-040: A replay with the same `Idempotency-Key` (§3) answers `200` with the lease as it is now and **without** `token`, because the hub does not keep the token. A caller that lost the token ends the lease and requests a new one.
 
 **Task fork integration**
 
-- SBX-FR-045: When the lease's workspace is a task fork, the box environment contains `PARLEY_REMOTE`, the fork's git remote URL (§5). The lease shows the same value as `remote`. For any other workspace `remote` is null and the variable is not set.
+- SBX-FR-045: When the lease's workspace is a task fork, the box environment contains `PARLEY_REMOTE`, the fork's `hub_url` (§4). The lease shows the same value as `remote`. When `[server].external_url` is not set, `hub_url` is null: `remote` is null, the variable is not set and no git credential is injected. For any other workspace `remote` is null and the variable is not set.
 - SBX-FR-046: When the workspace is a task fork and the profile sets `inject_git_credential = true`, the hub mints a PAT at box creation and places it in the box environment as `PARLEY_GIT_TOKEN`. The PAT:
-  - is bound to the fork and acts as the lease's creator (as the fork's owner when the lease was issued with the admin token);
-  - carries `git:read`, and `git:write` only if the credential that issued the lease may write to the fork's git;
-  - inherits the `paths` limit of the issuing PAT, if it had one (§8);
+  - is bound to the fork and is owned by the user who issued the lease. A lease issued with the admin token gets no git credential (`git_credential: false`), because a bound token needs a user as its owner (§3);
+  - carries a subset of `git:read`, `git:write` and `changes:write`: each of the three only if the credential that issued the lease holds it (an API key holds all three; this is the subset rule of §3), so that a push from the box can open the fork's automatic change (WS-FR-075, GIT-FR-043). An issuing PAT that holds neither `git:read` nor `git:write` gets no git credential (`git_credential: false`);
+  - inherits the `paths` limit of the issuing PAT, if it had one (§3);
   - expires at the lease's `expires_at` and is revoked when the lease ends, whichever comes first.
 
   The PAT is treated as a secret: no REST response, event, log line or gateway answer contains it. The lease shows only `git_credential: true`.
@@ -5234,12 +5254,12 @@ All routes follow the conventions of §3. The feature check of SBX-FR-020 applie
 **Lease object.** Every lease response has all the fields of §13.3.2. Example:
 
 ```json
-{"id":"sbx_3f2a9c0e7b1d4c5a8e6f0b2d1c3a4e5f","workspace":"widgets--a1b2c3d4","session_id":"ses_01HZX","profile":"tools",
+{"id":"sbx_3f2a9c0e7b1d4c5a8e6f0b2d1c3a4e5f","workspace":"widgets--a1b2c3d4","session_id":"0b6f3c1e-8a52-4d7e-9c1b-2f4a6d8e0c13","profile":"tools",
  "purpose":"triage","state":"leased","gateway_url":"https://sandboxes.example.com",
  "expires_at":"2026-01-02T04:04:05Z","lease_expires_at":"2026-01-02T03:09:05Z",
  "image":"registry.example.com/tools:1","network":"none","resources":{"cpus":1,"memory_mb":512,"pids":100,"disk_mb":0},
  "require_landlock":true,"secrets":["GIT_PAT"],"optional_secrets":[],
- "remote":"https://hub.example.com/git/widgets--a1b2c3d4.git","git_credential":true,
+ "remote":"https://hub.example.com/git/acme/widgets--a1b2c3d4.git","git_credential":true,
  "labels":{"team":"red"},"created_by":"user-1","created_at":"2026-01-02T03:04:05Z","updated_at":"2026-01-02T03:04:05Z",
  "sandbox_id":null,"error":null,"ended_at":null,"end_reason":null}
 ```
@@ -5357,8 +5377,8 @@ All commands live under `parley sandbox` and follow the CLI conventions of §3.
 - **Output:**
   - Without `--token-file`: a warning on stderr that the token will not be shown again, then the lease including `token` on stdout.
   - With `--token-file`: the token is written to the file with no trailing newline, and stdout shows the lease without `token`.
-  - If the token cannot be written, the CLI ends the lease it just created and exits 1. The message says whether the lease was released and, if it was not, gives the `parley sandbox destroy` command to run. The token is never printed as a fallback.
-- **Exit codes:** 0; 1 (hub error or token write failure); 2 (usage).
+  - If the token cannot be written, the CLI ends the lease it just created and exits 2 (a client error, §3). The message says whether the lease was released and, if it was not, gives the `parley sandbox destroy` command to run. The token is never printed as a fallback.
+- **Exit codes:** 0; 1 (hub error); 2 (usage, or token write failure).
 
 #### `parley sandbox list <workspace-slug>`
 
@@ -5393,7 +5413,7 @@ All commands live under `parley sandbox` and follow the CLI conventions of §3.
 | Workspace deletion, fork expiry | when it happens | live leases of that workspace are ended (SBX-FR-047) |
 | Shutdown | when the hub stops; 20 s in total | SBX-FR-073 |
 
-**Metrics** (on `/metrics`, exported from start whenever sandboxes are enabled):
+**Metrics** (on `/metrics`, exported from start; with sandboxes disabled they are exported with value 0, §14):
 
 | Metric | Type | Meaning |
 |---|---|---|
@@ -5403,7 +5423,7 @@ All commands live under `parley sandbox` and follow the CLI conventions of §3.
 
 ### 13.8 Events
 
-All sandbox events have `resource_type: "sandbox"`, `resource_id` = the lease id, `workspace` = the lease's workspace, and `session_id` = the lease's `session_id` (null when the lease has none). Metadata never contains a secret value, an `env` value, the lease token or the injected git credential. A failure to emit is logged and never changes the outcome. The catalogue is in §14.
+All sandbox events have `resource_type: "sandbox"`, `resource_id` = the lease id, `workspace` = the lease's workspace, and `session_id` = the lease's `session_id` (null when the lease has none). Metadata never contains a secret value, an `env` value, the lease token or the injected git credential. Each event is written in the same transaction as the lease state change it reports (§14). The catalogue is in §14.
 
 | Type | Actor | When | Metadata |
 |---|---|---|---|
@@ -5551,7 +5571,7 @@ Every field is present in every session response. `forks` and `changes` hold at 
 
 The four terminal states are absorbing. `terminated` cannot be set by a client. Usage may be reported only while the session is `active`.
 
-**Linking work to a session.** A fork request, a git push (`-o parley.session=<id>`), an API commit, a change version, a claim and a land may name a session. The reference is accepted when:
+**Linking work to a session.** A fork request, a git push (`-o parley.session=<id>`), an API commit, a change version, a claim, a land and a sandbox lease may name a session. The reference is accepted when:
 
 - the session exists,
 - it was created by the caller's user, or the caller is an admin token, and
@@ -5559,7 +5579,7 @@ The four terminal states are absorbing. `terminated` cannot be set by a client. 
 
 The session's status is not checked: work may be attributed after the session has ended, for example a land that happens later. A reference that fails these rules is refused with `400`, `error_type: unknown_session`, and nothing is changed. On a git push the refusal is reported in git's text form (§5).
 
-Every hub event caused by an operation that names a session carries that `session_id`. An event about a change that is caused by the hub itself (restack, conflict detection, automatic land) carries the session of the change version it concerns.
+Every hub event caused by an operation that names a session carries that `session_id`. An event about a change that is caused by the hub itself (restack, conflict detection, automatic land) carries the session of the change version it concerns. An event about a task fork (`hub.workspace.fork`, `hub.workspace.delete`, `hub.fork.expire`) carries the session the fork was created with (§4). A sandbox event carries the session of its lease (§13). A rebuild event carries the session of the push or land that queued the rebuild (§10).
 
 #### 14.3.3 Token usage record
 
@@ -5625,12 +5645,13 @@ One rule decides who may see a hub event, on the stream, the log and the audit q
 
 | Event | Visible to |
 |---|---|
-| `workspace` is set | Callers with read access to that workspace. For a task fork, also callers with read access to its parent; this still holds after the fork is deleted |
-| `workspace` is null, `metadata.scope` is `user` | The user named by `actor_id` |
-| `workspace` is null, `metadata.scope` is `org` | Members of the org named in `metadata.org` |
+| `workspace` is set | Callers with read access to that workspace. For a task fork, also callers with read access to its parent; this still holds after the fork is deleted. The next row is the exception |
+| `workspace` is set and the type is `hub.secret.*` or `hub.token.*` | Only callers with level `owner` or `admin` on that workspace (for a task fork: on the fork or on its parent). Secret names and bound tokens are private to the owner (§3, §11), so other readers of the workspace do not see these events |
+| `workspace` is null, `metadata.scope` is `user` | The user named in `metadata.scope_id` |
+| `workspace` is null, `metadata.scope` is `org` | Members of the org named in `metadata.scope_id` |
 | Any event | Admin tokens |
 
-A token bound to a workspace (§3) sees only events of that workspace and of the forks the token is valid on (§4). It never sees an event without a workspace.
+A token bound to a workspace (§3) sees only events of that workspace and of the forks the token is valid on (§4). A token bound to a task fork also sees the events of the fork's parent whose resource is a change with that fork as its source (§3, §7), so an agent can follow its own changes. A bound token never sees an event without a workspace.
 
 Access is evaluated when an event is delivered, not when the stream was opened. A workspace or fork created later is included from its first event; a caller who loses access stops receiving events of that workspace.
 
@@ -5640,7 +5661,7 @@ Run telemetry is never part of the event log. It is visible to callers with read
 
 `sessions:read`, `sessions:write`, `audit:read`, `audit:write`. The rules of §3 apply: a read check accepts either scope of the pair, and only PATs are scope-checked. `GET /events`, `GET /events/log` and `GET /audit` need `audit:read`.
 
-Bound tokens may call the routes of this section that are not under `/workspaces/:slug` (`/sessions…`, `/audit`, `/events`, `/events/log`). Their results are confined as §14.3.7 describes.
+Bound tokens may call the routes of this section that are not under `/workspaces/:slug` (`/sessions…`, `/audit`, `/events`, `/events/log`). Their results are confined to the workspaces the binding covers (§3): events as §14.3.7 describes, and sessions only when the session's workspace is covered. For a bound token, `POST /sessions` with a `workspace_slug` outside the binding and a `workspace` filter outside it answer `404 workspace not found`; every `/sessions/:id` route for a session of an uncovered workspace answers `404 session not found`, also when the token's user created that session.
 
 ### 14.4 Functional requirements
 
@@ -5649,7 +5670,7 @@ Bound tokens may call the routes of this section that are not under `/workspaces
 - AUD-FR-001: `POST /sessions` needs `sessions:write` and write access to the workspace named by `workspace_slug`. The workspace may be a task fork. An archived workspace refuses new sessions with `409 workspace_archived`.
 - AUD-FR-002: A new session has `status: active`, `started_at` = now, and records the caller's user id and credential type.
 - AUD-FR-003: Session creation is idempotent on `id`. A replay by the same user for the same workspace answers 200 with the stored session and changes nothing. An `id` that exists for another user or workspace answers `409 conflict`.
-- AUD-FR-004: Only the user who created a session, or an admin token, may complete it or report usage. Any credential of that user qualifies. A caller who can read the session but did not create it gets `403 forbidden`.
+- AUD-FR-004: Only the user who created a session, or an admin token, may complete it or report usage. Any credential of that user qualifies, within the confinement of a bound token (§14.3.8). A caller who can read the session but did not create it gets `403 forbidden`.
 - AUD-FR-005: `complete` accepts `completed`, `failed` or `timeout`. Completing an `active` session sets the status, `ended_at`, `error_message`, `duration_ms` and `cache_creation_input_tokens` in one atomic step. Completing a terminal session answers 200 with the unchanged record; when two completes race, exactly one takes effect and both answer 200.
 - AUD-FR-006: A usage report needs a non-blank `model` and token counts ≥ 0, and an `active` session (else `409 session_not_active`). A new record answers 201. A replay of an existing usage `id` in the same session answers 200 with the stored record and changes nothing: no record, no total, no metric. A usage `id` that exists in another session answers `409 conflict`.
 - AUD-FR-007: A session is readable by its creator, by any caller with read access to its workspace, and by admin tokens. A session on a task fork is also readable by callers with read access to the parent, also after the fork is gone. Workspace status does not affect reads. A caller who may not read a session gets `404 session not found`.
@@ -5974,7 +5995,7 @@ The newest event always stays in the event log, whatever its age, so `last_seq` 
 | `parley_agent_sessions_active` | gauge | `workspace` | Sessions in state `active` |
 | `parley_agent_tokens_total` | counter | `workspace`, `model`, `direction` (`input`, `output`, `cache_read`) | Tokens reported in usage records. Replays are not counted |
 | `parley_audit_records` | gauge | `kind` (`hub_event`, `run_event`, `outcome`, `tool_call`, `tool_error`, `trace`, `postmortem`, `session`, `usage`) | Stored records, sampled by retention |
-| `parley_jobqueue_depth` | gauge | `type`, `status` | Background jobs by type and status |
+| `parley_jobqueue_depth` | gauge | `type` (`rebuild`), `status` (`queued`, `running`, `failed`, `completed`, `dead_letter`, `cancelled`) | Durable jobs by job type and job status (§10) |
 | `parley_retention_errors_total` | counter | `step` | Failed retention steps |
 | `parley_retention_last_run_timestamp_seconds` | gauge | none | Unix time of the last fully successful retention run |
 | `parley_sandboxes_active` | gauge | `workspace` | See §13 |
@@ -5993,97 +6014,104 @@ Run event types are free-form strings chosen by agents and are not part of this 
 
 | Type | Emitted when | `resource_type` / `resource_id` | Metadata |
 |---|---|---|---|
-| `hub.workspace.create` | A workspace was created | `workspace` / slug | `git_url` (no userinfo), `branch` |
-| `hub.workspace.update` | A workspace was updated | `workspace` / slug | `fields` (names of the changed fields) |
-| `hub.workspace.archive` | A workspace was archived | `workspace` / slug | `head_sha` (when known) |
+| `hub.workspace.create` | A repository workspace was created | `workspace` / slug | `kind`, `git_url` (no userinfo), `workspace_mode`, `default_branch` (may be null) |
+| `hub.workspace.update` | A workspace was updated | `workspace` / slug | `fields` (names of the fields given) |
+| `hub.workspace.archive` | A workspace was archived | `workspace` / slug | `head_sha`, `origin_push` (`ok`, `partial`, `failed`), `forks` (count) |
 | `hub.workspace.reactivate` | An archived workspace was reactivated | `workspace` / slug | none |
-| `hub.workspace.delete` | A workspace was deleted by request. `workspace` is the deleted slug | `workspace` / slug | `revoked_tokens` (ids of the bound tokens revoked) |
-| `hub.workspace.sync` | A sync from origin finished | `workspace` / slug | `result` (the sync result of §4) |
-| `hub.workspace.fork` | A task fork was created. `workspace` is the fork's slug | `workspace` / fork slug | `parent`, `fork_point` (`{ref, sha}`), `expires_at` |
-| `hub.fork.expire` | The hub deleted a task fork. `workspace` is the fork's slug. Actor `system`. A fork deleted by request emits `hub.workspace.delete` instead | `workspace` / fork slug | `reason` (`ttl`, `landed`, `parent_deleted`), `parent` |
-| `hub.branch.push` | A push of a branch to origin was attempted. Written on success and on failure of the push itself; a request the hub refuses emits nothing | `branch` / branch name | `branch`, `sha`, `ok`, `remote_url` (no userinfo), then `result` (when `ok`) or `error_type` (when not) |
+| `hub.workspace.delete` | A workspace or task fork was deleted by a caller, or a fork was deleted together with its parent (one event per fork and one for the parent). `workspace` is the deleted slug | `workspace` / slug | `kind`, `parent_slug` (forks), `revoked_tokens` (sorted ids of the bound tokens revoked), `deleted_forks` (slugs; parent only) |
+| `hub.workspace.sync` | A sync from origin completed, also when branches are `ahead` or `diverged`. A failed sync emits nothing | `workspace` / slug | `created`, `fast_forward`, `ahead`, `diverged`, `reset` (lists of branch names), `updated` (list of `{ref, before, after}`) |
+| `hub.workspace.fork` | A task fork was created. `workspace` is the fork's slug | `workspace` / fork slug | `parent_slug`, `fork_point` (`{ref, sha}`), `expires_at`, `auto_change`, `purpose`, `token_id` (when a token was minted) |
+| `hub.fork.expire` | The expiry sweep deleted a task fork. `workspace` is the fork's slug. Actor `system`. A fork deleted by request or together with its parent emits `hub.workspace.delete` instead | `workspace` / fork slug | `parent_slug`, `reason` (`ttl`, `landed`), `expires_at`, `revoked_tokens` |
+| `hub.workspace.push` | A push of a branch to origin was attempted. Written on success and on failure of the push itself; a request the hub refuses emits nothing | `branch` / branch name | `branch`, `sha`, `force`, `ok`, `remote_url` (no userinfo), then `result` (when `ok`) or `error_type` (when not) |
+| `hub.workspace.reclone` | A reclone was accepted | `workspace` / slug | `origin_push` (`ok`, `partial`, `failed`) |
 | `hub.session.force_closed` | An active session was terminated because its workspace was archived or deleted, or its fork expired. One per session. Actor `system` | `session` / session id | `reason` (`workspace archived`, `workspace deleted`, `fork expired`) |
 
-Fork events are visible to readers of the parent (§14.3.7), so the owner of a workspace sees its forks come and go.
+Events whose `workspace` is a fork (`hub.workspace.fork`, `hub.workspace.delete` of a fork, `hub.fork.expire`, and everything else that happens on the fork) are visible to readers of the parent (§14.3.7), so the owner of a workspace sees its forks come and go.
 
 #### 14.8.2 Tokens (§3)
 
 | Type | Emitted when | `resource_type` / `resource_id` | Metadata |
 |---|---|---|---|
-| `hub.token.bind` | A token bound to a workspace was created, including the token issued with a fork | `token` / token id | `permissions`, `paths` (or null), `expires_at` (or null). Never the token |
-| `hub.token.bound_refused` | A bound token was refused because the request was outside its workspace. At most one event per token per minute. `workspace` is the bound workspace; the actor is the token's user | `token` / token id | `requested_workspace` (when the request named one), `method`, `route`, `status`, `surface` (`api`, `git`), `suppressed` (refusals not reported since the previous event) |
+| `hub.token.bind` | A token bound to a workspace was created, including the token issued with a fork and the git credential the hub mints for a sandbox (§13) | `token` / token id | `token_id`, `workspace`, `permissions`, `paths` (or null), `expires_at` (or null). Never the token |
+| `hub.token.bound_refused` | A bound token was refused because the request was outside its workspace. At most one event per token per minute. `workspace` is the bound workspace; the actor is the token's user | `token` / token id | `token_id`, `bound_workspace`, `requested_workspace` (when the request named one), `method`, `route`, `status` (403 or 404), `surface` (`api`, `git`), `suppressed` (refusals not reported since the previous event) |
 
 #### 14.8.3 Git server and source control API (§5, §6)
 
 | Type | Emitted when | `resource_type` / `resource_id` | Metadata |
 |---|---|---|---|
 | `hub.git.push` | A ref was updated: by a git push (§5), through the source control API (§6: ref create, move, delete, commit, rebase), or by a land moving its target (§8). One event per accepted ref update, in order; a rejected update emits nothing | `ref` / full ref name | `ref`, `before`, `after` (shas; null on the side that does not exist), `created`, `deleted`, `forced` (booleans; `forced` means the update was not a fast-forward), `via` (`git`, `api` or `land`) |
-| `hub.git.fetch` | A fetch or clone was served. Only when the workspace setting `audit_fetches` is on (default off) | `workspace` / slug | `protocol` (`v0`, `v2`), `shallow` (boolean), `filter` (partial-clone filter or null) |
+| `hub.git.fetch` | A fetch or clone was served. Only when the workspace setting `audit_fetches` is on (default off) | `workspace` / slug | `shallow` (boolean), `filter` (partial-clone filter or null) |
 | `hub.scm.commit` | A commit was created through the source control API | `commit` / new sha | `branch`, `sha`, `parent_sha`, `files` (paths touched, at most 100) |
 
 All events of one push are written together and have consecutive positions among the workspace's events.
 
 #### 14.8.4 Changes and landing (§7, §8)
 
-For every type in this table `resource_type` is `change`, `resource_id` is the change number as a decimal string, and `workspace` is the workspace the change belongs to (the workspace of its target branch). Every event also has `number` in its metadata.
+For every type in this table `resource_type` is `change`, `resource_id` is the change number as a decimal string, and `workspace` is the workspace the change belongs to (the workspace of its target branch). Every event also has `number` in its metadata. The events owned by §7 (`open`, `version`, `restack`, `conflict`, `ready`, `abandon`, `restore`) also carry `ref` (`<slug>#<number>`), `version` (the current version) and `head_sha`.
 
 | Type | Emitted when | Actor | Metadata beyond `number` |
 |---|---|---|---|
 | `hub.change.open` | A change entered state `open`: created open, or a draft was published | caller | `title`, `target_branch`, `source_workspace`, `source_branch`, `depends_on` (numbers), `was_draft` |
-| `hub.change.version` | A change got a new version, including version 1 of a draft | the pusher or committer; `system` for a restack | `version`, `head_sha`, `kind` (`push`, `commit`, `restack`) |
-| `hub.change.restack` | The hub restacked a change after a change below it moved or landed. Written after the `hub.change.version` of the new version | `system` | `version`, `head_sha`, `trigger` (number of the lower change) |
-| `hub.change.ready` | The change became landable: its `landing.status` is `ready` and its `mergeable` is `clean`, for its current version | `system` | `version` |
-| `hub.change.conflict` | The change's `mergeable` became `conflict`. Not repeated while it stays so | `system` | `version`, `files` |
-| `hub.change.overlap` | A new version made the change touch files that another open change also touches. One event per pair, on the change that got the new version, the first time the pair overlaps | `system` | `with` (number of the other change), `paths` |
-| `hub.change.approve` | A version was approved | caller | `version` |
-| `hub.change.reject` | A version was rejected | caller | `version` |
+| `hub.change.version` | A change got a new version, including version 1 of a draft; or the change was retargeted (`kind` is then `retarget` and no version is created) | the pusher, committer or caller; `system` for a restack done by the hub and for a `sync` version | `kind` (`push`, `commit`, `ref`, `rebase`, `restack`, `revert`, `sync`, `retarget`), `base_sha`, `patch_equivalent_to`, `draft` |
+| `hub.change.restack` | The hub restacked the change, on its own or on `POST …/restack`. Written after the `hub.change.version` of the new version | `system`; the caller for a manual restack | `onto_sha`, `trigger` (`version`, `land`, `manual`, `abandon`) |
+| `hub.change.ready` | The change became landable: its `landing.status` is `ready` and its `mergeable` is `clean`, for its current version | `system` | none |
+| `hub.change.conflict` | The change's `mergeable` became `conflict`, or a restack of it failed. Not repeated while it stays so | `system` | `files` (paths), `needs_restack` |
+| `hub.change.overlap` | A new version made two changes overlap that did not overlap before. One event on each of the two changes, naming the other. A pair is announced once; if the two stop overlapping and later overlap again, it is announced again | `system` | `with` (number and ref of the other change), `with_session_id`, `paths` (at most 100), `count` |
+| `hub.change.approve` | An approving verdict was recorded | caller | `version`, `approval_id`, `counts_for` |
+| `hub.change.reject` | A rejecting verdict was recorded | caller | `version`, `approval_id`, `counts_for` |
 | `hub.change.check` | A check result was reported | caller | `version`, `name`, `status` |
-| `hub.change.land` | The change landed | the caller of the land; `system` for an automatic land | `landed_sha`, `target_branch`, `strategy`, `attempts` |
-| `hub.change.land_fail` | A land ended without landing | as above | `reason` (`conflict`, `blocked`, `failed`), `attempts`, `files` (on `conflict`) |
-| `hub.change.abandon` | The change was abandoned | caller | none |
+| `hub.change.land` | A land attempt ended `landed`. One event per landed change, also for a stack | the caller of the land; `system` for an automatic land | `land_id`, `target_branch`, `onto_sha`, `landed_sha`, `strategy`, `attempts`, `noop`, `trigger`, `override`, `policy_revision` |
+| `hub.change.land_fail` | A land attempt ended `conflict`, `blocked` or `failed`, or an automatic land could not start because the user who set `auto_land` may no longer land (`reason: not_permitted`) | as above | `land_id`, `status` (`conflict`, `blocked`, `failed`), `reason`, `files` (on `conflict`) |
+| `hub.change.abandon` | The change was abandoned: by request, because its source branch was deleted (`reason: source_deleted`), because its source branch was gone after a reclone (`reason: source_lost`), or because its source fork was deleted or expired | caller (for `source_deleted`, the pusher who deleted the branch); `system` for a reclone and for a fork deletion or expiry | `reason` |
 | `hub.change.restore` | An abandoned change was restored | caller | none |
-| `hub.change.revert` | A reverting change was opened for a landed change. Written on the new change | caller | `reverts` (number of the landed change) |
-| `hub.policy.update` | The landing policy of a workspace was replaced. `resource_type` `policy`, `resource_id` slug | caller | `rules` (number of rules) |
+| `hub.change.revert` | A reverting change was opened for this landed change. Written on the landed change; the new change gets its own `hub.change.open` | caller | `reverted_by` (number of the reverting change) |
+| `hub.policy.update` | The landing policy of a workspace was replaced. `resource_type` `policy`, `resource_id` slug | caller | `revision`, `rules` (number of rules) |
 
 A land that loses a compare-and-swap race and is retried emits nothing for the lost attempt; `attempts` on the final event counts them.
 
 #### 14.8.5 Awareness (§9)
 
-`resource_type` is `claim` and `resource_id` the claim id.
+`resource_type` is `claim` and `resource_id` the claim id. `workspace` is the workspace the claim is stored on: the parent, when the claim was made through a fork's slug (§9).
 
 | Type | Emitted when | Actor | Metadata |
 |---|---|---|---|
-| `hub.claim.create` | A claim was made | caller | `paths`, `intent`, `expires_at` |
-| `hub.claim.release` | A claim was released by request | caller | `paths`, `intent` |
-| `hub.claim.expire` | A claim reached its expiry | `system` | `paths`, `intent` |
+| `hub.claim.create` | A claim was made | caller | `paths`, `intent`, `target_branch`, `expires_at` |
+| `hub.claim.release` | A claim was released by request | caller | `paths` |
+| `hub.claim.expire` | A claim reached its expiry | `system` | `paths` |
 
 #### 14.8.6 Carry-patch (§10)
 
-`resource_type` is `patch` with `resource_id` the patch branch name, or `rebuild` with `resource_id` the rebuild job id.
+`resource_type` is `patch` with `resource_id` the patch id, or `rebuild` with `resource_id` the rebuild job id. Patch events carry the branch as `branch_name` in metadata.
 
 | Type | Emitted when | Actor | `resource_type` | Metadata |
 |---|---|---|---|---|
 | `hub.patch.create` | A patch was registered. One event per patch, also for a batch | caller | `patch` | `branch_name`, `position`, `branch_resolution` |
-| `hub.patch.delete` | A patch was soft-deleted | caller | `patch` | `branch_name` |
-| `hub.patch.reset` | A patch branch was reset to origin | caller | `patch` | `branch_name`, `result` (`none`, `created`, `fast_forwarded`, `replaced`), `origin_sha`, `local_sha`, `replaced_sha` (the last two when they apply) |
+| `hub.patch.update` | A patch's status, position, description or PR URL changed | caller, or `system` | `patch` | `branch_name`, `changed` (field names), and for a status change `from`, `to`, `reason` (`api`, `rebuild_conflict`, `rebuild_clean`, `merged_upstream`) |
+| `hub.patch.reorder` | The patch list was reordered. One event; `resource_id` is the first patch of the new order | caller | `patch` | `patch_ids` (new order) |
+| `hub.patch.delete` | A patch was soft-deleted | caller, or `system` when a rebuild removed a merged patch | `patch` | `branch_name`, `reason` (`api`, `merged_upstream`) |
+| `hub.patch.restore` | A deleted patch was restored | caller | `patch` | `branch_name`, `position` |
+| `hub.patch.reset` | A reset to origin succeeded, whatever the action | caller | `patch` | `branch_name`, `action` (`none`, `created`, `fast_forwarded`, `replaced`), `local_sha`, `origin_sha`, `replaced_sha` |
 | `hub.patch.replace` | A patch branch was replaced by origin's, by a reset or by a sync | caller | `patch` | `branch_name`, `replaced_sha`, `origin_sha`, `trigger` (`reset_to_origin`, `sync`) |
-| `hub.patch.sync` | A carry-patch sync in origin mode finished. `resource_type` `workspace`, `resource_id` slug | caller | `workspace` | `created`, `fast_forwarded`, `replaced`, `diverged`, `missing_on_origin` (lists of branch names) |
+| `hub.patch.sync` | A sync in origin mode moved a patch branch or changed its origin state. One event per such patch | caller | `patch` | `branch_name`, `action`, `state`, `local_sha`, `origin_sha` |
 | `hub.patch.mirror_failed` | Mirroring a patch branch to origin failed. One per branch | `system` | `patch` | `branch_name`, `error` |
-| `hub.rebuild.enqueue` | A rebuild was requested through the API | caller | `rebuild` | `patch_count` |
-| `hub.rebuild.complete` | A rebuild succeeded | `system` | `rebuild` | `patches_applied` |
-| `hub.rebuild.fail` | A rebuild attempt failed, attempts that will be retried included | `system` | `rebuild` | `reason`, `conflict_files` (when a conflict) |
+| `hub.rebuild.enqueue` | A rebuild job was queued, from any source (API, push, sync, landing) | caller, or `system` | `rebuild` | `submitted_by`, `strategy`, `fail_mode`, `patch_count` |
+| `hub.rebuild.complete` | A rebuild published | `system` | `rebuild` | `upstream_head_sha`, `integration_head_sha`, `previous_integration_head_sha`, `patches_applied`, `patches_skipped`, `patches_conflicted`, `patches_removed` |
+| `hub.rebuild.fail` | A rebuild attempt failed, attempts that will be retried included | `system` | `rebuild` | `reason`, `will_retry`, `retry_count`, `conflict` (the conflict report, when the failure was a conflict) |
 | `hub.rebuild.push_failed` | Pushing the integration branch to origin failed after a rebuild | `system` | `rebuild` | `integration_branch`, `reason` |
-| `hub.rebuild.followup` | A follow-up rebuild was enqueued because inputs moved during a rebuild | `system` | `rebuild` | `stale_patches`, `upstream_stale`, `follow_up_job_id` |
+| `hub.rebuild.followup` | The stale-input check queued a follow-up rebuild. `resource_id` is the job that ended | `system` | `rebuild` | `follow_up_job_id`, `stale_patches` (branch names), `upstream_stale` |
+| `hub.rebuild.cancel` | A queued rebuild job was cancelled | caller | `rebuild` | none |
+| `hub.rebuild.requeue` | A dead-lettered rebuild job was requeued | caller | `rebuild` | none |
+| `hub.rebuild.rollback` | The integration branch was rolled back | caller | `rebuild` | `integration_branch`, `rolled_back_to`, `previous_head_sha` |
 
 #### 14.8.7 Secrets and variables (§11)
 
-Six types: `hub.secret.create`, `hub.secret.update`, `hub.secret.delete`, `hub.variable.create`, `hub.variable.update`, `hub.variable.delete`. One event per key. `resource_type` is `secret` or `variable`; `resource_id` is the key. Metadata: `scope` (`user`, `org`, `workspace`), `key`, and `org` (org slug) at org scope. Never a value.
+Six types: `hub.secret.create`, `hub.secret.update`, `hub.secret.delete`, `hub.variable.create`, `hub.variable.update`, `hub.variable.delete`. One event per key. `resource_type` is `secret` or `variable`; `resource_id` is the key. Metadata: `scope` (`user`, `org`, `workspace`), `scope_id` (the user id, org id or workspace slug) and `key`. Never a value.
 
 At workspace scope the event's `workspace` is the slug. At user and org scope `workspace` is null, and the scope decides who sees the event (§14.3.7). Credentials that the hub stores itself while creating a workspace or setting a webhook secret emit no secret event.
 
 #### 14.8.8 Forge integration (§12)
 
-**Writes to the forge.** One event per write request that reached the forge, on success and on failure. Common metadata: `target` (`origin`, `upstream`), `ok`, `error_type` (when not `ok`), `number` and `url` (when known). When the forge assigned no number because the call failed, `resource_id` is `none`.
+**Writes to the forge.** One event per write request that reached the forge, on success and on failure. `workspace` is the workspace whose forge was written: for a call through a task fork that is the parent, and `metadata.fork` holds the fork's slug. Common metadata: `target` (`origin`, `upstream`), `ok`, `error_type` (when not `ok`), `number` and `url` (when known), `fork` (for a call through a fork). When the forge assigned no number because the call failed, `resource_id` is `none`.
 
 | Type | `resource_type` / `resource_id` | Extra metadata |
 |---|---|---|
@@ -6115,11 +6143,11 @@ At workspace scope the event's `workspace` is the slug. At user and org scope `w
 
 | Type | Emitted when | Actor | Metadata |
 |---|---|---|---|
-| `hub.sandbox.lease` | A lease was issued | caller | `profile`, `purpose`, `ttl`, `secret_names`, `optional_secret_names` |
+| `hub.sandbox.lease` | A lease was issued | caller | `profile`, `purpose`, `ttl_seconds`, `secret_names`, `optional_secret_names`, `git_credential` |
 | `hub.sandbox.create` | The sandbox was created and the lease became active | `lease` (the lease's creator) | `sandbox_id`, `image`, `network` |
 | `hub.sandbox.failed` | The lease failed before a sandbox existed | `lease` | `error` |
-| `hub.sandbox.destroy` | The sandbox was destroyed other than by expiry | `lease`, caller, or `system` | `sandbox_id` (or null), `reason` (`client`, `api`, `restart`, `shutdown`) |
-| `hub.sandbox.expire` | Time ended the lease | `system` | `state` (`expired`, `destroyed`), `sandbox_id` (when one was destroyed) |
+| `hub.sandbox.destroy` | The sandbox was destroyed other than by expiry | `lease`, caller, or `system` | `sandbox_id` (or null), `reason` (`api`, `client`, `shutdown`, `restart`, `workspace_deleted`) |
+| `hub.sandbox.expire` | Time ended the lease: every change into `expired` | `system` | `sandbox_id` (string or null; non-null when a box was destroyed) |
 
 ### 14.9 Configuration
 
@@ -6128,7 +6156,7 @@ Keys of the hub configuration file (§3). Durations take a number and a unit (`s
 | Key | Default | Range | Effect |
 |---|---|---|---|
 | `[events].retention` | `30d` | `1h` to `[audit].max_age` | How long an event stays in the event log and can be resumed from |
-| `[events].max_sse_connections` | `100` | ≥ 1 | Open event streams allowed at once |
+| `[events].max_sse_connections` | `500` | ≥ 1 | Open event streams allowed at once |
 | `[audit].max_age` | `90d` | ≥ `1d` | Hub events, run events, outcomes, tool calls, tool errors |
 | `[audit].max_runs` | `50` | ≥ 1 | Runs with telemetry kept per workspace |
 | `[audit].trace_max_age` | `30d` | ≥ `1d` | Trace records |
@@ -6178,7 +6206,7 @@ The workspace setting `audit_fetches` (boolean, default `false`, §4) turns on `
 - **NFR-004** The server needs the `git` command at run time (version 2.38 or later, checked at start). The `parley` client is a single static binary with no dependency on the server's stacks.
 - **NFR-005** Version, commit and build time are set at build time and reported by `GET /version` and `parley version`.
 - **NFR-006** Deliverables: the two binaries, a hub container image, a sandbox base image, and Kubernetes manifests (configuration, deployment with one replica, persistent volume claim, service, an example for secrets).
-- **NFR-007** Backup is a consistent copy of the data directory. The hub provides a way to take one while running (a documented command or signal that produces a consistent snapshot), and a restored copy starts cleanly.
+- **NFR-007** Backup is a consistent copy of the data directory. The hub provides `parleyd backup <directory>` (§3), which writes a consistent snapshot of the data directory of a running hub into an empty directory. A hub started on a restored snapshot starts cleanly.
 
 ### 15.2 Concurrency and consistency
 
@@ -6194,9 +6222,9 @@ The workspace setting `audit_fetches` (boolean, default `false`, §4) turns on `
 - **NFR-021** Text that can carry credentials is scrubbed before it reaches a response, an event or a log: git errors, remote URLs, forge errors.
 - **NFR-022** Anti-enumeration: a caller without read access to a workspace gets the same answer as for a workspace that does not exist, on every surface.
 - **NFR-023** Git subprocesses run with validated ref names, a scrubbed environment, timeouts and process-group termination. Repository content is never executed by the hub: no hooks from repositories run, and server-side rebases do not run filters or drivers defined in repository configuration or attributes.
-- **NFR-024** Least privilege is expressible end to end: a token can be limited to scopes, to one workspace or fork, to paths, and in time. A task fork's token is useless outside the fork except for its own changes (§3).
+- **NFR-024** Least privilege is expressible end to end: a token can be limited to scopes, to one workspace or fork, to paths, and in time. A task fork's token reaches nothing outside the fork except its own changes and the read-only awareness and policy routes of its parent (§3).
 - **NFR-025** Forge webhooks are authenticated by signature or token and de-duplicated (§12). The ingress is outside bearer authentication and has its own body limit.
-- **NFR-026** Policy cannot be bypassed by choice of surface: the push rules apply identically to git pushes and to the source control API, and landing is the only way a protected branch moves.
+- **NFR-026** Policy cannot be bypassed by choice of surface: the push rules apply identically to git pushes and to the source control API, and a protected branch moves only by landing or by sync from origin (§8.3.1).
 
 ### 15.4 Performance targets
 
@@ -6235,9 +6263,9 @@ Each limit is defined in the section that owns it. The main ones:
 | Land attempt duration | 5 min | §8 |
 | Policy document | 200 rules, 64 KiB | §8 |
 | Claim TTL | default 1 h, max 24 h | §9 |
-| Durable job retries | 20, backoff 2 s doubling to 2 h | §10 |
+| Durable job retries | 20, backoff 4 s doubling to 2 h | §10 |
 | Event log retention | 30 d | §14 |
-| `parley` request timeout | 30 s (3 min for sync and push to origin) | §3, §4 |
+| `parley` request timeout | 30 s (3 min for sync, push to origin, archive and reclone) | §3, §4 |
 | `--wait` defaults | `--timeout 5m`, `--poll-interval 5s` | §3 |
 
 ### 15.6 Observability
@@ -6255,7 +6283,7 @@ Parley is accepted when the following hold, demonstrated by black-box tests agai
 
 1. **Change as the unit of work (§7).** A pushed branch becomes a change with a stable number. Each of five successive pushes, including a force push, yields a new version; all five heads are fetchable by version ref. The interdiff between a version and its pure rebase is empty. A commit on a protected branch resolves to its change, version and session.
 2. **Stacks (§7).** Three stacked changes are opened by pushing three branches. Amending the bottom one produces `restack` versions of the two above without client action. Landing the bottom one rebases the next onto the target and clears its `depends_on`. A restack that cannot apply sets `needs_restack` with a conflict report and moves nothing.
-3. **Task forks (§4).** One call returns a fork, its remote and a token. The fork is usable at once for a repository of at least 1 GB, and creation time does not grow with repository size. The token is refused everywhere outside the fork except for its own changes. A push to a tracking branch is refused. The fork disappears at its TTL, and earlier once its changes have landed.
+3. **Task forks (§4).** One call returns a fork, its remote and a token. The fork is usable at once for a repository of at least 1 GB, and creation time does not grow with repository size. The token is refused everywhere outside the fork except for its own changes and the parent's awareness and policy reads (§3). A push to a tracking branch is refused. The fork disappears at its TTL, and earlier once its changes have landed.
 4. **Source control API (§6).** Without any clone: read a file, a tree, a path's history, a diff and blame; create a commit of several files; observe `409 ref_moved` on a stale `expected_head_sha`; open and land a change. The resulting repository is identical to one produced by the equivalent git operations.
 5. **Optimistic landing (§8).** Twenty changes touching twenty different files are landed concurrently on one target: all land, none of the callers retries, the history is linear and contains each change once. Two changes editing the same lines are landed concurrently: exactly one lands, the other ends `conflict` with a report naming the file and the landed change, and the target contains only the first. A hub killed during a land restarts into a state where the change is either fully landed with its event, or not landed at all.
 6. **Conflict resolution without a clone (§8).** The conflicted file is fetched with markers, a resolution is submitted, and the change then lands.
@@ -6309,21 +6337,28 @@ Choices made while writing this document that the product owner should confirm o
 
 | # | Decision taken | Where | Alternative |
 |---|---|---|---|
-| 1 | Names: credential prefix `parley_`, environment prefix `PARLEY_`, client configuration in `~/.parley`, metrics `parley_*`; event types keep `hub.*` and refs keep `refs/hub/` | §3, §14 | Shorter credential prefix; `parley.*` events |
+| 1 | Names: credential prefix `parley_` (sandbox lease tokens are the exception: `sbl_`, §13), environment prefix `PARLEY_`, client configuration in `~/.parley`, metrics `parley_*`; event types keep `hub.*` and refs keep `refs/hub/` | §3, §14 | Shorter credential prefix; `parley.*` events |
 | 2 | The default branch is protected by default, so even the owner cannot push to it directly | §4, §8 | Protection off by default, or an owner exemption |
 | 3 | The default policy requires nothing: every change may land | §8 | A default that requires one approval for agent-authored changes |
 | 4 | Checks are reported on a version, not on the rebased result, and carry over a pure rebase | §8 | `fresh_checks` on by default |
-| 5 | An approval is not counted when given with the same credential that created the version; the rule compares credentials, not users | §8 | Compare users, with an explicit "agent" marker on tokens |
+| 5 | An approval is not counted when given with a credential that created any version of the change; the rule compares credentials, not users | §8 | Compare users, with an explicit "agent" marker on tokens |
 | 6 | Owners may override unmet approvals and checks (never blocks), with a recorded reason | §8 | No override at all |
 | 7 | Landing strategy defaults to `rebase` (commits kept); `squash` is a setting | §8 | Squash by default, one commit per change |
 | 8 | In a fork, the first push of a new branch opens a change automatically | §4, §5 | Explicit opening only |
 | 9 | Task forks live 24 h by default and are removed 1 h after their changes have landed | §4 | Longer defaults |
 | 10 | A fork owned by a read-only org member does not receive the parent workspace's secrets | §11 | No parent secrets for any fork |
-| 11 | Org members can fork and open changes against workspaces they can only read, and can land their own change when policy is satisfied (`land.by_author`) | §3, §7, §8 | Members may propose but never land |
+| 11 | Org members can fork and open changes against workspaces they can only read, and can land and revert their own change when policy is satisfied (`land.by_author`). They may also record verdicts and make claims | §3, §7, §8, §9 | Members may propose but never land |
 | 12 | Overlap is computed per file, and awareness never blocks | §9 | Optional exclusive claims |
 | 13 | Events are delivered by resumable stream and long-poll only | §14 | Outbound webhooks in the first release |
 | 14 | No compatibility with the earlier hub: API, CLI, configuration names and data files all change | §1 | A one-time import tool for existing deployments |
 | 15 | This document stays one file | — | Split into one file per section over a shared core |
+| 16 | A workspace-bound token can never override policy, whoever its user is | §8 | Any credential of the owner may override |
+| 17 | A token bound to a fork cannot record verdicts, report checks or revert on the parent | §3, §8 | Allow them for the fork's own changes |
+| 18 | Reporting a check needs write access to the target workspace | §8 | Read access, with a per-rule list of allowed reporters |
+| 19 | A fork never grants more than its parent: a member who leaves the organization loses the forks they created in it | §3, §4 | The creator keeps the fork until it expires |
+| 20 | An approval is discounted for any credential that created any version of the change, not only the approved one | §8 | Discount only the credential that created the approved version |
+| 21 | Secret and bound-token events of a workspace are visible only at `owner` or `admin` level | §3, §14 | Token events visible to every reader |
+| 22 | A sandbox lease issued with the admin token gets no injected git credential | §13 | Mint it as the fork's owner |
 
 ---
 
@@ -6540,6 +6575,7 @@ Generated from the route headings of §3–§14: 205 routes. Paths under `/api/v
 | GET | `/api/v1/events/log` | §14 |
 
 ---
+
 ## Appendix B: CLI command index
 
 Generated from the command headings of §3–§14: 163 commands. Flags, calls, output and exit codes are in the section named.
