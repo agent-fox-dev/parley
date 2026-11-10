@@ -5,9 +5,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
@@ -17,8 +20,57 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/cli"
+	"github.com/agent-fox-dev/parley/internal/config"
+	phub "github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/server"
 )
+
+var noEnv = config.MapEnv(nil)
+
+// configDir is a working directory whose config.toml makes the hub listen
+// on 127.0.0.1 at port.
+func configDir(t *testing.T, port int) string {
+	t.Helper()
+	dir := t.TempDir()
+	text := fmt.Sprintf("[server]\nbind = \"127.0.0.1\"\nport = %d\n", port)
+	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(text), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// withGrace sets the hub's request grace.
+func withGrace(d time.Duration) phub.Option {
+	return func(o *phub.Options) { o.RequestGrace = d }
+}
+
+// withMounts registers extra routes on the hub's server.
+func withMounts(mounts ...func(*server.Server)) phub.Option {
+	return func(o *phub.Options) {
+		o.Compose = func(c *phub.Composition) {
+			c.OnServer(func(_ *phub.Runtime, srv *server.Server) error {
+				for _, m := range mounts {
+					m(srv)
+				}
+				return nil
+			})
+		}
+	}
+}
+
+// listDir lists a directory's entries.
+func listDir(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	return names
+}
 
 // syncBuffer is a bytes.Buffer safe for the run goroutine to write while the
 // test reads it.
@@ -46,14 +98,15 @@ type runningHub struct {
 	cancel context.CancelFunc
 }
 
-// startHub calls run in a goroutine on 127.0.0.1:0 with no arguments and
-// waits for its listening line.
+// startHub calls run in a goroutine with no arguments, configured for
+// 127.0.0.1:0, and waits for its listening line.
 func startHub(t *testing.T, grace time.Duration, mounts ...func(*server.Server)) runningHub {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	stderr := &syncBuffer{}
 	code := make(chan int, 1)
-	go func() { code <- run(ctx, nil, "127.0.0.1:0", grace, io.Discard, stderr, mounts...) }()
+	dir := configDir(t, 0)
+	go func() { code <- run(ctx, nil, noEnv, dir, io.Discard, stderr, withGrace(grace), withMounts(mounts...)) }()
 
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -149,7 +202,8 @@ func TestRun_ExitsOneWithOneLineWhenTheAddressCannotBeBound(t *testing.T) {
 	addr := held.Addr().String()
 
 	var stdout, stderr bytes.Buffer
-	code := run(context.Background(), nil, addr, time.Second, &stdout, &stderr)
+	port := held.Addr().(*net.TCPAddr).Port
+	code := run(context.Background(), nil, noEnv, configDir(t, port), &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("run returned %d, want 1", code)
 	}
@@ -167,7 +221,7 @@ func TestRun_ExitsOneWithOneLineWhenTheAddressCannotBeBound(t *testing.T) {
 
 func TestRun_HelpPrintsUsageOnStdout(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := run(context.Background(), []string{"--help"}, "127.0.0.1:0", time.Second, &stdout, &stderr)
+	code := run(context.Background(), []string{"--help"}, noEnv, t.TempDir(), &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("run returned %d, want 0", code)
 	}
@@ -192,7 +246,7 @@ func TestRun_RejectsUnknownFlagsAndPositionalArguments(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
-			code := run(context.Background(), tt.args, "127.0.0.1:0", time.Second, &stdout, &stderr)
+			code := run(context.Background(), tt.args, noEnv, t.TempDir(), &stdout, &stderr)
 			if code != 2 {
 				t.Fatalf("run returned %d, want 2", code)
 			}
@@ -231,8 +285,8 @@ func TestRun_StopsOnSignalAndExitsZero(t *testing.T) {
 }
 
 func TestRun_ExitsZeroWhenTheGracePassesWithARequestInFlight(t *testing.T) {
-	if defaultShutdownGrace != 15*time.Second {
-		t.Errorf("default shutdown grace = %v, want 15 s", defaultShutdownGrace)
+	if phub.DefaultRequestGrace != 15*time.Second {
+		t.Errorf("default shutdown grace = %v, want 15 s", phub.DefaultRequestGrace)
 	}
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -310,5 +364,47 @@ func TestHub_StartReadVersionAndStop(t *testing.T) {
 	if c, err := net.Dial("tcp", hub.addr); err == nil {
 		c.Close()
 		t.Fatalf("a connection to %s was accepted after the hub stopped", hub.addr)
+	}
+}
+
+func TestRun_RefusesFlagsAndSubcommandsItDoesNotHave(t *testing.T) {
+	for _, args := range [][]string{{"--nope"}, {"-x"}, {"serve"}, {"--admin-email"}, {"backup"}, {"backup", "a", "b"}, {"backup", "a", "--nope"}} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			dir := t.TempDir()
+			var stdout, stderr bytes.Buffer
+			if code := run(context.Background(), args, noEnv, dir, &stdout, &stderr); code != 2 {
+				t.Fatalf("exit %d, want 2", code)
+			}
+			for _, want := range []string{"--admin-email", "--reset-admin-token", "backup <directory>"} {
+				if !strings.Contains(stderr.String(), want) {
+					t.Errorf("usage on stderr lacks %q", want)
+				}
+			}
+			if stdout.Len() != 0 {
+				t.Errorf("stdout = %q", stdout.String())
+			}
+			if names := listDir(t, dir); len(names) != 0 {
+				t.Errorf("created %v", names)
+			}
+		})
+	}
+}
+
+func TestRun_HelpNamesTheFlagsAndTheBackupCommand(t *testing.T) {
+	dir := t.TempDir()
+	var stdout, stderr bytes.Buffer
+	if code := run(context.Background(), []string{"--help"}, noEnv, dir, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit %d, want 0", code)
+	}
+	for _, want := range []string{"--admin-email", "--reset-admin-token", "backup <directory>"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("usage on stdout lacks %q", want)
+		}
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("stderr = %q", stderr.String())
+	}
+	if names := listDir(t, dir); len(names) != 0 {
+		t.Errorf("created %v", names)
 	}
 }
