@@ -142,9 +142,15 @@ func TestOpen_AFailingStepIsRolledBackAndStopsTheOpen(t *testing.T) {
 		return nil
 	}}
 	steps := []Step{
-		{Name: "ok1", Target: Main, Apply: func(ctx context.Context, tx *sql.Tx) error { ran = append(ran, "ok1"); return exec(`CREATE TABLE a (v)`)(ctx, tx) }},
+		{Name: "ok1", Target: Main, Apply: func(ctx context.Context, tx *sql.Tx) error {
+			ran = append(ran, "ok1")
+			return exec(`CREATE TABLE a (v)`)(ctx, tx)
+		}},
 		boom,
-		{Name: "ok3", Target: Main, Apply: func(ctx context.Context, tx *sql.Tx) error { ran = append(ran, "ok3"); return exec(`CREATE TABLE c (v)`)(ctx, tx) }},
+		{Name: "ok3", Target: Main, Apply: func(ctx context.Context, tx *sql.Tx) error {
+			ran = append(ran, "ok3")
+			return exec(`CREATE TABLE c (v)`)(ctx, tx)
+		}},
 	}
 	st, err := Open(ctx, opts, steps)
 	if st != nil || err == nil || !strings.Contains(err.Error(), "boom") {

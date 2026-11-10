@@ -180,6 +180,46 @@ func git(t *testing.T, dir string, args ...string) string {
 	return strings.TrimSpace(string(out))
 }
 
+// inProcessHub starts a hub on dir in a goroutine and returns its address
+// and a function that stops it and waits for it.
+func inProcessHub(t *testing.T, dir string, compose func(*hub.Composition), onRuntime func(*hub.Runtime)) (string, func()) {
+	t.Helper()
+	stderr := &lockedBuffer{}
+	ctx, cancel := context.WithCancel(context.Background())
+	exited := make(chan int, 1)
+	go func() {
+		exited <- hub.Run(ctx, hub.Options{Env: config.MapEnv(nil), WorkDir: dir, Stdout: &lockedBuffer{}, Stderr: stderr,
+			Compose: compose, OnRuntime: onRuntime})
+	}()
+	rec := listeningLine(t, stderr, exited)
+	stopped := false
+	stop := func() {
+		if !stopped {
+			stopped = true
+			cancel()
+			<-exited
+		}
+	}
+	t.Cleanup(stop)
+	return rec["addr"].(string), stop
+}
+
+// bareRepoWithTwoCommits creates a bare repository at path with two commits
+// on main, pushed from a clone.
+func bareRepoWithTwoCommits(t *testing.T, path string) {
+	t.Helper()
+	os.MkdirAll(path, 0o700)
+	git(t, path, "init", "--bare", "-b", "main")
+	work := t.TempDir()
+	git(t, work, "clone", path, "w")
+	for i := range 2 {
+		os.WriteFile(filepath.Join(work, "w", "f"), []byte(fmt.Sprint(i)), 0o600)
+		git(t, filepath.Join(work, "w"), "add", "f")
+		git(t, filepath.Join(work, "w"), "commit", "-m", "c")
+	}
+	git(t, filepath.Join(work, "w"), "push", "origin", "HEAD:main")
+}
+
 func TestLifecycle_BackupOfARunningHub(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte("[server]\nbind = \"127.0.0.1\"\nport = 0\n"), 0o600); err != nil {
@@ -192,16 +232,7 @@ func TestLifecycle_BackupOfARunningHub(t *testing.T) {
 		}})
 	}
 	var st atomic.Pointer[store.Store]
-	stderr := &lockedBuffer{}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	exited := make(chan int, 1)
-	go func() {
-		exited <- hub.Run(ctx, hub.Options{Env: config.MapEnv(nil), WorkDir: dir, Stdout: &lockedBuffer{}, Stderr: stderr, Compose: tableA,
-			OnRuntime: func(rt *hub.Runtime) { st.Store(rt.Store) }})
-	}()
-	rec := listeningLine(t, stderr, exited)
-	addr := rec["addr"].(string)
+	addr, stopHub := inProcessHub(t, dir, tableA, func(rt *hub.Runtime) { st.Store(rt.Store) })
 	tenRows := func(tx *sql.Tx) error {
 		for i := range 10 {
 			if _, err := tx.Exec(`INSERT INTO a VALUES (?)`, i); err != nil {
@@ -215,17 +246,7 @@ func TestLifecycle_BackupOfARunningHub(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	repo := filepath.Join(dir, "data", "workspaces", "r.git")
-	os.MkdirAll(repo, 0o700)
-	git(t, repo, "init", "--bare", "-b", "main")
-	work := t.TempDir()
-	git(t, work, "clone", repo, "w")
-	for i := range 2 {
-		os.WriteFile(filepath.Join(work, "w", "f"), []byte(fmt.Sprint(i)), 0o600)
-		git(t, filepath.Join(work, "w"), "add", "f")
-		git(t, filepath.Join(work, "w"), "commit", "-m", "c")
-	}
-	git(t, filepath.Join(work, "w"), "push", "origin", "HEAD:main")
+	bareRepoWithTwoCommits(t, filepath.Join(dir, "data", "workspaces", "r.git"))
 
 	stop := make(chan struct{})
 	writerErr := make(chan error, 1)
@@ -256,25 +277,17 @@ func TestLifecycle_BackupOfARunningHub(t *testing.T) {
 	if err := <-writerErr; err != nil {
 		t.Errorf("the writer failed: %v", err)
 	}
-	cancel()
-	<-exited
+	stopHub()
 
 	dir2 := t.TempDir()
 	conf2 := fmt.Sprintf("[server]\nbind = \"127.0.0.1\"\nport = 0\n[database]\npath = %q\n[workspace]\npath = %q\n",
 		filepath.Join(target, "parley.db"), filepath.Join(target, "workspaces"))
 	os.WriteFile(filepath.Join(dir2, "config.toml"), []byte(conf2), 0o600)
-	stderr2 := &lockedBuffer{}
-	ctx2, cancel2 := context.WithCancel(context.Background())
-	exited2 := make(chan int, 1)
-	go func() {
-		exited2 <- hub.Run(ctx2, hub.Options{Env: config.MapEnv(nil), WorkDir: dir2, Stdout: &lockedBuffer{}, Stderr: stderr2, Compose: tableA})
-	}()
-	rec2 := listeningLine(t, stderr2, exited2)
-	if c := statusOf(t, "http://"+rec2["addr"].(string)+"/readyz"); c != 200 {
+	addr2, stopHub2 := inProcessHub(t, dir2, tableA, nil)
+	if c := statusOf(t, "http://"+addr2+"/readyz"); c != 200 {
 		t.Errorf("/readyz of the hub on the snapshot = %d", c)
 	}
-	cancel2()
-	<-exited2
+	stopHub2()
 	db, err := sql.Open("sqlite", filepath.Join(target, "parley.db"))
 	if err != nil {
 		t.Fatal(err)
