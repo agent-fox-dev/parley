@@ -82,6 +82,40 @@ removes what it wrote. It opens no listener and changes nothing in the data.
 
 `parley` alone prints its help and exits 0.
 
+### parley login
+
+Signs in and saves the hub URL, the credential and the user's id to the
+client configuration file.
+
+| Flag | Default | |
+|---|---|---|
+| `--provider <name>` | `github` | the identity provider to sign in with |
+| `--expires <days>` | `90` | the new key's lifetime: 0, 30, 60 or 90 |
+| `--api-key <key \| ->` | | store this credential instead of signing in; `-` reads it from stdin |
+
+The hub URL is the first non-empty value of `--endpoint-url`,
+`PARLEY_ENDPOINT_URL` and the file key `endpoint_url`.
+
+- **Browser flow.** Lists the hub's providers, listens on `127.0.0.1`, opens
+  the provider's authorize URL with `redirect_uri` and a random `state` (or
+  prints it on stderr when no browser opens), waits up to 120 seconds for the
+  redirect, and exchanges the code with `POST /api/v1/auth/callback`.
+- **Key flow** (`--api-key`). Checks the credential with `GET /api/v1/user`
+  and saves it; no key is created or revoked.
+
+On success the user is printed on stdout (2-space indented JSON) and
+`Logged in as <username>` on stderr; the key is never printed.
+
+| Exit status | When |
+|---|---|
+| 0 | logged in |
+| 1 | the hub refused; its error envelope is printed on stderr as received |
+| 2 | a client-side failure: an envelope with `code` 0 and `error_type` `usage_error` (a bad flag or credential) or `client_error` (no hub URL, an unreachable hub, a state mismatch, a timeout, an unreadable or unwritable configuration file) |
+
+The configuration file is `$PARLEY_CONFIG_DIR/config.toml`, or
+`~/.parley/config.toml`; login creates the directory with mode 0700 and
+replaces the file atomically with mode 0600, keeping keys it does not know.
+
 ### parley version
 
 Prints the client's build and, when a hub URL is given, the hub's:

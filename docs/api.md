@@ -14,6 +14,68 @@ gives the rules every route follows.
 
 None of them needs a credential or is rate-limited.
 
+## Authentication
+
+Every route under `/api/v1` needs a credential, except `GET /auth/providers`
+and `POST /auth/callback`. Present it as `Authorization: Bearer <credential>`
+(the scheme in any letter case). The hub stores only the SHA-256 of each
+secret.
+
+| Type | Wire format | Identity |
+|---|---|---|
+| Admin token | `parley_admin_<64 lowercase hex>` | none (no user) |
+| API key | `parley_<key_id>_<secret>`, 8 and 32 characters of `[0-9A-Za-z]` | a user |
+| Personal access token | `parley_pat_<token_id>_<secret>`, 8 and 32 characters of `[a-z0-9]` | a user |
+
+The first failing check decides the answer:
+
+| Check | Answer |
+|---|---|
+| a Bearer credential of a known format | `401 unauthenticated`, `authentication required` |
+| the id exists and the secret matches | `401 unauthenticated`, `invalid credentials` |
+| not revoked | `401 unauthenticated`, `credential revoked` |
+| not expired | `401 unauthenticated`, `credential expired` |
+| the user is not blocked | `403 forbidden`, `user is blocked` |
+
+Revocation, expiry and blocking are reported only after the secret matched.
+A route that needs a user answers the admin token `403 forbidden`, `this route
+needs a user`.
+
+### GET /auth/providers
+
+Public. `200 {"items":[{"name","authorize_url"}],"next_cursor":null}`, ordered
+by name, with `Cache-Control: public, max-age=300`. `authorize_url` carries
+`client_id` and `scope` (`user:email` for `github`; `openid email profile` and
+`response_type=code` for `google`); the caller adds `redirect_uri` and
+`state`. Client secrets are never shown.
+
+### POST /auth/callback
+
+Public; `Idempotency-Key` is ignored. Body: `provider` (a configured one),
+`code` (not empty), `redirect_uri`, and optional `expires` (0, 30, 60 or 90
+days; 90 when absent). `redirect_uri` must be `http` on `localhost` or
+`127.0.0.1`, or share scheme, host and port with `[server].external_url`.
+
+The hub exchanges the code with the provider (15-second timeout), reads the
+user's id and verified e-mail, and in one transaction creates the user (with
+a personal org and membership) or refreshes an existing one, revokes the
+user's live API keys and issues a new one:
+
+```json
+{"user":{"id":"…","username":"alice","email":"a@x","full_name":"","role":"user","status":"active","provider":"github","provider_id":"123","created_at":"…","updated_at":"…"},
+ "api_key":{"key":"parley_<key_id>_<secret>","key_id":"<key_id>","expires_at":"…"}}
+```
+
+| Status | error_type | When |
+|---|---|---|
+| 400 | `invalid_request` | a missing or invalid field, an unknown provider, a `redirect_uri` that is not allowed |
+| 401 | `unauthenticated` | the provider rejected the code |
+| 403 | `forbidden` | the user is blocked |
+| 409 | `conflict` | the e-mail, username or org name is taken |
+| 502 | `upstream_error` | the provider failed, timed out, or gave no id or verified e-mail |
+
+A failed callback changes nothing.
+
 ## Every response
 
 Every response carries `X-Request-ID`, `X-Content-Type-Options: nosniff`,

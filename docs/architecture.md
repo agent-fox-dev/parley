@@ -16,7 +16,7 @@ of its REST API.
 | `internal/server/` | the HTTP server and the REST conventions: routes, the check pipeline, errors, bodies, lists, idempotency, rate limit, headers, access log |
 | `internal/server/timefmt/` | timestamps and durations (a leaf package) |
 | `internal/scrub/` | removes credentials from text (a leaf package) |
-| `internal/identity/` | admin settings and the admin token |
+| `internal/identity/` | the identity records (users, orgs, memberships, API keys, personal access tokens), the admin token, authentication of every request, the OAuth client and the login routes |
 | `internal/maintenance/` | the hourly maintenance loop and its task registry |
 | `internal/cli/` | the CLI's commands |
 | `internal/buildinfo/` | version, commit and build time set by the linker |
