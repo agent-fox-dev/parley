@@ -1,0 +1,902 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "38",
+  "spec_name": "carry_patch_rerere_and_maintenance",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "List remembered resolutions",
+      "rationale": "A developer cannot judge a remembered resolution, or find the wrong one, without seeing what the hub has recorded.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "a caller with read access sends GET /workspaces/:slug/rerere for a carry-patch workspace",
+          "action": "return every recorded entry, resolved or not, ordered by recorded_at descending, then by id ascending",
+          "contract": "HTTP 200 with body {items: [{id: string, path: string or null, resolved: boolean, recorded_at: RFC 3339 timestamp or null}], next_cursor: string or null}; no entry, ref or record is changed and no remote is contacted",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a carry-patch workspace 'demo' that is ready, created with the patch store and route guard of package 31",
+              "four entries written by the test through the remembered-resolution entry store of package 34, each with its conflict directory in the copy's rr-cache: A and B with the same recorded_at, A with a stored resolution and B without, C newer with a resolution, D oldest without"
+            ],
+            "pseudocode": "in internal/carrypatch/rerere_test.go: r = GET /api/v1/workspaces/demo/rerere; assert r.status == 200; assert ids(r.items) == [C, A, B, D] (C newest, A before B on the tie by id, D oldest); assert A.resolved == true and B.resolved == false and C.resolved == true; assert every item has exactly the members id, path, resolved, recorded_at; assert recorded_at of C is the stored time in whole seconds UTC; assert the entry records, the files under rr-cache and the refs of the copy are identical before and after; assert the test origin and upstream received no request"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "event_driven",
+          "condition": "a rebuild records a conflict in a file that no remembered resolution settles, and a later rebuild sees the same conflict resolved",
+          "action": "list the entry with the file as path and resolved false after the first rebuild, and the same id with resolved true and a recorded_at not earlier than before after the later rebuild",
+          "contract": "after the first rebuild the list has one item {path: the conflicted file, resolved: false}; after the later rebuild the item with that id has resolved true",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a carry-patch workspace 'demo' that is ready, created with the patch store and route guard of package 31",
+              "a test upstream and one patch whose branch changes the same lines of src/net/dial.go as a new upstream commit",
+              "the real rebuild executor and job queue, a replaceable clock"
+            ],
+            "pseudocode": "in internal/carrypatch/rerere_test.go: run the rebuild of package 34 with fail_mode fail_fast; l1 = GET rerere; assert len(l1.items) == 1 and l1.items[0].path == 'src/net/dial.go' and l1.items[0].resolved == false; fix the conflict on the patch branch the way package 34's own test of learning a resolution does, and run a second rebuild, which applies the patch; l2 = GET rerere; e = item of l2 with l1.items[0].id; assert e.resolved == true and e.path == 'src/net/dial.go' and e.recorded_at >= l1.items[0].recorded_at"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "event_driven",
+          "condition": "the list is read with a limit smaller than the number of entries and then with each returned next_cursor",
+          "action": "return the entries page by page in the order of the list, each entry exactly once",
+          "contract": "the pages concatenated equal the unpaged list; the last page has next_cursor null",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a carry-patch workspace 'demo' that is ready, created with the patch store and route guard of package 31",
+              "five entries in the entry store of package 34, three of them with the same recorded_at"
+            ],
+            "pseudocode": "in internal/carrypatch/rerere_test.go: p1 = GET rerere?limit=2; assert len(p1.items) == 2 and p1.next_cursor != null; follow next_cursor until null; assert the concatenated ids equal ids(GET rerere?limit=200) and contain no duplicate; assert the last page has next_cursor == null"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "state_driven",
+          "condition": "the workspace has no recorded entry, which includes every workspace that has no copy on disk yet",
+          "action": "answer the list with no items",
+          "contract": "HTTP 200 with body {items: [], next_cursor: null}",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/carrypatch/rerere_test.go, table over carry-patch workspaces in {status pending without a copy, status failed without a copy, ready with a copy and no entry}: r = GET rerere; assert r.status == 200 and r.items == [] (an array, not null) and r.next_cursor == null"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Forget a remembered resolution",
+      "rationale": "A wrong resolution that is replayed silently corrupts every later rebuild; the developer must be able to take it back.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "a caller with write access sends DELETE /workspaces/:slug/rerere/*pathspec and the percent-decoded pathspec equals the id of an entry",
+          "action": "remove that entry, its stored record and git's record of the conflict and its resolution, and no other entry",
+          "contract": "HTTP 204 with an empty body; the list no longer holds that id and still holds every other entry, also an entry whose path equals the pathspec",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a carry-patch workspace 'demo' that is ready, created with the patch store and route guard of package 31",
+              "entries X, Y, Z in the entry store of package 34 with their rr-cache directories; the path of Z is the text of X's id"
+            ],
+            "pseudocode": "in internal/carrypatch/rerere_test.go: r = DELETE /api/v1/workspaces/demo/rerere/<id of X>; assert r.status == 204 and r.body is empty; ids = ids(GET rerere); assert X not in ids and Y, Z in ids; assert the rr-cache directory and the stored record of X are gone and those of Y and Z are unchanged"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "event_driven",
+          "condition": "the percent-decoded pathspec, which may contain slashes, equals the id of no entry and equals the path of one or more entries",
+          "action": "remove every entry whose path equals the pathspec, comparing byte for byte",
+          "contract": "HTTP 204 with an empty body; no listed entry has that path afterwards; entries with other paths remain",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a carry-patch workspace 'demo' that is ready, created with the patch store and route guard of package 31",
+              "two entries with path 'src/net/dial.go', one with 'src/net/listen.go', one with 'docs/read me.md'"
+            ],
+            "pseudocode": "in internal/carrypatch/rerere_test.go, table over {('src/net/dial.go', removes 2 entries), ('docs/read%20me.md' sent percent-encoded, removes the entry with path 'docs/read me.md')}: r = DELETE rerere/<pathspec>; assert r.status == 204; assert no listed entry has the path; assert the entry with path 'src/net/listen.go' is still listed"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "unwanted",
+          "condition": "the pathspec equals neither the id nor the path of any entry",
+          "action": "refuse the request and remove nothing",
+          "contract": "HTTP 404 with error_type not_found and message 'resolution not found'; the stored records, the rr-cache and every other file of the copy are unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a carry-patch workspace 'demo' that is ready, created with the patch store and route guard of package 31",
+              "entry X with path 'src/net/dial.go'"
+            ],
+            "pseudocode": "in internal/carrypatch/rerere_test.go, table over pathspecs {an unknown 40-hex id, 'src/other.go', 'src/net' (a prefix of a path), 'SRC/NET/DIAL.GO', '../rr-cache/<id of X>', '..', 'refs/heads/main'} and over a workspace with no entry at all: r = DELETE rerere/<pathspec>; assert r.status == 404 and r.error.error_type == 'not_found' and r.error.message == 'resolution not found'; assert the file tree of the repository directory is unchanged"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "unwanted",
+          "condition": "the pathspec is empty or starts with '-'",
+          "action": "refuse the request before any entry is read and remove nothing",
+          "contract": "HTTP 400 with error_type invalid_request; the entries are unchanged and no git process was started",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a carry-patch workspace 'demo' that is ready, created with the patch store and route guard of package 31",
+              "one entry",
+              "a git runner that records its calls"
+            ],
+            "pseudocode": "in internal/carrypatch/rerere_test.go, table over {DELETE rerere/ (empty), DELETE rerere/-rf, DELETE rerere/--all, DELETE rerere/%2Dx}: assert status 400 and error.error_type == 'invalid_request'; assert the entries are unchanged; assert the recording git runner saw no call"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "ubiquitous",
+          "action": "for any forget, leave every rebuild job record, every patch and every ref as it was, queue no rebuild and write no event",
+          "contract": "after a forget the job records, the patch records, the output of git for-each-ref and the number of events are the same as before",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a carry-patch workspace 'demo' that is ready, created with the patch store and route guard of package 31",
+              "two patches, one completed rebuild job and one queued rebuild job that no worker claims in this test",
+              "two entries"
+            ],
+            "pseudocode": "in internal/carrypatch/rerere_test.go, table over {forget by id, forget by path, forget answered 404}: snapshot the jobs table, the patches table, for-each-ref and the event count; DELETE rerere/<pathspec>; assert the four snapshots are unchanged, including the queued job's status and updated_at"
+          }
+        },
+        {
+          "id": "REQ-2.6",
+          "pattern": "event_driven",
+          "condition": "a rebuild starts after a resolved entry was forgotten and meets the conflict that entry resolved",
+          "action": "find no resolution to replay, so that the patch conflicts",
+          "contract": "the rebuild's patch result for that patch has status conflict with the file in conflict_files, and the list shows an entry for the conflict with resolved false",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a carry-patch workspace 'demo' that is ready, created with the patch store and route guard of package 31",
+              "the state at the end of the check of the rebuild-recorded entry: one patch whose conflict with upstream in src/net/dial.go has a resolved entry, and the patch branch reset to the tip that conflicts"
+            ],
+            "pseudocode": "in internal/carrypatch/rerere_test.go: first assert a rebuild with fail_mode continue applies the patch (the resolution is replayed); DELETE rerere/src/net/dial.go; assert 204; run a second rebuild with fail_mode continue; assert its patch_results[0].status == 'conflict' and 'src/net/dial.go' in patch_results[0].conflict_files; l = GET rerere; assert one item with path 'src/net/dial.go' and resolved false"
+          }
+        },
+        {
+          "id": "REQ-2.7",
+          "pattern": "event_driven",
+          "condition": "two forget requests for the same entry are handled at the same time",
+          "action": "remove the entry once and answer both requests without a hub failure",
+          "contract": "one request answers HTTP 204; the other answers HTTP 204 or HTTP 404 with error_type not_found; neither answers 500; the entry is gone",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a carry-patch workspace 'demo' that is ready, created with the patch store and route guard of package 31"
+            ],
+            "pseudocode": "in internal/carrypatch/rerere_test.go, repeated 50 times with a fresh entry: send two DELETE rerere/<id> concurrently; assert the set of statuses is {204, 204} or {204, 404}; assert the entry is not listed"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Summarise a carry-patch workspace in one call",
+      "rationale": "A reader who wants the state at a glance should not have to join four routes, and must get the answer even when the remotes are down.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "a caller with read access sends GET /workspaces/:slug/patch-status for a carry-patch workspace",
+          "action": "return one document with the workspace's stored fields, the current head of the integration branch, the two rebuild summaries, the patches and the summary counts",
+          "contract": "HTTP 200 with body {workspace_slug, workspace_mode: 'carry_patch', status, git_url, upstream_url, integration_branch, clone_error, sync_error, upstream_head_sha, last_sync_at, integration_head_sha, last_rebuild, last_completed_rebuild, patches: [], summary: {}}, every member present, null where unset; integration_head_sha is the full 40-character id of refs/heads/<integration_branch> in the copy",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a carry-patch workspace 'demo' that is ready, created with the patch store and route guard of package 31",
+              "the workspace record has upstream_head_sha and last_sync_at set, sync_error 'upstream fetch failed' and clone_error null",
+              "one completed rebuild that published the integration branch deploy"
+            ],
+            "pseudocode": "in internal/carrypatch/patchstatus_test.go: r = GET /api/v1/workspaces/demo/patch-status; assert r.status == 200; assert the set of top-level members equals the fifteen named in the contract; assert workspace_slug == 'demo', workspace_mode == 'carry_patch', status == 'ready', integration_branch == 'deploy'; assert git_url, upstream_url, upstream_head_sha, last_sync_at, clone_error (null), sync_error ('upstream fetch failed') equal the stored values; assert integration_head_sha == rev-parse refs/heads/deploy and has 40 characters"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "state_driven",
+          "condition": "the integration branch does not exist in the copy or the workspace has no copy",
+          "action": "report integration_head_sha as null",
+          "contract": "HTTP 200; integration_head_sha is null; the status member equals the stored status",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/carrypatch/patchstatus_test.go, table over {ready with refs/heads/deploy deleted from the copy, status pending without a copy, status failed without a copy}: r = GET patch-status; assert r.status == 200 and r.integration_head_sha == null; assert the status member equals the stored status"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "ubiquitous",
+          "action": "report as last_rebuild the newest rebuild job of the workspace in any status and as last_completed_rebuild the newest job with status completed, each as {id, status, created_at, completed_at}, or null when there is none",
+          "contract": "last_rebuild and last_completed_rebuild are objects with exactly the members id, status, created_at, completed_at, or null",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "jobs inserted through the queue of package 33 with created_at set by a replaceable clock"
+            ],
+            "pseudocode": "in internal/carrypatch/patchstatus_test.go, table over job histories {none -> (null, null); [completed J1] -> (J1, J1); [completed J1, then dead_letter J2] -> (J2, J1); [cancelled J1, then queued J2] -> (J2, null); [completed J1, completed J2, failed J3] -> (J3, J2)}: r = GET patch-status; assert r.last_rebuild and r.last_completed_rebuild name the expected job ids; assert the members of each object are exactly id, status, created_at, completed_at; assert completed_at is null for the queued and the failed job; assert a job of another workspace is never reported"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "ubiquitous",
+          "action": "list in patches every non-deleted patch in position order with id, branch_name, position, status, conflict_files, last_rebuild_result, origin_sync_state, origin_sha and origin_synced_at, where last_rebuild_result is the status of that patch in the newest rebuild job that has a result for it, or null",
+          "contract": "patches has one object per non-deleted patch, in position order, each with exactly those nine members; deleted patches are absent; the list is not paged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a carry-patch workspace 'demo' that is ready, created with the patch store and route guard of package 31",
+              "patches p1 active with origin_sync_state in_sync, p2 conflict with conflict_files ['a.go'], p3 disabled, p4 active added after every job, and one deleted patch",
+              "job J1 (older, completed) with results p1 success, p2 success, p3 skipped; job J2 (newer, dead_letter) with results p1 success, p2 conflict"
+            ],
+            "pseudocode": "in internal/carrypatch/patchstatus_test.go: r = GET patch-status; assert [p.branch_name for p in r.patches] == ['p1', 'p2', 'p3', 'p4'] and positions == [1, 2, 3, 4]; assert the members of each object are exactly the nine named; assert last_rebuild_result of p1 == 'success' (newest job J2), of p2 == 'conflict' (J2) with conflict_files == ['a.go'], of p3 == 'skipped' (only J1 has a result for it), of p4 == null; assert origin_sync_state, origin_sha, origin_synced_at of p1 equal the stored values and are null for p2; assert the deleted patch is absent; with 250 non-deleted patches assert len(r.patches) == 250"
+          }
+        },
+        {
+          "id": "REQ-3.5",
+          "pattern": "ubiquitous",
+          "action": "report in summary the counts total_patches, active, conflict, disabled, merged_upstream, rerere_resolutions, patches_diverged and patches_missing_on_origin, each always present",
+          "contract": "summary has exactly those eight integer members; total_patches is the number of non-deleted patches; the four status counts add up to total_patches; rerere_resolutions is the number of entries the list route returns; a count with nothing to count is 0",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/carrypatch/patchstatus_test.go, table over {no patch and no entry -> all eight are 0; 2 active + 1 conflict + 1 disabled + 1 merged_upstream + 2 deleted, of which 1 diverged and 2 missing_on_origin, with 3 entries (2 resolved, 1 not) -> total_patches 5, active 2, conflict 1, disabled 1, merged_upstream 1, rerere_resolutions 3, patches_diverged 1, patches_missing_on_origin 2}: r = GET patch-status; assert r.summary equals the expected object and has exactly eight members"
+          }
+        },
+        {
+          "id": "REQ-3.6",
+          "pattern": "ubiquitous",
+          "action": "for any patch-status request, read the hub's records and the workspace's copy only: contact neither origin nor upstream and change no record, ref or entry",
+          "contract": "HTTP 200 while origin and upstream are unreachable; the remotes receive no request; the store, the refs and the rr-cache are unchanged; upstream_head_sha is the stored value, not upstream's present head",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a carry-patch workspace 'demo' that is ready, created with the patch store and route guard of package 31",
+              "test origin and test upstream of internal/gitrepo/gitrepotest with request counters"
+            ],
+            "pseudocode": "in internal/carrypatch/patchstatus_test.go: advance the test upstream by one commit, then stop the test origin and the test upstream; snapshot store rows, for-each-ref and rr-cache; r = GET patch-status; assert r.status == 200; assert r.upstream_head_sha == the stored value; assert both remotes' request counters are unchanged; assert the three snapshots are unchanged"
+          }
+        },
+        {
+          "id": "REQ-3.7",
+          "pattern": "state_driven",
+          "condition": "the workspace is in any status, including pending, cloning, failed, archived and during a running reclone, archive or delete",
+          "action": "answer the patch-status request",
+          "contract": "HTTP 200 with the status member equal to the stored status",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/carrypatch/patchstatus_test.go, table over carry-patch workspaces with status {pending, cloning, ready, failed, archived} and ready with the maintenance marker set: r = GET patch-status; assert r.status == 200 and r.json.status equals the stored status"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Refuse callers and workspaces the three routes do not serve",
+      "rationale": "The routes must leak nothing to a caller without access and must not pretend that a standard workspace or a fork has carry-patch state.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "unwanted",
+          "condition": "a personal access token without workspaces:read calls GET /workspaces/:slug/rerere or GET /workspaces/:slug/patch-status, or one without workspaces:write calls DELETE /workspaces/:slug/rerere/*pathspec",
+          "action": "refuse the request, whether or not the workspace exists",
+          "contract": "HTTP 403 with error_type insufficient_scope; nothing is read from the copy and no entry is removed",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a carry-patch workspace 'demo' that is ready, created with the patch store and route guard of package 31",
+              "one entry",
+              "tokens minted through package 06"
+            ],
+            "pseudocode": "in internal/carrypatch/routes_access_test.go, table over {(GET rerere, token with patches:read only), (GET patch-status, token with rebuilds:read only), (DELETE rerere/<id>, token with workspaces:read only)} x {slug 'demo', slug 'nosuch'}: assert status 403 and error.error_type == 'insufficient_scope'; assert the entry of 'demo' is still listed for an owner"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "unwanted",
+          "condition": "the caller has no access to the workspace on any of the three routes, or has read access only on the DELETE",
+          "action": "refuse the request",
+          "contract": "HTTP 404 with error_type not_found for a caller without access, the same answer as for a slug that names no workspace; HTTP 403 with error_type forbidden for a caller with read access only on the DELETE; no entry is removed",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a carry-patch workspace 'demo' that is ready, created with the patch store and route guard of package 31",
+              "one entry",
+              "an owner, an org member whose access level is read, and a user outside the org, through the access component of package 07"
+            ],
+            "pseudocode": "in internal/carrypatch/routes_access_test.go, table: a user outside the workspace's org on {GET rerere, GET patch-status, DELETE rerere/<id>} -> 404 not_found with a body equal to the one for slug 'nosuch'; an org member with read access on {GET rerere, GET patch-status} -> 200; the same member on DELETE rerere/<id> -> 403 forbidden; assert the entry is still listed"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "unwanted",
+          "condition": "the workspace is a standard workspace or a task fork, also the fork of a carry-patch workspace, on any of the three routes",
+          "action": "refuse the request",
+          "contract": "HTTP 400 with error_type workspace_mode_mismatch",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/carrypatch/routes_access_test.go, table over workspaces {standard 'plain', task fork of 'plain', task fork of the carry-patch 'demo'} x {GET rerere, GET patch-status, DELETE rerere/abc}: assert status 400 and error.error_type == 'workspace_mode_mismatch'"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "unwanted",
+          "condition": "the DELETE is sent with a valid pathspec while the carry-patch workspace's status does not allow a write",
+          "action": "refuse the request and remove nothing",
+          "contract": "HTTP 409 with error_type workspace_busy for status pending or cloning or while a reclone, archive or delete runs; workspace_not_ready for status failed; workspace_archived for status archived; the entries are unchanged",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/carrypatch/routes_access_test.go, table over the owner's DELETE rerere/<id> on a carry-patch workspace in {pending -> workspace_busy, cloning -> workspace_busy, ready with the maintenance marker set -> workspace_busy, failed -> workspace_not_ready, archived -> workspace_archived}: assert status 409 and the error_type of the row; assert the entry directory still exists where the workspace has a copy"
+          }
+        },
+        {
+          "id": "REQ-4.5",
+          "pattern": "ubiquitous",
+          "action": "check the DELETE in the order request validation, then workspace mode, then workspace status",
+          "contract": "a pathspec that starts with '-' on a standard workspace answers HTTP 400 invalid_request; a valid pathspec on an archived task fork answers HTTP 400 workspace_mode_mismatch; a pathspec that starts with '-' on an archived carry-patch workspace answers HTTP 400 invalid_request",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/carrypatch/routes_access_test.go, the three rows of the contract as a table sent by the owner: assert the status and error_type of each row"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Reach the three routes from the command line",
+      "rationale": "Developers and scripts work through parley; the routes need commands that behave like every other command.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "a user runs `parley rerere list <workspace-slug>`",
+          "action": "send GET /api/v1/workspaces/<slug>/rerere with the slug as one percent-encoded path segment and print the hub's response",
+          "contract": "the response body as JSON on stdout, nothing on stderr, exit status 0",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/rerere_test.go against an httptest hub that records requests: code, out, errOut = run('rerere', 'list', 'demo'); assert the hub saw GET /api/v1/workspaces/demo/rerere with the bearer credential; assert json(out) == the hub's body; assert errOut == '' and code == 0"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "event_driven",
+          "condition": "a user runs `parley rerere forget <workspace-slug> <id-or-path>` and the hub answers 204",
+          "action": "send DELETE /api/v1/workspaces/<slug>/rerere/<id-or-path> with each part of the argument between slashes percent-encoded on its own and the slashes kept, and print a confirmation that carries the argument as given",
+          "contract": "stdout is the JSON document {\"status\":\"forgotten\",\"pathspec\":\"<arg>\"}; exit status 0",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest hub that answers 204 and records the raw request path"
+            ],
+            "pseudocode": "in internal/cli/rerere_test.go, table over arguments {'3f2a…40 hex' -> path ends /rerere/3f2a…, 'src/net/dial.go' -> /rerere/src/net/dial.go, 'docs/read me.md' -> raw path /rerere/docs/read%20me.md, 'a/b?c#d' -> raw path /rerere/a/b%3Fc%23d}: code, out, _ = run('rerere', 'forget', 'demo', arg); assert the recorded request method is DELETE and its raw path is the expected one; assert json(out) == {status: 'forgotten', pathspec: arg}; assert code == 0"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "event_driven",
+          "condition": "a user runs `parley workspace patch-status <workspace-slug>`",
+          "action": "send GET /api/v1/workspaces/<slug>/patch-status and print the hub's response",
+          "contract": "the response body as JSON on stdout, exit status 0",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/patchstatus_test.go against an httptest hub: code, out, _ = run('workspace', 'patch-status', 'demo'); assert the hub saw GET /api/v1/workspaces/demo/patch-status; assert json(out) == the hub's body and code == 0; assert `parley workspace --help` lists patch-status"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "unwanted",
+          "condition": "the hub answers one of the three commands with an error",
+          "action": "print the hub's error envelope as received and print no confirmation",
+          "contract": "the envelope with its error_type on stderr, nothing on stdout, exit status 1",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/rerere_test.go, table over {(rerere forget demo nosuch, hub answers 404 not_found 'resolution not found'), (rerere list plain, 400 workspace_mode_mismatch), (workspace patch-status demo, 403 insufficient_scope), (rerere forget demo -- -x, 400 invalid_request)}: assert out == ''; assert json(errOut).error.error_type equals the hub's and json(errOut).error.code equals the status; assert code == 1"
+          }
+        },
+        {
+          "id": "REQ-5.5",
+          "pattern": "unwanted",
+          "condition": "one of the three commands is run with a wrong number of arguments",
+          "action": "refuse the command without sending a request",
+          "contract": "a usage_error envelope with code 0 on stderr, nothing on stdout, exit status 2; the hub receives no request",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/rerere_test.go, table over {['rerere', 'list'], ['rerere', 'list', 'a', 'b'], ['rerere', 'forget', 'demo'], ['rerere', 'forget', 'demo', 'a', 'b'], ['workspace', 'patch-status'], ['workspace', 'patch-status', 'a', 'b']}: assert code == 2 and json(errOut).error.error_type == 'usage_error' and out == ''; assert the httptest hub recorded no request"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Keep remote git operations to safe transports and a time limit",
+      "rationale": "A remote must not be able to make the hub read local files or run a helper, and a remote that hangs must not hold a worker or a request for ever.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "unwanted",
+          "condition": "a git operation would contact upstream or origin by a transport other than https or ssh, directly or because the remote redirects to one",
+          "action": "refuse the operation before any connection by that transport is made and move no ref",
+          "contract": "the operation returns an error that names the refused transport; no ref of the copy changed; a local repository named by a file URL or a path was not read, and no remote helper process was started",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a bare copy in t.TempDir()",
+              "the TLS test origin of internal/gitrepo/gitrepotest"
+            ],
+            "pseudocode": "in internal/gitrepo/safety_test.go, table over remote URLs {'http://127.0.0.1:<port>/r.git' (a listening plain-HTTP test server), 'git://127.0.0.1/r.git', 'file://<tmp>/src.git', '<tmp>/src.git', 'ext::sh -c \"touch <tmp>/pwned\"', an https test origin that answers 302 to an http URL} for the operations fetch, single-branch fetch and push: err = op(copy, url); assert err != nil and for the first five rows errors.Is(err, ErrTransportRefused) and the message names the scheme; assert for-each-ref of the copy is unchanged; assert <tmp>/pwned does not exist; assert the plain-HTTP server received no request; then assert a fetch from an https test origin and a fetch whose URL has the form 'git@host:path' pass the transport check (the second fails later, at the connection)"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "unwanted",
+          "condition": "a single git operation of a rebuild runs longer than 10 minutes",
+          "action": "stop the git process and the processes it started, end the attempt as a retryable failure and publish nothing",
+          "contract": "the job has status failed with retry_count one higher and next_attempt_at set, or dead_letter when no retry was left; one parley.rebuild.fail event with will_retry matching; the integration branch is unchanged; no patch result of the attempt is recorded as skipped, conflict or success because of the timeout; no git process of the attempt is alive",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a carry-patch workspace 'demo' that is ready, created with the patch store and route guard of package 31",
+              "one active patch",
+              "the git time limit set to 300 ms through the test option of the runner",
+              "a test upstream that accepts the fetch request and never answers"
+            ],
+            "pseudocode": "in internal/carrypatch/gitlimit_test.go: enqueue a rebuild and let a worker run it; wait for the job to leave running; assert job.status == 'failed' and job.retry_count == 1 and job.next_attempt_at != null and job.error mentions the time limit; assert the event parley.rebuild.fail has will_retry true; assert rev-parse of the integration branch equals the value before; assert no patch became conflict; assert the test upstream's hanging connection was closed by the client within 2 seconds of the limit; repeat with retry_count preset to 20 and assert status dead_letter and will_retry false"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "unwanted",
+          "condition": "a single git operation of a carry-patch request runs longer than 10 minutes",
+          "action": "stop the git process and the processes it started and fail the request without moving a ref through that operation",
+          "contract": "HTTP 500 with error_type internal and a message without credentials; the refs of the copy are unchanged; no git process of the request is alive",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a carry-patch workspace 'demo' that is ready, created with the patch store and route guard of package 31",
+              "the git time limit set to 300 ms",
+              "a test upstream that never answers"
+            ],
+            "pseudocode": "in internal/carrypatch/gitlimit_test.go: mount a test route that runs one remote fetch through the carry-patch git runner and the carry-patch error mapper, as the sync and preview handlers do; r = call it; assert r.status == 500 and r.error.error_type == 'internal'; assert the answer arrived between 300 ms and 3 s; assert for-each-ref is unchanged; assert the hanging connection was closed by the client"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "ubiquitous",
+          "action": "for any rebuild, apply the limit to each git operation on its own and not to the sum of the rebuild's operations",
+          "contract": "a rebuild whose git operations each end before the limit completes, also when together they take longer than the limit",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a carry-patch workspace 'demo' that is ready, created with the patch store and route guard of package 31",
+              "three active patches",
+              "the git time limit set to 500 ms",
+              "a git runner wrapper that delays every operation by 100 ms, so that the rebuild's operations sum to more than 500 ms"
+            ],
+            "pseudocode": "in internal/carrypatch/gitlimit_test.go: run a rebuild; assert job.status == 'completed' and the job ran for more than 500 ms in total; assert patches_applied == 3"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "Keep credentials out of text and caller values out of git options",
+      "rationale": "A leaked upstream token or an injected git option turns a rebuild service into a way into the team's repositories.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "ubiquitous",
+          "action": "for any failure of a git operation of carry-patch work, keep every credential value the hub resolved for that operation out of the API error message, the job error, the event metadata and the log lines it produces",
+          "contract": "the credential's value occurs in none of: the response body, the job record's error, any event written during the operation, any log line written during the operation",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a carry-patch workspace 'demo' that is ready, created with the patch store and route guard of package 31",
+              "the workspace secret UPSTREAM_GIT_PAT set to 's3cr3t-Upstream-Token-91'",
+              "a test upstream that answers 401 with a body that echoes the Authorization header it received, decoded",
+              "the hub's logger writing to a buffer"
+            ],
+            "pseudocode": "in internal/carrypatch/gitsafety_test.go: run a rebuild and wait for the attempt to fail; s = 's3cr3t-Upstream-Token-91'; assert s not in job.error; assert s not in the JSON of any event written since the test began; assert s not in the captured log output; assert job.error is not empty and names the fetch failure; then call the test route of the time-limit check against the same upstream and assert s not in the response body"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "ubiquitous",
+          "action": "for any text taken from git that carry-patch work puts into an API error message, a job error or event metadata, replace the user information of every URL in it by `***@`",
+          "contract": "'https://user:secret@host/x' reads 'https://***@host/x' and 'https://token@host/x' reads 'https://***@host/x'; text without URL user information is unchanged",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/gitrepo/safety_test.go, table for SanitizeGitText(text, credentials): {'fatal: unable to access https://alice:hunter2@example.com/r.git/' -> '…https://***@example.com/r.git/'; 'https://tok123@h/x and ssh://bob@h2/y' -> 'https://***@h/x and ssh://***@h2/y'; 'https://example.com/r.git' -> unchanged; 'git@example.com:team/r.git' -> unchanged (not a URL); 'mail bob@example.com' -> unchanged; '' -> ''; text containing the credential 'hunter2' outside a URL -> the value is absent from the result}; assert the function applied twice gives the same result as once"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "unwanted",
+          "condition": "a branch name, commit id or path value supplied by a caller begins with '-' when it reaches a git operation",
+          "action": "refuse the operation without starting a git process",
+          "contract": "the operation returns an invalid-argument error; no git process was started; a file an injected option would have written does not exist",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a bare repository in t.TempDir()",
+              "a process starter that records every git start"
+            ],
+            "pseudocode": "in internal/gitrepo/safety_test.go, table over hostile values {'--upload-pack=touch <tmp>/pwned', '-c', '--output=<tmp>/pwned', '--exec=touch <tmp>/pwned', '-'} passed as the branch, as the revision and as the path argument of every exported operation of internal/gitrepo that carry-patch code calls with a caller-supplied value (resolve a revision, read a ref, create a branch at a commit, single-branch fetch, delete a ref): assert errors.Is(err, ErrInvalidArgument); assert the recording process starter saw no git start; assert <tmp>/pwned does not exist; then with the real git and the branch name 'feature/x' assert the same operations succeed"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "Discard what an interrupted rebuild left behind",
+      "rationale": "A deploy or a crash of the hub must not leave half-built state in a repository; returning the job to the queue and the shutdown grace are the job queue's.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "parleyd starts and a rebuild interrupted by the stop left scratch working trees or worktree registrations behind",
+          "action": "discard them in every workspace and change no ref a client can read",
+          "contract": "after the start the rebuild work area of each workspace is empty, git worktree list shows the bare repository only, and refs/heads/*, refs/remotes/* and refs/parley/replaced/* are as before the start",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a carry-patch workspace 'demo' that is ready, created with the patch store and route guard of package 31",
+              "two active patches",
+              "a rebuild of package 34 started through the real executor and abandoned in the middle of the second patch by a test hook that returns without the executor's own clean-up, as a killed process would"
+            ],
+            "pseudocode": "in internal/carrypatch/recovery_test.go: snapshot for-each-ref of refs/heads, refs/remotes and refs/parley/replaced; run the start hook; assert the executor's work area for the workspace holds no entry; assert `git worktree list` has one line; assert the snapshot is unchanged; assert a rebuild enqueued afterwards completes"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "unwanted",
+          "condition": "at start a leftover cannot be removed, or a carry-patch workspace has no copy on disk",
+          "action": "log the failure with the workspace's slug, go on with the other workspaces and complete the start",
+          "contract": "the start hook returns no error and parleyd listens; the leftovers of the other workspace are gone; one log line names the affected slug; the queue of package 33 still returns the affected workspace's running job to queued",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "workspaces 'a' and 'b', each with a running job and leftovers of an abandoned rebuild"
+            ],
+            "pseudocode": "in internal/carrypatch/recovery_test.go, table over {the work area of workspace 'a' made unremovable by the test's file-remove function, the copy of workspace 'a' deleted from disk}: err = run the start hook; assert err == nil; assert the work area of workspace 'b' is empty; assert the log buffer has a line with slug 'a'; assert a hub started on this data answers GET /readyz with 200 and that the job of 'a', recovered by the queue of package 33, has status queued"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-9",
+      "title": "Purge patches deleted for more than 7 days",
+      "rationale": "A soft delete is a grace period, not a store that grows for ever.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-9.1",
+          "pattern": "event_driven",
+          "condition": "the maintenance pass runs the task patch_purge",
+          "action": "remove every patch whose status is deleted and whose deleted_at is more than 7 days before the pass, in every workspace, and keep every other patch",
+          "contract": "a patch deleted 7 days and 1 second ago no longer exists: GET /workspaces/:slug/patches/:id answers 404 and the list with include_deleted=true does not show it; a patch deleted exactly 7 days ago, a patch deleted yesterday and every non-deleted patch remain with their positions",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a fake clock",
+              "two carry-patch workspaces, one of them archived, with the patches of the table spread over both"
+            ],
+            "pseudocode": "in internal/carrypatch/purge_test.go: err = run the registered task 'patch_purge'; assert err == nil; table over patches {deleted 7d+1s ago -> gone, deleted 30d ago -> gone, deleted exactly 7d ago -> kept, deleted 1d ago -> kept, active added 60d ago -> kept, disabled -> kept, merged_upstream -> kept}: assert the store row exists or not as the row says; assert the non-deleted patches still hold positions 1..3; assert through the patch routes of package 31 that a purged id answers 404 and is absent from the list with include_deleted=true; assert a second run removes nothing more; assert the event count is unchanged"
+          }
+        },
+        {
+          "id": "REQ-9.2",
+          "pattern": "event_driven",
+          "condition": "patch_purge removes a patch",
+          "action": "delete refs/parley/replaced/<branch> of that patch's branch, unless a non-deleted patch of the same workspace uses the same branch, and keep the patch branch",
+          "contract": "the backup ref is absent after the purge when no non-deleted patch uses the branch and present with its old value when one does; refs/heads/<branch> is unchanged in both cases; backup refs of other branches are unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a carry-patch workspace 'demo' that is ready, created with the patch store and route guard of package 31",
+              "a patch on branch p-old deleted 8 days ago with a backup ref",
+              "a patch on branch p-reused deleted 8 days ago with a backup ref, and an active patch registered later on the same branch (rows written directly to the store)",
+              "an active patch on branch p-live with a backup ref"
+            ],
+            "pseudocode": "in internal/carrypatch/purge_test.go: run the task; assert refs/parley/replaced/p-old does not resolve; assert refs/parley/replaced/p-reused resolves to its old commit; assert refs/parley/replaced/p-live is unchanged; assert refs/heads/p-old and refs/heads/p-reused resolve to their old commits; assert both due patch rows are gone"
+          }
+        },
+        {
+          "id": "REQ-9.3",
+          "pattern": "state_driven",
+          "condition": "a workspace has no copy on disk",
+          "action": "remove its due patch records without a ref deletion and without reporting a failure",
+          "contract": "the due records of that workspace are gone and the task returns no error for it",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/carrypatch/purge_test.go, table over carry-patch workspaces in {status failed without a copy, status pending without a copy}: run the task; assert err == nil; assert the patch deleted 8 days ago is gone; assert the recording git runner saw no call for that workspace"
+          }
+        },
+        {
+          "id": "REQ-9.4",
+          "pattern": "event_driven",
+          "condition": "a patch that is due for purge is restored at the moment the purge runs",
+          "action": "let the restore win",
+          "contract": "the patch exists afterwards with status active and deleted_at null, and its backup ref is still present",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a carry-patch workspace 'demo' that is ready, created with the patch store and route guard of package 31",
+              "a patch deleted 8 days ago with a backup ref"
+            ],
+            "pseudocode": "in internal/carrypatch/purge_test.go: with a hook that pauses the purge after it has selected the due patches and before it removes this one, set the patch back to active in the store (status active, deleted_at null, appended position), as a restore does; resume the purge; assert the patch row exists with status active; assert refs/parley/replaced/<branch> still resolves; then repeat 50 times without the hook, running the task and the restoring update concurrently: assert that every time either the row exists as active with its backup ref, or the restoring update affected no row; never an active row without the ref it had and never a store error"
+          }
+        },
+        {
+          "id": "REQ-9.5",
+          "pattern": "unwanted",
+          "condition": "removing one patch fails, because the backup ref cannot be deleted or the store refuses the write",
+          "action": "log the failure with the workspace's slug and the patch id, leave that patch as it was, purge the other due patches and report the task as failed for this pass",
+          "contract": "the failed patch still exists with status deleted and its backup ref; every other due patch is gone; the task returns an error; one log line names the slug and the patch id; the next pass, with the fault removed, removes the patch and its backup ref",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a carry-patch workspace 'demo' that is ready, created with the patch store and route guard of package 31",
+              "three patches p1, p2, p3 deleted 8 days ago, each with a backup ref"
+            ],
+            "pseudocode": "in internal/carrypatch/purge_test.go, table over {the git runner fails the ref deletion for branch p2, the store fails the delete of patch p2}: err = run the task; assert err != nil; assert p2's row exists with status deleted and refs/parley/replaced/p2 resolves; assert p1 and p3 are gone with their backup refs; assert the log buffer has a line with the slug and p2's id; remove the fault; run the task again; assert err == nil and p2 and its backup ref are gone"
+          }
+        },
+        {
+          "id": "REQ-9.6",
+          "pattern": "ubiquitous",
+          "action": "run patch_purge in the first maintenance pass after start and in every hourly pass",
+          "check": {
+            "same_as": "PATH-3"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "A developer lists the remembered resolutions and forgets one",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "runs `parley rerere list demo` after a rebuild that conflicted in src/net/dial.go and a later rebuild that saw the conflict resolved"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends GET /api/v1/workspaces/demo/rerere"
+        },
+        {
+          "actor": "parleyd",
+          "action": "reads the workspace's remembered-resolution entries from the store, asks git which of them have a resolution, and answers 200 with one resolved entry"
+        },
+        {
+          "actor": "developer",
+          "action": "runs `parley rerere forget demo src/net/dial.go`"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends DELETE /api/v1/workspaces/demo/rerere/src/net/dial.go"
+        },
+        {
+          "actor": "parleyd",
+          "action": "removes the entry whose path is src/net/dial.go and answers 204"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints {\"status\":\"forgotten\",\"pathspec\":\"src/net/dial.go\"}"
+        },
+        {
+          "actor": "developer",
+          "action": "runs `parley rerere list demo` again and sees no entry"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parleyd started in-process on 127.0.0.1:0",
+          "the transactional store",
+          "internal/carrypatch routes, rebuild executor and job workers",
+          "internal/gitrepo with the git command",
+          "the parley CLI command tree",
+          "a test origin and a test upstream served over TLS by internal/gitrepo/gitrepotest"
+        ],
+        "setup": [
+          "a developer with an API key created the carry-patch workspace demo from the test origin and upstream and it is ready",
+          "one patch whose branch conflicts with a new upstream commit in src/net/dial.go",
+          "a rebuild ran and dead-lettered on the conflict, the patch branch was fixed, and a second rebuild completed"
+        ],
+        "end_state": [
+          "the first list prints one item with path src/net/dial.go and resolved true",
+          "the forget command exits 0 and prints the confirmation document",
+          "the second list prints items []",
+          "the store holds no remembered-resolution entry for demo and the rr-cache of the hub's copy holds no entry"
+        ],
+        "pseudocode": "new test in test/e2e/carrypatch_rerere_test.go: hub = startHub(t); set up demo, the patch and the two rebuilds through the CLI and git; out, code = cli('rerere', 'list', 'demo'); assert code == 0 and len(out.items) == 1 and out.items[0].path == 'src/net/dial.go' and out.items[0].resolved; out, code = cli('rerere', 'forget', 'demo', 'src/net/dial.go'); assert code == 0 and out == {status: 'forgotten', pathspec: 'src/net/dial.go'}; out, _ = cli('rerere', 'list', 'demo'); assert out.items == []"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "An org member reads the patch status",
+      "steps": [
+        {
+          "actor": "org member",
+          "action": "runs `parley workspace patch-status demo` with a credential that has read access"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends GET /api/v1/workspaces/demo/patch-status"
+        },
+        {
+          "actor": "parleyd",
+          "action": "reads the workspace record, the patches, the rebuild jobs and the integration branch of its copy, contacts no remote and answers 200"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints the summary document"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parleyd started in-process on 127.0.0.1:0",
+          "the transactional store",
+          "internal/carrypatch routes, patch store and rebuild executor",
+          "internal/jobs",
+          "internal/gitrepo with the git command",
+          "the parley CLI command tree",
+          "a test origin and a test upstream served over TLS by internal/gitrepo/gitrepotest"
+        ],
+        "setup": [
+          "the carry-patch workspace demo is ready with two patches and one completed rebuild",
+          "an org member whose access to demo is read",
+          "the test origin and the test upstream are stopped before the command runs"
+        ],
+        "end_state": [
+          "the command exits 0",
+          "the printed document has summary.total_patches 2 and summary.active 2",
+          "last_rebuild.status and last_completed_rebuild.status are completed and name the same job",
+          "integration_head_sha equals the head of deploy that a git client fetches from the hub",
+          "each patch has last_rebuild_result success"
+        ],
+        "pseudocode": "new test in test/e2e/carrypatch_status_test.go: hub = startHub(t); set up demo with two patches; cli('rebuild', 'submit', 'demo', '--wait'); origin.Close(); upstream.Close(); out, code = cliAs(member, 'workspace', 'patch-status', 'demo'); assert code == 0; assert out.summary.total_patches == 2 and out.summary.active == 2; assert out.last_rebuild.id == out.last_completed_rebuild.id and out.last_rebuild.status == 'completed'; assert out.integration_head_sha == git ls-remote <hub git URL> refs/heads/deploy; assert all(p.last_rebuild_result == 'success' for p in out.patches)"
+      }
+    },
+    {
+      "id": "PATH-3",
+      "title": "The maintenance pass purges an old deleted patch",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "soft-deleted the patch on branch p-old more than 7 days ago and the patch on branch p-new yesterday"
+        },
+        {
+          "actor": "parleyd",
+          "action": "starts its maintenance pass and runs the task patch_purge among the registered tasks"
+        },
+        {
+          "actor": "parleyd",
+          "action": "removes the patch on p-old and deletes refs/parley/replaced/p-old, and keeps the patch on p-new"
+        },
+        {
+          "actor": "git client",
+          "action": "lists the refs of the workspace and finds refs/heads/p-old but no refs/parley/replaced/p-old"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parleyd started in-process on 127.0.0.1:0 with its maintenance loop",
+          "the maintenance task registry of internal/maintenance",
+          "the transactional store",
+          "internal/carrypatch purge and patch routes",
+          "internal/gitrepo with the git command",
+          "the git smart HTTP server"
+        ],
+        "setup": [
+          "the carry-patch workspace demo is ready with patches on p-old and p-new, both soft-deleted, and a backup ref for p-old",
+          "the hub's replaceable clock is moved so that p-old was deleted 8 days ago and p-new 1 day ago",
+          "the hub's test option shortens the maintenance interval"
+        ],
+        "end_state": [
+          "GET /workspaces/demo/patches?include_deleted=true shows the patch on p-new and not the one on p-old",
+          "git ls-remote of the hub shows refs/heads/p-old and no refs/parley/replaced/p-old",
+          "the purge ran in the first pass after start and again in a later pass without error"
+        ],
+        "pseudocode": "new test in test/e2e/carrypatch_purge_test.go: hub = startHub(t, withClock(fake), withMaintenanceInterval(200ms)); set up demo and the two deleted patches; fake.Advance so that p-old is 8 days deleted; restart the hub on the same data; eventually: items = api GET patches?include_deleted=true; assert branches(items) == ['p-new']; refs = git ls-remote <hub git URL>; assert 'refs/heads/p-old' in refs and 'refs/parley/replaced/p-old' not in refs; assert the hub's log shows the task patch_purge finished at least twice without a failure line"
+      }
+    },
+    {
+      "id": "PATH-4",
+      "title": "An operator restarts the hub during a rebuild",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "runs `parley rebuild submit demo` and the rebuild starts"
+        },
+        {
+          "actor": "operator",
+          "action": "stops parleyd while the rebuild runs"
+        },
+        {
+          "actor": "parleyd",
+          "action": "starts no further job, waits for the running rebuild until the grace of the job queue ends, stops the attempt and exits"
+        },
+        {
+          "actor": "operator",
+          "action": "starts parleyd again on the same data"
+        },
+        {
+          "actor": "parleyd",
+          "action": "returns the job to queued through the job queue of package 33, discards what the interrupted rebuild left in the copy through the start hook of this package, then starts its workers"
+        },
+        {
+          "actor": "parleyd",
+          "action": "runs the job from the start and publishes the integration branch once"
+        },
+        {
+          "actor": "developer",
+          "action": "reads the job and sees it completed"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parleyd started in-process twice on the same data directory",
+          "the transactional store",
+          "internal/jobs worker pool",
+          "internal/carrypatch rebuild executor and recovery start hook",
+          "internal/gitrepo with the git command",
+          "a test origin and a test upstream served over TLS by internal/gitrepo/gitrepotest"
+        ],
+        "setup": [
+          "the carry-patch workspace demo is ready with two active patches",
+          "the test upstream delays its answer to the rebuild's fetch for longer than the grace, which the hub's test option shortens to 1 second",
+          "after the first hub has stopped, the upstream answers without delay"
+        ],
+        "end_state": [
+          "the first hub exits with status 0 within its total shutdown limit",
+          "between the two starts the job is recorded as not final and the integration branch is unchanged",
+          "after the second start the job reaches completed with two patch results of status success",
+          "the integration branch equals the job's integration_head_sha",
+          "the copy has no worktree registration and no rebuild work directory left"
+        ],
+        "pseudocode": "new test in test/e2e/carrypatch_restart_test.go: hub1 = startHub(t, withRebuildGrace(1s)); set up demo; upstream.Delay(10s); job = api POST /workspaces/demo/rebuild; wait until job.status == 'running'; before = hubRef('demo', 'deploy'); hub1.Stop(); assert hub1.ExitCode() == 0; assert hubRef('demo', 'deploy') == before; upstream.Delay(0); hub2 = startHub(t, sameData); eventually: j = api GET /workspaces/demo/rebuilds/<id>; assert j.status == 'completed' and len(j.patch_results) == 2; assert hubRef('demo', 'deploy') == j.integration_head_sha; assert `git worktree list` in the copy has one line"
+      }
+    }
+  ],
+  "external_apis": [
+    {
+      "package": "github.com/spf13/cobra",
+      "version": "v1",
+      "verified": false,
+      "symbols": [
+        {
+          "name": "Command",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "type Command struct { Use string; Short string; Args PositionalArgs; RunE func(cmd *Command, args []string) error }"
+        },
+        {
+          "name": "Command.AddCommand",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) AddCommand(cmds ...*Command)"
+        },
+        {
+          "name": "ExactArgs",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func ExactArgs(n int) PositionalArgs"
+        }
+      ]
+    }
+  ]
+}

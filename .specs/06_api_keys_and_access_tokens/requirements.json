@@ -1,0 +1,1155 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "06",
+  "spec_name": "api_keys_and_access_tokens",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Scope registry and the scope check",
+      "rationale": "Every package's routes rely on one registry and one check, so a PAT is held to the same rule everywhere.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "ubiquitous",
+          "action": "treat exactly these 32 case-sensitive names as registered scopes and every other string as unregistered: users:read, users:write, orgs:read, keys:read, keys:manage, tokens:read, tokens:write, tokens:manage, workspaces:read, workspaces:write, git:read, git:write, changes:read, changes:write, changes:approve, checks:write, patches:read, patches:write, rebuilds:read, rebuilds:write, secrets:read, secrets:write, vars:read, vars:write, forge:read, forge:write, sandboxes:read, sandboxes:write, audit:read, audit:write, sessions:read, sessions:write",
+          "contract": "the scope validator returns true for each of the 32 names and false for any other string",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/identity/scope_test.go: for each of the 32 names assert IsRegisteredScope(name); assert len(RegisteredScopes()) == 32; table of refused strings {'', 'git', 'git:', ':read', 'git:admin', 'GIT:READ', 'checks:read', 'orgs:write', 'keys:write', 'tokens:approve', ' git:read'}: assert !IsRegisteredScope(s)"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "event_driven",
+          "condition": "a request authenticated with a PAT reaches the scope check of a route that declares a needed scope",
+          "action": "pass the request to the next check when the PAT holds the needed scope itself, or the route needs R:read and the PAT holds R:write, or the route needs keys:read and the PAT holds keys:manage, or the route needs tokens:read and the PAT holds tokens:write or tokens:manage, or the route needs tokens:write and the PAT holds tokens:manage",
+          "contract": "the next check or the handler runs; the scope check writes no response",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/identity/scope_test.go, a table over (held scopes, needed scope, want): {[git:read], git:read, pass}, {[git:write], git:read, pass}, {[git:read], git:write, refuse}, {[users:write], users:read, pass}, {[keys:manage], keys:read, pass}, {[keys:read], keys:manage, refuse}, {[tokens:manage], tokens:write, pass}, {[tokens:manage], tokens:read, pass}, {[tokens:write], tokens:read, pass}, {[tokens:write], tokens:manage, refuse}, {[tokens:read], tokens:write, refuse}, {[changes:write], changes:approve, refuse}, {[changes:approve], changes:read, refuse}, {[changes:approve], changes:write, refuse}, {[changes:approve], changes:approve, pass}, {[checks:write], checks:write, pass}, {[changes:write], checks:write, refuse}, {[git:write], changes:read, refuse}, {[], git:read, refuse}: assert Satisfies(held, needed) == want; then through the server pipeline with a stub handler: a PAT caller with [git:write] on a route declaring git:read reaches the handler"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "unwanted",
+          "condition": "a request authenticated with a PAT reaches the scope check and the PAT holds neither the needed scope nor a scope that implies it",
+          "action": "refuse the request before the workspace access check, the admin check, request validation and the handler run",
+          "contract": "HTTP 403 with the error envelope, error_type insufficient_scope, and a message that names the needed scope; the same answer whether or not the addressed resource exists; the handler is not called",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the server pipeline of internal/server with the scope check installed at its position and a stub authenticator that reports a PAT caller"
+            ],
+            "pseudocode": "in internal/identity/scope_test.go: register a route declaring git:write whose handler records calls and whose later check would answer 404; send a request as a PAT caller holding [git:read]; assert status == 403; assert body.error.error_type == 'insufficient_scope'; assert body.error.code == 403; assert 'git:write' in body.error.message; assert handler calls == 0 and the later check was not called"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "ubiquitous",
+          "action": "for any request authenticated with the admin token or an API key, pass the scope check of every route whatever scope the route declares, and pass any request on a route that declares no scope",
+          "contract": "the next check or the handler runs",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/identity/scope_test.go, a table over callers {admin token, API key of a role-user user, API key of a role-admin user} and needed scopes {git:write, changes:approve, checks:write, tokens:manage}: the stub handler is reached; and a PAT caller with [git:read] on a route that declares no scope reaches the handler"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "ubiquitous",
+          "action": "for any PAT that does not hold changes:approve, refuse a check for changes:approve, and likewise for checks:write; and let changes:approve and checks:write satisfy no check other than the one for themselves",
+          "check": {
+            "same_as": "REQ-1.2"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "API keys: list, refresh and revoke",
+      "rationale": "A person must be able to see their keys, rotate a secret without a new login and cut off a key that leaked.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "a user credential (an API key, or a PAT holding keys:read or keys:manage) sends GET /user/keys",
+          "action": "answer with every API key of the caller in any state (live, revoked, expired), newest first by created_at then key_id descending, each as a Key object with the members key_id, user_id, expires_at, revoked_at and created_at and no secret",
+          "contract": "HTTP 200 with {items: Key[], next_cursor}; expires_at and revoked_at are null when unset",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock",
+              "alice has three keys created at different instants: one live, one revoked, one expired; bob has one key"
+            ],
+            "pseudocode": "in internal/identity/key_routes_test.go: r = GET /api/v1/user/keys as alice's live key; assert r.status == 200; assert ids(r.items) == [newest..oldest] and all three states are present; assert no item has a member named key or secret; assert bob's key is absent; as alice's PAT with [keys:read] and with [keys:manage]: 200; as alice's PAT with [git:read]: 403 insufficient_scope"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "event_driven",
+          "condition": "an API key sends POST /user/keys/:key_id/refresh naming a live key of its own user",
+          "action": "replace the key's secret with a new random one, keep key_id, set expires_at to the present instant plus the key's expires_days (null when expires_days is 0), and stop accepting the old secret at once",
+          "contract": "HTTP 200 with {key: 'parley_<key_id>_<new secret>', key_id, expires_at}; a later request with the old secret gets HTTP 401 and one with the new key authenticates",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock",
+              "alice's live key K was created with expires_days 30"
+            ],
+            "pseudocode": "in internal/identity/key_routes_test.go: advance the clock 10 days; r = POST /api/v1/user/keys/<K>/refresh as old key value; assert r.status == 200; assert r.key matches ^parley_<K>_[0-9A-Za-z]{32}$ and r.key != old value; assert r.key_id == K; assert r.expires_at == clock.now + 30 days; assert GET /user/keys with the old value -> 401; with r.key -> 200 and the listed key K has the new expires_at; table row for a key with expires_days 0: r.expires_at == null"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "unwanted",
+          "condition": "POST /user/keys/:key_id/refresh is sent with a PAT or with the admin token",
+          "action": "refuse the request and leave the key unchanged",
+          "contract": "HTTP 403 with error_type forbidden; the admin token gets the message \"this route needs a user\" of package 04; the key's secret and expires_at are unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock",
+              "alice's live key K"
+            ],
+            "pseudocode": "in internal/identity/key_routes_test.go, a table over callers {alice's PAT holding keys:manage, the admin token}: r = POST /api/v1/user/keys/<K>/refresh; assert r.status == 403; assert r.error.error_type == 'forbidden'; assert alice's key value still authenticates"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "unwanted",
+          "condition": "an API key sends POST /user/keys/:key_id/refresh naming a key of its own user that is revoked or expired",
+          "action": "refuse the request and leave the key unchanged",
+          "contract": "HTTP 409 with error_type conflict; the key record is unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock",
+              "alice has a second live key, a revoked key and an expired key"
+            ],
+            "pseudocode": "in internal/identity/key_routes_test.go, a table over target keys {revoked, expired}: r = POST /api/v1/user/keys/<target>/refresh as alice's other live key; assert r.status == 409; assert r.error.error_type == 'conflict'; assert the stored record of the target is unchanged"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "event_driven",
+          "condition": "a user credential (an API key, or a PAT holding keys:manage) sends DELETE /user/keys/:key_id naming a key of its own user that is not revoked",
+          "action": "set the key's revoked_at to the present instant and keep the record, also when the key is expired and also when the key is the one that authenticated the request",
+          "contract": "HTTP 200 with the Key, revoked_at set; the key no longer authenticates",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock",
+              "alice has live keys K1 and K3 and an expired key K2"
+            ],
+            "pseudocode": "in internal/identity/key_routes_test.go, a table over (caller, target): {live key K1, K1 itself}, {live key K1, expired key K2}, {alice's PAT with [keys:manage], live key K3}: r = DELETE /api/v1/user/keys/<target>; assert r.status == 200; assert r.key_id == target and r.revoked_at == clock.now; for the self-revoke row assert a following GET /user/keys with K1 -> 401; row {alice's PAT with [keys:read], K3}: 403 insufficient_scope and K3 not revoked"
+          }
+        },
+        {
+          "id": "REQ-2.6",
+          "pattern": "event_driven",
+          "condition": "DELETE /user/keys/:key_id names a key of the caller's user that is already revoked",
+          "action": "change nothing and answer with the key as stored",
+          "contract": "HTTP 200 with the Key; revoked_at keeps its earlier value",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock",
+              "alice has live keys K1 (the caller) and K2"
+            ],
+            "pseudocode": "in internal/identity/key_routes_test.go: first = DELETE /api/v1/user/keys/<K2>; advance the clock one hour; second = DELETE again; assert second.status == 200; assert second.revoked_at == first.revoked_at"
+          }
+        },
+        {
+          "id": "REQ-2.7",
+          "pattern": "unwanted",
+          "condition": "POST /user/keys/:key_id/refresh or DELETE /user/keys/:key_id names a key_id that does not exist or belongs to another user",
+          "action": "refuse the request with the same answer in both cases and change nothing",
+          "contract": "HTTP 404 with error_type not_found; the response for another user's key equals the response for a missing key; no key is changed",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock",
+              "user bob with a live API key"
+            ],
+            "pseudocode": "in internal/identity/key_routes_test.go, a table over routes {POST /user/keys/:id/refresh, DELETE /user/keys/:id} and ids {'zzzzzzzz' (no such key), bob's live key id}: as alice's live key assert r.status == 404; assert r.error.error_type == 'not_found'; assert the body for bob's key id equals the body for the missing id on the same route; assert bob's key still authenticates"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Creating a PAT",
+      "rationale": "Automation gets a credential of its own with only the scopes it needs, and its value is shown exactly once.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "a user credential (an API key, or a PAT holding tokens:manage) sends POST /user/tokens with a valid body",
+          "action": "create a PAT owned by the caller's user with a new token_id of 8 and a secret of 32 characters from [a-z0-9], the name given, the permissions given with duplicates dropped and the order kept, paths as given or null, workspace null, and store only a hash of the secret",
+          "contract": "HTTP 201 with the Token object plus token: 'parley_pat_<token_id>_<secret>'; the returned value authenticates as the new PAT",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock"
+            ],
+            "pseudocode": "in internal/identity/token_routes_test.go: r = POST /api/v1/user/tokens {name:'ci', permissions:['git:write','changes:write','git:write']} as alice's API key; assert r.status == 201; assert r.token matches ^parley_pat_[a-z0-9]{8}_[a-z0-9]{32}$ and contains r.token_id; assert r.permissions == ['git:write','changes:write']; assert r.paths == null and r.workspace == null and r.revoked_at == null; assert r.user_id == alice.id; assert r.created_at == clock.now; assert the store holds no column equal to the secret; assert GET /api/v1/user with r.token is authenticated (not 401); row with name of 255 characters: 201"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "event_driven",
+          "condition": "POST /user/tokens creates a PAT",
+          "action": "set expires_at to the creation instant plus expires times 24 hours for 30, 60 and 90, to null for 0, and use 90 when expires is absent",
+          "contract": "the Token's expires_at is the stated instant or null; once that instant has passed the token is expired and no longer authenticates",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock"
+            ],
+            "pseudocode": "in internal/identity/token_routes_test.go, a table over expires {absent -> now+90d, 0 -> null, 30 -> now+30d, 60 -> now+60d, 90 -> now+90d}: r = POST /api/v1/user/tokens; assert r.status == 201; assert r.expires_at == want, formatted as RFC 3339 UTC with whole seconds; then for the 30 row: at clock = expires_at - 1s the token authenticates, at clock = expires_at + 1s a request with it gets 401"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "unwanted",
+          "condition": "the body of POST /user/tokens has a name that is missing, not a string, empty or longer than 255 characters, or permissions that is missing, not an array, empty or holds a string that is not a registered scope, or an expires that is not one of the integers 0, 30, 60 and 90",
+          "action": "refuse the request and create nothing",
+          "contract": "HTTP 400 with error_type invalid_request; the caller's token list is unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock"
+            ],
+            "pseudocode": "in internal/identity/token_routes_test.go, a table of bodies: {no name}, {name:''}, {name of 256 characters}, {name: 5}, {no permissions}, {permissions: []}, {permissions: 'git:read'}, {permissions: ['git:read','git:admin']}, {permissions: ['GIT:READ']}, {expires: 45}, {expires: -1}, {expires: '30'}, {expires: 30.5}: r = POST /api/v1/user/tokens as alice's API key; assert r.status == 400; assert r.error.error_type == 'invalid_request'; after all rows assert GET /user/tokens returns items == []"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "unwanted",
+          "condition": "POST /user/tokens is sent with a PAT that does not hold tokens:manage",
+          "action": "refuse the request before validating the body and create nothing",
+          "contract": "HTTP 403 with error_type insufficient_scope, also when the body is invalid; no token is created",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock",
+              "alice has PATs with the listed scopes"
+            ],
+            "pseudocode": "in internal/identity/token_routes_test.go, a table over the caller PAT's scopes {[tokens:write], [tokens:read], [git:write]} and bodies {valid, {}}: r = POST /api/v1/user/tokens; assert r.status == 403; assert r.error.error_type == 'insufficient_scope'; assert alice's token count is unchanged"
+          }
+        },
+        {
+          "id": "REQ-3.5",
+          "pattern": "unwanted",
+          "condition": "any route under /user/keys or /user/tokens is called with the admin token",
+          "action": "refuse the request and change nothing",
+          "contract": "HTTP 403 with error_type forbidden and the message \"this route needs a user\", the one answer package 04 gives the admin token on a route that needs a user; no key or token is created or changed",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock",
+              "the hub's admin token"
+            ],
+            "pseudocode": "in internal/identity/token_routes_test.go, a table over (method, path): {GET /user/keys}, {POST /user/keys/x/refresh}, {DELETE /user/keys/x}, {POST /user/tokens}, {GET /user/tokens}, {GET /user/tokens/x}, {DELETE /user/tokens/x}, {PUT, PATCH, DELETE /user/tokens/x/permissions}: send with the admin token (and a valid body where one is taken); assert r.status == 403; assert r.error.error_type == 'forbidden'"
+          }
+        },
+        {
+          "id": "REQ-3.6",
+          "pattern": "event_driven",
+          "condition": "POST /user/tokens is repeated within 24 hours by the same caller with the same Idempotency-Key and the same body as a request that created a PAT",
+          "action": "create nothing and answer with the body of the first response without its token member",
+          "contract": "HTTP 200 with the Token object and no token member; exactly one PAT exists",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock"
+            ],
+            "pseudocode": "in internal/identity/token_routes_test.go: first = POST /api/v1/user/tokens with header Idempotency-Key: k1 and body B; second = the same request again; assert first.status == 201 and second.status == 200; assert second.token_id == first.token_id; assert 'token' not in second; assert GET /user/tokens returns one item"
+          }
+        },
+        {
+          "id": "REQ-3.7",
+          "pattern": "ubiquitous",
+          "action": "for any PAT, include its value in the response that created it and in no other response",
+          "contract": "Token objects returned by list, read, permission-change, revoke and admin routes carry no token member",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock"
+            ],
+            "pseudocode": "in internal/identity/token_routes_test.go: create a PAT, then collect the bodies of GET /user/tokens, GET /user/tokens/<id>, PUT /user/tokens/<id>/permissions, DELETE /user/tokens/<id> and, with an admin key, GET /users/alice/tokens and DELETE /users/alice/tokens/<id>; assert no body has a member named token and no body contains the secret text"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "The subset rule",
+      "rationale": "A token that could mint a stronger token would make every scope limit meaningless.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "a PAT holding tokens:manage sends POST /user/tokens, and it holds every requested permission exactly, and it either has no paths or every requested glob is covered by one of its own globs",
+          "action": "create the PAT as an API key caller's request would",
+          "contract": "HTTP 201 with the Token and its value",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock",
+              "alice has the caller PATs of the table"
+            ],
+            "pseudocode": "in internal/identity/token_routes_test.go, a table over (caller PAT, request): {[tokens:manage, git:read] no paths, permissions [git:read]}, {same, permissions [git:read, tokens:manage]}, {same, permissions [git:read] paths ['docs/**']}, {[tokens:manage, git:write] paths ['src/**'], permissions [git:write] paths ['src/api/*.go']}, {same, permissions [git:write] paths ['src/**']}: r = POST /api/v1/user/tokens; assert r.status == 201; assert r.permissions and r.paths equal the request's"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "unwanted",
+          "condition": "a PAT holding tokens:manage sends POST /user/tokens with a valid body that requests a permission the PAT does not itself hold, counting no implication",
+          "action": "refuse the request, name the first requested permission in request order that the caller does not hold, and create nothing",
+          "contract": "HTTP 403 with error_type insufficient_scope and a message containing the first offending permission; no token is created",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock",
+              "alice has the caller PATs of the table"
+            ],
+            "pseudocode": "in internal/identity/token_routes_test.go, a table over (caller scopes, requested, named): {[tokens:manage, git:write], [git:read], 'git:read'}, {[tokens:manage, git:read], [git:read, changes:write, vars:read], 'changes:write'}, {[tokens:manage], [tokens:write], 'tokens:write'}, {[tokens:manage, changes:write], [changes:approve], 'changes:approve'}: r = POST /api/v1/user/tokens; assert r.status == 403; assert r.error.error_type == 'insufficient_scope'; assert named in r.error.message; assert alice's token count is unchanged"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "unwanted",
+          "condition": "a PAT that has paths and holds tokens:manage sends POST /user/tokens with a valid body whose paths is absent or null, or holds a glob that none of the caller's globs covers",
+          "action": "refuse the request, name the first requested glob in request order that none of the caller's globs covers (or say that paths is required when none was requested), and create nothing",
+          "contract": "HTTP 403 with error_type insufficient_scope and a message containing the first offending glob; no token is created",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock",
+              "alice has the caller PAT"
+            ],
+            "pseudocode": "in internal/identity/token_routes_test.go, with a caller PAT [tokens:manage, git:write] paths ['src/**', 'docs/*'], a table over requested paths and the text expected in the message: {absent, 'paths'}, {null, 'paths'}, {['src/a.go', 'lib/**'], 'lib/**'}, {['docs/**'], 'docs/**'}, {['**'], '**'}: r = POST /api/v1/user/tokens {permissions:['git:write'], paths}; assert r.status == 403; assert r.error.error_type == 'insufficient_scope'; assert text in r.error.message; assert alice's token count is unchanged"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "ubiquitous",
+          "action": "for any POST /user/tokens sent with an API key, apply no subset rule: accept every set of registered scopes and every valid paths",
+          "contract": "HTTP 201 for any valid body",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock"
+            ],
+            "pseudocode": "in internal/identity/token_routes_test.go: as alice's API key (role user) POST /api/v1/user/tokens with all 32 registered scopes and paths ['**']; assert r.status == 201; assert len(r.permissions) == 32"
+          }
+        },
+        {
+          "id": "REQ-4.5",
+          "pattern": "unwanted",
+          "condition": "a PAT holding tokens:manage sends POST /user/tokens with a body that fails validation and also requests a permission or glob the PAT does not hold",
+          "action": "answer the validation failure, not the subset rule",
+          "contract": "HTTP 400 with error_type invalid_request; no token is created",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock"
+            ],
+            "pseudocode": "in internal/identity/token_routes_test.go: as a PAT [tokens:manage, git:read], table of bodies {permissions ['git:admin']}, {permissions ['git:read'], paths []}, {permissions ['git:write'], expires 45}: r = POST /api/v1/user/tokens; assert r.status == 400; assert r.error.error_type == 'invalid_request'"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Path globs: the paths field, matching and covering",
+      "rationale": "One definition of what a glob matches and what it covers keeps minting and write enforcement in agreement.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "POST /user/tokens creates a PAT from a body whose paths is an array of 1 to 50 globs, each a string of 1 to 255 characters that does not start with /",
+          "action": "store the globs in the order given, without removing duplicates, and return them as paths in the creation response and in every later Token object of that token",
+          "contract": "HTTP 201; paths in the response equals the array sent; a body without paths or with paths null yields paths null",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock"
+            ],
+            "pseudocode": "in internal/identity/token_routes_test.go: r = POST /api/v1/user/tokens {name:'d', permissions:['users:read'], paths:['docs/**','src/*.go','docs/**']} as alice's API key; assert r.status == 201 (a token without any write scope is accepted); assert r.paths == ['docs/**','src/*.go','docs/**']; assert GET /user/tokens/<id>.paths and the item in GET /user/tokens carry the same list; rows: a list of exactly 50 globs -> 201; a glob of exactly 255 characters -> 201; paths: null -> 201 with paths null"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "unwanted",
+          "condition": "the body of POST /user/tokens has a paths that is an empty array, not an array, an array of more than 50 entries, or holds an entry that is not a string, is empty, is longer than 255 characters or starts with /",
+          "action": "refuse the request and create nothing",
+          "contract": "HTTP 400 with error_type invalid_request; no token is created",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock"
+            ],
+            "pseudocode": "in internal/identity/pathglob_test.go, a table over paths values: [], a list of 51 globs, [''], [a string of 256 characters], ['/src/**'], ['docs/**', 7], 'docs/**', {}: assert ValidatePaths(v) returns an error; and in internal/identity/token_routes_test.go for the rows [], 51 globs and ['/src/**']: r = POST /api/v1/user/tokens; assert r.status == 400; assert r.error.error_type == 'invalid_request'; assert alice's token count is unchanged"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "ubiquitous",
+          "action": "for any glob and any repository file path, report a match exactly when the whole path matches the glob read left to right with * as any run (also empty) of characters other than /, ** as any run (also empty) of characters including /, and every other character as itself, compared case-sensitively",
+          "contract": "the matcher returns true or false; for a token without paths every path is allowed",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/identity/pathglob_test.go, a table over (glob, path, want): {docs/**, docs/a.md, true}, {docs/**, docs/api/b.md, true}, {docs/**, docs, false}, {docs/**, xdocs/a.md, false}, {src/*.go, src/main.go, true}, {src/*.go, src/x/y.go, false}, {src/*.go, src/.go, true}, {src/*.go, src/main.go.bak, false}, {**, any/deep/file, true}, {*, a/b, false}, {*, a, true}, {**/*.md, docs/a.md, true}, {**/*.md, a.md, false}, {README.md, README.md, true}, {README.md, readme.md, false}, {a?c, abc, false}, {a?c, a?c, true}, {a[b]c, a[b]c, true}, {a[b]c, abc, false}, {src/**/test/*, src/a/b/test/x, true}: assert MatchPath(glob, path) == want; and MatchAny(['docs/**','src/*.go'], 'src/main.go') == true; MatchAny(same, 'lib/x') == false; MatchAny(nil, 'lib/x') == true (no paths means unrestricted)"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "ubiquitous",
+          "action": "for any two globs C and G, report that C covers G exactly when C equals G, or C used as a pattern matches the text of G taken literally where a * of C matches a run that has no / and does not contain the sequence ** and a ** of C matches any run",
+          "contract": "the cover test returns true or false and never returns true for a requested glob that matches a path the covering glob does not match",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/identity/pathglob_test.go, a table over (C, G, want): {src/**, src/api/*.go, true}, {src/**, src/**, true}, {src/*, src/**, false}, {src/**, docs/**, false}, {src/*, src/*, true}, {src/*, src/*.go, true}, {src/*, src/a**, false}, {src/*, src/a/b, false}, {**, anything/**, true}, {**, *, true}, {*, **, false}, {src/*.go, src/main.go, true}, {src/*.go, src/**, false}, {docs/*, docs/**, false}, {a/**/c, a/b/**/c, true}: assert Covers(C, G) == want; and CoveredByAny(['src/**','docs/*'], 'docs/a.md') == true; CoveredByAny(same, 'lib/**') == false"
+          }
+        },
+        {
+          "id": "REQ-5.5",
+          "pattern": "ubiquitous",
+          "action": "for any pair of globs for which the cover test answers true and any file path the requested glob matches, have the covering glob match that path too",
+          "contract": "no counter-example exists over the generated domain",
+          "check": {
+            "kind": "property",
+            "pseudocode": "in internal/identity/pathglob_test.go: generate globs from the alphabet {a, b, /, *, **, .} up to 6 tokens and paths from {a, b, /, .} up to 8 characters (exhaustive or seeded random, at least 20000 triples); for each (C, G, p) with Covers(C, G) and MatchPath(G, p): assert MatchPath(C, p)"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Reading and revoking PATs",
+      "rationale": "A user must be able to see every token issued in their name and cut one off at once.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "a user credential (an API key, or a PAT holding tokens:read, tokens:write or tokens:manage) sends GET /user/tokens",
+          "action": "answer with every PAT of the caller's user in any state, tokens with a workspace binding included, newest first by created_at then token_id descending",
+          "contract": "HTTP 200 with {items: Token[], next_cursor}; paths, workspace, expires_at and revoked_at are null when unset",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock",
+              "alice has four PATs created at different instants: live, revoked, expired, and one stored with workspace 'my-ws'; bob has one PAT"
+            ],
+            "pseudocode": "in internal/identity/token_routes_test.go: r = GET /api/v1/user/tokens as alice's API key; assert r.status == 200; assert ids(r.items) are in newest-first order and number 4; assert the bound item has workspace == 'my-ws'; assert bob's token is absent; with limit=2 follow next_cursor and assert the two pages hold the 4 ids once each; as alice's PATs with [tokens:read], [tokens:write] and [tokens:manage]: 200"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "event_driven",
+          "condition": "a user credential (an API key, or a PAT holding tokens:read, tokens:write or tokens:manage) sends GET /user/tokens/:token_id naming a PAT of its own user",
+          "action": "answer with that token's Token object",
+          "contract": "HTTP 200 with the Token object",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock",
+              "alice has a live, a revoked and an expired PAT"
+            ],
+            "pseudocode": "in internal/identity/token_routes_test.go: r = GET /api/v1/user/tokens/<id> as alice's API key for each of alice's live, revoked and expired tokens; assert r.status == 200; assert r.token_id == id and r.name, r.permissions, r.paths, r.expires_at, r.revoked_at, r.created_at equal the stored values"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "event_driven",
+          "condition": "a user credential (an API key, or a PAT holding tokens:manage) sends DELETE /user/tokens/:token_id naming a PAT of its own user that is not revoked",
+          "action": "set the token's revoked_at to the present instant and keep the record, also when the token is expired and also when the token is the one that authenticated the request",
+          "contract": "HTTP 200 with the Token, revoked_at set; the token no longer authenticates",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock",
+              "alice has live PATs T1 and T3 and an expired PAT T2"
+            ],
+            "pseudocode": "in internal/identity/token_routes_test.go, a table over (caller, target): {alice's API key, live T1}, {alice's API key, expired T2}, {PAT T3 holding tokens:manage, T3 itself}: r = DELETE /api/v1/user/tokens/<target>; assert r.status == 200; assert r.revoked_at == clock.now; assert r.permissions is unchanged; for T1 and T3 assert a following GET /api/v1/user with the token value -> 401"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "event_driven",
+          "condition": "DELETE /user/tokens/:token_id names a PAT of the caller's user that is already revoked",
+          "action": "change nothing and answer with the token as stored",
+          "contract": "HTTP 200 with the Token; revoked_at keeps its earlier value",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock",
+              "alice has a live PAT T1"
+            ],
+            "pseudocode": "in internal/identity/token_routes_test.go: first = DELETE /api/v1/user/tokens/<T1>; advance the clock one hour; second = DELETE again; assert second.status == 200; assert second.revoked_at == first.revoked_at"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "unwanted",
+          "condition": "a route under /user/tokens/:token_id names a token_id that does not exist or belongs to another user",
+          "action": "refuse the request with the same answer in both cases and change nothing",
+          "contract": "HTTP 404 with error_type not_found; the response for another user's token equals the response for a missing one; no token is changed",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock",
+              "user bob with a live PAT [git:write]"
+            ],
+            "pseudocode": "in internal/identity/token_routes_test.go, a table over routes {GET /user/tokens/:id, DELETE /user/tokens/:id, PUT /user/tokens/:id/permissions, PATCH /user/tokens/:id/permissions, DELETE /user/tokens/:id/permissions} and ids {'zzzzzzzz', bob's token id}: as alice's API key with body {permissions:['git:read']} where one is taken; assert r.status == 404; assert r.error.error_type == 'not_found'; assert the body for bob's id equals the body for the missing id; assert bob's token is unchanged"
+          }
+        },
+        {
+          "id": "REQ-6.6",
+          "pattern": "unwanted",
+          "condition": "a PAT calls GET /user/tokens or GET /user/tokens/:token_id without tokens:read, tokens:write or tokens:manage, or DELETE /user/tokens/:token_id without tokens:manage, or a permissions route without tokens:write or tokens:manage",
+          "action": "refuse the request before looking the token up",
+          "contract": "HTTP 403 with error_type insufficient_scope, the same for an existing and a missing token_id; nothing is changed",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock",
+              "alice has PATs with the listed scopes"
+            ],
+            "pseudocode": "in internal/identity/token_routes_test.go, a table over (route, caller PAT scopes): {GET /user/tokens, [git:read]}, {GET /user/tokens/:id, [keys:manage]}, {DELETE /user/tokens/:id, [tokens:write]}, {DELETE /user/tokens/:id, [tokens:read]}, {PUT /user/tokens/:id/permissions, [tokens:read]}, {PATCH /user/tokens/:id/permissions, [tokens:read]}, {DELETE /user/tokens/:id/permissions, [git:write]}, each with :id an existing token of alice and with :id 'zzzzzzzz': assert r.status == 403; assert r.error.error_type == 'insufficient_scope'; assert the existing token is unchanged"
+          }
+        },
+        {
+          "id": "REQ-6.7",
+          "pattern": "event_driven",
+          "condition": "a hub-internal caller asks for the revocation by id of one token, giving a transaction of its own and a token_id",
+          "action": "set revoked_at of that token to now through the given transaction when it is null, without committing, without an ownership check and without writing an event, and leave an already revoked token unchanged",
+          "contract": "after the caller commits, the token has revoked_at set to the clock's time, every other member is unchanged, and a request with the token is answered HTTP 401; after the caller rolls back, the token is as before and still authenticates; an expired token is revoked the same way; an already revoked token keeps its revoked_at and no error is returned; a token_id that does not exist returns a not-found error and writes nothing; no other token is changed",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock",
+              "alice has live PATs T1 and T2, a PAT T3 that has expired and a PAT T4 revoked one hour ago; user bob has a live PAT B1"
+            ],
+            "pseudocode": "in internal/identity/token_ops_test.go: tx = store.Begin(); err = identity.RevokeTokenByID(tx, T1.id); assert err == nil; tx.Rollback(); assert T1 stored unchanged and GET /api/v1/user/tokens with T1 is 200; then a table over ids {T1, T3, B1}: tx = store.Begin(); assert identity.RevokeTokenByID(tx, id) == nil; tx.Commit(); assert stored revoked_at == clock.now and every other member is as before; assert a request with T1's value is 401; assert T2 is unchanged; tx = store.Begin(); assert identity.RevokeTokenByID(tx, T4.id) == nil; tx.Commit(); assert T4.revoked_at is the earlier value; err = identity.RevokeTokenByID(tx2, 'zzzzzzzz'); assert errors.Is(err, the not-found error of internal/identity); assert no row changed and no event was written"
+          }
+        },
+        {
+          "id": "REQ-6.8",
+          "pattern": "event_driven",
+          "condition": "a hub-internal caller asks for the expiry update of one token by id, giving a transaction of its own, a token_id and an instant",
+          "action": "set expires_at of that token to the instant, in whole seconds, through the given transaction, without committing, without an ownership check and without writing an event, and change no other member",
+          "contract": "after the caller commits, the token's expires_at equals the instant and every other member, revoked_at included, is unchanged; the token authenticates while the clock is before the instant and is answered HTTP 401 from the instant on, by the expiry predicate of package 04; after the caller rolls back, expires_at is as before; a token_id that does not exist returns a not-found error and writes nothing; no other token is changed",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock",
+              "alice has a live PAT T1 that expires in 1 hour, a live PAT T2 and a PAT T4 revoked one hour ago"
+            ],
+            "pseudocode": "in internal/identity/token_ops_test.go: later = clock.now + 6h; tx = store.Begin(); assert identity.SetTokenExpiryByID(tx, T1.id, later) == nil; tx.Rollback(); assert T1.expires_at is the earlier value; tx = store.Begin(); assert identity.SetTokenExpiryByID(tx, T1.id, later) == nil; tx.Commit(); assert stored T1.expires_at == later and every other member is as before; advance the clock 2h; assert GET /api/v1/user/tokens with T1 is 200; advance the clock to later; assert it is 401; then earlier: SetTokenExpiryByID(tx, T2.id, clock.now - 1s), commit; assert a request with T2 is 401; SetTokenExpiryByID(tx, T4.id, later), commit; assert T4.revoked_at is unchanged and a request with T4 is 401; err = identity.SetTokenExpiryByID(tx, 'zzzzzzzz', later); assert errors.Is(err, the not-found error of internal/identity); assert no row changed and no event was written"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "Changing a PAT's permissions",
+      "rationale": "A token's reach can be adjusted without issuing a new value, but never beyond what the adjusting credential holds.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "event_driven",
+          "condition": "a user credential (an API key, or a PAT holding tokens:write or tokens:manage) sends PUT /user/tokens/:token_id/permissions with a non-empty array of registered scopes for a live PAT of its own user",
+          "action": "replace the token's permissions with the list given, duplicates dropped and order kept",
+          "contract": "HTTP 200 with the Token after the change; the token is scope-checked against the new list from the next request on",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock",
+              "alice's live PAT T with [git:read, changes:write]"
+            ],
+            "pseudocode": "in internal/identity/token_routes_test.go: r = PUT /api/v1/user/tokens/<T>/permissions {permissions:['vars:read','git:write','vars:read']} as alice's API key; assert r.status == 200; assert r.permissions == ['vars:read','git:write']; assert r.revoked_at == null; assert GET /user/tokens/<T>.permissions is the same; assert a request with T's value on a stub route needing changes:read now gets 403 insufficient_scope"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "event_driven",
+          "condition": "a user credential (an API key, or a PAT holding tokens:write or tokens:manage) sends PATCH /user/tokens/:token_id/permissions with a non-empty array of registered scopes for a live PAT of its own user",
+          "action": "append the given scopes the token does not yet have, in the order given, after the existing ones and keep the scopes already present as they are",
+          "contract": "HTTP 200 with the Token after the change",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock",
+              "alice's live PAT T with [git:read, changes:write]"
+            ],
+            "pseudocode": "in internal/identity/token_routes_test.go: r = PATCH /api/v1/user/tokens/<T>/permissions {permissions:['changes:write','vars:read','vars:read']}; assert r.status == 200; assert r.permissions == ['git:read','changes:write','vars:read']"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "event_driven",
+          "condition": "a user credential (an API key, or a PAT holding tokens:write or tokens:manage) sends DELETE /user/tokens/:token_id/permissions with a non-empty array of strings for a live PAT of its own user",
+          "action": "remove the given scopes from the token's permissions, ignore every given string the token does not have whether registered or not, and apply no subset rule",
+          "contract": "HTTP 200 with the Token after the change",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock",
+              "alice's live PAT T with [git:read, changes:write, vars:read]"
+            ],
+            "pseudocode": "in internal/identity/token_routes_test.go: r = DELETE /api/v1/user/tokens/<T>/permissions {permissions:['changes:write','git:write','not-a-scope']} as alice's PAT holding only [tokens:write]; assert r.status == 200; assert r.permissions == ['git:read','vars:read']; assert r.revoked_at == null"
+          }
+        },
+        {
+          "id": "REQ-7.4",
+          "pattern": "event_driven",
+          "condition": "a PUT with an empty permissions array, or a DELETE on the permissions route, leaves a live PAT with no scope",
+          "action": "store the empty permissions list and revoke the token in the same transaction",
+          "contract": "HTTP 200 with the Token, permissions [] and revoked_at set; the token no longer authenticates",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock"
+            ],
+            "pseudocode": "in internal/identity/token_routes_test.go, a table over changes on a live PAT with [git:read, vars:read]: {PUT permissions []}, {DELETE permissions ['git:read','vars:read']}, {DELETE ['vars:read'] then DELETE ['git:read']}: assert last r.status == 200; assert r.permissions == []; assert r.revoked_at == clock.now; assert a request with the token's value -> 401"
+          }
+        },
+        {
+          "id": "REQ-7.5",
+          "pattern": "unwanted",
+          "condition": "the body of a permissions route has no permissions member or one that is not an array of strings, or a PUT or PATCH body names a string that is not a registered scope, or a PATCH or DELETE body has an empty permissions array",
+          "action": "refuse the request and leave the token unchanged",
+          "contract": "HTTP 400 with error_type invalid_request; the token's permissions and revoked_at are unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock",
+              "alice's live PAT T with [git:read]"
+            ],
+            "pseudocode": "in internal/identity/token_routes_test.go, a table over (method, body): {PUT, {}}, {PUT, {permissions:'git:read'}}, {PUT, {permissions:['git:admin']}}, {PUT, {permissions:[5]}}, {PATCH, {}}, {PATCH, {permissions:[]}}, {PATCH, {permissions:['git:read','nope']}}, {DELETE, {}}, {DELETE, {permissions:[]}}, {DELETE, {permissions:'git:read'}}: assert r.status == 400; assert r.error.error_type == 'invalid_request'; assert GET /user/tokens/<T>.permissions is unchanged"
+          }
+        },
+        {
+          "id": "REQ-7.6",
+          "pattern": "unwanted",
+          "condition": "a PAT sends a PUT or PATCH on a permissions route that would add to the target token a scope the calling PAT does not itself hold, counting no implication",
+          "action": "refuse the request, name the first such scope and leave the token unchanged",
+          "contract": "HTTP 403 with error_type insufficient_scope and a message containing the first offending scope; the target token is unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock",
+              "alice has the PATs C and T"
+            ],
+            "pseudocode": "in internal/identity/token_routes_test.go, with the caller PAT C [tokens:write, git:write] and target T [git:write], a table: {PUT T [git:write, git:read], names git:read}, {PATCH T [vars:read], names vars:read}, {PATCH C itself [tokens:manage], names tokens:manage}: assert r.status == 403; assert r.error.error_type == 'insufficient_scope'; assert the named scope in r.error.message; assert target permissions unchanged; passing rows: {PUT T [git:write]} -> 200, {PATCH T [git:write, tokens:write]} -> 200 (git:write is already present, tokens:write is held by C), and the same failing bodies sent with alice's API key -> 200"
+          }
+        },
+        {
+          "id": "REQ-7.7",
+          "pattern": "unwanted",
+          "condition": "a valid PUT, PATCH or DELETE on a permissions route names a PAT of the caller's user that is revoked or expired",
+          "action": "refuse the request and leave the token unchanged",
+          "contract": "HTTP 409 with error_type conflict; the token is unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock",
+              "alice has a revoked PAT and an expired PAT, each with [git:read]"
+            ],
+            "pseudocode": "in internal/identity/token_routes_test.go, a table over methods {PUT, PATCH, DELETE} and targets {revoked PAT, expired PAT} with body {permissions:['git:read']}: as alice's API key assert r.status == 409; assert r.error.error_type == 'conflict'; assert the stored token is unchanged"
+          }
+        },
+        {
+          "id": "REQ-7.8",
+          "pattern": "ubiquitous",
+          "action": "for any permission change, leave the token's paths, workspace, name and expires_at as they were and ignore body members named paths and workspace",
+          "contract": "the Token in the response and in later reads carries the paths, workspace, name and expires_at it was created with",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock"
+            ],
+            "pseudocode": "in internal/identity/token_routes_test.go: for PUT, PATCH and DELETE send {permissions:['git:read'], paths:['**'], workspace:'other'} to a live PAT with paths ['docs/**'] stored with workspace 'my-ws'; assert r.status == 200; assert r.paths == ['docs/**']; assert r.workspace == 'my-ws'; assert r.name and r.expires_at are unchanged"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "Admin key and token routes",
+      "rationale": "An operator must be able to see and cut off any user's credentials without that user's cooperation.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "an admin (the admin token, or an API key whose user has role admin) sends GET /users/:id/keys with a selector of an existing user",
+          "action": "answer with every API key of the selected user in any state, newest first",
+          "contract": "HTTP 200 with {items: Key[], next_cursor}",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub started in-process with a temporary store; user alice with a live API key; a fixed test clock",
+              "an admin-role user root with an API key; the hub's admin token; alice has a live and a revoked key and three PATs (live, revoked, expired)"
+            ],
+            "pseudocode": "in internal/identity/admin_credential_routes_test.go, a table over callers {the admin token, the API key of admin-role user root} and selectors {alice's UUID, 'alice@example.com', 'alice'}: r = GET /api/v1/users/<sel>/keys; assert r.status == 200; assert ids(r.items) == alice's keys newest first, the revoked one included; assert no item carries a secret"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "event_driven",
+          "condition": "an admin sends GET /users/:id/tokens with a selector of an existing user",
+          "action": "answer with every PAT of the selected user in any state, tokens with a workspace binding included, newest first",
+          "contract": "HTTP 200 with {items: Token[], next_cursor}",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the fixture of the admin key list test"
+            ],
+            "pseudocode": "in internal/identity/admin_credential_routes_test.go, the same table of callers and selectors as the key list: r = GET /api/v1/users/<sel>/tokens; assert r.status == 200; assert ids(r.items) == alice's three tokens newest first; assert no item has a token member"
+          }
+        },
+        {
+          "id": "REQ-8.3",
+          "pattern": "event_driven",
+          "condition": "an admin sends DELETE /users/:id/keys/:key_id or DELETE /users/:id/tokens/:token_id naming a key or token of the selected user",
+          "action": "set revoked_at of that key or token to the present instant when it is not yet revoked, and change nothing when it already is",
+          "contract": "HTTP 200 with the Key or Token, revoked_at set; a repeated call answers 200 with the same revoked_at; the credential no longer authenticates",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the fixture of the admin key list test"
+            ],
+            "pseudocode": "in internal/identity/admin_credential_routes_test.go, a table over (route, target): {DELETE /users/alice/keys/<live key>}, {DELETE /users/alice/tokens/<live token>}, {DELETE /users/alice/tokens/<expired token>}: first = send as the admin token; assert first.status == 200; assert first.revoked_at == clock.now; assert the credential's value -> 401 on GET /api/v1/user; advance the clock one hour; second = send as root's API key; assert second.status == 200 and second.revoked_at == first.revoked_at"
+          }
+        },
+        {
+          "id": "REQ-8.4",
+          "pattern": "unwanted",
+          "condition": "GET /users/:id/keys, GET /users/:id/tokens, DELETE /users/:id/keys/:key_id or DELETE /users/:id/tokens/:token_id is called with an API key whose user has role user, or with any PAT",
+          "action": "refuse the request and change nothing",
+          "contract": "HTTP 403 with error_type forbidden; no key or token is changed",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the fixture of the admin key list test",
+              "user bob with an API key; root has a PAT with every registered scope"
+            ],
+            "pseudocode": "in internal/identity/admin_credential_routes_test.go, a table over callers {alice's API key (role user) on her own id, bob's API key, a PAT of root holding all 32 scopes} and the four routes: assert r.status == 403; assert r.error.error_type == 'forbidden'; assert alice's key and token are not revoked"
+          }
+        },
+        {
+          "id": "REQ-8.5",
+          "pattern": "unwanted",
+          "condition": "an admin calls one of the four admin key and token routes with a selector that matches no user, or with a key_id or token_id that does not exist or belongs to a user other than the selected one",
+          "action": "refuse the request and change nothing",
+          "contract": "HTTP 404 with error_type not_found; no key or token is changed",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the fixture of the admin key list test",
+              "user bob with an API key and a PAT"
+            ],
+            "pseudocode": "in internal/identity/admin_credential_routes_test.go, as the admin token a table: {GET /users/nobody/keys}, {GET /users/nobody/tokens}, {DELETE /users/nobody/keys/<alice's key>}, {DELETE /users/alice/keys/zzzzzzzz}, {DELETE /users/alice/keys/<bob's key id>}, {DELETE /users/alice/tokens/zzzzzzzz}, {DELETE /users/alice/tokens/<bob's token id>}: assert r.status == 404; assert r.error.error_type == 'not_found'; assert bob's key and token are not revoked"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-9",
+      "title": "CLI commands for API keys",
+      "rationale": "A developer rotates and revokes the key on their machine without editing the config file by hand.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-9.1",
+          "pattern": "event_driven",
+          "condition": "the developer runs parley keys list",
+          "action": "send GET /api/v1/user/keys with the configured credential and print the response body on stdout",
+          "contract": "exit code 0; stdout holds the list document",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub (net/http/httptest) that records requests and answers canned bodies; PARLEY_CONFIG_DIR set to t.TempDir() with a config.toml holding endpoint_url, api_key and user_id"
+            ],
+            "pseudocode": "in internal/cli/keys_test.go: run(['keys','list']); assert the stub saw GET /api/v1/user/keys with Authorization: Bearer <configured key>; assert stdout is the canned list as JSON indented by 2 spaces; assert exit == 0"
+          }
+        },
+        {
+          "id": "REQ-9.2",
+          "pattern": "event_driven",
+          "condition": "the developer runs parley keys refresh with an API key configured",
+          "action": "send POST /api/v1/user/keys/<key_id>/refresh with the key_id taken from the configured API key, print the response on stdout, warn on stderr that the key will not be shown again, then replace api_key in the config file with the new key, keeping the file's other keys and mode 0600",
+          "contract": "exit code 0; stdout holds {key, key_id, expires_at}; the config file holds the new key",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub (net/http/httptest) that records requests and answers canned bodies; PARLEY_CONFIG_DIR set to t.TempDir() with a config.toml holding endpoint_url, api_key and user_id",
+              "the config file also holds an unknown key extra = 'x'"
+            ],
+            "pseudocode": "in internal/cli/keys_test.go: config api_key = 'parley_Ab3dE6gH_<32 chars>'; stub answers 200 {key:'parley_Ab3dE6gH_<new>', key_id:'Ab3dE6gH', expires_at:...}; run(['keys','refresh']); assert the stub saw POST /api/v1/user/keys/Ab3dE6gH/refresh; assert stdout == the response; assert stderr mentions that the key is not shown again; assert config.toml api_key == the new key, endpoint_url, user_id and an unknown key 'extra' are preserved, and the file mode is 0600; assert exit == 0"
+          }
+        },
+        {
+          "id": "REQ-9.3",
+          "pattern": "unwanted",
+          "condition": "the developer runs parley keys refresh or parley keys revoke and the configured credential is not an API key (a PAT, the admin token or a value of no known format)",
+          "action": "fail before sending any request",
+          "contract": "exit code 2; stderr holds an error envelope with error_type client_error; nothing on stdout; no request is sent",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub (net/http/httptest) that records requests and answers canned bodies; PARLEY_CONFIG_DIR set to t.TempDir() with a config.toml holding endpoint_url, api_key and user_id"
+            ],
+            "pseudocode": "in internal/cli/keys_test.go, a table over commands {keys refresh, keys revoke} and credentials {'parley_pat_k3x9q2mz_<32 chars>', 'parley_admin_<64 hex>', 'garbage'}: run; assert exit == 2; assert stderr is the error envelope with code 0 and error_type 'client_error'; assert stdout == ''; assert the stub saw no request; assert config.toml is unchanged"
+          }
+        },
+        {
+          "id": "REQ-9.4",
+          "pattern": "unwanted",
+          "condition": "parley keys refresh received the new key from the hub and the config file cannot be written or does not exist",
+          "action": "still print the response with the new key on stdout, warn on stderr that the new key was not saved, and exit with a client error",
+          "contract": "exit code 2; stdout holds the complete response including the new key; stderr holds the warning",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub (net/http/httptest) that records requests and answers canned bodies; PARLEY_CONFIG_DIR set to t.TempDir() with a config.toml holding endpoint_url, api_key and user_id"
+            ],
+            "pseudocode": "in internal/cli/keys_test.go, a table: {config directory made read-only after loading}, {no config file, credential and endpoint given by PARLEY_API_KEY and PARLEY_ENDPOINT_URL}: stub answers 200 with a new key; run(['keys','refresh']); assert stdout == the response including key; assert stderr mentions that the key was not saved; assert exit == 2; in the second row assert no config.toml was created"
+          }
+        },
+        {
+          "id": "REQ-9.5",
+          "pattern": "event_driven",
+          "condition": "the developer runs parley keys revoke with an API key configured",
+          "action": "send DELETE /api/v1/user/keys/<key_id> for the configured API key, print the response on stdout, clear api_key and user_id in the config file, and tell the user on stderr to run parley login",
+          "contract": "exit code 0; stdout holds the revoked Key; the config file no longer holds the credential; when the hub answers an error the config file is unchanged and the exit code is 1",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub (net/http/httptest) that records requests and answers canned bodies; PARLEY_CONFIG_DIR set to t.TempDir() with a config.toml holding endpoint_url, api_key and user_id"
+            ],
+            "pseudocode": "in internal/cli/keys_test.go: stub answers 200 with a Key whose revoked_at is set; run(['keys','revoke']); assert the stub saw DELETE /api/v1/user/keys/Ab3dE6gH; assert stdout == the Key; assert config.toml has no non-empty api_key or user_id and still has endpoint_url; assert 'parley login' in stderr; assert exit == 0; row with no config file and the credential from PARLEY_API_KEY: exit == 0 and no file is created; row where the stub answers 404: exit == 1, stderr is the hub's envelope, config.toml unchanged"
+          }
+        },
+        {
+          "id": "REQ-9.6",
+          "pattern": "event_driven",
+          "condition": "the operator runs parley admin keys list <user> or parley admin keys revoke <user> <key_id>",
+          "action": "send GET /api/v1/users/<user>/keys for list, or DELETE /api/v1/users/<user>/keys/<key_id> for revoke, with each argument percent-encoded as one path segment, and print the response body on stdout",
+          "contract": "exit code 0; stdout holds the list or the revoked Key; a wrong argument count is exit code 2 with error_type usage_error and no request",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub (net/http/httptest) that records requests and answers canned bodies; PARLEY_CONFIG_DIR set to t.TempDir() with a config.toml holding endpoint_url, api_key and user_id"
+            ],
+            "pseudocode": "in internal/cli/admin_keys_test.go: run(['admin','keys','list','alice']); assert the stub saw GET /api/v1/users/alice/keys; assert stdout == canned list; run(['admin','keys','list','a/b']); assert the request's escaped path is /api/v1/users/a%2Fb/keys; run(['admin','keys','revoke','alice','Ab3dE6gH']); assert the stub saw DELETE /api/v1/users/alice/keys/Ab3dE6gH; assert exit == 0 for both; table of wrong argument counts {admin keys list, admin keys revoke alice}: exit == 2, error_type 'usage_error', no request"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-10",
+      "title": "CLI commands for PATs",
+      "rationale": "Minting and adjusting tokens is what a developer does most often before handing work to an agent.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-10.1",
+          "pattern": "event_driven",
+          "condition": "the developer runs parley tokens create with --name and --permissions",
+          "action": "send POST /api/v1/user/tokens with name, permissions split at commas, paths (present only when --paths was given: every --paths value split at commas, in order) and expires (90 when the flag is absent), print the response on stdout and warn on stderr that the token value will not be shown again",
+          "contract": "exit code 0; stdout holds the Token with its token member; stderr holds the warning",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub (net/http/httptest) that records requests and answers canned bodies; PARLEY_CONFIG_DIR set to t.TempDir() with a config.toml holding endpoint_url, api_key and user_id"
+            ],
+            "pseudocode": "in internal/cli/tokens_test.go: run(['tokens','create','--name','ci','--permissions','git:read,changes:write','--paths','docs/**,src/*.go','--paths','README.md','--expires','30']); assert the stub saw POST /api/v1/user/tokens with JSON body {name:'ci', permissions:['git:read','changes:write'], paths:['docs/**','src/*.go','README.md'], expires:30} and Content-Type application/json; assert stdout == the canned Token including token; assert stderr mentions that the value is not shown again; assert exit == 0; row without --paths and --expires: the body has no paths member and expires == 90"
+          }
+        },
+        {
+          "id": "REQ-10.2",
+          "pattern": "unwanted",
+          "condition": "a parley tokens command is run without a required flag (--name or --permissions on create, --permissions on replace, add and remove), with a wrong number of arguments, or with an --expires that is not an integer",
+          "action": "fail before sending any request",
+          "contract": "exit code 2; stderr holds an error envelope with error_type usage_error; nothing on stdout; no request is sent",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub (net/http/httptest) that records requests and answers canned bodies; PARLEY_CONFIG_DIR set to t.TempDir() with a config.toml holding endpoint_url, api_key and user_id"
+            ],
+            "pseudocode": "in internal/cli/tokens_test.go, a table of argument lists: {tokens create --permissions git:read}, {tokens create --name ci}, {tokens create --name ci --permissions git:read --expires soon}, {tokens show}, {tokens revoke}, {tokens revoke a b}, {tokens replace k3x9q2mz}, {tokens add k3x9q2mz}, {tokens remove k3x9q2mz}, {tokens add --permissions git:read}: run; assert exit == 2; assert stderr is the error envelope with code 0 and error_type 'usage_error'; assert stdout == ''; assert the stub saw no request"
+          }
+        },
+        {
+          "id": "REQ-10.3",
+          "pattern": "event_driven",
+          "condition": "the developer runs parley tokens list, parley tokens show <token_id> or parley tokens revoke <token_id>",
+          "action": "send GET /api/v1/user/tokens for list, GET /api/v1/user/tokens/<token_id> for show, or DELETE /api/v1/user/tokens/<token_id> for revoke, and print the response body on stdout",
+          "contract": "exit code 0; stdout holds the list or the Token",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub (net/http/httptest) that records requests and answers canned bodies; PARLEY_CONFIG_DIR set to t.TempDir() with a config.toml holding endpoint_url, api_key and user_id"
+            ],
+            "pseudocode": "in internal/cli/tokens_test.go, a table over (args, method, path): {['tokens','list'], GET, /api/v1/user/tokens}, {['tokens','show','k3x9q2mz'], GET, /api/v1/user/tokens/k3x9q2mz}, {['tokens','revoke','k3x9q2mz'], DELETE, /api/v1/user/tokens/k3x9q2mz}: run; assert the stub saw exactly that request; assert stdout == the canned body indented by 2 spaces; assert exit == 0; row where the stub answers 404 not_found for show: exit == 1, stdout == '', stderr == the hub's envelope"
+          }
+        },
+        {
+          "id": "REQ-10.4",
+          "pattern": "event_driven",
+          "condition": "the developer runs parley tokens replace, add or remove with a token_id and --permissions",
+          "action": "send PUT (replace), PATCH (add) or DELETE (remove) to /api/v1/user/tokens/<token_id>/permissions with the body {permissions: the list split at commas}, print the response on stdout, and for replace and remove write a note on stderr when the returned Token has revoked_at set",
+          "contract": "exit code 0; stdout holds the Token after the change; stderr notes a revocation caused by replace or remove",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub (net/http/httptest) that records requests and answers canned bodies; PARLEY_CONFIG_DIR set to t.TempDir() with a config.toml holding endpoint_url, api_key and user_id"
+            ],
+            "pseudocode": "in internal/cli/tokens_test.go, a table over (args, method): {['tokens','replace','k3x9q2mz','--permissions','git:read,vars:read'], PUT}, {['tokens','add',...], PATCH}, {['tokens','remove',...], DELETE}: run; assert the stub saw method on /api/v1/user/tokens/k3x9q2mz/permissions with body {permissions:['git:read','vars:read']}; assert stdout == the canned Token; assert exit == 0; with a canned Token whose revoked_at is set: for replace and remove assert stderr mentions that the token was revoked; with revoked_at null assert stderr has no such note; row {['tokens','replace','k3x9q2mz','--permissions','']}: the body is {permissions:[]}"
+          }
+        },
+        {
+          "id": "REQ-10.5",
+          "pattern": "event_driven",
+          "condition": "the operator runs parley admin tokens list <user> or parley admin tokens revoke <user> <token_id>",
+          "action": "send GET /api/v1/users/<user>/tokens for list, or DELETE /api/v1/users/<user>/tokens/<token_id> for revoke, with each argument percent-encoded as one path segment, and print the response body on stdout",
+          "contract": "exit code 0; stdout holds the list or the revoked Token; a wrong argument count is exit code 2 with error_type usage_error and no request",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub (net/http/httptest) that records requests and answers canned bodies; PARLEY_CONFIG_DIR set to t.TempDir() with a config.toml holding endpoint_url, api_key and user_id"
+            ],
+            "pseudocode": "in internal/cli/admin_tokens_test.go: run(['admin','tokens','list','alice']); assert the stub saw GET /api/v1/users/alice/tokens; run(['admin','tokens','revoke','alice','k3x9q2mz']); assert the stub saw DELETE /api/v1/users/alice/tokens/k3x9q2mz; assert stdout == canned bodies and exit == 0; table of wrong argument counts {admin tokens list, admin tokens revoke alice}: exit == 2, error_type 'usage_error', no request; row where the stub answers 403 forbidden: exit == 1 and stderr == the hub's envelope"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "A developer mints a path-scoped token, an agent narrows it, and the developer revokes it",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "runs parley tokens create --name ci --permissions git:read,tokens:manage --paths 'docs/**'"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends POST /api/v1/user/tokens with the developer's API key"
+        },
+        {
+          "actor": "parleyd",
+          "action": "validates the body, stores the token with a hash of its secret and answers 201 with the token value"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints the Token with its value on stdout and warns on stderr that the value is not shown again"
+        },
+        {
+          "actor": "agent",
+          "action": "sends POST /api/v1/user/tokens with that token, asking for git:write"
+        },
+        {
+          "actor": "parleyd",
+          "action": "applies the subset rule and answers 403 insufficient_scope naming git:write"
+        },
+        {
+          "actor": "agent",
+          "action": "sends POST /api/v1/user/tokens asking for git:read with paths ['docs/api/*.md']"
+        },
+        {
+          "actor": "parleyd",
+          "action": "finds the permission held and the glob covered and answers 201 with a second token"
+        },
+        {
+          "actor": "developer",
+          "action": "runs parley tokens revoke with the first token's id"
+        },
+        {
+          "actor": "parleyd",
+          "action": "sets revoked_at on the first token and answers 200; the agent's next request with it is answered 401"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parley CLI binary code path (internal/cli)",
+          "parleyd HTTP server with authentication, scope check and token routes",
+          "transactional store"
+        ],
+        "setup": [
+          "a parleyd started in-process on 127.0.0.1:0 with a temporary data directory, as the tests of test/e2e start it",
+          "a user alice with a live API key, and a CLI config directory pointing at the hub with that key"
+        ],
+        "end_state": [
+          "parley tokens list shows two tokens of alice: the first with revoked_at set and paths ['docs/**'], the second live with permissions ['git:read'] and paths ['docs/api/*.md']",
+          "GET /api/v1/user/tokens with the first token's value answers 401",
+          "the refused request created no token"
+        ],
+        "pseudocode": "in test/e2e/tokens_test.go: out = cli('tokens','create','--name','ci','--permissions','git:read,tokens:manage','--paths','docs/**'); t1 = out.json; assert http(POST /api/v1/user/tokens, bearer t1.token, {name:'w', permissions:['git:write']}).status == 403; r2 = http(POST /api/v1/user/tokens, bearer t1.token, {name:'n', permissions:['git:read'], paths:['docs/api/*.md']}); assert r2.status == 201; cli('tokens','revoke', t1.token_id); assert http(GET /api/v1/user/tokens, bearer t1.token).status == 401; list = cli('tokens','list').json.items; assert len(list) == 2 and the item t1.token_id has revoked_at != null"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "A developer refreshes the API key on their machine",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "runs parley keys refresh"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "reads key_id from the configured API key and sends POST /api/v1/user/keys/<key_id>/refresh"
+        },
+        {
+          "actor": "parleyd",
+          "action": "replaces the key's secret, restarts its lifetime and answers 200 with the new key"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints the response and saves the new key to the config file"
+        },
+        {
+          "actor": "developer",
+          "action": "runs parley keys list"
+        },
+        {
+          "actor": "parleyd",
+          "action": "authenticates the new key and answers the list, which holds the same key_id"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parley CLI (internal/cli) with a real config file",
+          "parleyd HTTP server with authentication and key routes",
+          "transactional store"
+        ],
+        "setup": [
+          "a parleyd started in-process on 127.0.0.1:0 with a temporary data directory, as the tests of test/e2e start it",
+          "a user alice with a live API key saved in a CLI config file in a temporary PARLEY_CONFIG_DIR"
+        ],
+        "end_state": [
+          "the config file's api_key is the new key and differs from the old one",
+          "a request with the old key answers 401",
+          "parley keys list exits 0 and lists one key with the original key_id and revoked_at null"
+        ],
+        "pseudocode": "in test/e2e/keys_test.go: old = config.api_key; out = cli('keys','refresh').json; assert out.key != old and out.key_id == keyID(old); assert readConfig().api_key == out.key; assert http(GET /api/v1/user/keys, bearer old).status == 401; l = cli('keys','list'); assert l.exit == 0 and l.json.items[0].key_id == out.key_id"
+      }
+    },
+    {
+      "id": "PATH-3",
+      "title": "An operator revokes a user's token",
+      "steps": [
+        {
+          "actor": "operator",
+          "action": "runs parley admin tokens list alice with the admin token"
+        },
+        {
+          "actor": "parleyd",
+          "action": "passes the admin check, resolves the user selector and answers alice's tokens"
+        },
+        {
+          "actor": "operator",
+          "action": "runs parley admin tokens revoke alice <token_id>"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends DELETE /api/v1/users/alice/tokens/<token_id>"
+        },
+        {
+          "actor": "parleyd",
+          "action": "sets revoked_at on the token and answers 200; a later request with that token is answered 401"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parley CLI (internal/cli)",
+          "parleyd HTTP server with authentication, the admin check and the admin credential routes",
+          "transactional store"
+        ],
+        "setup": [
+          "a parleyd started in-process on 127.0.0.1:0 with a temporary data directory, as the tests of test/e2e start it",
+          "the hub's admin token; a user alice with a live PAT holding users:read"
+        ],
+        "end_state": [
+          "parley admin tokens list alice shows the token with revoked_at set",
+          "GET /api/v1/user with the token's value answers 401"
+        ],
+        "pseudocode": "in test/e2e/tokens_test.go: items = cli(--api-key admin, 'admin','tokens','list','alice').json.items; assert items[0].revoked_at == null; assert http(GET /api/v1/user, bearer pat).status == 200; r = cli(--api-key admin, 'admin','tokens','revoke','alice', items[0].token_id); assert r.exit == 0 and r.json.revoked_at != null; assert http(GET /api/v1/user, bearer pat).status == 401"
+      }
+    }
+  ],
+  "external_apis": [
+    {
+      "package": "github.com/spf13/cobra",
+      "version": "v1.10.2",
+      "verified": true,
+      "symbols": [
+        {
+          "name": "Command",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "type Command struct { Use string; Short string; Args PositionalArgs; RunE func(cmd *Command, args []string) error }"
+        },
+        {
+          "name": "Command.AddCommand",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) AddCommand(cmds ...*Command)"
+        },
+        {
+          "name": "Command.Flags",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) Flags() *pflag.FlagSet"
+        },
+        {
+          "name": "Command.MarkFlagRequired",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) MarkFlagRequired(name string) error"
+        },
+        {
+          "name": "ExactArgs",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func ExactArgs(n int) PositionalArgs"
+        },
+        {
+          "name": "Command.SetArgs",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) SetArgs(a []string)"
+        }
+      ]
+    },
+    {
+      "package": "github.com/spf13/pflag",
+      "version": "v1.0.10",
+      "verified": true,
+      "symbols": [
+        {
+          "name": "FlagSet.StringVar",
+          "import_path": "github.com/spf13/pflag",
+          "signature": "func (f *FlagSet) StringVar(p *string, name string, value string, usage string)"
+        },
+        {
+          "name": "FlagSet.StringSliceVar",
+          "import_path": "github.com/spf13/pflag",
+          "signature": "func (f *FlagSet) StringSliceVar(p *[]string, name string, value []string, usage string)"
+        },
+        {
+          "name": "FlagSet.IntVar",
+          "import_path": "github.com/spf13/pflag",
+          "signature": "func (f *FlagSet) IntVar(p *int, name string, value int, usage string)"
+        }
+      ]
+    }
+  ]
+}

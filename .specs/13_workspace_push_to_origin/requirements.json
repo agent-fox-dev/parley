@@ -1,0 +1,791 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "13",
+  "spec_name": "workspace_push_to_origin",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "The push request",
+      "rationale": "A caller names one branch in the path and may ask for force in the body; what the hub understands from both must not depend on the client.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "a caller with write access submits POST /api/v1/workspaces/:slug/branches/:name/push with no body, an empty body, `{}`, `{\"force\": false}`, `{\"force\": true}` or an object that has members other than `force`",
+          "action": "take `force` as true only when the body is an object whose `force` member is the JSON value true, take it as false in every other listed case, and ignore the other members",
+          "contract": "the push is carried out with that force value; the `force` member of the `parley.workspace.push` event shows it",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a ready repository workspace `demo` cloned from a test origin that accepts pushes, with the caller as its owner",
+              "the push operation is replaced by a stub that answers `pushed`"
+            ],
+            "pseudocode": "in internal/workspace/push_test.go, a table over the bodies {none, empty, `{}`, `{\"force\":false}`, `{\"force\":true}`, `{\"force\":true,\"extra\":1}`, `{\"extra\":1}`}: call the push handler with a stubbed push operation that records the force flag it is given; assert status 200 and that the recorded flag is true for the two bodies with `force` true and false for the others"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "unwanted",
+          "condition": "the body is not empty and is not a JSON object, or its `force` member is not a JSON boolean",
+          "action": "refuse the request",
+          "contract": "HTTP 400 with `error_type` `invalid_request`; origin is not contacted, no branch and no recorded origin head changes, and no event is written",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a ready repository workspace `demo` cloned from a test origin that accepts pushes, with the caller as its owner"
+            ],
+            "pseudocode": "in internal/workspace/push_test.go, a table over the bodies {`[]`, `\"x\"`, `5`, `{` (malformed), `{\"force\":\"true\"}`, `{\"force\":1}`, `{\"force\":null}`}: r = push(body); assert r.status == 400 and r.json.error.error_type == 'invalid_request'; assert the stubbed push operation was not called and the event count is unchanged"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "event_driven",
+          "condition": "the `:name` path segment contains percent-encoded characters",
+          "action": "percent-decode the segment exactly once and use the result as the branch name",
+          "contract": "the `branch` member of the answer is the once-decoded name: `fix%2F42` gives `fix/42` and `a%2525b` gives `a%25b`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready repository workspace `demo` cloned from a test origin that accepts pushes, with the caller as its owner",
+              "the hub's copy has the branches `fix/42` and `a%25b`"
+            ],
+            "pseudocode": "in internal/workspace/push_test.go, through the hub's real router, a table {path segment `fix%2F42` with hub branch `fix/42`, path segment `a%2525b` with hub branch `a%25b`}: r = POST the route; assert r.status == 200 and r.json.branch == the hub branch name; assert origin now has that branch"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "unwanted",
+          "condition": "the decoded branch name is not a valid branch name under the branch-name rule of WS-FR-011",
+          "action": "refuse the request",
+          "contract": "HTTP 400 with `error_type` `invalid_request`; origin is not contacted, no branch and no recorded origin head changes, and no event is written",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a ready repository workspace `demo` cloned from a test origin that accepts pushes, with the caller as its owner"
+            ],
+            "pseudocode": "in internal/workspace/push_test.go, a table over the decoded names {`a..b`, `-x`, `x.lock`, `a b`, `@`, `a//b`, `.hidden`, `x/`} sent percent-encoded: assert status 400 and `error_type` `invalid_request`; assert the stubbed push operation was not called"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "unwanted",
+          "condition": "the caller is a member of the workspace's organization without write access, or authenticates with a PAT that lacks the scope `workspaces:write`, or has no access to the workspace",
+          "action": "refuse the request before reading the body",
+          "contract": "HTTP 403 with `error_type` `forbidden` for the member; HTTP 403 with `error_type` `insufficient_scope` for the PAT without the scope; HTTP 404 with `error_type` `not_found` for the caller without access; origin is not contacted, no branch and no recorded origin head changes, and no event is written",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready repository workspace `demo` cloned from a test origin that accepts pushes, with the caller as its owner"
+            ],
+            "pseudocode": "in internal/workspace/push_test.go, through the hub's real router and access rule, a table over the callers {org member with an API key, owner with a PAT holding only `workspaces:read`, a user outside the organization}, each sending the invalid body `[]`: assert 403 forbidden, 403 insufficient_scope, 404 not_found in that order; then the owner with an API key, the owner with a PAT holding `workspaces:write` and the admin token each send no body: assert 200"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Refusals before the push",
+      "rationale": "Some branches and some workspaces must never be pushed by this route; refusing them before origin is contacted keeps the refusal free of side effects.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "unwanted",
+          "condition": "the workspace's status is not `ready`, or a reclone, archive or delete is running on it",
+          "action": "refuse the request with the state guard's answer",
+          "contract": "HTTP 409 with `error_type` `workspace_busy` for `pending`, `cloning` and a running reclone, archive or delete; `workspace_not_ready` for `failed`; `workspace_archived` for `archived`; origin is not contacted, no branch and no recorded origin head changes, and no event is written",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a repository workspace record put in each state through the store"
+            ],
+            "pseudocode": "in internal/workspace/push_test.go, a table over the workspace states {pending, cloning, ready with the maintenance marker set, failed, archived}: assert status 409 and the `error_type` of the contract; assert the stubbed push operation was not called"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "unwanted",
+          "condition": "the workspace is a fork",
+          "action": "refuse the request",
+          "contract": "HTTP 400 with `error_type` `fork_has_no_origin`; origin is not contacted, no branch and no recorded origin head changes, and no event is written",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/push_test.go: with a workspace record of kind `fork` whose parent is ready, push branch `work`; assert status 400 and `error_type` `fork_has_no_origin`; assert the stubbed push operation was not called"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "unwanted",
+          "condition": "the workspace's mode is `carry_patch` and the branch is the workspace's `integration_branch`",
+          "action": "refuse the request, with and without `force`",
+          "contract": "HTTP 403 with `error_type` `integration_branch`; origin is not contacted, no branch and no recorded origin head changes, and no event is written",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/push_test.go, a table over force {false, true}: with a carry-patch workspace whose `integration_branch` is `deploy`, push `deploy`; assert status 403 and `error_type` `integration_branch`; and with a standard workspace that has a branch `deploy`, assert the push of `deploy` is not refused"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "unwanted",
+          "condition": "the workspace's mode is `carry_patch` and the branch is the branch of a registered patch that is not deleted",
+          "action": "refuse the request, with and without `force`",
+          "contract": "HTTP 403 with `error_type` `patch_branch`; origin is not contacted, no branch and no recorded origin head changes, and no event is written",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/push_test.go, a table over force {false, true}: with a carry-patch workspace and a patch-branch lookup that reports `patch/a` as registered and `patch/gone` as not registered, push `patch/a`; assert status 403 and `error_type` `patch_branch`; assert the push of `patch/gone` is not refused; and with no lookup registered assert the push of `patch/a` is not refused"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "unwanted",
+          "condition": "the workspace's mode is `carry_patch` and the patch-branch lookup returns an error",
+          "action": "refuse the request and push nothing",
+          "contract": "HTTP 503 with `error_type` `unavailable`; origin is not contacted, no branch and no recorded origin head changes, and no event is written",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/push_test.go: with a carry-patch workspace and a patch-branch lookup that returns an error, push `feature`; assert status 503 and `error_type` `unavailable`; assert the stubbed push operation was not called"
+          }
+        },
+        {
+          "id": "REQ-2.6",
+          "pattern": "unwanted",
+          "condition": "`force` is true and at least one of the workspace's protected-branch globs matches the whole branch name, where `*` matches any run of characters except `/`, `**` matches any run of characters including `/` and every other character matches itself",
+          "action": "refuse the request",
+          "contract": "HTTP 403 with `error_type` `protected_branch`; origin is not contacted, no branch and no recorded origin head changes, and no event is written",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the workspace's stored setting `protected_branches` holds the row's globs, on a settings registry filled by RegisterSettingKeys of package 11; for the last row the workspace has no stored `protected_branches` value"
+            ],
+            "pseudocode": "in internal/workspace/push_test.go, a table of (globs, branch, protected?) with force true: ([`main`], `main`, yes); ([`main`], `main2`, no); ([`main`], `x/main`, no); ([`release/*`], `release/1.x`, yes); ([`release/*`], `release/1/x`, no); ([`release/**`], `release/1/x`, yes); ([`**`], `a/b/c`, yes); ([`*`], `a/b`, no); ([], `main`, no); (globs not set, the default branch, yes): assert status 403 and `error_type` `protected_branch` exactly for the rows marked yes, and that the stubbed push operation is called for the others"
+          }
+        },
+        {
+          "id": "REQ-2.7",
+          "pattern": "unwanted",
+          "condition": "the hub's copy of the repository has no branch `refs/heads/<name>`",
+          "action": "refuse the request",
+          "contract": "HTTP 404 with `error_type` `branch_not_found`; origin is not contacted, no branch and no recorded origin head changes, and no event is written",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready repository workspace `demo` cloned from a test origin that accepts pushes, with the caller as its owner"
+            ],
+            "pseudocode": "in internal/workspace/push_test.go: with a real copy that has no branch `nope`, push `nope` with force false; assert status 404 and `error_type` `branch_not_found`; assert origin received no connection (the test origin's request counter is unchanged)"
+          }
+        },
+        {
+          "id": "REQ-2.8",
+          "pattern": "ubiquitous",
+          "action": "for any request that fails more than one check, answer with the failure of the first check in this order: body, branch name, workspace status, fork, integration branch or patch branch, forced push of a protected branch, branch exists",
+          "contract": "the answer is that of the earliest failing check",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/push_test.go, a table of requests that each fail two adjacent checks: (body `[]` and name `a..b`) gives 400 invalid_request for the body; (name `a..b` on an archived workspace) gives 400 invalid_request; (archived carry-patch workspace, integration branch) gives 409 workspace_archived; (failed status on a record of kind fork) gives 409 workspace_not_ready; (carry-patch workspace, force true, integration branch that also matches a protected glob) gives 403 integration_branch; (force true, protected glob matches, branch missing) gives 403 protected_branch; (force false, branch missing) gives 404 branch_not_found"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Fast-forward push",
+      "rationale": "Without force a push may only add commits to origin's branch, so it can never discard work the hub has not seen.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "a request passes every check, `force` is false, and origin has no such branch or origin's branch is an ancestor of the hub's",
+          "action": "read the head of `refs/heads/<name>` once, push that commit to the same branch on origin and answer the result `pushed`",
+          "contract": "HTTP 200 with body {branch: the branch name, sha: the 40-character id of the pushed commit, remote: \"origin\", remote_url: the workspace's git_url without userinfo, result: string} with result `pushed`; origin's branch is at `sha`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready repository workspace `demo` cloned from a test origin that accepts pushes, with the caller as its owner",
+              "commits are added to the hub's copy with `git` on disk"
+            ],
+            "pseudocode": "in internal/workspace/push_test.go, with the real push operation, a table {hub branch `feature` that origin lacks; hub `feature` two commits ahead of origin's `feature`; the protected default branch `main` one commit ahead of origin's}: r = push(branch, no body); assert r.status == 200; assert r.json == {branch, sha: hub head, remote: 'origin', remote_url: the test origin's URL, result: 'pushed'}; assert the test origin's branch head == r.json.sha"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "event_driven",
+          "condition": "a request passes every check and origin's branch is already at the hub's head of that branch, with `force` false or true",
+          "action": "change nothing on origin and answer the result `up_to_date`",
+          "contract": "HTTP 200 with body {branch: the branch name, sha: the 40-character id of the pushed commit, remote: \"origin\", remote_url: the workspace's git_url without userinfo, result: string} with result `up_to_date`; origin's branch is unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready repository workspace `demo` cloned from a test origin that accepts pushes, with the caller as its owner"
+            ],
+            "pseudocode": "in internal/workspace/push_test.go, a table over force {false, true} on the unprotected branch `feature` whose head equals origin's: assert status 200 and result `up_to_date`; assert origin's branch head is unchanged; and with force true and no recorded origin head for the branch, assert the same answer"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "unwanted",
+          "condition": "`force` is false and origin's branch is not an ancestor of the hub's, because the two diverged or origin's branch is strictly ahead",
+          "action": "leave origin's branch as it is and refuse the push",
+          "contract": "HTTP 409 with `error_type` `non_fast_forward`; the message names the recorded origin head of the branch when one is recorded and says to sync or to push with force; origin's branch and the recorded origin head are unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready repository workspace `demo` cloned from a test origin that accepts pushes, with the caller as its owner",
+              "the test origin's branch is moved with `git` on disk after the clone"
+            ],
+            "pseudocode": "in internal/workspace/push_test.go, a table {origin's `feature` has a commit the hub lacks and the hub has one origin lacks; the hub's `feature` is one commit behind origin's}: r = push('feature'); assert r.status == 409 and `error_type` `non_fast_forward`; assert the message contains the recorded origin head, the word `sync` and the word `force`; assert origin's branch head and the recorded origin head are unchanged"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "ubiquitous",
+          "action": "for any push, send exactly the one ref `refs/heads/<name>` to origin and no other branch and no tag",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/gitrepo/push_test.go: with a hub copy holding the branches `a` and `b` and the tag `v1` that origin lacks, run the push operation for `a`; assert origin has `refs/heads/a`; assert origin has neither `refs/heads/b` nor `refs/tags/v1`"
+          }
+        },
+        {
+          "id": "REQ-3.5",
+          "pattern": "event_driven",
+          "condition": "the branch is protected and `force` is false",
+          "action": "push it fast-forward only, as any other branch",
+          "contract": "the answers of a non-forced push; never `protected_branch`",
+          "check": {
+            "same_as": "REQ-3.1"
+          }
+        },
+        {
+          "id": "REQ-3.6",
+          "pattern": "ubiquitous",
+          "action": "for any push, authenticate to origin with the workspace's origin credential as resolved from the workspace's secrets at the time of that push",
+          "contract": "origin receives HTTP Basic authentication with user `x-token-auth` and the token when `GIT_PAT` is set, else with `GIT_USERNAME` and `GIT_PASSWORD` when both are set, else none; a secret changed between two pushes is used by the second",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready repository workspace `demo` cloned from a test origin that accepts pushes, with the caller as its owner"
+            ],
+            "pseudocode": "in internal/workspace/push_test.go, with a test origin that requires Basic authentication, a table {`GIT_PAT` = t1 with origin accepting x-token-auth:t1; `GIT_USERNAME` = u and `GIT_PASSWORD` = p with origin accepting u:p}: assert the push answers 200; then make origin accept only x-token-auth:t2, store `GIT_PAT` = t2 as the workspace secret and push a new commit; assert 200 without restarting the hub; assert the credential appears neither in the copy's git configuration nor in the arguments of the `git` process"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Forced push with a lease",
+      "rationale": "A rewritten branch must be publishable, but never at the price of commits that reached origin after the hub last looked.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "`force` is true, origin's branch is at the origin head the hub last recorded for it, and that commit is not an ancestor of the hub's head",
+          "action": "replace origin's branch with the hub's head and answer the result `forced`",
+          "contract": "HTTP 200 with body {branch: the branch name, sha: the 40-character id of the pushed commit, remote: \"origin\", remote_url: the workspace's git_url without userinfo, result: string} with result `forced`; origin's branch is at `sha`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready repository workspace `demo` cloned from a test origin that accepts pushes, with the caller as its owner"
+            ],
+            "pseudocode": "in internal/workspace/push_test.go: rewrite the hub's unprotected `feature` so that its head is not a descendant of origin's head, with the recorded origin head equal to origin's head; r = push('feature', {force: true}); assert r.status == 200 and r.json.result == 'forced'; assert origin's branch head == r.json.sha"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "event_driven",
+          "condition": "`force` is true and the push is a fast-forward of origin's branch from the recorded origin head, or creates a branch for which no origin head is recorded and which origin does not have",
+          "action": "push the hub's head and answer the result `pushed`",
+          "contract": "HTTP 200 with body {branch: the branch name, sha: the 40-character id of the pushed commit, remote: \"origin\", remote_url: the workspace's git_url without userinfo, result: string} with result `pushed`; origin's branch is at `sha`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready repository workspace `demo` cloned from a test origin that accepts pushes, with the caller as its owner"
+            ],
+            "pseudocode": "in internal/workspace/push_test.go, a table with force true {hub `feature` one commit ahead of origin's and of the recorded origin head; hub branch `new` that origin lacks and that has no recorded origin head}: assert status 200 and result `pushed`; assert origin's branch head == sha"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "unwanted",
+          "condition": "`force` is true and origin's branch is neither at the hub's head nor in the state the lease names: it moved since the hub last saw it, it exists although the hub never recorded an origin head for it, or it was deleted although the hub recorded one",
+          "action": "overwrite nothing on origin and refuse the push",
+          "contract": "HTTP 409 with `error_type` `origin_moved`; origin's branch (or its absence) and the recorded origin head are unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready repository workspace `demo` cloned from a test origin that accepts pushes, with the caller as its owner",
+              "origin is changed with `git` on disk after the clone; recorded origin heads are set or removed with SetOriginHead and DeleteOriginHead of internal/gitrepo on the hub's copy"
+            ],
+            "pseudocode": "in internal/workspace/push_test.go, a table with force true on a rewritten hub `feature` {origin's `feature` got a new commit after the last recorded head; no origin head is recorded and origin has `feature` at another commit; an origin head is recorded and origin's `feature` was deleted}: r = push; assert r.status == 409 and `error_type` `origin_moved`; assert origin's ref state and the recorded origin head are exactly as before the call"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "ubiquitous",
+          "action": "for any forced push, state the expected value of origin's branch explicitly as the lease and never send a force that origin would apply whatever its branch holds",
+          "check": {
+            "same_as": "REQ-4.3"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Failures of the push itself",
+      "rationale": "A caller can act on a failed push only when the answer says which of origin, the credential, the network or the clock stopped it.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "unwanted",
+          "condition": "origin refuses the update of the branch itself, for example by a branch rule or a server-side hook",
+          "action": "report origin's refusal with origin's reason",
+          "contract": "HTTP 422 with `error_type` `origin_rejected`; the message carries origin's reason; origin's branch and the recorded origin head are unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready repository workspace `demo` cloned from a test origin that accepts pushes, with the caller as its owner"
+            ],
+            "pseudocode": "in internal/workspace/push_test.go: with a test origin whose hook refuses every update with the text `branch is locked`, push a fast-forward of `feature`; assert status 422 and `error_type` `origin_rejected`; assert the message contains `branch is locked`; assert origin's branch head and the recorded origin head are unchanged"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "unwanted",
+          "condition": "origin asks for authentication and the workspace has no origin credential, or origin rejects the stored credential",
+          "action": "report that origin could not authenticate the hub and say which of the two cases applies",
+          "contract": "HTTP 502 with `error_type` `origin_unauthenticated`; the message says either that the workspace has no credential or that origin rejected the stored credential; origin's branch and the recorded origin head are unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready repository workspace `demo` cloned from a test origin that accepts pushes, with the caller as its owner"
+            ],
+            "pseudocode": "in internal/workspace/push_test.go, a table over the test origin's behaviour after the clone, each pushing a fast-forward of `feature`: (requires Basic authentication, workspace without credential) gives 502 origin_unauthenticated with a message containing `no credential`; (requires Basic authentication, stored `GIT_PAT` not accepted) gives 502 origin_unauthenticated with a message containing `rejected`; (answers HTTP 403 to the push) gives 502 origin_forbidden; (answers HTTP 404) gives 502 origin_not_found; (listener closed) gives 502 origin_unreachable; (serves a certificate the hub does not trust) gives 502 origin_unreachable; (answers HTTP 500) gives 502 upstream_error; for every row assert the recorded origin head is unchanged"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "unwanted",
+          "condition": "origin answers that the credential may not push to the repository",
+          "action": "report the refusal",
+          "contract": "HTTP 502 with `error_type` `origin_forbidden`; origin's branch and the recorded origin head are unchanged",
+          "check": {
+            "same_as": "REQ-5.2"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "unwanted",
+          "condition": "origin has no repository at the workspace's `git_url`, or the credential cannot see it",
+          "action": "report that the repository was not found",
+          "contract": "HTTP 502 with `error_type` `origin_not_found`; origin's branch and the recorded origin head are unchanged",
+          "check": {
+            "same_as": "REQ-5.2"
+          }
+        },
+        {
+          "id": "REQ-5.5",
+          "pattern": "unwanted",
+          "condition": "origin cannot be reached because name resolution, the connection or TLS fails",
+          "action": "report that origin is unreachable",
+          "contract": "HTTP 502 with `error_type` `origin_unreachable`; origin's branch and the recorded origin head are unchanged",
+          "check": {
+            "same_as": "REQ-5.2"
+          }
+        },
+        {
+          "id": "REQ-5.6",
+          "pattern": "unwanted",
+          "condition": "the push fails in any way not named by another criterion of this requirement or by `non_fast_forward` and `origin_moved`",
+          "action": "report an upstream failure",
+          "contract": "HTTP 502 with `error_type` `upstream_error`; origin's branch and the recorded origin head are unchanged",
+          "check": {
+            "same_as": "REQ-5.2"
+          }
+        },
+        {
+          "id": "REQ-5.7",
+          "pattern": "unwanted",
+          "condition": "the push has not finished when its deadline of 2 minutes passes",
+          "action": "end the `git` process and report a timeout",
+          "contract": "HTTP 504 with `error_type` `origin_timeout`, answered no later than 5 seconds after the deadline; no `git` process of the push remains; the recorded origin head is unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready repository workspace `demo` cloned from a test origin that accepts pushes, with the caller as its owner"
+            ],
+            "pseudocode": "in internal/workspace/push_test.go: build the handler with a push deadline of 300 ms and a test origin that stalls after accepting the connection; t0 = now; r = push('feature'); assert r.status == 504 and `error_type` `origin_timeout`; assert now - t0 < 5.3 s; assert the push operation's child process has exited; assert the recorded origin head is unchanged"
+          }
+        },
+        {
+          "id": "REQ-5.8",
+          "pattern": "unwanted",
+          "condition": "the origin credential cannot be read from the workspace's secrets",
+          "action": "fail the request without contacting origin and without falling back to an anonymous push",
+          "contract": "HTTP 500 with `error_type` `internal`; origin is not contacted, no branch and no recorded origin head changes, and no event is written",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/push_test.go: with a credential resolver that returns an error, push `feature`; assert status 500 and `error_type` `internal`; assert the stubbed push operation was not called and the event count is unchanged"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Records after a push",
+      "rationale": "The hub's memory of origin and the audit record must both reflect every push that reached origin, whoever was still listening.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "a push ends with the result `pushed`, `forced` or `up_to_date`",
+          "action": "record the pushed commit as the origin head of that branch, by setting the ref refs/remotes/origin/<name> of the hub's copy, and write the workspace's origin_head_sha for the default branch in the same store transaction as the push event",
+          "contract": "the ref refs/remotes/origin/<name> of the hub's copy, which is the recorded origin head of the branch, resolves to `sha`; for the default branch the workspace's `origin_head_sha` equals `sha`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready repository workspace `demo` cloned from a test origin that accepts pushes, with the caller as its owner"
+            ],
+            "pseudocode": "in internal/workspace/push_test.go, a table {fast-forward of the default branch `main` (pushed); forced push of `feature` (forced); `feature` already on origin with no recorded origin head (up_to_date)}: after the 200, assert gitrepo's OriginHead of the branch in the hub's copy == r.json.sha; for `main` assert the workspace record's `origin_head_sha` == r.json.sha"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "ubiquitous",
+          "action": "for any push that fails, leave the recorded origin head of the branch as it was before the call",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready repository workspace `demo` cloned from a test origin that accepts pushes, with the caller as its owner"
+            ],
+            "pseudocode": "in internal/workspace/push_test.go, a table over the failures {non_fast_forward, origin_moved, origin_rejected, origin_timeout} produced as in the checks of those answers: read refs/remotes/origin/<name> of the hub's copy before and after the call (absent counts as a value); assert they are equal"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "event_driven",
+          "condition": "a push handed to origin succeeds",
+          "action": "write exactly one `parley.workspace.push` event",
+          "contract": "one event of type `parley.workspace.push` with `workspace` the slug, the caller as actor, `resource_type` `branch`, `resource_id` the branch name and metadata {branch, sha, force, ok, remote_url} with ok true and `result` equal to the answer's result, and no `error_type`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready repository workspace `demo` cloned from a test origin that accepts pushes, with the caller as its owner"
+            ],
+            "pseudocode": "in internal/workspace/push_test.go, with the real event log, a table over the results {pushed, forced, up_to_date}: n = count(events of type parley.workspace.push); push; assert the count is n + 1; assert the new event's workspace, actor, resource_type == 'branch', resource_id == branch and metadata == {branch, sha, force, ok: true, remote_url, result} with the values of the answer and the request's force"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "event_driven",
+          "condition": "a push handed to origin fails with `non_fast_forward`, `origin_moved`, `origin_rejected`, `origin_unauthenticated`, `origin_forbidden`, `origin_not_found`, `origin_unreachable`, `upstream_error` or `origin_timeout`",
+          "action": "write exactly one `parley.workspace.push` event",
+          "contract": "one event of type `parley.workspace.push` with `workspace` the slug, the caller as actor, `resource_type` `branch`, `resource_id` the branch name and metadata {branch, sha, force, ok, remote_url} with ok false and `error_type` equal to the answer's `error_type`, and no `result`; `sha` is the hub's head that was offered",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready repository workspace `demo` cloned from a test origin that accepts pushes, with the caller as its owner"
+            ],
+            "pseudocode": "in internal/workspace/push_test.go, with the real event log, a table over the nine failures produced as in the checks of those answers: n = count(push events); push; assert the count is n + 1; assert the new event's metadata.ok == false, metadata.error_type == r.json.error.error_type, metadata.sha == the hub's branch head and that metadata has no member `result`"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "unwanted",
+          "condition": "a request is refused before the push: by access, body, branch name, workspace status, fork, integration branch, patch branch, protected branch, a missing branch or an unreadable credential",
+          "action": "write no event",
+          "contract": "the event log holds no new `parley.workspace.push` event after the refusal",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready repository workspace `demo` cloned from a test origin that accepts pushes, with the caller as its owner"
+            ],
+            "pseudocode": "in internal/workspace/push_test.go, with the real event log, a table with one request per refusal named in the condition: n = count(push events); send the request; assert the answer is the refusal; assert count(push events) == n"
+          }
+        },
+        {
+          "id": "REQ-6.6",
+          "pattern": "event_driven",
+          "condition": "the caller disconnects while the push is running",
+          "action": "let the push run to completion or to its deadline and then write the origin head and the event as for a connected caller",
+          "contract": "origin's branch is at the pushed commit, the recorded origin head equals it and one `parley.workspace.push` event with ok true exists, although no response was delivered",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready repository workspace `demo` cloned from a test origin that accepts pushes, with the caller as its owner"
+            ],
+            "pseudocode": "in internal/workspace/push_test.go: with a test origin that delays its answer by 500 ms, start the push over a real connection and cancel the client's request after 100 ms; poll up to 5 s; assert origin's `feature` == the hub head; assert the recorded origin head == the hub head; assert exactly one new push event with ok true; then repeat with an origin that stalls and a handler deadline of 300 ms and assert exactly one new event with ok false and error_type `origin_timeout`"
+          }
+        },
+        {
+          "id": "REQ-6.7",
+          "pattern": "unwanted",
+          "condition": "origin accepted the push and the transaction that writes origin_head_sha and the event cannot be committed to the store",
+          "action": "report a hub failure, put the ref refs/remotes/origin/<name> back to the value it had before the call, and leave origin as it is",
+          "contract": "HTTP 500 with `error_type` `internal`; the recorded origin head is unchanged and no event is written",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/push_test.go: with a stubbed push operation that answers `pushed` and a store whose transaction fails, push `feature`; assert status 500 and `error_type` `internal`; assert refs/remotes/origin/feature of the hub's copy has the value it had before the call (absent when it was absent), origin_head_sha is unchanged and the event count is unchanged"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "Scrubbed messages",
+      "rationale": "Origin's own error text can repeat the URL it was called with; nothing the hub passes on may carry the credential.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "ubiquitous",
+          "action": "for any error message this route returns and any text it writes into an event, replace every occurrence of the origin credential's value by `[redacted]` and remove the userinfo from every URL",
+          "contract": "neither the token nor the password of the workspace's origin credential occurs in the response or in the event; `https://user:pass@host/path` reads `https://host/path`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready repository workspace `demo` cloned from a test origin that accepts pushes, with the caller as its owner"
+            ],
+            "pseudocode": "in internal/workspace/push_test.go: store `GIT_PAT` = `tok-SECRET-123`; make the test origin's hook refuse with the text `denied for tok-SECRET-123 at https://x-token-auth:tok-SECRET-123@git.example/r.git`; r = push('feature'); assert r.status == 422; assert the message contains `[redacted]` and `https://git.example/r.git`; assert neither the response body nor the serialized push event contains `tok-SECRET-123`; repeat with `GIT_USERNAME` and `GIT_PASSWORD` and assert the password does not occur"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "event_driven",
+          "condition": "the text of an error message of this route is longer than 1024 characters after the replacements",
+          "action": "cut the message to at most 1024 characters, ending on a character boundary",
+          "contract": "the `message` member of the error has at most 1024 characters and is valid UTF-8",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready repository workspace `demo` cloned from a test origin that accepts pushes, with the caller as its owner"
+            ],
+            "pseudocode": "in internal/workspace/push_test.go: make the test origin's hook refuse with a text of 5000 characters that includes multi-byte characters; r = push('feature'); assert r.status == 422; assert the character count of r.json.error.message <= 1024 and that it is valid UTF-8"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "ubiquitous",
+          "action": "for any answer and any event of this route, give `remote_url` as the workspace's `git_url` with URL userinfo removed",
+          "contract": "`remote_url` is `https://host/path` for a stored `https://user:pass@host/path` and for a stored `https://host/path`; a stored `git@host:path` is given unchanged",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/push_test.go, a table over stored `git_url` values written straight to the store {`https://u:p@git.example/a.git`, `https://git.example/a.git`, `git@git.example:org/a.git`} with a stubbed push operation: assert r.json.remote_url and the event's metadata.remote_url are `https://git.example/a.git`, `https://git.example/a.git` and `git@git.example:org/a.git`"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "The `parley workspace push` command",
+      "rationale": "Publishing a branch is a one-line step in a developer's or an agent's script.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "a user runs `parley workspace push <slug> <branch>` without `--force`",
+          "action": "send POST /api/v1/workspaces/<slug>/branches/<branch>/push with the slug and the branch each percent-encoded as one path segment and the body `{\"force\": false}`, and print the hub's answer",
+          "contract": "exit status 0; stdout is the push answer as one JSON document; stderr is empty",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/workspace_test.go: against an httptest server that records the request and answers 200 with a push answer, run `workspace push demo fix/42`; assert the request's method is POST, its escaped path is `/api/v1/workspaces/demo/branches/fix%2F42/push` and its body decodes to {force: false}; assert exit 0, stdout decodes to the answer and stderr is empty"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "event_driven",
+          "condition": "a user runs the command with `--force`",
+          "action": "write a warning on stderr that origin's branch may be replaced, then send the request with the body `{\"force\": true}` and print the hub's answer",
+          "contract": "exit status 0; stdout is the push answer alone; stderr holds the warning, written before the request is sent",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/workspace_test.go: against an httptest server whose handler records what the command's stderr holds at the moment the request arrives, run `workspace push demo main --force`; assert the body decodes to {force: true}; assert the stderr captured at request time already contains `may be replaced`; assert stdout decodes to the answer and nothing else"
+          }
+        },
+        {
+          "id": "REQ-8.3",
+          "pattern": "unwanted",
+          "condition": "the hub answers the push with an error",
+          "action": "print the hub's error envelope on stderr as received",
+          "contract": "exit status 1; stdout is empty; stderr holds the envelope with the hub's `error_type`",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/workspace_test.go, a table over hub answers {409 non_fast_forward, 409 origin_moved, 403 protected_branch, 504 origin_timeout}: run the command; assert exit 1; assert stdout is empty; assert stderr decodes to an envelope whose code and error_type are the hub's"
+          }
+        },
+        {
+          "id": "REQ-8.4",
+          "pattern": "unwanted",
+          "condition": "the command is given fewer or more than two arguments",
+          "action": "report a usage error and send nothing",
+          "contract": "exit status 2; stderr holds an envelope with `error_type` `usage_error`; the hub receives no request",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/workspace_test.go, a table over the argument lists {none, `demo`, `demo main extra`}: run the command against an httptest server; assert exit 2 and `error_type` `usage_error` on stderr; assert the server received no request"
+          }
+        },
+        {
+          "id": "REQ-8.5",
+          "pattern": "ubiquitous",
+          "action": "give the push request a timeout of 3 minutes in place of the client's default of 30 seconds",
+          "contract": "an answer the hub gives after more than 30 seconds and less than 3 minutes is printed; a request still unanswered after 3 minutes ends with `client_error` and exit status 2",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/workspace_test.go: run the command with an HTTP transport stub that records the deadline of the request's context and answers at once; assert the deadline lies between 179 s and 181 s after the start of the command"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "A developer publishes a landed branch from the shell",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "runs `parley workspace push demo main` after the hub's `main` has moved ahead of origin's"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends POST /api/v1/workspaces/demo/branches/main/push with the body {\"force\": false} and a 3-minute timeout"
+        },
+        {
+          "actor": "parleyd",
+          "action": "authenticates the caller, checks write access, the body, the branch name, the workspace status and the refusals, and reads the head of `main`"
+        },
+        {
+          "actor": "parleyd",
+          "action": "resolves the origin credential from the workspace's secrets and pushes that commit to `refs/heads/main` on origin, fast-forward only"
+        },
+        {
+          "actor": "origin",
+          "action": "authenticates the hub and fast-forwards its `main`"
+        },
+        {
+          "actor": "parleyd",
+          "action": "records the commit as the origin head of `main`, writes the `parley.workspace.push` event and answers 200 with result `pushed`"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints the answer on stdout and exits 0"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parley CLI command",
+          "parleyd HTTP server with authentication and the workspace access rule",
+          "push handler",
+          "transactional store",
+          "secrets store",
+          "event log",
+          "git subprocess wrapper",
+          "test origin served by git http-backend over TLS"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with a secrets key",
+          "a test origin that requires Basic authentication and accepts pushes",
+          "the workspace `demo` created through POST /workspaces with `git_pat` and waited for until `ready`",
+          "one commit added to the hub's `main` with `git` on disk in the hub's copy"
+        ],
+        "end_state": [
+          "the command exits 0 and its stdout decodes to an answer with result `pushed` and the hub's head as `sha`",
+          "the test origin's `main` is at that commit",
+          "the workspace record's `origin_head_sha` equals its `head_sha`",
+          "the event log holds exactly one `parley.workspace.push` event for `demo`, with ok true"
+        ],
+        "pseudocode": "in test/e2e/workspace_push_test.go: hub = startHub(); origin = gitrepotest.SmartOrigin(auth); create workspace demo; waitReady; sha = commitOnDisk(hubCopy('demo'), 'main'); out, code = runCLI('workspace', 'push', 'demo', 'main'); assert code == 0 and out.result == 'pushed' and out.sha == sha; assert origin.head('main') == sha; assert store.workspace('demo').origin_head_sha == sha; assert count(events(type='parley.workspace.push', workspace='demo')) == 1"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "An agent's forced push is stopped by the lease and succeeds after a sync",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "rewrites the branch `feature` in the hub and submits POST /api/v1/workspaces/demo/branches/feature/push with {\"force\": true}, after another commit reached origin's `feature`"
+        },
+        {
+          "actor": "parleyd",
+          "action": "passes the checks and offers the hub's head to origin with the lease of the origin head it last recorded"
+        },
+        {
+          "actor": "origin",
+          "action": "finds its `feature` at another commit than the lease names and leaves it untouched"
+        },
+        {
+          "actor": "parleyd",
+          "action": "writes a `parley.workspace.push` event with ok false and error_type `origin_moved` and answers 409 `origin_moved`"
+        },
+        {
+          "actor": "agent",
+          "action": "submits POST /api/v1/workspaces/demo/sync, which records origin's new head, and repeats the forced push"
+        },
+        {
+          "actor": "parleyd",
+          "action": "pushes with the new lease, records the origin head, writes the event and answers 200 with result `forced`"
+        },
+        {
+          "actor": "origin",
+          "action": "replaces its `feature` with the pushed commit"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parleyd HTTP server with authentication and the workspace access rule",
+          "push handler",
+          "sync handler",
+          "transactional store",
+          "event log",
+          "git subprocess wrapper",
+          "test origin served by git http-backend over TLS"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0",
+          "the workspace `demo` cloned from a test origin that has the unprotected branch `feature`",
+          "the hub's `feature` rewritten with `git` on disk so that it does not descend from origin's",
+          "one more commit added to the test origin's `feature` after the clone"
+        ],
+        "end_state": [
+          "the first push answered 409 `origin_moved` and the test origin's `feature` still held the commit added there",
+          "the second push answered 200 with result `forced` and the test origin's `feature` is at the hub's head",
+          "the event log holds two `parley.workspace.push` events for `feature`: ok false with error_type `origin_moved`, then ok true with result `forced`"
+        ],
+        "pseudocode": "in test/e2e/workspace_push_test.go: r1 = post(push('demo', 'feature'), {force: true}); assert r1.status == 409 and r1.json.error.error_type == 'origin_moved'; assert origin.head('feature') == originCommit; post('/workspaces/demo/sync'); r2 = post(push('demo', 'feature'), {force: true}); assert r2.status == 200 and r2.json.result == 'forced'; assert origin.head('feature') == r2.json.sha; ev = events(type='parley.workspace.push', workspace='demo'); assert [e.metadata.ok for e in ev] == [false, true]"
+      }
+    }
+  ],
+  "external_apis": [
+    {
+      "package": "github.com/spf13/cobra",
+      "version": "v1",
+      "verified": false,
+      "symbols": [
+        {
+          "name": "Command",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "type Command struct { Use string; Short string; Args PositionalArgs; RunE func(cmd *Command, args []string) error }"
+        },
+        {
+          "name": "ExactArgs",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func ExactArgs(n int) PositionalArgs"
+        },
+        {
+          "name": "Command.AddCommand",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) AddCommand(cmds ...*Command)"
+        },
+        {
+          "name": "Command.Flags",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) Flags() *pflag.FlagSet"
+        }
+      ]
+    }
+  ]
+}

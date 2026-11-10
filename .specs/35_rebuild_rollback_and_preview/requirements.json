@@ -1,0 +1,576 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "35",
+  "spec_name": "rebuild_rollback_and_preview",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Who may roll back, and when",
+      "rationale": "Rollback moves a branch only the hub writes, so it is a write that needs a ready carry-patch workspace and a rebuild that has a head to go back to.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "unwanted",
+          "condition": "POST /api/v1/workspaces/:slug/rebuilds/:id/rollback is sent by a PAT without the scope rebuilds:write, by an org member without write access, or by a caller with no access to the workspace",
+          "action": "refuse the request without reading the job, moving the integration branch or emitting an event",
+          "contract": "HTTP 403 with error_type insufficient_scope for the PAT; HTTP 403 with error_type forbidden for the org member; HTTP 404 with error_type not_found, identical to the answer for an unknown slug, for a caller with no access; the integration branch is unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a rollback fixture: a bare repository made with git in t.TempDir() holding the integration branch deploy at commit H2 and the commit H1 as its parent, a carry-patch workspace record my-fork in status ready in a real store in t.TempDir(), and a completed rebuild job J2 of it with integration_head_sha H2 and previous_integration_head_sha H1",
+              "the route mounted on the real router of internal/server with the access middleware of internal/access, and a recording event emitter"
+            ],
+            "pseudocode": "in internal/carrypatch/rollback_test.go, TestRollbackRoute_RefusesCallersWithoutWriteAccess, a table over {PAT with only rebuilds:read -> 403 insufficient_scope, org member with read access -> 403 forbidden, user outside the organization -> 404 not_found, unknown slug -> 404 not_found}: r = POST .../workspaces/my-fork/rebuilds/J2/rollback; assert r.status and r.json.error.error_type; assert the outsider's body equals the unknown slug's body; assert head(deploy) == H2 and emitter.events is empty"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "unwanted",
+          "condition": "the workspace of a rollback request is not in carry-patch mode, which includes a standard workspace and every task fork",
+          "action": "refuse the request before looking at the workspace's status or at the job",
+          "contract": "HTTP 400 with error_type workspace_mode_mismatch, also when the workspace is archived or failed; no ref is moved",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "workspace records in a real store: a standard workspace in status ready, a standard workspace in status archived, and a task fork of the carry-patch workspace my-fork"
+            ],
+            "pseudocode": "in internal/carrypatch/rollback_test.go, TestRollbackRoute_RefusesNonCarryPatchWorkspace, a table over the three workspaces: r = POST .../rebuilds/<any uuid>/rollback as the owner; assert r.status == 400 and r.json.error.error_type == 'workspace_mode_mismatch'"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "unwanted",
+          "condition": "the carry-patch workspace of a rollback request is in status pending or cloning, or a reclone, archive or delete of it is running, or its status is failed or archived",
+          "action": "refuse the request by the workspace's status before looking at the job",
+          "contract": "HTTP 409 with error_type workspace_busy for pending, cloning and a running reclone, archive or delete; HTTP 409 with error_type workspace_not_ready for failed; HTTP 409 with error_type workspace_archived for archived; the answer is the same for a known and an unknown job id; the integration branch is unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the rollback fixture with the workspace record put into each state of the table in turn"
+            ],
+            "pseudocode": "in internal/carrypatch/rollback_test.go, TestRollbackRoute_RefusesByWorkspaceStatus, a table over {pending, cloning, reclone running, archive running, delete running -> 409 workspace_busy; failed -> 409 workspace_not_ready; archived -> 409 workspace_archived}, each with job id J2 and with an unknown uuid: assert r.status and r.json.error.error_type; assert head(deploy) == H2"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "unwanted",
+          "condition": "the :id of a rollback request on a ready carry-patch workspace is an unknown job id, is not a UUID, or is the id of a rebuild job of another workspace",
+          "action": "refuse the request without moving the integration branch",
+          "contract": "HTTP 404 with error_type not_found and the message 'rebuild job not found'; the integration branch is unchanged and no event is emitted",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the rollback fixture, plus a second carry-patch workspace other-fork of the same owner with a completed job K1 that has a previous head"
+            ],
+            "pseudocode": "in internal/carrypatch/rollback_test.go, TestRollbackRoute_UnknownJob, a table over the id {a random uuid, 'not-a-uuid', K1}: r = POST .../workspaces/my-fork/rebuilds/<id>/rollback as the owner; assert r.status == 404 and r.json.error.error_type == 'not_found' and r.json.error.message == 'rebuild job not found'; assert head(deploy) == H2 in my-fork, the integration branch of other-fork is unchanged and emitter.events is empty"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "unwanted",
+          "condition": "the job of a rollback request is not in status completed, or its previous_integration_head_sha is null, or the commit its previous_integration_head_sha names does not exist in the repository",
+          "action": "refuse the request without moving the integration branch",
+          "contract": "HTTP 409 with error_type rollback_unavailable; the integration branch is unchanged and no event is emitted",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the rollback fixture, plus jobs of my-fork in the store: one each in status queued, running, failed, dead_letter and cancelled (the dead_letter one carrying a previous_integration_head_sha H1 left by an earlier attempt), a completed job J1 with previous_integration_head_sha null, and a completed job J3 whose previous_integration_head_sha is a well-formed 40-hex id of no object in the repository"
+            ],
+            "pseudocode": "in internal/carrypatch/rollback_test.go, TestRollback_Unavailable, a table over the seven jobs: r = POST .../rebuilds/<id>/rollback as the owner; assert r.status == 409 and r.json.error.error_type == 'rollback_unavailable'; assert head(deploy) == H2 and emitter.events is empty. One more row: previous_integration_head_sha names a blob object, not a commit -> the same answer"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Move the integration branch back",
+      "rationale": "An operator who finds a published rebuild bad needs the head before it restored in one call, without losing the patch list or racing a rebuild that publishes at the same moment.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "a caller with write access sends POST /api/v1/workspaces/:slug/rebuilds/:id/rollback for a ready carry-patch workspace and a completed job whose previous_integration_head_sha names a commit that exists in the repository",
+          "action": "read the current head of the integration branch, move the branch to the job's previous_integration_head_sha with one compare-and-swap against the head it read, and answer with both commit ids",
+          "contract": "HTTP 200 with body {rolled_back_to: 40 hex, the job's previous_integration_head_sha; previous_head_sha: 40 hex, the head the rollback replaced}; the integration branch points at rolled_back_to. When the branch already pointed at the target, HTTP 200 with both members equal",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the rollback fixture: deploy at H2, completed job J2 with previous_integration_head_sha H1",
+              "the route mounted on the real router with the access middleware, internal/gitrepo running the git binary"
+            ],
+            "pseudocode": "in internal/carrypatch/rollback_test.go, TestRollback_MovesIntegrationBranch: r = POST .../rebuilds/J2/rollback as the owner; assert r.status == 200 and r.json == {rolled_back_to: H1, previous_head_sha: H2}; assert head(deploy) == H1; repeat the same request and assert 200 with r.json == {rolled_back_to: H1, previous_head_sha: H1} and head(deploy) == H1; repeat the first case with the admin token on a fresh fixture and assert 200"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "unwanted",
+          "condition": "the integration branch moves between the read of its head and the compare-and-swap of a rollback",
+          "action": "refuse the request and leave the branch at the value the other writer gave it",
+          "contract": "HTTP 409 with error_type ref_moved and error.details.current_sha equal to the branch's current head; the branch is not moved by the rollback and no event is emitted",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the rollback fixture, with a hook between the head read and the compare-and-swap of the rollback operation that moves deploy to a third commit H3 with git update-ref, as a publishing rebuild would"
+            ],
+            "pseudocode": "in internal/carrypatch/rollback_test.go, TestRollback_LosesCompareAndSwap: r = POST .../rebuilds/J2/rollback; assert r.status == 409 and r.json.error.error_type == 'ref_moved' and r.json.error.details.current_sha == H3; assert head(deploy) == H3 and emitter.events is empty"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "event_driven",
+          "condition": "a rollback is requested for a completed job with an existing previous head while the integration branch does not exist",
+          "action": "create the integration branch at the job's previous_integration_head_sha with a compare-and-swap that expects the branch to be absent",
+          "contract": "HTTP 200 with body {rolled_back_to: the job's previous_integration_head_sha, previous_head_sha: null}; the integration branch exists and points at rolled_back_to",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the rollback fixture with refs/heads/deploy deleted by git update-ref -d, the commits H1 and H2 kept reachable from another branch"
+            ],
+            "pseudocode": "in internal/carrypatch/rollback_test.go, TestRollback_CreatesMissingIntegrationBranch: r = POST .../rebuilds/J2/rollback; assert r.status == 200 and r.json.rolled_back_to == H1 and r.json.previous_head_sha is JSON null; assert head(deploy) == H1"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "ubiquitous",
+          "action": "for any successful rollback, change no ref other than the integration branch, no patch (status, position, conflict_files, deleted_at), no job record and nothing on origin, queue no rebuild, and not push the integration branch to origin whatever rebuild_push_integration_branch says",
+          "contract": "after the 200 answer every ref except refs/heads/<integration_branch> has its former value, the patch rows and job rows are equal to those before the request, the job count is unchanged and origin received no push",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the rollback fixture with rebuild_push_integration_branch true, auto_rebuild_after_push true and auto_rebuild_after_sync true in the workspace settings",
+              "patches in the store: a at position 1 active, b at position 2 in status conflict with conflict_files ['x.txt'], c deleted with deleted_at set (as the rebuild J2 left a merged patch), with patch branches and a backup ref refs/parley/replaced/a in the repository",
+              "an origin bare repository in t.TempDir() configured as the workspace's origin, holding its own deploy branch"
+            ],
+            "pseudocode": "in internal/carrypatch/rollback_test.go, TestRollback_ChangesIntegrationBranchOnly: before = (git for-each-ref of the hub repository, git for-each-ref of origin, all patch rows, all job rows); POST .../rebuilds/J2/rollback -> 200; after = the same; assert after.refs differs from before.refs only in refs/heads/deploy; assert origin refs, patch rows and job rows are equal; assert the job queue holds no job in status queued"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "event_driven",
+          "condition": "a rollback has moved or created the integration branch",
+          "action": "emit one parley.rebuild.rollback event through the event log, after the compare-and-swap succeeded",
+          "contract": "one event of type parley.rebuild.rollback with resource_type rebuild, resource_id the job id, workspace the slug, the caller as actor, and metadata {integration_branch: string, rolled_back_to: 40 hex, previous_head_sha: 40 hex or null}; a refused rollback emits no event",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the rollback fixture with a recording event emitter in place of the event log"
+            ],
+            "pseudocode": "in internal/carrypatch/rollback_test.go, TestRollback_EmitsEvent: POST .../rebuilds/J2/rollback as user u1 -> 200; assert emitter.events has exactly one entry e with e.type == 'parley.rebuild.rollback', e.resource_type == 'rebuild', e.resource_id == J2, e.workspace == 'my-fork', e.actor == u1 and e.metadata == {integration_branch: 'deploy', rolled_back_to: H1, previous_head_sha: H2}; with the integration branch missing first, assert metadata.previous_head_sha is null"
+          }
+        },
+        {
+          "id": "REQ-2.6",
+          "pattern": "state_driven",
+          "condition": "another rebuild job of the workspace is queued, running or failed",
+          "action": "serve a rollback of a completed job as it does when no rebuild is pending, without waiting for the other job and without changing it",
+          "contract": "HTTP 200 with the rollback body; the other job's record is unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the rollback fixture plus one more job of my-fork put into each of the statuses queued, running and failed in turn"
+            ],
+            "pseudocode": "in internal/carrypatch/rollback_test.go, TestRollback_ProceedsBesideARebuild, a table over the other job's status {queued, running, failed}: r = POST .../rebuilds/J2/rollback; assert r.status == 200 and head(deploy) == H1; assert the other job's row is equal to the one before the request"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Who may preview, and when",
+      "rationale": "Preview reads the repository and the last fetched upstream, so it needs read access, a ready carry-patch workspace and an upstream base to predict against.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "unwanted",
+          "condition": "GET /api/v1/workspaces/:slug/rebuild-preview is sent by a PAT without the scope rebuilds:read or by a caller with no access to the workspace",
+          "action": "refuse the request without running a git command",
+          "contract": "HTTP 403 with error_type insufficient_scope for the PAT; HTTP 404 with error_type not_found, identical to the answer for an unknown slug, for a caller with no access; an org member with read access and no write access is answered HTTP 200",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a preview fixture: a bare repository made with git in t.TempDir() with refs/remotes/upstream/HEAD pointing at refs/remotes/upstream/main at commit U, a carry-patch workspace record my-fork in status ready with default_branch main in a real store, and one active patch a whose branch patch/a adds a file on top of U",
+              "the route mounted on the real router of internal/server with the access middleware of internal/access"
+            ],
+            "pseudocode": "in internal/carrypatch/preview_test.go, TestPreviewRoute_Access, a table over {PAT with only patches:read -> 403 insufficient_scope, user outside the organization -> 404 not_found, unknown slug -> 404 not_found, org member with read access -> 200, PAT with rebuilds:read of the owner -> 200}: r = GET .../workspaces/my-fork/rebuild-preview; assert r.status and, for errors, r.json.error.error_type; assert the outsider's body equals the unknown slug's body"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "unwanted",
+          "condition": "the workspace of a preview request is not in carry-patch mode, which includes a standard workspace and every task fork",
+          "action": "refuse the request before looking at the workspace's status",
+          "contract": "HTTP 400 with error_type workspace_mode_mismatch, also when the workspace is archived or failed",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "workspace records in a real store: a standard workspace in status ready, a standard workspace in status archived, and a task fork of the carry-patch workspace my-fork"
+            ],
+            "pseudocode": "in internal/carrypatch/preview_test.go, TestPreviewRoute_RefusesNonCarryPatchWorkspace, a table over the three workspaces: r = GET .../rebuild-preview as the owner; assert r.status == 400 and r.json.error.error_type == 'workspace_mode_mismatch'"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "unwanted",
+          "condition": "the carry-patch workspace of a preview request is in status pending or cloning, or a reclone, archive or delete of it is running, or its status is failed or archived",
+          "action": "refuse the request by the workspace's status without running a git command",
+          "contract": "HTTP 409 with error_type workspace_busy for pending, cloning and a running reclone, archive or delete; HTTP 409 with error_type workspace_not_ready for failed; HTTP 409 with error_type workspace_archived for archived",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the preview fixture with the workspace record put into each state of the table in turn"
+            ],
+            "pseudocode": "in internal/carrypatch/preview_test.go, TestPreviewRoute_RefusesByWorkspaceStatus, a table over {pending, cloning, reclone running, archive running, delete running -> 409 workspace_busy; failed -> 409 workspace_not_ready; archived -> 409 workspace_archived}: r = GET .../rebuild-preview as the owner; assert r.status and r.json.error.error_type"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "unwanted",
+          "condition": "a preview is requested and the repository has neither a resolvable upstream default branch under refs/remotes/upstream/ nor an upstream branch named like the workspace's default_branch",
+          "action": "refuse the request without fetching upstream",
+          "contract": "HTTP 409 with error_type upstream_unknown; no fetch is started",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the preview fixture with every ref under refs/remotes/upstream/ deleted, and the workspace's upstream_url pointing at a path that does not exist"
+            ],
+            "pseudocode": "in internal/carrypatch/preview_test.go, TestPreview_UpstreamUnknown: r = GET .../rebuild-preview as the owner; assert r.status == 409 and r.json.error.error_type == 'upstream_unknown'; assert no ref exists under refs/remotes/upstream/ afterwards"
+          }
+        },
+        {
+          "id": "REQ-3.5",
+          "pattern": "ubiquitous",
+          "action": "for any preview, take the upstream base from the refs under refs/remotes/upstream/ as the last upstream fetch left them (the upstream's default branch, else the upstream branch named like the workspace's default_branch) and contact neither upstream nor origin",
+          "contract": "HTTP 200 whose upstream_head_sha is the 40-hex id of that ref's commit, also when the upstream URL is unreachable or upstream has moved since the last fetch",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the preview fixture with the workspace's upstream_url and git_url pointing at paths that do not exist"
+            ],
+            "pseudocode": "in internal/carrypatch/preview_test.go, TestPreview_UsesLastFetchedBaseWithoutFetching, a table over the upstream refs {refs/remotes/upstream/HEAD -> upstream/main at U and workspace default_branch 'trunk' -> base U; no upstream HEAD, refs/remotes/upstream/trunk at U2 and default_branch 'trunk' -> base U2}: r = GET .../rebuild-preview; assert r.status == 200 and r.json.upstream_head_sha == the expected base"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Predict the outcome of each patch",
+      "rationale": "A developer wants to know which patches the next rebuild would stop on, and wants a conflict in the same structured form a rebuild or a landing reports.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "a caller with read access sends GET /api/v1/workspaces/:slug/rebuild-preview for a ready carry-patch workspace that has an upstream base",
+          "action": "test the non-deleted patches that are neither disabled nor merged_upstream in position order, each against the predicted state that starts at the upstream base, and answer with one result per tested patch in that order",
+          "contract": "HTTP 200 with body {upstream_head_sha: 40 hex, patch_results: [{patch_id: string, branch_name: string, position: int, status: 'would_succeed'|'would_conflict'|'would_skip', conflict_files: string[], conflict: object|null}]}; patches in status disabled, merged_upstream or deleted have no entry; with no patch to test, patch_results is [] and never null",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the preview fixture with patches a (position 1, active), d (position 2, disabled), b (position 3, in status conflict), m (position 4, merged_upstream) and x (deleted), each with an existing branch whose change touches a file of its own"
+            ],
+            "pseudocode": "in internal/carrypatch/preview_test.go, TestPreview_ListsTestedPatchesInPositionOrder: r = GET .../rebuild-preview as the owner; assert r.status == 200 and r.json.upstream_head_sha == U; assert [(p.branch_name, p.position, p.status) for p in r.json.patch_results] == [('patch/a', 1, 'would_succeed'), ('patch/b', 3, 'would_succeed')] and every entry has patch_id, conflict_files == [] and conflict == null; then set every patch to disabled and assert 200 with the raw body holding \"patch_results\": []"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "event_driven",
+          "condition": "the branch of a tested patch does not exist in the repository",
+          "action": "report the patch as would_skip and leave the predicted state as it was",
+          "contract": "the patch's entry has status would_skip, conflict_files [] and conflict null; the patches after it are tested against the state before it",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the preview fixture with patches a (position 1), gone (position 2, registered for a branch that was deleted) and b (position 3), where a and b touch different files"
+            ],
+            "pseudocode": "in internal/carrypatch/preview_test.go, TestPreview_MissingBranchWouldSkip: r = GET .../rebuild-preview; assert statuses(r) == ['would_succeed', 'would_skip', 'would_succeed']; assert the entry of gone has conflict_files == [] and conflict == null"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "event_driven",
+          "condition": "the tip of a tested patch merges onto the predicted state without a conflict, which includes a tip the predicted state already contains",
+          "action": "report the patch as would_succeed and make the merge result the predicted state the later patches are tested against",
+          "contract": "the patch's entry has status would_succeed, conflict_files [] and conflict null; a later patch that changes the same lines as this patch is tested against a state that includes this patch",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the preview fixture with patch a changing line 1 of f.txt to 'a', and patch b, branched from upstream, changing the same line to 'b'; and a second fixture where patch c's tip is the upstream base itself"
+            ],
+            "pseudocode": "in internal/carrypatch/preview_test.go, TestPreview_CleanPatchJoinsPredictedState: r = GET .../rebuild-preview; assert statuses(r) == ['would_succeed', 'would_conflict'] (b conflicts only because a is in the state); assert the conflict of b has target_sha != U and its files entry for f.txt has ours.sha == git rev-parse patch/a:f.txt; in the second fixture assert the entry of c is would_succeed"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "event_driven",
+          "condition": "the merge of a tested patch's tip onto the predicted state has a conflict",
+          "action": "report the patch as would_conflict with the conflicted paths and a conflict report, and leave the patch out of the predicted state the later patches are tested against",
+          "contract": "the patch's entry has status would_conflict, conflict_files the conflicted paths in ascending order with at least one entry, and a non-null conflict; a later patch that conflicts only with this patch is would_succeed",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the preview fixture where upstream U changed line 1 of f.txt and g.txt, patch b (position 1) changes the same lines of g.txt and f.txt from an older upstream commit, and patch c (position 2), branched from U, changes line 1 of g.txt once more: it merges onto U without a conflict and would conflict with a state that held b"
+            ],
+            "pseudocode": "in internal/carrypatch/preview_test.go, TestPreview_ConflictingPatchIsLeftOut: r = GET .../rebuild-preview; assert statuses(r) == ['would_conflict', 'would_succeed']; assert entry(b).conflict_files == ['f.txt', 'g.txt'] and entry(b).conflict != null; assert entry(c).conflict == null"
+          }
+        },
+        {
+          "id": "REQ-4.5",
+          "pattern": "ubiquitous",
+          "action": "for any would_conflict entry, fill conflict with the conflict report of a rebuild: the patch id, the predicted state the patch was tested against as target_sha, the patch tip as head_sha and as commit_sha, the merge base of the two as base_sha, and one files entry per conflicted path",
+          "contract": "conflict is {patch_id: string, target_sha: 40 hex, head_sha: 40 hex, base_sha: 40 hex, commit_sha: 40 hex, files: [{path: string, kind: one of content|add_add|modify_delete|delete_modify|rename|mode|binary|submodule, base: {sha, mode, path}|null, ours: {sha, mode, path}|null, theirs: {sha, mode, path}|null, landed_by: []}], landed_changes: [], change: null}; target_sha is the upstream base for the first tested patch; the paths of files equal conflict_files",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the preview fixture where the first patch b conflicts with U in f.txt (both changed line 1: kind content) and in new.txt (both added it with different content: kind add_add), and deletes del.txt that U modified (kind modify_delete: the predicted state modified it, the patch deleted it)"
+            ],
+            "pseudocode": "in internal/carrypatch/preview_test.go, TestPreview_ConflictReportShape: c = GET .../rebuild-preview .patch_results[0].conflict; assert c.patch_id == id(b); c.target_sha == U; c.head_sha == tip(patch/b) == c.commit_sha; c.base_sha == git merge-base U tip(patch/b); c.landed_changes == [] and c.change == null; assert [f.path for f in c.files] == conflict_files; for f.txt assert kind == 'content', base.sha, ours.sha and theirs.sha equal git rev-parse of <base_sha>:f.txt, U:f.txt and patch/b:f.txt and landed_by == []; for new.txt assert kind == 'add_add' and base == null; for del.txt assert kind == 'modify_delete' and theirs == null and ours.sha == git rev-parse U:del.txt"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Preview is a prediction and changes nothing",
+      "rationale": "A preview that altered a ref, a patch or a job, or that depended on the strategy or on remembered resolutions, could not be run freely before every rebuild and during one.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "ubiquitous",
+          "action": "for any value of the workspace setting rebuild_strategy, test each patch as a merge of the patch tip onto the predicted state",
+          "contract": "the preview body is the same, apart from the commit ids preview itself built, with rebuild_strategy rebase and with rebuild_strategy merge: the same statuses and the same conflict_files per patch",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the preview fixture with a patch whose branch has two commits, the first of which conflicts with upstream when replayed alone and the second of which restores upstream's content, so that a commit-by-commit replay conflicts and a merge of the tip does not"
+            ],
+            "pseudocode": "in internal/carrypatch/preview_test.go, TestPreview_TestsAMergeWhateverTheStrategy, a table over rebuild_strategy {rebase, merge}: r = GET .../rebuild-preview; assert statuses(r) == ['would_succeed'] in both rows"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "ubiquitous",
+          "action": "for any preview, report a conflicting patch as would_conflict whether or not a remembered resolution exists for its conflict, and neither read nor write the remembered resolutions",
+          "contract": "a patch whose conflict has a recorded resolution is would_conflict with the conflicted path in conflict_files; the repository's rr-cache directory has the same entries and contents after the preview",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the preview fixture with patch b conflicting with U in f.txt, and a resolution of exactly that conflict recorded in the repository's rr-cache by merging patch/b onto U in a temporary worktree with rerere.enabled true, resolving f.txt and committing"
+            ],
+            "pseudocode": "in internal/carrypatch/preview_test.go, TestPreview_IgnoresRememberedResolutions: before = listing with contents of <repo>/rr-cache; r = GET .../rebuild-preview; assert entry(b).status == 'would_conflict' and entry(b).conflict_files == ['f.txt']; assert the listing of rr-cache equals before"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "ubiquitous",
+          "action": "for any preview request, whatever its answer, change no ref, no patch field and no job, and emit no event",
+          "contract": "after the answer the output of git for-each-ref for the repository, the patch rows (status and conflict_files of a would_conflict patch included) and the job rows are equal to those before the request, and the event log gained no entry",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the preview fixture with an active patch b that conflicts with U (its stored status active and conflict_files []), an active patch a that does not, one completed job and a recording event emitter"
+            ],
+            "pseudocode": "in internal/carrypatch/preview_test.go, TestPreview_ChangesNothing: before = (git for-each-ref, patch rows, job rows); r = GET .../rebuild-preview -> 200 with entry(b).status == 'would_conflict'; assert (git for-each-ref, patch rows, job rows) == before; assert the stored patch b still has status active and conflict_files []; assert emitter.events is empty; repeat with the upstream refs removed (409 upstream_unknown) and assert the same equality"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "state_driven",
+          "condition": "a rebuild job of the workspace is queued, running or failed",
+          "action": "answer a preview as it does when no rebuild is pending, from the patch tips and the upstream base it reads once at the start of the request",
+          "contract": "HTTP 200 with the preview body; the job's record is unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the preview fixture plus one job of my-fork put into each of the statuses queued, running and failed in turn"
+            ],
+            "pseudocode": "in internal/carrypatch/preview_test.go, TestPreview_AnswersBesideARebuild, a table over the job's status {queued, running, failed}: r = GET .../rebuild-preview; assert r.status == 200 and statuses(r) == ['would_succeed']; assert the job's row is equal to the one before the request"
+          }
+        },
+        {
+          "id": "REQ-5.5",
+          "pattern": "unwanted",
+          "condition": "a git command of a preview fails for another reason than a merge conflict, which includes a command stopped by the time limit on one git operation",
+          "action": "fail the whole request without reporting the failure as a patch result",
+          "contract": "HTTP 500 with error_type internal; the body holds no patch_results; no ref is changed",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the preview operation with a git runner stub in place of internal/gitrepo's trial merge that returns, for the second patch, in turn: an error that is not a conflict, and a deadline-exceeded error"
+            ],
+            "pseudocode": "in internal/carrypatch/preview_test.go, TestPreview_GitFailureIsInternalError, a table over the two errors: r = GET .../rebuild-preview; assert r.status == 500 and r.json.error.error_type == 'internal'; assert r.json has no member patch_results"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "The parley rebuild rollback and preview commands",
+      "rationale": "Operators and scripts roll back and preview from the shell, and a script needs an exit code that says a patch would conflict.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "a user runs parley rebuild rollback <workspace-slug> <rebuild-id>",
+          "action": "send POST /api/v1/workspaces/<workspace-slug>/rebuilds/<rebuild-id>/rollback with no body and each argument as one percent-encoded path segment, print the answer as one JSON document on stdout and exit 0",
+          "contract": "stdout: the rollback answer as one JSON document; exit 0. On a hub error: the error envelope as received on stderr, nothing on stdout, exit 1. On an argument count other than two: exit 2 and no request",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub (net/http/httptest) that records requests and answers from a script, and the command run through the root command of internal/cli with captured stdout, stderr and exit code"
+            ],
+            "pseudocode": "in internal/cli/rebuild_test.go, TestRebuildRollback_PostsAndPrints: run ['rebuild', 'rollback', 'my-fork', 'j2']; assert the stub saw one POST /api/v1/workspaces/my-fork/rebuilds/j2/rollback with an empty body; assert stdout parses as the stub's answer {rolled_back_to, previous_head_sha} and exit == 0; run with slug 'a/b' and assert the raw path holds /workspaces/a%2Fb/rebuilds/; run with the stub answering 409 rollback_unavailable and assert stdout is empty, stderr is the envelope as received and exit == 1; run with one argument and with three and assert exit == 2 and no request"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "event_driven",
+          "condition": "a user runs parley rebuild preview <workspace-slug>",
+          "action": "send GET /api/v1/workspaces/<workspace-slug>/rebuild-preview with the slug as one percent-encoded path segment, print the answer as one JSON document on stdout and exit 0",
+          "contract": "stdout: the preview answer as one JSON document; exit 0, also when a patch is would_conflict and --fail-on-conflict is not given. On a hub error: the error envelope as received on stderr, nothing on stdout, exit 1. On an argument count other than one: exit 2 and no request",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub (net/http/httptest) that records requests and answers from a script, and the command run through the root command of internal/cli with captured stdout, stderr and exit code"
+            ],
+            "pseudocode": "in internal/cli/rebuild_test.go, TestRebuildPreview_GetsAndPrints: run ['rebuild', 'preview', 'my-fork'] with the stub answering a preview holding one would_conflict entry; assert the stub saw one GET /api/v1/workspaces/my-fork/rebuild-preview; assert stdout parses as the stub's answer, stderr is empty and exit == 0; run with the stub answering 409 upstream_unknown and assert stdout is empty, stderr is the envelope as received and exit == 1; run with no argument and with two and assert exit == 2 and no request"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "optional",
+          "condition": "--fail-on-conflict is given to parley rebuild preview",
+          "action": "after printing the answer, report condition_not_met on stderr naming the branches whose status is would_conflict and exit 3 when at least one entry of patch_results has status would_conflict, and exit 0 otherwise",
+          "contract": "stdout carries the answer in every case; exit 3 with an error envelope of error_type condition_not_met and code 0 on stderr, its message holding the conflicting branch names, when a patch would conflict; exit 0 with empty stderr otherwise; a hub error still exits 1",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub (net/http/httptest) that records requests and answers from a script, and the command run through the root command of internal/cli with captured stdout, stderr and exit code"
+            ],
+            "pseudocode": "in internal/cli/rebuild_test.go, TestRebuildPreview_FailOnConflict, a table over the stub's answer with the flag given: {patch/a would_succeed, patch/b would_conflict -> exit 3, stderr parses as an envelope with error_type 'condition_not_met' and code 0 whose message contains 'patch/b' and not 'patch/a'}, {would_succeed and would_skip only -> exit 0, stderr empty}, {patch_results [] -> exit 0}, {hub answers 409 upstream_unknown -> exit 1, stdout empty}: assert stdout parses as the full answer in the first three rows"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "An operator rolls the integration branch back to the head before a rebuild",
+      "steps": [
+        {
+          "actor": "operator",
+          "action": "runs parley rebuild rollback my-fork <id of the second completed rebuild> after that rebuild published a head that includes a faulty patch"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends POST /api/v1/workspaces/my-fork/rebuilds/<id>/rollback with the operator's API key"
+        },
+        {
+          "actor": "parleyd",
+          "action": "authenticates the caller, finds write access, a ready carry-patch workspace and a completed job whose previous head exists in the repository"
+        },
+        {
+          "actor": "parleyd",
+          "action": "reads the head of the integration branch and moves the branch to the job's previous_integration_head_sha with one compare-and-swap"
+        },
+        {
+          "actor": "parleyd",
+          "action": "writes the parley.rebuild.rollback event and answers 200 with rolled_back_to and previous_head_sha"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints the answer on stdout and exits 0"
+        },
+        {
+          "actor": "operator",
+          "action": "finds the integration branch at the head the first rebuild published, and both patches still registered"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the parley CLI command tree of internal/cli with its real HTTP client",
+          "a hub started in-process on 127.0.0.1:0 with its real router, authentication and access middleware",
+          "the rollback operation of internal/carrypatch",
+          "the rebuild worker and job queue that produced the two completed jobs",
+          "internal/gitrepo running the git binary",
+          "the SQLite store of internal/store",
+          "the event log of internal/event"
+        ],
+        "setup": [
+          "a hub started in-process as the end-to-end tests of package 01 start it, against a data directory in t.TempDir()",
+          "an origin and an upstream repository served by the test origin helper internal/gitrepo/gitrepotest, origin holding the branches patch/a and patch/b on top of upstream's main",
+          "the carry-patch workspace my-fork created through POST /workspaces with workspace_mode carry_patch and waited for until ready",
+          "patch/a registered and a rebuild submitted and waited for until completed (job 1, head H1); then patch/b registered and a second rebuild submitted and waited for until completed (job 2, head H2, previous_integration_head_sha H1)"
+        ],
+        "end_state": [
+          "the command exits 0 and prints rolled_back_to equal to H1 and previous_head_sha equal to H2",
+          "refs/heads/deploy in the workspace's bare repository on disk points at H1",
+          "GET /workspaces/my-fork/patches still lists patch/a and patch/b, both active, at positions 1 and 2",
+          "GET /workspaces/my-fork/rebuilds/<job 2> still shows status completed with integration_head_sha H2",
+          "the event log holds one parley.rebuild.rollback event whose resource_id is job 2 and whose metadata has rolled_back_to H1 and previous_head_sha H2"
+        ],
+        "pseudocode": "in test/e2e/rebuild_rollback_preview_test.go, TestRebuildRollback_FromTheShell: j1 = parley('rebuild', 'submit', 'my-fork', '--wait'); add patch/b; j2 = parley('rebuild', 'submit', 'my-fork', '--wait'); assert j2.previous_integration_head_sha == j1.integration_head_sha; out, code = parley('rebuild', 'rollback', 'my-fork', j2.id); assert code == 0 and out == {rolled_back_to: j1.integration_head_sha, previous_head_sha: j2.integration_head_sha}; assert git -C <data>/<workspace path>/my-fork.git rev-parse refs/heads/deploy == j1.integration_head_sha; assert the patch list and job 2 as in end_state; assert GET /events/log filtered to type parley.rebuild.rollback has one entry with that metadata"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "A developer previews a rebuild and is told which patch would conflict",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "runs parley rebuild preview my-fork --fail-on-conflict on a workspace whose second patch changes a line the last fetched upstream also changed"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends GET /api/v1/workspaces/my-fork/rebuild-preview with the developer's API key"
+        },
+        {
+          "actor": "parleyd",
+          "action": "authenticates the caller, finds read access and a ready carry-patch workspace, and resolves the upstream base from the refs of the last upstream fetch without fetching"
+        },
+        {
+          "actor": "parleyd",
+          "action": "tests a merge of each patch tip in position order onto the predicted state: the first joins the state, the second conflicts and is left out"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers 200 with upstream_head_sha and the two results, the second would_conflict with conflict_files and a conflict report"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints the answer on stdout, reports condition_not_met naming the conflicting branch on stderr and exits 3"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the parley CLI command tree of internal/cli with its real HTTP client",
+          "a hub started in-process on 127.0.0.1:0 with its real router, authentication and access middleware",
+          "the preview operation of internal/carrypatch",
+          "internal/gitrepo running the git binary",
+          "the SQLite store of internal/store",
+          "the event log of internal/event"
+        ],
+        "setup": [
+          "a hub started in-process as the end-to-end tests of package 01 start it, against a data directory in t.TempDir()",
+          "an upstream repository whose main changed line 1 of f.txt in its latest commit, and an origin holding patch/a (adds a.txt) and patch/b (changes line 1 of f.txt from the commit before upstream's latest), both served by internal/gitrepo/gitrepotest",
+          "the carry-patch workspace my-fork created through POST /workspaces and waited for until ready, so that its setup fetched upstream; patch/a and patch/b registered at positions 1 and 2",
+          "the upstream server stopped before the preview"
+        ],
+        "end_state": [
+          "the command exits 3; stdout parses as the preview with upstream_head_sha equal to upstream's main and statuses would_succeed for patch/a and would_conflict for patch/b with conflict_files ['f.txt'] and a conflict whose target_sha is not the upstream base",
+          "stderr holds an envelope with error_type condition_not_met naming patch/b",
+          "git for-each-ref of the workspace's bare repository on disk is the same before and after the command",
+          "GET /workspaces/my-fork/patches shows both patches active with empty conflict_files, and GET /workspaces/my-fork/rebuilds lists no job",
+          "the same command without --fail-on-conflict exits 0 with the same statuses"
+        ],
+        "pseudocode": "in test/e2e/rebuild_rollback_preview_test.go, TestRebuildPreview_FromTheShell: refs = git -C <repo on disk> for-each-ref; stop the upstream server; out, code, err = parley('rebuild', 'preview', 'my-fork', '--fail-on-conflict'); assert code == 3; assert out.upstream_head_sha == upstream main; assert [(p.branch_name, p.status) for p in out.patch_results] == [('patch/a', 'would_succeed'), ('patch/b', 'would_conflict')]; assert out.patch_results[1].conflict_files == ['f.txt'] and out.patch_results[1].conflict.target_sha != out.upstream_head_sha; assert 'condition_not_met' in err and 'patch/b' in err; assert git for-each-ref == refs; assert the patch list and the empty job list as in end_state; out, code = parley('rebuild', 'preview', 'my-fork'); assert code == 0"
+      }
+    }
+  ]
+}

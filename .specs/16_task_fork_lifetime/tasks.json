@@ -1,0 +1,232 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "16",
+  "spec_name": "task_fork_lifetime",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/fork/... ./internal/config/... ./internal/workspace/... ./internal/cli/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "09",
+      "reason": "builds its CLI commands on the client, output and exit-code helpers of the CLI foundation"
+    },
+    {
+      "spec": "11",
+      "reason": "registers ttl with the update handler of that package (RegisterForkField) and its checks read forks through GET /workspaces/:slug"
+    },
+    {
+      "spec": "14",
+      "reason": "implements the ForkRemover interface that package declares (DELETE of a fork and the removal of forks inside a parent's delete) and removes a fork's owned data through its RemoveOwned and its one registry of removers"
+    },
+    {
+      "spec": "15",
+      "reason": "provides the fork record with expires_at, the [forks] limits and the rule ResolveTTL that judges a ttl, the parent-state guard of fork updates, the storage of a fork's own branches and the fork command group of the CLI"
+    },
+    {
+      "spec": "52",
+      "reason": "emits its hub events through the event log component"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Read the early-expiry switch from configuration",
+      "criteria": [
+        "REQ-1"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/config/forks_test.go as a table-driven test and confirm it fails",
+        "Register the key expire_on_land of the [forks] table with the configuration key registry of package 03 in internal/config, as a bool with the default true, beside the keys default_ttl, max_ttl and max_per_workspace that package 15 registered; change none of those three",
+        "Hand the loaded value to the sweep of this package through the composition in internal/hub/fork.go (package 03 owns process composition; nothing is wired in cmd/parleyd)",
+        "Add no rule for a ttl here: default_ttl, max_ttl, the refusal of a contradictory configuration, ResolveTTL in internal/fork/lifetime.go and expires_at at creation are package 15's, and the ttl update of this package calls ResolveTTL"
+      ],
+      "touches": [
+        "internal/config/forks.go",
+        "internal/config/forks_test.go",
+        "internal/hub/fork.go"
+      ],
+      "done_when": [
+        "`go test ./internal/config/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Remove a fork in one transactional step and serve DELETE for forks",
+      "criteria": [
+        "REQ-3"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/fork/remove_test.go, with recording fakes for the sandbox collaborator and for a remover of owned data and a session closer registered in the Teardown set of package 14, and confirm they fail",
+        "Define in internal/fork the one collaborator interface this task needs and package 14 does not have: a sandbox collaborator (delete the sandboxes of a workspace slug with a reason and a checkpoint switch; report whether a slug has a sandbox in state provisioning or ready), which package 47 implements; treat an absent one as a fork without sandboxes. Keep no registry of removal participants: a fork's owned data is removed through the one registry of package 14, and packages 47 and 49 register their removers and the session closer only in package 14's Teardown, never with internal/fork",
+        "Build the removal component: first call the sandbox collaborator with reason workspace_deleted and checkpoint off, and stop with its error when it fails; then, in one store transaction, load the fork record (not found ends the removal with a not-found result), call RemoveOwned of package 14 with the transaction, the fork's slug and the reason (fork expired for the cause expired, workspace deleted for deleted and parent_deleted), which revokes the bound tokens through RevokeBoundTo of package 08, runs every registered remover of owned data (secret.RemoveWorkspace of package 39, which package 14 registers there, removes the fork's secrets as RemoveScope(tx, workspace, slug) would; this package does not call RemoveScope itself) and asks the session closer, and keep the token ids it returns; remove the fork record, and write the removal's event through the event writer of package 52",
+        "Let the caller of the component choose the event: for cause deleted it is parley.workspace.delete with the caller as actor, metadata kind fork, parent_slug and revoked_tokens sorted ascending, without a deleted_forks member, carrying the fork's session_id when it has one",
+        "After the commit, discard the fork's own branches from the repository data through the storage functions of package 15 and internal/gitrepo; never before the commit. Record a discard that fails in a pending-discard table of the store and log it, without changing the removal's result",
+        "Make removal safe against a concurrent removal of the same fork: the record's deletion inside the transaction decides the winner, and the loser gets the not-found result and writes no event",
+        "Implement DeleteFork(ctx, slug, caller) of the ForkRemover interface that package 14 declares in internal/workspace/teardown.go: package 14's DELETE /api/v1/workspaces/{slug} route has already checked the scope workspaces:write and write access when it calls it; apply the state guard of package 10 to the parent, which answers 409 workspace_busy for a pending, cloning or marked parent and lets ready and archived parents pass; then run the removal; return nil on success (the route answers 204 with an empty body), the API error 404 not_found for the not-found result and 500 internal for any other failure",
+        "Register no route and edit no handler of package 14: register the fork component as the fork remover in the Teardown set of package 14 on the composition value of internal/hub, in internal/hub/fork.go, so that DELETE on a fork slug reaches DeleteFork",
+        "Pass the sandbox collaborator and the Teardown set of package 14 into the fork component on the composition value of internal/hub, in internal/hub/fork.go, with no sandbox collaborator while package 47 does not exist",
+        "Export CountTaskForks(ctx) from internal/fork: the number of task fork records that exist (a removed fork no longer counts); package 51 registers it as the source of parley_forks_active"
+      ],
+      "touches": [
+        "internal/fork/remove.go",
+        "internal/fork/remove_test.go",
+        "internal/fork/collaborators.go",
+        "internal/store/",
+        "internal/hub/fork.go"
+      ],
+      "done_when": [
+        "`go test ./internal/fork/... -count=1` passes, including the concurrent delete test under `-race`"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Let an owner set a new lifetime through the workspace update",
+      "criteria": [
+        "REQ-2.1",
+        "REQ-2.2",
+        "REQ-2.3",
+        "REQ-2.4",
+        "REQ-2.5"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/fork/lifetime_test.go and confirm they fail",
+        "Register a handler for ttl with RegisterForkField of package 11's update handler: the name is already in that handler's table as a fork-only field; the value must be a JSON string, and null, a number and a boolean are 400 invalid_request; change no file of package 11",
+        "Validate the value with ResolveTTL of package 15 (internal/fork/lifetime.go), the one rule for a ttl, using the request time from the injected clock; a refusal is 400 invalid_request and fails the whole body, so no other field of the same request is stored",
+        "Add no parent check: the guard package 15 registered with RegisterForkUpdateGuard runs for every update of a fork after validation and before the write, and answers 409 parent_archived for an archived parent and 409 workspace_busy for a pending or cloning parent or a set maintenance marker; cover both answers for a ttl update by test",
+        "Store the new expires_at and updated_at in the same transaction as the other fields of the body",
+        "Rely on package 11's fixed order of metadata.fields (display_name, description, org_id, settings, ttl, purpose, auto_change), which lists ttl when the body carried it; the event already carries parent_slug and the fork's session_id for a fork",
+        "Leave the access and scope checks to the handler as package 11 built them; confirm by test that a member gets 403 also when the parent is archived and that an invalid ttl gets 400 also when the parent is archived"
+      ],
+      "touches": [
+        "internal/fork/extend.go",
+        "internal/fork/lifetime_test.go",
+        "internal/hub/fork.go"
+      ],
+      "done_when": [
+        "`go test ./internal/fork/... ./internal/workspace/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Remove every fork of a parent inside the parent's delete",
+      "criteria": [
+        "REQ-4"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/fork/remove_test.go and confirm they fail",
+        "Implement RemoveForksOf(ctx, transaction, parent slug, actor) of package 14's ForkRemover interface on the removal component: it takes the open store transaction of the parent's delete and removes every fork of that parent in that transaction with cause parent_deleted, in ascending slug order",
+        "For each fork run the same in-transaction part as a single removal (RemoveOwned of package 14 with the reason workspace deleted, then remove the record) and write one parley.workspace.delete event with the given actor, metadata kind fork, parent_slug and that fork's revoked_tokens; write no parley.fork.expire",
+        "Return the removed slugs sorted ascending and a function that discards the own branches of all removed forks; the caller runs it after its commit, and nothing is discarded when the caller rolls back",
+        "Do not call the sandbox collaborator here: the parent's delete removes the sandboxes of the workspace and its forks first (package 14 with package 47)",
+        "Return an empty list and write no event for a parent without forks",
+        "Change nothing in package 14: its removal step calls RemoveForksOf of the registered fork remover, puts the returned slugs into the parent event's deleted_forks and runs the returned discard function after its commit; prove the hand-off with a test that deletes an archived parent with two forks through package 14's real route"
+      ],
+      "touches": [
+        "internal/fork/remove.go",
+        "internal/fork/remove_test.go"
+      ],
+      "depends_on": [
+        2
+      ],
+      "done_when": [
+        "`go test ./internal/fork/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Expire forks with a sweep that runs every minute",
+      "criteria": [
+        "REQ-5",
+        "REQ-2.6"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/fork/sweep_test.go with a fake clock and a fake ticker and confirm they fail",
+        "Build the sweep pass in internal/fork: read every fork whose expires_at is at or before the clock's time, in ascending slug order, and remove each through the removal component with cause expired",
+        "Skip a fork whose parent is pending, cloning or carries the maintenance marker; forks of an archived parent are removed like any other",
+        "Have the removal write parley.fork.expire for a sweep removal instead of parley.workspace.delete: actor system, workspace and resource_id the fork's slug, metadata parent_slug, reason, expires_at as stored at removal and revoked_tokens sorted ascending, carrying the fork's session_id when it has one",
+        "When one removal fails, log the fork's slug and the error with the logger and go on with the next fork; the fork is found again by the next pass because nothing about it changed",
+        "At the end of each pass retry every recorded pending discard and delete the record of each that succeeds",
+        "Guard the pass so that two never run at once: a pass requested while one runs returns a skipped result at once",
+        "Check the context before each fork and stop the pass when it is cancelled; a removal already started runs to its commit or rollback",
+        "Add the loop: one pass right after start, then one per tick of a 60-second ticker that tests replace, ending when its context is cancelled",
+        "Register a task named fork expiry in the maintenance task registry of package 03 that triggers one pass",
+        "Register the loop as background work on the composition value of internal/hub (package 03), in internal/hub/fork.go, so that it starts after the store is open and stops on shutdown before the store is closed"
+      ],
+      "touches": [
+        "internal/fork/sweep.go",
+        "internal/fork/sweep_test.go",
+        "internal/fork/remove.go",
+        "internal/maintenance/",
+        "internal/hub/fork.go"
+      ],
+      "depends_on": [
+        2,
+        3
+      ],
+      "done_when": [
+        "`go test ./internal/fork/... -count=1 -race` passes"
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Remove a fork a day after its work has landed",
+      "criteria": [
+        "REQ-6"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/fork/early_test.go with fakes for the change reader and the sandbox collaborator and confirm they fail",
+        "Define the change reader interface in internal/fork: for a fork slug it returns the source branch and the state of every change that has the fork as source; with no reader given, a fork has no changes",
+        "Keep a last-activity instant on the fork record, set to the creation time when the fork is created and shown in no response; add the store migration for it",
+        "Export the activity hook as RecordActivity(ctx, slug) of internal/fork: given a fork slug it sets the last-activity instant to the clock's time and does nothing for a slug that is not a fork; it is called for a push or API write to the fork and for a change of the fork being opened, versioned, landed, abandoned or restored",
+        "Register fork.RecordActivity from internal/hub/fork.go with the three places that declare a fork-activity hook, through one adapter each and for each of those packages that is in the repository at this point (a package built later is registered in the same file when it arrives): pushrule.ForkActivity of package 18, change.ForkActivity of package 22, and the after-landing hook list of internal/land (package 25), whose adapter calls RecordActivity for the source workspace of every landed change; import none of the three from internal/fork",
+        "In the sweep pass, after the forks past expires_at were handled and only when expire_on_land is true, evaluate every remaining fork: at least one change; every change landed or abandoned; every existing own branch (listed through the storage functions of package 15) is the source branch of a landed or abandoned change; the last activity is at least 24 hours before the clock's time; the sandbox collaborator reports no sandbox in provisioning or ready",
+        "Remove a fork that passes with cause expired and reason landed in its parley.fork.expire event; a fork that is also past expires_at was already removed with reason ttl earlier in the same pass",
+        "When the change reader or the sandbox collaborator returns an error for a fork, log the slug and the error, leave the fork and go on; do not ask the change reader at all when expire_on_land is false",
+        "Apply the same parent-busy skip and the same failure handling as for a removal by ttl"
+      ],
+      "touches": [
+        "internal/fork/early.go",
+        "internal/fork/early_test.go",
+        "internal/fork/sweep.go",
+        "internal/fork/collaborators.go",
+        "internal/store/"
+      ],
+      "depends_on": [
+        5
+      ],
+      "done_when": [
+        "`go test ./internal/fork/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Add parley fork extend and parley fork delete",
+      "criteria": [
+        "REQ-7"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/cli/fork_test.go, driving the command tree in-process against an httptest server, and confirm they fail",
+        "Add the subcommands extend and delete to the fork command group that package 15 created in internal/cli/fork.go; each takes exactly one argument",
+        "Before any request, refuse an argument that does not contain two consecutive hyphens with the usage error of package 09 (exit status 2, envelope with code 0 and error_type usage_error on stderr, nothing on stdout)",
+        "extend: require the flag --ttl with a non-empty value, send PATCH to the workspace route with a body holding only ttl through the shared HTTP client, and print the response; do not check the form of the duration on the client",
+        "delete: define no confirmation flag, send DELETE to the workspace route, and on 204 print the confirmation document with status deleted and the slug",
+        "Leave path encoding, the request timeout, the printing of a hub error and the exit status 1 to the client and output helpers of package 09",
+        "Add test/e2e/fork_lifetime_test.go with the two end-to-end flows of this package: extend then delete through the CLI with a fork-bound token, and a fork with ttl 5m removed by the sweep after the test advances the hub's clock"
+      ],
+      "touches": [
+        "internal/cli/fork.go",
+        "internal/cli/fork_test.go",
+        "test/e2e/fork_lifetime_test.go"
+      ],
+      "depends_on": [
+        5
+      ],
+      "done_when": [
+        "`go test ./internal/cli/... ./test/e2e/... -count=1` passes"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,794 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "18",
+  "spec_name": "git_push_rules",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Rule order and the decision",
+      "rationale": "The git server and the source control API must reach the same decision for the same write, so the order and the fail-closed answer live in one engine (GIT-FR-030, GIT-FR-033, SCM-FR-021).",
+      "system": "push rule engine",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "ubiquitous",
+          "action": "for any ref update, evaluate the rules in the order hub-owned refs, protected branches, default branch deletion, tracking branches, carry-patch push control, path-scoped tokens, and answer with the message and error_type of the first rule that refuses",
+          "contract": "decision {allowed: false, message: the rule's message with <branch> replaced by the ref name without refs/heads/, error_type: one of hub_owned_ref, protected_branch, default_branch, tracking_branch, integration_branch, patch_branch, path_not_allowed}",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a bare repository made with git init in t.TempDir() holding branches main, dev, feat and patch/a",
+              "stub lookups: tracking branches {main, dev} for the fork; a carry-patch controller stub with a scripted answer per ref"
+            ],
+            "pseudocode": "in internal/gitserver/pushrule/engine_test.go, a table of updates that two rules would refuse, each run through Evaluate, asserting message and error_type: (delete of the protected default branch 'main' -> protected_branch, 'main is protected and cannot be force-pushed or deleted', not default_branch); (fork: create of 'main' that is protected and a tracking branch -> protected_branch); (fork: fast-forward of protected tracking branch 'main' by the parent's owner with an API key -> tracking_branch); (fork with protected_branches []: delete of tracking default branch 'main' -> default_branch); (carry_patch workspace: fast-forward of protected branch 'patch/a' by the owner with an API key, controller refuses with patch_branch -> patch_branch and the controller's message); (carry_patch workspace: update of 'patch/a' by an org-member-level caller, protected -> protected_branch, controller not asked); (update of unprotected 'feat' by a PAT with paths ['docs/**'] adding a commit that changes 'src/a.go' -> path_not_allowed); (fork: update of tracking branch 'dev' by the same PAT with the same commit -> tracking_branch)"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "event_driven",
+          "condition": "a ref update outside refs/parley/ is refused by no rule",
+          "action": "allow it and report whether it is a create, a delete, a forced update and a direct push",
+          "contract": "decision {allowed: true, created: before is all-zero, deleted: after is all-zero, forced: neither create nor delete and before is not an ancestor of after, direct: false for every ref that is not a protected branch}",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/gitserver/pushrule/engine_test.go, a table run through Evaluate with an owner-level API key caller on a repository workspace with protected_branches ['main']: create refs/heads/feat -> created; fast-forward of refs/heads/feat -> none of the flags; update of refs/heads/feat to a commit that is not a descendant -> forced; delete of refs/heads/feat -> deleted; create, move and delete of refs/tags/v1; create of refs/notes/commits; create of refs/custom/x; create of refs/heads/parley/x; create of refs/parleyx/y; every row asserts allowed == true and the four flags, with direct == false"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "unwanted",
+          "condition": "a rule cannot be evaluated because the workspace's settings cannot be read, an ancestry question to git fails, the tracking-branch lookup fails, the carry-patch controller reports a failure, the version-files lookup fails, or the workspace is in mode carry_patch and no controller is registered",
+          "action": "refuse the ref update",
+          "contract": "decision {allowed: false, message: 'internal error; try again', error_type: 'internal'}; Evaluate itself returns no Go error and never a decision with allowed true for that update",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/gitserver/pushrule/engine_test.go, a table of injected faults, one per row, each on an update that would otherwise be allowed: settings reader returns an error; the repository view returns an error for is-ancestor on a protected branch; tracking lookup returns an error on a fork; controller stub returns an error on a carry_patch workspace; engine built with no controller and workspace mode carry_patch; version-files lookup returns an error for a path-scoped PAT update that adds no commit; assert message == 'internal error; try again' and error_type == 'internal' in every row"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "ubiquitous",
+          "action": "for any request, evaluate every ref update before anything is written, and write no ref, emit no event and start no forward to origin while evaluating",
+          "contract": "one decision per update in request order; the repository's refs are byte-for-byte the same after Evaluate as before it",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/gitserver/pushrule/engine_test.go: refsBefore = git for-each-ref; v = Evaluate(request with three updates: one allowed, one refused by rule 1, one on a carry_patch patch branch for which the controller stub answers allow-after-forward); assert len(v.Decisions) == 3 in request order; assert v.Refused(); assert git for-each-ref == refsBefore; assert the stub's forward function was called 0 times; assert the event writer stub was called 0 times"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Hub-owned refs, the default branch and tracking branches",
+      "rationale": "Refs the hub maintains, the branch every clone checks out and the branches a fork inherits must not be rewritten by a client (rules 1, 2a and 3 of GIT-FR-030, WS-FR-073).",
+      "system": "push rule engine",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "unwanted",
+          "condition": "a ref update names a ref under refs/parley/, whatever the credential, including the admin token",
+          "action": "refuse the create, the update and the delete",
+          "contract": "decision {allowed: false, message: 'refs/parley/ is maintained by the hub and cannot be pushed to', error_type: 'hub_owned_ref'}",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/gitserver/pushrule/rules_test.go, a table over refs {refs/parley/changes/3/1, refs/parley/replaced/patch-a, refs/parley/sandboxes/sb1/main, refs/parley/x} x kinds {create, update, delete} x callers {admin token, owner API key, owner PAT}: assert the message and error_type hub_owned_ref in every row"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "unwanted",
+          "condition": "a ref update deletes the workspace's default branch and no protected_branches glob matches that branch",
+          "action": "refuse the delete for every credential",
+          "contract": "decision {allowed: false, message: '<branch> is the default branch and cannot be deleted', error_type: 'default_branch'}",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/gitserver/pushrule/rules_test.go: workspace with default branch 'trunk' and protected_branches []; table over callers {admin token, owner API key}: delete of refs/heads/trunk -> message 'trunk is the default branch and cannot be deleted', error_type default_branch; and in the same table a forced update of refs/heads/trunk and a delete of refs/tags/trunk are allowed"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "unwanted",
+          "condition": "the workspace is a task fork and a ref update names a branch that the tracking-branch lookup reports as a tracking branch",
+          "action": "refuse the create, the update and the delete for every credential",
+          "contract": "decision {allowed: false, message: '<branch> tracks the parent workspace and is read-only in this fork; push a new branch', error_type: 'tracking_branch'}",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a fork workspace fact set {kind: fork, parent: demo} and a repository workspace fact set"
+            ],
+            "pseudocode": "in internal/gitserver/pushrule/rules_test.go, with a lookup stub reporting {dev, release/1} as tracking branches of fork 'demo--k3x9w2ab' and protected_branches []: table over branches {dev, release/1} x kinds {create, update, delete} x callers {admin token, fork owner API key, fork-bound PAT} -> 'dev tracks the parent workspace and is read-only in this fork; push a new branch' with error_type tracking_branch; a create of refs/heads/task-1 in the fork is allowed; an update of refs/heads/dev on a repository workspace is allowed and the lookup is not called for it"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Protected branches and the owner exemption",
+      "rationale": "Work reaches a protected branch by landing; the owner keeps a fast-forward door that can be closed, and nobody can rewrite or delete the branch (rule 2, GIT-FR-034, GIT-FR-035, section 8.3.1).",
+      "system": "push rule engine",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "ubiquitous",
+          "action": "for any branch name and any protected_branches list, treat the branch as protected exactly when the branch-glob matcher of package 11 (internal/workspace/branchglob.go) reports that at least one glob matches the whole branch name, and use no other matcher for protected_branches",
+          "contract": "protected(branch, globs) is what the matcher of package 11 answers for the branch name without refs/heads/ (* is any run of characters except /, ** any run including /, case-sensitive); an empty list protects nothing; refs outside refs/heads/ are never protected",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/gitserver/pushrule/protected_test.go, with the real matcher of internal/workspace, a table of (branch, globs, want) asked through the engine's protected test: ('main',['main'],true); ('main2',['main'],false); ('mai',['main'],false); ('Main',['main'],false); ('release/1.0',['release/*'],true); ('release/1.0/hotfix',['release/*'],false); ('release/1.0/hotfix',['release/**'],true); ('a',['*'],true); ('feature/a',['*'],false); ('feature/a',['**'],true); ('x',[],false); ('dev',['main','dev'],true); ('rel-1',['rel-*'],true); and through Evaluate: a forced update of refs/tags/main with protected_branches ['main'] is allowed"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "unwanted",
+          "condition": "a ref update is a forced update or a delete of a protected branch, whatever the credential and whatever protect.owner_push is",
+          "action": "refuse it",
+          "contract": "decision {allowed: false, message: '<branch> is protected and cannot be force-pushed or deleted', error_type: 'protected_branch'}",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a bare repository in t.TempDir() where main has a descendant commit and an unrelated commit to push"
+            ],
+            "pseudocode": "in internal/gitserver/pushrule/protected_test.go, one table of (caller, protect.owner_push, update kind on protected 'main', want): rows for forced update and delete x callers {admin token, owner API key, owner unbound PAT without paths, owner workspace-bound PAT} x owner_push {true, false} -> 'main is protected and cannot be force-pushed or deleted'; rows for create of 'release/2' with protected_branches ['main','release/*'] x the same callers -> 'release/2 is protected; push another branch and open a change (git push -o parley.change)'; rows for a fast-forward of 'main': (admin token, false), (owner API key, false), (member-level API key, true), (owner workspace-bound PAT, true), (owner PAT with paths ['**'], true), (member-level PAT, true) -> 'main is protected; push another branch and open a change (git push -o parley.change)'; rows for a fast-forward of 'main' with owner_push true: admin token, owner API key, owner unbound PAT without paths, and on a fork the parent's owner with an API key on the fork's own protected branch -> allowed with direct == true; every refused row asserts error_type protected_branch"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "unwanted",
+          "condition": "a ref update creates a branch that a protected_branches glob matches, whatever the credential",
+          "action": "refuse it",
+          "contract": "decision {allowed: false, message: '<branch> is protected; push another branch and open a change (git push -o parley.change)', error_type: 'protected_branch'}",
+          "check": {
+            "same_as": "REQ-3.2"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "unwanted",
+          "condition": "a ref update is a fast-forward of a protected branch and protect.owner_push is false, or the caller's level is neither owner nor admin, or the credential is a workspace-bound PAT or a PAT with paths",
+          "action": "refuse it",
+          "contract": "decision {allowed: false, message: '<branch> is protected; push another branch and open a change (git push -o parley.change)', error_type: 'protected_branch'}",
+          "check": {
+            "same_as": "REQ-3.2"
+          }
+        },
+        {
+          "id": "REQ-3.5",
+          "pattern": "event_driven",
+          "condition": "a ref update is a fast-forward of an existing protected branch, protect.owner_push is true, the caller's level is owner or admin, and the credential is an API key, the admin token or a PAT that is neither bound to a workspace nor carries paths",
+          "action": "let the update pass rule 2 and mark it as a direct push",
+          "contract": "decision {allowed: true, direct: true, created: false, deleted: false, forced: false}, provided rules 1, 3, 4 and 5 do not refuse it",
+          "check": {
+            "same_as": "REQ-3.2"
+          }
+        },
+        {
+          "id": "REQ-3.6",
+          "pattern": "unwanted",
+          "condition": "a ref update satisfies the owner exemption and names a branch that the tracking-branch rule or the carry-patch controller refuses",
+          "action": "refuse it with the message and error_type of that later rule",
+          "contract": "decision {allowed: false, error_type: 'tracking_branch', 'integration_branch' or 'patch_branch'}; direct is not reported as true",
+          "check": {
+            "same_as": "REQ-1.1"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Carry-patch hand-off and forwarding to origin",
+      "rationale": "Carry-patch push control is decided elsewhere (package 37), but where it sits in the order, that its one outside effect runs last, and what its failure does to a push are part of push processing (rule 4, GIT-FR-031, GIT-FR-061).",
+      "system": "push rule engine",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "a ref update on a workspace in mode carry_patch has passed rules 1 to 3",
+          "action": "ask the registered carry-patch controller once for that update and take its answer as the decision of rule 4",
+          "contract": "controller answers refuse -> decision {allowed: false, message: the controller's message, error_type: the controller's integration_branch or patch_branch}; allow -> the update goes on to rule 5; allow-after-forward -> the update goes on to rule 5 and, when allowed, carries a pending forward; the controller is not asked on a workspace in mode standard nor for an update that rules 1 to 3 refused",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/gitserver/pushrule/carrypatch_test.go, with a recording controller stub: table of (workspace mode, ref, scripted answer, want decision, want controller calls): (carry_patch, refs/heads/integration, refuse{'integration branch integration is maintained by the hub; push a patch branch and rebuild instead', integration_branch}, refused with that message and type, 1); (carry_patch, refs/heads/patch/a, allow, allowed without forward, 1); (carry_patch, refs/heads/patch/a, allow-after-forward, allowed with a pending forward, 1); (carry_patch, refs/parley/x, any, hub_owned_ref, 0); (standard, refs/heads/patch/a, any, allowed, 0)"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "unwanted",
+          "condition": "the workspace is in mode carry_patch and no carry-patch controller is registered",
+          "action": "refuse every ref update that passed rules 1 to 3",
+          "contract": "decision {allowed: false, message: 'internal error; try again', error_type: 'internal'}",
+          "check": {
+            "same_as": "REQ-1.3"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "event_driven",
+          "condition": "every ref update of a request is allowed and at least one carries a pending forward",
+          "system": "ref writer",
+          "action": "run the forwards after all rules have been evaluated and before any ref is written, in command order, each under a limit of 120 seconds",
+          "contract": "each pending forward is invoked exactly once, in command order, before the ref transaction; in a request with a refused update no forward is invoked",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a bare repository in t.TempDir() with the objects of every after value present",
+              "the ref writer built with a stub event writer"
+            ],
+            "pseudocode": "in internal/gitserver/pushrule/apply_test.go, with forwards that append their ref and the current value of the hub ref to a log: Apply(verdict of two patch-branch updates with forwards and one plain update); assert log refs == the two refs in command order; assert every logged hub ref value == its before value (the transaction had not run); assert all three refs hold their after values afterwards; then Apply(verdict with one refused update and one forward) -> assert the log did not grow and no ref moved"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "unwanted",
+          "condition": "a forward to origin fails",
+          "system": "ref writer",
+          "action": "refuse the whole request, write no ref, run no later forward and leave earlier forwards of the same request as they are",
+          "contract": "the failed update: {allowed: false, message: the message the forward returned, error_type: 'patch_branch'}; every other update: message 'not updated: another ref in this push was refused'; no ref of the hub changed; no event written",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/gitserver/pushrule/apply_test.go: three updates with forwards f1 (succeeds), f2 (fails with 'origin rejected push: non-fast-forward'), f3; r = Apply(...); assert r.Refused; assert r.Updates[1].Message == 'origin rejected push: non-fast-forward' and error_type == 'patch_branch'; assert r.Updates[0].Message == r.Updates[2].Message == 'not updated: another ref in this push was refused'; assert f1 called once, f3 called 0 times, no undo call recorded for f1; assert git for-each-ref unchanged; assert event writer stub calls == 0"
+          }
+        },
+        {
+          "id": "REQ-4.5",
+          "pattern": "unwanted",
+          "condition": "a forward to origin has not finished when its 120 second limit passes",
+          "system": "ref writer",
+          "action": "cancel that forward and refuse the whole request",
+          "contract": "the update: {allowed: false, message: 'origin rejected push: timed out', error_type: 'patch_branch'}; the forward's context is cancelled; no ref of the hub changed",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/gitserver/pushrule/apply_test.go, with the ref writer's forward limit set to 50 ms through its test option and a forward that blocks until its context is done: r = Apply(...); assert r.Updates[0].Message == 'origin rejected push: timed out'; assert the forward observed ctx.Err() != nil; assert git for-each-ref unchanged; and assert the production default of the limit == 120 s"
+          }
+        },
+        {
+          "id": "REQ-4.6",
+          "pattern": "event_driven",
+          "condition": "the ref writer has finished an accepted request, whatever its surface: a git push, a write through the source control API or a land",
+          "system": "ref writer",
+          "action": "report the workspace, the moved refs in command order, via and the session id to every registered post-push listener in the background",
+          "contract": "each listener is called once with the slug, the accepted updates, via ('git', 'api' or 'land' as the caller of Apply passed it) and the session id of the request, or null; the call is made by the ref writer's event step, so the git processor, package 21 and package 25 make none of their own; the caller's answer is complete while a listener is still running; a listener that returns an error or panics changes neither the answer nor the refs; no listener is called for a refused request or a push with no commands",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a bare repository in t.TempDir(), a migrated store and the ref writer with two listeners registered: A, which records its arguments and blocks on a channel, and B, which panics",
+              "the push processor mounted on net/http/httptest over the same repository"
+            ],
+            "pseudocode": "in internal/gitserver/pushrule/event_test.go, a table over (via, session) {('git', 's-1'); ('api', 's-2'); ('land', null)}: run Apply and its event step for a verdict of one create; assert the event step returned while A is still blocked; release A; assert A received ('demo', [the create], via, session) exactly once per row; assert the process did not crash and the ref holds its after value; Apply(a verdict with a refused update) -> assert A's call count unchanged; and in internal/gitserver/receive_test.go: resp = push(create refs/heads/feat); assert resp is fully read with 'ok refs/heads/feat' while A is still blocked and A received via 'git'; a request with no commands -> assert no further call"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Path-scoped tokens",
+      "rationale": "An operator bounds an agent's write access by paths; the bound must hold for every commit the agent adds and must not be dodged by adopting commits made with another credential (rule 5, GIT-FR-032, LAND-FR-080).",
+      "system": "push rule engine",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "unwanted",
+          "condition": "the caller's credential is a PAT with paths, every ref update passed rules 1 to 4, and a commit that is new to the repository changes a path that matches none of the token's globs",
+          "action": "refuse the whole request and name the first offending path",
+          "contract": "the first update in command order from whose after value the offending commit is reachable: {allowed: false, message: 'path <path> is outside this token's allowed paths', error_type: 'path_not_allowed', path: <path>}; the verdict as a whole is refused",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a bare repository in t.TempDir() with branches main, feat and other; for the fork row a second bare repository acting as the parent whose refs the repository view includes",
+              "the glob matcher of package 06 used unstubbed"
+            ],
+            "pseudocode": "in internal/gitserver/pushrule/paths_test.go, a table of pushes by a PAT with paths ['docs/**'], each built with git in the test repository and run through Evaluate, (case, want): (commit changes docs/a.md -> allowed); (commit changes docs/a.md and src/main.go -> path src/main.go); (older commit changes zz/late.txt, newer commit changes aa/first.txt -> path zz/late.txt); (one commit changes b.txt and a.txt -> path a.txt); (commit renames docs/a.md to src/a.md -> path src/a.md); (commit renames src/x.md to docs/x.md -> path src/x.md); (new root commit on a new branch with docs/a.md and other/b.md -> path other/b.md); (merge commit whose first-parent diff is docs/m.md and whose second parent, already in the repository, changed src/s.go -> allowed); (force-push of a branch rebased onto a newer main whose existing commits changed src/** and whose own commit changes docs/r.md -> allowed); (fork: pushed head contains commits that only the parent repository's refs reach and that changed src/** plus one own commit changing docs/f.md -> allowed); (annotated tag refs/tags/v1 pointing to a new commit that changes src/t.go -> path src/t.go); (refs/notes/commits with a new commit that changes a file named by a commit id -> path that file); (delete of refs/heads/feat -> allowed); (fast-forward of refs/heads/feat to a commit already reachable from refs/heads/other, no change lookup registered -> allowed); (two updates, the second head carrying the offending commit -> the second decision carries the message and the first is allowed); in every refused row assert error_type == 'path_not_allowed' and the path field"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "ubiquitous",
+          "action": "for any request by a PAT with paths, check exactly the commits reachable from the pushed after values and not reachable from any ref the repository had before the push, including the parent's refs in a task fork, comparing each commit with its first parent, a root commit with the empty tree, and counting a rename with both its old and its new path",
+          "contract": "commits already in the repository or in the fork's parent are never the reason for a refusal; tags, notes and other refs are checked like branches",
+          "check": {
+            "same_as": "REQ-5.1"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "ubiquitous",
+          "action": "for any refused path check, name the first offending path taking the checked commits oldest first, a parent before its children, and the paths within one commit in byte order",
+          "contract": "the path in the message and in the path field is the same for the same pushed commits on every evaluation",
+          "check": {
+            "same_as": "REQ-5.1"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "event_driven",
+          "condition": "a PAT with paths pushes a delete, or an update that adds no new commit to a branch for which the version-files lookup reports no version",
+          "action": "allow the update under rule 5",
+          "contract": "decision {allowed: true}",
+          "check": {
+            "same_as": "REQ-5.1"
+          }
+        },
+        {
+          "id": "REQ-5.5",
+          "pattern": "unwanted",
+          "condition": "a PAT with paths pushes an update that adds no new commit, and the version-files lookup reports that the branch is the source of a draft or open change, or that the push opens one, with a file among the resulting version's files against its base that matches none of the token's globs",
+          "action": "refuse the whole request and name the first such file in byte order",
+          "contract": "decision {allowed: false, message: 'path <path> is outside this token's allowed paths', error_type: 'path_not_allowed', path: <path>}",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/gitserver/pushrule/paths_test.go, with a version-files lookup stub and a fast-forward of refs/heads/feat to a commit already in the repository, PAT paths ['docs/**']: lookup reports files ['src/x.go','docs/a.md','lib/y.go'] -> refused with path lib/y.go; lookup reports files ['docs/a.md'] -> allowed; lookup reports no version -> allowed; assert the lookup received exactly the workspace slug, the branch, the after value and the opens-change flag the request carried, and no target branch, also in a row whose flag says the update opens a change"
+          }
+        },
+        {
+          "id": "REQ-5.6",
+          "pattern": "event_driven",
+          "condition": "the caller's credential is an API key, the admin token or a PAT without paths",
+          "action": "skip rule 5 without reading any commit",
+          "contract": "decision {allowed: true} for an update that rules 1 to 4 pass, whatever paths its commits change; the repository view receives no new-commits or changed-files question",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/gitserver/pushrule/paths_test.go, with a counting repository view: table over callers {owner API key, admin token, PAT with paths null}: Evaluate(update adding a commit that changes src/main.go) -> allowed; assert the view's new-commits call count == 0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Push processing over git-receive-pack",
+      "rationale": "A push either lands whole or leaves no trace, and a stock git client must be told why in the two places it looks (GIT-FR-020 to GIT-FR-027, section 5.7).",
+      "system": "push processor",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "a git client sends a git-receive-pack request in which every ref update passes the rules and the compare-and-swap",
+          "action": "update all refs of the request together, keep the pushed objects in the repository and answer with the status report",
+          "contract": "HTTP 200, Content-Type application/x-git-receive-pack-result, a report 'unpack ok' followed by 'ok <ref>' per command in command order; every ref holds its after value (a deleted ref is gone); every pushed object is readable in the repository",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the push processor mounted on net/http/httptest over a bare repository in t.TempDir(), with the real rule engine, the real ref writer and an owner-level API key caller",
+              "client capabilities report-status, side-band-64k, delete-refs, atomic unless a row says otherwise"
+            ],
+            "pseudocode": "in internal/gitserver/receive_test.go, a table of requests built with a pkt-line test helper and a pack from git pack-objects, posted to the processor: create refs/heads/feat; fast-forward of refs/heads/feat; forced update of refs/heads/feat; a request of two deletes with no pack; create of refs/tags/v1; create of refs/notes/commits; one request creating refs/heads/a and refs/heads/b and deleting refs/heads/old; for each: assert status 200 and the content type; parse the side-band report; assert 'unpack ok' and one 'ok <ref>' per command in order; assert git rev-parse of each ref == after (or fails for a delete); assert git cat-file -e of each after value succeeds; assert no quarantine directory is left under the repository"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "unwanted",
+          "condition": "at least one ref update of a push is refused by a rule or by the compare-and-swap",
+          "action": "update no ref, discard the pushed objects, emit no event, skip the mapping stage and report every ref",
+          "contract": "HTTP 200; report 'unpack ok'; 'ng <ref> <message>' for each refused ref; 'ng <ref> not updated: another ref in this push was refused' for every other ref; one side-band line 'error: <ref>: <message>' per refused ref; all refs unchanged; the pushed commit ids are not readable in the repository and no quarantine directory remains; zero events; the mapping stage was not called",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/gitserver/receive_test.go, a table of two-ref requests (one offending ref, plus create refs/heads/ok) with a recording mapping stage and the real event writer over a store in t.TempDir(): offending ref = create refs/parley/changes/1/1 (rule 1 message); forced update of protected main by the admin token ('main is protected and cannot be force-pushed or deleted'); delete of unprotected default branch; fast-forward of refs/heads/feat with a stale before ('ref changed since it was read; fetch and try again'); for each: assert status 200; assert report lines == ['unpack ok', 'ng <offending> <message>', 'ng refs/heads/ok not updated: another ref in this push was refused'] in command order; assert side-band text contains 'error: <offending>: <message>' once; assert git for-each-ref unchanged; assert git cat-file -e <pushed commit> fails; assert no quarantine directory; assert event count == 0; assert mapping stage calls == 0"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "event_driven",
+          "condition": "a git-receive-pack request with at least one command arrives",
+          "action": "run its stages in the order options stage, pack into quarantine, rule evaluation, forwards, ref update with the ref-updated stages inside its commit step, mapping stage, events, answer",
+          "contract": "the options stage receives the push options before any pack byte is stored and may refuse the push with a message M: then no object is stored, nothing is written, the report is 'unpack ok' and 'ng <ref> M' for every ref, and one side-band line 'error: M' is sent; the mapping stage receives the accepted updates with their direct flags and the version a ref-updated stage reported for each, after the refs hold their after values and before any parley.git.push event is written, and each line it returns is sent on the side band; a session id the options stage sets is the session of the ref-updated stages and of the events; with no stage registered every option is accepted and no line is added",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/gitserver/receive_test.go, with recording stages that note the time order of their calls, whether the request body still has unread pack bytes, the refs at call time and the event count at call time: push(create refs/heads/feat with options ['parley.change','x=y']); assert the options stage saw both options and an unread pack; assert the mapping stage saw refs/heads/feat == after and event count 0 and its returned line 'change demo#1 version 1 (opened)' appears in the side-band output; then with an options stage that refuses with the message 'invalid push option parley.nope: unknown option': assert the side band carries 'error: invalid push option parley.nope: unknown option', the report has 'unpack ok' and 'ng refs/heads/feat invalid push option parley.nope: unknown option', no object of the pack is in the repository or a quarantine, refs unchanged, event count unchanged; then with no stages registered: push with option 'parley.anything' -> 'ok refs/heads/feat'"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "unwanted",
+          "condition": "the pack of a push cannot be read, or a command's after value names an object that is neither in the pack nor in the repository",
+          "action": "fail the push and change nothing",
+          "contract": "HTTP 200; report 'unpack invalid pack' and 'ng <ref> unpacker error' per command; all refs unchanged; no pushed object readable; no event",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/gitserver/receive_test.go, a table of bodies after a valid command 'create refs/heads/feat': a pack truncated in the middle; twenty bytes that are not a pack; a valid pack that does not contain the after commit; an empty body where a pack is required; assert report == ['unpack invalid pack', 'ng refs/heads/feat unpacker error']; assert git for-each-ref unchanged; assert no quarantine directory; assert event count == 0"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "event_driven",
+          "condition": "a git-receive-pack request arrives whose command list is empty",
+          "action": "answer it as a successful no-op",
+          "contract": "HTTP 200 with Content-Type application/x-git-receive-pack-result and an empty body; no ref changed; no event; neither stage called",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/gitserver/receive_test.go: resp = post(a body holding only a flush packet); assert status 200, the content type and len(body) == 0; assert git for-each-ref unchanged; assert event count == 0; assert options stage and mapping stage call counts == 0"
+          }
+        },
+        {
+          "id": "REQ-6.6",
+          "pattern": "event_driven",
+          "condition": "an accepted push moves the default branch of a repository workspace",
+          "action": "store the new commit id as the workspace's head_sha before the push is answered",
+          "contract": "at the moment the response has been read, the workspace record's head_sha equals the after value (40 hexadecimal characters); a push to a task fork and a push that does not move the default branch do not set head_sha",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/gitserver/receive_test.go, with a recording head_sha setter that notes whether the response writer had been written to: owner API key fast-forwards protected default branch main -> assert setter called once with ('demo', after) before the first response byte; push to refs/heads/feat -> setter call count unchanged; fast-forward of an own branch named like the base branch on a fork workspace fact set -> setter call count unchanged"
+          }
+        },
+        {
+          "id": "REQ-6.7",
+          "pattern": "event_driven",
+          "condition": "a client that did not ask for report-status, or did not ask for side-band-64k, sends a push",
+          "action": "apply the rules and the atomicity as for any push and send only what the client asked for",
+          "contract": "without report-status: HTTP 200 and no status report; without side-band-64k: the status report is sent unwrapped and no 'error:' line is sent; in both cases a refused push leaves all refs unchanged and an accepted one updates them",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/gitserver/receive_test.go, a table of (capabilities, request, want): ({}, create refs/parley/x, body empty and refs unchanged); ({}, create refs/heads/feat, body empty and ref created); ({report-status}, forced update of protected main, body is plain pkt-lines 'unpack ok', 'ng refs/heads/main main is protected and cannot be force-pushed or deleted' with no side-band framing and no 'error:' text, refs unchanged)"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "Compare-and-swap of refs",
+      "rationale": "No request fails only because another operation is running; writers of the same ref are ordered by compare-and-swap instead of locks (GIT-FR-022, PLAT-FR-019).",
+      "system": "ref writer",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "unwanted",
+          "condition": "a ref update's before value is not the ref's current value: the ref has moved, the update creates a ref that exists, or it updates or deletes a ref that is missing",
+          "action": "refuse the whole request and write no ref",
+          "contract": "the mismatching update: {allowed: false, message: 'ref changed since it was read; fetch and try again', outcome: ref_moved}; every other update: message 'not updated: another ref in this push was refused'; all refs unchanged; no event",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a bare repository in t.TempDir() with refs/heads/feat two commits ahead of the stale before value"
+            ],
+            "pseudocode": "in internal/gitserver/pushrule/apply_test.go, a table of single mismatches, each applied in a request together with a valid create of refs/heads/ok: update of refs/heads/feat with before == an older commit; create of refs/heads/feat which exists; update of refs/heads/gone which does not exist; delete of refs/heads/gone; delete of refs/heads/feat with a wrong before; assert the result is refused with outcome ref_moved, the message on the mismatching update and the not-updated message on refs/heads/ok; assert git for-each-ref unchanged (refs/heads/ok was not created); assert event writer stub calls == 0"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "event_driven",
+          "condition": "two or more requests update the same ref from the same before value at the same time",
+          "system": "push processor",
+          "action": "apply exactly one of them and refuse the others",
+          "contract": "exactly one request answers 'ok <ref>'; each other answers 'ng <ref> ref changed since it was read; fetch and try again'; the ref holds the winner's after value",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/gitserver/receive_test.go: eight goroutines each post a fast-forward of refs/heads/feat from the same before to its own distinct commit, released together; assert count of 'ok refs/heads/feat' == 1 and count of 'ng refs/heads/feat ref changed since it was read; fetch and try again' == 7; assert git rev-parse refs/heads/feat == the winner's after; assert the seven losers' commits are not readable in the repository"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "event_driven",
+          "condition": "requests that update different refs of one workspace run at the same time",
+          "system": "push processor",
+          "action": "apply each of them without waiting for the other",
+          "contract": "every request answers 'ok <ref>'; a request completes while another request on the same workspace is still held in a stage",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/gitserver/receive_test.go: request A creates refs/heads/a and is held inside a mapping stage that blocks on a channel; request B creates refs/heads/b; assert B's response 'ok refs/heads/b' is read while A is still blocked; release A; assert A answers 'ok refs/heads/a'; assert both refs exist"
+          }
+        },
+        {
+          "id": "REQ-7.4",
+          "pattern": "event_driven",
+          "condition": "every ref update of a request passed the rules, its ref transaction is prepared, and ref-updated stages are registered with the ref writer",
+          "action": "run each registered stage once, in registration order, inside the commit step: in one store transaction the ref writer opens, after the compare-and-swap is verified and before the refs take their new values, and commit that store transaction directly after the ref transaction",
+          "contract": "each stage is called once with the store transaction, the workspace facts, the caller facts with the credential type and id, the session id, via, the version kind the caller of Apply named (push, commit, ref, rebase or none) and the accepted updates with their flags; at call time every ref still holds its before value and the new objects are readable in the repository; rows a stage wrote in the transaction are stored when Apply returns; the result of each update carries the version {workspace_slug, number, version} a stage reported for it, or none; no stage is called for a refused request",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a bare repository in t.TempDir() and a migrated store; two recording stages registered with the ref writer, the first writing one row in the transaction it is given and reporting version {demo, 4, 2} for refs/heads/feat"
+            ],
+            "pseudocode": "in internal/gitserver/pushrule/apply_test.go: Apply(verdict of update refs/heads/feat and create refs/heads/other, via 'api', version kind 'commit', session 's1', caller with credential id 'k1'); assert the stages were called once each in registration order with via 'api', kind 'commit', session 's1', credential id 'k1' and both updates; assert each stage saw refs/heads/feat at its before value and could read the after commit; assert after Apply the ref holds after and the stage's row is stored; assert result[refs/heads/feat].version == {demo, 4, 2} and result[refs/heads/other].version is none; Apply(a verdict with a refused update) -> assert no stage call"
+          }
+        },
+        {
+          "id": "REQ-7.5",
+          "pattern": "unwanted",
+          "condition": "a ref-updated stage returns an error",
+          "action": "abort the ref transaction, roll the store transaction back, call no later stage and refuse the whole request",
+          "contract": "Apply returns the stage's error unchanged beside the results; every update: {allowed: false, message: 'internal error; try again', error_type: 'internal'}; all refs unchanged; no row of any stage is stored; the journal entry is removed; no event; over git every ref is reported 'ng <ref> internal error; try again' and the request counts as error",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a bare repository in t.TempDir() and a migrated store; a first stage that writes one row and a second stage that returns an error value E; a third recording stage"
+            ],
+            "pseudocode": "in internal/gitserver/pushrule/apply_test.go: res, err = Apply(verdict of one update of refs/heads/feat, via 'git', version kind 'push'); assert err is E; assert every result has allowed == false, message 'internal error; try again' and error_type 'internal'; assert git for-each-ref unchanged; assert the first stage's row is absent; assert the third stage was not called; assert the journal is empty and the event writer stub has no call"
+          }
+        },
+        {
+          "id": "REQ-7.6",
+          "pattern": "event_driven",
+          "condition": "an accepted request with via git or api has written at least one ref of a task fork",
+          "action": "report the fork's slug once to the registered fork activity recorder after the refs are written",
+          "contract": "the recorder (the interface ForkActivity of internal/gitserver/pushrule, which package 16 registers) is called once with the fork's slug; it is not called for a repository workspace, for a refused request or for via land; a recorder error is logged and changes neither the result nor the refs; with no recorder registered nothing happens",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a recording fork activity recorder registered with the ref writer; workspace facts for a repository workspace demo and for a task fork demo--t1"
+            ],
+            "pseudocode": "in internal/gitserver/pushrule/apply_test.go, a table of (workspace, via, verdict, want calls): (demo--t1, 'git', accepted, ['demo--t1']); (demo--t1, 'api', accepted, ['demo--t1']); (demo, 'git', accepted, []); (demo--t1, 'git', one refused update, []); then a recorder that returns an error: assert Apply still reports the request accepted and the ref holds its after value; then no recorder: assert accepted"
+          }
+        },
+        {
+          "id": "REQ-7.7",
+          "pattern": "event_driven",
+          "condition": "a caller hands Apply, with via land, a verdict it built with AllowedVerdict instead of Evaluate",
+          "action": "write the updates of that verdict as an accepted request without asking the rule engine",
+          "contract": "AllowedVerdict(updates) returns a verdict in which every update is allowed, with created, deleted and forced computed as Evaluate computes them and direct false; Apply with via land moves a branch that protected_branches matches, also when protect.owner_push is false, and calls no rule and no collaborator of the engine; the compare-and-swap still decides (a moved ref answers ref_moved and writes nothing); the ref-updated stages run with via land; the event has via 'land' and direct false",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a bare repository in t.TempDir() whose refs/heads/main is at commit A, a migrated store, workspace facts with protected_branches ['main'] and protect.owner_push false, a recording ref-updated stage, a capturing event writer and an engine whose collaborators count their calls"
+            ],
+            "pseudocode": "in internal/gitserver/pushrule/apply_test.go: v = AllowedVerdict([update refs/heads/main A -> B]); assert v has no refused update and its decision is {allowed, created false, deleted false, forced false, direct false}; res = Apply(v, via 'land', version kind none) then the event step; assert refs/heads/main == B; assert the stage was called once with via 'land'; assert the captured event has via 'land' and direct false; assert every engine collaborator's call count == 0; then Apply(AllowedVerdict([update refs/heads/main A -> C]), via 'land') -> assert outcome ref_moved and refs/heads/main == B"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "The parley.git.push event",
+      "rationale": "Consumers of the event stream follow what agents do one ref update at a time, and an accepted update must not go unrecorded because the hub stopped at the wrong moment (GIT-FR-060, GIT-FR-035, sections 5.8 and 14.3.6).",
+      "system": "ref writer",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "the refs of an accepted request have been written",
+          "action": "write one parley.git.push event per updated ref, in command order",
+          "contract": "each event: type 'parley.git.push', resource_type 'ref', resource_id the full ref name, action 'push', workspace the slug the request named (the fork's slug for a fork), actor_type 'pat', 'api_key' or 'admin_token' after the credential, session_id the id the options stage set or null, metadata {ref, before, after, created, deleted, forced, direct, via}; before is null for a create and after is null for a delete, otherwise 40 hexadecimal characters; direct is true only for a protected branch moved under the owner exemption; via is 'git' for a push",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the push processor over a bare repository in t.TempDir() and the event component of internal/event unstubbed"
+            ],
+            "pseudocode": "in internal/gitserver/push_event_test.go, pushing through the processor with the real event log over a store in t.TempDir() and reading the workspace's events back: table of (caller, update, want metadata): (PAT, create refs/heads/feat, before null, created true, others false); (PAT, fast-forward, all flags false); (PAT, forced update, forced true); (API key, delete, after null, deleted true); (owner API key, fast-forward of protected main, direct true); (admin token, create refs/tags/v1, created true); assert one event per update with type, resource_type 'ref', resource_id == ref, action 'push', via 'git', actor_type per caller, workspace 'demo'; push to fork fact set 'demo--k3x9w2ab' -> workspace == 'demo--k3x9w2ab'; with an options stage that sets session 's-1' -> session_id == 's-1', otherwise null; a request with three commands -> three events in command order"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "ubiquitous",
+          "action": "for any accepted request with several ref updates, write its events in one store transaction so that they hold consecutive positions among the workspace's events",
+          "contract": "between the first and the last event of one request no other event of the same workspace appears, also when other requests on that workspace are accepted at the same time",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/gitserver/push_event_test.go: six goroutines each push one request creating three refs with a distinct prefix (refs/heads/g<i>/a, /b, /c), released together; read the workspace's events in order; assert 18 events; assert that the events of each prefix occupy three adjacent positions in command order a, b, c"
+          }
+        },
+        {
+          "id": "REQ-8.3",
+          "pattern": "event_driven",
+          "condition": "the source control API or a land applies ref updates through the ref writer and names its surface",
+          "action": "write the same event with via set to that surface",
+          "contract": "metadata.via == 'api' or 'land' as passed; every other field as for a push; a via value other than 'git', 'api' and 'land' is refused with an error before any ref is written; the git server, package 21 and package 25 all call the same Apply",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/gitserver/pushrule/event_test.go: table over via {'git','api','land'}: Apply(verdict of one create, via) with a capturing event writer -> assert event.metadata.via == via and the other fields; Apply(..., via 'cli') -> assert an error is returned, git for-each-ref unchanged and no event captured"
+          }
+        },
+        {
+          "id": "REQ-8.4",
+          "pattern": "unwanted",
+          "condition": "a request is refused, fails at the pack, or has no commands",
+          "action": "write no event",
+          "contract": "the workspace's event count is unchanged",
+          "check": {
+            "same_as": "REQ-6.2"
+          }
+        },
+        {
+          "id": "REQ-8.5",
+          "pattern": "unwanted",
+          "condition": "the event write fails after the refs of a request have been written",
+          "action": "complete the request as accepted and keep its journal entry",
+          "contract": "the result is accepted ('ok <ref>' over git); every ref holds its after value; the journal still holds the request's entry with every ref update, the actor, the session id and via",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a store in t.TempDir() with the journal migration applied"
+            ],
+            "pseudocode": "in internal/gitserver/pushrule/journal_test.go, with an event writer that returns an error: r = Apply(verdict of two creates, via 'git'); assert !r.Refused and r.Err == nil; assert both refs hold after; assert the journal has one entry listing both updates in command order with actor_type, session id and via"
+          }
+        },
+        {
+          "id": "REQ-8.6",
+          "pattern": "event_driven",
+          "condition": "the hub starts and the journal holds entries",
+          "action": "before serving requests, write the events of every entry whose refs hold their after values, drop every entry whose refs were never written, and remove each handled entry in the same transaction as its events",
+          "contract": "after start-up: exactly one parley.git.push event per ref update of an entry of the first kind, with the fields the original request would have written; no event for an entry of the second kind; the journal is empty; running the reconciliation again writes nothing",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/gitserver/pushrule/journal_test.go, with the real event log: seed the journal with entry E1 (two updates; set the repository's refs to their after values with git update-ref), entry E2 (one create; ref absent), entry E3 (one delete whose ref is already gone); Reconcile(); assert events == E1's two in command order then E3's one, with before/after/created/deleted, actor_type, session id and via from the entries; assert no event for E2; assert the journal is empty; Reconcile() again -> assert event count unchanged; and assert the reconciliation is registered to run in parleyd's start-up before the listener accepts requests by starting the in-process hub over the seeded store and reading the events on the first request"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-9",
+      "title": "Limits, timeout and counting",
+      "rationale": "An operator bounds what one push may cost and sees in the metrics how pushes end (GIT-FR-002, GIT-FR-024, GIT-FR-062, section 5.9).",
+      "system": "push processor",
+      "criteria": [
+        {
+          "id": "REQ-9.1",
+          "pattern": "unwanted",
+          "condition": "[git].max_push_size is greater than 0 and the pack of a push is larger than it",
+          "action": "fail the push and change nothing",
+          "contract": "HTTP 200; report 'unpack pack exceeds the maximum push size' and 'ng <ref> unpacker error' per command; refs unchanged; no pushed object readable; no event; a pack of exactly the limit is accepted; with the limit 0 a pack of any size is accepted, also one larger than [server].max_body_size",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/gitserver/limits_test.go, with a pack of N bytes: table of (max_push_size, want): (N, 'ok refs/heads/feat'); (N-1, ['unpack pack exceeds the maximum push size', 'ng refs/heads/feat unpacker error'], refs unchanged, no quarantine directory, event count 0); (0, ok); and (0 with the server body limit set to 1 KiB and a pack over 1 KiB, ok)"
+          }
+        },
+        {
+          "id": "REQ-9.2",
+          "pattern": "unwanted",
+          "condition": "[git].timeout passes before the ref transaction of a push has started",
+          "action": "abandon the push and change nothing",
+          "contract": "report 'unpack push timed out' and 'ng <ref> unpacker error' per command when the client can still be answered; refs unchanged; the quarantine directory is removed; no event; the git subprocesses of the push are no longer running",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/gitserver/limits_test.go, with [git].timeout 100 ms: (a) an options stage that blocks until its context is done; (b) a request body that delivers half the pack and then stalls; for each: assert the handler returns within 2 s; assert the report holds 'unpack push timed out' in case (a); assert git for-each-ref unchanged; assert no quarantine directory; assert event count == 0; and with the default configuration assert the processor's limit == 30 minutes"
+          }
+        },
+        {
+          "id": "REQ-9.3",
+          "pattern": "event_driven",
+          "condition": "the processor has finished a git-receive-pack request",
+          "action": "return its result to the git server of package 17, which counts the request once in parley_git_requests_total with service receive-pack",
+          "contract": "result 'ok' for an accepted push and for a push with no commands; 'refused' for a push refused by a rule, by the options stage or by the compare-and-swap; 'error' for a pack failure, a timeout and a push refused with 'internal error; try again'; exactly one increment per request, made by the handler of package 17 from the returned result; the processor increments no counter itself",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/gitserver/limits_test.go, sending each request through the git-receive-pack route of package 17 with the processor installed and reading the counter before and after it, a table of (request, want label): (create refs/heads/feat, ok); (flush only, ok); (create refs/parley/x, refused); (options stage refuses, refused); (stale before, refused); (truncated pack, error); (pack over max_push_size, error); (timeout, error); (settings reader fails, error); assert the delta of {service='receive-pack', result=want} == 1 and the delta of the two other results == 0"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "An agent pushes a new branch and then force-pushes it",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "commits on a new branch in a clone of workspace 'demo' and runs git push origin fix-retry with a PAT that has git:write"
+        },
+        {
+          "actor": "git client",
+          "action": "sends the create of refs/heads/fix-retry and its pack to POST /git/acme/demo.git/git-receive-pack"
+        },
+        {
+          "actor": "parleyd",
+          "action": "receives the pack into quarantine, evaluates the push rules, creates the ref by compare-and-swap, writes one parley.git.push event with created true and answers 'ok refs/heads/fix-retry'"
+        },
+        {
+          "actor": "agent",
+          "action": "amends the commit and runs git push --force origin fix-retry"
+        },
+        {
+          "actor": "parleyd",
+          "action": "allows the forced update of the unprotected branch, moves the ref and writes a second event with forced true"
+        },
+        {
+          "actor": "git client",
+          "action": "prints the forced update and exits 0"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "a stock git client",
+          "the git routes and authentication of internal/gitserver",
+          "the push processor, rule engine and ref writer",
+          "internal/gitrepo with the git command",
+          "the event log of internal/event",
+          "the SQLite store"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with a data directory in t.TempDir()",
+          "workspace 'demo' in organization 'acme', status ready, default branch main, owned by a user with a PAT carrying git:write",
+          "a local clone made with git clone over the hub's git URL"
+        ],
+        "end_state": [
+          "refs/heads/fix-retry in the hub's repository equals the amended commit",
+          "the first commit of the branch is still readable in the repository",
+          "the workspace's events hold two parley.git.push events for refs/heads/fix-retry: the first with created true and before null, the second with forced true, both with via git and actor_type pat"
+        ],
+        "pseudocode": "in internal/gitserver/push_integration_test.go: start the hub; clone; commit; run git push origin fix-retry with the PAT as Basic password; assert exit 0; amend; run git push --force origin fix-retry; assert exit 0; assert hub git rev-parse refs/heads/fix-retry == local HEAD; evs = events of 'demo' of type parley.git.push; assert len(evs) == 2 and evs[0].metadata.created and evs[1].metadata.forced"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "A developer pushes a protected branch directly and is refused with a bound token",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "runs git push origin main with an API key, fast-forwarding the protected default branch of the workspace the developer owns"
+        },
+        {
+          "actor": "parleyd",
+          "action": "applies the owner exemption, moves refs/heads/main, sets the workspace's head_sha and writes a parley.git.push event with direct true"
+        },
+        {
+          "actor": "developer",
+          "action": "commits again and runs git push origin main feature-x with a PAT bound to the workspace"
+        },
+        {
+          "actor": "parleyd",
+          "action": "refuses refs/heads/main under rule 2, updates no ref, discards the pushed objects and reports both refs"
+        },
+        {
+          "actor": "git client",
+          "action": "prints '! [remote rejected] main -> main (main is protected; push another branch and open a change (git push -o parley.change))', the not-updated message for feature-x and the remote: error line, and exits with a non-zero code"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "a stock git client",
+          "the git routes and authentication of internal/gitserver",
+          "the push processor, rule engine and ref writer",
+          "the workspace record and settings of internal/workspace",
+          "internal/gitrepo with the git command",
+          "the event log of internal/event",
+          "the SQLite store"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with a data directory in t.TempDir()",
+          "workspace 'demo' in organization 'acme' with default settings (protected_branches [main], protect.owner_push true), owned by a user with an API key and a PAT bound to 'demo' with git:write",
+          "a local clone"
+        ],
+        "end_state": [
+          "after the first push: refs/heads/main and the workspace's head_sha equal the pushed commit, and one parley.git.push event has direct true",
+          "after the second push: git exited non-zero and its stderr holds the rule 2 message for main, 'not updated: another ref in this push was refused' for feature-x and a line starting 'remote: error: refs/heads/main:'",
+          "refs/heads/main is still the first pushed commit, refs/heads/feature-x does not exist, git fetch of the second commit's id fails, and no further event was written"
+        ],
+        "pseudocode": "in internal/gitserver/push_integration_test.go: push main with the API key; assert exit 0; assert workspace.head_sha == pushed id; assert last event.metadata.direct; commit; out, code = git push origin main feature-x with the bound PAT; assert code != 0; assert out contains the three texts; assert hub refs unchanged; assert git fetch origin <second commit id> fails; assert event count unchanged"
+      }
+    },
+    {
+      "id": "PATH-3",
+      "title": "An agent with a path-scoped token is held to its paths",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "commits changes to docs/guide.md and src/main.go on a new branch and runs git push origin docs-fix with a PAT whose paths are ['docs/**']"
+        },
+        {
+          "actor": "parleyd",
+          "action": "finds src/main.go among the files changed by the new commit, refuses the whole push with 'path src/main.go is outside this token's allowed paths' and discards the pushed objects"
+        },
+        {
+          "actor": "git client",
+          "action": "prints the remote rejection with that message and exits with a non-zero code"
+        },
+        {
+          "actor": "agent",
+          "action": "amends the commit to change only docs/guide.md and pushes again"
+        },
+        {
+          "actor": "parleyd",
+          "action": "finds every changed path matched by docs/**, creates the ref and writes one parley.git.push event"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "a stock git client",
+          "the git routes and authentication of internal/gitserver",
+          "the push processor, rule engine and ref writer",
+          "the token store and glob matcher of internal/identity",
+          "internal/gitrepo with the git command",
+          "the event log of internal/event",
+          "the SQLite store"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with a data directory in t.TempDir()",
+          "workspace 'demo' whose main already holds src/main.go and docs/guide.md, owned by a user with a PAT carrying git:write and paths ['docs/**']",
+          "a local clone"
+        ],
+        "end_state": [
+          "the first push exited non-zero with 'path src/main.go is outside this token's allowed paths' in git's output, refs/heads/docs-fix absent and no event written",
+          "the second push exited 0, refs/heads/docs-fix equals the amended commit, and exactly one parley.git.push event exists for it"
+        ],
+        "pseudocode": "in internal/gitserver/push_integration_test.go: out, code = git push origin docs-fix with the path-scoped PAT; assert code != 0 and out contains the message; assert hub has no refs/heads/docs-fix; assert event count == 0; amend to docs only; push; assert exit 0; assert hub ref == local HEAD; assert event count == 1"
+      }
+    }
+  ]
+}

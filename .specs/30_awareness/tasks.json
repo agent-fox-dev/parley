@@ -1,0 +1,262 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "30",
+  "spec_name": "awareness",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/awareness/... ./internal/cli/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "22",
+      "reason": "reads the change records and versions, follows the parley.change.version event and opens changes in the end-to-end test; through it uses the access rule, the scope check, the glob matcher, the store, the router and the git wrapper"
+    },
+    {
+      "spec": "52",
+      "reason": "emits parley.change.overlap and the three claim events through the event component and reads the change events from the event log"
+    },
+    {
+      "spec": "09",
+      "reason": "builds the six commands on the CLI root, HTTP client, output and exit codes, including the shared exit with status 3"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Index changes by touched file from the event log",
+      "criteria": [
+        "REQ-2"
+      ],
+      "steps": [
+        "Add the index behaviours to internal/awareness/index_test.go and internal/awareness/worker_test.go, using a real repository made with git init in t.TempDir(), a real SQLite store and fixture implementations of the event source and the change reader, and confirm they fail",
+        "Define in internal/awareness the two interfaces the index needs from other packages: an event source with one method of the shape of ReadAfter(position, limit) of package 52, returning the events with a higher seq in ascending order and the position examined; and a change reader that returns one change by workspace and number with its state, target branch, depends_on, session, version, base_sha, head_sha, landed commit and time and the summary fields of an overlap entry",
+        "Register this package's schema steps with the store of package 03: indexed changes (workspace, number, target branch, phase in flight, landed or out, landed commit and time, session), their files (workspace, number, path), announced pairs, and the worker's position",
+        "List a version's files with the git wrapper of internal/gitrepo as one name-and-status diff with rename detection between base_sha and head_sha, returning both paths of a rename and every file without a cap",
+        "Read a batch with the event source, skip every event whose type is not one of the four, and process each of the others in one store transaction that also stores the event's sequence number as the new position; after a batch store the examined position: a parley.change.version event replaces the change's files and target branch and marks it in flight; land marks it landed with the landed commit and time; abandon takes it out of the in-flight set; restore lists the files of the current version again and marks it in flight",
+        "When the files cannot be listed, record the change with no files, log the workspace and number through the hub's logger and still advance the position; when the transaction fails, leave the position where it was so that the next pass applies the event again",
+        "Offer a pass function that applies every pending event and returns, so that tests drive the worker without timers",
+        "Wire the event component of package 52 (its ReadAfter) and the exported change read of the change component of package 22 into the worker in parleyd's composition, and register the worker as background work of package 03 that runs a pass every second until its context is cancelled; the interval is a parameter"
+      ],
+      "touches": [
+        "internal/awareness/schema.go",
+        "internal/awareness/index.go",
+        "internal/awareness/index_test.go",
+        "internal/awareness/files.go",
+        "internal/awareness/worker.go",
+        "internal/awareness/worker_test.go",
+        "internal/awareness/deps.go",
+        "internal/hub/"
+      ],
+      "done_when": [
+        "`go test ./internal/awareness/... -count=1` passes",
+        "a worker restarted in the middle of a backlog ends with the same index as an uninterrupted one in the test"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Decide which changes overlap and announce new pairs",
+      "criteria": [
+        "REQ-4",
+        "REQ-3.2",
+        "REQ-3.3"
+      ],
+      "steps": [
+        "Add the pair and event behaviours to internal/awareness/overlap_events_test.go, the stack table to internal/awareness/overlaps_test.go and the entry table to internal/awareness/entry_test.go, and confirm they fail",
+        "Add one function that returns, for a change, its overlapping partners with the common files: other in-flight changes of the same workspace and target branch that share at least one indexed file and are not in the same stack",
+        "Decide stack membership at evaluation time by following depends_on through the change reader to the bottom change; two changes with the same bottom are one stack",
+        "Add the overlap entry builder: the change summary with the intent cut to its first 500 characters and landing reduced to its status, the common files in ascending byte order cut to 100, paths_truncated and count",
+        "At the end of each index update, inside its transaction, compare the change's partners with the announced pairs that include it: for each new pair write two parley.change.overlap events through the event component of package 52 (actor system, the session of the change the event is written on, metadata number, with, with_session_id, paths cut to 100 and count) and record the pair; for each recorded pair that no longer overlaps delete the record",
+        "Run that comparison after every kind of update (version, retarget, land, abandon, restore), so that a pair that stopped and returned is announced again and one update that creates several pairs announces each"
+      ],
+      "touches": [
+        "internal/awareness/overlap.go",
+        "internal/awareness/overlap_events_test.go",
+        "internal/awareness/overlaps_test.go",
+        "internal/awareness/entry.go",
+        "internal/awareness/entry_test.go",
+        "internal/awareness/index.go"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Serve the overlaps of a change",
+      "criteria": [
+        "REQ-3.1",
+        "REQ-3.4",
+        "REQ-3.5"
+      ],
+      "steps": [
+        "Add the route behaviours to internal/awareness/overlaps_test.go as table-driven tests over httptest and confirm they fail",
+        "Add one helper that every awareness route uses: it takes the slug the access component granted and returns the workspace the route acts on, which is the parent for a task fork and the workspace itself otherwise, read from the workspace record of package 07",
+        "Register GET /api/v1/workspaces/{slug}/changes/{number}/overlaps on the router of package 02, declared with the scope changes:read and the access need read, so that the scope check and the access rule run before the handler",
+        "Parse the number as a positive integer and read the change through the change reader; answer 404 change_not_found when it is not a positive integer or names no change of the workspace acted on",
+        "For a draft or open change build one overlap entry per partner, order by count descending and then number ascending, and page the list with the list helper of package 02; for a landed or abandoned change answer an empty list",
+        "Register the overlaps expander with the include expander registry of the change component of package 22, backed by the function that computes the ordered entries for a workspace and a number, so that GET …/changes/:number?include=overlaps carries them"
+      ],
+      "touches": [
+        "internal/awareness/routes.go",
+        "internal/awareness/resolve.go",
+        "internal/awareness/overlaps.go",
+        "internal/awareness/overlaps_test.go",
+        "internal/hub/"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Answer the activity query",
+      "criteria": [
+        "REQ-5"
+      ],
+      "steps": [
+        "Add the activity behaviours to internal/awareness/activity_test.go and the glob table to internal/awareness/glob_test.go, with a real repository for target_sha and for a commit since, and confirm they fail",
+        "Add the claim table to this package's schema steps and a claim store with insert and the query for claims that are active and not past expires_at on a workspace and target branch; later tasks add the routes on top of it",
+        "Add the glob test for two globs: take each glob's text before its first asterisk as its literal prefix and answer yes when either glob, matched with the path-glob matcher of package 06, matches the other's literal prefix",
+        "Parse the query: paths from repeated parameters and comma lists together, each glob validated (1 to 255 characters, no leading slash), 1 to 50 globs; since as exactly 40 hexadecimal characters or an RFC 3339 timestamp, defaulting to 24 hours before the request on the replaceable clock; exclude_change as a positive integer; answer 400 invalid_request for each violation and for a commit the repository does not hold",
+        "Resolve target_branch from the target parameter or the default branch of the workspace acted on, and target_sha through the git wrapper, null when the branch does not exist",
+        "Build changes from the index: in-flight changes on the target branch with a file matching any glob, as overlap entries over their matching files, ordered by count descending and then number ascending",
+        "Build claims from the claim store with the glob test, newest first",
+        "Build landed from the index: landed changes on the target branch with a matching file, newest first, selected by landed_at for a timestamp and by the landed commit not being reachable from since for a commit id, cut to 100, each with number, ref, title, landed_sha, landed_at, session_id and its matching files cut to 100",
+        "Apply exclude_session and exclude_change to all three lists",
+        "Register GET /api/v1/workspaces/{slug}/activity with the scope changes:read and the access need read, and keep the function that builds the answer callable with an extra claim id to leave out, for claim creation"
+      ],
+      "touches": [
+        "internal/awareness/activity.go",
+        "internal/awareness/activity_test.go",
+        "internal/awareness/glob.go",
+        "internal/awareness/glob_test.go",
+        "internal/awareness/claim.go",
+        "internal/awareness/schema.go",
+        "internal/awareness/routes.go"
+      ],
+      "depends_on": [
+        2
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Create claims under the configured limits",
+      "criteria": [
+        "REQ-6",
+        "REQ-8.5"
+      ],
+      "steps": [
+        "Add the creation behaviours to internal/awareness/claim_create_test.go and the configuration table to internal/awareness/config_test.go, with a fixed clock and a real event log, and confirm they fail",
+        "Register the keys awareness.default_claim_ttl (duration, 1h), awareness.max_claim_ttl (duration, 24h) and awareness.max_claims_per_workspace (integer, 1000) with the configuration loader of package 03, each refusing a non-positive value, and refuse a default above the maximum with an error that names awareness.default_claim_ttl",
+        "Define the session interface of internal/awareness with two operations, check and record, which package 49 installs from the linking check and the recording operation of internal/session; with none installed refuse every session_id",
+        "Validate the body in this order: paths, intent, ttl (a duration string of at least 1 second and at most the configured maximum), target_branch, session_id type; answer 400 invalid_request for the first violation; then the session-link check, answering 400 unknown_session",
+        "Count, inside the creating transaction, the claims of the workspace acted on that are active and not past expires_at, and the same for the session when one is given; answer 429 with error_type claim_limit_reached at the configured workspace limit or at 50 for the session",
+        "Store the claim with a new UUID, the acted-on workspace's slug, by taken from the authenticated caller, change null, state active, created_at and expires_at from the clock, record a claim link through the session interface when the claim names a session, and write parley.claim.create through the event component, all in the same transaction",
+        "Answer 201 with the claim and the activity for its paths and target branch with the default since, leaving the new claim out of the activity's claims",
+        "Register POST /api/v1/workspaces/{slug}/claims with the scope changes:write and the access need read, as a creating route under the idempotency convention of package 02"
+      ],
+      "touches": [
+        "internal/awareness/config.go",
+        "internal/awareness/config_test.go",
+        "internal/awareness/claim.go",
+        "internal/awareness/claim_create.go",
+        "internal/awareness/claim_create_test.go",
+        "internal/awareness/deps.go",
+        "internal/awareness/routes.go"
+      ],
+      "depends_on": [
+        4
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Read, list, renew and release claims",
+      "criteria": [
+        "REQ-7",
+        "REQ-1"
+      ],
+      "steps": [
+        "Add the claim route behaviours to internal/awareness/claim_routes_test.go and the access tables over all seven awareness routes to internal/awareness/routes_test.go, through the real router, scope check and access component, and confirm they fail",
+        "Render a claim with its eleven members everywhere through one function that reports expired for a stored active claim whose expires_at is not after the clock's time",
+        "Register GET …/claims/{id} and GET …/claims with the scope changes:read, and PATCH …/claims/{id} and DELETE …/claims/{id} with the scope changes:write, all with the access need read",
+        "Look a claim up by id within the workspace acted on; answer 404 claim_not_found for an id that is not a UUID, is unknown or belongs to another workspace",
+        "List with the filters state (default active, the reported state, so expired includes stored-active claims past expires_at), session_id and path (the glob test of the activity task), ordered by created_at descending and then id descending, paged with the list helper; answer 400 invalid_request for an unknown state",
+        "Before PATCH and DELETE act, allow the caller only when it is the admin token, has the level owner on the workspace the claim is stored on according to the access component, or is the user in the claim's by; otherwise answer 403 forbidden",
+        "PATCH: validate the body (at least one of ttl and intent, the same bounds as at creation), answer 409 claim_not_active when the reported state is not active, then set expires_at to the clock's time plus ttl and replace the intent as given; write no event",
+        "DELETE: for an active claim set the state to released, record the time it ended and write parley.claim.release with metadata paths in the same transaction; for any other state change nothing; answer 204 with an empty body in both cases"
+      ],
+      "touches": [
+        "internal/awareness/claim.go",
+        "internal/awareness/claim_routes.go",
+        "internal/awareness/claim_routes_test.go",
+        "internal/awareness/routes.go",
+        "internal/awareness/routes_test.go"
+      ],
+      "depends_on": [
+        3,
+        5
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Expire, link, fulfil and clean up claims in the background",
+      "criteria": [
+        "REQ-8.1",
+        "REQ-8.2",
+        "REQ-8.3",
+        "REQ-8.4"
+      ],
+      "steps": [
+        "Add the behaviours to internal/awareness/expiry_test.go, internal/awareness/claim_link_test.go and internal/awareness/cleanup_test.go with a controlled clock, and confirm they fail",
+        "Add the expiry run: in one transaction per claim, set a stored-active claim whose expires_at is not after the clock's time to expired, record the time it ended as its expires_at, and write parley.claim.expire with actor system and metadata paths",
+        "Register the expiry run as background work of package 03 that fires every minute until its context is cancelled, and expose the single run for tests",
+        "In the index worker, when the event is a parley.change.version with version 1 and a session, set change on every claim of that session that is active, on the change's workspace and target branch and not yet linked, inside the event's transaction",
+        "In the index worker, when the event is a land or an abandon, set every active claim linked to that change to fulfilled and record the time it ended, without an event; a restore changes no claim",
+        "Register the maintenance task claim_cleanup with the task registry of package 03: delete every claim that is released, expired or fulfilled and ended 7 days before the clock's time or earlier",
+        "Add the remover of owned data for the workspace delete of package 14: a function that removes every claim, indexed change, file row and announced pair of one workspace inside the caller's transaction and revokes no token; add it to the collaborator set of internal/workspace in parleyd's composition"
+      ],
+      "touches": [
+        "internal/awareness/expiry.go",
+        "internal/awareness/expiry_test.go",
+        "internal/awareness/claim_link.go",
+        "internal/awareness/claim_link_test.go",
+        "internal/awareness/cleanup.go",
+        "internal/awareness/cleanup_test.go",
+        "internal/awareness/index.go",
+        "internal/hub/"
+      ],
+      "depends_on": [
+        1,
+        5
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Add parley activity, parley change overlaps and parley claim",
+      "criteria": [
+        "REQ-9",
+        "REQ-8.6"
+      ],
+      "steps": [
+        "Add the command behaviours to internal/cli/activity_test.go, internal/cli/change_overlaps_test.go and internal/cli/claim_test.go against an httptest hub that records method, path, query and body, and confirm they fail",
+        "Add parley activity <slug> in internal/cli/activity.go with --paths (required), --target, --since, --exclude-session, --exclude-change and --fail-on-overlap, on the HTTP client, output and exit-code helpers of package 09; send a query parameter only for a flag that was given",
+        "Add the subcommand overlaps <slug> <number> with --fail-on-overlap to the change command group of package 22 from internal/cli/change_overlaps.go; create the group there only if package 22 has not registered it",
+        "Add the claim command group in internal/cli/claim.go: create (--paths and --intent required, --target, --ttl, --session; the comma list becomes the paths array and a member is sent only for a flag that was given), list (--state, --session, --path, --limit, --cursor), renew (--ttl, default 1h) and release (prints {})",
+        "For --fail-on-overlap print the body first, then use the shared exit of package 09 with status 3 and condition_not_met when changes or claims of the activity answer, or items of the overlaps answer, is not empty",
+        "Make a missing required flag, a wrong argument count and a number or --exclude-change value that is not a positive integer a usage error before any request",
+        "Add test/e2e/awareness_test.go with the two end-to-end flows of the PRD: start the hub in-process on a loopback port the system picks, with the index worker running and a controlled clock for the expiry flow, run the CLI command tree against it, and assert that opening a change on claimed, overlapping paths is answered 201"
+      ],
+      "touches": [
+        "internal/cli/activity.go",
+        "internal/cli/activity_test.go",
+        "internal/cli/change_overlaps.go",
+        "internal/cli/change_overlaps_test.go",
+        "internal/cli/claim.go",
+        "internal/cli/claim_test.go",
+        "test/e2e/awareness_test.go"
+      ],
+      "depends_on": [
+        3,
+        4,
+        6,
+        7
+      ]
+    }
+  ]
+}

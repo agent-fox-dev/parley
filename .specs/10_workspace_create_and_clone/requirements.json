@@ -1,0 +1,961 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "10",
+  "spec_name": "workspace_create_and_clone",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Validation rules for workspace names, URLs, branches and durations",
+      "rationale": "Every workspace route judges a slug, a URL, a branch name and a duration by the same rule, so the rules are built once.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "ubiquitous",
+          "action": "for any string, accept it as a repository slug exactly when it is 3 to 64 characters long, holds only the letters a to z, digits and hyphens, starts with a letter, ends with a letter or digit and does not contain two hyphens in a row",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/validate_test.go, a table over ValidateSlug: accepted {abc, a1b, my-repo-2, a 64-character slug}; refused {'', ab, a 65-character slug, 1abc, -abc, abc-, a--b, Abc, a_b, a.b, 'a b', 'abç'}; assert the result per row"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "ubiquitous",
+          "action": "for any string, accept it as a git_url exactly when it has the form https://<host>/<path> without userinfo or the form git@<host>:<path>, with a non-empty host and a non-empty path, without resolving the host or opening a connection",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/validate_test.go, a table over ValidateGitURL: accepted {https://example.com/a/b.git, https://example.com:8443/a, git@example.com:a/b.git}; refused {'', http://example.com/a, ssh://git@example.com/a, file:///tmp/a, /tmp/a, https://example.com, https://example.com/, https:///a, https://user@example.com/a, https://user:pw@example.com/a, git@example.com:, git@:a, other@example.com:a}; assert the result per row; the host name in every row does not resolve, which proves no lookup happens"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "ubiquitous",
+          "action": "for any string, accept it as a branch name exactly when it is not empty, holds no control character, space, ~, ^, :, ?, *, [ or backslash, holds no '..', '//' or '@{', is not exactly '@', does not start with '-' or '/', does not end with '/', '.' or '.lock', and has no path component that starts with '.' or ends with '.lock'",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/validate_test.go, a table over ValidateBranchName: accepted {main, feature/x, fix-42, a.b, a@b, release/1.2}; refused {'', '@', 'a b', a~b, a^b, a:b, a?b, a*b, a[b, a\\b, a..b, a//b, a@{b, -a, /a, a/, a., a.lock, .a, a/.b, a.lock/b, a name holding a tab, a name holding byte 0x7f}; assert the result per row"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "ubiquitous",
+          "action": "for any string, accept it as a fork name exactly when it is 1 to 32 characters long, holds only the letters a to z, digits and hyphens, starts and ends with a letter or digit and does not contain two hyphens in a row",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/validate_test.go, a table over ValidateForkName: accepted {a, 7, a-b, 1x, a 32-character name}; refused {'', a 33-character name, -a, a-, a--b, A, a_b}; assert the result per row"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "ubiquitous",
+          "action": "for any string, parse it as a duration exactly when it is a positive whole number in decimal digits followed by one unit m, h or d, and return the length of time it names",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/validate_test.go, a table over ParseDuration: {90m -> 90 minutes, 24h -> 24 hours, 7d -> 168 hours, 1m -> 1 minute}; refused {'', 0m, 0d, -1h, +1h, 1.5h, 10, 10s, 1h30m, h, ' 5m', 5M}; assert the value or the refusal per row"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "State preconditions of routes that need the repository",
+      "rationale": "A caller must be able to tell 'come back in a moment' from 'this needs repair' from 'this is archived', and must never be refused only because someone else is working.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "unwanted",
+          "condition": "a route that needs the repository is asked for a workspace whose maintenance marker is set or whose status is pending or cloning",
+          "action": "refuse the request without acting",
+          "contract": "HTTP 409 with error_type workspace_busy",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/guard_test.go, a table over RequireReady(workspace) with rows {status, marker} -> outcome: {pending, none} -> 409 workspace_busy; {cloning, none} -> 409 workspace_busy; {ready, reclone} -> 409 workspace_busy; {failed, reclone} -> 409 workspace_busy; {ready, archive} -> 409 workspace_busy; {archived, delete} -> 409 workspace_busy; {failed, none} -> 409 workspace_not_ready; {archived, none} -> 409 workspace_archived; {ready, none} -> nil. Assert the returned error's status and error_type per row. Then call RequireReady on one ready workspace from 50 goroutines at once and assert every call returns nil"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "unwanted",
+          "condition": "a route that needs the repository is asked for a workspace whose status is failed and whose maintenance marker is not set",
+          "action": "refuse the request without acting",
+          "contract": "HTTP 409 with error_type workspace_not_ready",
+          "check": {
+            "same_as": "REQ-2.1"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "unwanted",
+          "condition": "a route that needs the repository is asked for a workspace whose status is archived and whose maintenance marker is not set",
+          "action": "refuse the request without acting",
+          "contract": "HTTP 409 with error_type workspace_archived",
+          "check": {
+            "same_as": "REQ-2.1"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "ubiquitous",
+          "action": "for any workspace whose status is ready and whose maintenance marker is not set, let the request pass the state check, however many other requests are running on that workspace",
+          "contract": "the guard returns no error",
+          "check": {
+            "same_as": "REQ-2.1"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Who may call POST /workspaces",
+      "rationale": "A workspace needs a user as owner, and a token must hold the write scope before it can create anything.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "unwanted",
+          "condition": "POST /workspaces is called with a personal access token that does not hold the scope workspaces:write",
+          "action": "refuse the request and create nothing",
+          "contract": "HTTP 403 with error_type insufficient_scope; no workspace exists afterwards",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace service on a temporary store with the real access, secret and event components, served through net/http/httptest",
+              "a user U with a personal organization and an API key"
+            ],
+            "pseudocode": "in internal/workspace/create_test.go, a table over callers posting a valid body: {PAT with no scopes, PAT with only workspaces:read} -> 403 insufficient_scope; {admin token} -> 403 forbidden; {PAT with workspaces:write} -> 201; {API key} -> 201. Then the same refused callers posting the body {} -> the same 403 and error_type, never 400. After every refused row assert the store holds no workspace and the event log no parley.workspace.create"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "unwanted",
+          "condition": "POST /workspaces is called with the admin token",
+          "action": "refuse the request and create nothing",
+          "contract": "HTTP 403 with error_type forbidden; no workspace exists afterwards",
+          "check": {
+            "same_as": "REQ-3.1"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "ubiquitous",
+          "action": "for any POST /workspaces request, answer with the first failing check in the order scope, admin-token refusal, body validation, so that a caller refused by scope or as admin token gets the same 403 for a valid and for an invalid body",
+          "contract": "HTTP 403 with the same error_type for a valid and an invalid body",
+          "check": {
+            "same_as": "REQ-3.1"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Validation of the create request",
+      "rationale": "An invalid registration must be refused whole, with an answer that says which member is wrong.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "unwanted",
+          "condition": "the body of POST /workspaces has no slug or no git_url, or one of them is not a string or breaks its validation rule",
+          "action": "refuse the request, naming the first invalid member in the order slug, git_url, default_branch, org_id, display_name, description, workspace_mode, upstream_url, integration_branch, settings, git_pat, git_username, git_password",
+          "contract": "HTTP 400 with error_type invalid_request; no workspace, secret or event is recorded",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace service on a temporary store with the real access, secret and event components, served through net/http/httptest",
+              "a user U with a personal organization and an API key"
+            ],
+            "pseudocode": "in internal/workspace/create_test.go, a table over bodies posted by U, each derived from a valid body: {no slug, slug 'ab', slug 'A-b', slug 7, no git_url, git_url 'http://example.com/a', git_url 'https://u:p@example.com/a', git_url null}; plus one body with slug 'ab' and git_url 'file:///x' whose message must name slug. Assert 400 invalid_request per row, the member name in error.message, and that the store holds no workspace and the event log is empty"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "unwanted",
+          "condition": "default_branch is present and not null and is not a valid branch name, or display_name is longer than 128 characters, or description is longer than 1024 characters, or one of the three is neither a string nor null",
+          "action": "refuse the request",
+          "contract": "HTTP 400 with error_type invalid_request; no workspace, secret or event is recorded",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace service on a temporary store with the real access, secret and event components, served through net/http/httptest",
+              "a user U with a personal organization and an API key"
+            ],
+            "pseudocode": "in internal/workspace/create_test.go, a table: {default_branch 'a..b', default_branch '', default_branch 5, display_name of 129 characters, display_name [], description of 1025 characters, description 1} -> 400 invalid_request and nothing stored; {display_name of 128 two-byte characters, description of 1024 characters, default_branch null, display_name null, description null} -> 201"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "unwanted",
+          "condition": "git_pat is given together with git_username or git_password, or only one of git_username and git_password is given, or a given credential member is an empty string or not a string, or a credential member is given with a git_url of the form git@<host>:<path>",
+          "action": "refuse the request without contacting origin",
+          "contract": "HTTP 400 with error_type invalid_request; origin is not contacted; no workspace, secret or event is recorded",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace service on a temporary store with the real access, secret and event components, served through net/http/httptest",
+              "a user U with a personal organization and an API key",
+              "a fake origin lister that records its calls"
+            ],
+            "pseudocode": "in internal/workspace/create_test.go, a table of credential members on a valid https body: {pat+username, pat+password, pat+username+password, username only, password only, pat '', username '' with password, username with password '', pat 5} and {pat with git_url git@example.com:a/b.git, username+password with that URL} -> 400 invalid_request; assert the fake origin lister recorded zero calls and nothing is stored"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "unwanted",
+          "condition": "workspace_mode is a string other than '', standard and carry_patch, or is neither a string nor null; or the mode is standard and upstream_url or integration_branch is given with a non-null value; or the mode is carry_patch and upstream_url is missing or is not a valid git_url or integration_branch is given and is not a valid branch name",
+          "action": "refuse the request",
+          "contract": "HTTP 400 with error_type invalid_request; no workspace, secret or event is recorded",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace service on a temporary store with the real access, secret and event components, served through net/http/httptest",
+              "a user U with a personal organization and an API key"
+            ],
+            "pseudocode": "in internal/workspace/create_test.go, a table: {mode 'mirror', mode 3, standard + upstream_url, no mode + integration_branch 'deploy', carry_patch without upstream_url, carry_patch + upstream_url 'http://x/y', carry_patch + valid upstream_url + integration_branch 'a..b'} -> 400 invalid_request and nothing stored; {mode '', mode null, standard + upstream_url null} -> 201 with workspace_mode standard; {carry_patch + upstream_url https://example.com/up.git} -> 201 with workspace_mode carry_patch, that upstream_url and integration_branch null; {the same + integration_branch 'deploy'} -> 201 with integration_branch deploy"
+          }
+        },
+        {
+          "id": "REQ-4.5",
+          "pattern": "unwanted",
+          "condition": "org_id names no organization by id or by slug, or names an organization the caller is not a member of",
+          "action": "refuse the request",
+          "contract": "HTTP 400 with error_type invalid_request for an unknown organization; HTTP 403 with error_type forbidden for an organization the caller is not a member of; no workspace, secret or event is recorded",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace service on a temporary store with the real access, secret and event components, served through net/http/httptest",
+              "a user U with a personal organization and an API key",
+              "an organization B that U is not a member of"
+            ],
+            "pseudocode": "in internal/workspace/create_test.go: post with org_id 'no-such-org' -> 400 invalid_request; post with the id of organization B, and again with B's slug -> 403 forbidden; post with org_id 7 -> 400 invalid_request; assert nothing stored after each. Then add U to B and post with B's slug -> 201 with org_id equal to B's id and org_slug equal to B's slug; post with org_id null -> 201 in U's personal organization"
+          }
+        },
+        {
+          "id": "REQ-4.6",
+          "pattern": "unwanted",
+          "condition": "settings is present and is neither null nor a JSON object, or holds a key that is not a registered setting",
+          "action": "refuse the request and, for an unregistered key, name it in the message as unknown setting \"<key>\"",
+          "contract": "HTTP 400 with error_type invalid_request; no workspace, secret or event is recorded",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace service on a temporary store with the real access, secret and event components, served through net/http/httptest",
+              "a user U with a personal organization and an API key"
+            ],
+            "pseudocode": "in internal/workspace/create_test.go, a table: {settings [], settings 'x', settings 1} -> 400 invalid_request; {settings {\"nope\": true}} -> 400 invalid_request with error.message containing unknown setting \"nope\"; {settings null, settings {}} -> 201 whose settings member is an object. With a key 'k' registered by the test through RegisterSetting (default true, a Validate that accepts JSON booleans only): {settings {\"k\": false}} -> 201 with settings.k false; {settings {\"k\": null}} -> 201 with settings.k true; {settings {\"k\": \"x\"}} -> 400 invalid_request"
+          }
+        },
+        {
+          "id": "REQ-4.7",
+          "pattern": "ubiquitous",
+          "action": "ignore every member of the create body that the route does not define",
+          "contract": "HTTP 201; the extra members change nothing in the stored workspace",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace service on a temporary store with the real access, secret and event components, served through net/http/httptest",
+              "a user U with a personal organization and an API key"
+            ],
+            "pseudocode": "in internal/workspace/create_test.go: post a valid body with the extra members {\"status\": \"ready\", \"owner_id\": \"someone\", \"kind\": \"fork\", \"zzz\": [1]}; assert 201, status pending, owner_id equal to U's id and kind repository"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Check of a given origin credential before anything is stored",
+      "rationale": "A mistyped token should cost the developer one refused request, not a workspace that fails to clone minutes later.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "a valid create request carries git_pat, or git_username with git_password",
+          "action": "list origin's refs with that credential, under a deadline of 10 seconds, before it stores the workspace, a secret or an event",
+          "contract": "one ref listing against git_url with the credential; nothing is stored before it returns",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace service on a temporary store with the real access, secret and event components, served through net/http/httptest",
+              "a user U with a personal organization and an API key",
+              "a secret encryption key is configured",
+              "a fake origin lister that records its arguments, its context deadline and the store's workspace count at call time"
+            ],
+            "pseudocode": "in internal/workspace/credential_test.go: post with git_pat 'tok-123'; assert the lister was called once with the request's git_url, user name x-token-auth and password tok-123, with a context deadline between 9 and 10 seconds away, and that at the moment of the call the store held no workspace. Post with git_username 'u' and git_password 'p'; assert the lister saw u and p"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "unwanted",
+          "condition": "the ref listing made with the given credential fails because origin refuses the credential, origin cannot be reached or the 10-second deadline passes",
+          "action": "refuse the request with a message that contains neither the token nor the password, and create nothing",
+          "contract": "HTTP 400 with error_type credential_check_failed; the response does not contain the credential; no workspace, secret or event is recorded",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace service on a temporary store with the real access, secret and event components, served through net/http/httptest",
+              "a user U with a personal organization and an API key",
+              "a secret encryption key is configured",
+              "a fake origin lister whose result the test sets"
+            ],
+            "pseudocode": "in internal/workspace/credential_test.go, a table over the lister's result: {authentication refused, connection refused, context deadline exceeded, an error whose text holds the token and https://x-token-auth:tok-123@host/}; assert 400 with error_type credential_check_failed, that the response body does not contain tok-123, and that the store holds no workspace, the secret store no entry and the event log no event. In internal/gitrepo/gitrepo_test.go: ListRemote against a listener that accepts and never answers, with a 200 ms context, returns an error within 2 seconds and leaves no git process running"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "unwanted",
+          "condition": "a valid create request carries a credential and the hub has no secret encryption key configured",
+          "action": "refuse the request without contacting origin and create nothing",
+          "contract": "HTTP 503 with error_type secrets_unavailable; origin is not contacted; no workspace, secret or event is recorded",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace service on a temporary store with the real access, secret and event components, served through net/http/httptest",
+              "a user U with a personal organization and an API key",
+              "no secret encryption key is configured",
+              "a fake origin lister that records its calls"
+            ],
+            "pseudocode": "in internal/workspace/credential_test.go: post with git_pat; assert 503 with error_type secrets_unavailable, zero lister calls, no workspace stored. Post the same body without git_pat; assert 201"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "event_driven",
+          "condition": "a valid create request carries no credential member",
+          "action": "answer without contacting origin",
+          "contract": "HTTP 201; zero requests to origin during the request",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace service on a temporary store with the real access, secret and event components, served through net/http/httptest",
+              "a user U with a personal organization and an API key",
+              "a fake origin lister that records its calls"
+            ],
+            "pseudocode": "in internal/workspace/credential_test.go: post a valid body without credential members, with the clone workers stopped; assert 201 and zero lister calls"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Registration of a repository workspace",
+      "rationale": "Registration is the entry to the product: it must give the caller a complete record at once and must never leave half a workspace behind.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "a caller with a user identity posts a valid body to POST /workspaces with a slug that is not in use",
+          "action": "record the workspace with kind repository, status pending, the caller as owner, the given or the caller's personal organization, display_name defaulting to the slug and description defaulting to the empty string, and answer with the workspace object",
+          "contract": "HTTP 201 with the workspace object: every field present, nullable fields null and never omitted, status pending, access owner",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace service on a temporary store with the real access, secret and event components, served through net/http/httptest",
+              "a user U with a personal organization and an API key"
+            ],
+            "pseudocode": "in internal/workspace/create_test.go: r = post {slug: 'demo', git_url: 'https://example.com/a.git'} as U with the clone workers stopped; assert 201; assert the body holds exactly the members of the workspace object (every field of the workspace record plus org_slug, hub_url, access, settings); assert slug demo, kind repository, workspace_mode standard, status pending, access owner, owner_id U, org_id U's personal organization, display_name demo, description '', and that default_branch, head_sha, origin_head_sha, clone_error, last_sync_at, sync_error, upstream_url, integration_branch, upstream_head_sha, parent_slug, fork_point, expires_at, auto_change, purpose and session_id are present with value null; assert created_at == updated_at in RFC 3339 UTC with whole seconds. Post with display_name '' -> display_name equals the slug; with default_branch 'trunk' -> default_branch trunk"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "ubiquitous",
+          "action": "for any workspace object it returns, set org_slug to the slug of the workspace's organization, hub_url to <external_url>/git/<org_slug>/<slug>.git with one trailing slash of the configured external URL removed or to null when no external URL is configured, and settings to every setting key registered with RegisterSetting with its effective value",
+          "contract": "hub_url is a string of that form or null; org_slug is a string; settings is an object",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace service on a temporary store with the real access, secret and event components, served through net/http/httptest",
+              "a user U with a personal organization and an API key"
+            ],
+            "pseudocode": "in internal/workspace/create_test.go, a table over the configured external URL: {'https://hub.example' -> https://hub.example/git/<org>/demo.git, 'https://hub.example/' -> the same, 'https://hub.example/base/' -> https://hub.example/base/git/<org>/demo.git, '' -> null}; assert hub_url per row and org_slug equal to the organization's slug; with no setting registered assert settings == {}"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "event_driven",
+          "condition": "a create request with a credential passes the credential check",
+          "action": "store git_pat as the workspace secret GIT_PAT, or git_username and git_password as the workspace secrets GIT_USERNAME and GIT_PASSWORD, in the same transaction as the workspace, and put the credential in no response, event or log line",
+          "contract": "workspace secrets GIT_PAT, or GIT_USERNAME and GIT_PASSWORD, exist for the slug; the credential value is absent from the response, the event and the log",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace service on a temporary store with the real access, secret and event components, served through net/http/httptest",
+              "a user U with a personal organization and an API key",
+              "a secret encryption key is configured",
+              "a fake origin lister that succeeds",
+              "the hub's logger writes to a buffer"
+            ],
+            "pseudocode": "in internal/workspace/credential_test.go: post with git_pat 'tok-123'; assert 201; assert the secret component lists the key GIT_PAT in the workspace scope of the slug and resolves it to tok-123; assert neither the response body, nor the JSON of the recorded event, nor the captured log output contains tok-123. Post another slug with git_username 'u1x' and git_password 'pw-9z'; assert the keys GIT_USERNAME and GIT_PASSWORD exist and pw-9z appears in none of the three outputs"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "event_driven",
+          "condition": "a workspace is created",
+          "action": "write one hub event of type parley.workspace.create in the same transaction, with the slug as workspace and resource, the caller as actor, and the metadata kind, git_url, workspace_mode and default_branch",
+          "contract": "one event parley.workspace.create with metadata {kind, git_url, workspace_mode, default_branch}; default_branch is the given value or null",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace service on a temporary store with the real access, secret and event components, served through net/http/httptest",
+              "a user U with a personal organization and an API key"
+            ],
+            "pseudocode": "in internal/workspace/create_test.go: after a successful post assert the event log holds exactly one new event with type parley.workspace.create, workspace 'demo', actor U and metadata {kind: repository, git_url: the posted URL, workspace_mode: standard, default_branch: null}; after a post with default_branch 'trunk' assert metadata.default_branch == 'trunk'; after each refused request of the tables in this file assert the event count is unchanged"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "unwanted",
+          "condition": "the slug of a create request is already the slug of a workspace in any status",
+          "action": "refuse the request without contacting origin and leave the existing workspace, its secrets and the event log unchanged",
+          "contract": "HTTP 409 with error_type conflict; the existing workspace is unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace service on a temporary store with the real access, secret and event components, served through net/http/httptest",
+              "a user U with a personal organization and an API key",
+              "a fake origin lister that records its calls"
+            ],
+            "pseudocode": "in internal/workspace/create_test.go: create 'demo'; post 'demo' again as U and as another user V, each with a git_pat; assert 409 conflict both times, zero lister calls, the stored workspace unchanged (owner U, same updated_at), no secret added and the event count unchanged. Set the workspace's status to archived in the store and post again -> 409 conflict"
+          }
+        },
+        {
+          "id": "REQ-6.6",
+          "pattern": "unwanted",
+          "condition": "two create requests with the same slug run at the same time",
+          "action": "create exactly one workspace and refuse the other request",
+          "contract": "exactly one HTTP 201; every other request answers HTTP 409 with error_type conflict; one workspace and one event exist",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a workspace service on a temporary store with the real access, secret and event components, served through net/http/httptest",
+              "a user U with a personal organization and an API key"
+            ],
+            "pseudocode": "in internal/workspace/create_test.go: start 8 goroutines that post the same slug at once against the real store, half as U and half as V; assert exactly one 201 and seven 409 conflict; assert the store holds one workspace with that slug whose owner is the caller of the 201, and the event log one parley.workspace.create"
+          }
+        },
+        {
+          "id": "REQ-6.7",
+          "pattern": "unwanted",
+          "condition": "the workspace, a credential secret or the event cannot be stored",
+          "action": "roll back the whole transaction and answer with an internal error",
+          "contract": "HTTP 500 with error_type internal; no workspace, secret or event is recorded",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace service on a temporary store with the real access, secret and event components, served through net/http/httptest",
+              "a user U with a personal organization and an API key",
+              "a secret encryption key is configured",
+              "a fake origin lister that succeeds"
+            ],
+            "pseudocode": "in internal/workspace/create_test.go, a table over the failing collaborator, each wrapped to return an error on its write: {workspace insert, secret write, event write}; post a valid body with git_pat; assert 500 with error_type internal; assert afterwards the store holds no workspace with the slug, the secret component no entry for it and the event log no event; then remove the fault and post the same slug -> 201"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "Origin credential resolution",
+      "rationale": "A rotated secret must take effect at the next use, and a broken secret store must never turn a private repository into an anonymous request.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "ubiquitous",
+          "action": "resolve the origin credential of a workspace from its secrets on every use: a non-empty GIT_PAT gives Basic authentication with user name x-token-auth and the token as password; otherwise GIT_USERNAME and GIT_PASSWORD, when both are set, give Basic authentication with them; otherwise no credential",
+          "contract": "a user name and password pair, or the value 'no credential'",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace with secrets set through the real secret component"
+            ],
+            "pseudocode": "in internal/workspace/credential_test.go, a table over the workspace's secrets -> ResolveOriginCredential: {GIT_PAT t} -> (x-token-auth, t); {GIT_PAT t, GIT_USERNAME u, GIT_PASSWORD p} -> (x-token-auth, t); {GIT_USERNAME u, GIT_PASSWORD p} -> (u, p); {GIT_PAT '', GIT_USERNAME u, GIT_PASSWORD p} -> (u, p); {GIT_USERNAME u} -> none; {GIT_PASSWORD p} -> none; {GIT_PAT ''} -> none; {} -> none. Then change GIT_PAT from t to t2 through the secret component and assert the next call returns t2 without a restart"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "unwanted",
+          "condition": "the secrets of the workspace cannot be read while the credential is resolved",
+          "action": "return an error to the operation that needed the credential and make no anonymous request to origin",
+          "contract": "a non-nil error; zero requests to origin",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/credential_test.go: with a secret reader that returns an error, ResolveOriginCredential returns a non-nil error and no credential; in internal/workspace/clone_test.go: run clone work for a pending workspace with that reader; assert the fake git runner recorded zero invocations, the workspace is failed and clone_error is not empty"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "ubiquitous",
+          "action": "for any git command it runs against origin with a credential, pass the credential to git outside the URL, outside the command-line arguments and outside the copy's configuration",
+          "contract": "the credential value appears in no git argument, in no URL and nowhere in the copy's directory",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "git 2.38 or later on PATH"
+            ],
+            "pseudocode": "in internal/gitrepo/gitrepo_test.go: serve a bare repository with gitrepotest.NewOrigin requiring Basic authentication (x-token-auth, tok-123); ListRemote and Clone with that credential succeed, and both fail without it; with a runner hook that records every argv, assert no argument of any git invocation contains tok-123; after Clone assert that neither the copy's config file nor the output of git config --list in the copy contains tok-123 and that remote.origin.url equals the origin URL without userinfo"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "Clone of a pending workspace",
+      "rationale": "The hub's own copy is what every other feature works on; a workspace must end either usable or plainly failed, never in between.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "clone work starts for a workspace in status pending",
+          "action": "set the status to cloning and clear clone_error before it contacts origin",
+          "contract": "status cloning and clone_error null while the clone runs",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a workspace service on a temporary store and a temporary repository root",
+              "an origin served by gitrepotest.NewOrigin with the branches main (default) and dev, the tag v1 and three commits",
+              "a pending workspace whose git_url is that origin"
+            ],
+            "pseudocode": "in internal/workspace/clone_test.go: give the workspace a clone_error 'old' and status pending; run clone work with an origin handler that blocks until released; while blocked assert status cloning and clone_error null; release and assert ready"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "event_driven",
+          "condition": "the clone of a workspace succeeds",
+          "action": "hold every branch and tag of origin with full history in a bare copy, record default_branch as the branch given at creation or else origin's default branch, head_sha as the head of that branch, origin_head_sha and the origin head of every branch as the ref refs/remotes/origin/<name> of the copy, and set the status to ready",
+          "contract": "status ready; default_branch set; head_sha and origin_head_sha equal and full 40-character commit ids; refs/remotes/origin/<name> of the copy at origin's head for every branch of origin; no event written",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a workspace service on a temporary store and a temporary repository root",
+              "an origin served by gitrepotest.NewOrigin with the branches main (default) and dev, the tag v1 and three commits",
+              "a pending workspace whose git_url is that origin"
+            ],
+            "pseudocode": "in internal/workspace/clone_test.go: run clone work; assert status ready, default_branch main, head_sha equal to origin's main head as a 40-character id, origin_head_sha == head_sha, clone_error null; assert the copy at RepoPath(workspace) is bare, has refs/heads/main, refs/heads/dev and refs/tags/v1 at origin's ids, is not shallow and rev-list --count main == 3; assert the refs under refs/remotes/origin/ of the copy are exactly main and dev, each at origin's id, and that gitrepo's OriginHeads on the copy returns {main: <id>, dev: <id>}. Second workspace created with default_branch dev: assert default_branch dev and head_sha equal to origin's dev head. Assert the event log gained no event"
+          }
+        },
+        {
+          "id": "REQ-8.3",
+          "pattern": "unwanted",
+          "condition": "a default_branch was given at creation and origin has no branch of that name",
+          "action": "fail the clone with a clone_error that names the missing branch",
+          "contract": "status failed; clone_error contains the branch name; no copy on disk",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a workspace service on a temporary store and a temporary repository root",
+              "an origin served by gitrepotest.NewOrigin with the branches main (default) and dev, the tag v1 and three commits",
+              "a pending workspace whose git_url is that origin"
+            ],
+            "pseudocode": "in internal/workspace/clone_test.go: workspace created with default_branch 'nope'; run clone work; assert status failed, clone_error contains 'nope', default_branch still 'nope', head_sha null, and no entry exists at RepoPath(workspace)"
+          }
+        },
+        {
+          "id": "REQ-8.4",
+          "pattern": "unwanted",
+          "condition": "the clone fails because origin cannot be reached, origin refuses the request, the credential cannot be read or origin has no branch",
+          "action": "set the status to failed and clone_error to the failure text with secret values replaced by [redacted], userinfo removed from URLs and a length of at most 1024 bytes, leave no directory at the copy's place or beside it, write no event and start no further attempt",
+          "contract": "status failed; clone_error non-empty, at most 1024 bytes, free of credentials and URL userinfo; no copy on disk; no event; no retry",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a workspace service on a temporary store and a temporary repository root",
+              "an origin served by gitrepotest.NewOrigin with the branches main (default) and dev, the tag v1 and three commits",
+              "a pending workspace whose git_url is that origin"
+            ],
+            "pseudocode": "in internal/workspace/clone_test.go, a table over the origin: {a closed port, an origin that answers 401 to the stored GIT_PAT 'tok-123', an origin that answers 403, an empty repository, a git runner whose error text is 5000 bytes long and holds tok-123 and https://u:pw@host/x}; run clone work; assert status failed, clone_error not empty, at most 1024 bytes, without tok-123, without 'u:pw@'; for the empty repository assert clone_error == 'origin has no branches'; assert the repository root holds no entry for the slug and no temporary directory; assert the event count is unchanged; wait 3 poll rounds of the worker and assert the origin received no further request and the status is still failed"
+          }
+        },
+        {
+          "id": "REQ-8.5",
+          "pattern": "optional",
+          "condition": "a post-clone step is registered for the workspace's mode",
+          "action": "run that step once after a fresh clone and before it sets the status to ready, and set the status to ready also when the step returns an error, after logging the error",
+          "contract": "the step runs exactly once per fresh clone, before ready; its error does not change the final status",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace service on a temporary store and a temporary repository root",
+              "an origin served by gitrepotest.NewOrigin with the branches main (default) and dev, the tag v1 and three commits",
+              "a pending workspace whose git_url is that origin",
+              "the hub's logger writes to a buffer"
+            ],
+            "pseudocode": "in internal/workspace/clone_test.go: register a step for mode carry_patch that records the workspace status it observes and returns an error; clone a carry_patch workspace; assert the step ran once, observed status cloning with the copy present at RepoPath, the final status is ready and the log holds the step's error. Clone a standard workspace; assert the step did not run. Run clone work that adopts an existing valid copy of a carry_patch workspace; assert the step did not run"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-9",
+      "title": "Durable and bounded clone work",
+      "rationale": "A restart or a burst of registrations must neither lose a clone nor start an unbounded number of them.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-9.1",
+          "pattern": "event_driven",
+          "condition": "the hub starts and the store holds workspaces in status pending or cloning",
+          "action": "queue clone work for every one of them in ascending created_at order, then slug, and remove the temporary directories of interrupted clones, before it listens for requests",
+          "contract": "every pending or cloning workspace ends ready or failed without a new request; clones start in created_at order",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a temporary store and repository root",
+              "an origin served by gitrepotest.NewOrigin"
+            ],
+            "pseudocode": "in internal/workspace/worker_test.go: insert workspaces c (created 10:00:02, cloning), a (10:00:01, pending), b (10:00:01, pending), r (ready) and f (failed) into the store and a leftover temporary clone directory into the repository root; start the workers with a size of 1 and a git runner that records the order of clones; assert the recorded order is a, b, c, that r and f were not touched, that the leftover directory is gone, and that Start returned only after all three were queued"
+          }
+        },
+        {
+          "id": "REQ-9.2",
+          "pattern": "event_driven",
+          "condition": "clone work finds a copy at the workspace's place that opens as a repository, whose default branch resolves to a commit, whose origin URL equals the workspace's git_url and whose recorded workspace instance id equals the workspace's",
+          "action": "keep the copy, read head_sha from it, record default_branch from the copy's default branch when the workspace has none, set the status to ready and make no request to origin",
+          "contract": "status ready with head_sha equal to the copy's head of the default branch; zero requests to origin",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a temporary store and repository root",
+              "an origin served by gitrepotest.NewOrigin that counts requests"
+            ],
+            "pseudocode": "in internal/workspace/worker_test.go: clone a workspace to ready; add a commit to main directly in the copy; set the status to pending in the store; shut the origin down; run clone work; assert status ready, head_sha equal to the copy's new main head, and zero requests reached the origin. Variant: set default_branch to null in the store before the run; assert default_branch is main afterwards"
+          }
+        },
+        {
+          "id": "REQ-9.3",
+          "pattern": "unwanted",
+          "condition": "clone work finds something at the workspace's place that is not a valid copy of this workspace: it does not open as a repository, its default branch does not resolve, its origin URL differs from git_url, or its workspace instance id differs",
+          "action": "discard it and clone origin fresh",
+          "contract": "status ready; the copy holds origin's refs only; nothing of the earlier content remains",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a temporary store and repository root",
+              "an origin served by gitrepotest.NewOrigin that counts requests"
+            ],
+            "pseudocode": "in internal/workspace/worker_test.go, a table over what lies at RepoPath before clone work runs: {a plain file, an empty directory, a bare repository without commits, a valid copy whose remote.origin.url was changed, a valid copy cloned from the same URL whose parley.workspace value is another instance id (the copy of an earlier workspace with the same slug), a valid copy with no parley.workspace value}; each holds a marker ref refs/heads/stale where it is a repository; run clone work; assert status ready, the copy has origin's refs, refs/heads/stale does not exist and the origin received a clone request"
+          }
+        },
+        {
+          "id": "REQ-9.4",
+          "pattern": "state_driven",
+          "condition": "as many clones are running as the configured number of workers",
+          "action": "keep further clone work waiting and start it in the order it was recorded as running clones finish",
+          "contract": "never more running clones than the configured number of workers; waiting work starts first-recorded first",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a temporary store and repository root"
+            ],
+            "pseudocode": "in internal/workspace/worker_test.go: start the workers with size 2 and a git runner whose clones block on a channel and count how many run at once; record clone work for w1..w5 in that order; assert exactly 2 clones are running and w3..w5 are still pending; release one at a time and assert the next started is w3, then w4, then w5; assert the largest number observed running at once is 2 and all five end ready"
+          }
+        },
+        {
+          "id": "REQ-9.5",
+          "pattern": "event_driven",
+          "condition": "the hub shuts down while a clone is running",
+          "action": "interrupt the git process, leave the workspace in status pending or cloning with no directory at the copy's place and no temporary directory, and return from shutdown",
+          "contract": "shutdown returns; the workspace is still pending or cloning; nothing on disk for it; the next start completes the clone",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a temporary store and repository root",
+              "an origin served by gitrepotest.NewOrigin whose handler can block"
+            ],
+            "pseudocode": "in internal/workspace/worker_test.go: start a clone against an origin handler that blocks; call Stop with a 5-second context; assert Stop returns nil within 5 seconds, no git child process of the test remains, the status is cloning or pending, RepoPath does not exist and the repository root holds no temporary directory; start new workers on the same store with the origin unblocked; assert the workspace becomes ready"
+          }
+        },
+        {
+          "id": "REQ-9.6",
+          "pattern": "unwanted",
+          "condition": "the configured number of clone workers is lower than 1",
+          "action": "refuse to start, with an error that names [workspace].workers",
+          "contract": "a non-nil error that contains '[workspace].workers'; parleyd exits with status 1 and does not listen",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/worker_test.go, a table over the size {0, -1}: constructing the workers returns an error whose text contains '[workspace].workers' and starts no goroutine; sizes {1, 4} return no error"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-10",
+      "title": "The command parley workspace create",
+      "rationale": "A developer registers a repository from the shell and a script can block until the repository is usable.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-10.1",
+          "pattern": "event_driven",
+          "condition": "parley workspace create is run with --slug and --git-url and passes the client checks",
+          "action": "send one POST /workspaces whose JSON body holds a member for each flag given and no member for a flag not given, print the returned workspace on stdout and exit 0",
+          "contract": "exit 0 with the workspace as one JSON document on stdout; exit 1 with the hub's error envelope on stderr when the hub refuses",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a net/http/httptest server that records every request and answers from a script",
+              "PARLEY_ENDPOINT_URL and a credential point the command at that server"
+            ],
+            "pseudocode": "in internal/cli/workspace_test.go: run with --slug demo --git-url https://example.com/a.git; assert one request, method POST, path /api/v1/workspaces, body exactly {slug, git_url}; assert stdout is the scripted 201 body as one JSON document and exit 0. Run with every flag: assert the members default_branch, org_id (from --org), display_name, description, workspace_mode, upstream_url, integration_branch, git_username, git_password and settings; run with --git-pat: assert git_pat. Script a 409 conflict: assert the envelope on stderr, nothing on stdout, exit 1"
+          }
+        },
+        {
+          "id": "REQ-10.2",
+          "pattern": "unwanted",
+          "condition": "--slug or --git-url is missing, or --git-pat is given together with --git-username or --git-password, or only one of --git-username and --git-password is given, or a credential flag is given with an empty value",
+          "action": "stop before sending any request",
+          "contract": "exit 2; error envelope with error_type usage_error on stderr; nothing on stdout; no request sent",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a net/http/httptest server that records every request and answers from a script",
+              "PARLEY_ENDPOINT_URL and a credential point the command at that server"
+            ],
+            "pseudocode": "in internal/cli/workspace_test.go, a table of argument lists: {no --slug, no --git-url, --git-pat t --git-username u, --git-pat t --git-password p, --git-username u alone, --git-password p alone, --git-pat '', --git-username '' --git-password p, --git-username u --git-password ''}; assert exit 2, stderr holds an envelope with code 0 and error_type usage_error, stdout is empty and the server recorded zero requests"
+          }
+        },
+        {
+          "id": "REQ-10.3",
+          "pattern": "ubiquitous",
+          "action": "for any --setting key=value, split the text at the first '=' and send, under settings[key]: null when the value is empty; otherwise, when the key is protected_branches, the list of the value's comma-separated parts; otherwise the boolean when the value is true or false; otherwise the value as a string; the last occurrence of a repeated key winning",
+          "contract": "the settings member of the request body is an object with one member per distinct key",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a net/http/httptest server that records every request and answers from a script",
+              "PARLEY_ENDPOINT_URL and a credential point the command at that server"
+            ],
+            "pseudocode": "in internal/cli/workspace_test.go, a table over --setting arguments -> the settings member of the sent body: {a=true -> {a: true}}, {a=false -> {a: false}}, {a= -> {a: null}}, {protected_branches=main,release/* -> {protected_branches: [main, release/*]}}, {protected_branches=main -> {protected_branches: [main]}}, {protected_branches=true -> {protected_branches: ['true']}}, {protected_branches= -> {protected_branches: null}}, {u=https://x/y?a=b -> {u: 'https://x/y?a=b'}}, {a=1 -> {a: '1'}}, {a=x and a=y -> {a: 'y'}}; with no --setting the body has no settings member"
+          }
+        },
+        {
+          "id": "REQ-10.4",
+          "pattern": "unwanted",
+          "condition": "a --setting argument has no '=' or an empty key",
+          "action": "stop before sending any request",
+          "contract": "exit 2; error envelope with error_type usage_error on stderr; no request sent",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a net/http/httptest server that records every request and answers from a script",
+              "PARLEY_ENDPOINT_URL and a credential point the command at that server"
+            ],
+            "pseudocode": "in internal/cli/workspace_test.go, a table {--setting abc, --setting =v, --setting ''}: assert exit 2, error_type usage_error on stderr, zero requests"
+          }
+        },
+        {
+          "id": "REQ-10.5",
+          "pattern": "event_driven",
+          "condition": "the command is run with --wait and the hub answers the create with 201",
+          "action": "poll GET /workspaces/<slug> at the poll interval under the timeout until the status is ready or failed, then print that final workspace as the only document on stdout and exit 0 for ready",
+          "contract": "exit 0 with the final workspace (status ready) as the only document on stdout",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a net/http/httptest server that records every request and answers from a script",
+              "PARLEY_ENDPOINT_URL and a credential point the command at that server"
+            ],
+            "pseudocode": "in internal/cli/workspace_test.go: script 201 pending, then GET answers pending, cloning, ready; run with --wait --poll-interval 10ms; assert three GETs to /api/v1/workspaces/demo, stdout holds exactly one document with status ready, exit 0. Script GET to answer pending forever with --timeout 50ms: assert empty stdout, wait_timeout on stderr, exit 1. Script GET to answer 404: assert that envelope on stderr and exit 1. Run with --timeout 0s: exit 2 and zero requests"
+          }
+        },
+        {
+          "id": "REQ-10.6",
+          "pattern": "unwanted",
+          "condition": "the workspace polled by --wait reaches the status failed",
+          "action": "print the final workspace on stdout, report the failed wait on stderr and exit with status 1",
+          "contract": "exit 1; the final workspace on stdout; error envelope with error_type wait_failed on stderr",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a net/http/httptest server that records every request and answers from a script",
+              "PARLEY_ENDPOINT_URL and a credential point the command at that server"
+            ],
+            "pseudocode": "in internal/cli/workspace_test.go: script 201 pending, then GET answers cloning, failed with clone_error 'x'; assert stdout holds one document with status failed and clone_error 'x', stderr holds an envelope with error_type wait_failed, exit 1"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "A developer registers a public repository and the hub clones it",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "runs parley workspace create --slug demo --git-url <origin URL>"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends POST /api/v1/workspaces with the slug and the git_url and the developer's API key"
+        },
+        {
+          "actor": "parleyd",
+          "action": "authenticates the caller, validates the body, records the workspace in status pending together with the event parley.workspace.create, and answers 201"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints the workspace with status pending and access owner and exits 0"
+        },
+        {
+          "actor": "parleyd",
+          "action": "starts clone work, sets the status to cloning and makes a bare clone of origin"
+        },
+        {
+          "actor": "origin",
+          "action": "serves its branches and tags"
+        },
+        {
+          "actor": "parleyd",
+          "action": "writes origin's head of every branch as refs/remotes/origin/<name> in the copy, records default_branch and head_sha and sets the status to ready"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the run function of cmd/parleyd with the clone workers",
+          "internal/server on a real TCP listener",
+          "internal/workspace with the real store, access, secret and event components",
+          "internal/gitrepo running the real git command",
+          "internal/cli with its real HTTP client",
+          "an origin served over TLS by gitrepotest.NewOrigin"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with a temporary data directory and repository root, an external URL and 2 clone workers",
+          "a user with an API key",
+          "an origin with the branches main and dev and the tag v1"
+        ],
+        "end_state": [
+          "the command printed a workspace with status pending and access owner and exited 0",
+          "the workspace record reaches status ready with default_branch main and head_sha equal to origin's main head",
+          "the bare copy under the repository root holds main, dev and v1 at origin's commit ids",
+          "the event log holds one parley.workspace.create for the slug"
+        ],
+        "pseudocode": "in test/e2e/workspace_create_test.go: hub = startHub(t); out, code = runCLI('workspace', 'create', '--slug', 'demo', '--git-url', origin.URL); assert code == 0 and out.status == 'pending' and out.access == 'owner' and out.hub_url ends with '/demo.git'; eventually(10s) hub.Workspaces.Get('demo').status == 'ready'; assert head_sha == origin.Head('main'); assert git for-each-ref in the copy lists main, dev, v1; assert one parley.workspace.create event"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "A developer registers a private repository with a token",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "sends POST /api/v1/workspaces with slug, git_url and git_pat"
+        },
+        {
+          "actor": "parleyd",
+          "action": "lists origin's refs with the token under a 10-second deadline"
+        },
+        {
+          "actor": "origin",
+          "action": "accepts the token and answers the ref listing"
+        },
+        {
+          "actor": "parleyd",
+          "action": "stores the workspace, the secret GIT_PAT and the event in one transaction and answers 201 without the token"
+        },
+        {
+          "actor": "parleyd",
+          "action": "resolves the credential from the secret, clones origin with it and sets the status to ready"
+        },
+        {
+          "actor": "developer",
+          "action": "sends the same request for another slug with a wrong token and receives 400 credential_check_failed"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the run function of cmd/parleyd with the clone workers",
+          "internal/workspace with the real store, secret and event components",
+          "internal/gitrepo running the real git command",
+          "an origin served over TLS by gitrepotest.NewOrigin that requires Basic authentication"
+        ],
+        "setup": [
+          "a hub started in-process with a secret encryption key configured and its log captured",
+          "a user with an API key",
+          "an origin that accepts only the user name x-token-auth with the token tok-123"
+        ],
+        "end_state": [
+          "the first workspace is ready and its copy holds origin's branches",
+          "the workspace has the secret GIT_PAT",
+          "the token appears in no response body, in no event, in no log line and nowhere under the repository root",
+          "the request with the wrong token answered 400 credential_check_failed and no second workspace exists"
+        ],
+        "pseudocode": "in test/e2e/workspace_create_test.go: r = post('/workspaces', {slug: 'priv', git_url: origin.URL, git_pat: 'tok-123'}); assert r.status == 201 and 'tok-123' not in r.body; eventually ready; assert secrets list of the workspace holds GIT_PAT; assert grep of the hub log, of the events JSON and of every file under the repository root finds no 'tok-123'; r2 = post(... slug: 'priv2', git_pat: 'wrong'); assert r2.status == 400 and r2.error_type == 'credential_check_failed' and the store has no workspace priv2"
+      }
+    },
+    {
+      "id": "PATH-3",
+      "title": "An operator restarts the hub and an interrupted clone is resumed",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "sends POST /api/v1/workspaces for an origin that answers slowly"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers 201 and starts the clone"
+        },
+        {
+          "actor": "operator",
+          "action": "stops parleyd while the clone is running"
+        },
+        {
+          "actor": "parleyd",
+          "action": "interrupts the clone, leaves nothing at the copy's place and exits"
+        },
+        {
+          "actor": "operator",
+          "action": "starts parleyd again on the same data directory"
+        },
+        {
+          "actor": "parleyd",
+          "action": "queues the workspace before it listens, clones origin and sets the status to ready"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the run function of cmd/parleyd with its start and stop sequence",
+          "internal/workspace with the real store",
+          "internal/gitrepo running the real git command",
+          "an origin served over TLS by gitrepotest.NewOrigin"
+        ],
+        "setup": [
+          "a hub started in-process with a temporary data directory and repository root",
+          "an origin whose handler blocks until the test releases it"
+        ],
+        "end_state": [
+          "after the stop the workspace record is pending or cloning and the repository root holds no entry for the slug",
+          "after the second start, with no further request, the workspace is ready with origin's head"
+        ],
+        "pseudocode": "in test/e2e/workspace_create_test.go: post create; eventually status == 'cloning'; hub.Stop(); assert status in the store is pending or cloning and no directory for the slug or temporary directory exists; origin.Release(); hub2 = startHub(t, sameDataDir); eventually(10s) status == 'ready' and head_sha == origin.Head('main')"
+      }
+    }
+  ],
+  "external_apis": [
+    {
+      "package": "github.com/spf13/cobra",
+      "version": "v1.10.2",
+      "verified": false,
+      "symbols": [
+        {
+          "name": "Command",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "type Command struct { Use string; Short string; RunE func(cmd *Command, args []string) error; ... }"
+        },
+        {
+          "name": "Command.AddCommand",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) AddCommand(cmds ...*Command)"
+        },
+        {
+          "name": "Command.Flags",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) Flags() *pflag.FlagSet"
+        }
+      ]
+    }
+  ]
+}

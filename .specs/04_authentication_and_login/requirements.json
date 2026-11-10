@@ -1,0 +1,1149 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "04",
+  "spec_name": "authentication_and_login",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Credential presentation",
+      "rationale": "Every later route trusts what authentication reports about the caller, so the three credential types and the two public routes are fixed once.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "a request to a non-public route under /api/v1 carries an Authorization header with the scheme Bearer, in any letter case, and a live admin token, API key or PAT",
+          "action": "pass the request to the next check and report the caller to it: the credential type, the credential id, the user with role and status (none for the admin token) and, for a PAT, its permissions, paths and workspace",
+          "contract": "the route's handler runs and reads a caller {type: \"admin\" | \"api_key\" | \"pat\", credential_id: \"admin\" | key_id | token_id, user: User or none, permissions: string[], paths: string[] or null, workspace: string or null}; permissions, paths and workspace are set only for a PAT",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a test hub: the request pipeline of internal/server with the authenticator and routes of internal/identity installed, over a store opened in t.TempDir()",
+              "the store is bootstrapped with an admin token through the bootstrap code of package 03",
+              "user alice (role user, status active) holds a live API key and a live PAT with permissions [git:read], paths [docs/**] and no workspace",
+              "a non-public test route GET /api/v1/test/whoami that answers 200 with the caller it was given"
+            ],
+            "pseudocode": "in internal/identity/authenticate_test.go, a table over {admin token, API key, PAT} x scheme {Bearer, bearer, BEARER}: r = get('/api/v1/test/whoami', Authorization: scheme + ' ' + credential); assert r.status == 200; admin: assert r.json.type == 'admin' and r.json.credential_id == 'admin' and r.json.user == null; API key: assert type == 'api_key' and credential_id == key_id and user.id == alice.id and user.role == 'user' and user.status == 'active'; PAT: assert type == 'pat' and credential_id == token_id and user.id == alice.id and permissions == ['git:read'] and paths == ['docs/**'] and workspace == null; one more row with two spaces after the scheme and a trailing space after the credential: assert 200"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "unwanted",
+          "condition": "a request to a non-public route under /api/v1 has no Authorization header, a scheme other than Bearer, an empty credential, or a credential that matches none of the three wire formats",
+          "action": "refuse the request before any later check runs",
+          "contract": "HTTP 401 with error_type unauthenticated and message \"authentication required\"; the route's handler does not run",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a test hub: the request pipeline of internal/server with the authenticator and routes of internal/identity installed, over a store opened in t.TempDir()",
+              "a non-public test route GET /api/v1/test/whoami that answers 200 with the caller it was given and counts its calls"
+            ],
+            "pseudocode": "in internal/identity/authenticate_test.go, a table over the Authorization values {absent, 'Basic dXNlcjpwYXNz', 'Bearer', 'Bearer    ', 'Bearer hello', 'Token ' + valid API key, 'Bearer parley_admin_' + 63 hex, 'Bearer parley_admin_' + 64 uppercase hex, 'Bearer parley_pat_' + 8 + '_' + 31 characters, 'Bearer parley_pat_' + 8 uppercase + '_' + 32, 'Bearer parley_' + 7 + '_' + 32, 'Bearer parley_' + 8 + '_' + 33, 'Bearer parley_' + 8 with a '-' + '_' + 32}: r = get('/api/v1/test/whoami', header); assert r.status == 401; assert r.json.error.error_type == 'unauthenticated'; assert r.json.error.code == 401; assert r.json.error.message == 'authentication required'; assert handlerCalls == 0"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "unwanted",
+          "condition": "the credential matches a wire format and its id is not stored, or its secret does not match the stored hash, or it has the admin format and differs from the admin token or the hub is not bootstrapped",
+          "action": "refuse the request without saying which of the id and the secret was wrong",
+          "contract": "HTTP 401 with error_type unauthenticated and message \"invalid credentials\"; the body is the same for an unknown id and for a wrong secret",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a test hub: the request pipeline of internal/server with the authenticator and routes of internal/identity installed, over a store opened in t.TempDir()",
+              "user alice holds a live API key and a live PAT; one case uses a second store that was never bootstrapped",
+              "a non-public test route GET /api/v1/test/whoami that answers 200 with the caller it was given"
+            ],
+            "pseudocode": "in internal/identity/authenticate_test.go, a table over {API key with an unknown key_id, alice's key_id with another 32-character secret, PAT with an unknown token_id, alice's token_id with another secret, an admin-format token that is not the admin token, the admin token against a store with no admin hash}: r = get('/api/v1/test/whoami', 'Bearer ' + credential); assert r.status == 401; assert r.json.error.error_type == 'unauthenticated'; assert r.json.error.message == 'invalid credentials'; assert body(unknown key_id) == body(wrong secret)"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "event_driven",
+          "condition": "a request to GET /auth/providers or POST /auth/callback carries no Authorization header, or one that would fail authentication on another route",
+          "action": "answer the route without authenticating the request",
+          "contract": "the same status and body as the same request without the header; GET /api/v1/auth/providers answers 200",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a test hub: the request pipeline of internal/server with the authenticator and routes of internal/identity installed, over a store opened in t.TempDir()",
+              "one provider github is configured"
+            ],
+            "pseudocode": "in internal/identity/providers_test.go, a table over the Authorization values {absent, 'Bearer hello', 'Bearer ' + a revoked API key, 'Basic x'}: r = get('/api/v1/auth/providers', header); assert r.status == 200; assert r.body == body(absent); and r = post('/api/v1/auth/callback', {}, 'Bearer hello'); assert r.status == 400"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "unwanted",
+          "condition": "the admin token is presented on a route that is declared as needing a user",
+          "action": "refuse the request, because the admin token has no user",
+          "contract": "HTTP 403 with error_type forbidden and message \"this route needs a user\"; the route's handler does not run; the same route passes an API key and a PAT",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a test hub: the request pipeline of internal/server with the authenticator and routes of internal/identity installed, over a store opened in t.TempDir()",
+              "the store is bootstrapped with an admin token; user alice holds a live API key and a live PAT",
+              "a non-public test route GET /api/v1/test/me declared as needing a user, which counts its calls",
+              "a non-public test route GET /api/v1/test/whoami that answers 200 with the caller it was given"
+            ],
+            "pseudocode": "in internal/identity/authenticate_test.go: r = get('/api/v1/test/me', 'Bearer ' + adminToken); assert r.status == 403; assert r.json.error.error_type == 'forbidden'; assert r.json.error.message == 'this route needs a user'; assert handlerCalls == 0; assert get('/api/v1/test/me', 'Bearer ' + aliceKey).status == 200; assert get('/api/v1/test/me', 'Bearer ' + alicePAT).status == 200; assert get('/api/v1/test/whoami', 'Bearer ' + adminToken).status == 200"
+          }
+        },
+        {
+          "id": "REQ-1.6",
+          "pattern": "ubiquitous",
+          "action": "for any API key or PAT it stores, keep the SHA-256 hash of the secret and never the secret itself",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a store opened in t.TempDir() with user alice"
+            ],
+            "pseudocode": "in internal/identity/credential_test.go: key = issue an API key for alice; pat = store a PAT for alice; close the store; data = bytes of every file under the data directory; assert not contains(data, secret part of key); assert not contains(data, secret part of pat); assert contains(data, hex(sha256(secret part of key))); and assert the generated key matches ^parley_[0-9A-Za-z]{8}_[0-9A-Za-z]{32}$ and the PAT matches ^parley_pat_[a-z0-9]{8}_[a-z0-9]{32}$; two issued keys differ in key_id and secret"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Credential state",
+      "rationale": "A revoked, expired or blocked credential must stop working at once, and its state must not be readable by someone who holds only its id.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "unwanted",
+          "condition": "the secret of an API key or PAT matches and the credential's revoked_at is set",
+          "action": "refuse the request",
+          "contract": "HTTP 401 with error_type unauthenticated and message \"credential revoked\"",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a test hub: the request pipeline of internal/server with the authenticator and routes of internal/identity installed, over a store opened in t.TempDir()",
+              "user alice holds a live API key and a live PAT",
+              "a non-public test route GET /api/v1/test/whoami that answers 200 with the caller it was given"
+            ],
+            "pseudocode": "in internal/identity/authenticate_test.go, a table over {API key, PAT}: assert get('/api/v1/test/whoami', bearer).status == 200; set revoked_at = now in the store; r = get('/api/v1/test/whoami', bearer); assert r.status == 401; assert r.json.error.error_type == 'unauthenticated'; assert r.json.error.message == 'credential revoked'"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "unwanted",
+          "condition": "the secret of an API key or PAT matches, the credential is not revoked and the current time is at or after its expires_at",
+          "action": "refuse the request",
+          "contract": "HTTP 401 with error_type unauthenticated and message \"credential expired\"; a credential whose expires_at is null or later than the current time passes",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a test hub: the request pipeline of internal/server with the authenticator and routes of internal/identity installed, over a store opened in t.TempDir()",
+              "the authenticator takes its clock as a parameter",
+              "a non-public test route GET /api/v1/test/whoami that answers 200 with the caller it was given"
+            ],
+            "pseudocode": "in internal/identity/authenticate_test.go, a table over {API key, PAT} x expires_at {now - 1 s, now, now + 1 s, null} with the authenticator's clock fixed at now: r = get('/api/v1/test/whoami', bearer); for now - 1 s and now: assert r.status == 401 and r.json.error.error_type == 'unauthenticated' and r.json.error.message == 'credential expired'; for now + 1 s and null: assert r.status == 200"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "unwanted",
+          "condition": "the secret of an API key or PAT matches, the credential is neither revoked nor expired and its user's status is blocked",
+          "action": "refuse the request",
+          "contract": "HTTP 403 with error_type forbidden and message \"user is blocked\"; the credential's record is unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a test hub: the request pipeline of internal/server with the authenticator and routes of internal/identity installed, over a store opened in t.TempDir()",
+              "user alice holds a live API key and a live PAT",
+              "a non-public test route GET /api/v1/test/whoami that answers 200 with the caller it was given"
+            ],
+            "pseudocode": "in internal/identity/authenticate_test.go, a table over {API key, PAT}: set alice.status = 'blocked' in the store; r = get('/api/v1/test/whoami', bearer); assert r.status == 403; assert r.json.error.error_type == 'forbidden'; assert r.json.error.message == 'user is blocked'; assert the stored credential has revoked_at == null"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "ubiquitous",
+          "action": "for any credential that fails more than one check, give the answer of the first failing check in the order format, secret, revoked, expired, blocked, so that a wrong secret is always answered \"invalid credentials\" whatever the credential's state",
+          "contract": "revoked and expired: 401 \"credential revoked\"; revoked with a blocked user: 401 \"credential revoked\"; expired with a blocked user: 401 \"credential expired\"; the id of a revoked, expired or blocked user's credential with a wrong secret: 401 \"invalid credentials\" with the same body as an unknown id",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a test hub: the request pipeline of internal/server with the authenticator and routes of internal/identity installed, over a store opened in t.TempDir()",
+              "a non-public test route GET /api/v1/test/whoami that answers 200 with the caller it was given"
+            ],
+            "pseudocode": "in internal/identity/authenticate_test.go, a table over {API key, PAT} x states {revoked+expired -> 401 'credential revoked', revoked+blocked user -> 401 'credential revoked', expired+blocked user -> 401 'credential expired'}: assert status and message; then for each of the states {revoked, expired, blocked user}: r = get('/api/v1/test/whoami', 'Bearer ' + credential with its secret replaced by another 32 characters); assert r.status == 401 and r.json.error.message == 'invalid credentials'; assert r.body == body(request with an unknown id)"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "event_driven",
+          "condition": "a blocked user's status returns to active",
+          "action": "authenticate again every credential of that user that is neither revoked nor expired, and keep refusing the revoked and the expired ones",
+          "contract": "the live API key and the live PAT are answered 200; the revoked key is answered 401 \"credential revoked\"; the expired PAT is answered 401 \"credential expired\"",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a test hub: the request pipeline of internal/server with the authenticator and routes of internal/identity installed, over a store opened in t.TempDir()",
+              "user alice is blocked and holds a live API key, a live PAT, a revoked API key and an expired PAT",
+              "a non-public test route GET /api/v1/test/whoami that answers 200 with the caller it was given"
+            ],
+            "pseudocode": "in internal/identity/authenticate_test.go: assert all four credentials get 403 'user is blocked' except the revoked one (401 'credential revoked') and the expired one (401 'credential expired'); set alice.status = 'active'; assert get(whoami, liveKey).status == 200; assert get(whoami, livePAT).status == 200; assert message(get(whoami, revokedKey)) == 'credential revoked'; assert message(get(whoami, expiredPAT)) == 'credential expired'"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Provider list",
+      "rationale": "A client that starts a login has to learn where to send the browser without holding a credential or a client secret.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "a caller sends GET /auth/providers",
+          "action": "answer the configured providers ordered by name, each with its name and an authorize_url that carries the provider's client id and the scopes the hub needs: user:email for github, openid email profile for google",
+          "contract": "HTTP 200 {items: [{name: string, authorize_url: string}], next_cursor: null} with Cache-Control: public, max-age=300; github: https://github.com/login/oauth/authorize?client_id=<client_id>&scope=user%3Aemail; google: https://accounts.google.com/o/oauth2/v2/auth with the query parameters client_id, scope \"openid email profile\" and response_type \"code\"; an item has no other member",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a test hub: the request pipeline of internal/server with the authenticator and routes of internal/identity installed, over a store opened in t.TempDir()",
+              "the configuration lists google (client_id gg-id, client_secret gg-secret) before github (client_id gh-id, client_secret gh-secret), with no URL overrides"
+            ],
+            "pseudocode": "in internal/identity/providers_test.go: r = get('/api/v1/auth/providers'); assert r.status == 200; assert r.header['Cache-Control'] == 'public, max-age=300'; assert r.json.next_cursor == null; assert names(r.json.items) == ['github', 'google']; assert r.json.items[0].authorize_url == 'https://github.com/login/oauth/authorize?client_id=gh-id&scope=user%3Aemail'; u = parse(r.json.items[1].authorize_url); assert u.scheme + '://' + u.host + u.path == 'https://accounts.google.com/o/oauth2/v2/auth'; assert u.query == {client_id: 'gg-id', scope: 'openid email profile', response_type: 'code'}; assert keys(each item) == {name, authorize_url}; assert not contains(r.body, 'gh-secret') and not contains(r.body, 'gg-secret') and no response header contains either"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "state_driven",
+          "condition": "no provider is configured",
+          "action": "answer GET /auth/providers with an empty list",
+          "contract": "HTTP 200 {items: [], next_cursor: null}",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a test hub: the request pipeline of internal/server with the authenticator and routes of internal/identity installed, over a store opened in t.TempDir()",
+              "the configuration has no [[oauth.providers]] entry"
+            ],
+            "pseudocode": "in internal/identity/providers_test.go: r = get('/api/v1/auth/providers'); assert r.status == 200; assert r.json.items == [] (an array, not null); assert r.json.next_cursor == null"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "optional",
+          "condition": "a provider's configuration sets authorize_url",
+          "action": "build that provider's authorize_url on the configured URL in place of the provider's public endpoint, with the same client_id and scope parameters",
+          "contract": "for github with authorize_url https://ghe.example/login/oauth/authorize: https://ghe.example/login/oauth/authorize?client_id=<client_id>&scope=user%3Aemail",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a test hub: the request pipeline of internal/server with the authenticator and routes of internal/identity installed, over a store opened in t.TempDir()",
+              "github is configured with client_id gh-id and authorize_url https://ghe.example/login/oauth/authorize"
+            ],
+            "pseudocode": "in internal/identity/providers_test.go: r = get('/api/v1/auth/providers'); assert r.json.items[0].authorize_url == 'https://ghe.example/login/oauth/authorize?client_id=gh-id&scope=user%3Aemail'"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "ubiquitous",
+          "action": "for any answer of GET /auth/providers, leave every configured client_secret out of the body and the headers",
+          "check": {
+            "same_as": "REQ-3.1"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Identity read from the provider",
+      "rationale": "The hub knows a person only through the stable id and the verified e-mail the provider vouches for.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "a login with provider github holds a code and an allowed redirect_uri",
+          "action": "exchange the code at the provider's token URL for an access token and read the user's id, login, name and e-mail from the user URL with that token",
+          "contract": "one form-encoded POST to the token URL with client_id, client_secret, code, redirect_uri and grant_type=authorization_code and the header Accept: application/json; one GET to the user URL with Authorization: Bearer <access token>; the identity is {provider: \"github\", provider_id: the id as a decimal string, username: login, full_name: name or \"\", email: the profile's email}",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a fake provider: an httptest server that answers the token URL and the user URL (and, for GitHub, the e-mail list URL) from a script the test sets, and records every request it receives",
+              "github is configured with client_id gh-id, client_secret gh-secret and token_url and userinfo_url pointing at the fake provider",
+              "the fake answers the token URL with {access_token: 'at-1'} and the user URL with {id: 123, login: 'alice', name: 'Alice A', email: 'a@x'}"
+            ],
+            "pseudocode": "in internal/identity/oauth_test.go: id, err = client.Identity(ctx, 'github', 'code-1', 'http://127.0.0.1:5000/callback'); assert err == nil; assert id == {provider: 'github', provider_id: '123', username: 'alice', full_name: 'Alice A', email: 'a@x'}; t = fake.requests[0]; assert t.method == 'POST' and t.header['Accept'] == 'application/json' and t.form == {client_id: 'gh-id', client_secret: 'gh-secret', code: 'code-1', redirect_uri: 'http://127.0.0.1:5000/callback', grant_type: 'authorization_code'}; assert fake.requests[1].header['Authorization'] == 'Bearer at-1'; assert len(fake.requests) == 2"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "optional",
+          "condition": "the GitHub profile's email is null or empty",
+          "action": "read the e-mail list from the user URL with /emails appended and use the address of the entry whose primary and verified are both true",
+          "contract": "one GET to <user URL>/emails with Authorization: Bearer <access token>; identity.email is that entry's email",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a fake provider: an httptest server that answers the token URL and the user URL (and, for GitHub, the e-mail list URL) from a script the test sets, and records every request it receives",
+              "the fake answers the user URL with {id: 123, login: 'alice', email: null} and the e-mail list with [{email: 'old@x', primary: false, verified: true}, {email: 'a@x', primary: true, verified: true}]"
+            ],
+            "pseudocode": "in internal/identity/oauth_test.go: id, err = client.Identity(ctx, 'github', 'code-1', uri); assert err == nil; assert id.email == 'a@x'; assert fake.requests[2].path ends with '/emails' and fake.requests[2].header['Authorization'] == 'Bearer at-1'"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "event_driven",
+          "condition": "a login with provider google holds a code and an allowed redirect_uri",
+          "action": "exchange the code at the token URL and read sub, name, email and email_verified from the user URL",
+          "contract": "the identity is {provider: \"google\", provider_id: sub, username: name, full_name: name, email: email}, and email is taken only when email_verified is true",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a fake provider: an httptest server that answers the token URL and the user URL (and, for GitHub, the e-mail list URL) from a script the test sets, and records every request it receives",
+              "google is configured with token_url and userinfo_url pointing at the fake provider",
+              "the fake answers the token URL with {access_token: 'at-1'} and the user URL with {sub: '1099', name: 'Alice Smith', email: 'a@x', email_verified: true}"
+            ],
+            "pseudocode": "in internal/identity/oauth_test.go: id, err = client.Identity(ctx, 'google', 'code-1', uri); assert err == nil; assert id == {provider: 'google', provider_id: '1099', username: 'Alice Smith', full_name: 'Alice Smith', email: 'a@x'}"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "optional",
+          "condition": "the provider gives no login or display name, or one that is empty after trimming white space",
+          "action": "use <provider>-<provider_id> as the username",
+          "contract": "identity.username is \"github-123\" for provider github with id 123, \"google-1099\" for provider google with sub 1099",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a fake provider: an httptest server that answers the token URL and the user URL (and, for GitHub, the e-mail list URL) from a script the test sets, and records every request it receives"
+            ],
+            "pseudocode": "in internal/identity/oauth_test.go, a table over {github with login '', github with no login member, google with no name member, google with name '   '}: id, err = client.Identity(...); assert err == nil; assert id.username == provider + '-' + id.provider_id; and one row with github login '  alice ' : assert id.username == 'alice'"
+          }
+        },
+        {
+          "id": "REQ-4.5",
+          "pattern": "unwanted",
+          "condition": "the provider's answer carries no user id, or no verified e-mail",
+          "action": "fail the identity read as a failure of the provider and return no identity",
+          "contract": "the identity read returns an error of the kind upstream, which POST /auth/callback answers as HTTP 502 with error_type upstream_error",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a fake provider: an httptest server that answers the token URL and the user URL (and, for GitHub, the e-mail list URL) from a script the test sets, and records every request it receives"
+            ],
+            "pseudocode": "in internal/identity/oauth_test.go, a table over the fake's answers {github user without id, github email null with an e-mail list of [{primary: true, verified: false}, {primary: false, verified: true}], github email null with an empty e-mail list, google without sub, google with email_verified false, google with email_verified true and no email}: id, err = client.Identity(...); assert kind(err) == upstream; assert id is the zero value"
+          }
+        },
+        {
+          "id": "REQ-4.6",
+          "pattern": "unwanted",
+          "condition": "the token URL answers a JSON object with an error member and a status below 500",
+          "action": "fail the identity read as a code the provider rejected, without calling the user URL",
+          "contract": "the identity read returns an error of the kind rejected, which POST /auth/callback answers as HTTP 401 with error_type unauthenticated; the user URL receives no request",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a fake provider: an httptest server that answers the token URL and the user URL (and, for GitHub, the e-mail list URL) from a script the test sets, and records every request it receives"
+            ],
+            "pseudocode": "in internal/identity/oauth_test.go, a table over the token answers {200 {error: 'bad_verification_code'}, 400 {error: 'invalid_grant'}}: id, err = client.Identity(...); assert kind(err) == rejected; assert len(fake.requests) == 1"
+          }
+        },
+        {
+          "id": "REQ-4.7",
+          "pattern": "unwanted",
+          "condition": "the token URL or the user URL cannot be reached, answers a status of 500 or above, answers a body that is not a JSON object, or the token URL answers neither an access token nor an error member, or the user URL answers a status other than 200",
+          "action": "fail the identity read as a failure of the provider",
+          "contract": "the identity read returns an error of the kind upstream; the error's text holds neither the code, the client secret, the access token nor the provider's body",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a fake provider: an httptest server that answers the token URL and the user URL (and, for GitHub, the e-mail list URL) from a script the test sets, and records every request it receives"
+            ],
+            "pseudocode": "in internal/identity/oauth_test.go, a table over {token URL connection refused, token 503, token 200 'not json', token 200 {}, user URL 401, user URL 500, user URL 200 '[1,2]', e-mail list URL 500 when the profile hides the address}: id, err = client.Identity(ctx, 'github', 'code-1', uri); assert kind(err) == upstream; for each of 'code-1', 'gh-secret', 'at-1' and the fake's body text: assert not contains(err.Error(), it)"
+          }
+        },
+        {
+          "id": "REQ-4.8",
+          "pattern": "unwanted",
+          "condition": "a call to the provider has not answered within 15 seconds",
+          "action": "abandon the call and fail the identity read as a failure of the provider",
+          "contract": "the identity read returns an error of the kind upstream no later than the timeout plus the time of one scheduling delay; the connection to the provider is closed",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a fake provider: an httptest server that answers the token URL and the user URL (and, for GitHub, the e-mail list URL) from a script the test sets, and records every request it receives",
+              "the client is built with a provider timeout of 50 ms in place of the default 15 s",
+              "the fake delays its answer to the token URL by 500 ms"
+            ],
+            "pseudocode": "in internal/identity/oauth_test.go: start = now; id, err = client.Identity(ctx, 'github', 'code-1', uri); assert kind(err) == upstream; assert now - start < 300 ms; and the same with the delay on the user URL in place of the token URL"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "First login",
+      "rationale": "A person who signs in for the first time must leave with a user, an organization to own workspaces in and a working key, or with nothing at all.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "POST /auth/callback has read an identity whose provider and provider_id match no user",
+          "action": "create, in one transaction, the user with status active, a personal org whose name is the username and whose owner_id is the user, the user's membership of that org and an API key, and answer the user and the key",
+          "contract": "HTTP 200 {user: {id, username, email, full_name, role, status: \"active\", provider, provider_id, created_at, updated_at}, api_key: {key: \"parley_<key_id>_<secret>\", key_id, expires_at}}; the store then holds one user, one org with name == username and owner_id == user.id, one membership (org, user) and one live key; the returned key authenticates as that user",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a test hub: the request pipeline of internal/server with the authenticator and routes of internal/identity installed, over a store opened in t.TempDir()",
+              "the callback's provider client is replaced by a stub that returns the identity, or the error, the test sets; github is configured",
+              "the callback's clock is fixed at T0",
+              "the stub returns {provider: 'github', provider_id: '123', username: 'alice', full_name: 'Alice A', email: 'a@x'}",
+              "the store has no user",
+              "a non-public test route GET /api/v1/test/whoami that answers 200 with the caller it was given"
+            ],
+            "pseudocode": "in internal/identity/login_test.go: r = post('/api/v1/auth/callback', {provider: 'github', code: 'c', redirect_uri: 'http://127.0.0.1:5000/callback'}); assert r.status == 200; u = r.json.user; assert u.username == 'alice' and u.email == 'a@x' and u.full_name == 'Alice A' and u.status == 'active' and u.provider == 'github' and u.provider_id == '123' and u.created_at == u.updated_at == format(T0); assert r.json.api_key.key == 'parley_' + r.json.api_key.key_id + '_' + 32 characters; assert keys(r.json.api_key) == {key, key_id, expires_at}; org = the only org in the store; assert org.name == 'alice' and org.slug == 'alice' and org.owner_id == u.id and org.status == 'active'; assert memberships == [(org.id, u.id)]; w = get('/api/v1/test/whoami', 'Bearer ' + r.json.api_key.key); assert w.status == 200 and w.json.user.id == u.id"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "optional",
+          "condition": "the new user's username is already the username of another user",
+          "action": "try <name>-2 to <name>-10 in that order and create the user under the first one that is free, naming the personal org after it",
+          "contract": "HTTP 200 with user.username == the first free of <name>-2 … <name>-10; the personal org's name equals that username",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a test hub: the request pipeline of internal/server with the authenticator and routes of internal/identity installed, over a store opened in t.TempDir()",
+              "the callback's provider client is replaced by a stub that returns the identity, or the error, the test sets; github is configured",
+              "the callback's clock is fixed at T0",
+              "the stub returns a new provider identity with username 'alice' and an e-mail no user has"
+            ],
+            "pseudocode": "in internal/identity/login_test.go, a table over the existing usernames {[alice] -> 'alice-2', [alice, alice-2, alice-3] -> 'alice-4', [alice, alice-2 … alice-9] -> 'alice-10'}: r = post('/api/v1/auth/callback', {provider: 'github', code: 'c', redirect_uri: 'http://127.0.0.1:5000/callback'}); assert r.status == 200; assert r.json.user.username == want; assert the org owned by r.json.user.id has name == want"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "event_driven",
+          "condition": "a new user is created by a login",
+          "action": "give the user the role admin when the identity's e-mail equals the bootstrap admin_email, ignoring letter case, and no user with role admin exists, and the role user otherwise",
+          "contract": "user.role in the answer and in the store is \"admin\" or \"user\" by that rule",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a test hub: the request pipeline of internal/server with the authenticator and routes of internal/identity installed, over a store opened in t.TempDir()",
+              "the callback's provider client is replaced by a stub that returns the identity, or the error, the test sets; github is configured",
+              "the callback's clock is fixed at T0"
+            ],
+            "pseudocode": "in internal/identity/login_test.go, a table over {admin_email 'Boss@X.io', identity e-mail 'boss@x.io', no admin user -> 'admin'; the same with an existing user of role admin -> 'user'; the same with an existing blocked user of role admin -> 'user'; admin_email 'boss@x.io', identity e-mail 'a@x' -> 'user'; no admin_email stored -> 'user'}: r = post('/api/v1/auth/callback', {provider: 'github', code: 'c', redirect_uri: 'http://127.0.0.1:5000/callback'}); assert r.status == 200; assert r.json.user.role == want; assert the stored user's role == want"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "ubiquitous",
+          "action": "for any new user, derive the personal org's slug from the username in four steps: lowercase it, replace every character outside [a-z0-9_-] with -, collapse runs of - and trim leading and trailing - and _; if fewer than 2 characters remain use u-<first 8 characters of the user id>; if it starts with a digit prefix u-; if the slug is taken try <slug>-1 to <slug>-10 in that order",
+          "contract": "Alice.Smith -> alice-smith; 42bob -> u-42bob; a -> u-<first 8 characters of the user id>; alice when the slug alice is taken -> alice-1",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/identity/slug_test.go, a table over username -> slug with user id '0a1b2c3d-…': {'Alice.Smith' -> 'alice-smith', '42bob' -> 'u-42bob', 'a' -> 'u-0a1b2c3d', '9' -> 'u-0a1b2c3d', '--x__' -> 'u-0a1b2c3d', '_bob_' -> 'bob', 'A  B' -> 'a-b', 'Alice Smith' -> 'alice-smith', 'a..b--c' -> 'a-b-c', 'ünï' -> 'u-0a1b2c3d', 'snake_case-x' -> 'snake_case-x'}: assert slug(username, id) == want; and with a store: taken [alice] -> 'alice-1'; taken [alice, alice-1 … alice-9] -> 'alice-10'; the org a login creates for username 'Alice.Smith' has slug 'alice-smith'"
+          }
+        },
+        {
+          "id": "REQ-5.5",
+          "pattern": "unwanted",
+          "condition": "a new user cannot be created without breaking uniqueness: the identity's e-mail belongs to another user, an org already has the username as its name, the username and all of <name>-2 to <name>-10 are taken, or the slug and all of <slug>-1 to <slug>-10 are taken",
+          "action": "refuse the login and create nothing",
+          "contract": "HTTP 409 with error_type conflict; the numbers of users, orgs, memberships and API keys in the store are unchanged and no key is revoked",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a test hub: the request pipeline of internal/server with the authenticator and routes of internal/identity installed, over a store opened in t.TempDir()",
+              "the callback's provider client is replaced by a stub that returns the identity, or the error, the test sets; github is configured",
+              "the callback's clock is fixed at T0",
+              "the stub returns a new provider identity with username 'alice' and e-mail 'a@x'"
+            ],
+            "pseudocode": "in internal/identity/login_test.go, a table over the prior state {user bob with e-mail 'a@x'; an org named 'alice' with slug 'other'; users alice, alice-2 … alice-10; orgs with slugs alice, alice-1 … alice-10 and other names}: before = counts of users, orgs, memberships, keys and of keys with revoked_at set; r = post('/api/v1/auth/callback', {provider: 'github', code: 'c', redirect_uri: 'http://127.0.0.1:5000/callback'}); assert r.status == 409; assert r.json.error.error_type == 'conflict'; assert counts == before"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Later logins and the API key",
+      "rationale": "A login is the one place an API key is born, and each login leaves the person with exactly one live key.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "POST /auth/callback has read an identity whose provider and provider_id match an existing user whose status is active",
+          "action": "refresh that user's email and username from the provider, keep the user's id, role, full_name and personal org as they are, and answer the user and a new key",
+          "contract": "HTTP 200 with user.id unchanged, user.email and user.username as the provider now gives them and user.updated_at at the time of the login; no org or membership is created and the personal org keeps its name and slug",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a test hub: the request pipeline of internal/server with the authenticator and routes of internal/identity installed, over a store opened in t.TempDir()",
+              "the callback's provider client is replaced by a stub that returns the identity, or the error, the test sets; github is configured",
+              "the callback's clock is fixed at T0",
+              "user alice exists from an earlier login (provider github, provider_id '123', e-mail 'a@x', role admin, full_name 'Custom') with her personal org",
+              "the stub returns {provider: 'github', provider_id: '123', username: 'alicia', full_name: 'Other', email: 'new@x'}"
+            ],
+            "pseudocode": "in internal/identity/login_test.go: r = post('/api/v1/auth/callback', {provider: 'github', code: 'c', redirect_uri: 'http://127.0.0.1:5000/callback'}); assert r.status == 200; u = r.json.user; assert u.id == alice.id and u.username == 'alicia' and u.email == 'new@x' and u.role == 'admin' and u.full_name == 'Custom' and u.created_at == alice.created_at and u.updated_at == format(T0); assert count(users) == 1 and count(orgs) == 1 and count(memberships) == 1; assert the org's name == 'alice' and slug == 'alice'"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "optional",
+          "condition": "the username the provider now gives an existing user is the username of another user",
+          "action": "keep the user's old username and complete the login",
+          "contract": "HTTP 200 with user.username == the old username; user.email is refreshed",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a test hub: the request pipeline of internal/server with the authenticator and routes of internal/identity installed, over a store opened in t.TempDir()",
+              "the callback's provider client is replaced by a stub that returns the identity, or the error, the test sets; github is configured",
+              "the callback's clock is fixed at T0",
+              "users alice (github, '123') and bob exist",
+              "the stub returns {provider: 'github', provider_id: '123', username: 'bob', email: 'new@x'}"
+            ],
+            "pseudocode": "in internal/identity/login_test.go: r = post('/api/v1/auth/callback', {provider: 'github', code: 'c', redirect_uri: 'http://127.0.0.1:5000/callback'}); assert r.status == 200; assert r.json.user.username == 'alice'; assert r.json.user.email == 'new@x'; assert bob's stored username == 'bob'"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "unwanted",
+          "condition": "the identity matches an existing user whose status is blocked",
+          "action": "refuse the login and change nothing",
+          "contract": "HTTP 403 with error_type forbidden and message \"user is blocked\"; the user's email and username are not refreshed, no key of the user is revoked and no key is issued",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a test hub: the request pipeline of internal/server with the authenticator and routes of internal/identity installed, over a store opened in t.TempDir()",
+              "the callback's provider client is replaced by a stub that returns the identity, or the error, the test sets; github is configured",
+              "the callback's clock is fixed at T0",
+              "user alice (github, '123', e-mail 'a@x') is blocked and holds one API key k1 that is not revoked",
+              "the stub returns {provider: 'github', provider_id: '123', username: 'alicia', email: 'new@x'}"
+            ],
+            "pseudocode": "in internal/identity/login_test.go: r = post('/api/v1/auth/callback', {provider: 'github', code: 'c', redirect_uri: 'http://127.0.0.1:5000/callback'}); assert r.status == 403; assert r.json.error.error_type == 'forbidden'; assert r.json.error.message == 'user is blocked'; assert the stored alice has username 'alice', e-mail 'a@x' and her old updated_at; assert alice's keys == [k1] and k1.revoked_at == null"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "event_driven",
+          "condition": "a login completes for a new or an existing user",
+          "action": "revoke every live API key of that user and issue one new API key whose lifetime is the requested expires, 90 days when the body gives none",
+          "contract": "api_key.expires_at is the login time plus expires x 24 hours for expires 30, 60 and 90, and null for expires 0; every key the user held before has revoked_at set and is answered 401 \"credential revoked\"; a key that was already revoked keeps its revoked_at; the user's PATs and other users' keys still authenticate; the new key authenticates",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a test hub: the request pipeline of internal/server with the authenticator and routes of internal/identity installed, over a store opened in t.TempDir()",
+              "the callback's provider client is replaced by a stub that returns the identity, or the error, the test sets; github is configured",
+              "the callback's clock is fixed at T0",
+              "user alice (github, '123') holds two live API keys k1 and k2, one key k0 revoked a day ago and one live PAT; user bob holds a live API key",
+              "the stub returns alice's identity",
+              "a non-public test route GET /api/v1/test/whoami that answers 200 with the caller it was given"
+            ],
+            "pseudocode": "in internal/identity/login_test.go, a table over expires {absent -> T0 + 90 d, 90 -> T0 + 90 d, 60 -> T0 + 60 d, 30 -> T0 + 30 d, 0 -> null}: r = post('/api/v1/auth/callback', body with expires); assert r.status == 200; assert r.json.api_key.expires_at == want; then for the first row: assert message(get(whoami, k1)) == 'credential revoked' and message(get(whoami, k2)) == 'credential revoked'; assert k1.revoked_at == format(T0) and k0.revoked_at == its old value; assert get(whoami, alicePAT).status == 200; assert get(whoami, bobKey).status == 200; assert get(whoami, r.json.api_key.key).status == 200; assert count(alice's keys with revoked_at == null) == 1"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "unwanted",
+          "condition": "the e-mail the provider now gives an existing user belongs to another user",
+          "action": "refuse the login and change nothing",
+          "contract": "HTTP 409 with error_type conflict; the user's email and username are unchanged, the user's live keys stay live and no key is issued",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a test hub: the request pipeline of internal/server with the authenticator and routes of internal/identity installed, over a store opened in t.TempDir()",
+              "the callback's provider client is replaced by a stub that returns the identity, or the error, the test sets; github is configured",
+              "the callback's clock is fixed at T0",
+              "users alice (github, '123', e-mail 'a@x', one live key k1) and bob (e-mail 'b@x') exist",
+              "the stub returns {provider: 'github', provider_id: '123', username: 'alicia', email: 'b@x'}",
+              "a non-public test route GET /api/v1/test/whoami that answers 200 with the caller it was given"
+            ],
+            "pseudocode": "in internal/identity/login_test.go: r = post('/api/v1/auth/callback', {provider: 'github', code: 'c', redirect_uri: 'http://127.0.0.1:5000/callback'}); assert r.status == 409; assert r.json.error.error_type == 'conflict'; assert the stored alice has e-mail 'a@x' and username 'alice'; assert alice's keys == [k1] and k1.revoked_at == null; assert get(whoami, k1).status == 200"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "Callback validation and provider failures",
+      "rationale": "The callback is a public route that spends a client secret, so it refuses everything it can before it calls the provider and says exactly which side failed afterwards.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "unwanted",
+          "condition": "the body of POST /auth/callback lacks provider, code or redirect_uri, has an empty code, names a provider that is not configured, or has an expires that is not one of the integers 0, 30, 60 and 90",
+          "action": "refuse the request without calling the provider",
+          "contract": "HTTP 400 with error_type invalid_request; the provider receives no request; no user, org, membership or key is created and no key is revoked",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a test hub: the request pipeline of internal/server with the authenticator and routes of internal/identity installed, over a store opened in t.TempDir()",
+              "a fake provider: an httptest server that answers the token URL and the user URL (and, for GitHub, the e-mail list URL) from a script the test sets, and records every request it receives",
+              "only github is configured, with token_url and userinfo_url pointing at the fake provider, which answers a complete identity"
+            ],
+            "pseudocode": "in internal/identity/login_test.go, a table over the bodies {no provider, no code, no redirect_uri, code '', provider 'gitlab', provider 'google' (supported, not configured), provider 7, expires 45, expires -1, expires '90', expires 1.5, expires null with every other member valid is accepted as absent}: r = post('/api/v1/auth/callback', body); for the refused rows: assert r.status == 400; assert r.json.error.error_type == 'invalid_request'; assert len(fake.requests) == 0; assert count(users) == 0 and count(keys) == 0; for the accepted row: assert r.status == 200"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "ubiquitous",
+          "action": "for any redirect_uri, accept it only when its scheme is http and its host is localhost or 127.0.0.1, with any port and path, or when its scheme, host and port equal those of [server].external_url",
+          "contract": "an accepted redirect_uri is passed unchanged to the provider's token URL; a refused one is answered HTTP 400 with error_type invalid_request before any call to the provider",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a test hub: the request pipeline of internal/server with the authenticator and routes of internal/identity installed, over a store opened in t.TempDir()",
+              "a fake provider: an httptest server that answers the token URL and the user URL (and, for GitHub, the e-mail list URL) from a script the test sets, and records every request it receives",
+              "github is configured against the fake provider, which answers a new identity for every code"
+            ],
+            "pseudocode": "in internal/identity/login_test.go, a table with external_url 'https://hub.example.com': accepted {'http://127.0.0.1:5000/callback', 'http://localhost:8123/x/y', 'http://localhost/callback', 'https://hub.example.com/cli/done', 'https://hub.example.com:443/x'}; refused {'https://127.0.0.1:5000/callback', 'https://localhost/x', 'http://hub.example.com/x', 'https://hub.example.com:8443/x', 'https://evil.example/x', 'http://127.0.0.1.evil.example/x', 'http://localhost@evil.example/x', 'http://[::1]:5000/callback', 'callback', '', '://'}; and with external_url '': 'https://hub.example.com/x' is refused and 'http://127.0.0.1:1/c' is accepted; for each: r = post('/api/v1/auth/callback', {provider: 'github', code: 'c', redirect_uri: uri}); accepted: assert r.status == 200 and fake.requests[0].form.redirect_uri == uri; refused: assert r.status == 400 and r.json.error.error_type == 'invalid_request' and len(fake.requests) == 0"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "unwanted",
+          "condition": "the redirect_uri of POST /auth/callback is not an allowed one",
+          "action": "refuse the request without calling the provider",
+          "contract": "HTTP 400 with error_type invalid_request; the provider receives no request and nothing is changed",
+          "check": {
+            "same_as": "REQ-7.2"
+          }
+        },
+        {
+          "id": "REQ-7.4",
+          "pattern": "unwanted",
+          "condition": "the provider rejects the code of POST /auth/callback",
+          "action": "refuse the login and change nothing",
+          "contract": "HTTP 401 with error_type unauthenticated; no user, org, membership or key is created and no key is revoked",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a test hub: the request pipeline of internal/server with the authenticator and routes of internal/identity installed, over a store opened in t.TempDir()",
+              "a fake provider: an httptest server that answers the token URL and the user URL (and, for GitHub, the e-mail list URL) from a script the test sets, and records every request it receives",
+              "github is configured against the fake provider, which answers the token URL with 200 {error: 'bad_verification_code'}",
+              "user alice exists with one live key k1"
+            ],
+            "pseudocode": "in internal/identity/login_test.go: r = post('/api/v1/auth/callback', {provider: 'github', code: 'c', redirect_uri: 'http://127.0.0.1:5000/callback'}); assert r.status == 401; assert r.json.error.error_type == 'unauthenticated'; assert count(users) == 1 and alice's key k1 has revoked_at == null"
+          }
+        },
+        {
+          "id": "REQ-7.5",
+          "pattern": "unwanted",
+          "condition": "the provider fails or does not answer in time during POST /auth/callback, or returns an identity without a user id or a verified e-mail",
+          "action": "refuse the login, change nothing, and keep the code, the client secret, the access token and the provider's response body out of the answer",
+          "contract": "HTTP 502 with error_type upstream_error and a fixed message; no user, org, membership or key is created and no key is revoked",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a test hub: the request pipeline of internal/server with the authenticator and routes of internal/identity installed, over a store opened in t.TempDir()",
+              "a fake provider: an httptest server that answers the token URL and the user URL (and, for GitHub, the e-mail list URL) from a script the test sets, and records every request it receives",
+              "github is configured with client_secret gh-secret against the fake provider, whose access token is at-1",
+              "user alice exists with one live key k1"
+            ],
+            "pseudocode": "in internal/identity/login_test.go, a table over the fake's behaviour {token URL 503 with body 'boom-body', token URL slower than the provider timeout (set to 50 ms), user URL 500, user without id, google-style unverified e-mail, github hidden e-mail with no primary verified entry}: r = post('/api/v1/auth/callback', {provider: 'github', code: 'code-1', redirect_uri: 'http://127.0.0.1:5000/callback'}); assert r.status == 502; assert r.json.error.error_type == 'upstream_error'; for each of 'code-1', 'gh-secret', 'at-1', 'boom-body': assert not contains(r.body, it); assert count(users) == 1 and alice's key k1 has revoked_at == null"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "Saved login and the hub URL",
+      "rationale": "Later commands just work only if the login leaves the hub URL and the credential in one private file.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "a login succeeds and no config file exists",
+          "action": "create the config directory with mode 0700 and the file config.toml in it with mode 0600, holding endpoint_url, api_key and user_id",
+          "contract": "the file is $PARLEY_CONFIG_DIR/config.toml when PARLEY_CONFIG_DIR is set and non-empty, otherwise ~/.parley/config.toml; it parses as TOML with endpoint_url == the resolved hub URL without trailing slashes, api_key == the stored credential and user_id == the id of the returned User",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub: an httptest server that answers /api/v1/auth/providers, /api/v1/auth/callback and /api/v1/user from a script the test sets, and records every request",
+              "the stub answers GET /api/v1/user with 200 and a User whose id is 'u-1'"
+            ],
+            "pseudocode": "in internal/cli/config_test.go, a table over {PARLEY_CONFIG_DIR = tmp + '/cfg', PARLEY_CONFIG_DIR = '' with HOME = tmp}: code = cli.Run(ctx, ['login', '--api-key', 'parley_' + key, '--endpoint-url', stub.url + '/'], stdout, stderr); assert code == 0; path = tmp + '/cfg/config.toml' or tmp + '/.parley/config.toml'; assert mode(dir(path)) == 0700; assert mode(path) == 0600; assert toml(path) == {endpoint_url: stub.url, api_key: 'parley_' + key, user_id: 'u-1'}"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "event_driven",
+          "condition": "a login succeeds and the config file exists",
+          "action": "replace the file atomically, set endpoint_url, api_key and user_id, keep every other key the file held, and leave the file with mode 0600",
+          "contract": "after the login the file has mode 0600, the three keys carry the new values, keys the CLI does not know are still present with their values, and the directory holds no other file",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub: an httptest server that answers /api/v1/auth/providers, /api/v1/auth/callback and /api/v1/user from a script the test sets, and records every request",
+              "config.toml exists with mode 0644 and the content: endpoint_url = \"http://old\", api_key = \"old\", theme = \"dark\", and a table [editor] with tab = 4"
+            ],
+            "pseudocode": "in internal/cli/config_test.go: code = cli.Run(ctx, ['login', '--api-key', newKey, '--endpoint-url', stub.url], stdout, stderr); assert code == 0; assert mode(path) == 0600; t = toml(path); assert t.endpoint_url == stub.url and t.api_key == newKey and t.user_id == 'u-1'; assert t.theme == 'dark' and t.editor.tab == 4; assert list(dir(path)) == ['config.toml']"
+          }
+        },
+        {
+          "id": "REQ-8.3",
+          "pattern": "unwanted",
+          "condition": "parley login starts and the config file exists and is not valid TOML",
+          "action": "fail before sending any request and leave the file as it is",
+          "contract": "exit status 2; stderr carries the error envelope with code 0 and error_type client_error; stdout is empty; the hub receives no request; the file's bytes are unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub: an httptest server that answers /api/v1/auth/providers, /api/v1/auth/callback and /api/v1/user from a script the test sets, and records every request",
+              "config.toml exists with the content 'not = [toml'"
+            ],
+            "pseudocode": "in internal/cli/config_test.go, a table over the flows {['login', '--api-key', key, '--endpoint-url', stub.url], ['login', '--endpoint-url', stub.url]}: code = cli.Run(ctx, args, stdout, stderr); assert code == 2; e = json(stderr).error; assert e.code == 0 and e.error_type == 'client_error'; assert stdout == ''; assert len(stub.requests) == 0; assert read(path) == 'not = [toml'"
+          }
+        },
+        {
+          "id": "REQ-8.4",
+          "pattern": "unwanted",
+          "condition": "the hub has accepted the login and the config file cannot be written",
+          "action": "fail and say on stderr that the credential was accepted and not saved",
+          "contract": "exit status 2; stderr carries the error envelope with code 0 and error_type client_error; stdout is empty; no partly written file is left in the config directory",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub: an httptest server that answers /api/v1/auth/providers, /api/v1/auth/callback and /api/v1/user from a script the test sets, and records every request",
+              "the config directory exists with mode 0500 and is empty (the test is skipped when run as root)"
+            ],
+            "pseudocode": "in internal/cli/config_test.go: code = cli.Run(ctx, ['login', '--api-key', key, '--endpoint-url', stub.url], stdout, stderr); assert code == 2; e = json(stderr).error; assert e.code == 0 and e.error_type == 'client_error' and contains(e.message, 'not saved'); assert stdout == ''; assert list(config dir) == []"
+          }
+        },
+        {
+          "id": "REQ-8.5",
+          "pattern": "ubiquitous",
+          "action": "for any parley login, take the hub URL from the first non-empty value of the flag --endpoint-url, the environment variable PARLEY_ENDPOINT_URL and the config file key endpoint_url",
+          "contract": "the login's requests go to <that URL without trailing slashes>/api/v1/…",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "three stub hubs that each answer GET /api/v1/user with 200 and a User"
+            ],
+            "pseudocode": "in internal/cli/login_test.go, a table over {flag A, env B, file C -> A; no flag, env B, file C -> B; no flag, env '', file C -> C; flag A + '///' -> A}, where A, B and C are three stub hubs: code = cli.Run(ctx, ['login', '--api-key', key] + flag, stdout, stderr); assert code == 0; assert only the wanted stub received a request and its path was '/api/v1/user'"
+          }
+        },
+        {
+          "id": "REQ-8.6",
+          "pattern": "unwanted",
+          "condition": "parley login finds no hub URL in the flag, the environment variable or the config file",
+          "action": "fail before sending any request",
+          "contract": "exit status 2; stderr carries the error envelope with code 0, error_type client_error and a message that names --endpoint-url, PARLEY_ENDPOINT_URL and endpoint_url; stdout is empty; no config file is created",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir() that does not exist yet; PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset"
+            ],
+            "pseudocode": "in internal/cli/login_test.go, a table over {['login'], ['login', '--api-key', key]}: code = cli.Run(ctx, args, stdout, stderr); assert code == 2; e = json(stderr).error; assert e.code == 0 and e.error_type == 'client_error'; for each of '--endpoint-url', 'PARLEY_ENDPOINT_URL', 'endpoint_url': assert contains(e.message, it); assert stdout == ''; assert not exists(config dir)"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-9",
+      "title": "Login with a credential in hand",
+      "rationale": "An agent or a CI job that already holds a credential stores it without a browser.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-9.1",
+          "pattern": "event_driven",
+          "condition": "a developer runs parley login --api-key <credential> and a hub URL resolves",
+          "action": "send GET /user with the credential as the Bearer credential and, when the hub answers 200, save the hub URL, the credential and the user's id, print the User on stdout and \"Logged in as <username>\" on stderr",
+          "contract": "exit status 0; stdout is one JSON document, the User the hub returned, indented by 2 spaces and followed by a newline; stderr contains the line \"Logged in as <username>\"; the only request the hub receives is GET /api/v1/user with Authorization: Bearer <credential>, so no key is created or revoked; --provider and --expires have no effect",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub: an httptest server that answers /api/v1/auth/providers, /api/v1/auth/callback and /api/v1/user from a script the test sets, and records every request",
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir() that does not exist yet; PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset",
+              "the stub answers GET /api/v1/user with 200 and a User with username 'alice'"
+            ],
+            "pseudocode": "in internal/cli/login_test.go, a table over the credentials {an API key, a PAT} and the extra flags {none, ['--provider', 'google', '--expires', '30']}: code = cli.Run(ctx, ['login', '--api-key', cred, '--endpoint-url', stub.url] + extra, stdout, stderr); assert code == 0; assert stdout == json.indent(user, 2 spaces) + '\\n'; assert contains(stderr, 'Logged in as alice'); assert len(stub.requests) == 1; q = stub.requests[0]; assert q.method == 'GET' and q.path == '/api/v1/user' and q.header['Authorization'] == 'Bearer ' + cred; assert toml(config file).api_key == cred"
+          }
+        },
+        {
+          "id": "REQ-9.2",
+          "pattern": "optional",
+          "condition": "the value of --api-key is -",
+          "action": "read the credential from stdin, without its surrounding white space, and proceed as with a credential given on the command line",
+          "contract": "the hub receives Authorization: Bearer <the line read from stdin>; the saved api_key is that credential",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub: an httptest server that answers /api/v1/auth/providers, /api/v1/auth/callback and /api/v1/user from a script the test sets, and records every request",
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir() that does not exist yet; PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset"
+            ],
+            "pseudocode": "in internal/cli/login_test.go, a table over stdin {cred + '\\n', cred, '  ' + cred + '\\r\\n'}: code = run ['login', '--api-key', '-', '--endpoint-url', stub.url] with that stdin; assert code == 0; assert stub.requests[0].header['Authorization'] == 'Bearer ' + cred; assert toml(config file).api_key == cred"
+          }
+        },
+        {
+          "id": "REQ-9.3",
+          "pattern": "unwanted",
+          "condition": "the hub answers the GET /user of a key-flow login with an error",
+          "action": "print the hub's error as received and save nothing",
+          "contract": "exit status 1; stderr carries the hub's error envelope with its code, message and error_type unchanged; stdout is empty; the config file is not created, and an existing one keeps its bytes",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub: an httptest server that answers /api/v1/auth/providers, /api/v1/auth/callback and /api/v1/user from a script the test sets, and records every request",
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir() that does not exist yet; PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset"
+            ],
+            "pseudocode": "in internal/cli/login_test.go, a table over the stub's answers {401 unauthenticated 'invalid credentials', 403 forbidden 'this route needs a user' (the admin token), 403 insufficient_scope (a PAT without users:read)} x {no config file, an existing config file}: code = cli.Run(ctx, ['login', '--api-key', cred, '--endpoint-url', stub.url], stdout, stderr); assert code == 1; assert json(stderr) == the envelope the stub sent; assert stdout == ''; assert the config file is absent, or its bytes equal the bytes before"
+          }
+        },
+        {
+          "id": "REQ-9.4",
+          "pattern": "unwanted",
+          "condition": "a key-flow login cannot get an answer it can read: the hub cannot be reached, the answer is not a JSON object, or the credential given is empty",
+          "action": "fail on the client side and save nothing",
+          "contract": "exit status 2; stderr carries the error envelope with code 0 and error_type client_error for an unreachable hub or an undecodable answer, usage_error for an empty credential (in which case the hub receives no request); stdout is empty; no config file is created",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub: an httptest server that answers /api/v1/auth/providers, /api/v1/auth/callback and /api/v1/user from a script the test sets, and records every request",
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir() that does not exist yet; PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset"
+            ],
+            "pseudocode": "in internal/cli/login_test.go, a table over {endpoint 'http://127.0.0.1:1' -> client_error, stub answers 200 'hello' -> client_error, ['--api-key', ''] -> usage_error, ['--api-key', '-'] with empty stdin -> usage_error}: code = run; assert code == 2; e = json(stderr).error; assert e.code == 0 and e.error_type == want; assert stdout == ''; assert not exists(config dir); for the usage_error rows: assert len(stub.requests) == 0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-10",
+      "title": "Login through the browser",
+      "rationale": "A person signs in where their identity already lives, and the CLI never sees a password.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-10.1",
+          "pattern": "event_driven",
+          "condition": "a developer runs parley login without --api-key and a hub URL resolves",
+          "action": "fetch GET /auth/providers without a credential, pick the provider named by --provider (github when the flag is absent), listen on 127.0.0.1 on a free port, and open in the browser the provider's authorize_url with redirect_uri=http://127.0.0.1:<port>/callback and a random state added as query parameters",
+          "contract": "the opener is called once with a URL that keeps the authorize_url's own parameters and adds redirect_uri (http://127.0.0.1:<port>/callback, where <port> accepts a TCP connection) and state (32 hexadecimal characters, different on every run); the providers request carries no Authorization header",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub: an httptest server that answers /api/v1/auth/providers, /api/v1/auth/callback and /api/v1/user from a script the test sets, and records every request",
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir() that does not exist yet; PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset",
+              "the stub lists github with authorize_url 'https://idp.example/authorize?client_id=gh-id&scope=user%3Aemail' and answers POST /api/v1/auth/callback with 200 {user: {id: 'u-1', username: 'alice', …}, api_key: {key: K, key_id, expires_at}}",
+              "the login command is built with a browser opener the test supplies, which records the URL and then plays the browser: it sends the GET the test scripts to the URL's redirect_uri",
+              "the opener answers the redirect with the code 'c1' and the state it was given"
+            ],
+            "pseudocode": "in internal/cli/login_test.go: run ['login', '--endpoint-url', stub.url] twice; for each: u = parse(opener.url); assert u.host == 'idp.example' and u.query.client_id == 'gh-id' and u.query.scope == 'user:email'; assert u.query.redirect_uri matches ^http://127\\.0\\.0\\.1:[0-9]+/callback$; assert u.query.state matches ^[0-9a-f]{32}$; assert stub.requests[0].path == '/api/v1/auth/providers' and 'Authorization' not in stub.requests[0].header; assert state(run 1) != state(run 2); and with the stub listing github and google and ['--provider', 'google']: assert host(opener.url) == host of google's authorize_url"
+          }
+        },
+        {
+          "id": "REQ-10.2",
+          "pattern": "unwanted",
+          "condition": "no browser can be opened",
+          "action": "print the authorize URL on stderr and keep waiting for the redirect",
+          "contract": "stderr contains the complete URL with its redirect_uri and state; a redirect that arrives afterwards completes the login with exit status 0",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub: an httptest server that answers /api/v1/auth/providers, /api/v1/auth/callback and /api/v1/user from a script the test sets, and records every request",
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir() that does not exist yet; PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset",
+              "the stub lists github with authorize_url 'https://idp.example/authorize?client_id=gh-id&scope=user%3Aemail' and answers POST /api/v1/auth/callback with 200 {user: {id: 'u-1', username: 'alice', …}, api_key: {key: K, key_id, expires_at}}",
+              "the browser opener returns an error"
+            ],
+            "pseudocode": "in internal/cli/login_test.go: start run ['login', '--endpoint-url', stub.url] in a goroutine; url = wait for a line of stderr that contains 'https://idp.example/authorize'; q = parse(url).query; get(q.redirect_uri + '?code=c1&state=' + q.state); assert run returned 0; assert toml(config file).api_key == K"
+          }
+        },
+        {
+          "id": "REQ-10.3",
+          "pattern": "event_driven",
+          "condition": "the redirect arrives at /callback on the CLI's listener with a code and the state the CLI sent",
+          "action": "show a success page in the browser, send POST /auth/callback with the provider, the code, the redirect_uri it gave the provider and the --expires value, save the hub URL, the returned key and the user's id, print the User on stdout and \"Logged in as <username>\" on stderr",
+          "contract": "exit status 0; the hub receives POST /api/v1/auth/callback with the JSON body {provider, code, redirect_uri, expires} (expires 90 without the flag) and no Authorization header; the browser's GET is answered 200 with an HTML page; stdout is the user object alone, indented by 2 spaces, and does not contain the key; the config file holds api_key == api_key.key and user_id == user.id; the listener's port no longer accepts connections",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub: an httptest server that answers /api/v1/auth/providers, /api/v1/auth/callback and /api/v1/user from a script the test sets, and records every request",
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir() that does not exist yet; PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset",
+              "the stub lists github with authorize_url 'https://idp.example/authorize?client_id=gh-id&scope=user%3Aemail' and answers POST /api/v1/auth/callback with 200 {user: {id: 'u-1', username: 'alice', …}, api_key: {key: K, key_id, expires_at}}",
+              "the login command is built with a browser opener the test supplies, which records the URL and then plays the browser: it sends the GET the test scripts to the URL's redirect_uri",
+              "the opener answers the redirect with the code 'c1' and the state it was given"
+            ],
+            "pseudocode": "in internal/cli/login_test.go, a table over the flags {none -> expires 90, ['--expires', '30'] -> 30, ['--expires', '0'] -> 0}: code = cli.Run(ctx, ['login', '--endpoint-url', stub.url] + flags, stdout, stderr); assert code == 0; b = json(stub.requests[1].body); assert stub.requests[1].path == '/api/v1/auth/callback' and b == {provider: 'github', code: 'c1', redirect_uri: the redirect_uri in opener.url, expires: want} and 'Authorization' not in stub.requests[1].header; assert opener.response.status == 200 and opener.response.contentType starts with 'text/html'; assert stdout == json.indent(user, 2 spaces) + '\\n' and not contains(stdout, K); assert contains(stderr, 'Logged in as alice'); assert toml(config file) == {endpoint_url: stub.url, api_key: K, user_id: 'u-1'}; assert net.Dial('tcp', host of redirect_uri) fails"
+          }
+        },
+        {
+          "id": "REQ-10.4",
+          "pattern": "unwanted",
+          "condition": "the redirect arrives with a state other than the one the CLI sent, with an error parameter, or without a code",
+          "action": "fail the login, show a failure page in the browser, and neither call the hub's callback nor save anything",
+          "contract": "exit status 2; stderr carries the error envelope with code 0 and error_type client_error; the browser's GET is answered 400 with an HTML page; the hub receives no POST /auth/callback; stdout is empty; no config file is created",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub: an httptest server that answers /api/v1/auth/providers, /api/v1/auth/callback and /api/v1/user from a script the test sets, and records every request",
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir() that does not exist yet; PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset",
+              "the stub lists github with authorize_url 'https://idp.example/authorize?client_id=gh-id&scope=user%3Aemail' and answers POST /api/v1/auth/callback with 200 {user: {id: 'u-1', username: 'alice', …}, api_key: {key: K, key_id, expires_at}}",
+              "the login command is built with a browser opener the test supplies, which records the URL and then plays the browser: it sends the GET the test scripts to the URL's redirect_uri"
+            ],
+            "pseudocode": "in internal/cli/login_test.go, a table over the redirect query {'code=c1&state=wrong', 'code=c1', 'error=access_denied&state=' + state, 'state=' + state}: code = cli.Run(ctx, ['login', '--endpoint-url', stub.url], stdout, stderr); assert code == 2; e = json(stderr).error; assert e.code == 0 and e.error_type == 'client_error'; assert opener.response.status == 400 and opener.response.contentType starts with 'text/html'; assert no stub request has path '/api/v1/auth/callback'; assert stdout == ''; assert not exists(config dir)"
+          }
+        },
+        {
+          "id": "REQ-10.5",
+          "pattern": "unwanted",
+          "condition": "no redirect has arrived 120 seconds after the browser was opened",
+          "action": "stop listening and fail the login",
+          "contract": "exit status 2; stderr carries the error envelope with code 0 and error_type client_error; the listener's port no longer accepts connections; the hub receives no POST /auth/callback; no config file is created",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub: an httptest server that answers /api/v1/auth/providers, /api/v1/auth/callback and /api/v1/user from a script the test sets, and records every request",
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir() that does not exist yet; PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset",
+              "the stub lists github with authorize_url 'https://idp.example/authorize?client_id=gh-id&scope=user%3Aemail' and answers POST /api/v1/auth/callback with 200 {user: {id: 'u-1', username: 'alice', …}, api_key: {key: K, key_id, expires_at}}",
+              "the login command is built with a wait of 100 ms in place of the default 120 s and an opener that records the URL and sends nothing"
+            ],
+            "pseudocode": "in internal/cli/login_test.go: start = now; code = cli.Run(ctx, ['login', '--endpoint-url', stub.url], stdout, stderr); assert code == 2; assert now - start < 2 s; e = json(stderr).error; assert e.code == 0 and e.error_type == 'client_error'; assert net.Dial('tcp', host of the redirect_uri in opener.url) fails; assert no stub request has path '/api/v1/auth/callback'; assert not exists(config dir)"
+          }
+        },
+        {
+          "id": "REQ-10.6",
+          "pattern": "unwanted",
+          "condition": "the hub answers GET /auth/providers or POST /auth/callback of a browser login with an error",
+          "action": "print the hub's error as received and save nothing",
+          "contract": "exit status 1; stderr carries the hub's error envelope with its code, message and error_type unchanged; stdout is empty; no config file is created",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub: an httptest server that answers /api/v1/auth/providers, /api/v1/auth/callback and /api/v1/user from a script the test sets, and records every request",
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir() that does not exist yet; PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset",
+              "the stub lists github with authorize_url 'https://idp.example/authorize?client_id=gh-id&scope=user%3Aemail' and answers POST /api/v1/auth/callback with 200 {user: {id: 'u-1', username: 'alice', …}, api_key: {key: K, key_id, expires_at}}",
+              "the login command is built with a browser opener the test supplies, which records the URL and then plays the browser: it sends the GET the test scripts to the URL's redirect_uri",
+              "the opener answers the redirect with the code 'c1' and the state it was given"
+            ],
+            "pseudocode": "in internal/cli/login_test.go, a table over the stub's answers {providers 429 rate_limited; callback 400 invalid_request; callback 401 unauthenticated; callback 403 forbidden 'user is blocked'; callback 409 conflict; callback 502 upstream_error}: code = cli.Run(ctx, ['login', '--endpoint-url', stub.url], stdout, stderr); assert code == 1; assert the last JSON document on stderr == the envelope the stub sent; assert stdout == ''; assert not exists(config dir); for the providers row: assert opener.calls == 0"
+          }
+        },
+        {
+          "id": "REQ-10.7",
+          "pattern": "unwanted",
+          "condition": "a browser login cannot start: the hub cannot be reached, its provider list is not a readable answer, the list does not hold the provider named by --provider, or --expires is not one of 0, 30, 60 and 90",
+          "action": "fail before opening the browser",
+          "contract": "exit status 2; stderr carries the error envelope with code 0 and error_type usage_error for a bad --expires (in which case the hub receives no request) and client_error otherwise; for a provider the hub does not list, the message names the providers it does list; the opener is not called; no config file is created",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub: an httptest server that answers /api/v1/auth/providers, /api/v1/auth/callback and /api/v1/user from a script the test sets, and records every request",
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir() that does not exist yet; PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset",
+              "the login command is built with an opener that counts its calls"
+            ],
+            "pseudocode": "in internal/cli/login_test.go, a table over {endpoint 'http://127.0.0.1:1' -> client_error; stub answers providers with 200 'hello' -> client_error; ['--provider', 'google'] with only github listed -> client_error and contains(message, 'github'); stub lists no provider -> client_error; ['--expires', '45'] -> usage_error; ['--expires', 'x'] -> usage_error}: code = run; assert code == 2; e = json(stderr).error; assert e.code == 0 and e.error_type == want; assert opener.calls == 0; assert stdout == ''; assert not exists(config dir); for the usage_error rows: assert len(stub.requests) == 0"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "A developer signs in for the first time and the saved key works",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "runs parley login --endpoint-url with the hub's URL"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "fetches GET /api/v1/auth/providers, listens on a loopback port and opens the provider's authorize URL with its redirect_uri and a random state"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers the provider list with the authorize URL built from the configured client id"
+        },
+        {
+          "actor": "developer",
+          "action": "approves the sign-in at the provider, whose redirect brings the browser to the CLI's listener with a code and the state"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "checks the state and sends POST /api/v1/auth/callback with the provider, the code and the redirect_uri"
+        },
+        {
+          "actor": "parleyd",
+          "action": "validates the redirect_uri, exchanges the code with the provider and reads the identity"
+        },
+        {
+          "actor": "parleyd",
+          "action": "creates the user, the personal org, the membership and an API key in one transaction and answers 200 with the user and the key"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "saves endpoint_url, api_key and user_id to config.toml with mode 0600, prints the user on stdout and exits 0"
+        },
+        {
+          "actor": "developer",
+          "action": "sends a request to a protected route with the saved key"
+        },
+        {
+          "actor": "parleyd",
+          "action": "matches the key's hash, finds the key live and its user active, and passes the request as that user"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parleyd through the Run function of internal/hub on a real TCP listener",
+          "the request pipeline of internal/server",
+          "internal/identity: routes, OAuth client over real HTTP, sign-in transaction, authenticator",
+          "internal/store on a real database file",
+          "internal/config reading a real config.toml",
+          "internal/cli login with its real HTTP client, redirect listener and config file"
+        ],
+        "setup": [
+          "parleyd started in-process through the Run function of internal/hub on 127.0.0.1:0 with a data directory and a config.toml under t.TempDir()",
+          "a fake GitHub: an httptest server with an authorize page that redirects to the given redirect_uri with a fresh code and the given state, a token URL that turns that code into an access token once, and a user URL; config.toml has one [[oauth.providers]] entry github whose authorize_url, token_url and userinfo_url point at it",
+          "the hub is started with one extra non-public test route GET /api/v1/test/whoami that answers the caller",
+          "the login command's browser opener is replaced by a function that sends a GET to the URL and follows redirects, as a browser does",
+          "PARLEY_CONFIG_DIR is a directory under t.TempDir()",
+          "the fake GitHub's user is {id: 123, login: 'Alice.Smith', name: 'Alice Smith', email: 'a@x'}"
+        ],
+        "end_state": [
+          "parley login exited 0 and printed a User with username Alice.Smith and status active",
+          "config.toml exists with mode 0600 and holds the hub's URL, a key of the form parley_<8>_<32> and the user's id",
+          "the store holds one user, one org with slug alice-smith owned by that user, and one membership",
+          "GET /api/v1/test/whoami with the saved key answers 200 with type api_key and that user's id",
+          "the same request without an Authorization header answers 401 authentication required"
+        ],
+        "pseudocode": "in test/e2e/login_test.go: code = cli.Run(ctx, ['login', '--endpoint-url', hubURL], stdout, stderr); assert code == 0; u = json(stdout); assert u.username == 'Alice.Smith' and u.status == 'active'; cfg = toml(configDir + '/config.toml'); assert mode(configDir + '/config.toml') == 0600; assert cfg.endpoint_url == hubURL and cfg.user_id == u.id and cfg.api_key matches ^parley_[0-9A-Za-z]{8}_[0-9A-Za-z]{32}$; w = get(hubURL + '/api/v1/test/whoami', 'Bearer ' + cfg.api_key); assert w.status == 200 and w.json.type == 'api_key' and w.json.user.id == u.id; assert get(hubURL + '/api/v1/test/whoami').status == 401; assert the store's only org has slug 'alice-smith' and owner_id == u.id"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "A second login replaces the developer's key",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "runs parley login on a second machine, with another config directory, and approves at the provider"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends POST /api/v1/auth/callback with the new code"
+        },
+        {
+          "actor": "parleyd",
+          "action": "finds the user by provider and provider id, refreshes the e-mail and username, revokes the first key and issues a second one"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "saves the second key on the second machine and prints the same user"
+        },
+        {
+          "actor": "developer",
+          "action": "sends a request with the first key from the first machine"
+        },
+        {
+          "actor": "parleyd",
+          "action": "matches the first key's secret, finds it revoked and answers 401 with the message credential revoked"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parleyd through the Run function of internal/hub on a real TCP listener",
+          "internal/identity: routes, OAuth client, sign-in transaction, authenticator",
+          "internal/store on a real database file",
+          "internal/cli login with its real HTTP client and config file"
+        ],
+        "setup": [
+          "parleyd started in-process through the Run function of internal/hub on 127.0.0.1:0 with a data directory and a config.toml under t.TempDir()",
+          "a fake GitHub: an httptest server with an authorize page that redirects to the given redirect_uri with a fresh code and the given state, a token URL that turns that code into an access token once, and a user URL; config.toml has one [[oauth.providers]] entry github whose authorize_url, token_url and userinfo_url point at it",
+          "the hub is started with one extra non-public test route GET /api/v1/test/whoami that answers the caller",
+          "the login command's browser opener is replaced by a function that sends a GET to the URL and follows redirects, as a browser does",
+          "PARLEY_CONFIG_DIR is a directory under t.TempDir()",
+          "a first parley login has completed with config directory A"
+        ],
+        "end_state": [
+          "both logins printed a User with the same id",
+          "the key in directory A is answered 401 with error_type unauthenticated and message credential revoked",
+          "the key in directory B is answered 200",
+          "the store holds one user, one org and two API keys, one of them revoked"
+        ],
+        "pseudocode": "in test/e2e/login_test.go: k1 = toml(A + '/config.toml').api_key; set PARLEY_CONFIG_DIR = B; code = cli.Run(ctx, ['login', '--endpoint-url', hubURL], stdout, stderr); assert code == 0; k2 = toml(B + '/config.toml').api_key; assert k2 != k1; assert json(stdout).id == toml(A + '/config.toml').user_id; r = get(hubURL + '/api/v1/test/whoami', 'Bearer ' + k1); assert r.status == 401 and r.json.error.message == 'credential revoked'; assert get(hubURL + '/api/v1/test/whoami', 'Bearer ' + k2).status == 200; assert count(users) == 1 and count(orgs) == 1"
+      }
+    },
+    {
+      "id": "PATH-3",
+      "title": "An operator calls the hub with the admin token",
+      "steps": [
+        {
+          "actor": "operator",
+          "action": "sends a request to a protected route with Authorization: Bearer and the admin token the bootstrap wrote"
+        },
+        {
+          "actor": "parleyd",
+          "action": "recognises the admin format, verifies the token against the stored hash and passes the request as the admin caller, with no user"
+        },
+        {
+          "actor": "operator",
+          "action": "sends the same request with one character of the token changed, and once more without the header"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers 401 invalid credentials to the changed token and 401 authentication required to the missing header"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parleyd through the Run function of internal/hub, including the admin-token bootstrap of package 03",
+          "the request pipeline of internal/server",
+          "the authenticator of internal/identity",
+          "internal/store on a real database file"
+        ],
+        "setup": [
+          "a data directory and config directory under t.TempDir(); parleyd is run once with --admin-email boss@x.io, the token is read from the admin_token file and the file is deleted",
+          "parleyd is then started in-process on 127.0.0.1:0 with one extra non-public test route GET /api/v1/test/whoami that answers the caller"
+        ],
+        "end_state": [
+          "the admin token is answered 200 with type admin, credential_id admin and no user",
+          "the changed token is answered 401 with message invalid credentials",
+          "the request without a header is answered 401 with message authentication required",
+          "the database file does not contain the admin token"
+        ],
+        "pseudocode": "in test/e2e/auth_test.go: r = get(hubURL + '/api/v1/test/whoami', 'Bearer ' + token); assert r.status == 200 and r.json.type == 'admin' and r.json.credential_id == 'admin' and r.json.user == null; bad = token with its last character replaced by another hexadecimal digit; r = get(…, 'Bearer ' + bad); assert r.status == 401 and r.json.error.message == 'invalid credentials'; r = get(…); assert r.status == 401 and r.json.error.message == 'authentication required'; assert not contains(bytes of the files in the data directory, token)"
+      }
+    }
+  ],
+  "external_apis": [
+    {
+      "package": "github.com/BurntSushi/toml",
+      "version": "v1.6.0",
+      "verified": true,
+      "symbols": [
+        {
+          "name": "Unmarshal",
+          "import_path": "github.com/BurntSushi/toml",
+          "signature": "func Unmarshal(data []byte, v any) error"
+        },
+        {
+          "name": "Marshal",
+          "import_path": "github.com/BurntSushi/toml",
+          "signature": "func Marshal(v any) ([]byte, error)"
+        }
+      ]
+    },
+    {
+      "package": "github.com/spf13/cobra",
+      "version": "v1.10.2",
+      "verified": false,
+      "symbols": [
+        {
+          "name": "Command.AddCommand",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) AddCommand(cmds ...*Command)"
+        },
+        {
+          "name": "Command.Flags",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) Flags() *pflag.FlagSet"
+        }
+      ]
+    }
+  ]
+}

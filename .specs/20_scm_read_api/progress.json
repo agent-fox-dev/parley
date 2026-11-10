@@ -1,0 +1,61 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/progress.v3.json",
+  "spec_id": "20",
+  "spec_name": "scm_read_api",
+  "schema_version": 3,
+  "updated_at": "",
+  "tasks": [
+    {
+      "id": 1,
+      "state": "pending"
+    },
+    {
+      "id": 2,
+      "state": "pending"
+    },
+    {
+      "id": 3,
+      "state": "pending"
+    },
+    {
+      "id": 4,
+      "state": "pending"
+    },
+    {
+      "id": 5,
+      "state": "pending"
+    },
+    {
+      "id": 6,
+      "state": "pending"
+    },
+    {
+      "id": 7,
+      "state": "pending"
+    },
+    {
+      "id": 8,
+      "state": "pending"
+    },
+    {
+      "id": 9,
+      "state": "pending"
+    },
+    {
+      "id": 10,
+      "state": "pending"
+    },
+    {
+      "id": 11,
+      "state": "pending"
+    },
+    {
+      "id": 12,
+      "state": "pending"
+    },
+    {
+      "id": 13,
+      "state": "pending"
+    }
+  ]
+}

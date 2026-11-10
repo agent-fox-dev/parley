@@ -1,0 +1,285 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "22",
+  "spec_name": "change_opening_and_versions",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/change/... ./internal/cli/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "09",
+      "reason": "builds its CLI commands on the client, output and exit-code helpers of the CLI foundation"
+    },
+    {
+      "spec": "12",
+      "reason": "registers a branch-move observer with its sync, through which a source branch moved by a sync gets its version of kind sync"
+    },
+    {
+      "spec": "18",
+      "reason": "registers its version-recording stage with the ref writer in internal/gitserver/pushrule, which runs it inside the commit step of every ref update, and writes version refs in the hub-owned refs/parley/* namespace"
+    },
+    {
+      "spec": "21",
+      "reason": "registers itself as the ChangeLinker that package declares in internal/scm for its commit, ref and rebase routes, and reuses the source control API's diff computation"
+    },
+    {
+      "spec": "52",
+      "reason": "emits its hub events through the event log component"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Open a change through the component, with defaults, version 1 and events",
+      "criteria": [
+        "REQ-3",
+        "REQ-9.8"
+      ],
+      "steps": [
+        "Add the behaviours of opening (defaults, version 1 and its ref, numbering, events, draft, collaborators, rollback) to internal/change/open_test.go with a shared test hub helper (migrated store in t.TempDir(), a bare repository made with git init, stub collaborators) and confirm they fail",
+        "Add the store migration for the change record: changes (every field of the change object, plus the abandon reason and a per-version patch id), versions, the per-change session list, landed-commit records and a per-workspace number counter; make (source workspace, source branch) unique among draft and open changes",
+        "Define the collaborator interfaces the component takes at construction, in internal/change/collaborators.go: workspace reader (status, kind, parent, default branch, fork base branch, purpose and session, changes.require_intent, integration branch); SessionLinker with two operations: a check (caller, session id, workspace -> accepted, refused or internal error; the name and check packages 19 and 21 also declare) and a record (the store transaction, session id, workspace, change number and version number; only this package declares it), both filled by package 49 with session.Check and session.Record, the record doing nothing while no linker is registered; event writer; StackLinker with two operations, LinkVersion (called at open and for every new version with the request's depends_on or none) and SetDependsOn (called by the PATCH of package 23 with a number or null), both implemented by package 24; landing evaluator; version observers; AutoLandGuard with its registration function RegisterAutoLandGuard (one operation, called with the store transaction, the caller with its credential type, id and paths, the change and the value before auto_land is stored; filled by package 29; default: accept); ForkActivity (record activity for a fork slug, filled by package 16). Give each optional one the default of the PRD's design decision 5",
+        "Implement Open(ctx, tx, input), whose input names the author and the creating credential (type and id), the version kind (ref, push, commit or, from package 29 only, revert) and an optional reverts (the number of the change being reverted, stored on the change): it runs entirely in the transaction it is given, never begins or commits one, and returns errors that carry an HTTP status and an error_type",
+        "Register POST /workspaces/:slug/changes with internal/server as a creating route (scope changes:write, need read on :slug) that opens a transaction, calls Open with kind 'ref' and commits, mapping a returned error to its status and error_type and an error without one to 500 internal; the route's authorization and body validation follow in the next task",
+        "Add the store-level moves of a change to state abandoned (with a reason) and to state landed, which later tasks expose as setters and the tests of this task use",
+        "Resolve the defaults: source workspace, title from the head commit subject (cut to 200 characters), intent from the commit body then the fork purpose (cut to 16,000), target branch, session from the trigger then the fork (dropped when the linker refuses it), auto_land false, labels without duplicates",
+        "Allocate the next number of the workspace from the counter so that a number is never given twice; compute base_sha as the merge base of head and target, stats, the touched paths (at most 2,000, with paths_truncated) and the stable patch id through internal/gitrepo",
+        "Record version 1 with the kind the trigger names ('ref' for the REST route, 'revert' for the revert of package 29) and write refs/parley/changes/<number>/1 in the target workspace's repository, first making the head commit present there when the source is a fork; when version 1 has a session, call the record operation of the session linker in the same transaction with the change's number and version 1, and return its error unchanged",
+        "Set state draft or open, mergeable unknown and landing (blocked/draft for a draft, else the evaluator's answer); when auto_land is true ask the AutoLandGuard, after version 1 is recorded and before the flag is stored, and return its refusal unchanged; store the flag through the one function SetAutoLand(tx, change, value, caller) of internal/change, which here stores the flag alone and which package 23 extends to store the setter (the caller's user, credential type and paths globs), so that the open and the PATCH write the flag through the same setter; call LinkVersion of the stack linker with the request's depends_on, then the evaluator, store its landing, and only then each observer with version 1 and its creating credential, so that an observer reads the new landing in the same transaction; return a collaborator's error unchanged; for a fork source call the fork activity recorder",
+        "Write parley.change.version, and parley.change.open unless draft, through the event writer in the same transaction, with the metadata of §7.8",
+        "Serialize the change object and the version object with every member, arrays never null, timestamps in whole seconds UTC"
+      ],
+      "touches": [
+        "internal/change/store.go",
+        "internal/change/change.go",
+        "internal/change/collaborators.go",
+        "internal/change/open.go",
+        "internal/change/open_test.go",
+        "internal/change/testhub_test.go",
+        "internal/gitrepo/"
+      ],
+      "done_when": [
+        "`go test ./internal/change/... -count=1` passes with a real SQLite file and a real git repository"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Authorize and validate opens on POST /workspaces/:slug/changes",
+      "criteria": [
+        "REQ-1",
+        "REQ-2"
+      ],
+      "steps": [
+        "Add the authorization and validation behaviours to internal/change/open_test.go (tables per refusal, the ordered chain, concurrency, nothing-written) and confirm they fail",
+        "Extend the POST /workspaces/:slug/changes route of the previous task with the checks below, in the position the check order of package 02 gives each (binding, scope, access, validation, state)",
+        "Implement Authorize: write access to the source workspace; a source that is unknown or invisible answers 400 source_not_related, one that is readable but not writable 403 forbidden; for a token bound to a fork on the fork's parent, require source.workspace_slug to be the bound fork, else 403 token_bound",
+        "Validate the body: source.branch present, member types, at most 20 labels each matching the label pattern, depends_on a positive integer (400 invalid_request); an explicit session_id through the session linker (400 unknown_session)",
+        "Apply the workspace status answers of WS-FR-007 to the target and the source workspace (409 workspace_busy, workspace_not_ready, workspace_archived)",
+        "Run the checks of CHG-FR-003 in order inside Open: target branch exists; not the integration branch (403 integration_branch); source related; source branch exists; not the same branch; at least one commit ahead (nothing_to_land); no merge commit ahead (merge_commits_unsupported); no draft or open change with this source (409 change_exists with details); title rules; intent length; intent_required unless draft or changes.require_intent is false",
+        "For a path-scoped token, compare the files of the resulting version against its base with the token's globs using the cover rule of internal/identity, after the chain, and refuse with 403 path_not_allowed",
+        "Make concurrent opens of one source safe: the uniqueness of the store decides, and the loser answers 409 change_exists, not 500",
+        "Confirm that every refusal leaves no row, no ref under refs/parley/changes and no event"
+      ],
+      "touches": [
+        "internal/change/routes.go",
+        "internal/change/authorize.go",
+        "internal/change/open.go",
+        "internal/change/open_test.go"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Record a version for every new head of a change's source branch",
+      "criteria": [
+        "REQ-4.1",
+        "REQ-4.2",
+        "REQ-4.3",
+        "REQ-4.4",
+        "REQ-4.5",
+        "REQ-4.6",
+        "REQ-4.7"
+      ],
+      "steps": [
+        "Add the version behaviours to internal/change/version_test.go and confirm they fail",
+        "Implement RecordVersion(ctx, tx, {workspace, branch, new head, kind, actor, creating credential (type and id) or none, session}) in the caller's transaction: find the draft or open change whose source is that branch; return no version and no error when there is none or the head equals the current version's head",
+        "Check a given session with the session linker and return the 400 unknown_session error before anything is written",
+        "Record the next version: kind, created_by ('system' actor type for the system actor), the creating credential as a stored column that the version object does not show, session, head, base (merge base with the target; the previous version's base when the target branch is missing), stats; write its version ref as in opening; when the version has a session, call the record operation of the session linker in the same transaction with the change's number and the version's number, and return its error unchanged",
+        "Compute the stable patch id of base..head and set patch_equivalent_to to the latest earlier version with the same id, else null",
+        "Update the change: version, head_sha, base_sha, stats, paths, session_id, the session list (each session once, in order of first contribution), updated_at, mergeable unknown",
+        "Derive landing: blocked/draft for a draft; blocked/target_not_found, blocked/nothing_to_land or blocked/merge_commits for those causes without calling the evaluator; else the evaluator's answer",
+        "Call LinkVersion of the stack linker, the landing derivation and the observers (each with the change, the version and its creating credential) in that order, with the derived landing stored before the first observer runs so that an observer reads the evaluation of the new version in the same transaction, then write parley.change.version with kind, base_sha, patch_equivalent_to and draft",
+        "Confirm that a rolled-back caller transaction leaves no version, no changed field and no event, and that version refs survive deletion and rewriting of the source branch"
+      ],
+      "touches": [
+        "internal/change/version.go",
+        "internal/change/version_test.go",
+        "internal/change/store.go",
+        "internal/gitrepo/"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Give other components lookups and setters on the change record",
+      "criteria": [
+        "REQ-9.1",
+        "REQ-9.2",
+        "REQ-9.3",
+        "REQ-9.4",
+        "REQ-9.5",
+        "REQ-9.6",
+        "REQ-9.7"
+      ],
+      "steps": [
+        "Add the lookup and setter behaviours to internal/change/lookup_test.go and confirm they fail",
+        "Implement the setters, each taking the caller's transaction: depends_on, the base of the current version (base_sha with stats, paths and patch id recomputed against it, for the stack linker of package 24 and the retarget of package 23), mergeable with its conflict report (cleared when not conflict), needs_restack with restack_reason, landing, landed with its landed-commit records and the move to state landed, reverts, reverted_by, and the move to state abandoned with a reason; each sets updated_at and returns the change-not-found error for an unknown change; the move to abandoned calls the fork activity recorder when the source workspace is a fork",
+        "Derive dependants at read time as the ascending numbers of the draft and open changes whose depends_on names the change",
+        "Implement ChangeOfCommit(workspace, sha): a change that landed the commit wins over one that has it as a version head; among several the lowest number; version is the highest version with that head, or for a landed commit the version it was landed from, or null",
+        "Implement OpenChangeOfBranch(workspace, branch): the draft or open change whose source is that branch, reported under its target workspace",
+        "Implement ChangesOfSession(session): every change, across workspaces, with a version of that session, ordered by workspace slug and number",
+        "Implement ChangeNumbersOfSource(workspace slug): the {target workspace slug, number} of every change, in any state, whose source workspace is that workspace, ordered by number; the fork view of package 17 is built from it",
+        "Implement ReadChange(workspace, number), the one exported read of a change for packages 27, 29 and 30: the change record as GET …/changes/:number shows it, without scope or access checks, read through the caller's store transaction when one is given, and the change-not-found error for an unknown number",
+        "Implement OpenCounts(ctx), exported from internal/change: the number of changes in state draft or open per workspace slug, with no entry for a workspace that has none; package 51 registers it as the source of parley_changes_open"
+      ],
+      "touches": [
+        "internal/change/lookup.go",
+        "internal/change/setters.go",
+        "internal/change/lookup_test.go",
+        "internal/change/store.go"
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Abandon changes whose source is deleted and delete them with their workspace",
+      "criteria": [
+        "REQ-5"
+      ],
+      "steps": [
+        "Add the source-deletion and retention behaviours to internal/change/retention_test.go and confirm they fail",
+        "Implement SourceDeleted(ctx, tx, workspace, branch, actor): move the draft or open change of that source to abandoned with reason source_deleted and write parley.change.abandon; do nothing for a branch without such a change",
+        "Implement ForkDeleted(ctx, tx, fork, actor): the same for every draft or open change whose source workspace is the fork, with reason source_workspace_deleted and one event per change; leave landed and abandoned changes alone",
+        "Implement WorkspaceDeleted(ctx, tx, workspace): delete the workspace's changes, versions, session links, landed-commit records and number counter",
+        "Never delete a version or a version ref on abandonment; confirm that RecordVersion ignores an abandoned change and that a new change opens from the same source under a higher number"
+      ],
+      "touches": [
+        "internal/change/retention.go",
+        "internal/change/retention_test.go"
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Serve one change, its versions and the by-commit lookup",
+      "criteria": [
+        "REQ-6"
+      ],
+      "steps": [
+        "Add the read behaviours to internal/change/read_test.go and confirm they fail",
+        "Register GET /workspaces/:slug/changes/:number, …/versions, …/versions/:version and …/changes/by-commit/:sha with scope changes:read and need read; make sure the router matches by-commit before :number",
+        "Answer 404 change_not_found for an unknown number, a :number that is not a positive integer and any number on a fork's slug",
+        "Serve include on the change: versions from this package; approvals, checks, stack and overlaps from an expander registry that other packages fill; a name outside the five is 400 invalid_request; a name without an expander adds no member",
+        "Serve the version list oldest first in the list envelope, and one version by number or 'latest' with its ref name; 400 invalid_request for a malformed :version, 404 not_found for a missing one",
+        "Serve by-commit from ChangeOfCommit as {change, version, landed}; 400 invalid_request for a :sha that is not 40 hexadecimal characters",
+        "Confine a token bound to a fork, on the fork's parent, to changes whose source workspace is the fork, using the binding information of internal/access: other changes answer 404 change_not_found"
+      ],
+      "touches": [
+        "internal/change/routes.go",
+        "internal/change/read.go",
+        "internal/change/read_test.go",
+        "internal/change/expand.go"
+      ]
+    },
+    {
+      "id": 7,
+      "title": "List changes with filters, order and paging",
+      "criteria": [
+        "REQ-7"
+      ],
+      "steps": [
+        "Add the list behaviours to internal/change/list_test.go and confirm they fail",
+        "Register GET /workspaces/:slug/changes as a list route of internal/server (limit, cursor, next_cursor) with scope changes:read and need read",
+        "Apply the filters state (repeatable, default draft and open), target_branch, source_workspace, author (user id, or me for the caller's user), session_id (any contributing session), label, path (the glob syntax of path-scoped tokens over the stored paths), mergeable and landing_status, combined with AND",
+        "Order by updated_at descending then number descending, or by number ascending with sort=number; give the pager a total order so that pages neither repeat nor skip",
+        "Serve stack_of by walking the stored depends_on links down to the bottom and up through dependants, lowest first, in any state, ignoring sort and the default state filter; 404 change_not_found for an unknown change",
+        "On a fork's slug, list the parent's changes whose source workspace is the fork; for a token bound to a fork on the parent, add the same confinement",
+        "Leave conflict out of every item, and paths and paths_truncated unless include=paths; refuse values outside a filter's domain, another include and author=me from the admin token with 400 invalid_request"
+      ],
+      "touches": [
+        "internal/change/list.go",
+        "internal/change/list_test.go",
+        "internal/change/routes.go"
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Serve a version's diff and the interdiff of two versions",
+      "criteria": [
+        "REQ-8"
+      ],
+      "steps": [
+        "Add the diff behaviours to internal/change/diff_test.go and confirm they fail",
+        "Register GET /workspaces/:slug/changes/:number/diff with scope changes:read and need read; parse version (default latest), against, path (repeatable), format (json or patch) and patches; 400 invalid_request for malformed values, 404 not_found for a version the change does not have",
+        "Plain diff: call the diff computation of internal/scm for base_sha..head_sha of the version in direct mode with its limits and rename detection, and add version and against (null) to its answer",
+        "Interdiff: compute both versions' diffs against their own bases; a file is changed when its patch, compared without index lines and hunk positions, differs between them or only one version touches it; for a changed file produce the unified diff of its content at the head of against to its content at the head of version; list every file either version touches; count only changed files in stats",
+        "Apply the path globs to the file list, drop patches when patches=false, and for format=patch answer text/x-diff with the patches concatenated",
+        "Answer 404 ref_not_found when a commit of a named version is missing from the repository, while record reads keep working"
+      ],
+      "touches": [
+        "internal/change/diff.go",
+        "internal/change/diff_test.go",
+        "internal/change/routes.go",
+        "internal/scm/"
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Wire the change component into parleyd, the ref writer and the source control API",
+      "criteria": [
+        "REQ-4.8"
+      ],
+      "steps": [
+        "Add the table over a git push and the commit, ref-move and rebase routes to internal/change/scm_hook_test.go, on a hub built by the wiring of internal/hub, and confirm it fails",
+        "Construct the change component in internal/hub/change.go with the store, internal/gitrepo, the workspace reader, the session linker, the event writer and the binding and access components, and register its routes",
+        "Register a ref-updated stage with the ref writer of package 18 (RegisterRefUpdatedStage in internal/gitserver/pushrule): for each accepted update of a branch that is not flagged direct, when via is git or api and the version kind is push, commit, ref or rebase, call RecordVersion in the stage's store transaction with that kind, the caller as actor, the caller's credential type and id and the session, and report the recorded {workspace_slug, number, version} for the update; for a deleted branch call SourceDeleted; do nothing for via land. This one stage serves the git push of packages 18 and 19 and the commit, ref and rebase routes of package 21",
+        "Register the component with package 21 as its ChangeLinker (RegisterChangeLinker in internal/scm): the lookup from OpenChangeOfBranch, the opening check from Authorize and the validation of Open without writing, and the open from Open in a transaction of the adapter with kind commit",
+        "Expose the same calls (Authorize, Open, RecordVersion, SourceDeleted, ForkDeleted, WorkspaceDeleted, ReadChange, OpenCounts, SetAutoLand, the lookups and the setters) as the component's exported API for packages 19, 20, 21, 23 to 30, 12, 14, 16, 49 and 51, with registration functions for the stack linker, landing evaluator, version observers, the auto_land guard and include expanders",
+        "Confirm that an error from RecordVersion (for example unknown_session) makes the stage fail, so that the ref writer moves no ref and the branch does not move without its version",
+        "Register a branch-move observer with package 12 (the observer interface of internal/workspace): for a branch a sync moved, call RecordVersion with kind sync and the system actor in a store transaction of the observer"
+      ],
+      "touches": [
+        "internal/hub/change.go",
+        "internal/change/service.go",
+        "internal/change/scm_hook_test.go",
+        "internal/scm/",
+        "internal/change/refstage.go",
+        "internal/gitserver/pushrule"
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Add parley change open, list, show, find, versions and diff",
+      "criteria": [
+        "REQ-10"
+      ],
+      "steps": [
+        "Add the command behaviours to internal/cli/change_test.go against a fake hub from httptest and confirm they fail",
+        "Add the command group 'change' to the CLI root with the six commands, each built on the shared HTTP client, output and exit-code handling of internal/cli (package 09)",
+        "open: require --source; build the body from the flags given and from nothing else; read --intent from the text, from the file after '@', or from standard input for '-'; an unreadable file is a client_error before any request",
+        "list: map each flag to its query parameter, repeating state per --state value",
+        "show, find, versions: one GET each to the route of the command; --include passes through unchanged",
+        "diff: map --version, --against and --path; --patch sends format=patch and prints the body as received; --name-only sends patches=false; both together is a usage error",
+        "Reject a missing or extra argument and a <number>, --version, --against, --depends-on or --stack-of that is not a positive integer as a usage error before any request",
+        "Add the two end-to-end scenarios to test/e2e/change_test.go, starting a real hub in-process and driving it with the CLI, HTTP and stock git"
+      ],
+      "touches": [
+        "internal/cli/change.go",
+        "internal/cli/change_test.go",
+        "test/e2e/change_test.go"
+      ],
+      "depends_on": [
+        9
+      ]
+    }
+  ]
+}

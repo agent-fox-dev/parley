@@ -1,0 +1,1223 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "22",
+  "spec_name": "change_opening_and_versions",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Who may open a change",
+      "rationale": "A contributor must be able to propose work from a fork into a workspace they can only read, and nobody else may write on their behalf.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "a caller with the scope changes:write, read access to the target workspace and write access to the source workspace submits POST /workspaces/:slug/changes with a source branch that has one commit the target does not contain",
+          "action": "open the change and return the change object",
+          "contract": "HTTP 201 with a change object whose workspace_slug is :slug, number is a positive integer, ref is '<slug>#<number>', state is 'open', version is 1, source is {workspace_slug, branch} as resolved, and author is {actor_type, actor_id, username} of the credential",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)"
+            ],
+            "pseudocode": "in internal/change/open_test.go: push branch 'feat' with one commit on top of main; r = POST /api/v1/workspaces/demo/changes {source:{branch:'feat'}} as u1's API key; assert r.status == 201; assert r.json.workspace_slug == 'demo' and r.json.number == 1 and r.json.ref == 'demo#1' and r.json.state == 'open' and r.json.version == 1; assert r.json.source == {workspace_slug:'demo', branch:'feat'}; assert r.json.author == {actor_type:'api_key', actor_id:u1, username:u1.username}"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "unwanted",
+          "condition": "the caller is a PAT without the scope changes:write",
+          "action": "refuse the open and write nothing",
+          "contract": "HTTP 403 with error_type 'insufficient_scope'; the workspace has no change",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)",
+              "demo belongs to org o1 with member m; the fork 'demo--other' owned by u2 has branch 'feat' with one commit ahead of main"
+            ],
+            "pseudocode": "in internal/change/open_test.go, a table over callers of POST /workspaces/demo/changes {source:{workspace_slug:S, branch:'feat'}}: {PAT of u1 with only changes:read -> 403 insufficient_scope; user u9 with no access to demo -> 404 not_found; org member m with source S = 'demo--other' (a fork owned by u2, which m reads as member) -> 403 forbidden; org member m with S = 'demo' -> 403 forbidden}; for each: assert status and error.error_type; assert the list of changes of demo is empty and no ref under refs/parley/changes exists"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "unwanted",
+          "condition": "the caller has no access to the target workspace",
+          "action": "refuse the open with the answer of a workspace that does not exist",
+          "contract": "HTTP 404 with error_type 'not_found'; the workspace has no change",
+          "check": {
+            "same_as": "REQ-1.2"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "unwanted",
+          "condition": "the caller can read the source workspace but has no write access to it",
+          "action": "refuse the open and write nothing",
+          "contract": "HTTP 403 with error_type 'forbidden'; the workspace has no change",
+          "check": {
+            "same_as": "REQ-1.2"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "event_driven",
+          "condition": "an org member with read-only access to the target workspace submits POST /workspaces/:slug/changes naming a branch of their own fork of that workspace as source",
+          "action": "open the change in the target workspace with the fork's branch as source",
+          "contract": "HTTP 201 with workspace_slug equal to the target workspace and source.workspace_slug equal to the fork's slug",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)",
+              "demo belongs to org o1 with member m"
+            ],
+            "pseudocode": "in internal/change/open_test.go: member m owns fork 'demo--m1' with branch 'task' one commit ahead of main; r = POST /workspaces/demo/changes {source:{workspace_slug:'demo--m1', branch:'task'}} as m; assert r.status == 201; assert r.json.workspace_slug == 'demo' and r.json.source.workspace_slug == 'demo--m1' and r.json.target_branch == 'main'"
+          }
+        },
+        {
+          "id": "REQ-1.6",
+          "pattern": "unwanted",
+          "condition": "the caller is a token bound to a fork F, the route names F's parent and the body's source.workspace_slug is absent or is not F",
+          "action": "refuse the open and write nothing",
+          "contract": "HTTP 403 with error_type 'token_bound'; the parent has no change",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)",
+              "forks 'demo--m1' (owner m) and 'demo--other', each with a branch one commit ahead of main"
+            ],
+            "pseudocode": "in internal/change/open_test.go, a table over bodies sent to POST /workspaces/demo/changes with a PAT bound to 'demo--m1' (binding information: parent of the bound fork): {source:{branch:'task'}} -> 403 token_bound; {source:{workspace_slug:'demo--other', branch:'feat'}} -> 403 token_bound; {source:{workspace_slug:'demo--m1', branch:'task'}} -> 201; assert that after the two refusals GET /workspaces/demo/changes as u1 is empty"
+          }
+        },
+        {
+          "id": "REQ-1.7",
+          "pattern": "unwanted",
+          "condition": "the caller is a path-scoped token and a file the resulting version changes against its base matches none of the token's globs",
+          "action": "refuse the open before anything is written",
+          "contract": "HTTP 403 with error_type 'path_not_allowed'; no change, no version ref and no event exists",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)"
+            ],
+            "pseudocode": "in internal/change/open_test.go, a table over a PAT with paths ['docs/**'] and source branches: {branch touching docs/a.md only -> 201; branch touching docs/a.md and src/x.go -> 403 path_not_allowed; branch whose only commit, made earlier with another credential, touches src/x.go -> 403 path_not_allowed}; after each refusal assert no change, no ref under refs/parley/changes and no recorded event"
+          }
+        },
+        {
+          "id": "REQ-1.8",
+          "pattern": "unwanted",
+          "condition": "the target workspace or the source workspace has status pending, cloning, failed or archived, or an exclusive operation is running on it",
+          "action": "refuse the open and write nothing",
+          "contract": "HTTP 409 with error_type 'workspace_busy' for pending, cloning or an exclusive operation, 'workspace_not_ready' for failed and 'workspace_archived' for archived",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)"
+            ],
+            "pseudocode": "in internal/change/open_test.go, a table over {which: target, source} x {status: pending, cloning, exclusive operation running, failed, archived} with the workspace reader stubbed to that status: r = POST /workspaces/demo/changes as u1 (owner); assert r.status == 409 and error.error_type == the expected type; assert no change exists"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Validation at open",
+      "rationale": "A change that cannot land for a structural reason is refused at the door, with one machine-readable reason per case.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "unwanted",
+          "condition": "the body of POST /workspaces/:slug/changes has no source.branch, a member of the wrong JSON type, more than 20 labels, a label that does not match ^[a-z0-9][a-z0-9_.:/-]{0,62}$, or a depends_on that is not a positive integer",
+          "action": "refuse the open and write nothing",
+          "contract": "HTTP 400 with error_type 'invalid_request'; the workspace has no change",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)",
+              "branch 'feat' one commit ahead of main, recreated per row"
+            ],
+            "pseudocode": "in internal/change/open_test.go, a table over bodies: {} ; {source:{}} ; {source:{branch:''}} ; {source:{branch:'feat'}, draft:'yes'} ; {source:{branch:'feat'}, labels:[21 valid labels]} ; labels:['Upper'] ; labels:['-x'] ; labels:[a 64-character label] ; depends_on:0 ; depends_on:-1 ; depends_on:'1' -> each 400 invalid_request and no change; and the accepted boundaries {labels:[20 labels]}, {labels:[a 63-character label]}, {labels:['a','a']} -> 201, the last with labels == ['a']"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "unwanted",
+          "condition": "the body names a session_id that the session linker (the interface SessionLinker of internal/change, to which package 49 hands its session-linking check) refuses for this caller and workspace",
+          "action": "refuse the open and write nothing",
+          "contract": "HTTP 400 with error_type 'unknown_session'; the workspace has no change",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)"
+            ],
+            "pseudocode": "in internal/change/open_test.go: the session linker stub refuses 's-other'; r = POST /workspaces/demo/changes {source:{branch:'feat'}, session_id:'s-other'}; assert r.status == 400 and error.error_type == 'unknown_session'; assert no change exists; then with session_id 's-mine' (accepted) assert 201 and json.session_id == 's-mine' and json.sessions == ['s-mine']"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "unwanted",
+          "condition": "an open fails one of these checks, taken in this order: the target branch exists in the target workspace; the source workspace is the target workspace or a fork of it; the source branch exists; source and target are not the same branch of the same workspace; the source has at least one commit the target does not contain; none of those commits is a merge commit",
+          "action": "refuse the open with the answer of the first failing check and write nothing",
+          "contract": "in the same order: HTTP 400 'target_not_found'; 400 'source_not_related'; 400 'source_not_found'; 400 'invalid_request'; 400 'nothing_to_land'; 400 'merge_commits_unsupported'; a request that fails several checks gets the answer of the earliest",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)",
+              "a second unrelated workspace 'elsewhere' readable by u1; a branch 'merged' whose history ahead of main contains a merge commit; a branch 'behind' at an ancestor of main; the carry-patch workspace 'cp' whose workspace reader reports integration branch 'integration'"
+            ],
+            "pseudocode": "in internal/change/open_test.go, a table with one row per case (target branch missing -> 400 target_not_found; target is the integration branch of a carry-patch workspace -> 403 integration_branch; source workspace unknown, invisible to the caller, or neither the target nor a fork of it -> 400 source_not_related; source branch missing -> 400 source_not_found; source and target the same branch of the same workspace -> 400 invalid_request; source has no commit the target lacks -> 400 nothing_to_land; a merge commit among the commits the target lacks -> 400 merge_commits_unsupported), plus rows that fail two checks at once and expect the earlier answer: {target 'nope' and source branch 'nope' -> target_not_found; source workspace 'elsewhere' and branch 'nope' -> source_not_related; branch equal to main (nothing ahead) given as both source and target -> invalid_request}; for each: assert status and error.error_type; assert no change exists"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "unwanted",
+          "condition": "the target branch is the integration branch of a carry-patch workspace",
+          "action": "refuse the open and write nothing, while an open that targets a patch branch or a protected branch is accepted",
+          "contract": "HTTP 403 with error_type 'integration_branch'",
+          "check": {
+            "same_as": "REQ-2.3"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "unwanted",
+          "condition": "another change in state draft or open already has the same source workspace and branch",
+          "action": "refuse the open, name the existing change and write nothing",
+          "contract": "HTTP 409 with error_type 'change_exists' and error.details equal to {workspace_slug, number, ref} of the existing change",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)"
+            ],
+            "pseudocode": "in internal/change/open_test.go: open change 1 from 'feat'; r = POST the same body again; assert r.status == 409 and error.error_type == 'change_exists' and error.details == {workspace_slug:'demo', number:1, ref:'demo#1'}; repeat with change 1 as a draft -> 409; then mark change 1 abandoned through the component and POST again -> 201 with number 2"
+          }
+        },
+        {
+          "id": "REQ-2.6",
+          "pattern": "unwanted",
+          "condition": "after the checks above pass, the title (given or defaulted) is empty, longer than 200 characters or contains a line break, or the given intent is longer than 16,000 characters, or the intent is empty or white space only while draft is not true and the workspace setting changes.require_intent is true",
+          "action": "refuse the open and write nothing",
+          "contract": "HTTP 400 with error_type 'invalid_request' for the title and the intent length, and HTTP 400 with error_type 'intent_required' for the empty intent",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)"
+            ],
+            "pseudocode": "in internal/change/open_test.go, a table: {title:''} ; {title: 201 characters} ; {title:'a\\nb'} ; {head commit with empty subject, no title} ; {intent: 16001 characters} -> 400 invalid_request; {no intent, head commit without body, source not a fork} ; {intent:'  \\n'} -> 400 intent_required; accepted: {title: 200 characters, intent: 16000 characters} -> 201; {no intent, draft:true} -> 201 with intent ''; {no intent, require_intent false} -> 201; a head commit whose subject has 250 characters and no title -> 201 with a title of the first 200 characters"
+          }
+        },
+        {
+          "id": "REQ-2.7",
+          "pattern": "unwanted",
+          "condition": "two opens with the same source workspace and branch run concurrently",
+          "action": "let exactly one of them create the change",
+          "contract": "one request answers HTTP 201 and the other HTTP 409 with error_type 'change_exists'; exactly one change and one version 1 exist",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)"
+            ],
+            "pseudocode": "in internal/change/open_test.go: start 8 goroutines posting the same body at once (no Idempotency-Key); collect statuses; assert exactly one 201 and seven 409 change_exists; assert the list of changes has one item"
+          }
+        },
+        {
+          "id": "REQ-2.8",
+          "pattern": "ubiquitous",
+          "action": "for any open that is refused, leave the store, the repository and the event log as they were: no change, no version, no ref under refs/parley/changes and no event",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)"
+            ],
+            "pseudocode": "in internal/change/open_test.go, over one representative refusal of each status class (400 nothing_to_land, 403 path_not_allowed, 409 change_exists with change 1 present, 400 intent_required): snapshot = (rows of the change and version tables, git for-each-ref refs/parley/changes, recorded events); POST; assert the snapshot is unchanged"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Defaults and the result of opening",
+      "rationale": "An agent that only names a branch still gets a complete change, and every consumer downstream learns of it at once.",
+      "system": "change component",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "a change is opened without source.workspace_slug, title, intent, target_branch, session_id, auto_land or labels",
+          "action": "fill source.workspace_slug with the route's workspace, title with the subject of the head commit, intent with the body of the head commit and, when that is empty, the purpose of the source fork, target_branch with the fork's base branch for a fork source and the workspace's default branch otherwise, session_id with the session of the triggering push or commit and, when there is none, the session recorded on the source fork, auto_land with false and labels with an empty list",
+          "contract": "the returned change object carries the defaulted values; a defaulted intent longer than 16,000 characters is cut to 16,000; a defaulted session the session linker refuses is replaced by null",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)"
+            ],
+            "pseudocode": "in internal/change/open_test.go, a table over sources: {branch of demo, head commit 'Add x\\n\\nBecause y' -> title 'Add x', intent 'Because y', target_branch 'main', session_id null, auto_land false, labels []}; {fork with base branch 'release', purpose 'fix the flake', session 's1', head commit with subject only -> intent 'fix the flake', target_branch 'release', session_id 's1'}; {same fork, head commit with body -> intent is the body}; {Open called through the component with trigger session 's2' on that fork -> session_id 's2'}; {fork session refused by the linker stub -> session_id null and 201}; {head commit body of 20000 characters -> intent length 16000}; and explicit values {title, intent, target_branch, auto_land:true, labels:['a']} are returned as given"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "event_driven",
+          "condition": "a change is opened",
+          "action": "record version 1 with the head of the source branch as head_sha, the merge base of that head and the target branch as base_sha, the kind the trigger names, created_by, session_id and stats, write the ref refs/parley/changes/<number>/1 in the target workspace's repository, and set the change's version, head_sha, base_sha, stats, paths and paths_truncated from it",
+          "contract": "the change has version 1; GET …/versions lists one version with number 1 and patch_equivalent_to null; the ref resolves to head_sha; stats is {commits, files_changed, insertions, deletions} of base_sha..head_sha; paths lists the touched files, at most 2,000, with paths_truncated true when there were more",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)"
+            ],
+            "pseudocode": "in internal/change/open_test.go: 'feat' has 2 commits ahead of main touching a.txt (+3 -1) and b.txt (+2); open; assert change.version == 1 and change.head_sha == rev-parse feat and change.base_sha == merge-base(feat, main); assert change.stats == {commits:2, files_changed:2, insertions:5, deletions:1}; assert change.paths == ['a.txt','b.txt'] and paths_truncated == false; assert git rev-parse refs/parley/changes/1/1 == head_sha; versions == [{number:1, kind:'ref', patch_equivalent_to:null, ...}] for an open through the REST route; a second case with a commit touching 2001 files: len(paths) == 2000 and paths_truncated == true"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "ubiquitous",
+          "action": "for any sequence of opens, number the changes of one workspace from 1 in strictly increasing order, independently of other workspaces, and never give a number to a second change, also after the first holder was abandoned or its open was refused",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)"
+            ],
+            "pseudocode": "in internal/change/open_test.go: open 3 changes in demo and 2 in a second workspace 'other', with one refused open and one abandonment in between; assert demo's numbers are strictly increasing starting at 1 and pairwise distinct, other's start at 1, and every ref equals '<slug>#<number>'"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "event_driven",
+          "condition": "a change is opened with draft absent or false",
+          "action": "write, in the caller's transaction, the event parley.change.version for version 1 and then the event parley.change.open",
+          "contract": "both events have resource_type 'change', resource_id the number as a string, workspace the target workspace, the session_id when known and metadata ref, version and head_sha; parley.change.version adds kind, base_sha, patch_equivalent_to null and draft false; parley.change.open adds title, target_branch, source_workspace, source_branch, depends_on and was_draft false",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)"
+            ],
+            "pseudocode": "in internal/change/open_test.go: open from fork 'demo--m1' branch 'task' with session 's1'; events = recording event writer; assert the types in order == ['parley.change.version', 'parley.change.open']; assert each has resource_type 'change', resource_id '1', workspace 'demo', session_id 's1', metadata.ref 'demo#1', metadata.version 1, metadata.head_sha == head; assert events[0].metadata has kind, base_sha, patch_equivalent_to == null, draft == false; assert events[1].metadata == {…, title, target_branch:'main', source_workspace:'demo--m1', source_branch:'task', depends_on:null, was_draft:false}"
+          }
+        },
+        {
+          "id": "REQ-3.5",
+          "pattern": "event_driven",
+          "condition": "a change is opened with draft true",
+          "action": "create it in state draft with landing {status: blocked, reason: draft}, accept an empty intent, and write parley.change.version with draft true and no parley.change.open",
+          "contract": "HTTP 201 with state 'draft' and landing.status 'blocked' and landing.reason 'draft'; exactly one event, of type parley.change.version, with metadata.draft true",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)"
+            ],
+            "pseudocode": "in internal/change/open_test.go: r = POST {source:{branch:'feat'}, draft:true} where the head commit has no body; assert r.status == 201 and r.json.state == 'draft' and r.json.intent == '' and r.json.landing == {status:'blocked', reason:'draft', requirements:[]}; assert recorded event types == ['parley.change.version'] and metadata.draft == true"
+          }
+        },
+        {
+          "id": "REQ-3.6",
+          "pattern": "event_driven",
+          "condition": "a change is opened with draft absent or false",
+          "action": "set mergeable to unknown, hand the change and the request's depends_on to the stack linker, store the landing object the landing evaluator answers, and only then notify every version observer once with version 1 and its creating credential, all inside the caller's transaction",
+          "contract": "without registered collaborators the change has depends_on null, dependants [], mergeable 'unknown', conflict null, needs_restack false, restack_reason null and landing {status: 'ready', reason: null, requirements: []}; with a registered stack linker, evaluator and observer, each is called exactly once, in the order stack linker, evaluator, observer, the observer reads the stored landing of this evaluation, and the values they set are in the returned change",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)"
+            ],
+            "pseudocode": "in internal/change/open_test.go: (a) no collaborators: open; assert the seven default values named in the contract; (b) register a stack linker stub that sets depends_on 7 and base_sha X when given depends_on 7, an evaluator stub answering {status:'pending', reason:null, requirements:[{name:'r'}]} and a counting observer that reads the change through ReadChange in the transaction it is given: open with depends_on:7; assert the call order == [linker, evaluator, observer] and the landing the observer read has status 'pending'; assert linker calls == 1 with depends_on 7, observer calls == 1 with version.number 1, change.depends_on == 7, change.base_sha == X, change.landing.status == 'pending'"
+          }
+        },
+        {
+          "id": "REQ-3.7",
+          "pattern": "unwanted",
+          "condition": "a collaborator returns an error during an open, or the caller of the component rolls its transaction back after Open returned",
+          "action": "return the collaborator's error to the caller and leave no change, version or event in the store",
+          "contract": "Open returns the error unchanged (the REST route answers with that error's status and error_type, HTTP 500 'internal' for an error that carries none); after the rollback a read of the change answers 404 'change_not_found' and the event writer holds no event of the call",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)"
+            ],
+            "pseudocode": "in internal/change/open_test.go: (a) stack linker stub returns an error carrying 400 invalid_dependency: r = POST with depends_on:9; assert r.status == 400 and error.error_type == 'invalid_dependency'; assert no change and no event; (b) call Open directly inside a store transaction, assert it returns a change with number 1, roll the transaction back; assert the change and version tables are empty and GET …/changes/1 is 404 change_not_found; (c) observer stub returns a plain error -> POST answers 500 internal and nothing is stored"
+          }
+        },
+        {
+          "id": "REQ-3.8",
+          "pattern": "unwanted",
+          "condition": "a change is opened with auto_land true and the registered auto_land guard refuses the flag",
+          "action": "refuse the open with the guard's error and write nothing",
+          "contract": "Open calls the guard (the interface AutoLandGuard of internal/change, which package 29 registers through RegisterAutoLandGuard) exactly once, inside the caller's transaction, after version 1 is recorded and before auto_land is stored, with the caller (user and credential type, id and paths), the change and the value true; a refusal is returned unchanged (the REST route answers HTTP 403 with error_type 'path_not_allowed' and the path) and no change, version or event remains; when the guard accepts, the change has auto_land true; the guard is not called for auto_land false or absent; with no guard registered auto_land true is stored",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)",
+              "a recording auto_land guard stub registered through RegisterAutoLandGuard"
+            ],
+            "pseudocode": "in internal/change/open_test.go: (a) the guard refuses with an error carrying 403 path_not_allowed and path 'src/x.go': r = POST with auto_land:true by PAT t1 with paths ['docs/**']; assert r.status == 403 and error.error_type == 'path_not_allowed' and error.path == 'src/x.go'; assert the guard was called once with credential {pat, t1, ['docs/**']}, a change whose version is 1 and value true; assert the change and version tables are empty and no event was written; (b) the guard accepts: POST with auto_land:true -> 201 and auto_land == true, guard calls == 1; (c) POST without auto_land and with auto_land:false -> 201 and no guard call; (d) no guard registered: POST with auto_land:true -> 201 and auto_land == true"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Versions recorded with the ref update",
+      "rationale": "A change must never miss a head of its branch, and the client must not have to do anything for it.",
+      "system": "change component",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "RecordVersion is called inside a store transaction for a branch that is the source of a draft or open change and whose new head differs from the head of the change's current version",
+          "action": "record a version with the next number, the given kind, created_by, the creating credential (type and id, none for a version the hub creates) and session, the new head as head_sha, the merge base of the new head and the target branch as base_sha and its stats, write its version ref, and update the change's version, head_sha, base_sha, stats, paths, session_id, sessions and updated_at and set mergeable to unknown",
+          "contract": "RecordVersion returns the new version; after commit the change reads back with version n+1 and the new values, and GET …/versions lists versions 1..n+1 in order with the earlier versions unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)",
+              "change 1 open from branch 'feat' of demo (version 1), opened through the component"
+            ],
+            "pseudocode": "in internal/change/version_test.go: v1 = versions[0]; add a commit to 'feat' (new head H2); tx: v = RecordVersion(tx, {workspace:'demo', branch:'feat', head:H2, kind:'push', actor:u1, credential:{type:'api_key', id:'k1'}, session:'s2'}); commit; assert v.number == 2 and v.kind == 'push' and v.head_sha == H2 and v.created_by.actor_id == u1 and v.session_id == 's2'; assert the stored creating credential of version 2 is {api_key, k1} and the version object has no member for it; change = get(1); assert change.version == 2 and change.head_sha == H2 and change.stats.commits == 2 and change.session_id == 's2' and change.mergeable == 'unknown' and change.updated_at >= before; assert versions == [v1 unchanged, v]; then force the branch to an unrelated history H3 and record: version 3 of the same change 1; a table over kind in {push, commit, ref, rebase, restack, revert, sync} asserts the kind is stored as given, and restack with the system actor gives created_by.actor_type == 'system'"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "event_driven",
+          "condition": "RecordVersion is called for a branch whose new head is already the head of the change's current version, or for a branch that is not the source of a draft or open change",
+          "action": "record nothing and write no event",
+          "contract": "RecordVersion returns no version and no error; the change, its versions and the event log are unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)",
+              "change 1 open from branch 'feat' of demo (version 1), opened through the component"
+            ],
+            "pseudocode": "in internal/change/version_test.go, a table: {branch 'feat', head == current head}; {branch 'unrelated' with no change}; {branch 'feat' after change 1 was marked landed}; {branch 'feat' after change 1 was marked abandoned}; {branch 'feat' of another workspace}: v, err = RecordVersion(tx, row); assert v == nil and err == nil; assert the version count and the recorded events are unchanged"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "ubiquitous",
+          "action": "for any version of a change that exists, keep refs/parley/changes/<number>/<version> in the target workspace's repository resolving to that version's head, whatever later happens to the source branch, including for a source branch in a fork",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)",
+              "change 1 open from branch 'feat' of demo (version 1), opened through the component"
+            ],
+            "pseudocode": "in internal/change/version_test.go: record versions 2 (amend) and 3 (unrelated history) on change 1, then delete branch 'feat' and run git gc --prune=now in the repository; for n in 1..3 assert git rev-parse refs/parley/changes/1/<n> == versions[n].head_sha and git cat-file -e of it succeeds; second case: a change whose source is branch 'task' of fork 'demo--m1' (a separate repository): after open and one RecordVersion, both refs resolve in demo's repository, not only in the fork's"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "event_driven",
+          "condition": "a version is recorded whose diff against its own base is identical to the diff of an earlier version of the same change against that version's base",
+          "action": "set patch_equivalent_to to the number of the latest such earlier version, and to null when there is none",
+          "contract": "the version object's patch_equivalent_to is that number or null",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)",
+              "change 1 open from branch 'feat' of demo (version 1), opened through the component"
+            ],
+            "pseudocode": "in internal/change/version_test.go, a sequence on change 1: v2 = 'feat' rebased onto a moved main without content change -> patch_equivalent_to == 1; v3 = an amended commit with different content -> null; v4 = v3 rebased again -> 3; v5 = the content of v1 restored on the newest main -> 2 (the latest of versions 1 and 2, which share that diff)"
+          }
+        },
+        {
+          "id": "REQ-4.5",
+          "pattern": "event_driven",
+          "condition": "a version is recorded whose head is equal to or behind the target branch, or that has a merge commit among its commits, or while the target branch does not exist",
+          "action": "record the version, keep the change in its state and store the structural landing reason without asking the landing evaluator",
+          "contract": "landing is {status: 'blocked', reason: 'nothing_to_land'}, {status: 'blocked', reason: 'merge_commits'} or {status: 'blocked', reason: 'target_not_found'} in the three cases; a version of a draft has reason 'draft'; a later version without such a cause gets the evaluator's answer again",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)",
+              "change 1 open from branch 'feat' of demo (version 1), opened through the component"
+            ],
+            "pseudocode": "in internal/change/version_test.go, a table of moves of 'feat' on open change 1 with a counting evaluator stub: {reset to main's head -> blocked/nothing_to_land, evaluator not called}; {reset to an ancestor of main -> blocked/nothing_to_land}; {head with a merge commit ahead of main -> blocked/merge_commits}; {target branch deleted, then a new commit -> blocked/target_not_found, base_sha == previous version's base_sha}; {a normal commit ahead of main -> evaluator called once, landing.status 'ready'}; in every row assert change.state == 'open' and a version was recorded; one row on a draft change -> blocked/draft"
+          }
+        },
+        {
+          "id": "REQ-4.6",
+          "pattern": "event_driven",
+          "condition": "a version after the first is recorded",
+          "action": "call the stack linker, then the landing derivation, store its landing, and only then call every version observer once with the change, the new version and the creating credential of the version (credential type and credential id, or none for a version created by the hub), and write the event parley.change.version, all inside the caller's transaction",
+          "contract": "one event of type parley.change.version with resource_id the change number, metadata ref, version (the new number), head_sha, kind, base_sha, patch_equivalent_to and draft; no parley.change.open event; an observer that reads the change in the transaction it is given sees the landing derived for the new version, not the previous one; a caller that rolls its transaction back leaves no version, no changed field of the change and no event",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)",
+              "change 1 open from branch 'feat' of demo (version 1), opened through the component"
+            ],
+            "pseudocode": "in internal/change/version_test.go: register a recording stack linker, evaluator and observer; record version 2 with kind 'commit'; assert the call order == [linker, evaluator, observer] and each count == 1; with an evaluator stub that answers 'pending' for version 2 after 'ready' for version 1, assert the observer read landing.status == 'pending' through ReadChange in its transaction; assert the observer's payload carries the creating credential given to RecordVersion ({pat, t1}), and none for a version recorded with the system actor; assert recorded events since version 1 == [parley.change.version with metadata {ref:'demo#1', version:2, head_sha:H2, kind:'commit', base_sha, patch_equivalent_to:null, draft:false}]; second case: RecordVersion in a transaction that is rolled back: get(1).version == 1, versions has 1 item, no new event"
+          }
+        },
+        {
+          "id": "REQ-4.7",
+          "pattern": "unwanted",
+          "condition": "RecordVersion is given a session that the session linker refuses",
+          "action": "record nothing and return the unknown-session error",
+          "contract": "RecordVersion returns an error with status 400 and error_type 'unknown_session'; the change, its versions and the event log are unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)",
+              "change 1 open from branch 'feat' of demo (version 1), opened through the component"
+            ],
+            "pseudocode": "in internal/change/version_test.go: linker stub refuses 's-other'; v, err = RecordVersion(tx, {…, head:H2, session:'s-other'}); assert v == nil and err carries (400, 'unknown_session'); assert version count == 1 and no new event; with no session the same call records version 2 with session_id null and change.sessions unchanged"
+          }
+        },
+        {
+          "id": "REQ-4.8",
+          "pattern": "event_driven",
+          "condition": "the ref writer of package 18 runs its ref-updated stages for an accepted request (a git push, an API commit, an API ref move or a server-side rebase of package 21) that moved the source branch of a draft or open change",
+          "action": "record the version in the ref-updated stage this package registers with the ref writer, inside the store transaction of that ref update and before the request is answered, with the version kind the caller of the ref writer named (push, commit, ref or rebase), the session and the caller's credential, and report {workspace_slug, number, version} to the ref writer for that update; record nothing for an update flagged direct, for via land and for version kind none, and call SourceDeleted for a deleted branch",
+          "contract": "after the request returns, GET …/changes/:number shows the next version with head_sha equal to the branch's new head and the kind of the surface used; the ref writer's result for the update names the change and the version; an error from the stage (for example unknown_session) leaves the branch where it was and records nothing; a git push that deletes the source branch leaves the change abandoned with reason source_deleted",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub built by the wiring of internal/hub, with real internal/scm routes and a real repository",
+              "change 1 open from branch 'feat'"
+            ],
+            "pseudocode": "in internal/change/scm_hook_test.go, a table over the surfaces {git push of 'feat' with stock git -> 'push'; POST …/scm/commits on branch 'feat' -> 'commit'; the ref move route to another commit ahead of main -> 'ref'; POST …/scm/rebase of 'feat' onto a moved main -> 'rebase' with patch_equivalent_to == the previous version}: use the real surface on a hub with the change component wired as internal/hub/change.go wires it; immediately GET …/changes/1; assert version == previous + 1 and head_sha == the new head and versions[-1].kind == expected; assert the API answers' change member names that version; with a session linker that refuses: POST …/scm/commits with a session_id the route accepted but the stage's linker refuses -> the branch head is unchanged and no version exists; git push --delete of 'feat' -> get(1).state == 'abandoned'"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Source deletion and retention",
+      "rationale": "A change outlives its branch as a record, and disappears only with its workspace.",
+      "system": "change component",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "SourceDeleted is called inside a store transaction for a branch that is the source of a draft or open change",
+          "action": "move the change to state abandoned with reason source_deleted, keep its versions and version refs, and write the event parley.change.abandon",
+          "contract": "the change reads back with state 'abandoned' and its version count unchanged; every version ref still resolves; one event parley.change.abandon with metadata.reason 'source_deleted', ref, version and head_sha; a branch with no draft or open change records nothing and returns no error",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)"
+            ],
+            "pseudocode": "in internal/change/retention_test.go: change 1 (open) with 2 versions; delete branch 'feat'; tx: SourceDeleted(tx, 'demo', 'feat', actor u1); commit; assert get(1).state == 'abandoned' and len(versions) == 2 and both refs resolve; assert the last event is parley.change.abandon with metadata.reason == 'source_deleted'; the same for a draft change; SourceDeleted for branch 'nothing' -> nil error and no event"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "event_driven",
+          "condition": "ForkDeleted is called inside a store transaction for a fork",
+          "action": "move every draft or open change whose source workspace is the fork to state abandoned with reason source_workspace_deleted, write one parley.change.abandon event for each, and leave landed and abandoned changes and every version ref of the target workspace as they are",
+          "contract": "the fork's draft and open changes read back 'abandoned' through the parent's slug; its landed and earlier abandoned changes are unchanged; changes with another source are unchanged; every version ref still resolves in the target workspace",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)"
+            ],
+            "pseudocode": "in internal/change/retention_test.go: in demo: change 1 open from fork f1, change 2 draft from f1, change 3 marked landed from f1, change 4 open from fork f2, change 5 open from demo itself; tx: ForkDeleted(tx, 'demo--f1', system actor); commit; assert states == {1:'abandoned', 2:'abandoned', 3:'landed', 4:'open', 5:'open'}; assert exactly two parley.change.abandon events with metadata.reason == 'source_workspace_deleted'; assert refs/parley/changes/1/1, 2/1 and 3/1 resolve in demo"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "event_driven",
+          "condition": "WorkspaceDeleted is called inside a store transaction for a workspace",
+          "action": "delete every change of that workspace with its versions, sessions links and landed-commit records, and leave the changes of other workspaces untouched",
+          "contract": "after commit the change and version tables hold no row of the workspace; ChangeOfCommit and ChangesOfSession return nothing for it; another workspace's changes read back unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)"
+            ],
+            "pseudocode": "in internal/change/retention_test.go: demo has 3 changes (open, landed, abandoned) and 'other' has 1; tx: WorkspaceDeleted(tx, 'demo'); commit; assert count(changes where workspace == 'demo') == 0 and count(versions of demo) == 0; assert ChangeOfCommit('demo', a former head) reports not found; assert the change of 'other' is unchanged"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "event_driven",
+          "condition": "a change was abandoned by SourceDeleted or ForkDeleted and its former source branch exists again",
+          "action": "record no version for moves of that branch on the abandoned change, and accept a new open from the same source under a new number",
+          "contract": "RecordVersion returns no version; POST /workspaces/:slug/changes with that source answers HTTP 201 with a number higher than the abandoned change's",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)"
+            ],
+            "pseudocode": "in internal/change/retention_test.go: after the first case of the source-deletion test, recreate 'feat' with a new commit; assert RecordVersion(tx, 'demo', 'feat', …) == nil; r = POST {source:{branch:'feat'}}; assert r.status == 201 and r.json.number == 2; assert get(1).state == 'abandoned' and get(1).version is unchanged"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Reading a change, its versions and its commits",
+      "rationale": "Reviewers and tools address the change by number and need every version and the way back from a commit.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "a caller with changes:read and read access to the workspace requests GET /workspaces/:slug/changes/:number for an existing change",
+          "action": "return the change object with every field of the change, timestamps in RFC 3339 UTC with whole seconds and commit ids in full",
+          "contract": "HTTP 200 with the members workspace_slug, number, ref, title, intent, state, target_branch, source, version, head_sha, base_sha, depends_on, dependants, author, session_id, sessions, mergeable, conflict, needs_restack, restack_reason, stats, paths, paths_truncated, landing, auto_land, labels, landed, reverts, reverted_by, created_at and updated_at; list members are arrays, never null",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)",
+              "change 1 (open, from fork 'demo--m1', 3 versions, session 's1'), change 2 (draft, from demo branch 'b2'), change 3 (marked landed, with one landed-commit record) in demo"
+            ],
+            "pseudocode": "in internal/change/read_test.go: r = GET /workspaces/demo/changes/1 as org member m; assert r.status == 200; assert the set of keys of r.json == the 31 names in the contract; assert len(head_sha) == 40 and len(base_sha) == 40; assert dependants, sessions, paths, labels are JSON arrays; assert created_at matches ^\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\dZ$; assert sessions == ['s1'] and version == 3"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "event_driven",
+          "condition": "the request carries include, a comma list of the names versions, approvals, checks, stack and overlaps",
+          "action": "add the member versions with the version list, oldest first, when versions is named, and for each other name add the member its registered expander returns, or no member when no expander is registered",
+          "contract": "HTTP 200 with the change object plus the requested members; a name outside the five answers HTTP 400 with error_type 'invalid_request'",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)",
+              "change 1 (open, from fork 'demo--m1', 3 versions, session 's1'), change 2 (draft, from demo branch 'b2'), change 3 (marked landed, with one landed-commit record) in demo"
+            ],
+            "pseudocode": "in internal/change/read_test.go, a table: {include=versions -> json.versions has 3 items numbered 1,2,3}; {no include -> no member 'versions'}; {include=versions,checks with an expander registered for 'checks' returning [{name:'ci'}] -> json.checks == [{name:'ci'}] and versions present}; {include=stack with no expander -> 200 and no member 'stack'}; {include=bogus -> 400 invalid_request}; {include=versions,,bogus -> 400 invalid_request}"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "event_driven",
+          "condition": "a caller requests GET /workspaces/:slug/changes/:number/versions",
+          "action": "return the versions of the change as a list, oldest first, each with number, head_sha, base_sha, kind, patch_equivalent_to, created_by, session_id, stats and created_at",
+          "contract": "HTTP 200 with {items, next_cursor}; items are in ascending number order",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)",
+              "change 1 (open, from fork 'demo--m1', 3 versions, session 's1'), change 2 (draft, from demo branch 'b2'), change 3 (marked landed, with one landed-commit record) in demo"
+            ],
+            "pseudocode": "in internal/change/read_test.go: r = GET …/changes/1/versions; assert r.status == 200 and [v.number for v in r.json.items] == [1,2,3] and r.json.next_cursor == null; assert the set of keys of items[0] == the nine names in the action; assert items[0].created_by has actor_type, actor_id, username"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "event_driven",
+          "condition": "a caller requests GET /workspaces/:slug/changes/:number/versions/:version with a version number or the word latest",
+          "action": "return that version, or the current version for latest, with the name of its version ref",
+          "contract": "HTTP 200 with the version object plus ref equal to 'refs/parley/changes/<number>/<version number>'; a :version that is neither a positive integer nor 'latest' answers HTTP 400 with error_type 'invalid_request'; a number the change does not have answers HTTP 404 with error_type 'not_found'",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)",
+              "change 1 (open, from fork 'demo--m1', 3 versions, session 's1'), change 2 (draft, from demo branch 'b2'), change 3 (marked landed, with one landed-commit record) in demo"
+            ],
+            "pseudocode": "in internal/change/read_test.go, a table over :version on change 1: {'2' -> 200, number 2, ref 'refs/parley/changes/1/2'}; {'latest' -> 200, number 3, ref 'refs/parley/changes/1/3'}; {'0', '-1', 'x', '1.5' -> 400 invalid_request}; {'4' -> 404 not_found}"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "event_driven",
+          "condition": "a caller requests GET /workspaces/:slug/changes/by-commit/:sha with a full commit id",
+          "action": "find the change that has the commit as a version head or that landed it, preferring a change that landed it and then the lowest number, and return it with the version and the landed flag",
+          "contract": "HTTP 200 with {change: <change object>, version: int or null, landed: bool}, where version is the highest version of that change with this head, or for a landed commit the version it was landed from or null, and landed is true only for a commit the change landed; a commit that is neither answers HTTP 404 with error_type 'change_not_found'; a :sha that is not 40 hexadecimal characters answers HTTP 400 with error_type 'invalid_request'",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)",
+              "change 1 (open, from fork 'demo--m1', 3 versions, session 's1'), change 2 (draft, from demo branch 'b2'), change 3 (marked landed, with one landed-commit record) in demo"
+            ],
+            "pseudocode": "in internal/change/read_test.go, a table over :sha: {head of version 2 of change 1 -> change.number 1, version 2, landed false}; {current head of change 1 -> version 3, landed false}; {landed_sha of change 3's landed-commit record whose version_sha is the head of its version 1 -> change.number 3, version 1, landed true}; {a commit that is the head of change 2 and also a landed commit of change 3 -> change.number 3, landed true}; {an inner (non-head) commit of change 1 -> 404 change_not_found}; {a commit on main unrelated to any change -> 404 change_not_found}; {'abc123' -> 400 invalid_request}"
+          }
+        },
+        {
+          "id": "REQ-6.6",
+          "pattern": "unwanted",
+          "condition": "a read names a change number the workspace does not have, a :number that is not a positive integer, or a fork's slug with any number",
+          "action": "refuse the read",
+          "contract": "HTTP 404 with error_type 'change_not_found' on GET …/changes/:number, …/versions, …/versions/:version and …/diff",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)",
+              "change 1 (open, from fork 'demo--m1', 3 versions, session 's1'), change 2 (draft, from demo branch 'b2'), change 3 (marked landed, with one landed-commit record) in demo"
+            ],
+            "pseudocode": "in internal/change/read_test.go, a table over {route: change, versions, versions/1, diff} x {'/workspaces/demo/changes/99', '/workspaces/demo/changes/abc', '/workspaces/demo/changes/0', '/workspaces/demo--m1/changes/1'}: assert status == 404 and error.error_type == 'change_not_found'"
+          }
+        },
+        {
+          "id": "REQ-6.7",
+          "pattern": "unwanted",
+          "condition": "a read route of this package is called by a PAT without the scope changes:read, or by a caller with no access to the workspace",
+          "action": "refuse the read without revealing whether the workspace or the change exists",
+          "contract": "HTTP 403 with error_type 'insufficient_scope' for the missing scope, also when the workspace does not exist; HTTP 404 with error_type 'not_found' for the caller without access",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)",
+              "change 1 (open, from fork 'demo--m1', 3 versions, session 's1'), change 2 (draft, from demo branch 'b2'), change 3 (marked landed, with one landed-commit record) in demo"
+            ],
+            "pseudocode": "in internal/change/read_test.go, a table over the six GET routes (list, change, by-commit, versions, version, diff) x {PAT of u1 with only git:read on 'demo' -> 403 insufficient_scope; the same PAT on 'no-such-workspace' -> 403 insufficient_scope; user u9 without access -> 404 not_found, with the same body as for 'no-such-workspace'}"
+          }
+        },
+        {
+          "id": "REQ-6.8",
+          "pattern": "unwanted",
+          "condition": "a token bound to a fork F calls a read route of this package on F's parent for a change whose source workspace is not F",
+          "action": "refuse the read as if the change did not exist, and confine the list and the by-commit lookup to changes whose source workspace is F",
+          "contract": "HTTP 404 with error_type 'change_not_found' on GET …/changes/:number, …/versions, …/versions/:version, …/diff and …/by-commit/:sha; GET …/changes returns only changes whose source.workspace_slug is F; changes with source F answer as for the token's user",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)",
+              "change 1 (open, from fork 'demo--m1', 3 versions, session 's1'), change 2 (draft, from demo branch 'b2'), change 3 (marked landed, with one landed-commit record) in demo"
+            ],
+            "pseudocode": "in internal/change/read_test.go, with a PAT bound to 'demo--m1' (binding information: parent of the bound fork): GET …/changes/1 -> 200; GET …/changes/2, …/changes/2/versions, …/changes/2/versions/1, …/changes/2/diff, …/changes/by-commit/<head of change 2> -> 404 change_not_found; GET …/changes?state=draft&state=open&state=landed -> items == [change 1]"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "Listing changes",
+      "rationale": "Agents and reviewers find the work that concerns them without reading every change.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "event_driven",
+          "condition": "a caller requests GET /workspaces/:slug/changes without filters",
+          "action": "return the changes in state draft or open, ordered by updated_at descending and then number descending, each without the member conflict and without the members paths and paths_truncated",
+          "contract": "HTTP 200 with {items, next_cursor}; with include=paths every item carries paths and paths_truncated; an include value other than paths answers HTTP 400 with error_type 'invalid_request'",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)",
+              "demo holds changes 1..8 with distinct updated_at values and a mix of: states draft, open, landed, abandoned; targets main and release; sources in demo and in forks 'demo--f1' and 'demo--f2'; authors u1 and m; sessions; labels; paths; mergeable and landing.status values set through the component's setters; changes 4 <- 5 <- 6 linked by depends_on"
+            ],
+            "pseudocode": "in internal/change/list_test.go: r = GET /workspaces/demo/changes; assert every item.state in {draft, open}; assert items are sorted by (updated_at desc, number desc); assert no item has the key 'conflict' or 'paths'; r2 = GET …?include=paths: every item has 'paths' and 'paths_truncated' and no 'conflict'; GET …?include=versions -> 400 invalid_request"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "event_driven",
+          "condition": "the list request carries one or more of the filters state (repeatable), target_branch, source_workspace, author, session_id, label, path, mergeable and landing_status",
+          "action": "return exactly the changes that satisfy every given filter, where state matches any of its values, author is a user id or me for the caller's user, session_id matches a change that has the session among its sessions, label matches a change that carries the label, and path is a glob that matches at least one of the change's stored paths",
+          "contract": "HTTP 200 with the matching changes only, in the default order",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)",
+              "demo holds changes 1..8 with distinct updated_at values and a mix of: states draft, open, landed, abandoned; targets main and release; sources in demo and in forks 'demo--f1' and 'demo--f2'; authors u1 and m; sessions; labels; paths; mergeable and landing.status values set through the component's setters; changes 4 <- 5 <- 6 linked by depends_on"
+            ],
+            "pseudocode": "in internal/change/list_test.go, a table of query -> expected set of numbers, one row per filter and two combined rows: state=landed; state=draft&state=abandoned; target_branch=release; source_workspace=demo--f1; author=<u1 id>; author=me as m; session_id=s1 (a session of an earlier version, not the current one); label=perf; path=docs/** ; path=src/*.go ; mergeable=conflict; landing_status=blocked; target_branch=main&label=perf&state=open; a filter that matches nothing -> items == [] and next_cursor == null"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "event_driven",
+          "condition": "the list request carries sort=number or stack_of=<number>",
+          "action": "order the result by number ascending for sort=number, and for stack_of return every change of that change's stack, in any state, lowest change of the stack first, following the stored depends_on links",
+          "contract": "HTTP 200; with sort=number the numbers ascend; with stack_of the items are the chain from the change that depends on nothing up to the top, whichever member of the stack was named",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)",
+              "demo holds changes 1..8 with distinct updated_at values and a mix of: states draft, open, landed, abandoned; targets main and release; sources in demo and in forks 'demo--f1' and 'demo--f2'; authors u1 and m; sessions; labels; paths; mergeable and landing.status values set through the component's setters; changes 4 <- 5 <- 6 linked by depends_on"
+            ],
+            "pseudocode": "in internal/change/list_test.go: GET …?sort=number&state=draft&state=open&state=landed&state=abandoned -> numbers == [1..8]; GET …?stack_of=5 -> [4,5,6]; GET …?stack_of=6 -> [4,5,6]; GET …?stack_of=4 -> [4,5,6]; GET …?stack_of=1 (no links) -> [1]; GET …?stack_of=5&sort=number&state=landed -> [4,5,6]"
+          }
+        },
+        {
+          "id": "REQ-7.4",
+          "pattern": "event_driven",
+          "condition": "the list is requested on a fork's slug by a caller with read access to the fork",
+          "action": "return the changes of the fork's parent whose source workspace is the fork, with the same filters and order",
+          "contract": "HTTP 200 with only changes whose source.workspace_slug is the fork and whose workspace_slug is the parent",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)",
+              "demo holds changes 1..8 with distinct updated_at values and a mix of: states draft, open, landed, abandoned; targets main and release; sources in demo and in forks 'demo--f1' and 'demo--f2'; authors u1 and m; sessions; labels; paths; mergeable and landing.status values set through the component's setters; changes 4 <- 5 <- 6 linked by depends_on"
+            ],
+            "pseudocode": "in internal/change/list_test.go: r = GET /workspaces/demo--f1/changes?state=draft&state=open&state=landed&state=abandoned; assert every item.source.workspace_slug == 'demo--f1' and item.workspace_slug == 'demo' and the set of numbers == the changes created from f1; GET /workspaces/demo--f2/changes?label=perf applies the filter within f2's changes"
+          }
+        },
+        {
+          "id": "REQ-7.5",
+          "pattern": "unwanted",
+          "condition": "a list filter has a value outside its domain: a state other than draft, open, landed or abandoned, a mergeable other than clean, conflict or unknown, a landing_status other than ready, pending or blocked, a sort other than number, author=me from the admin token, or a stack_of that is not a positive integer",
+          "action": "refuse the request",
+          "contract": "HTTP 400 with error_type 'invalid_request'; a stack_of that names no change of the workspace answers HTTP 404 with error_type 'change_not_found'",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)",
+              "demo holds changes 1..8 with distinct updated_at values and a mix of: states draft, open, landed, abandoned; targets main and release; sources in demo and in forks 'demo--f1' and 'demo--f2'; authors u1 and m; sessions; labels; paths; mergeable and landing.status values set through the component's setters; changes 4 <- 5 <- 6 linked by depends_on"
+            ],
+            "pseudocode": "in internal/change/list_test.go, a table: state=closed; mergeable=maybe; landing_status=green; sort=title; author=me with the admin token; stack_of=x; stack_of=0 -> 400 invalid_request; stack_of=99 -> 404 change_not_found"
+          }
+        },
+        {
+          "id": "REQ-7.6",
+          "pattern": "ubiquitous",
+          "action": "for any filter and either order, return every matching change exactly once across the pages obtained by following next_cursor with any limit from 1 to 200",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)",
+              "demo holds changes 1..8 with distinct updated_at values and a mix of: states draft, open, landed, abandoned; targets main and release; sources in demo and in forks 'demo--f1' and 'demo--f2'; authors u1 and m; sessions; labels; paths; mergeable and landing.status values set through the component's setters; changes 4 <- 5 <- 6 linked by depends_on"
+            ],
+            "pseudocode": "in internal/change/list_test.go, a table over {default order, sort=number} x limit in {1, 3, 200} with all four states requested: follow next_cursor until null; assert the concatenated numbers have no duplicate, equal the unpaged result in order, and the last page has next_cursor == null"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "Diff and interdiff",
+      "rationale": "A reviewer re-reads only what moved between two versions, not what a rebase dragged in.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "a caller requests GET /workspaces/:slug/changes/:number/diff without against",
+          "action": "return the diff of the named version, or of the current version when version is absent or latest, from its base_sha to its head_sha, computed by the diff component of the source control API with rename detection and its limits",
+          "contract": "HTTP 200 with {base_sha, head_sha, merge_base_sha, files, stats, truncated, version, against}, where base_sha and merge_base_sha are the version's base_sha, head_sha is its head_sha, version is the resolved number, against is null and every file is a file change object with a patch",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)",
+              "change 1 from 'feat' with version 1 (a.txt and b.txt changed), version 2 (rebased onto a moved main, same content: patch-equivalent to 1) and version 3 (b.txt changed further, c.txt added)"
+            ],
+            "pseudocode": "in internal/change/diff_test.go: r = GET …/changes/1/diff; assert r.status == 200 and r.json.version == 3 and r.json.against == null; assert base_sha == versions[2].base_sha == merge_base_sha and head_sha == versions[2].head_sha; assert [f.path for f in files] == ['a.txt','b.txt','c.txt'] and each has status, insertions, deletions and a non-empty patch; assert truncated == false; r1 = GET …/diff?version=1 -> version 1 and files a.txt, b.txt"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "event_driven",
+          "condition": "the diff request carries against with the number of another version of the same change",
+          "action": "return the interdiff: one entry for every file either version touches, with changed true when the file's patch against the version's own base differs between the two versions or only one of them touches it, and for a changed file the unified diff from its content at the head of against to its content at the head of version",
+          "contract": "HTTP 200 with base_sha the head of against, head_sha the head of version, merge_base_sha null, version and against the two numbers, files each carrying changed, a patch only where changed is true, and stats counting the changed files only",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)",
+              "change 1 from 'feat' with version 1 (a.txt and b.txt changed), version 2 (rebased onto a moved main, same content: patch-equivalent to 1) and version 3 (b.txt changed further, c.txt added)"
+            ],
+            "pseudocode": "in internal/change/diff_test.go: r = GET …/changes/1/diff?version=3&against=1; assert r.json.version == 3 and r.json.against == 1 and merge_base_sha == null; byPath = files by path; assert byPath['a.txt'].changed == false and 'patch' not in byPath['a.txt']; assert byPath['b.txt'].changed == true and its patch contains the lines added in version 3 and none of the lines that main gained between the versions; assert byPath['c.txt'].changed == true and status == 'added'; assert stats.files_changed == 2; and against=3&version=1 lists c.txt as changed with status 'deleted'"
+          }
+        },
+        {
+          "id": "REQ-8.3",
+          "pattern": "ubiquitous",
+          "action": "for any two versions of a change of which one is patch-equivalent to the other, and for a version compared with itself, return an interdiff in which no file is changed",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)",
+              "change 1 from 'feat' with version 1 (a.txt and b.txt changed), version 2 (rebased onto a moved main, same content: patch-equivalent to 1) and version 3 (b.txt changed further, c.txt added)"
+            ],
+            "pseudocode": "in internal/change/diff_test.go, a table over (version, against) in {(2,1), (1,2), (3,3)}: r = GET …/diff?version=V&against=A; assert r.status == 200; assert every file.changed == false and no file has a patch; assert stats == {files_changed:0, insertions:0, deletions:0} apart from the commits member"
+          }
+        },
+        {
+          "id": "REQ-8.4",
+          "pattern": "event_driven",
+          "condition": "the diff request carries path globs, patches=false or format=patch",
+          "action": "limit the files to those matching at least one path glob, leave the patch out of every file when patches is false, and for format=patch answer the patch text of the files that would carry a patch",
+          "contract": "with path: only matching files and stats over them; with patches=false: no file has a patch; with format=patch: HTTP 200 with content type text/x-diff and a body that git apply --check accepts on the left-hand commit",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)",
+              "change 1 from 'feat' with version 1 (a.txt and b.txt changed), version 2 (rebased onto a moved main, same content: patch-equivalent to 1) and version 3 (b.txt changed further, c.txt added)"
+            ],
+            "pseudocode": "in internal/change/diff_test.go, a table: {?path=b.* -> files == [b.txt]}; {?path=a.txt&path=c.txt -> files == [a.txt, c.txt]}; {?path=zzz/** -> files == [] and stats.files_changed == 0}; {?patches=false -> no 'patch' key in any file, with and without against=1}; {?format=patch -> content type starts with 'text/x-diff', body applies with git apply --check on base_sha}; {?format=patch&against=1 -> body applies on the head of version 1 and mentions b.txt and c.txt but not a.txt}"
+          }
+        },
+        {
+          "id": "REQ-8.5",
+          "pattern": "unwanted",
+          "condition": "the diff request has a version that is neither a positive integer nor latest, an against that is not a positive integer, a format other than json or patch, a patches value that is not a boolean, or names a version number the change does not have",
+          "action": "refuse the request",
+          "contract": "HTTP 400 with error_type 'invalid_request' for a malformed value; HTTP 404 with error_type 'not_found' for a version or against number the change does not have",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)",
+              "change 1 from 'feat' with version 1 (a.txt and b.txt changed), version 2 (rebased onto a moved main, same content: patch-equivalent to 1) and version 3 (b.txt changed further, c.txt added)"
+            ],
+            "pseudocode": "in internal/change/diff_test.go, a table: version=x; version=0; against=latest; against=-2; format=html; patches=maybe -> 400 invalid_request; version=9; against=9 -> 404 not_found"
+          }
+        },
+        {
+          "id": "REQ-8.6",
+          "pattern": "unwanted",
+          "condition": "the head or base commit of a version named by a diff request no longer exists in the target workspace's repository",
+          "action": "refuse the request, while reads of the change and version records still succeed",
+          "contract": "HTTP 404 with error_type 'ref_not_found' on GET …/diff; GET …/changes/:number and GET …/versions still answer HTTP 200",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)",
+              "change 1 from 'feat' with version 1 (a.txt and b.txt changed), version 2 (rebased onto a moved main, same content: patch-equivalent to 1) and version 3 (b.txt changed further, c.txt added)"
+            ],
+            "pseudocode": "in internal/change/diff_test.go: simulate a reclone by replacing the repository directory of demo with a fresh git init --bare holding only main; r = GET …/changes/1/diff; assert r.status == 404 and error.error_type == 'ref_not_found'; the same for ?version=3&against=1; assert GET …/changes/1 is 200 and GET …/changes/1/versions lists 3 versions"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-9",
+      "title": "Lookups and setters for other components",
+      "rationale": "The source control API, sessions, stacks, policy and landing all read or annotate the same change record.",
+      "system": "change component",
+      "criteria": [
+        {
+          "id": "REQ-9.1",
+          "pattern": "event_driven",
+          "condition": "another component asks ChangeOfCommit for a workspace and a full commit id",
+          "action": "answer with the workspace slug, change number and version of the change that has the commit as a version head or landed it, by the same preference as the by-commit route, or answer that there is none",
+          "contract": "returns {workspace_slug, number, version} and found = true, or found = false with no error for a commit of no change; the result equals what GET …/changes/by-commit/:sha reports for the same commit",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)",
+              "change 1 (open, from fork 'demo--m1', 3 versions, session 's1'), change 2 (draft, from demo branch 'b2'), change 3 (marked landed, with one landed-commit record) in demo"
+            ],
+            "pseudocode": "in internal/change/lookup_test.go, with the fixture of the by-commit table in internal/change/read_test.go: for each row, got, found = ChangeOfCommit('demo', sha); assert found == (the route answered 200) and, when found, got.number and got.version equal the route's change.number and version; assert ChangeOfCommit('other', the same sha) is not found"
+          }
+        },
+        {
+          "id": "REQ-9.2",
+          "pattern": "event_driven",
+          "condition": "another component asks OpenChangeOfBranch for a workspace and a branch name",
+          "action": "answer with the target workspace slug and number of the draft or open change whose source is that branch of that workspace, or answer that there is none",
+          "contract": "returns {workspace_slug, number} and found = true for a draft or open change, where workspace_slug is the target workspace also when the branch is in a fork; found = false for a branch whose only changes are landed or abandoned, and for a branch with none",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)",
+              "change 1 (open, from fork 'demo--m1', 3 versions, session 's1'), change 2 (draft, from demo branch 'b2'), change 3 (marked landed, with one landed-commit record) in demo"
+            ],
+            "pseudocode": "in internal/change/lookup_test.go, a table: {('demo--m1', 'task') -> {workspace_slug:'demo', number:1}}; {('demo', 'b2') (draft) -> number 2}; {the source branch of landed change 3 -> not found}; {('demo', 'main') -> not found}; {('demo', 'task') (right name, wrong workspace) -> not found}"
+          }
+        },
+        {
+          "id": "REQ-9.3",
+          "pattern": "event_driven",
+          "condition": "versions of a change were recorded under sessions",
+          "action": "list on the change, as sessions, every session that contributed a version, each once and in the order of first contribution, keep session_id as the session of the current version, and answer ChangesOfSession with every change, across workspaces, that has a version of that session",
+          "contract": "the change object's sessions holds each contributing session once; ChangesOfSession(session) returns the {workspace_slug, number} of each such change ordered by workspace slug and number, and an empty result for a session of no version",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)"
+            ],
+            "pseudocode": "in internal/change/lookup_test.go: on change 1 record versions with sessions s1, s2, none, s1; assert change.sessions == ['s1','s2'] and change.session_id == 's1'; after the version without a session assert session_id == null and sessions == ['s1','s2']; open change 2 in workspace 'other' with session s2; assert ChangesOfSession('s2') == [{demo,1},{other,2}] and ChangesOfSession('s9') == []"
+          }
+        },
+        {
+          "id": "REQ-9.4",
+          "pattern": "event_driven",
+          "condition": "another component sets, inside a store transaction, one of the fields it computes on a change: depends_on, the base of the current version (base_sha with stats, paths and patch id recomputed against it), mergeable with conflict, needs_restack with restack_reason, landing, landed with its landed-commit records and state landed, reverts or reverted_by",
+          "action": "store the value, set updated_at, and derive dependants of every change as the numbers of the draft and open changes whose depends_on names it",
+          "contract": "after commit GET …/changes/:number returns the stored values; dependants of the lower change lists the dependant in ascending order; a setter called for a change that does not exist returns the change-not-found error and stores nothing; values set in a transaction that is rolled back are not visible",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)"
+            ],
+            "pseudocode": "in internal/change/lookup_test.go: changes 1, 2, 3 open on main; set depends_on of 2 and 3 to 1 -> get(1).dependants == [2,3]; mark 3 abandoned -> get(1).dependants == [2]; set mergeable 'conflict' with a report R on 2 -> get(2).mergeable == 'conflict' and get(2).conflict == R; set mergeable 'clean' -> conflict == null; set needs_restack true with reason 'conflict'; set landing {status:'pending', reason:null, requirements:[x]}; set landed {sha, at, by, land_id, commits:[{version_sha, landed_sha}]} on 1 -> get(1).state == 'landed' and get(1).landed.commits has 1 item and ChangeOfCommit(landed_sha).number == 1; setter on change 99 -> errors.Is(err, the change-not-found error); a setter inside a rolled-back transaction leaves the old value"
+          }
+        },
+        {
+          "id": "REQ-9.5",
+          "pattern": "event_driven",
+          "condition": "another component asks ChangeNumbersOfSource for a workspace slug",
+          "action": "answer with the numbers of every change, in any state, whose source workspace is that workspace, each with the slug of its target workspace",
+          "contract": "returns the list of {workspace_slug, number} ordered by number, and an empty list with no error for a workspace that is the source of no change; the fork view of package 17 uses it to decide which version refs a fork advertises",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' and its fork 'demo--t1' as bare repositories made with git init, and stub collaborators (workspace reader, session linker, recording event writer)"
+            ],
+            "pseudocode": "in internal/change/lookup_test.go: open change 1 from demo--t1/work, change 2 from demo/feat and change 3 from demo--t1/other; abandon 3; assert ChangeNumbersOfSource('demo--t1') == [{demo,1},{demo,3}]; assert ChangeNumbersOfSource('demo') == [{demo,2}]; assert ChangeNumbersOfSource('nosuch') == [] with no error"
+          }
+        },
+        {
+          "id": "REQ-9.6",
+          "pattern": "event_driven",
+          "condition": "a change whose source workspace is a task fork is opened, or is moved to state abandoned through the setter of this package",
+          "action": "report the fork's slug once to the registered fork activity recorder",
+          "contract": "the recorder (the interface ForkActivity of internal/change, which package 16 registers) is called once with the source fork's slug per open and per move to abandoned; it is not called for a change whose source is a repository workspace, by ForkDeleted, nor for the move to landed (package 16 registers its own after-landing hook with package 25); a recorder error is logged and changes nothing; with no recorder registered nothing happens",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' and its fork 'demo--t1', stub collaborators and a recording fork activity recorder"
+            ],
+            "pseudocode": "in internal/change/lookup_test.go: open change 1 from demo--t1/work -> recorder.calls == ['demo--t1']; open change 2 from demo/feat -> no new call; move 1 to abandoned through the setter -> one more call with 'demo--t1'; open change 3 from demo--t1/other (one more call) and set it landed -> no call for the landing; ForkDeleted('demo--t1') -> no call; with a recorder that returns an error the open still answers the change"
+          }
+        },
+        {
+          "id": "REQ-9.7",
+          "pattern": "event_driven",
+          "condition": "another component asks ReadChange for a workspace slug and a change number",
+          "action": "answer with the change record of that number in that workspace, without a scope or access check",
+          "contract": "returns the change with the fields GET …/changes/:number shows (among them state, target_branch, source, version, head_sha, base_sha, depends_on, session_id, mergeable, landing, auto_land, landed, reverts and reverted_by); called with a store transaction it sees what that transaction has written; an unknown number, and a number of another workspace, return the change-not-found error; packages 27, 29 and 30 use this one read",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)",
+              "change 1 (open, from fork 'demo--m1', 3 versions, session 's1'), change 2 (draft, from demo branch 'b2'), change 3 (marked landed, with one landed-commit record) in demo"
+            ],
+            "pseudocode": "in internal/change/lookup_test.go: c = ReadChange('demo', 1); assert c equals the body of GET /workspaces/demo/changes/1 member by member; assert ReadChange('demo', 3).state == 'landed' and its landed member is set; assert errors.Is(ReadChange('demo', 99), the change-not-found error) and the same for ReadChange('other', 1); inside a store transaction set landing {status:'pending'} on change 1 and assert ReadChange with that transaction returns landing.status 'pending' while ReadChange without it still returns the old value; roll back"
+          }
+        },
+        {
+          "id": "REQ-9.8",
+          "pattern": "event_driven",
+          "condition": "another component calls Open with reverts set to the number of a change and the version kind revert",
+          "action": "open the change as any other, record version 1 with kind revert and store reverts on the change in the same transaction",
+          "contract": "the returned change has reverts equal to the given number and reverted_by null; its version 1 has kind 'revert'; the event parley.change.version carries kind 'revert'; reverted_by of the reverted change is not touched by Open (package 29 sets it through the setter); a change opened through POST …/changes always has reverts null and version 1 of kind 'ref'",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub from httptest with a migrated store in t.TempDir(), the workspace 'demo' (owner u1, default branch main) as a bare repository made with git init, and stub collaborators (workspace reader, session linker, recording event writer)",
+              "change 1 marked landed in demo, and a branch 'revert/1' of demo with one commit ahead of main"
+            ],
+            "pseudocode": "in internal/change/open_test.go: in a store transaction c = Open({source: demo/'revert/1', target 'main', reverts: 1, kind: 'revert', author u1, credential {api_key, k1}}); commit; assert c.reverts == 1 and c.reverted_by == null; assert GET …/changes/<c.number>/versions/1 has kind 'revert'; assert the recorded parley.change.version event has metadata.kind == 'revert'; assert ReadChange('demo', 1).reverted_by == null; then POST /workspaces/demo/changes from another branch -> assert reverts == null and version 1 kind == 'ref'"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-10",
+      "title": "The change commands of the CLI",
+      "rationale": "The same operations must be scriptable from a shell without writing HTTP.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-10.1",
+          "pattern": "event_driven",
+          "condition": "a user runs parley change open <slug> with --source and any of --source-workspace, --target, --title, --intent, --draft, --depends-on, --auto-land, --label (repeatable) and --session",
+          "action": "send POST /api/v1/workspaces/<slug>/changes with a body that holds source.branch and one member for each flag given and no member for a flag not given, then print the response body",
+          "contract": "the request body maps --source-workspace to source.workspace_slug, --target to target_branch, --title to title, --intent to intent, --draft to draft true, --depends-on to depends_on as a number, --auto-land to auto_land true, --label values to labels and --session to session_id; stdout is the response as one JSON document indented by 2 spaces; exit code 0",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a fake hub from httptest.NewServer that records each request's method, path, query and body and answers a canned JSON body",
+              "the CLI root command run in-process with --endpoint-url pointing at the fake hub and --api-key set"
+            ],
+            "pseudocode": "in internal/cli/change_test.go, a table: {change open demo --source feat -> body == {source:{branch:'feat'}}}; {… --source task --source-workspace demo--m1 --target release --title T --intent I --draft --depends-on 4 --auto-land --label a --label b --session s1 -> body == {source:{workspace_slug:'demo--m1', branch:'task'}, target_branch:'release', title:'T', intent:'I', draft:true, depends_on:4, auto_land:true, labels:['a','b'], session_id:'s1'}}; for each assert method POST, path /api/v1/workspaces/demo/changes, stdout parses to the canned body, exit 0; a slug 'a/b' is sent as the path segment 'a%2Fb'"
+          }
+        },
+        {
+          "id": "REQ-10.2",
+          "pattern": "event_driven",
+          "condition": "--intent is given as @<file> or as -",
+          "action": "send the content of the file, or of standard input, as the intent",
+          "contract": "the request's intent equals the bytes read, as text; a file that cannot be read sends no request, prints the error envelope with code 0 and error_type 'client_error' on stderr and exits 2",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a fake hub from httptest.NewServer that records each request's method, path, query and body and answers a canned JSON body",
+              "the CLI root command run in-process with --endpoint-url pointing at the fake hub and --api-key set"
+            ],
+            "pseudocode": "in internal/cli/change_test.go: write 'why\\nline 2\\n' to a file f in t.TempDir(); run change open demo --source feat --intent @f -> body.intent == 'why\\nline 2\\n'; run with --intent - and stdin 'from stdin' -> body.intent == 'from stdin'; run with --intent @<missing path> -> the fake hub received 0 requests, stderr parses to {error:{code:0, error_type:'client_error', …}}, stdout is empty, exit code 2"
+          }
+        },
+        {
+          "id": "REQ-10.3",
+          "pattern": "event_driven",
+          "condition": "a user runs parley change list <slug> with any of --state (repeatable), --target, --author, --session, --label, --path, --mergeable, --landing-status, --stack-of, --limit and --cursor",
+          "action": "send GET /api/v1/workspaces/<slug>/changes with one query parameter per flag given and print the response body",
+          "contract": "the query maps --state to state (once per value), --target to target_branch, --author to author, --session to session_id, --label to label, --path to path, --mergeable to mergeable, --landing-status to landing_status, --stack-of to stack_of, --limit to limit and --cursor to cursor; no parameter is sent for a flag not given; exit code 0",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a fake hub from httptest.NewServer that records each request's method, path, query and body and answers a canned JSON body",
+              "the CLI root command run in-process with --endpoint-url pointing at the fake hub and --api-key set"
+            ],
+            "pseudocode": "in internal/cli/change_test.go, a table: {change list demo -> query empty}; {… --state draft --state landed --target main --author me --session s1 --label perf --path 'docs/**' --mergeable clean --landing-status ready --stack-of 4 --limit 10 --cursor abc -> query == {state:[draft,landed], target_branch:[main], author:[me], session_id:[s1], label:[perf], path:[docs/**], mergeable:[clean], landing_status:[ready], stack_of:[4], limit:[10], cursor:[abc]}}; assert stdout parses to the canned list and exit 0"
+          }
+        },
+        {
+          "id": "REQ-10.4",
+          "pattern": "event_driven",
+          "condition": "a user runs parley change show <slug> <number> (optionally with --include <list>), parley change find <slug> <sha> or parley change versions <slug> <number>",
+          "action": "send GET to /changes/<number> with include when given, to /changes/by-commit/<sha>, or to /changes/<number>/versions, under /api/v1/workspaces/<slug>, and print the response body",
+          "contract": "one GET request to the named path; stdout is the response as one JSON document; exit code 0; a hub error is printed on stderr as received and the exit code is 1",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a fake hub from httptest.NewServer that records each request's method, path, query and body and answers a canned JSON body",
+              "the CLI root command run in-process with --endpoint-url pointing at the fake hub and --api-key set"
+            ],
+            "pseudocode": "in internal/cli/change_test.go, a table: {change show demo 12 -> GET /api/v1/workspaces/demo/changes/12, no query}; {change show demo 12 --include versions,stack -> query include == 'versions,stack'}; {change find demo <40 hex> -> GET …/changes/by-commit/<sha>}; {change versions demo 12 -> GET …/changes/12/versions}; one row where the fake hub answers 404 {error:{code:404, error_type:'change_not_found', message:'…'}}: stderr parses to that envelope, stdout empty, exit 1"
+          }
+        },
+        {
+          "id": "REQ-10.5",
+          "pattern": "event_driven",
+          "condition": "a user runs parley change diff <slug> <number> with any of --version, --against, --path (repeatable), --patch and --name-only",
+          "action": "send GET /api/v1/workspaces/<slug>/changes/<number>/diff with version, against and path from the flags, format=patch for --patch and patches=false for --name-only, and print what the hub answers",
+          "contract": "with --patch stdout is the patch text exactly as received; otherwise stdout is the response as one JSON document; exit code 0",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a fake hub from httptest.NewServer that records each request's method, path, query and body and answers a canned JSON body",
+              "the CLI root command run in-process with --endpoint-url pointing at the fake hub and --api-key set"
+            ],
+            "pseudocode": "in internal/cli/change_test.go, a table: {change diff demo 12 -> query empty, JSON printed}; {… --version 3 --against 1 --path 'a/**' --path b.txt -> query == {version:[3], against:[1], path:[a/**, b.txt]}}; {… --name-only -> query patches == 'false'}; {… --patch with the fake hub answering text/x-diff 'diff --git a/x b/x\\n…' -> query format == 'patch' and stdout == the body byte for byte}"
+          }
+        },
+        {
+          "id": "REQ-10.6",
+          "pattern": "unwanted",
+          "condition": "a change command is run without a required argument or flag, with too many arguments, with a <number>, --version, --against, --depends-on or --stack-of that is not a positive integer, or with both --patch and --name-only",
+          "action": "send no request and report a usage error",
+          "contract": "stderr carries the error envelope with code 0 and error_type 'usage_error'; stdout is empty; exit code 2",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a fake hub from httptest.NewServer that records each request's method, path, query and body and answers a canned JSON body",
+              "the CLI root command run in-process with --endpoint-url pointing at the fake hub and --api-key set"
+            ],
+            "pseudocode": "in internal/cli/change_test.go, a table: change open demo (no --source); change open (no slug); change show demo; change show demo x; change show demo 1 2; change find demo; change versions demo 0; change diff demo 1 --version x; change diff demo 1 --patch --name-only; change list demo --stack-of -1; change open demo --source f --depends-on z: assert the fake hub received 0 requests, stderr parses to an envelope with error_type 'usage_error' and code 0, stdout == '', exit code 2"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "A developer opens a change and reads it back by number, by commit and by ref",
+      "steps": [
+        {
+          "actor": "git client",
+          "action": "pushes branch feat with two commits to the workspace demo over smart HTTP"
+        },
+        {
+          "actor": "developer",
+          "action": "runs parley change open demo --source feat --intent 'why'"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends POST /api/v1/workspaces/demo/changes with the source branch and the intent"
+        },
+        {
+          "actor": "parleyd",
+          "action": "authorizes the caller, validates the source against main, allocates number 1, records version 1, writes refs/parley/changes/1/1 and the events parley.change.version and parley.change.open in one transaction, and answers 201"
+        },
+        {
+          "actor": "developer",
+          "action": "runs parley change show demo 1 --include versions and parley change find demo <head commit>"
+        },
+        {
+          "actor": "parleyd",
+          "action": "returns the change with its version list, and the change with version 1 for the commit"
+        },
+        {
+          "actor": "git client",
+          "action": "fetches refs/parley/changes/1/1 from the workspace and receives the head commit"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parleyd started in-process by its run function on 127.0.0.1:0",
+          "the parley CLI command tree",
+          "internal/change",
+          "internal/store on a real database file",
+          "internal/gitrepo with the git binary",
+          "the git smart HTTP server",
+          "stock git as client"
+        ],
+        "setup": [
+          "a hub with a ready workspace 'demo' whose default branch is main, and a developer API key that owns it",
+          "a local clone with branch feat two commits ahead of main"
+        ],
+        "end_state": [
+          "parley change open exits 0 and prints a change with number 1, state open, version 1 and the given intent",
+          "parley change show demo 1 --include versions prints one version whose head_sha is the pushed head",
+          "parley change find prints that change with version 1 and landed false",
+          "git fetch origin refs/parley/changes/1/1 succeeds and FETCH_HEAD equals the pushed head",
+          "the hub's event log holds parley.change.version and then parley.change.open for change 1"
+        ],
+        "pseudocode": "in test/e2e/change_test.go: hub = start hub; git push origin feat; out = run('parley change open demo --source feat --intent why'); assert exit 0 and out.number == 1 and out.state == 'open' and out.intent == 'why'; show = run('parley change show demo 1 --include versions'); assert show.versions[0].head_sha == rev-parse feat; found = run('parley change find demo ' + head); assert found.change.number == 1 and found.version == 1 and found.landed == false; git fetch origin refs/parley/changes/1/1; assert rev-parse FETCH_HEAD == head"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "An agent commits to the source branch through the API and reads what moved between two versions",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "opens a change from branch feat with POST /api/v1/workspaces/demo/changes"
+        },
+        {
+          "actor": "parleyd",
+          "action": "records version 1 and answers 201"
+        },
+        {
+          "actor": "agent",
+          "action": "creates a commit on feat through the commit route of the source control API, changing one file"
+        },
+        {
+          "actor": "parleyd",
+          "action": "moves the branch with a compare-and-swap and, in the transaction of that ref update, records version 2 of kind commit, writes refs/parley/changes/1/2 and the event parley.change.version"
+        },
+        {
+          "actor": "agent",
+          "action": "runs parley change versions demo 1 and parley change diff demo 1 --against 1"
+        },
+        {
+          "actor": "parleyd",
+          "action": "returns the two versions, oldest first, and the interdiff in which only the file of the new commit is changed"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parleyd started in-process by its run function on 127.0.0.1:0",
+          "the parley CLI command tree",
+          "internal/change",
+          "internal/scm commit route",
+          "internal/store on a real database file",
+          "internal/gitrepo with the git binary"
+        ],
+        "setup": [
+          "a hub with a ready workspace 'demo' and branch feat one commit ahead of main, changing a.txt",
+          "an agent PAT with git:write, changes:write and changes:read owned by the workspace's owner"
+        ],
+        "end_state": [
+          "the change has version 2 whose head_sha is the commit the API returned, and versions/2 has kind commit",
+          "refs/parley/changes/1/1 and refs/parley/changes/1/2 both resolve in the workspace's repository",
+          "parley change diff demo 1 --against 1 prints an interdiff with version 2, against 1, the new commit's file changed and a.txt not changed"
+        ],
+        "pseudocode": "in test/e2e/change_test.go: POST /changes {source:{branch:'feat'}} -> 201; c = POST /scm/commits {branch:'feat', expected_head_sha:head, message:'more', operations:[put b.txt]} -> 201; ch = GET /changes/1; assert ch.version == 2 and ch.head_sha == c.commit.sha; vs = run('parley change versions demo 1'); assert [v.number for v in vs.items] == [1,2] and vs.items[1].kind == 'commit'; d = run('parley change diff demo 1 --against 1'); assert d.version == 2 and d.against == 1; assert file b.txt has changed == true and file a.txt has changed == false"
+      }
+    }
+  ],
+  "external_apis": [
+    {
+      "package": "github.com/spf13/cobra",
+      "version": "v1.10.2",
+      "verified": false,
+      "symbols": [
+        {
+          "name": "Command",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "type Command struct { Use string; Short string; Args PositionalArgs; RunE func(cmd *Command, args []string) error; ... }"
+        },
+        {
+          "name": "ExactArgs",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func ExactArgs(n int) PositionalArgs"
+        },
+        {
+          "name": "(*Command).Flags",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) Flags() *pflag.FlagSet"
+        }
+      ]
+    }
+  ]
+}

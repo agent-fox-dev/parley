@@ -1,0 +1,319 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "51",
+  "spec_name": "audit_query_and_retention",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/audit/... ./internal/metrics/... ./internal/telemetry/... ./internal/session/... ./internal/event/... ./internal/cli/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "50",
+      "reason": "reads and prunes the telemetry records its store holds, and through it the session store of package 49"
+    },
+    {
+      "spec": "52",
+      "reason": "reads hub events under its visibility rule for the audit query and trims its event log and store in retention"
+    },
+    {
+      "spec": "09",
+      "reason": "builds `parley audit query` on its HTTP client, output, exit codes and command helper"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Build the metric catalogue, the registry and the recorder",
+      "criteria": [
+        "REQ-9"
+      ],
+      "steps": [
+        "Add the catalogue, report, source, replace, refusal, failing-source and concurrency behaviours to internal/metrics/catalogue_test.go and internal/metrics/registry_test.go and confirm they fail",
+        "Create internal/metrics as a package that imports nothing of the project except the logger interface it is given; write the catalogue as one table of 27 entries taken from the Metrics section of the PRD: name, help text, type, label names in documented order, the closed value list of each closed label (open labels have none) and, for the four histograms, the bucket bounds",
+        "Create the registry: New returns one that already holds, for every catalogue entry, a zero series for each combination of closed label values; for a metric with an open label the zero series carries the empty string in each open label and is dropped from the output as soon as the metric has a reported or sourced series",
+        "Define the Recorder interface with Add (counter), Set (gauge), Observe (histogram) and SetFamily (replace every series of a gauge), each taking the metric name and a label map and returning an error; the registry implements it; also provide a recorder that accepts everything and records nothing, for the tests of other packages",
+        "Make a histogram observation count in every bucket whose bound is at least the value, in +Inf, in the sum and in the count; a value equal to a bound falls into that bound's bucket",
+        "Add RegisterSource for counters and gauges: one function per metric that returns samples (label map and value) or an error; the registry calls it once per exposition, merges its samples over the zero series of closed label combinations and never caches them",
+        "Refuse with an error naming the metric, changing nothing: a name outside the catalogue, label names that are not exactly the metric's, a value outside a closed set, a call that does not fit the metric's type, a negative counter amount, a source for a histogram and a second source for one metric",
+        "When a source returns an error or panics, export that metric's zero series for this scrape and log the metric's name; drop a single sample whose labels do not fit and keep the valid ones; never let a source fail the exposition",
+        "Guard all state so that reports and expositions from many goroutines are safe; confirm with the race detector"
+      ],
+      "touches": [
+        "internal/metrics/catalogue.go",
+        "internal/metrics/registry.go",
+        "internal/metrics/recorder.go",
+        "internal/metrics/source.go",
+        "internal/metrics/catalogue_test.go",
+        "internal/metrics/registry_test.go"
+      ],
+      "done_when": [
+        "`go test ./internal/metrics/... -race -count=1` passes"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Serve `/metrics` and count every HTTP request",
+      "criteria": [
+        "REQ-10"
+      ],
+      "steps": [
+        "Add the exposition, escaping, request-counting and wrong-method behaviours to internal/metrics/expose_test.go, handler_test.go and http_test.go and confirm they fail",
+        "Write the text exposition (format 0.0.4): families in catalogue order, one `# HELP` and one `# TYPE` line each, samples sorted by label values in the catalogue's label order, histograms as `_bucket` lines with cumulative counts and an `le` label ending in `+Inf`, then `_sum` and `_count`",
+        "Escape label values: backslash, double quote and line feed; write values so that an integer prints without an exponent",
+        "Add the handler for `GET /metrics`: status 200, `Content-Type: text/plain; version=0.0.4; charset=utf-8`, no authentication whatever the Authorization header holds; register it on the hub's router as a public route outside `/api/v1` with the method `GET`, so that the router answers other methods with 405 and an `Allow` header",
+        "Add the request instrumentation as a wrapper around the hub's whole handler (REST, git, webhook ingress, probes, `/metrics`): it takes the start time from the replaceable clock, lets the router serve, then reads the status that was written (200 when the handler wrote none) and the pattern the router matched",
+        "Report each request once: `parley_http_requests_total` with `method` in upper case, `path` equal to the matched pattern without its method and host part or `unmatched` when the router matched nothing, and `status` as three digits; `parley_http_request_duration_seconds` with the same `method` and `path` and the elapsed seconds",
+        "Keep streaming responses working through the wrapper: the wrapped response writer still supports flushing and connection hijacking where the underlying one does",
+        "Wire in internal/hub: create one registry per process, hand it to the composition so that later packages receive it as their recorder and can register sources, mount the handler and install the instrumentation as the outermost wrapper"
+      ],
+      "touches": [
+        "internal/metrics/expose.go",
+        "internal/metrics/handler.go",
+        "internal/metrics/http.go",
+        "internal/metrics/expose_test.go",
+        "internal/metrics/handler_test.go",
+        "internal/metrics/http_test.go",
+        "internal/hub"
+      ],
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Serve the per-run record lists",
+      "criteria": [
+        "REQ-1"
+      ],
+      "steps": [
+        "Add the list, order, paging, filter, validation and access behaviours to internal/telemetry/read_test.go and confirm they fail",
+        "Add read queries beside the telemetry store of package 50 for the five record kinds: by workspace and run, with optional exact-match filters, a half-open time range on `timestamp`, a direction and a position after (`timestamp`, `id`); every query is bound to the workspace and the run",
+        "Register five `GET` routes under `/workspaces/{slug}/runs/{run_id}` (`events`, `sessions/outcomes`, `tools/calls`, `tools/errors`, `traces`) on the router of internal/server, each declared with scope `audit:read` (which `audit:write` also satisfies) and workspace need `read` with no state precondition, so that the shared pipeline answers 401, 403 `insufficient_scope` and 404 `not_found` before the handler runs and an archived workspace is served",
+        "Validate before any read, naming the parameter in the message of a 400 `invalid_request`: the run id format (`YYYYMMDD_HHMMSS_` plus six lower-case hexadecimal digits), `severity` and `order` against their sets, the trace `event_type` against the five trace types, `session_id` as a UUID in any case (compared in lower case), `since` and `until` as RFC 3339 with any offset, and `since` before `until`; share this validator with the later tasks of this package",
+        "Allow per route only its documented filters: events `event_type`, `severity`, `node_id`, `session_id`; outcomes `node_id`, `session_id`, `status`; tool calls and tool errors `node_id`, `session_id`, `tool_name`; traces `event_type`, `node_id`, `session_id`; ignore unknown parameter names",
+        "Page with the list helper of internal/server: `limit` and `cursor` by its rules, the cursor position being (`timestamp`, `id`) and its fingerprint covering the route, both path parameters and every filter including `order`",
+        "Answer each item with every field of its record as package 50 stores it, JSON-valued fields as JSON; an unknown run answers an empty list",
+        "Wire the routes in internal/hub"
+      ],
+      "touches": [
+        "internal/telemetry/read.go",
+        "internal/telemetry/read_store.go",
+        "internal/telemetry/validate.go",
+        "internal/telemetry/read_test.go",
+        "internal/hub"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Serve a run's postmortem and transcript",
+      "criteria": [
+        "REQ-2"
+      ],
+      "steps": [
+        "Add the postmortem, transcript, paging and validation behaviours to internal/telemetry/postmortem_read_test.go and internal/telemetry/transcript_test.go and confirm they fail",
+        "Register `GET /workspaces/{slug}/runs/{run_id}/postmortem` and `…/transcript` with the same scope and access declaration as the list routes, and validate the run id with the shared validator",
+        "Postmortem: read the one postmortem of the workspace and run and answer it with every field; when there is none in this workspace answer 404 with the specific error type `postmortem_not_found`, raised through the error helper of internal/server",
+        "Transcript: require a non-empty `node_id` (400 `invalid_request` naming it otherwise); read the traces of the workspace, run and node ordered by `timestamp`, then `sequence` with an absent sequence as 0, then `id`",
+        "Map each trace to an item: role `system`, `assistant`, `tool_use` or `tool_error` by its event type; skip `session.result`; `content` is `data.content` when it is a JSON string, else the empty string; `tool_name` is `data.tool_name` when it is a JSON string, else null; `timestamp` is the trace's",
+        "Answer `{run_id, node_id, items, next_cursor}`; page with `limit` and `cursor` by the list helper's rules, the cursor addressing trace records so that skipped `session.result` records count as consumed and a page is filled up to `limit` items where enough remain",
+        "An unknown run or node answers 200 with an empty list"
+      ],
+      "touches": [
+        "internal/telemetry/postmortem_read.go",
+        "internal/telemetry/transcript.go",
+        "internal/telemetry/postmortem_read_test.go",
+        "internal/telemetry/transcript_test.go",
+        "internal/hub"
+      ],
+      "depends_on": [
+        3
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Answer the audit query as one merged, paged list",
+      "criteria": [
+        "REQ-3",
+        "REQ-4.7"
+      ],
+      "steps": [
+        "Add the merge, item-shape, paging, visibility, time-range and authentication behaviours to internal/audit/query_test.go and confirm they fail",
+        "Create internal/audit and register `GET /audit` on the router of internal/server with scope `audit:read` (which `audit:write` also satisfies) and no workspace in the path; bound tokens may call it",
+        "Declare in internal/audit the two narrow read interfaces the query needs and satisfy them from the packages that own the data: hub events from the event store of package 52, newest first from a position, restricted by that package's visibility rule for the caller; run events from the telemetry store of package 50, newest first from a position, restricted to a set of workspaces or unrestricted for an admin token",
+        "Work out the caller's run-event workspaces: unrestricted for an admin token; otherwise the readable set of the access component, cut down to the binding for a workspace-bound token, plus deleted forks whose parent (the part of the slug before `--`) is in that set",
+        "Merge the two sources by time descending, then id descending, then hub before agent: fetch up to limit+1 items from each source from the cursor position and merge; a hub event's time is its `time`, a run event's its `timestamp`",
+        "Build every item with the same seventeen members; fill the common six for both sources, the seven hub members from the event record, the four agent members from the run event, and null for the members of the other source; an agent item's `time` keeps its fractional seconds",
+        "Apply `since` (inclusive) and `until` (exclusive) to both sources",
+        "Page with the list helper of internal/server; the cursor position is (time, id, source) and its fingerprint covers every filter",
+        "Never return a record of type `parley.webhook.ping`; return what is stored without an age limit of the query's own",
+        "Wire the route in internal/hub with the real stores, the visibility rule and the access component"
+      ],
+      "touches": [
+        "internal/audit/query.go",
+        "internal/audit/item.go",
+        "internal/audit/sources.go",
+        "internal/audit/query_test.go",
+        "internal/event",
+        "internal/telemetry/read_store.go",
+        "internal/hub"
+      ],
+      "depends_on": [
+        3
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Filter the audit query and refuse every invalid parameter",
+      "criteria": [
+        "REQ-4.1",
+        "REQ-4.2",
+        "REQ-4.3",
+        "REQ-4.4",
+        "REQ-4.5",
+        "REQ-4.6"
+      ],
+      "steps": [
+        "Add the common-filter, hub-only, agent-only, source-conflict, validation and workspace-refusal behaviours to internal/audit/filters_test.go and confirm they fail",
+        "Parse the query into one filter value before any read: `source`, `workspace`, `types`, `session_id`, `since`, `until`, the hub-only `actor_id`, `actor_type`, `resource_type`, `resource_id`, `action` and the agent-only `run_id`, `node_id`, `severity`; ignore unknown parameter names",
+        "Validate, answering 400 `invalid_request` with the parameter's name: `source`, `actor_type` and `severity` against their sets; `session_id` as a UUID; `run_id` against the run id format; timestamps and `since` before `until` with the shared validator; `types` as at most 20 comma-separated entries, none empty, `*` only as the last character of an entry",
+        "Decide which sources are read: `source` when given; a hub-only filter removes run events and an agent-only filter removes hub events; both kinds together read nothing and answer an empty list; a hub-only filter with `source=agent` and an agent-only filter with `source=hub` are 400 naming the filter",
+        "Match `types` entries with OR, each exactly or by prefix when it ends in `*`, against a hub event's `type` and a run event's `event_type`; match every other filter exactly; combine all filters with AND",
+        "Check the `workspace` filter before reading: accept it for an admin token, for a workspace the caller can read (inside the binding for a bound token), and for a fork slug whose parent the caller can read; otherwise answer 404 `not_found` with the message `workspace not found`, identical for an unreadable and a missing slug",
+        "Pass the filters to both source readers so that they are applied in the stores, not after paging"
+      ],
+      "touches": [
+        "internal/audit/filters.go",
+        "internal/audit/types.go",
+        "internal/audit/filters_test.go",
+        "internal/audit/query.go",
+        "internal/audit/sources.go"
+      ],
+      "depends_on": [
+        5
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Add `parley audit query`",
+      "criteria": [
+        "REQ-5"
+      ],
+      "steps": [
+        "Add the flag-mapping, hub-error and usage-error behaviours to internal/cli/audit_test.go and confirm they fail",
+        "Declare the command group `audit` and its command `query` through the command helper of package 09 with method `GET`, path `/audit`, no named argument and `auth` `user`",
+        "Add the thirteen flags: `--source`, `--workspace`, `--types`, `--session`, `--run-id`, `--actor-id`, `--resource-type`, `--resource-id`, `--action`, `--since`, `--until`, `--cursor` as strings and `--limit` as an integer",
+        "Send one request through the client of package 09 whose query holds a parameter for exactly the flags the user gave, each under its API name (`--session` becomes `session_id`, the others replace `-` by `_`), values unchanged; validate nothing the hub validates",
+        "Print the response body through the output helper of package 09; let its error handling produce exit status 1 with the hub's envelope and exit status 2 for a positional argument or a `--limit` that is not an integer, with no request sent",
+        "Register the group on the root command"
+      ],
+      "touches": [
+        "internal/cli/audit.go",
+        "internal/cli/audit_test.go",
+        "internal/cli/root.go"
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Configure retention and run its steps in order",
+      "criteria": [
+        "REQ-6",
+        "REQ-7"
+      ],
+      "steps": [
+        "Add the default, accepted-value, refused-value, order, failing-step, timestamp and cancellation behaviours to internal/audit/config_test.go and internal/audit/retention_test.go and confirm they fail",
+        "Register seven keys with the key registry of internal/config, each with its default and rule: `audit.max_age` 90d, `audit.trace_max_age` 30d, `audit.postmortem_max_age` 180d, `audit.orphan_retention` 30d and `sessions.max_age` 90d as durations of at least one day; `sessions.max_active_age` 7d as a duration of at least one hour; `audit.max_runs` 50 as an integer of at least 1; durations are a number with one of the units s, m, h, d, parsed with the duration helper of package 02; do not register `audit.write_timeout` or any `[events]` key",
+        "Make a refused value fail the load with an error that names `section.key`, so that the hub's start stops with exit status 1 before listening",
+        "Expose the loaded values as one settings value of internal/audit, which also takes the loaded `events.retention` from Retention of package 52's event component; building it returns an error naming `events.retention` and `audit.max_age` when the first is longer than the second, and internal/hub returns that error from the start before the listener is bound",
+        "Create the retention run: a fixed list of the eleven step names in the documented order, each bound to a function that takes a context and returns an error; a constructor that takes the steps, the recorder, the logger and the clock",
+        "Run the steps one after the other; on a step's error or panic log one line with the step's name, add 1 to `parley_retention_errors_total` for that step and continue with the next step",
+        "After the last step, when no step failed, set `parley_retention_last_run_timestamp_seconds` to the clock's Unix time; when a step failed, leave it and return an error naming the failed steps",
+        "Before each step check the context: when it is cancelled, stop, count nothing for the steps not started, leave the timestamp and return the context's error; a step that itself returns the context's error after cancellation is not counted either",
+        "Register the run with the maintenance task registry of internal/maintenance under the name `retention` in internal/hub, so that the loop of package 03 runs it once right after start and then hourly; until the next two tasks land, bind each step to a function that does nothing and succeeds"
+      ],
+      "touches": [
+        "internal/audit/config.go",
+        "internal/audit/retention.go",
+        "internal/audit/config_test.go",
+        "internal/audit/retention_test.go",
+        "internal/hub"
+      ],
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Prune sessions and run telemetry",
+      "criteria": [
+        "REQ-8.1",
+        "REQ-8.2",
+        "REQ-8.3",
+        "REQ-8.4"
+      ],
+      "steps": [
+        "Add the stale-session, age-based telemetry, run-count and session-deletion behaviours to internal/audit/steps_sessions_test.go and internal/audit/steps_telemetry_test.go and confirm they fail",
+        "Treat every age limit as strict: a record whose time equals now minus the limit is kept; take now from the clock once per step",
+        "`stale_sessions`: beside the session store of package 49, add the operation TimeOutActiveBefore that sets every active session started before a cutoff to `timeout` with `ended_at` = now, the documented error message and `duration_ms` computed from `started_at` and `ended_at`, in one transaction, writing no hub event; the step calls it with now minus `sessions.max_active_age`",
+        "`run_records`: beside the telemetry store, add a delete of run events, session outcomes, tool calls and tool errors with `timestamp` before a cutoff; the step calls it with now minus `audit.max_age`",
+        "`max_runs`: per workspace, list the runs that have at least one run event, outcome, tool call, tool error or trace with the `timestamp` of their earliest such record; order them oldest first, ties by run id ascending; when there are more than `audit.max_runs`, delete those five kinds for the oldest excess runs; never touch postmortems or sessions",
+        "`traces`: delete trace records with `timestamp` before now minus `audit.trace_max_age`; `postmortems`: delete postmortems with `ingested_at` before now minus `audit.postmortem_max_age`",
+        "`sessions`: beside the session store, add DeleteTerminalBefore, a delete of terminal sessions started before a cutoff together with their usage records in one transaction, never an active session; the step calls it with now minus `sessions.max_age`",
+        "Run each step in its own transaction or transactions and return the store's error unchanged so that the run counts it; bind the five steps of this task into the retention run in place of the placeholders"
+      ],
+      "touches": [
+        "internal/audit/steps_sessions.go",
+        "internal/audit/steps_telemetry.go",
+        "internal/audit/steps_sessions_test.go",
+        "internal/audit/steps_telemetry_test.go",
+        "internal/session/retention.go",
+        "internal/telemetry/retention.go",
+        "internal/hub"
+      ],
+      "depends_on": [
+        8
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Trim events, prune deliveries and orphans, and recompute the record gauges",
+      "criteria": [
+        "REQ-8.5",
+        "REQ-8.6",
+        "REQ-8.7",
+        "REQ-8.8"
+      ],
+      "steps": [
+        "Add the event-log, hub-event, delivery, orphan and gauge behaviours to internal/audit/steps_events_test.go, steps_orphans_test.go and steps_gauges_test.go and confirm they fail",
+        "`event_log`: call Expire of package 52's event component with now minus `events.retention`; that operation moves the oldest `seq` of the event log to the first event whose `time` is not before the cutoff, keeps the event with the highest `seq` in the log whatever its age and deletes no event, so the events that left the log stay stored for the audit query; add no second operation for it",
+        "`hub_events`: beside the event store of package 52, in internal/event/retention.go, add a delete of hub events with `time` before a cutoff that never deletes the event with the highest `seq`; the step calls it with now minus `audit.max_age`",
+        "`webhook_deliveries`: declare the interface DeliveryPruner in internal/audit with one operation, PruneDeliveries(ctx, before), which deletes the delivery records whose last attempt is before the given time and that are not pending and returns the number deleted, and the registration RegisterDeliveryPruner; the step calls the pruner with now minus 7 days and succeeds without doing anything when none is registered; package 53 registers its delivery store there, and this task imports nothing of internal/webhook",
+        "`orphans`: collect the workspace slugs that sessions, usage records, the six telemetry kinds and hub events carry; a slug is orphaned when no workspace has it and, for a slug containing `--`, when no workspace has the part before the first `--` either; ask the workspace record of the access component for existence",
+        "For each orphaned slug delete the records older than `audit.orphan_retention` by each record's own time: sessions of any status by `started_at` with their usage records, usage records by `reported_at`, telemetry by `timestamp`, postmortems by `ingested_at`, hub events by `time`; never a hub event without a workspace and never the event with the highest `seq`",
+        "`gauges`: count the stored records of the nine kinds and set `parley_audit_records` for each, 0 included; count active sessions per workspace through ActiveCounts of package 49 and replace the whole `parley_agent_sessions_active` family with the result, so that a workspace without active sessions has no series",
+        "In internal/hub connect the values the earlier packages export to the registry, using the recorder's own calls: an observer registered with OnUsage of package 49 that calls Add on `parley_agent_tokens_total` once per direction with a count above 0; an observer registered with OnRunEvent of package 50 that fills a per-type tally; one source for `parley_audit_events_total` that returns that tally under source agent and written_by_type of package 52's Counters under source hub; sources for `parley_events_seq` (last_seq) and `parley_sse_connections` (open_streams)",
+        "In internal/hub connect the feature metrics of the packages built earlier, one reporter per metric as in the table of the PRD's Metrics section: a source reading the request counter of internal/gitserver for `parley_git_requests_total`; an adapter behind the request recorder interface of internal/scm that calls Add on `parley_scm_requests_total`; a source that calls the exported read `change.OpenCounts(ctx)` of package 22 (draft and open changes per workspace) for `parley_changes_open`; one final observer of internal/land that reports `parley_lands_total`, `parley_land_attempts` and `parley_land_duration_seconds`; a source that calls the exported read `fork.CountTaskForks(ctx)` of package 16 for `parley_forks_active`; a source reading Depth of internal/jobs for `parley_jobqueue_depth`. Pass the registry to the sandbox packages as the metrics recorder interface package 44 declares in internal/sandbox/metrics.go (Add, Set, Observe with a metric name and a label map), in place of its default, before their components are built; compute no sandbox metric here: `parley_sandbox_exec_total` is reported by package 46",
+        "Bind the six steps of this task into the retention run in place of the placeholders and confirm the hub's first maintenance pass sets the last-run timestamp"
+      ],
+      "touches": [
+        "internal/audit/steps_events.go",
+        "internal/audit/steps_orphans.go",
+        "internal/audit/steps_gauges.go",
+        "internal/audit/steps_events_test.go",
+        "internal/audit/steps_orphans_test.go",
+        "internal/audit/steps_gauges_test.go",
+        "internal/event/retention.go",
+        "internal/session/retention.go",
+        "internal/telemetry/retention.go",
+        "internal/hub",
+        "test/e2e/audit_test.go",
+        "test/e2e/metrics_test.go"
+      ],
+      "depends_on": [
+        2,
+        9
+      ]
+    }
+  ]
+}

@@ -1,0 +1,1078 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "33",
+  "spec_name": "rebuild_jobs",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Enqueue a durable job with dedup",
+      "rationale": "A caller asks for work once and must be able to trust that it is recorded, and that a workspace never accumulates pending jobs.",
+      "system": "job queue",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "Enqueue is called inside a store transaction for a job type and a workspace that has no job of that type in queued, running or failed",
+          "action": "store a new job with status queued, retry_count 0, the given payload document, a null result document and created_at and updated_at equal to the clock's present, as part of that transaction, and return it",
+          "contract": "returns the job {id: a version 4 UUID, type, workspace_slug, status: 'queued', retry_count: 0, next_attempt_at: null, error: null, completed_at: null} and a nil error; the job is visible to other readers only after the caller's transaction commits",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a queue of internal/jobs over a real store opened in t.TempDir(), a controlled clock, and no background dispatcher: the test runs single dispatcher passes"
+            ],
+            "pseudocode": "in internal/jobs/enqueue_test.go: tx = store.begin(); j, err = q.Enqueue(tx, 'probe', 'w', payload); assert err == nil; assert j.status == 'queued' and j.retry_count == 0 and j.next_attempt_at == null and j.completed_at == null; assert j.id matches the UUID v4 pattern; assert q.Get(j.id) from outside the transaction is not found; tx.commit(); assert q.Get(j.id).payload == payload; a second case rolls the transaction back and asserts the job does not exist"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "unwanted",
+          "condition": "Enqueue is called for a job type and a workspace that already has a job of that type in queued, running or failed",
+          "action": "store nothing and report a duplicate that names the existing job",
+          "contract": "returns a duplicate error from which the caller reads the existing job's id (errors.As to the queue's duplicate error type); the number of jobs of the workspace is unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a queue of internal/jobs over a real store opened in t.TempDir(), a controlled clock, and no background dispatcher: the test runs single dispatcher passes",
+              "a scripted handler registered for the job type 'probe' that records every call and returns what the case tells it"
+            ],
+            "pseudocode": "in internal/jobs/enqueue_test.go, a table over the existing job's status {queued, running, failed}: _, err = q.Enqueue(tx, 'probe', 'w', p); assert err is the duplicate error and its job id == existing.id; assert count(jobs of 'w') == 1. Further rows where the enqueue succeeds: existing job completed, dead_letter or cancelled; existing pending job of workspace 'other'; existing pending job of 'w' with another job type"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "unwanted",
+          "condition": "several Enqueue calls for the same job type and workspace run at the same time in separate transactions",
+          "action": "let exactly one of them store a job and report a duplicate to every other",
+          "contract": "exactly one call returns a job; each other call returns the duplicate error or, when its transaction lost a write conflict, is retried by the queue until it returns the duplicate error; one job of the workspace exists afterwards",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a queue of internal/jobs over a real store file in t.TempDir()"
+            ],
+            "pseudocode": "in internal/jobs/enqueue_test.go: start 16 goroutines that each begin a transaction, call q.Enqueue(tx, 'probe', 'w', p) and commit on success; assert exactly 1 success and 15 duplicate errors naming the winner's id; assert count(jobs of 'w') == 1"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "event_driven",
+          "condition": "a follow-up enqueue names a job of the same type and workspace that is running, and that job is the only job of the workspace in queued, running or failed",
+          "action": "store the follow-up as a new queued job",
+          "contract": "returns the new job with status 'queued' and an id different from the named job's",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a queue of internal/jobs over a real store opened in t.TempDir(), a controlled clock, and no background dispatcher: the test runs single dispatcher passes",
+              "a scripted handler registered for the job type 'probe' that records every call and returns what the case tells it"
+            ],
+            "pseudocode": "in internal/jobs/enqueue_test.go: a = enqueue and claim a job of 'w' whose handler blocks; f, err = q.EnqueueFollowUp(tx, a.id, payload); assert err == nil; assert f.status == 'queued' and f.id != a.id and f.type == a.type and f.workspace_slug == 'w'"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "unwanted",
+          "condition": "a follow-up enqueue names a job that is not running, or names a running job while another job of the workspace is already queued or failed",
+          "action": "store nothing and report a duplicate",
+          "contract": "returns the duplicate error naming a pending job of the workspace when one exists; returns a not-found error when the named job does not exist; the number of jobs is unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a queue of internal/jobs over a real store opened in t.TempDir(), a controlled clock, and no background dispatcher: the test runs single dispatcher passes",
+              "a scripted handler registered for the job type 'probe' that records every call and returns what the case tells it"
+            ],
+            "pseudocode": "in internal/jobs/enqueue_test.go, a table: {named job queued, named job failed, named job completed with another job queued, named job running and a follow-up already queued} -> duplicate error; {unknown job id} -> not-found error; in every row count(jobs) is unchanged"
+          }
+        },
+        {
+          "id": "REQ-1.6",
+          "pattern": "ubiquitous",
+          "action": "for any job whose enqueueing transaction committed, return the same job, with the same id, payload and status, after the store is closed and opened again",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a real store file in t.TempDir()"
+            ],
+            "pseudocode": "in internal/jobs/store_test.go: enqueue three jobs for three workspaces and commit; close the store; open it again at the same path; build a new queue; for each: assert q.Get(id) equals the job returned at enqueue in id, type, workspace_slug, status, payload, created_at"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Run queued jobs on workers",
+      "rationale": "The hub executes its own jobs, a few at a time, and never two for one workspace.",
+      "system": "job queue",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "a dispatcher pass finds a queued job whose type has a registered handler, while fewer than 4 jobs are running and no job of the same type and workspace is running",
+          "action": "claim the job by setting its status to running and emptying its result document, and call the handler once with the job and a context",
+          "contract": "the handler receives the job with status 'running' and its payload; a concurrent read of the job shows status 'running', result null and updated_at at the clock's present",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a queue of internal/jobs over a real store opened in t.TempDir(), a controlled clock, and no background dispatcher: the test runs single dispatcher passes",
+              "a scripted handler registered for the job type 'probe' that records every call and returns what the case tells it; the handler blocks until released"
+            ],
+            "pseudocode": "in internal/jobs/queue_test.go: j = enqueue('probe','w', p); q.Pass(); wait until the handler is entered; assert handler.calls == [j.id] and the job it received has status 'running' and payload p; assert q.Get(j.id).status == 'running' and result == null"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "event_driven",
+          "condition": "a job is queued while the queue runs with its background dispatcher and a worker is free",
+          "action": "start the job's handler within 5 seconds",
+          "contract": "the handler is called no later than 5 seconds after the enqueueing transaction committed",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a queue over a real store file in t.TempDir() with a handler for 'probe'"
+            ],
+            "pseudocode": "in internal/jobs/queue_test.go: start q.Run(ctx) with the real clock and the default dispatcher interval; t0 = now; enqueue and commit; wait for the handler call with a 5 s deadline; assert it arrived; a second case enqueues without waking the dispatcher (the wake is disabled by a test option) and asserts the call still arrives within 5 s"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "state_driven",
+          "condition": "4 jobs are running",
+          "action": "claim no further job, and claim the next queued job on the first dispatcher pass after one of the 4 has ended",
+          "contract": "at no moment are more than 4 handlers running; the fifth job stays 'queued' until a running job is settled",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a queue of internal/jobs over a real store opened in t.TempDir(), a controlled clock, and no background dispatcher: the test runs single dispatcher passes",
+              "a scripted handler registered for the job type 'probe' that records every call and returns what the case tells it; each handler blocks until released"
+            ],
+            "pseudocode": "in internal/jobs/queue_test.go: enqueue jobs for workspaces w1..w6; q.Pass(); assert 4 handlers entered and jobs 5 and 6 are 'queued'; q.Pass() again; assert still 4; release handler 1; q.Pass(); assert job 5 is 'running' and job 6 'queued'; assert the maximum number of handlers observed running together == 4"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "state_driven",
+          "condition": "a job of a type and workspace is running",
+          "action": "leave every queued job of the same type and workspace unclaimed, and claim it on the first dispatcher pass after the running job has ended",
+          "contract": "the follow-up's handler call begins after the running job's settlement committed",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a queue of internal/jobs over a real store opened in t.TempDir(), a controlled clock, and no background dispatcher: the test runs single dispatcher passes",
+              "a scripted handler registered for the job type 'probe' that records every call and returns what the case tells it"
+            ],
+            "pseudocode": "in internal/jobs/queue_test.go: a = enqueue('probe','w') and claim it (handler blocks); f = q.EnqueueFollowUp(tx, a.id, p); q.Pass(); assert f is 'queued' and handler.calls == [a.id]; release a; q.Pass(); assert q.Get(a.id).status == 'completed' and f is 'running'"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "ubiquitous",
+          "action": "for any queued job, let at most one worker claim it, however many dispatcher passes run at the same time",
+          "contract": "the handler is called exactly once per transition from queued to running",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a queue over a real store file in t.TempDir()",
+              "a scripted handler registered for the job type 'probe' that records every call and returns what the case tells it"
+            ],
+            "pseudocode": "in internal/jobs/queue_test.go: enqueue one job; run 16 goroutines that each call q.Pass() at the same moment; release the handler; assert handler.calls has length 1; repeat for 50 jobs on 50 workspaces with the limit of 4 and assert every job id appears exactly once in handler.calls when all are completed"
+          }
+        },
+        {
+          "id": "REQ-2.6",
+          "pattern": "ubiquitous",
+          "action": "claim queued jobs in the order of created_at ascending, then id ascending",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a queue of internal/jobs over a real store opened in t.TempDir(), a controlled clock, and no background dispatcher: the test runs single dispatcher passes",
+              "a scripted handler registered for the job type 'probe' that records every call and returns what the case tells it"
+            ],
+            "pseudocode": "in internal/jobs/queue_test.go: with the limit of 4 filled by blocking jobs, enqueue x at t, y at t+1s, z at t+1s for three further workspaces; release one running job at a time with a pass after each; assert the claim order is x, then the smaller id of {y, z}, then the other"
+          }
+        },
+        {
+          "id": "REQ-2.7",
+          "pattern": "state_driven",
+          "condition": "no handler is registered for a queued job's type",
+          "action": "leave the job queued and unchanged on every dispatcher pass, and claim it on the first pass after a handler for its type is registered",
+          "contract": "the job's status stays 'queued' and its updated_at does not change; the pass reports no error",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a queue of internal/jobs over a real store opened in t.TempDir(), a controlled clock, and no background dispatcher: the test runs single dispatcher passes"
+            ],
+            "pseudocode": "in internal/jobs/queue_test.go: j = enqueue('nohandler','w'); q.Pass(); q.Pass(); assert q.Get(j.id) equals j; q.Register('nohandler', h); q.Pass(); assert h.calls == [j.id]"
+          }
+        },
+        {
+          "id": "REQ-2.8",
+          "pattern": "event_driven",
+          "condition": "a dispatcher pass finds a failed job whose next_attempt_at is at or before the clock's present",
+          "action": "set the job's status to queued and its next_attempt_at to null, keeping retry_count and error, and treat it in the same pass like any queued job",
+          "contract": "one second before next_attempt_at the job is still 'failed' and its handler is not called; at next_attempt_at the handler is called a second time with the same job id",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a queue of internal/jobs over a real store opened in t.TempDir(), a controlled clock, and no background dispatcher: the test runs single dispatcher passes",
+              "a scripted handler registered for the job type 'probe' that records every call and returns what the case tells it"
+            ],
+            "pseudocode": "in internal/jobs/queue_test.go: run one attempt that fails retryably at T (next_attempt_at == T+4s); clock = T+3s; q.Pass(); assert status 'failed' and handler.calls has length 1; clock = T+4s; q.Pass(); assert handler.calls has length 2 and the job it received has retry_count 1 and error set; a variant with all 4 workers busy asserts the job is 'queued' with next_attempt_at null after the pass"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Settle the outcome of an attempt",
+      "rationale": "A failure that may pass is retried with growing delays; one that cannot pass ends the job at once, where a person can look at it and requeue it.",
+      "system": "job queue",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "the handler of a running job returns nil",
+          "action": "set the job's status to completed, clear error and the failure detail, set completed_at to the clock's present, leave next_attempt_at null and keep the result document the handler stored",
+          "contract": "a read of the job returns status 'completed', error null, detail null, completed_at set, retry_count unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a queue of internal/jobs over a real store opened in t.TempDir(), a controlled clock, and no background dispatcher: the test runs single dispatcher passes",
+              "a scripted handler registered for the job type 'probe' that records every call and returns what the case tells it"
+            ],
+            "pseudocode": "in internal/jobs/settle_test.go: a job that failed once retryably (retry_count 1, error set) runs again and its handler stores result R and returns nil; assert status == 'completed'; error == null; detail == null; completed_at == clock.now; retry_count == 1; result == R"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "event_driven",
+          "condition": "the handler of a running job returns an error that is not marked permanent, and the job's retry_count is below 20",
+          "action": "set the job's status to failed, raise retry_count by one to n, set next_attempt_at to the clock's present plus min(2 seconds × 2 to the power n, 2 hours), store the error's text in error, replace the failure detail by the one the error carries or clear it, and leave completed_at null",
+          "contract": "after the n-th retryable failure next_attempt_at − now is 4 s for n=1, 8 s for n=2, 16 s for n=3, 4096 s for n=11, 7200 s for n=12 and 7200 s for n=20",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a queue of internal/jobs over a real store opened in t.TempDir(), a controlled clock, and no background dispatcher: the test runs single dispatcher passes",
+              "a scripted handler registered for the job type 'probe' that records every call and returns what the case tells it"
+            ],
+            "pseudocode": "in internal/jobs/settle_test.go, a table over retry_count before the attempt {0, 1, 2, 10, 11, 19}: settle a retryable error 'boom'; assert status == 'failed'; retry_count == before+1; next_attempt_at − clock.now == {4s, 8s, 16s, 4096s, 7200s, 7200s}; error == 'boom'; completed_at == null. One more row: an error carrying detail D after a failure that stored detail C -> detail == D; then an error with no detail -> detail == null"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "unwanted",
+          "condition": "the handler of a running job returns an error that is not marked permanent, and the job's retry_count is 20",
+          "action": "set the job's status to dead_letter with retry_count still 20, store the error's text, set completed_at and leave next_attempt_at null",
+          "contract": "a read returns status 'dead_letter', retry_count 20, next_attempt_at null, completed_at set; no later dispatcher pass calls the handler for this job",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a queue of internal/jobs over a real store opened in t.TempDir(), a controlled clock, and no background dispatcher: the test runs single dispatcher passes",
+              "a scripted handler registered for the job type 'probe' that records every call and returns what the case tells it"
+            ],
+            "pseudocode": "in internal/jobs/settle_test.go: drive one job through 20 retryable failures, advancing the clock to each next_attempt_at; assert it is 'failed' with retry_count 20; advance and fail a 21st time; assert status == 'dead_letter' and retry_count == 20 and completed_at != null and next_attempt_at == null; advance the clock by 3 h and run a pass; assert handler.calls has length 21"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "unwanted",
+          "condition": "the handler of a running job returns an error marked permanent",
+          "action": "set the job's status to dead_letter without changing retry_count, store the error's text and the detail document the error carries, set completed_at and never retry the job",
+          "contract": "a read returns status 'dead_letter', retry_count as before the attempt, error the text, detail the document, completed_at set, next_attempt_at null",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a queue of internal/jobs over a real store opened in t.TempDir(), a controlled clock, and no background dispatcher: the test runs single dispatcher passes",
+              "a scripted handler registered for the job type 'probe' that records every call and returns what the case tells it"
+            ],
+            "pseudocode": "in internal/jobs/settle_test.go, a table over retry_count before {0, 3}: the handler returns jobs.Permanent(err 'conflict') carrying detail D; assert status == 'dead_letter'; retry_count == before; error == 'conflict'; detail == D; completed_at == clock.now; advance 3 h; q.Pass(); assert the handler was not called again"
+          }
+        },
+        {
+          "id": "REQ-3.5",
+          "pattern": "unwanted",
+          "condition": "the handler of a running job panics",
+          "action": "recover the panic, settle the attempt as a retryable failure whose error text contains the panic value, and keep serving other jobs",
+          "contract": "the job is 'failed' (or 'dead_letter' when retry_count was 20) with error containing the panic value; the process does not exit; a job of another workspace queued afterwards completes",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a queue of internal/jobs over a real store opened in t.TempDir(), a controlled clock, and no background dispatcher: the test runs single dispatcher passes",
+              "a scripted handler registered for the job type 'probe' that records every call and returns what the case tells it"
+            ],
+            "pseudocode": "in internal/jobs/settle_test.go: the handler panics with 'kaboom' for workspace 'w'; q.Pass(); assert q.Get(j.id).status == 'failed' and error contains 'kaboom' and retry_count == 1; enqueue a job for 'w2' with a handler result of nil; q.Pass(); assert it is 'completed'"
+          }
+        },
+        {
+          "id": "REQ-3.6",
+          "pattern": "event_driven",
+          "condition": "an attempt is settled and the job's type registered a settlement hook",
+          "action": "call the hook once inside the store transaction of the settlement, with the job as the settlement leaves it and a flag that is true only when the new status is failed",
+          "contract": "what the hook writes through the transaction is committed together with the job's new status; the flag is true for 'failed' and false for 'completed' and 'dead_letter'",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a queue of internal/jobs over a real store opened in t.TempDir(), a controlled clock, and no background dispatcher: the test runs single dispatcher passes",
+              "a scripted handler registered for the job type 'probe' that records every call and returns what the case tells it; the handler's type also registers a recording settlement hook"
+            ],
+            "pseudocode": "in internal/jobs/settle_test.go, a table over outcomes {nil, retryable error, permanent error, retryable error at retry_count 20}: the hook writes a marker row through the transaction it is given and records its arguments; assert hook calls == 1; hook.job.status == {'completed','failed','dead_letter','dead_letter'}; hook.will_retry == {false,true,false,false}; assert the marker row exists exactly when the job has the new status"
+          }
+        },
+        {
+          "id": "REQ-3.7",
+          "pattern": "unwanted",
+          "condition": "the settlement hook returns an error or panics",
+          "action": "undo the hook's own writes, log the failure with the job id, and commit the settlement without them",
+          "contract": "the job has its new status; no row the hook wrote exists; the next dispatcher pass proceeds",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a queue of internal/jobs over a real store opened in t.TempDir(), a controlled clock, and no background dispatcher: the test runs single dispatcher passes",
+              "a scripted handler registered for the job type 'probe' that records every call and returns what the case tells it"
+            ],
+            "pseudocode": "in internal/jobs/settle_test.go, a table {hook returns an error after writing a marker row, hook panics after writing a marker row}: settle a success; assert q.Get(j.id).status == 'completed'; assert the marker row does not exist; assert the log holds one entry naming j.id; a queued job of another workspace is claimed on the next pass"
+          }
+        },
+        {
+          "id": "REQ-3.8",
+          "pattern": "event_driven",
+          "condition": "the handler stores a result document on its job while the job is running",
+          "action": "replace the job's result document and make it visible to readers at once",
+          "contract": "a read of the job during the run returns the last stored document; storing on a job that is not running returns a not-running error and changes nothing",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a queue of internal/jobs over a real store opened in t.TempDir(), a controlled clock, and no background dispatcher: the test runs single dispatcher passes",
+              "a scripted handler registered for the job type 'probe' that records every call and returns what the case tells it"
+            ],
+            "pseudocode": "in internal/jobs/settle_test.go: inside the handler: q.SetResult(ctx, j.id, R1); the test reads q.Get(j.id).result == R1 while the handler blocks; q.SetResult(ctx, j.id, R2); read == R2; release; after completion result == R2; then q.SetResult(ctx, j.id, R3) returns the not-running error and result is still R2; a later claim of a requeued job shows result null"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Recover after a crash and stop at shutdown",
+      "rationale": "A job must not be lost or stuck because the hub stopped while it ran.",
+      "system": "job queue",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "the queue's start hook runs and the store holds jobs with status running",
+          "action": "set each of them to queued with retry_count, error, payload and created_at unchanged, before the dispatcher makes its first pass, and leave jobs in every other status untouched",
+          "contract": "the hook returns nil; afterwards no job is 'running'; a job that was 'failed' keeps its next_attempt_at",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a real store file in t.TempDir()",
+              "a scripted handler registered for the job type 'probe' that records every call and returns what the case tells it; handlers of the first queue block for ever"
+            ],
+            "pseudocode": "in internal/jobs/lifecycle_test.go: with a first queue, bring jobs into {running with retry_count 0, running with retry_count 3 and an error text, failed, queued, completed, dead_letter, cancelled}; abandon that queue without settling; close and reopen the store; q2 = new queue; assert q2.Recover(ctx) == nil; assert both running jobs are 'queued' with retry_count {0, 3} and the error text kept; assert the five others are unchanged field by field"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "event_driven",
+          "condition": "the dispatcher runs after a recovery that returned a job to queued",
+          "action": "claim the job and call its handler again from the start with the same job id and payload and an empty result document",
+          "contract": "the handler is called once by the new queue for that job; when it returns nil the job is 'completed' with the retry_count it had before the stop",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a real store file in t.TempDir()",
+              "a scripted handler registered for the job type 'probe' that records every call and returns what the case tells it"
+            ],
+            "pseudocode": "in internal/jobs/lifecycle_test.go: queue 1 claims job j (payload P), its handler stores result R and then blocks for ever; abandon queue 1, close and reopen the store; q2 = new queue with a handler that returns nil; q2.Recover(ctx); q2.Pass(); assert handler2.calls == [j.id] and the job it received has payload P and result null and retry_count 0; assert q2.Get(j.id).status == 'completed' and retry_count == 0"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "event_driven",
+          "condition": "the hub's shutdown reaches the queue while handlers are running",
+          "action": "claim no further job, wait up to 30 seconds for the running handlers, settle the outcome of each handler that returns in that time, and stop when all have returned",
+          "contract": "the queue's run function returns as soon as the last running handler has returned and was settled; a job queued before or during the shutdown stays 'queued'",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a queue of internal/jobs over a real store opened in t.TempDir(), a controlled clock, and no background dispatcher: the test runs single dispatcher passes",
+              "a scripted handler registered for the job type 'probe' that records every call and returns what the case tells it"
+            ],
+            "pseudocode": "in internal/jobs/lifecycle_test.go: start q.Run(ctx) with a controlled clock; job a is running (handler blocks), job b is queued for another workspace behind a full limit or enqueued after the cancel; cancel ctx; assert Run has not returned; q.Pass() has no effect: b stays 'queued'; release a's handler with nil; assert Run returns; assert a is 'completed' and b is 'queued' and b's handler was never called"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "unwanted",
+          "condition": "a handler is still running 30 seconds after the shutdown reached the queue",
+          "action": "cancel that handler's context, stop without settling the attempt, and leave the job with status running in the store",
+          "contract": "the run function returns at 30 seconds; the job's status, retry_count and error are as they were while it ran; an outcome the handler returns afterwards is dropped",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a queue of internal/jobs over a real store opened in t.TempDir(), a controlled clock, and no background dispatcher: the test runs single dispatcher passes",
+              "a scripted handler registered for the job type 'probe' that records every call and returns what the case tells it"
+            ],
+            "pseudocode": "in internal/jobs/lifecycle_test.go: job a is running with a handler that waits for its context; cancel the run context; advance the clock 29 s; assert Run has not returned and the handler's context is not done; advance to 30 s; assert the handler's context is done and Run returns; let the handler return an error; assert q.Get(a.id).status == 'running' and retry_count == 0 and error == null"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Count jobs and remove them with their workspace",
+      "rationale": "Operators watch the depth of the queue, and a deleted workspace must leave no job behind.",
+      "system": "job queue",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "a caller asks the queue for its depth",
+          "action": "return, for every registered job type, the number of jobs in each of the statuses queued, running, failed, completed, dead_letter and cancelled, with 0 for a status that has none",
+          "contract": "a map from job type to the six statuses, each with a count; all six keys are present for every registered type, also when the type has no job",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a queue of internal/jobs over a real store opened in t.TempDir(), a controlled clock, and no background dispatcher: the test runs single dispatcher passes",
+              "a scripted handler registered for the job type 'probe' that records every call and returns what the case tells it"
+            ],
+            "pseudocode": "in internal/jobs/queue_test.go: register 'probe' and 'rebuild'; bring 'probe' jobs into queued x2, running x1, failed x1, completed x3, dead_letter x1, cancelled x1; d = q.Depth(ctx); assert d['probe'] == {queued:2, running:1, failed:1, completed:3, dead_letter:1, cancelled:1}; assert d['rebuild'] has the six keys, all 0"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "event_driven",
+          "condition": "the workspace removal calls the queue's remover for a workspace slug inside its store transaction",
+          "action": "delete every job of that workspace, of every type and status, as part of that transaction, and leave the jobs of other workspaces",
+          "contract": "after the commit no job of the workspace is readable and an enqueue for the same slug succeeds; after a rollback every job is as before",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a queue of internal/jobs over a real store opened in t.TempDir(), a controlled clock, and no background dispatcher: the test runs single dispatcher passes",
+              "a scripted handler registered for the job type 'probe' that records every call and returns what the case tells it"
+            ],
+            "pseudocode": "in internal/jobs/store_test.go: jobs of 'w' in {queued, failed, completed, dead_letter} and one job of 'other'; tx = begin; q.RemoveWorkspace(tx, 'w'); tx.rollback(); assert 4 jobs of 'w' exist; tx = begin; q.RemoveWorkspace(tx, 'w'); tx.commit(); assert q.List('w') is empty and q.Get(id) is not found for each; assert the job of 'other' is unchanged; assert q.Enqueue(tx2, 'probe', 'w', p) succeeds"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "unwanted",
+          "condition": "a handler is running for a job whose workspace's jobs were removed",
+          "action": "cancel the handler's context when the removal has committed and drop the handler's outcome without creating a job record",
+          "contract": "the handler's context is done after the removal; when the handler returns, no job of the workspace exists, the settlement hook is not called and the dispatcher's next pass reports no error",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a queue of internal/jobs over a real store opened in t.TempDir(), a controlled clock, and no background dispatcher: the test runs single dispatcher passes",
+              "a scripted handler registered for the job type 'probe' that records every call and returns what the case tells it"
+            ],
+            "pseudocode": "in internal/jobs/store_test.go: job a of 'w' is running with a handler that waits for its context; remove 'w' and commit; assert the handler's context is done; the handler returns an error; assert q.Get(a.id) is not found; assert hook calls == 0; q.Pass() returns no error"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Submit a rebuild",
+      "rationale": "A developer or an agent asks for a rebuild once and gets a job to follow.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "a caller with write access (and, for a PAT, the scope rebuilds:write) sends POST /workspaces/:slug/rebuild for a ready carry-patch workspace that has at least one patch in active or conflict and no rebuild job in queued, running or failed",
+          "action": "queue a rebuild job whose strategy and fail mode are the body's values, or the workspace settings rebuild_strategy and rebuild_fail_mode for a value that is omitted, null or an empty string, whose integration_branch is the workspace's and whose submitted_by is the caller's user id, and answer with the rebuild job record",
+          "contract": "HTTP 202 with the rebuild job record: status 'queued', retry_count 0, next_attempt_at, error, conflict, completed_at, upstream_head_sha, integration_head_sha and previous_integration_head_sha null, the four patches_ counts 0, integration_branch_pushed false, patch_results [], created_at and updated_at RFC 3339 UTC with whole seconds; every field of the record is present",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub router over a real store with the rebuild routes mounted, a ready carry-patch workspace 'w' owned by user U with integration branch 'deploy', and patches as the case states; no handler is registered for the job type 'rebuild', so queued jobs stay queued unless the test moves them through the queue",
+              "one patch with status active; a second table row uses a workspace whose only non-deleted patch has status conflict"
+            ],
+            "pseudocode": "in internal/carrypatch/rebuild_routes_test.go, a table over {no body, empty body, '{}', {strategy:'', fail_mode:null}, {strategy:'merge'}, {fail_mode:'continue'}, {strategy:'merge', fail_mode:'continue'}} crossed with settings {unset -> rebase/fail_fast, rebuild_strategy 'merge' and rebuild_fail_mode 'continue'}: r = POST; assert r.status == 202; assert r.json.status == 'queued'; r.json.strategy and fail_mode == the expected pair; r.json.integration_branch == 'deploy'; r.json.submitted_by == U.id; assert the set of members of r.json equals the record's field list and the defaults of the contract; assert GET .../rebuilds/{id} returns the same document"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "event_driven",
+          "condition": "a rebuild job is queued through the shared enqueue, from any source",
+          "action": "write one event parley.rebuild.enqueue in the same store transaction as the job, with resource_type rebuild, resource_id the job id, the actor and the session the source gave, and metadata submitted_by, strategy, fail_mode and patch_count, where patch_count is the number of patches of the workspace in active or conflict",
+          "contract": "the event log holds exactly one parley.rebuild.enqueue per queued job; when the enqueue reports a duplicate or its transaction fails, no event exists",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub router over a real store with the rebuild routes mounted, a ready carry-patch workspace 'w' owned by user U with integration branch 'deploy', and patches as the case states; no handler is registered for the job type 'rebuild', so queued jobs stay queued unless the test moves them through the queue",
+              "patches: two active or conflict, one disabled, one deleted",
+              "the real event component of internal/event over the same store"
+            ],
+            "pseudocode": "in internal/carrypatch/rebuild_enqueue_test.go, a table over sources {POST by user U -> actor U, submitted_by U.id; EnqueueRebuild with submitted_by 'system:push' and actor system and session S; 'system:land'; 'system:followup' as a follow-up of a running job}: assert events of type parley.rebuild.enqueue for the workspace == 1 more than before; e.resource_type == 'rebuild'; e.resource_id == job.id; e.actor and e.session_id as given; e.metadata == {submitted_by, strategy, fail_mode, patch_count: 2}; then a duplicate enqueue: assert the event count is unchanged"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "unwanted",
+          "condition": "the body of POST /workspaces/:slug/rebuild carries a strategy other than rebase or merge, a fail_mode other than fail_fast or continue, or either member with a JSON type other than string or null",
+          "action": "refuse the request and queue nothing",
+          "contract": "HTTP 400 with error_type 'invalid_request'; no job and no event are created",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub router over a real store with the rebuild routes mounted, a ready carry-patch workspace 'w' owned by user U with integration branch 'deploy', and patches as the case states; no handler is registered for the job type 'rebuild', so queued jobs stay queued unless the test moves them through the queue",
+              "one active patch"
+            ],
+            "pseudocode": "in internal/carrypatch/rebuild_routes_test.go, a table over bodies {{strategy:'squash'}, {strategy:'REBASE'}, {fail_mode:'stop'}, {strategy:1}, {fail_mode:true}, {strategy:'merge', fail_mode:'x'}}: r = POST; assert r.status == 400 and r.json.error.error_type == 'invalid_request' and r.json.error.code == 400; assert count(jobs of 'w') == 0 and no parley.rebuild.enqueue exists"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "unwanted",
+          "condition": "POST /workspaces/:slug/rebuild arrives for a carry-patch workspace that has no patch in active or conflict",
+          "action": "refuse the request and queue nothing",
+          "contract": "HTTP 400 with error_type 'no_active_patches'; no job and no event are created",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub router over a real store with the rebuild routes mounted, a ready carry-patch workspace 'w' owned by user U with integration branch 'deploy', and patches as the case states; no handler is registered for the job type 'rebuild', so queued jobs stay queued unless the test moves them through the queue"
+            ],
+            "pseudocode": "in internal/carrypatch/rebuild_routes_test.go, a table over patch lists {none, one disabled, one merged_upstream, one deleted, disabled + merged_upstream + deleted}: r = POST; assert r.status == 400 and r.json.error.error_type == 'no_active_patches'; assert count(jobs of 'w') == 0"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "unwanted",
+          "condition": "POST /workspaces/:slug/rebuild arrives while the workspace has a rebuild job in queued, running or failed",
+          "action": "refuse the request, queue nothing and name the existing job's id in the error message",
+          "contract": "HTTP 409 with error_type 'concurrent_rebuild' and a message that contains the existing job's id; the existing job is unchanged; no event is created",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub router over a real store with the rebuild routes mounted, a ready carry-patch workspace 'w' owned by user U with integration branch 'deploy', and patches as the case states; no handler is registered for the job type 'rebuild', so queued jobs stay queued unless the test moves them through the queue",
+              "jobs in a given status are produced through the queue itself: enqueue, then single dispatcher passes with a scripted handler registered for 'rebuild' where a status other than queued is needed",
+              "one active patch"
+            ],
+            "pseudocode": "in internal/carrypatch/rebuild_routes_test.go, a table over the existing job's status {queued, running, failed}: r = POST; assert r.status == 409 and r.json.error.error_type == 'concurrent_rebuild' and r.json.error.message contains existing.id; assert count(jobs of 'w') == 1. Rows that answer 202: existing job completed, dead_letter, cancelled; a pending job of another workspace only"
+          }
+        },
+        {
+          "id": "REQ-6.6",
+          "pattern": "ubiquitous",
+          "action": "for any rebuild job, return the strategy, fail_mode and integration_branch captured when it was queued, whatever the workspace settings are changed to afterwards and through every later status of the job, a requeue included",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub router over a real store with the rebuild routes mounted, a ready carry-patch workspace 'w' owned by user U with integration branch 'deploy', and patches as the case states; no handler is registered for the job type 'rebuild', so queued jobs stay queued unless the test moves them through the queue",
+              "jobs in a given status are produced through the queue itself: enqueue, then single dispatcher passes with a scripted handler registered for 'rebuild' where a status other than queued is needed",
+              "one active patch"
+            ],
+            "pseudocode": "in internal/carrypatch/rebuild_routes_test.go: settings rebase/fail_fast; j = POST with no body; set the settings rebuild_strategy 'merge' and rebuild_fail_mode 'continue'; assert GET j shows strategy 'rebase' and fail_mode 'fail_fast'; claim the job and assert the handler receives a payload with 'rebase' and 'fail_fast' and 'deploy'; dead-letter it, requeue it; assert the record still shows 'rebase', 'fail_fast', 'deploy'"
+          }
+        },
+        {
+          "id": "REQ-6.7",
+          "pattern": "event_driven",
+          "condition": "POST /workspaces/:slug/rebuild is repeated with the Idempotency-Key, caller and body of an earlier request that was answered 202",
+          "action": "queue nothing and answer with the original job record",
+          "contract": "HTTP 200 with the body of the first answer; one job and one parley.rebuild.enqueue exist for the workspace",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub router over a real store with the rebuild routes mounted, a ready carry-patch workspace 'w' owned by user U with integration branch 'deploy', and patches as the case states; no handler is registered for the job type 'rebuild', so queued jobs stay queued unless the test moves them through the queue",
+              "the idempotency middleware of internal/server is installed on the router",
+              "one active patch"
+            ],
+            "pseudocode": "in internal/carrypatch/rebuild_routes_test.go: r1 = POST with Idempotency-Key 'k1'; assert r1.status == 202; r2 = the same request again; assert r2.status == 200 and r2.body == r1.body; assert count(jobs of 'w') == 1 and count(parley.rebuild.enqueue) == 1"
+          }
+        },
+        {
+          "id": "REQ-6.8",
+          "pattern": "event_driven",
+          "condition": "another component calls the shared rebuild enqueue for a carry-patch workspace with a submitted_by value, with or without a strategy and a fail mode",
+          "action": "queue the job with the same fallback to the settings and the same dedup as the route, without the no_active_patches check, and on a duplicate return a result that says nothing was queued and names the existing job's id",
+          "contract": "returns (job, queued true) when a job was stored and (existing job id, queued false) with a nil error on a duplicate; a workspace whose patches are all disabled or merged still gets a job",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub router over a real store with the rebuild routes mounted, a ready carry-patch workspace 'w' owned by user U with integration branch 'deploy', and patches as the case states; no handler is registered for the job type 'rebuild', so queued jobs stay queued unless the test moves them through the queue",
+              "jobs in a given status are produced through the queue itself: enqueue, then single dispatcher passes with a scripted handler registered for 'rebuild' where a status other than queued is needed"
+            ],
+            "pseudocode": "in internal/carrypatch/rebuild_enqueue_test.go, a table over submitted_by {'system:push', 'system:land', U.id}: on a workspace whose only patch is disabled: res = EnqueueRebuild(ctx, 'w', opts); assert res.queued and res.job.submitted_by == the value and strategy/fail_mode == the settings; call again: assert not res.queued and res.existing_id == the first id and err == nil and count(jobs of 'w') == 1; with opts.follow_up_of = the id of the running job and submitted_by 'system:followup': assert res.queued and the new job is 'queued'"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "List and read rebuild jobs",
+      "rationale": "Whoever follows a rebuild reads one record, with the same fields in every status.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "event_driven",
+          "condition": "a caller with read access (and, for a PAT, the scope rebuilds:read) sends GET /workspaces/:slug/rebuilds/:id for a job of that workspace",
+          "action": "answer with the rebuild job record built from the job, its payload, its result document and the detail of its last failure",
+          "contract": "HTTP 200 with every field of the record present; next_attempt_at is non-null only while status is 'failed'; completed_at is non-null only in 'completed', 'dead_letter' and 'cancelled'; error is the last failure's text or null; conflict is the last failure's detail document or null; members the result document lacks have the defaults null, 0, false and []",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub router over a real store with the rebuild routes mounted, a ready carry-patch workspace 'w' owned by user U with integration branch 'deploy', and patches as the case states; no handler is registered for the job type 'rebuild', so queued jobs stay queued unless the test moves them through the queue",
+              "jobs in a given status are produced through the queue itself: enqueue, then single dispatcher passes with a scripted handler registered for 'rebuild' where a status other than queued is needed"
+            ],
+            "pseudocode": "in internal/carrypatch/rebuild_routes_test.go, a table over the job's state {queued; running with no result; running with result {patch_results:[one entry], upstream_head_sha: S}; failed after one retryable error 'fetch failed'; dead_letter after a permanent error with detail D; completed with a full result document; cancelled; requeued}: r = GET; assert r.status == 200; assert the member set equals the record's field list; assert (next_attempt_at != null) == (status == 'failed'); assert (completed_at != null) == (status in {completed, dead_letter, cancelled}); failed: error == 'fetch failed' and retry_count == 1; dead_letter: conflict == D; running with result: patch_results has 1 entry and upstream_head_sha == S; completed: the result's members appear unchanged; requeued: error == null and conflict == null and retry_count == 0"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "event_driven",
+          "condition": "a caller with read access sends GET /workspaces/:slug/rebuilds, with or without a status filter, limit and cursor",
+          "action": "answer with the rebuild jobs of that workspace only, restricted to the given status when one is given, ordered by created_at descending and then id descending, in pages",
+          "contract": "HTTP 200 with {items: [rebuild job record, …], next_cursor: string or null}; items is [] when nothing matches; following next_cursor until it is null returns every matching job exactly once",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub router over a real store with the rebuild routes mounted, a ready carry-patch workspace 'w' owned by user U with integration branch 'deploy', and patches as the case states; no handler is registered for the job type 'rebuild', so queued jobs stay queued unless the test moves them through the queue",
+              "jobs in a given status are produced through the queue itself: enqueue, then single dispatcher passes with a scripted handler registered for 'rebuild' where a status other than queued is needed"
+            ],
+            "pseudocode": "in internal/carrypatch/rebuild_routes_test.go: workspace 'w' holds 5 jobs created at t, t+1s, t+1s, t+2s, t+3s in statuses {completed, dead_letter, cancelled, completed, queued}, workspace 'w2' holds 1 job; assert GET .../rebuilds items are the 5 jobs of 'w' in the order created_at desc, id desc; assert ?status=completed returns the 2 completed jobs newest first; assert ?status=running returns items [] and next_cursor null; assert ?limit=2 pages 2+2+1 with no repeat and no gap and next_cursor null on the last page; assert an empty workspace returns {items: [], next_cursor: null}"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "unwanted",
+          "condition": "GET /workspaces/:slug/rebuilds carries a status value that is not one of queued, running, failed, completed, dead_letter and cancelled",
+          "action": "refuse the request",
+          "contract": "HTTP 400 with error_type 'invalid_request'",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub router over a real store with the rebuild routes mounted, a ready carry-patch workspace 'w' owned by user U with integration branch 'deploy', and patches as the case states; no handler is registered for the job type 'rebuild', so queued jobs stay queued unless the test moves them through the queue"
+            ],
+            "pseudocode": "in internal/carrypatch/rebuild_routes_test.go, a table over ?status= {'done', 'QUEUED', '', 'queued,failed'}: assert r.status == 400 and r.json.error.error_type == 'invalid_request'"
+          }
+        },
+        {
+          "id": "REQ-7.4",
+          "pattern": "unwanted",
+          "condition": "a request to GET /workspaces/:slug/rebuilds/:id, DELETE /workspaces/:slug/rebuilds/:id or POST /workspaces/:slug/rebuilds/:id/requeue names an id that is not a UUID, names no job, or names a job of another workspace",
+          "action": "refuse the request and change nothing",
+          "contract": "HTTP 404 with error_type 'not_found' and message 'rebuild job not found'; the job of the other workspace is unchanged and no event is written",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub router over a real store with the rebuild routes mounted, a ready carry-patch workspace 'w' owned by user U with integration branch 'deploy', and patches as the case states; no handler is registered for the job type 'rebuild', so queued jobs stay queued unless the test moves them through the queue",
+              "jobs in a given status are produced through the queue itself: enqueue, then single dispatcher passes with a scripted handler registered for 'rebuild' where a status other than queued is needed"
+            ],
+            "pseudocode": "in internal/carrypatch/rebuild_routes_test.go, a table over the three routes crossed with ids {'abc', a random UUID, the id of a queued job of workspace 'w2' the caller can also write, the id of a dead_letter job of 'w2'}: assert r.status == 404 and r.json.error.error_type == 'not_found' and r.json.error.message == 'rebuild job not found'; assert the jobs of 'w2' are unchanged; assert no parley.rebuild.cancel or parley.rebuild.requeue exists"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "Cancel and requeue rebuild jobs",
+      "rationale": "A queued rebuild that is no longer wanted can be withdrawn, and a dead-lettered one can be given a fresh run once its cause is fixed.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "a caller with write access sends DELETE /workspaces/:slug/rebuilds/:id for a job that is queued",
+          "action": "set the job's status to cancelled and its completed_at to the present, write parley.rebuild.cancel with the caller as actor, resource_type rebuild, the job id as resource_id and no metadata in the same transaction, and answer with the job record",
+          "contract": "HTTP 200 with the rebuild job record, status 'cancelled', completed_at set; one parley.rebuild.cancel exists; the job's handler is never called",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub router over a real store with the rebuild routes mounted, a ready carry-patch workspace 'w' owned by user U with integration branch 'deploy', and patches as the case states; no handler is registered for the job type 'rebuild', so queued jobs stay queued unless the test moves them through the queue",
+              "one active patch"
+            ],
+            "pseudocode": "in internal/carrypatch/rebuild_routes_test.go: j = POST rebuild; r = DELETE .../rebuilds/{j.id}; assert r.status == 200 and r.json.status == 'cancelled' and r.json.completed_at != null; assert one parley.rebuild.cancel with actor U, resource_id j.id and empty metadata; register a handler for 'rebuild' and run a dispatcher pass; assert the handler was not called; assert a new POST rebuild answers 202"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "unwanted",
+          "condition": "DELETE /workspaces/:slug/rebuilds/:id names a job whose status is running, failed, completed, dead_letter or cancelled",
+          "action": "refuse the request and leave the job unchanged",
+          "contract": "HTTP 409 with error_type 'job_not_cancellable'; the job's status and updated_at are unchanged; no parley.rebuild.cancel is written",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub router over a real store with the rebuild routes mounted, a ready carry-patch workspace 'w' owned by user U with integration branch 'deploy', and patches as the case states; no handler is registered for the job type 'rebuild', so queued jobs stay queued unless the test moves them through the queue",
+              "jobs in a given status are produced through the queue itself: enqueue, then single dispatcher passes with a scripted handler registered for 'rebuild' where a status other than queued is needed"
+            ],
+            "pseudocode": "in internal/carrypatch/rebuild_routes_test.go, a table over the job's status {running, failed, completed, dead_letter, cancelled}: r = DELETE; assert r.status == 409 and r.json.error.error_type == 'job_not_cancellable'; assert the job read back equals the job before; assert count(parley.rebuild.cancel) is unchanged"
+          }
+        },
+        {
+          "id": "REQ-8.3",
+          "pattern": "unwanted",
+          "condition": "a cancel request and a worker's claim reach the same queued job at the same time",
+          "action": "let exactly one of them take effect",
+          "contract": "either the answer is HTTP 200 with status 'cancelled' and the handler is never called, or the answer is HTTP 409 'job_not_cancellable' and the handler is called once; never both and never neither",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub router over a real store with the rebuild routes mounted, a ready carry-patch workspace 'w' owned by user U with integration branch 'deploy', and patches as the case states; no handler is registered for the job type 'rebuild', so queued jobs stay queued unless the test moves them through the queue",
+              "a real store file in t.TempDir()",
+              "a scripted handler registered for 'rebuild' that returns nil",
+              "one active patch"
+            ],
+            "pseudocode": "in internal/carrypatch/rebuild_routes_test.go, repeated 100 times: queue a job; at the same moment send DELETE and run a dispatcher pass; assert (r.status == 200 and handler calls for the job == 0 and the job is 'cancelled') or (r.status == 409 and handler calls == 1 and the job is 'running' or settled)"
+          }
+        },
+        {
+          "id": "REQ-8.4",
+          "pattern": "event_driven",
+          "condition": "a caller with write access sends POST /workspaces/:slug/rebuilds/:id/requeue for a job that is dead_letter, while no other rebuild job of the workspace is queued, running or failed",
+          "action": "set the job's status to queued with retry_count 0 and error, conflict, next_attempt_at and completed_at null, keep its id, created_at, strategy, fail_mode, integration_branch and submitted_by, write parley.rebuild.requeue with the caller as actor and no metadata in the same transaction, and answer with the job record",
+          "contract": "HTTP 200 with the rebuild job record, status 'queued', retry_count 0, error null, conflict null, completed_at null; one parley.rebuild.requeue exists with resource_id the job id; the next dispatcher pass calls the handler with the payload of the first enqueue",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub router over a real store with the rebuild routes mounted, a ready carry-patch workspace 'w' owned by user U with integration branch 'deploy', and patches as the case states; no handler is registered for the job type 'rebuild', so queued jobs stay queued unless the test moves them through the queue",
+              "jobs in a given status are produced through the queue itself: enqueue, then single dispatcher passes with a scripted handler registered for 'rebuild' where a status other than queued is needed"
+            ],
+            "pseudocode": "in internal/carrypatch/rebuild_routes_test.go, a table over how the job was dead-lettered {permanent error with detail D at retry_count 0, retries exhausted at retry_count 20}: r = POST requeue; assert r.status == 200; r.json.status == 'queued'; retry_count == 0; error == null; conflict == null; completed_at == null; id, created_at, strategy, fail_mode, integration_branch, submitted_by equal the values before; assert one parley.rebuild.requeue with actor U and empty metadata; run a pass; assert the handler received the same job id and payload"
+          }
+        },
+        {
+          "id": "REQ-8.5",
+          "pattern": "unwanted",
+          "condition": "POST /workspaces/:slug/rebuilds/:id/requeue names a job whose status is queued, running, failed, completed or cancelled",
+          "action": "refuse the request and leave the job unchanged, whatever the other jobs of the workspace are",
+          "contract": "HTTP 409 with error_type 'job_not_requeueable'; the job is unchanged; no parley.rebuild.requeue is written",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub router over a real store with the rebuild routes mounted, a ready carry-patch workspace 'w' owned by user U with integration branch 'deploy', and patches as the case states; no handler is registered for the job type 'rebuild', so queued jobs stay queued unless the test moves them through the queue",
+              "jobs in a given status are produced through the queue itself: enqueue, then single dispatcher passes with a scripted handler registered for 'rebuild' where a status other than queued is needed"
+            ],
+            "pseudocode": "in internal/carrypatch/rebuild_routes_test.go, a table over the job's status {queued, running, failed, completed, cancelled}, each once alone and, for completed and cancelled, once more with another job of the workspace queued: r = POST requeue; assert r.status == 409 and r.json.error.error_type == 'job_not_requeueable'; assert the job read back equals the job before"
+          }
+        },
+        {
+          "id": "REQ-8.6",
+          "pattern": "unwanted",
+          "condition": "POST /workspaces/:slug/rebuilds/:id/requeue names a dead_letter job while another rebuild job of the workspace is queued, running or failed",
+          "action": "refuse the request and leave both jobs unchanged",
+          "contract": "HTTP 409 with error_type 'concurrent_rebuild'; the named job stays 'dead_letter' with its error and retry_count; no parley.rebuild.requeue is written",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub router over a real store with the rebuild routes mounted, a ready carry-patch workspace 'w' owned by user U with integration branch 'deploy', and patches as the case states; no handler is registered for the job type 'rebuild', so queued jobs stay queued unless the test moves them through the queue",
+              "jobs in a given status are produced through the queue itself: enqueue, then single dispatcher passes with a scripted handler registered for 'rebuild' where a status other than queued is needed"
+            ],
+            "pseudocode": "in internal/carrypatch/rebuild_routes_test.go, a table over the other job's status {queued, running, failed}: r = POST requeue of the dead_letter job; assert r.status == 409 and r.json.error.error_type == 'concurrent_rebuild'; assert both jobs read back unchanged; rows that answer 200: the other job is completed, cancelled or dead_letter"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-9",
+      "title": "Refuse callers and workspace states the rebuild routes do not serve",
+      "rationale": "The five routes answer like every other carry-patch route, so a client handles one set of refusals.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-9.1",
+          "pattern": "unwanted",
+          "condition": "a request to one of the five rebuild job routes comes from a PAT without the route's scope (rebuilds:read on the two GET routes, rebuilds:write on the others), from a caller with no access to the workspace, or, on a write route, from a caller with read access only",
+          "action": "refuse the request before validating it and change nothing",
+          "contract": "HTTP 403 'insufficient_scope' for the missing scope, whether or not the workspace exists; HTTP 404 'not_found' for no access or an unknown slug; HTTP 403 'forbidden' for read access on a write route; no job and no event are created or changed",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub router over a real store with the rebuild routes mounted, a ready carry-patch workspace 'w' owned by user U with integration branch 'deploy', and patches as the case states; no handler is registered for the job type 'rebuild', so queued jobs stay queued unless the test moves them through the queue",
+              "jobs in a given status are produced through the queue itself: enqueue, then single dispatcher passes with a scripted handler registered for 'rebuild' where a status other than queued is needed",
+              "the authentication, scope and access components of packages 04, 06 and 07 are installed on the router",
+              "one active patch, one queued job and one dead_letter job where the route needs them"
+            ],
+            "pseudocode": "in internal/carrypatch/rebuild_routes_test.go, a table over the routes {POST rebuild, GET rebuilds, GET rebuilds/:id, DELETE rebuilds/:id, POST rebuilds/:id/requeue} crossed with callers {PAT of U without the route's scope on 'w' -> 403 insufficient_scope; the same PAT on slug 'missing' -> 403 insufficient_scope; PAT with rebuilds:read only on the three write routes -> 403 insufficient_scope; user X with no access -> 404 not_found; owner on slug 'missing' -> 404 not_found; org member with read access on the three write routes -> 403 forbidden; the same member on the two GET routes -> 200}: assert status and error_type; assert the jobs of 'w' are unchanged; POST rebuild by the member with an invalid body is still 403"
+          }
+        },
+        {
+          "id": "REQ-9.2",
+          "pattern": "unwanted",
+          "condition": "a request to one of the five rebuild job routes passes access and validation and names a workspace that is not in carry-patch mode",
+          "action": "refuse the request",
+          "contract": "HTTP 400 with error_type 'workspace_mode_mismatch' on a standard workspace and on a task fork of a carry-patch workspace",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub router over a real store with the rebuild routes mounted, a ready carry-patch workspace 'w' owned by user U with integration branch 'deploy', and patches as the case states; no handler is registered for the job type 'rebuild', so queued jobs stay queued unless the test moves them through the queue"
+            ],
+            "pseudocode": "in internal/carrypatch/rebuild_routes_test.go, a table over the five routes crossed with {a ready standard workspace, a task fork of the carry-patch workspace 'w'}: assert r.status == 400 and r.json.error.error_type == 'workspace_mode_mismatch'; the job-id routes use a random UUID and still answer 400, not 404; POST rebuild with body {strategy:'squash'} on the standard workspace answers 400 'invalid_request'"
+          }
+        },
+        {
+          "id": "REQ-9.3",
+          "pattern": "unwanted",
+          "condition": "a request to POST /workspaces/:slug/rebuild, DELETE /workspaces/:slug/rebuilds/:id or POST /workspaces/:slug/rebuilds/:id/requeue names a carry-patch workspace that is pending, cloning, failed, archived or under a running reclone, archive or delete",
+          "action": "refuse the request before looking at patches or jobs and change nothing",
+          "contract": "HTTP 409 with error_type 'workspace_busy' for pending, cloning and a running reclone, archive or delete; 'workspace_not_ready' for failed; 'workspace_archived' for archived; an unknown job id in the same request does not turn the answer into 404",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub router over a real store with the rebuild routes mounted, a ready carry-patch workspace 'w' owned by user U with integration branch 'deploy', and patches as the case states; no handler is registered for the job type 'rebuild', so queued jobs stay queued unless the test moves them through the queue",
+              "jobs in a given status are produced through the queue itself: enqueue, then single dispatcher passes with a scripted handler registered for 'rebuild' where a status other than queued is needed"
+            ],
+            "pseudocode": "in internal/carrypatch/rebuild_routes_test.go, a table over the three write routes crossed with workspace states {pending, cloning, maintenance marker set, failed, archived}: assert r.status == 409 and error_type == {workspace_busy, workspace_busy, workspace_busy, workspace_not_ready, workspace_archived}; rows with a random UUID as job id give the same answers; POST rebuild on an archived workspace with no patch answers 409 'workspace_archived', not 'no_active_patches'; assert no job changed"
+          }
+        },
+        {
+          "id": "REQ-9.4",
+          "pattern": "state_driven",
+          "condition": "a carry-patch workspace is pending, cloning, failed, archived or under a running reclone, archive or delete",
+          "action": "serve GET /workspaces/:slug/rebuilds and GET /workspaces/:slug/rebuilds/:id as in a ready workspace",
+          "contract": "HTTP 200 with the same body the route returns when the workspace is ready",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub router over a real store with the rebuild routes mounted, a ready carry-patch workspace 'w' owned by user U with integration branch 'deploy', and patches as the case states; no handler is registered for the job type 'rebuild', so queued jobs stay queued unless the test moves them through the queue",
+              "jobs in a given status are produced through the queue itself: enqueue, then single dispatcher passes with a scripted handler registered for 'rebuild' where a status other than queued is needed"
+            ],
+            "pseudocode": "in internal/carrypatch/rebuild_routes_test.go: queue and complete one job while 'w' is ready and keep both GET answers; a table over workspace states {pending, cloning, maintenance marker set, failed, archived}: assert both GET routes answer 200 with bodies equal to the kept ones"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-10",
+      "title": "Drive rebuild jobs from the command line",
+      "rationale": "People and scripts queue a rebuild and wait for its real end, not for the first failed attempt.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-10.1",
+          "pattern": "event_driven",
+          "condition": "a user runs parley rebuild submit <workspace-slug> without --wait, with or without --strategy and --fail-mode",
+          "action": "send POST /api/v1/workspaces/<slug>/rebuild with a JSON body that holds only the members whose flags were given, print the answered job record and exit 0",
+          "contract": "one request; body {} with no flag, {strategy} or {fail_mode} or both otherwise; stdout is the hub's response as one JSON document indented by 2 spaces; exit status 0; a hub error is printed on stderr as received with exit status 1",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server stands in for the hub, records every request and answers from a script; the command runs through cli.Run with --endpoint-url and --api-key set"
+            ],
+            "pseudocode": "in internal/cli/rebuild_test.go, a table over flags {none -> body {}, --strategy merge -> {strategy:'merge'}, --fail-mode continue -> {fail_mode:'continue'}, both}: code = run(['rebuild','submit','w', ...]); assert the recorded request is POST /api/v1/workspaces/w/rebuild with that body; assert code == 0 and json(stdout) == the scripted 202 record; one row where the hub answers 409 concurrent_rebuild: assert code == 1, stdout == '' and json(stderr).error.error_type == 'concurrent_rebuild'"
+          }
+        },
+        {
+          "id": "REQ-10.2",
+          "pattern": "event_driven",
+          "condition": "a user runs parley rebuild submit or parley rebuild requeue with --wait and the job reaches completed",
+          "action": "after the starting request, poll GET /api/v1/workspaces/<slug>/rebuilds/<id> at the poll interval, continue through the statuses queued, running and failed, stop at completed, print the final job record and exit 0",
+          "contract": "stdout holds exactly one JSON document, the record with status 'completed'; exit status 0; a record with status 'failed' never ends the wait",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server stands in for the hub, records every request and answers from a script; the command runs through cli.Run with --endpoint-url and --api-key set"
+            ],
+            "pseudocode": "in internal/cli/rebuild_test.go, a table over the commands {submit w --wait, requeue w <id> --wait} with --poll-interval 10ms: the hub answers the start with status 'queued', then polls with 'running', 'failed' (retry_count 1, next_attempt_at set), 'queued', 'running', 'completed'; assert code == 0; assert json(stdout).status == 'completed' and stdout holds one document; assert 5 GET requests to /api/v1/workspaces/w/rebuilds/<id>; assert the default of --timeout is 5m and of --poll-interval 5s in the command's flags"
+          }
+        },
+        {
+          "id": "REQ-10.3",
+          "pattern": "unwanted",
+          "condition": "a wait started by parley rebuild submit --wait or parley rebuild requeue --wait ends in dead_letter or cancelled, or passes its --timeout",
+          "action": "print the final job record when there is one, report the failure of the wait and exit 1",
+          "contract": "dead_letter or cancelled: stdout is the final record, stderr the envelope with error_type 'wait_failed', exit status 1; timeout: stdout empty, stderr the envelope with error_type 'wait_timeout', exit status 1, and no cancel request is sent",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server stands in for the hub, records every request and answers from a script; the command runs through cli.Run with --endpoint-url and --api-key set"
+            ],
+            "pseudocode": "in internal/cli/rebuild_test.go, a table over the two commands crossed with poll scripts {running then dead_letter; cancelled at once; failed for ever with --timeout 50ms}: assert code == 1; for dead_letter and cancelled: json(stdout).status == that status and json(stderr).error.error_type == 'wait_failed'; for the timeout: stdout == '' and json(stderr).error.error_type == 'wait_timeout' and no DELETE request was recorded"
+          }
+        },
+        {
+          "id": "REQ-10.4",
+          "pattern": "event_driven",
+          "condition": "a user runs parley rebuild list <workspace-slug>, parley rebuild status <workspace-slug> <rebuild-id>, parley rebuild cancel <workspace-slug> <rebuild-id> or parley rebuild requeue <workspace-slug> <rebuild-id> without --wait",
+          "action": "send the one request of the command (GET /workspaces/:slug/rebuilds with the status query only when --status was given, GET /workspaces/:slug/rebuilds/:id, DELETE /workspaces/:slug/rebuilds/:id, POST /workspaces/:slug/rebuilds/:id/requeue with no body), print the hub's response and exit 0",
+          "contract": "one request with the method and path of the command; stdout is the hub's response; exit status 0; a hub error is printed on stderr as received with exit status 1",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server stands in for the hub, records every request and answers from a script; the command runs through cli.Run with --endpoint-url and --api-key set"
+            ],
+            "pseudocode": "in internal/cli/rebuild_test.go, a table {list w -> GET /api/v1/workspaces/w/rebuilds with no query; list w --status failed -> the same with ?status=failed; status w ID -> GET .../rebuilds/ID; cancel w ID -> DELETE .../rebuilds/ID; requeue w ID -> POST .../rebuilds/ID/requeue with an empty body}: assert the recorded method, path, query and body; assert code == 0 and json(stdout) == the scripted response; rows where the hub answers 404 not_found, 409 job_not_cancellable and 409 job_not_requeueable: assert code == 1, stdout == '' and stderr carries the envelope as received"
+          }
+        },
+        {
+          "id": "REQ-10.5",
+          "pattern": "unwanted",
+          "condition": "a parley rebuild command is given a --strategy other than rebase or merge, a --fail-mode other than fail_fast or continue, a --status that is not one of the six job statuses, a --timeout or --poll-interval that is not positive, or a wrong number of arguments",
+          "action": "report a usage error and send no request",
+          "contract": "exit status 2; stdout empty; stderr carries the envelope with code 0 and error_type 'usage_error'; the hub receives no request",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server stands in for the hub, records every request and answers from a script; the command runs through cli.Run with --endpoint-url and --api-key set"
+            ],
+            "pseudocode": "in internal/cli/rebuild_test.go, a table over argument lists {submit w --strategy squash; submit w --fail-mode stop; list w --status done; submit; submit w x; status w; cancel w; requeue w; submit w --wait --timeout 0s; requeue w ID --poll-interval -1s}: assert code == 2; stdout == ''; json(stderr).error.error_type == 'usage_error' and code == 0; assert the server recorded no request"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "A developer submits a rebuild and waits through a retry",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "runs parley rebuild submit <slug> --wait on a carry-patch workspace with one active patch"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends POST /api/v1/workspaces/<slug>/rebuild"
+        },
+        {
+          "actor": "parleyd",
+          "action": "stores the job as queued together with parley.rebuild.enqueue and answers 202 with the job record"
+        },
+        {
+          "actor": "parleyd",
+          "action": "claims the job on a worker and runs the handler, which fails with a retryable error; the job becomes failed with retry_count 1 and next_attempt_at 4 seconds later"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "polls GET /api/v1/workspaces/<slug>/rebuilds/<id>, sees failed and keeps polling"
+        },
+        {
+          "actor": "parleyd",
+          "action": "returns the job to queued when next_attempt_at is reached, runs the handler again and settles the job as completed"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints the final job record with status completed and exits 0"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parley CLI (cli.Run)",
+          "HTTP router with authentication, access and the rebuild routes",
+          "shared rebuild enqueue",
+          "job queue with its background dispatcher",
+          "transactional store",
+          "event log"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with a controlled clock and a real store in t.TempDir()",
+          "a ready carry-patch workspace with one active patch, created through the hub",
+          "the handler registered for the job type 'rebuild' is a scripted test handler that returns a retryable error on its first call and nil on its second (the rebuild handler of package 34 replaces it in production)"
+        ],
+        "end_state": [
+          "the command's exit status is 0 and stdout is one job record with status 'completed' and retry_count 1",
+          "the handler was called twice with the same job id",
+          "the event log holds one parley.rebuild.enqueue for the job",
+          "GET /api/v1/workspaces/<slug>/rebuilds lists the job once"
+        ],
+        "pseudocode": "in test/e2e/rebuild_jobs_test.go: start the hub; create the workspace and patch; run cli.Run(['rebuild','submit',slug,'--wait','--poll-interval','20ms']) in a goroutine; wait until GET the job shows 'failed' with retry_count 1 and next_attempt_at == failure time + 4s; advance the clock by 4s; wait for the command; assert code == 0; assert json(stdout).status == 'completed' and retry_count == 1; assert handler.calls == 2; assert the events of type parley.rebuild.enqueue for the job == 1"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "A rebuild job survives a restart of the hub",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "sends POST /workspaces/:slug/rebuild and receives 202 with the job record"
+        },
+        {
+          "actor": "parleyd",
+          "action": "claims the job; the handler is running when the hub stops"
+        },
+        {
+          "actor": "operator",
+          "action": "starts the hub again on the same data directory"
+        },
+        {
+          "actor": "parleyd",
+          "action": "returns the job from running to queued with retry_count unchanged before any worker starts, then claims it and runs the handler from the start"
+        },
+        {
+          "actor": "agent",
+          "action": "reads GET /workspaces/:slug/rebuilds/:id and sees status completed"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "HTTP router with the rebuild routes",
+          "job queue with crash recovery as a start hook",
+          "transactional store on disk",
+          "hub start and shutdown of internal/hub"
+        ],
+        "setup": [
+          "a hub started in-process on a data directory in t.TempDir()",
+          "a ready carry-patch workspace with one active patch",
+          "a scripted handler for 'rebuild' that never returns and ignores its context in the first hub, and returns nil in the second"
+        ],
+        "end_state": [
+          "after the restart the job has status 'completed', retry_count 0 and the id the POST returned",
+          "the second hub's handler was called once, with the payload captured at enqueue",
+          "no job has status 'running'"
+        ],
+        "pseudocode": "in test/e2e/rebuild_jobs_test.go: start hub 1; id = POST rebuild; wait until GET shows 'running'; stop hub 1 with its shutdown grace cut short by the controlled clock; open the store directly and assert the job is still 'running'; start hub 2 on the same directory; wait until GET id shows 'completed'; assert retry_count == 0; assert handler2.calls == [id]"
+      }
+    },
+    {
+      "id": "PATH-3",
+      "title": "An agent cancels a queued rebuild and requeues a dead-lettered one",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "sends POST /workspaces/:slug/rebuild; the handler fails with a permanent error"
+        },
+        {
+          "actor": "parleyd",
+          "action": "settles the job as dead_letter with the error text and the failure detail"
+        },
+        {
+          "actor": "agent",
+          "action": "sends POST /workspaces/:slug/rebuild again and receives 202 with a second job, then POST requeue of the first job"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers the requeue with 409 concurrent_rebuild because the second job is queued"
+        },
+        {
+          "actor": "agent",
+          "action": "sends DELETE /workspaces/:slug/rebuilds/<second id> twice"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers 200 with status cancelled and parley.rebuild.cancel, then 409 job_not_cancellable"
+        },
+        {
+          "actor": "agent",
+          "action": "sends POST requeue of the first job again"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers 200 with status queued, retry_count 0, error and conflict null, and writes parley.rebuild.requeue"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "HTTP router with authentication, access and the rebuild routes",
+          "shared rebuild enqueue",
+          "job queue",
+          "transactional store",
+          "event log"
+        ],
+        "setup": [
+          "a hub started in-process with a real store in t.TempDir()",
+          "a ready carry-patch workspace with one active patch",
+          "a scripted handler for 'rebuild' that returns a permanent error with a detail document on its first call and blocks on later calls; the dispatcher is paused by the test while the second job must stay queued"
+        ],
+        "end_state": [
+          "the first job is 'queued' with retry_count 0 (the dispatcher is still paused), error null and conflict null",
+          "the second job is 'cancelled' with completed_at set",
+          "the event log holds two parley.rebuild.enqueue, one parley.rebuild.cancel and one parley.rebuild.requeue for the workspace",
+          "GET /workspaces/:slug/rebuilds returns the two jobs, the second first"
+        ],
+        "pseudocode": "in test/e2e/rebuild_jobs_test.go: a = POST rebuild; wait until GET a shows 'dead_letter' with conflict != null; pause the dispatcher; b = POST rebuild; assert 202; assert POST a/requeue is 409 'concurrent_rebuild'; assert DELETE b is 200 'cancelled'; assert DELETE b is 409 'job_not_cancellable'; r = POST a/requeue; assert 200 and status 'queued' and retry_count 0 and error == null and conflict == null; assert the counts of the three event types; assert the list order is [b, a]"
+      }
+    }
+  ]
+}

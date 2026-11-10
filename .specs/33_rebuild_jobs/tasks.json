@@ -1,0 +1,253 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "33",
+  "spec_name": "rebuild_jobs",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/jobs/... ./internal/carrypatch/... ./internal/cli/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "31",
+      "reason": "carry-patch workspaces, the patch list, the integration branch accessor, the RebuildEnqueuer interface this package implements and the common carry-patch precondition check the rebuild routes call"
+    },
+    {
+      "spec": "09",
+      "reason": "the parley rebuild commands are built on its command helper, HTTP client, output, exit codes and shared --wait"
+    },
+    {
+      "spec": "52",
+      "reason": "parley.rebuild.enqueue, cancel and requeue are written through its event component in the transaction of the state change"
+    },
+    {
+      "spec": "14",
+      "reason": "registers the remover of a workspace's job records with the removers of owned data it declares in internal/workspace"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Store durable jobs and enqueue them with dedup",
+      "criteria": [
+        "REQ-1"
+      ],
+      "steps": [
+        "Add the enqueue behaviours to internal/jobs/enqueue_test.go and the reopen behaviour to internal/jobs/store_test.go, against a real store in t.TempDir(), and confirm they fail",
+        "Define the job in internal/jobs/job.go: id, type, workspace slug, status (queued, running, failed, completed, dead_letter, cancelled), payload, result and failure-detail documents held as opaque JSON, retry_count, next_attempt_at, error, created_at, updated_at, completed_at; say which statuses are pending (queued, running, failed) and which are final",
+        "Register the schema migration for the job table with internal/store, with an index that serves 'pending jobs of a type and workspace' and 'jobs of a workspace newest first'",
+        "Build the queue value in internal/jobs/queue.go from the store, a replaceable clock and a logger; expose Get by id and a read of one workspace's jobs of a type with an optional status filter, ordered by created_at descending then id descending, with the paging inputs the list helper of internal/server needs",
+        "Implement Enqueue(tx, type, workspace, payload): inside the caller's transaction, refuse with a duplicate error carrying the existing job's id when a pending job of that type and workspace exists, else insert a queued job with a random version 4 UUID made with crypto/rand, retry_count 0 and both timestamps at the clock's present",
+        "Make dedup hold under concurrency: the check and the insert are one atomic step in the store, so that of several concurrent enqueues one stores a job and every other reports the duplicate",
+        "Implement EnqueueFollowUp(tx, runningJobID, payload): allowed only when the named job is running and is the workspace's only pending job; a not-found error for an unknown id; the duplicate error otherwise",
+        "Return errors from every operation; nothing in internal/jobs ends the process"
+      ],
+      "touches": [
+        "internal/jobs/job.go",
+        "internal/jobs/store.go",
+        "internal/jobs/queue.go",
+        "internal/jobs/enqueue.go",
+        "internal/jobs/enqueue_test.go",
+        "internal/jobs/store_test.go",
+        "internal/store/"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Claim queued jobs and run them on workers",
+      "criteria": [
+        "REQ-2"
+      ],
+      "steps": [
+        "Add the claiming behaviours to internal/jobs/queue_test.go with a scripted handler and single dispatcher passes under a controlled clock, and confirm they fail",
+        "Define the handler interface in internal/jobs/handler.go: one operation that runs an attempt (context and job in, error out) and one settlement hook (transaction, job, will-retry flag in, error out); Register(type, handler) on the queue",
+        "Implement one dispatcher pass (Pass): first return every failed job whose next_attempt_at is at or before the clock's present to queued with next_attempt_at null; then claim queued jobs in the order created_at ascending, id ascending",
+        "A claim is one conditional update from queued to running that also empties the result document and sets updated_at; a pass whose update changed no row lost the claim and moves on",
+        "Skip a queued job while 4 jobs are running, while another job of its type and workspace is running, and while its type has no registered handler; such a job is left unchanged",
+        "Run each claimed job's handler on its own goroutine with a context the queue can cancel; count running handlers so that the limit of 4 holds across concurrent passes",
+        "Implement Run(ctx): a background dispatcher that makes a pass at least once per second and whenever it is woken; wake it after an enqueue's transaction commits, after a requeue and after every settlement; give tests an option to set the interval and to disable the wake",
+        "Settle a handler that returns nil as completed (status and completed_at in one transaction) so that the limit of 4 and the one-per-workspace rule can be observed end to end; the settlement of failures, the hook and the backoff are the next task's"
+      ],
+      "touches": [
+        "internal/jobs/handler.go",
+        "internal/jobs/queue.go",
+        "internal/jobs/queue_test.go"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Settle attempts: complete, retry with backoff, dead-letter",
+      "criteria": [
+        "REQ-3"
+      ],
+      "steps": [
+        "Add the settlement behaviours to internal/jobs/settle_test.go, the backoff table among them, and confirm they fail",
+        "Add the error markers in internal/jobs/errors.go: Permanent(err) marks an error permanent, WithDetail(err, document) attaches a detail document; any other error is retryable",
+        "Settle a nil return as completed: clear error and detail, set completed_at, keep retry_count and the stored result",
+        "Settle a retryable error with retry_count below 20 as failed: raise retry_count to n, set next_attempt_at to the present plus min(2 s × 2ⁿ, 2 h), store the error text, replace or clear the detail",
+        "Settle a retryable error at retry_count 20, and every permanent error, as dead_letter: retry_count unchanged, error text and detail stored, completed_at set, next_attempt_at null",
+        "Recover a panic of a handler and settle it as a retryable error whose text contains the panic value",
+        "Do each settlement in one store transaction and call the type's settlement hook inside it with the job as settled and will_retry true only for failed; run the hook under a savepoint so that a hook that returns an error or panics has its writes undone, is logged with the job id, and the settlement still commits",
+        "Implement SetResult(ctx, jobID, document): replaces the result document of a running job and returns a not-running error for a job in any other status",
+        "Wake the dispatcher after every settlement so that a follow-up or a waiting job starts on the next pass"
+      ],
+      "touches": [
+        "internal/jobs/errors.go",
+        "internal/jobs/settle.go",
+        "internal/jobs/settle_test.go",
+        "internal/jobs/queue.go"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Recover running jobs at start and stop cleanly at shutdown",
+      "criteria": [
+        "REQ-4"
+      ],
+      "steps": [
+        "Add the recovery and shutdown behaviours to internal/jobs/lifecycle_test.go, with a store that is closed and reopened and a controlled clock for the 30-second grace, and confirm they fail",
+        "Implement Recover(ctx): set every running job to queued, leaving retry_count, error, payload and created_at as they are, and touch no job in another status",
+        "Make Run stop on cancellation of its context: claim nothing more, wait for the running handlers, settle each outcome that arrives within 30 seconds, and return when the last has been settled",
+        "At 30 seconds cancel the contexts of the handlers still running and return without settling them; drop an outcome that arrives after that, so the job stays running in the store",
+        "Register the queue where the hub is composed (internal/hub of package 03): Recover as a start hook, so it completes before the listener is bound and before the first dispatcher pass, and Run as background work with a grace of 30 seconds",
+        "Give the hub's run function an option that supplies the handler for a job type, so that tests and package 34 register the handler of 'rebuild' without changing the composition"
+      ],
+      "touches": [
+        "internal/jobs/lifecycle.go",
+        "internal/jobs/lifecycle_test.go",
+        "internal/jobs/queue.go",
+        "internal/hub/",
+        "cmd/parleyd/"
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Report queue depth and remove jobs with their workspace",
+      "criteria": [
+        "REQ-5"
+      ],
+      "steps": [
+        "Add the depth behaviour to internal/jobs/queue_test.go and the removal behaviours to internal/jobs/store_test.go and confirm they fail",
+        "Implement Depth(ctx): for every registered job type, the count of jobs in each of the six statuses, with 0 for an absent status; this is what package 51 reads for parley_jobqueue_depth{type,status}",
+        "Implement RemoveWorkspace(tx, slug): delete every job of the workspace inside the caller's transaction",
+        "After that transaction commits, cancel the context of every handler running for a removed job; make settlement and SetResult treat a job that no longer exists as nothing to do: no record is created, the settlement hook is not called, no error reaches the dispatcher",
+        "Register RemoveWorkspace with the removers of owned data that package 14 declares in internal/workspace/teardown.go, where the hub is composed, so that the jobs of a workspace go in its delete transaction"
+      ],
+      "touches": [
+        "internal/jobs/queue.go",
+        "internal/jobs/store.go",
+        "internal/jobs/queue_test.go",
+        "internal/jobs/store_test.go",
+        "internal/hub/"
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Queue rebuilds through one shared enqueue and POST /workspaces/:slug/rebuild",
+      "criteria": [
+        "REQ-6"
+      ],
+      "steps": [
+        "Add the submit behaviours to internal/carrypatch/rebuild_routes_test.go and the shared-enqueue and event behaviours to internal/carrypatch/rebuild_enqueue_test.go, against a real router, store and event component, and confirm they fail",
+        "Define the job type name 'rebuild' and the rebuild payload (strategy, fail_mode, integration_branch, submitted_by, and the session id given at enqueue, which the job record does not show and package 34 puts on the job's events) in internal/carrypatch/rebuild_enqueue.go",
+        "Implement EnqueueRebuild(ctx, slug, options) as the implementation of the interface RebuildEnqueuer that package 31 declares in internal/carrypatch/rebuild_enqueuer.go, with that file's options and result types: options carry an optional strategy and fail mode, submitted_by, the event's actor and session, and an optional follow-up-of job id; an empty strategy or fail mode falls back to the workspace settings rebuild_strategy (default rebase) and rebuild_fail_mode (default fail_fast); the integration branch is what IntegrationBranch of package 31 returns for the workspace",
+        "In one store transaction: enqueue through internal/jobs (Enqueue, or EnqueueFollowUp when a follow-up-of id is given) and write parley.rebuild.enqueue through the event component of package 52 with resource_type rebuild, the job id, the given actor and session, and metadata submitted_by, strategy, fail_mode and patch_count (patches in active or conflict)",
+        "On the queue's duplicate error return a result that says nothing was queued and names the existing job's id, with a nil error and no event; do not apply the no_active_patches check here",
+        "Build the rebuild job record in internal/carrypatch/rebuild_record.go from a job: the payload's four fields, status, retry_count, next_attempt_at, error (null when empty), conflict (the failure detail), the three timestamps as RFC 3339 UTC whole seconds, and the result document's members under their record names with the defaults null, 0, false and [] for absent ones; every field is always present",
+        "Add the POST route in internal/carrypatch/rebuild_routes.go, registered as a resource-creating POST so that the Idempotency-Key handling of internal/server applies: scope rebuilds:write, write access, then body validation (optional body; strategy and fail_mode a string or null from their lists, else 400 invalid_request), then the carry-patch precondition check of package 31 for a write route",
+        "Then answer 400 no_active_patches when no patch is active or conflict, then call EnqueueRebuild with the caller's user id as submitted_by and the caller as actor; a duplicate is 409 concurrent_rebuild with a message that contains the existing job's id; success is 202 with the record",
+        "Mount the route on the hub's router where the other carry-patch routes are mounted, and register the implementation as the hub's RebuildEnqueuer through the registration call of package 31, replacing its default, so that packages 32, 34, 36 and 37 queue through it"
+      ],
+      "touches": [
+        "internal/carrypatch/rebuild_enqueue.go",
+        "internal/carrypatch/rebuild_enqueue_test.go",
+        "internal/carrypatch/rebuild_record.go",
+        "internal/carrypatch/rebuild_routes.go",
+        "internal/carrypatch/rebuild_routes_test.go",
+        "internal/hub/"
+      ]
+    },
+    {
+      "id": 7,
+      "title": "List and read rebuild jobs",
+      "criteria": [
+        "REQ-7"
+      ],
+      "steps": [
+        "Add the list, get and job-not-found behaviours to internal/carrypatch/rebuild_routes_test.go and confirm they fail",
+        "Add GET /workspaces/:slug/rebuilds/:id: scope rebuilds:read, read access, the carry-patch mode check, then the job lookup; answer 200 with the record, which for a running job carries the result document as last stored",
+        "Add one job lookup used by every job route: an id that is not a UUID, names no job, names a job of another workspace or a job of another type answers 404 not_found with the message 'rebuild job not found'",
+        "Add GET /workspaces/:slug/rebuilds: validate status against the six statuses (400 invalid_request otherwise) and limit and cursor through the list helper of internal/server; return the workspace's rebuild jobs ordered by created_at descending then id descending as {items, next_cursor}",
+        "Keep both routes free of the workspace status check: they answer in every workspace state"
+      ],
+      "touches": [
+        "internal/carrypatch/rebuild_routes.go",
+        "internal/carrypatch/rebuild_record.go",
+        "internal/carrypatch/rebuild_routes_test.go",
+        "internal/jobs/queue.go"
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Cancel queued jobs and requeue dead-lettered ones",
+      "criteria": [
+        "REQ-8"
+      ],
+      "steps": [
+        "Add the cancel and requeue behaviours, the cancel-against-claim race among them, to internal/carrypatch/rebuild_routes_test.go and confirm they fail",
+        "Implement Cancel(tx, jobID) in internal/jobs/cancel.go as one conditional update from queued to cancelled that sets completed_at; when no row changed, return a not-cancellable error; the same condition is what a claim uses, so exactly one of the two takes effect",
+        "Implement Requeue(tx, jobID): a job that is not dead_letter returns a not-requeueable error; then, when another pending job of the type and workspace exists, the duplicate error; otherwise set queued, retry_count 0, error, detail, next_attempt_at and completed_at null, keeping id, created_at and payload; wake the dispatcher after the commit",
+        "Add DELETE /workspaces/:slug/rebuilds/:id: scope rebuilds:write, write access, the carry-patch precondition check for a write route, the job lookup, then Cancel and parley.rebuild.cancel (actor the caller, no metadata) in one transaction; 200 with the record, or 409 job_not_cancellable",
+        "Add POST /workspaces/:slug/rebuilds/:id/requeue (no body) with the same checks, then Requeue and parley.rebuild.requeue (actor the caller, no metadata) in one transaction; 200 with the record, 409 job_not_requeueable, or 409 concurrent_rebuild",
+        "Add the dead-letter, cancel and requeue flow to test/e2e/rebuild_jobs_test.go against a hub started in-process, with a scripted handler supplied through the run function's handler option"
+      ],
+      "touches": [
+        "internal/jobs/cancel.go",
+        "internal/jobs/queue.go",
+        "internal/carrypatch/rebuild_routes.go",
+        "internal/carrypatch/rebuild_routes_test.go",
+        "test/e2e/rebuild_jobs_test.go"
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Answer scope, access, mode and workspace-state refusals on the five routes",
+      "criteria": [
+        "REQ-9"
+      ],
+      "steps": [
+        "Add the refusal tables over the five routes to internal/carrypatch/rebuild_routes_test.go, with the authentication, scope and access components installed on the router, and confirm which rows fail",
+        "Declare each route's scope and access need where it is registered: rebuilds:read and read access for the two GET routes; rebuilds:write and write access for POST rebuild, DELETE and requeue, so that a missing scope is 403 insufficient_scope before the workspace is looked at, no access is 404 not_found and read access on a write route is 403 forbidden",
+        "Fix the order inside every handler: request validation, then the carry-patch mode check (400 workspace_mode_mismatch, also on a task fork), then on the three write routes the workspace status check (409 workspace_busy, workspace_not_ready or workspace_archived), then the job lookup, then the route's own state checks",
+        "Confirm the two GET routes skip the status check and answer 200 in every workspace state, and that a job id that names nothing does not turn a mode or status refusal into 404",
+        "Use the precondition check package 31 provides for carry-patch routes; do not write a second one"
+      ],
+      "touches": [
+        "internal/carrypatch/rebuild_routes.go",
+        "internal/carrypatch/rebuild_routes_test.go"
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Add the parley rebuild commands",
+      "criteria": [
+        "REQ-10"
+      ],
+      "steps": [
+        "Add the command behaviours to internal/cli/rebuild_test.go against an httptest server that records requests, and confirm they fail",
+        "Declare the group 'rebuild' and its commands submit, list, status, cancel and requeue in internal/cli/rebuild.go through the command helper of package 09, each with its method, path and exact argument count; package 35 adds preview and rollback to the same group",
+        "submit: flags --strategy and --fail-mode, checked against their lists before any request (usage error otherwise); the body holds only the members whose flags were given, {} when none",
+        "list: flag --status checked against the six statuses, sent as the status query only when given; status, cancel and requeue send their one request and print the response",
+        "Export one function that waits for a rebuild job: it polls GET /workspaces/:slug/rebuilds/:id through the shared wait of package 09 with terminal states completed (successful), dead_letter and cancelled (unsuccessful); failed, queued and running continue the wait. submit and requeue call it. parley workspace sync --wait (package 12) and parley patch reset-to-origin --wait (package 32) do not depend on this package: they hand the same terminal states to the shared wait themselves",
+        "Give submit and requeue the flags --wait, --timeout (default 5m) and --poll-interval (default 5s) through the shared wait; with --wait print the final record; the exit statuses and the wait_failed and wait_timeout reports are the shared wait's",
+        "Add the submit-and-wait-through-a-retry flow and the restart flow to test/e2e/rebuild_jobs_test.go, driving cli.Run and the REST API against a hub started in-process with a controlled clock"
+      ],
+      "touches": [
+        "internal/cli/rebuild.go",
+        "internal/cli/rebuild_test.go",
+        "test/e2e/rebuild_jobs_test.go"
+      ]
+    }
+  ]
+}

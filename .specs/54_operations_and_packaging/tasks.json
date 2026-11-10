@@ -1,0 +1,303 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "54",
+  "spec_name": "operations_and_packaging",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/gitrepo/... ./internal/hub/... ./internal/server/... ./internal/store/... ./deploy/... ./test/upgrade/... ./test/e2e/... ./test/image/... ./test/perf/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "03",
+      "reason": "extends its run function, start hooks, stores and schema steps, logger and scrubber, configuration loader and parleyd backup"
+    },
+    {
+      "spec": "02",
+      "reason": "the request id a log line must carry and the access-log line are created by its middleware"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Refuse to serve without git 2.38 or later",
+      "criteria": [
+        "REQ-1"
+      ],
+      "steps": [
+        "Add the behaviours of the version check to internal/gitrepo/version_test.go and internal/hub/gitcheck_test.go and confirm they fail; the tests place a script named git first on the PATH of the hub's environment lookup",
+        "Add version parsing to internal/gitrepo: read the two numbers after 'git version ', keep the text up to the first space, ignore the rest, and compare on major and minor only",
+        "Add the check itself: resolve git through a path lookup it is given, run git --version with a time limit it is given, kill the process when the limit passes, and return one of the four error texts of the PRD's table (not found, too old, cannot read, failed)",
+        "Register the check in the hub's composition as the start hook named git-version, ahead of every other start hook, with a limit of 10 seconds and the PATH of the hub's environment lookup; on success log one info line 'git version checked' with git_version",
+        "Confirm that the runs that end before the start hooks (--help, a usage error, backup, the bootstrap runs) still succeed on a PATH without git, changing nothing in them",
+        "Add the end-to-end test of the old-git start followed by the good start to test/e2e/operations_test.go"
+      ],
+      "touches": [
+        "internal/gitrepo/version.go",
+        "internal/gitrepo/version_test.go",
+        "internal/hub/gitcheck.go",
+        "internal/hub/gitcheck_test.go",
+        "internal/hub/hub.go",
+        "test/e2e/operations_test.go"
+      ],
+      "done_when": [
+        "`go test ./internal/gitrepo/... ./internal/hub/... ./test/e2e/... -count=1` passes on a host with git 2.38 or later"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Make every log line parseable, attributable and free of credentials",
+      "criteria": [
+        "REQ-3"
+      ],
+      "steps": [
+        "Add the behaviours to internal/hub/logging_test.go, internal/server/headers_test.go and test/e2e/logging_test.go and confirm they fail",
+        "Write time in UTC ending in Z and the level as TRACE, DEBUG, INFO, WARN or ERROR, the trace level included; keep one line of output per logged line",
+        "Add request_id to every line logged with a context that carries the request id of package 02's middleware, and to no other line",
+        "Scrub attribute values of every type: render errors as their message, walk groups, lists and maps, render byte slices and text-rendered values, and pass each resulting string through the scrubber; leave numbers, booleans and durations as they are",
+        "Rely on package 02 for the access-log line's path member: its REQ-8.5 writes path as the URL path without the query string in internal/server/accesslog.go, so edit nothing in that file; the table in internal/server/headers_test.go only confirms the point for this package's log audit",
+        "Drop a line whose write to stderr fails, without returning the failure to the code that logged and without stopping the process",
+        "Add the log audit to test/e2e/logging_test.go: a hub at level trace, five requests carrying marker secrets, and the three assertions over the whole of stderr"
+      ],
+      "touches": [
+        "internal/hub/logging.go",
+        "internal/hub/logging_test.go",
+        "internal/server/headers_test.go",
+        "test/e2e/logging_test.go"
+      ],
+      "done_when": [
+        "`go test ./internal/hub/... ./internal/server/... ./test/e2e/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Record a release's data and open every recorded release",
+      "criteria": [
+        "REQ-2"
+      ],
+      "steps": [
+        "Add the behaviours to test/upgrade/compat_test.go, test/upgrade/record/record_test.go and test/upgrade/upgrade_test.go and confirm they fail",
+        "Add a read-only listing of a store's applied schema steps, in order of application, and of the registered steps of each store, to internal/store",
+        "Add the compatibility rule to test/upgrade: every recorded name registered, same relative order, the first offending step named with 'not registered' or 'out of order'",
+        "Add the recorder as a run function that takes its arguments, an output directory, stdout and stderr and returns the exit status: validate the name, refuse an existing archive, bootstrap and serve a hub in a temporary directory, create fixture.git with one commit on main under the workspace root, stop the hub, write the manifest and the .tar.gz, remove the temporary directory",
+        "Add test/upgrade/record/main.go, which calls the run function with the output directory test/upgrade/testdata",
+        "Record the first archive with `go run ./test/upgrade/record baseline` and add test/upgrade/testdata/baseline.tar.gz to the repository",
+        "Add the upgrade test: for every archive, apply the compatibility rule, start the hub on the unpacked data, and assert readiness, the applied steps, the admin token hash and the repository; start it a second time and assert that nothing was applied; fail when testdata holds no archive"
+      ],
+      "touches": [
+        "internal/store/migrate.go",
+        "internal/store/store_test.go",
+        "test/upgrade/compat.go",
+        "test/upgrade/compat_test.go",
+        "test/upgrade/upgrade_test.go",
+        "test/upgrade/record/record.go",
+        "test/upgrade/record/main.go",
+        "test/upgrade/record/record_test.go",
+        "test/upgrade/testdata/baseline.tar.gz"
+      ],
+      "depends_on": [
+        1
+      ],
+      "done_when": [
+        "`go test ./test/upgrade/... -count=1` passes with baseline.tar.gz present",
+        "running the recorder a second time with the name baseline exits 1 and leaves the archive unchanged"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Prove that a backup taken under load restores to a hub that starts cleanly",
+      "criteria": [
+        "REQ-4"
+      ],
+      "steps": [
+        "Add a load helper to test/e2e: four writers committing transactions of 10 rows to a table of the transactional store, one writer on the analytical store, and two git clients each pushing commit after commit to one bare repository under the workspace root; it records every error it sees and the commits pushed before a given moment",
+        "Add a restore helper to test/e2e that copies a snapshot's transactional store, analytics.db and workspace directory into the data directory of a new working directory and writes its config.toml",
+        "Add the restore test of an idle hub's snapshot: the restored hub applies no step, runs a registered start hook once before it listens, keeps the admin token hash, commits a transaction and accepts a push, and the snapshot's files are unchanged",
+        "Add the test under load, repeated for three backups of one running hub: no writer and no push fails, the restored hub is ready, both stores pass PRAGMA integrity_check, the load table's row count is a multiple of 10, and each repository passes git fsck with a head that is the source's head or an ancestor of it and a descendant of what was pushed before the backup",
+        "Where a test fails, correct the cause in the snapshot code of internal/store or internal/hub (the order of copying, a file copied while it changes) and not the test"
+      ],
+      "touches": [
+        "test/e2e/restore_test.go",
+        "test/e2e/load.go",
+        "internal/hub/backup.go",
+        "internal/store/snapshot.go"
+      ],
+      "depends_on": [
+        1
+      ],
+      "done_when": [
+        "`go test ./test/e2e/... -run Restore -count=5` passes five times in a row"
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Build the hub container image",
+      "criteria": [
+        "REQ-5"
+      ],
+      "steps": [
+        "Add the engine lookup of the image tests to test/image and its table test: skip unless PARLEY_IMAGE_TESTS is 1, use PARLEY_CONTAINER_ENGINE or docker, fail naming a command that is not on the PATH",
+        "Add the hub image tests to test/image/hub_test.go; they build the image once per run with the build arguments VERSION, COMMIT and BUILD_TIME and remove the containers and the volume they create",
+        "Write containers/hub/Dockerfile with the repository root as its context: a build stage that builds parleyd and parley without cgo and with the three build values set through the linker flags of internal/buildinfo, and a final stage on a base whose packaged git is 2.38 or later",
+        "In the final stage: both binaries in /usr/local/bin, user and group id 10001, XDG_CONFIG_HOME=/var/lib/parley/config, XDG_DATA_HOME=/var/lib/parley/data, the directory /var/lib/parley owned by 10001, declared as a volume and used as working directory, port 8080 declared, the entry point parleyd in exec form and no default arguments",
+        "Add a .dockerignore at the repository root that keeps .git, .specs and test data out of the build context",
+        "Run the image tests with PARLEY_IMAGE_TESTS=1 on a host with a container engine and confirm they pass; confirm that without the variable `go test ./test/image/...` passes with every image test skipped"
+      ],
+      "touches": [
+        "containers/hub/Dockerfile",
+        ".dockerignore",
+        "test/image/engine.go",
+        "test/image/engine_test.go",
+        "test/image/hub_test.go"
+      ],
+      "depends_on": [
+        1
+      ],
+      "done_when": [
+        "`PARLEY_IMAGE_TESTS=1 go test ./test/image/... -run Hub -count=1` passes where a container engine is installed",
+        "`go test ./test/image/... -count=1` passes without the variable"
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Build the reference sandbox image and the image contract check",
+      "criteria": [
+        "REQ-6"
+      ],
+      "steps": [
+        "Add the contract check to test/image as a function that takes the engine and an image reference, runs git init, a commit and git rev-parse HEAD in a container of that image as its default user, and returns an error naming the image and git when one of them fails",
+        "Add the sandbox image tests to test/image/sandbox_test.go: the contract check against the reference image, against an image without git that the test builds, and against PARLEY_SANDBOX_IMAGE when that is set; the contents of the reference image; the command passing through unchanged as user 1000",
+        "Write containers/sandbox/Dockerfile: the same build stage for the parley CLI, and a final stage with git 2.38 or later, /bin/sh, the base image's CA certificates, parley in /usr/local/bin, a user with id 1000 and a writable home directory, no entry point, and no parleyd and no agent",
+        "Run the tests with PARLEY_IMAGE_TESTS=1 and confirm they pass"
+      ],
+      "touches": [
+        "containers/sandbox/Dockerfile",
+        "test/image/contract.go",
+        "test/image/sandbox_test.go"
+      ],
+      "done_when": [
+        "`PARLEY_IMAGE_TESTS=1 go test ./test/image/... -run Sandbox -count=1` passes where a container engine is installed"
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Ship Kubernetes manifests that run one hub on a persistent volume",
+      "criteria": [
+        "REQ-7"
+      ],
+      "steps": [
+        "Add gopkg.in/yaml.v3 to go.mod and add deploy/kubernetes/manifests_test.go with the behaviours of the four manifest criteria; confirm they fail",
+        "Write configmap.yaml with a config.toml that sets [server] bind 0.0.0.0, port 8080 and an external_url, [logging] level info, and one [[oauth.providers]] table named github whose client_secret is ${GITHUB_CLIENT_SECRET}",
+        "Write secret.example.yaml (Secret parley-secrets, stringData with GITHUB_CLIENT_SECRET set to replace-me) and pvc.yaml (parley-data, ReadWriteOnce, 20Gi, no storage class)",
+        "Write deployment.yaml: one replica, strategy Recreate, one container of the parley-hub image with no command and no args, envFrom the secret, the claim mounted at /var/lib/parley, the ConfigMap's config.toml mounted by subPath at /var/lib/parley/config/config.toml, liveness on /healthz and readiness on /readyz at port 8080, runAsUser 10001, runAsNonRoot, fsGroup 10001, terminationGracePeriodSeconds 40",
+        "Write service.yaml: ClusterIP, port 8080 to the container's port, selecting the Deployment's pods",
+        "Load the ConfigMap's config.toml through the configuration loader of internal/config in the test, with the example Secret's keys as environment and with an empty environment"
+      ],
+      "touches": [
+        "go.mod",
+        "go.sum",
+        "deploy/kubernetes/configmap.yaml",
+        "deploy/kubernetes/secret.example.yaml",
+        "deploy/kubernetes/pvc.yaml",
+        "deploy/kubernetes/deployment.yaml",
+        "deploy/kubernetes/service.yaml",
+        "deploy/kubernetes/manifests_test.go"
+      ],
+      "done_when": [
+        "`go test ./deploy/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Run performance scenarios against a hub and report their verdicts",
+      "criteria": [
+        "REQ-8"
+      ],
+      "steps": [
+        "Add the behaviours to test/perf/config_test.go, test/perf/stats_test.go and test/perf/run_test.go, with a stub hub built on net/http/httptest in test/perf/stub_test.go; confirm they fail",
+        "Add the configuration from an environment lookup: skip without PARLEY_PERF_URL, an error naming a missing PARLEY_PERF_TOKEN or PARLEY_PERF_WORKSPACE, the workspace list split on commas and trimmed, the capacity flag, the sandbox profile, the report path with its default in the system's temporary directory, and the scenario deadline and event wait as fields tests can shorten",
+        "Add the nearest-rank p95 and the verdict of a measurement against a target with the comparisons lt, le and ge",
+        "Add the scenario type (name, target, the variables it needs, its deadline, its body) and the registry that holds the fourteen names in the PRD's order with their targets; a scenario whose body is not yet written reports error with no measurement",
+        "Add the run: read GET /version within 10 seconds or fail naming the URL, pick a run id of 12 hexadecimal characters, run each scenario under its deadline, mark the ones whose variable is unset as skipped naming the variable, turn a failing request into status error with method, path, status and error_type, and always go on to the next scenario",
+        "Add the HTTP client of the harness on net/http: the bearer token on every request, durations measured from sending to the end of the response, hub text in details cut to 200 bytes and the token never copied into a detail or an error",
+        "Add the report: the JSON document of the PRD written to the report path, the same results logged as a table, and an error naming the path when it cannot be written",
+        "Add TestPerformanceTargets, which skips, fails or passes as the configuration and the run say and never fails for a missed, skipped or error result",
+        "Add the smoke test against a real in-process hub to test/perf/run_test.go"
+      ],
+      "touches": [
+        "test/perf/config.go",
+        "test/perf/config_test.go",
+        "test/perf/stats.go",
+        "test/perf/stats_test.go",
+        "test/perf/run.go",
+        "test/perf/run_test.go",
+        "test/perf/client.go",
+        "test/perf/report.go",
+        "test/perf/scenario.go",
+        "test/perf/stub_test.go",
+        "test/perf/targets_test.go"
+      ],
+      "depends_on": [
+        1
+      ],
+      "done_when": [
+        "`go test ./test/perf/... -count=1` passes with no PARLEY_PERF variable set, and reports TestPerformanceTargets as skipped"
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Measure the latency and throughput targets",
+      "criteria": [
+        "REQ-9.1",
+        "REQ-9.2",
+        "REQ-9.3",
+        "REQ-9.6"
+      ],
+      "steps": [
+        "Add the behaviours to test/perf/scenarios_test.go and extend the stub hub with the fork, source control, change, land, event and sandbox exec routes; confirm they fail. Take the request and response shapes of each route from the PRD section that owns it (docs/prd/04, 06, 07, 08, 13 and 14)",
+        "Add the set-up every scenario shares: a target branch perf/<run id> in the first workspace, never the default branch, and the record of every fork, sandbox and stream a scenario creates",
+        "Add the clean-up that runs when a scenario ends in any verdict: delete its forks and sandboxes, close its streams, and list each clean-up request answered with 400 or more in cleanup_errors with its method, path and status",
+        "Add fork_create, file_read, commit_create and sandbox_exec as request-duration scenarios with 50, 200, 50 and 50 samples; sandbox_exec is skipped without a sandbox profile",
+        "Add land (20 changes of 20 commits, one at a time, from the land request to the success of the land attempt), land_throughput (120 changes, at most 8 land requests in flight, landed times 60 over the seconds elapsed) and land_concurrency (16 land requests at once, counting the attempts that did not end in success as the measurement, not as request errors)",
+        "Add mergeability: 100 open changes, one more change landed to move the target, polling no faster than once per second until none reports unknown",
+        "Add event_latency: one subscriber on GET /events, 50 commits, the largest time from response to event, 0 for an event that came first, and error for an event that has not come after the event wait (10 seconds)"
+      ],
+      "touches": [
+        "test/perf/scenarios_latency.go",
+        "test/perf/scenarios_land.go",
+        "test/perf/cleanup.go",
+        "test/perf/scenario.go",
+        "test/perf/scenarios_test.go",
+        "test/perf/stub_test.go"
+      ],
+      "done_when": [
+        "`go test ./test/perf/... -count=1` passes against the stub hub"
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Measure the capacity and sandbox targets",
+      "criteria": [
+        "REQ-9.4",
+        "REQ-9.5"
+      ],
+      "steps": [
+        "Add the behaviours to test/perf/scenarios_test.go and extend the stub hub with limits on forks, changes, streams and sandboxes; confirm they fail",
+        "Add the capacity loop: create until the target count is reached or the hub refuses, report the count that existed at once, keep the refusal's error_type as the detail, and give the scenario the 60-minute deadline",
+        "Add active_forks over every listed workspace (moving on when one refuses), open_changes in the first workspace, event_streams on GET /events and sandboxes_running, each run only with PARLEY_PERF_CAPACITY=1, the last also only with a sandbox profile",
+        "Add sandbox_ready: 5 sandboxes of the configured profile one after the other, the largest time from the create response to the first read showing ready, and error with the state_reason when one reaches failed",
+        "Register the created forks, changes, streams and sandboxes with the clean-up of the latency task, so that a capacity scenario leaves nothing behind"
+      ],
+      "touches": [
+        "test/perf/scenarios_capacity.go",
+        "test/perf/scenarios_sandbox.go",
+        "test/perf/scenarios_test.go",
+        "test/perf/stub_test.go"
+      ],
+      "done_when": [
+        "`go test ./test/perf/... -count=1` passes against the stub hub"
+      ]
+    }
+  ]
+}

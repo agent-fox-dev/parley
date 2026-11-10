@@ -1,0 +1,1019 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "51",
+  "spec_name": "audit_query_and_retention",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Per-run record lists",
+      "rationale": "A developer debugging an agent needs the records of one run, in order and filtered, without seeing another run's or another workspace's data.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "a caller with read access to the workspace, whose credential is an API key, the admin token or a PAT holding `audit:read` or `audit:write`, sends `GET /api/v1/workspaces/:slug/runs/:run_id/events`, `…/sessions/outcomes`, `…/tools/calls`, `…/tools/errors` or `…/traces`, on a workspace of any status",
+          "action": "answer the records of that kind stored for the workspace and run of the path, and no record of another run or another workspace, each with every field of its record, ordered by (`timestamp`, `id`) ascending",
+          "contract": "HTTP 200 with `{\"items\": [...], \"next_cursor\": string or null}`; a run event item has `id`, `workspace`, `run_id`, `timestamp`, `ingested_at`, `event_type`, `severity`, `node_id`, `session_id`, `payload`; a run without records answers `items: []` and `next_cursor: null`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 with its data directory in t.TempDir()",
+              "workspaces ws1 (later archived in the archived case) and ws2; for each record kind three records under (ws1, run A), one under (ws1, run B) and one under (ws2, run A), written through the telemetry store of package 50"
+            ],
+            "pseudocode": "in internal/telemetry/read_test.go, a table over the five list routes x workspace {ready, archived} x credential {owner API key, org member API key, PAT with audit:read, PAT with only audit:write, admin token}: r = get(route for run A on ws1, cred); assert r.status == 200; assert ids(r.items) == the three ids seeded for (ws1, run A) sorted by (timestamp, id), where two records share a timestamp and differ in id; assert every item has every field of its record kind and JSON-valued fields are JSON values, not strings; assert no id of (ws1, run B) or (ws2, run A) appears; assert get(route for a well-formed run id with no records).json == {items: [], next_cursor: null}"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "event_driven",
+          "condition": "a per-run list route is called with `order=desc`, or with `limit` and the `cursor` of the previous page",
+          "action": "reverse the order to (`timestamp`, `id`) descending for `order=desc`, and page through the list in the requested order without repeating or skipping a record",
+          "contract": "HTTP 200; following `next_cursor` from the first page until it is null yields every record of the run exactly once in the requested order; `next_cursor` is null on the last page",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 with its data directory in t.TempDir()",
+              "five records of each kind under one run, two of them with the same timestamp"
+            ],
+            "pseudocode": "in internal/telemetry/read_test.go, a table over the five list routes x order {asc, desc}: all = get(route?order=o).items; pages = follow(route?order=o&limit=2) until next_cursor == null; assert concat(pages) == all; assert all for desc == reverse(all for asc); assert len(pages) == 3 and the last page has next_cursor null"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "event_driven",
+          "condition": "a per-run list route is called with one or more of its filters (`event_type`, `severity`, `node_id`, `session_id` on events; `node_id`, `session_id`, `status` on outcomes; `node_id`, `session_id`, `tool_name` on tool calls and tool errors; `event_type`, `node_id`, `session_id` on traces) or with `since` or `until`",
+          "action": "return only the records that equal every given filter value exactly and whose `timestamp` is at or after `since` and before `until`",
+          "contract": "HTTP 200 with the matching records only; a record whose `timestamp` equals `since` is included and one whose `timestamp` equals `until` is excluded",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 with its data directory in t.TempDir()",
+              "records of each kind at timestamps T1 < T2 < T3 with differing node_id, session_id, severity, status, tool_name and event_type"
+            ],
+            "pseudocode": "in internal/telemetry/read_test.go, a table of {route, query, expected ids} with one row per filter of each route, one row combining two filters, one row with a filter value that is a prefix of a stored value (expects no match), and rows since=T2 (expects T2 and T3), until=T2 (expects T1), since=T1&until=T3 (expects T1 and T2), since given with a +02:00 offset equal to T2: assert ids(get(route+query).items) == expected"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "unwanted",
+          "condition": "a per-run list route is called by a caller with read access with a `run_id` that is not `YYYYMMDD_HHMMSS_` followed by six lower-case hexadecimal digits, a `severity` outside `info`, `warning`, `error`, `critical`, an `order` outside `asc`, `desc`, on the traces route an `event_type` outside `session.init`, `assistant.message`, `tool.use`, `tool.error`, `session.result`, a `session_id` that is not a UUID, a `since` or `until` that is not RFC 3339, a `since` that is not before `until`, a `limit` outside 1 to 200, or a cursor that is malformed or was issued for another query",
+          "action": "refuse the request without reading any record",
+          "contract": "HTTP 400 with `error_type` `invalid_request` and a message that names the offending parameter",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the read handlers mounted on an httptest server with a telemetry store wrapped by a call recorder",
+              "a caller with read access"
+            ],
+            "pseudocode": "in internal/telemetry/read_test.go, a table of {route, path run_id, query, parameter name}: run_id '2026', run_id '20260601_120000_ABCDEF', run_id '20260601_120000_abcde'; severity=fatal; order=up; traces event_type=tool.call; session_id=abc; since=yesterday; until=2026-06-01; since=T&until=T; since later than until; limit=0; limit=201; limit=x; cursor=%%%; a cursor taken from the events route sent to the traces route; a cursor taken with node_id=a sent with node_id=b: r = get(route+query); assert r.status == 400 and r.error_type == 'invalid_request' and r.message contains the parameter name; assert the store saw no read"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "unwanted",
+          "condition": "one of the seven per-run read routes (the five lists, `…/postmortem`, `…/transcript`) is called without a valid credential, with a PAT that holds neither `audit:read` nor `audit:write`, or by a caller who has no read access to the workspace",
+          "action": "refuse the request and return no telemetry",
+          "contract": "no valid credential: HTTP 401 with `error_type` `unauthenticated`; PAT without the scope: HTTP 403 with `error_type` `insufficient_scope`, for an existing and for a missing workspace alike; no read access or a slug that does not exist: HTTP 404 with `error_type` `not_found`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 with its data directory in t.TempDir()",
+              "workspace ws1 with telemetry and a user `outsider` who is neither its owner nor a member of its organization"
+            ],
+            "pseudocode": "in internal/telemetry/read_test.go, a table over the seven per-run read routes: assert get(route, no credential).status == 401 and error_type == 'unauthenticated'; p = PAT with scope sessions:read only; assert get(route on ws1, p).status == 403 and error_type == 'insufficient_scope'; assert get(route on 'nope', p).status == 403; a = get(route on ws1, outsider key); b = get(route on 'nope', outsider key); assert a.status == 404 and a.error_type == 'not_found' and a.body == b.body"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Postmortem and transcript of a run",
+      "rationale": "The postmortem says why a run stopped and the transcript shows what one node said and did; both are read far more often than they are written.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "a caller with read access sends `GET /api/v1/workspaces/:slug/runs/:run_id/postmortem` and the run has a postmortem in this workspace",
+          "action": "answer the stored postmortem with every field",
+          "contract": "HTTP 200 with `id`, `workspace`, `run_id`, `timestamp`, `ingested_at`, `schema_version`, `run_status`, `started_at`, `completed_at`, `task_summary`, `cost_summary`, `blocked_tasks`, `session_history`; `task_summary` and `cost_summary` are JSON objects and `blocked_tasks` and `session_history` JSON arrays",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 with its data directory in t.TempDir()",
+              "workspace ws1 with a postmortem for run A whose task_summary is {total: 4} and whose blocked_tasks is []"
+            ],
+            "pseudocode": "in internal/telemetry/postmortem_read_test.go: r = get('/api/v1/workspaces/ws1/runs/'+runA+'/postmortem', owner key); assert r.status == 200; assert r.json equals the stored postmortem field by field; assert r.json.task_summary.total == 4 and r.json.blocked_tasks is an array"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "unwanted",
+          "condition": "the postmortem route is called by a caller with read access for a run that has no postmortem in this workspace, including a run whose postmortem exists only in another workspace",
+          "action": "refuse the read",
+          "contract": "HTTP 404 with `error_type` `postmortem_not_found`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 with its data directory in t.TempDir()",
+              "workspaces ws1 and ws2 readable by the caller; a postmortem for run A in ws1 only"
+            ],
+            "pseudocode": "in internal/telemetry/postmortem_read_test.go, a table over {a run with records and no postmortem, a run id nothing was stored for, run A read through ws2 while its postmortem is in ws1}: r = get(postmortem route); assert r.status == 404 and r.error_type == 'postmortem_not_found'"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "event_driven",
+          "condition": "a caller with read access sends `GET /api/v1/workspaces/:slug/runs/:run_id/transcript?node_id=N`",
+          "action": "take the trace records of that workspace, run and node ordered by `timestamp`, then `sequence`, skip every `session.result`, and turn each remaining trace into one item whose `role` is `system` for `session.init`, `assistant` for `assistant.message`, `tool_use` for `tool.use` and `tool_error` for `tool.error`, whose `content` is `data.content` when that is a string and `\"\"` otherwise, and whose `tool_name` is `data.tool_name` when that is a string and null otherwise",
+          "contract": "HTTP 200 with `{\"run_id\", \"node_id\", \"items\": [{\"role\", \"content\", \"tool_name\", \"timestamp\"}], \"next_cursor\"}`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 with its data directory in t.TempDir()",
+              "traces of (ws1, run A, node n1): session.init, assistant.message, tool.use and tool.error (same timestamp, sequences 2 and 1 stored in that order), assistant.message, session.result; one trace of node n2"
+            ],
+            "pseudocode": "in internal/telemetry/transcript_test.go: r = get(transcript route for run A, node_id=n1); assert r.status == 200 and r.json.run_id == runA and r.json.node_id == 'n1'; assert roles(r.items) == ['system', 'assistant', 'tool_use', 'tool_error', 'assistant']; assert the two traces sharing a timestamp appear in sequence order 1 then 2; assert the item built from data {content: 'hi'} has content 'hi' and tool_name null; the one from data {content: {a: 1}, tool_name: 'bash'} has content '' and tool_name 'bash'; the one from data {tool_name: 7} has tool_name null; the one from data null has content ''; assert no item for session.result and no item of node n2; assert each item has exactly the keys role, content, tool_name, timestamp"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "event_driven",
+          "condition": "the transcript route is called with `limit` and `cursor`, or for a run or node nothing is stored for",
+          "action": "page through the transcript items in order without repeating or skipping one, and answer an empty list for an unknown run or node",
+          "contract": "HTTP 200; pages joined equal the unpaged transcript; an unknown run or node answers `items: []` with `next_cursor: null`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 with its data directory in t.TempDir()",
+              "the traces of the transcript check above, with the session.result in the middle of the sequence so that a page boundary falls on it"
+            ],
+            "pseudocode": "in internal/telemetry/transcript_test.go: all = get(transcript, node_id=n1).items; pages = follow(transcript?node_id=n1&limit=2); assert concat(pages) == all and the last next_cursor == null; assert get(transcript for a well-formed unknown run, node_id=n1).json.items == []; assert get(transcript for run A, node_id=ghost).json.items == [] and next_cursor == null"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "unwanted",
+          "condition": "the transcript route is called without `node_id` or with an empty one, or the postmortem or transcript route is called with a `run_id` that does not match the run id format, or the transcript route with a `limit` outside 1 to 200 or a malformed cursor",
+          "action": "refuse the request",
+          "contract": "HTTP 400 with `error_type` `invalid_request` and a message that names `node_id`, `run_id`, `limit` or `cursor`",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the read handlers mounted on an httptest server",
+              "a caller with read access"
+            ],
+            "pseudocode": "in internal/telemetry/transcript_test.go, a table of {route, query, name}: transcript without node_id; transcript?node_id=; transcript with run id 'x', node_id=n1; postmortem with run id '20260601-120000-abcdef'; transcript?node_id=n1&limit=0; transcript?node_id=n1&cursor=%%%: r = get(route); assert r.status == 400 and r.error_type == 'invalid_request' and r.message contains name"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "One audit query over hub events and run events",
+      "rationale": "An operator reconstructing who did what needs the hub's own events and the agents' events in one list, newest first.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "a caller whose credential is an API key, the admin token or a PAT holding `audit:read` or `audit:write` sends `GET /api/v1/audit`",
+          "action": "answer one list that merges the hub events and the run events the caller may see, ordered by time descending, then `id` descending, where the time of a hub event is its `time` and the time of a run event its `timestamp`",
+          "contract": "HTTP 200 with `{\"items\": [...], \"next_cursor\": string or null}`; with nothing to return `items` is `[]`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 with its data directory in t.TempDir()",
+              "workspace ws1; three hub events written through the event component of package 52 and three run events written through the telemetry store, with interleaved times; one hub event and one run event share the same second"
+            ],
+            "pseudocode": "in internal/audit/query_test.go: r = get('/api/v1/audit', admin token); assert r.status == 200; assert [(i.source, i.id) for i in r.items] == the six seeded records sorted by (time desc, id desc), in which hub and agent items interleave and two items share a time and are ordered by id descending; on an empty hub assert r.json == {items: [], next_cursor: null}; repeat with a PAT holding only audit:write and assert status 200"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "ubiquitous",
+          "action": "for any item of the audit list, return exactly the members `source`, `id`, `type`, `time`, `workspace`, `session_id`, `seq`, `actor_type`, `actor_id`, `resource_type`, `resource_id`, `action`, `metadata`, `run_id`, `node_id`, `severity` and `payload`; set `source` `hub` and the hub event record's values for a hub event with the four agent members null; set `source` `agent`, `type` to the run event's `event_type`, `time` to its `timestamp` with fractional seconds, and `run_id`, `node_id`, `severity`, `payload` for a run event with the seven hub members null",
+          "contract": "every item is a JSON object with those seventeen keys; `metadata` and `payload` are JSON objects or null, never strings",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 with its data directory in t.TempDir()",
+              "one hub event with non-empty metadata and a session_id; one run event with event_type tool.started, timestamp 2026-06-01T13:59:58.123456+02:00 and payload {k: 'v'}"
+            ],
+            "pseudocode": "in internal/audit/query_test.go: for each item of get('/api/v1/audit', admin).items: assert keys(item) == the seventeen names; hub item for the seeded event: assert seq, actor_type, actor_id, resource_type, resource_id, action, metadata equal the event record read from GET /api/v1/events/log and run_id, node_id, severity, payload are null; agent item: assert type == 'tool.started', time == '2026-06-01T11:59:58.123456Z', payload == {k: 'v'}, severity == 'info', run_id == runA and seq, actor_type, actor_id, resource_type, resource_id, action, metadata are null"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "event_driven",
+          "condition": "`GET /api/v1/audit` is called with `limit` and with the `cursor` of the previous page",
+          "action": "page through the merged list across both sources without repeating or skipping an item that existed throughout",
+          "contract": "HTTP 200; the pages joined equal the unpaged list; `next_cursor` is null on the last page, also when the number of items is a multiple of `limit`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 with its data directory in t.TempDir()",
+              "the six records of the merge check"
+            ],
+            "pseudocode": "in internal/audit/query_test.go, a table over limit {1, 2, 3, 6}: pages = follow('/api/v1/audit?limit='+n, admin); assert concat(pages) == get('/api/v1/audit', admin).items; assert the last page's next_cursor == null; assert a page boundary that falls between the hub item and the agent item of the same second loses neither"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "state_driven",
+          "condition": "the caller is not an admin token",
+          "action": "return only the hub events the visibility rule of the event component lets the caller see and only the run events of workspaces the caller can read, and for a workspace-bound token only records of the workspaces its binding covers and no hub event without a workspace",
+          "contract": "HTTP 200; a record the caller may not see is absent from every page; the admin token receives every stored record, including those of a workspace that no longer exists",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 with its data directory in t.TempDir()",
+              "workspaces ws1 and ws2 in different organizations; a deleted task fork ws1--gone with one hub event and one run event left; hub events: one plain and one parley.secret.* on ws1, one on ws2, one with workspace null and user scope, one with workspace null and org scope; run events on ws1 and ws2; workspace ws3 deleted with one run event left"
+            ],
+            "pseudocode": "in internal/audit/query_test.go, a table of {caller, expected record set}: admin token -> all; owner of ws1 -> every ws1 record including the parley.secret.* event, the event of its own user scope, the records of the deleted fork ws1--gone, and nothing of ws2; org member with read access to ws1 -> ws1 records without the parley.secret.* event; outsider -> only the event of its own user scope; token bound to ws1 -> ws1 records only and no event with workspace null: assert set(ids(follow('/api/v1/audit', caller))) == expected; assert no item has type parley.webhook.ping"
+          }
+        },
+        {
+          "id": "REQ-3.5",
+          "pattern": "event_driven",
+          "condition": "`GET /api/v1/audit` is called with `since`, `until` or both",
+          "action": "return only items whose time is at or after `since` and before `until`, for hub events and run events alike",
+          "contract": "HTTP 200; an item whose time equals `since` is included and one whose time equals `until` is excluded",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 with its data directory in t.TempDir()",
+              "one hub event and one run event at each of T1, T2, T3"
+            ],
+            "pseudocode": "in internal/audit/query_test.go, a table of {query, expected ids} over records of both sources at T1 < T2 < T3: since=T2 -> T2 and T3 of both sources; until=T2 -> T1 of both; since=T1&until=T3 -> T1 and T2; since=T2 written with offset -05:00 -> same as since=T2: assert ids(get('/api/v1/audit'+query, admin).items) == expected"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Audit filters and their validation",
+      "rationale": "A filter that is silently ignored or quietly returns nothing makes an audit answer untrustworthy; every filter either narrows the result or is refused.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "`GET /api/v1/audit` is called with `source`, `workspace`, `types` or `session_id`",
+          "action": "apply each given filter to both sources and combine them with AND: `source` keeps one source; `workspace` matches the slug exactly; `types` is a comma-separated list whose entries combine with OR, each an exact type or a prefix ending in `*`, matched against a hub event's `type` and a run event's `event_type`; `session_id` matches exactly, in any letter case",
+          "contract": "HTTP 200 with the matching items; a type that no record has gives `items: []`, not an error; `types=*` matches every record",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 with its data directory in t.TempDir()",
+              "workspace ws1 and its fork ws1--f1; hub events of types parley.change.land, parley.change.open and parley.workspace.sync; run events of types tool.started and session.fail; some records carry session id S"
+            ],
+            "pseudocode": "in internal/audit/filters_test.go, a table of {query, expected ids}: source=hub; source=agent; workspace=ws1 (ws1 records only, not those of ws1--f1); types=parley.change.land; types=parley.change.*; types=parley.change.*,tool.started (hub and agent items); types=*; types=parley.nothing.here (expects []); session_id=S in upper case; workspace=ws1&source=agent&types=tool.*: assert ids(get('/api/v1/audit?'+query, admin).items) == expected"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "event_driven",
+          "condition": "`GET /api/v1/audit` is called with one of the hub-only filters `actor_id`, `actor_type`, `resource_type`, `resource_id`, `action`, and `source` is absent or `hub`",
+          "action": "return only hub events whose field equals the value exactly, and no run event",
+          "contract": "HTTP 200 with hub items only",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 with its data directory in t.TempDir()",
+              "hub events with differing actors, resources and actions; run events on the same workspace"
+            ],
+            "pseudocode": "in internal/audit/filters_test.go, a table with one row per hub-only filter and one combining actor_type=system&action=land: items = get('/api/v1/audit?'+query, admin).items; assert every item.source == 'hub' and ids(items) == expected; repeat each row with &source=hub and assert the same result"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "event_driven",
+          "condition": "`GET /api/v1/audit` is called with one of the agent-only filters `run_id`, `node_id`, `severity`, and `source` is absent or `agent`",
+          "action": "return only run events whose field equals the value exactly, and no hub event; when a hub-only filter is given as well and `source` is absent, return nothing",
+          "contract": "HTTP 200 with agent items only; an agent-only filter together with a hub-only filter answers `{\"items\": [], \"next_cursor\": null}`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 with its data directory in t.TempDir()",
+              "run events of two runs, two nodes and two severities; hub events on the same workspace"
+            ],
+            "pseudocode": "in internal/audit/filters_test.go, a table with one row per agent-only filter: items = get('/api/v1/audit?'+query, admin).items; assert every item.source == 'agent' and ids(items) == expected; assert get('/api/v1/audit?run_id='+runA+'&action=land', admin).json == {items: [], next_cursor: null}"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "unwanted",
+          "condition": "`GET /api/v1/audit` is called with `source=agent` and a hub-only filter, or with `source=hub` and an agent-only filter",
+          "action": "refuse the request",
+          "contract": "HTTP 400 with `error_type` `invalid_request` and a message that names the filter",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the audit handler mounted on an httptest server with stores wrapped by a call recorder"
+            ],
+            "pseudocode": "in internal/audit/filters_test.go, a table over {source=agent x each of actor_id, actor_type, resource_type, resource_id, action} and {source=hub x each of run_id, node_id, severity}: r = get('/api/v1/audit?'+query, admin); assert r.status == 400 and r.error_type == 'invalid_request' and r.message contains the filter name"
+          }
+        },
+        {
+          "id": "REQ-4.5",
+          "pattern": "unwanted",
+          "condition": "`GET /api/v1/audit` is called with a `source` outside `hub`, `agent`, an `actor_type` outside `admin_token`, `api_key`, `pat`, `forge`, `system`, a `severity` outside `info`, `warning`, `error`, `critical`, a `session_id` that is not a UUID, a `run_id` that does not match the run id format, a `since` or `until` that is not RFC 3339, a `since` that is not before `until`, a `types` list with more than 20 entries, with an empty entry or with a `*` that is not the last character of its entry, a `limit` outside 1 to 200, or a cursor that is malformed or was issued for another query",
+          "action": "refuse the request without reading any record",
+          "contract": "HTTP 400 with `error_type` `invalid_request` and a message that names the parameter",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the audit handler mounted on an httptest server with stores wrapped by a call recorder"
+            ],
+            "pseudocode": "in internal/audit/filters_test.go, a table of {query, parameter}: source=both; actor_type=user; severity=fatal; session_id=123; run_id=20260601; since=noon; until=2026-13-01T00:00:00Z; since=T&until=T; since=T2&until=T1; types with 21 entries; types=a,,b; types=parley.*.land; types=*x; limit=0; limit=201; cursor=!!!; a cursor issued for workspace=ws1 sent with workspace=ws2: r = get('/api/v1/audit?'+query, admin); assert r.status == 400 and r.error_type == 'invalid_request' and r.message contains parameter; assert the stores saw no read; assert types with exactly 20 entries answers 200; assert an unknown parameter name (foo=1) answers 200"
+          }
+        },
+        {
+          "id": "REQ-4.6",
+          "pattern": "unwanted",
+          "condition": "the `workspace` filter of `GET /api/v1/audit` names a workspace the caller cannot read, a workspace outside the binding of a workspace-bound token, or a slug no workspace has, and the caller is not an admin token and the slug is not a task fork's slug whose parent the caller can read",
+          "action": "refuse the request",
+          "contract": "HTTP 404 with `error_type` `not_found` and message `workspace not found`, with the same body for an unreadable and for a missing workspace",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 with its data directory in t.TempDir()",
+              "workspaces ws1 and ws2; a deleted fork ws1--gone and a deleted workspace ws3, each with one hub event and one run event left"
+            ],
+            "pseudocode": "in internal/audit/filters_test.go, a table of {caller, slug, expected status}: outsider, ws1 -> 404; outsider, nope -> 404 with the same body; owner of ws1, ws2 -> 404; token bound to ws1, ws2 owned by the same user -> 404; owner of ws1, ws1 -> 200; owner of ws1, deleted fork ws1--gone -> 200 with the fork's leftover records; admin, deleted workspace ws3 -> 200 with its leftover records; admin, nope -> 200 with items []: r = get('/api/v1/audit?workspace='+slug, caller); assert r.status == expected and for 404 r.error_type == 'not_found'"
+          }
+        },
+        {
+          "id": "REQ-4.7",
+          "pattern": "unwanted",
+          "condition": "`GET /api/v1/audit` is called without a valid credential, or with a PAT that holds neither `audit:read` nor `audit:write`",
+          "action": "refuse the request",
+          "contract": "no valid credential: HTTP 401 with `error_type` `unauthenticated`; PAT without the scope: HTTP 403 with `error_type` `insufficient_scope`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 with its data directory in t.TempDir()"
+            ],
+            "pseudocode": "in internal/audit/query_test.go: assert get('/api/v1/audit', no credential).status == 401 and error_type == 'unauthenticated'; assert get('/api/v1/audit', PAT with sessions:read only).status == 403 and error_type == 'insufficient_scope'"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "The `parley audit query` command",
+      "rationale": "The operator's audit starts in a shell; the command is the query with one flag per filter.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "a user runs `parley audit query` with any of the flags `--source`, `--workspace`, `--types`, `--session`, `--run-id`, `--actor-id`, `--resource-type`, `--resource-id`, `--action`, `--since`, `--until`, `--limit`, `--cursor`",
+          "action": "send one `GET /api/v1/audit` whose query carries `source`, `workspace`, `types`, `session_id`, `run_id`, `actor_id`, `resource_type`, `resource_id`, `action`, `since`, `until`, `limit` and `cursor` for exactly the flags that were given, each value unchanged, and print the response body",
+          "contract": "exit status 0; stdout holds the hub's `{items, next_cursor}` document as one JSON document; stderr is empty",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server standing in for the hub that records each request and answers 200 with a fixed list document",
+              "PARLEY_ENDPOINT_URL and PARLEY_API_KEY set"
+            ],
+            "pseudocode": "in internal/cli/audit_test.go, a table of {args, expected query}: no flag -> empty query; one row per flag -> its single parameter (--session S -> session_id=S); all thirteen flags -> thirteen parameters; --types 'parley.change.*,tool.started' -> the value percent-encoded as one parameter: code = cli.Run(ctx, ['audit', 'query', ...args], stdout, stderr); assert the stub saw exactly one request with method GET, path /api/v1/audit and query == expected; assert code == 0 and json(stdout) == the stub's body and stderr == ''"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "unwanted",
+          "condition": "the hub answers `parley audit query` with an error status",
+          "action": "print the hub's error envelope and nothing else",
+          "contract": "exit status 1; stdout is empty; stderr holds the error envelope with the hub's `error_type`",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server standing in for the hub that answers the error envelope"
+            ],
+            "pseudocode": "in internal/cli/audit_test.go, a table over stub answers {400 invalid_request, 404 not_found, 403 insufficient_scope}: code = cli.Run(ctx, ['audit', 'query', '--source', 'both'], stdout, stderr); assert code == 1 and stdout == '' and json(stderr).error.error_type == the stub's error_type"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "unwanted",
+          "condition": "`parley audit query` is run with a positional argument or with a `--limit` value that is not an integer",
+          "action": "fail before sending any request",
+          "contract": "exit status 2; stdout is empty; stderr holds the error envelope of a usage error; the hub receives no request",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server standing in for the hub that records each request"
+            ],
+            "pseudocode": "in internal/cli/audit_test.go, a table over args {['audit', 'query', 'extra'], ['audit', 'query', '--limit', 'ten']}: code = cli.Run(ctx, args, stdout, stderr); assert code == 2 and stdout == '' and stderr != ''; assert the stub saw no request; assert cli.Run(ctx, ['audit'], ...) prints help for the group and returns 0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Retention configuration",
+      "rationale": "An operator sets how long each kind of record is kept; a limit the hub cannot honour must stop the start, not be guessed.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "state_driven",
+          "condition": "a retention key is absent from the configuration file",
+          "action": "use its default: `[audit].max_age` 90 days, `[audit].max_runs` 50, `[audit].trace_max_age` 30 days, `[audit].postmortem_max_age` 180 days, `[audit].orphan_retention` 30 days, `[sessions].max_age` 90 days, `[sessions].max_active_age` 7 days",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/audit/config_test.go: cfg = load a configuration file without [audit] and [sessions] through the loader of internal/config with this package's keys registered; s = audit.SettingsFrom(cfg); assert s equals the seven defaults as durations and an integer (90*24h, 50, 30*24h, 180*24h, 30*24h, 90*24h, 7*24h)"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "event_driven",
+          "condition": "the configuration file sets a retention key to a value inside its range: a duration written as a number and one of the units `s`, `m`, `h`, `d` that is at least `1d` for `[audit].max_age`, `[audit].trace_max_age`, `[audit].postmortem_max_age`, `[audit].orphan_retention` and `[sessions].max_age` and at least `1h` for `[sessions].max_active_age`, or an integer of at least 1 for `[audit].max_runs`",
+          "action": "accept the value and use it in the retention run",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/audit/config_test.go, a table of {key, value, expected}: audit.max_age '1d' -> 24h; audit.max_age '86400s' -> 24h; audit.max_age '36h' -> 36h; audit.trace_max_age '1440m' -> 24h; audit.postmortem_max_age '365d'; audit.orphan_retention '1d'; sessions.max_age '2d'; sessions.max_active_age '1h'; sessions.max_active_age '60m'; audit.max_runs 1; audit.max_runs 1000: assert load succeeds and audit.SettingsFrom(cfg) carries expected for that key and defaults for the others"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "unwanted",
+          "condition": "the configuration file sets a retention key to a value that is malformed, of the wrong type or below its range",
+          "action": "stop the start before listening",
+          "contract": "`parleyd` exits with status 1 and writes one error line to stderr that names the key as `section.key` (for example `audit.max_age`); no `listening` line is written",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/audit/config_test.go, a table of {key, value}: audit.max_age '23h'; audit.max_age '0d'; audit.max_age 'ninety'; audit.max_age '-1d'; audit.max_age '1w'; audit.max_age 90 (integer); audit.trace_max_age '86399s'; audit.postmortem_max_age '12h'; audit.orphan_retention ''; sessions.max_age '23h'; sessions.max_active_age '59m'; audit.max_runs 0; audit.max_runs -3; audit.max_runs '50' (string): err = load; assert err != nil and err text contains the section.key; and once through hub.Run with audit.max_runs = 0: assert exit status == 1 and stderr contains 'audit.max_runs' and no 'listening'"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "unwanted",
+          "condition": "the loaded `[events].retention` is longer than the loaded `[audit].max_age`",
+          "action": "stop the start before listening, and accept equal values",
+          "contract": "`parleyd` exits with status 1 and writes one error line to stderr that names both `events.retention` and `audit.max_age`; no `listening` line is written; with both values equal the hub starts",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/audit/config_test.go, a table of {events.retention, audit.max_age, ok}: {'30d', '90d', ok}; {'2d', '2d', ok}; {'1h', '1d', ok}; {'91d', '90d', refused}; {'30d' (the default), '7d', refused}; {'25h', '1d', refused}: load the configuration with the keys of this package and of package 52 registered and build the retention settings; for a refused row assert err != nil and err text contains 'events.retention' and 'audit.max_age'; and once through hub.Run with events.retention = '91d': assert exit status == 1 and no 'listening' line"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "The retention run",
+      "rationale": "Retention is eleven independent clean-ups; one that fails must not leave the other ten undone, and the operator must be able to see that it failed.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "event_driven",
+          "condition": "the maintenance loop runs its `retention` task, which it does once right after start and then every hour",
+          "action": "run the eleven steps once each, one after the other, in the order `stale_sessions`, `run_records`, `max_runs`, `traces`, `postmortems`, `sessions`, `event_log`, `webhook_deliveries`, `hub_events`, `orphans`, `gauges`",
+          "contract": "each step has ended before the next starts; the task returns no error when every step succeeded",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a test clock fixed at 2026-06-01T12:00:00Z",
+              "a metrics registry of internal/metrics as the recorder"
+            ],
+            "pseudocode": "in internal/audit/retention_test.go: run = audit.NewRetention(eleven fake steps that append their name to a log, recorder, clock); err = run.Run(ctx); assert err == nil; assert log == the eleven names in the documented order; assert audit.StepNames() == the same list"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "unwanted",
+          "condition": "a retention step returns an error or panics",
+          "action": "log the failure with the step's name, add 1 to `parley_retention_errors_total` for that step, run every remaining step, and leave `parley_retention_last_run_timestamp_seconds` unchanged",
+          "contract": "`parley_retention_errors_total{step=\"<name>\"}` grows by exactly 1 per failed step per run; every other step ran; the task returns an error naming the failed steps; the process does not terminate",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a test clock fixed at 2026-06-01T12:00:00Z",
+              "a first fully successful run at an earlier clock time, so that the timestamp gauge holds a value to compare"
+            ],
+            "pseudocode": "in internal/audit/retention_test.go, a table over {step 1 fails, a middle step fails, the last step fails, two steps fail, a step panics}: before = value(parley_retention_last_run_timestamp_seconds); err = run.Run(ctx); assert err != nil and err text contains each failed step name; assert the log holds all eleven names in order; assert value(parley_retention_errors_total{step=failed}) == 1 for each failed step and 0 for every other step; assert value(parley_retention_last_run_timestamp_seconds) == before; assert the captured log output has one line per failed step naming it"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "event_driven",
+          "condition": "every step of a retention run succeeded",
+          "action": "set `parley_retention_last_run_timestamp_seconds` to the Unix time at which the run ended",
+          "contract": "the gauge equals the clock's time in whole seconds; no `parley_retention_errors_total` series changed",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a test clock fixed at 2026-06-01T12:00:00Z"
+            ],
+            "pseudocode": "in internal/audit/retention_test.go: assert value(parley_retention_last_run_timestamp_seconds) == 0 before any run; run.Run(ctx); assert value == unix(2026-06-01T12:00:00Z); advance the clock one hour; run.Run(ctx); assert value == unix(2026-06-01T13:00:00Z); assert every parley_retention_errors_total series is 0"
+          }
+        },
+        {
+          "id": "REQ-7.4",
+          "pattern": "unwanted",
+          "condition": "the context of a retention run is cancelled while a step runs, as at shutdown",
+          "action": "start no further step, count no error for the steps that did not start, and leave the last-run timestamp unchanged",
+          "contract": "the task returns the context's error within the time the running step takes to observe the cancellation; `parley_retention_errors_total` is unchanged for the steps not started",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a test clock fixed at 2026-06-01T12:00:00Z"
+            ],
+            "pseudocode": "in internal/audit/retention_test.go: step 3 cancels the context and returns ctx.Err(); err = run.Run(ctx); assert errors.Is(err, context.Canceled); assert log == the first three names; assert value(parley_retention_errors_total{step}) == 0 for steps 4 to 11; assert the timestamp gauge is unchanged"
+          }
+        },
+        {
+          "id": "REQ-7.5",
+          "pattern": "event_driven",
+          "condition": "`parleyd` starts",
+          "action": "register the retention run with the maintenance loop under the task name `retention`, so that a first run happens right after start without any request",
+          "contract": "after start, `parley_retention_last_run_timestamp_seconds` on `GET /metrics` becomes greater than 0 without any API request",
+          "check": {
+            "same_as": "PATH-3"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "The retention steps",
+      "rationale": "Each step enforces one documented limit; together they keep sessions, telemetry and hub events bounded and the record gauges true.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "the `stale_sessions` step runs",
+          "action": "set every `active` session whose `started_at` is before now minus `[sessions].max_active_age` to `status` `timeout` with `ended_at` = now, `error_message` = `session exceeded maximum active age` and `duration_ms` = the milliseconds from `started_at` to `ended_at`, and change no other session",
+          "contract": "the step returns no error; a later `GET /sessions/:id` of such a session shows `status: timeout`; an `active` session started exactly at the cutoff or later stays `active`; terminal sessions are unchanged; no hub event is written",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "transactional and analytical stores opened in t.TempDir() with the schema of packages 49, 50 and 52",
+              "a test clock fixed at 2026-06-01T12:00:00Z",
+              "default retention settings unless the row says otherwise"
+            ],
+            "pseudocode": "in internal/audit/steps_sessions_test.go, a table of sessions {active started 8d ago, active started exactly 7d ago, active started 6d ago, completed started 30d ago}: run the stale_sessions step; assert the first has status 'timeout', ended_at == now, error_message == 'session exceeded maximum active age' and duration_ms == 8*24*3600*1000; assert the other three are byte-identical to before; assert the event store's last seq is unchanged; run the step again and assert nothing changes"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "event_driven",
+          "condition": "the `run_records`, `traces` or `postmortems` step runs",
+          "action": "delete, for `run_records`, the run events, session outcomes, tool calls and tool errors whose `timestamp` is before now minus `[audit].max_age`; for `traces`, the trace records whose `timestamp` is before now minus `[audit].trace_max_age`; for `postmortems`, the postmortems whose `ingested_at` is before now minus `[audit].postmortem_max_age`; and keep every other record",
+          "contract": "the step returns no error; a record exactly at the cutoff is kept; `run_records` deletes no trace and no postmortem, `traces` deletes only traces, `postmortems` only postmortems",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "transactional and analytical stores opened in t.TempDir() with the schema of packages 49, 50 and 52",
+              "a test clock fixed at 2026-06-01T12:00:00Z",
+              "default retention settings unless the row says otherwise"
+            ],
+            "pseudocode": "in internal/audit/steps_telemetry_test.go, a table of {step, kind, age, expected}: run_records x {run event, outcome, tool call, tool error} x {91d -> deleted, exactly 90d -> kept, 89d -> kept}; run_records x {trace 91d, postmortem 91d} -> kept; traces x {trace 31d -> deleted, exactly 30d -> kept, run event 31d -> kept}; postmortems x {ingested 181d ago -> deleted, exactly 180d -> kept, ingested 10d ago with timestamp 400d ago -> kept}: seed, run the one step, assert the set of remaining ids == expected"
+          }
+        },
+        {
+          "id": "REQ-8.3",
+          "pattern": "event_driven",
+          "condition": "the `max_runs` step runs and a workspace holds run events, outcomes, tool calls, tool errors or traces for more than `[audit].max_runs` runs",
+          "action": "delete the run events, session outcomes, tool calls, tool errors and traces of that workspace's oldest runs until `[audit].max_runs` runs remain, where a run's age is the `timestamp` of its earliest record, and keep every postmortem and every session",
+          "contract": "the step returns no error; exactly `[audit].max_runs` runs of the workspace still have telemetry and they are the newest; a workspace at or below the limit loses nothing; other workspaces are counted separately",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "transactional and analytical stores opened in t.TempDir() with the schema of packages 49, 50 and 52",
+              "a test clock fixed at 2026-06-01T12:00:00Z",
+              "default retention settings unless the row says otherwise"
+            ],
+            "pseudocode": "in internal/audit/steps_telemetry_test.go with audit.max_runs = 2: ws1 has runs r1 < r2 < r3 < r4 by earliest record (r1 has a late record newer than r4's earliest, which must not make it young), each with one record of every kind and a postmortem; ws2 has two runs; ws3 has three runs of which one holds only a postmortem: run the max_runs step; assert ws1 keeps the five telemetry kinds of r3 and r4 only; assert the postmortems of r1 to r4 all remain; assert ws2 and ws3 are unchanged; assert no session row changed; run again and assert nothing changes"
+          }
+        },
+        {
+          "id": "REQ-8.4",
+          "pattern": "event_driven",
+          "condition": "the `sessions` step runs",
+          "action": "delete every session in a terminal state (`completed`, `failed`, `timeout`, `terminated`) whose `started_at` is before now minus `[sessions].max_age`, together with all usage records of those sessions, and never delete an `active` session",
+          "contract": "the step returns no error; no usage record remains whose session was deleted; an `active` session of any age and its usage records remain",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "transactional and analytical stores opened in t.TempDir() with the schema of packages 49, 50 and 52",
+              "a test clock fixed at 2026-06-01T12:00:00Z",
+              "default retention settings unless the row says otherwise"
+            ],
+            "pseudocode": "in internal/audit/steps_sessions_test.go, a table of sessions each with two usage records {completed 91d, failed 91d, timeout 91d, terminated 91d, completed exactly 90d, completed 10d, active 400d}: run the sessions step; assert the first four sessions and their eight usage records are gone; assert the last three sessions and their six usage records remain"
+          }
+        },
+        {
+          "id": "REQ-8.5",
+          "pattern": "event_driven",
+          "condition": "the `event_log` or `hub_events` step runs",
+          "action": "for `event_log`, move the oldest `seq` of the event log forward to the first event whose `time` is not before now minus `[events].retention`; for `hub_events`, delete every hub event whose `time` is before now minus `[audit].max_age`; and in both keep the event with the highest `seq`, whatever its age",
+          "contract": "the step returns no error; after `event_log`, a resume position before the new oldest `seq` on `GET /events/log` answers HTTP 410 `cursor_expired` while `GET /audit` still returns the events that left the log; after `hub_events`, `GET /audit` no longer returns the deleted events; the last `seq` is unchanged by both steps",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 with its data directory in t.TempDir()",
+              "a test clock fixed at 2026-06-01T12:00:00Z",
+              "events written through the event component of package 52 at controlled clock times"
+            ],
+            "pseudocode": "in internal/audit/steps_events_test.go, with events e1 (100d old), e2 (40d), e3 (20d), e4 (1d): run event_log; assert the event component reports oldest_seq == seq(e3) and last seq == seq(e4); assert get('/api/v1/events/log?after='+(seq(e1)), admin).status == 410 and error_type == 'cursor_expired'; assert ids(get('/api/v1/audit?source=hub', admin).items) == [e4, e3, e2, e1]; run hub_events; assert the audit ids == [e4, e3, e2]; second case with a single event 200d old: run both steps; assert the event still exists, oldest_seq == last seq == its seq"
+          }
+        },
+        {
+          "id": "REQ-8.6",
+          "pattern": "event_driven",
+          "condition": "the `webhook_deliveries` step runs",
+          "action": "ask the delivery pruner to delete every event webhook delivery record whose last attempt is more than 7 days before now and that is not `pending`, and do nothing when no pruner is wired",
+          "contract": "the step returns no error in both cases; the pruner is called once with the cutoff now minus 7 days; a pruner error is the step's error",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a test clock fixed at 2026-06-01T12:00:00Z"
+            ],
+            "pseudocode": "in internal/audit/steps_events_test.go: fake pruner over records {succeeded 8d, failed 8d, pending 30d, succeeded exactly 7d, succeeded 1d}: run the step; assert the pruner was called once with cutoff == now - 168h and the fake kept {pending 30d, exactly 7d, 1d}; with a nil pruner: assert the step returns nil; with a pruner returning an error: assert the step returns that error"
+          }
+        },
+        {
+          "id": "REQ-8.7",
+          "pattern": "event_driven",
+          "condition": "the `orphans` step runs",
+          "action": "delete the sessions, usage records, telemetry records of all six kinds and hub events whose workspace slug names no existing workspace and that are older than `[audit].orphan_retention`, treating a record of a task fork slug `<parent>--<name>` as belonging to the parent while the parent exists",
+          "contract": "the step returns no error; records of existing workspaces, records of a deleted fork whose parent exists, orphan records younger than the grace period, hub events without a workspace and the event with the highest `seq` all remain",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "transactional and analytical stores opened in t.TempDir() with the schema of packages 49, 50 and 52",
+              "a test clock fixed at 2026-06-01T12:00:00Z",
+              "default retention settings unless the row says otherwise"
+            ],
+            "pseudocode": "in internal/audit/steps_orphans_test.go, a table of {slug, state, record age, expected}: ws1 existing, 60d -> kept; gone (deleted), 31d -> deleted for a session with its usage record, a run event, an outcome, a tool call, a tool error, a trace, a postmortem and a hub event; gone, exactly 30d -> kept; gone, 5d -> kept; ws1--f1 (deleted fork, parent exists), 60d -> kept; gone--f2 (deleted fork of a deleted parent), 60d -> deleted; hub event with workspace null, 60d -> kept: seed, run the orphans step, assert the remaining ids == expected; assert an active session of `gone` older than 30d is deleted too"
+          }
+        },
+        {
+          "id": "REQ-8.8",
+          "pattern": "event_driven",
+          "condition": "the `gauges` step runs",
+          "action": "set `parley_audit_records` for each of the kinds `hub_event`, `run_event`, `outcome`, `tool_call`, `tool_error`, `trace`, `postmortem`, `session`, `usage` to the number of stored records of that kind, and replace the series of `parley_agent_sessions_active` by one series per workspace that has at least one `active` session, valued with their number",
+          "contract": "the step returns no error; all nine `kind` series are exported, 0 for a kind without records; a workspace that had active sessions at the previous run and has none now has no `parley_agent_sessions_active` series",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "transactional and analytical stores opened in t.TempDir() with the schema of packages 49, 50 and 52",
+              "a test clock fixed at 2026-06-01T12:00:00Z",
+              "default retention settings unless the row says otherwise",
+              "a metrics registry of internal/metrics"
+            ],
+            "pseudocode": "in internal/audit/steps_gauges_test.go: seed 3 hub events, 2 run events, 1 outcome, 0 tool calls, 4 tool errors, 5 traces, 1 postmortem, 3 sessions (2 active on ws1, 1 active on ws2), 6 usage records; run the gauges step; assert value(parley_audit_records{kind=k}) == the count for each of the nine kinds, tool_call == 0; assert parley_agent_sessions_active has exactly {ws1: 2, ws2: 1}; complete the ws2 session; run the step; assert the exposition has no parley_agent_sessions_active series with workspace ws2 and ws1 == 2"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-9",
+      "title": "The metrics registry and its recorder",
+      "rationale": "A dashboard built on a documented metric must never find it missing; and twenty packages reporting numbers must not each invent their own exposition.",
+      "system": "metrics registry",
+      "criteria": [
+        {
+          "id": "REQ-9.1",
+          "pattern": "ubiquitous",
+          "action": "for any of the 27 metrics of the catalogue of the PRD's Metrics section, export it from start-up, before anything was reported, under its documented name and type (counter, gauge or histogram), with one series at value 0 for every combination of its closed label values, and, for a metric with an open label (`method`, `path`, `status`, `workspace`, `model`, `type`), with the open labels set to the empty string until the metric has its first reported series",
+          "contract": "a fresh registry's exposition has, per metric, one `# TYPE <name> <type>` line and at least one sample; a histogram has one `_bucket` sample per documented bucket bound plus `le=\"+Inf\"`, a `_sum` and a `_count`, all 0",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/metrics/catalogue_test.go, one table with a row per metric of the catalogue {name, type, closed labels with their values, open labels, buckets}, written out from the PRD's table (parley_http_requests_total, parley_http_request_duration_seconds, parley_git_requests_total, parley_scm_requests_total, parley_changes_open, parley_lands_total, parley_land_attempts, parley_land_duration_seconds, parley_forks_active, parley_events_seq, parley_sse_connections, parley_webhook_deliveries_total, parley_webhook_queue_depth, parley_audit_events_total, parley_agent_sessions_active, parley_agent_tokens_total, parley_audit_records, parley_jobqueue_depth, parley_retention_errors_total, parley_retention_last_run_timestamp_seconds, parley_sandboxes, parley_sandbox_creates_total, parley_sandbox_seconds, parley_sandbox_exec_total, parley_sandbox_denials_total, parley_sandbox_checkpoints_total, parley_sandbox_runtime_up): text = expose(metrics.New()); for each row: assert text has the line '# TYPE '+name+' '+type; assert the set of label combinations of its samples == the product of the closed values with open labels ''; e.g. parley_git_requests_total has 9 series, parley_scm_requests_total 52 (13 op values: refs, commits, tree, file, diff, compare, blame, search, commit, ref_create, ref_move, ref_delete, rebase; 4 result values: ok, ref_moved, refused, error), parley_lands_total 4, parley_webhook_deliveries_total 3, parley_audit_events_total 2 (source hub and agent, type ''), parley_agent_tokens_total 3, parley_audit_records 9, parley_jobqueue_depth 6 (type rebuild), parley_retention_errors_total 11, parley_sandboxes 5, parley_sandbox_creates_total 2, parley_sandbox_exec_total 4, parley_sandbox_checkpoints_total 3, each unlabelled metric 1; assert every sample value == 0; for the four histograms assert the le values == the documented bounds plus '+Inf'; assert the number of families in text == 27"
+          }
+        },
+        {
+          "id": "REQ-9.2",
+          "pattern": "event_driven",
+          "condition": "a package reports to the recorder: `Add` on a counter, `Set` on a gauge or `Observe` on a histogram, with the metric's name and one value for each of its labels",
+          "action": "apply the report so that the next exposition shows it: a counter grows by the amount, a gauge takes the value, and a histogram adds the observation to every bucket whose bound is at least the value, to `+Inf`, to `_sum` and to `_count`; and stop exporting the empty-label placeholder of a metric once it has a reported series",
+          "contract": "the call returns no error; the exposition after it differs from the one before only in the samples of that series",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/metrics/registry_test.go, a table of {calls, expected samples}: Add(parley_lands_total, {result: landed}, 1) twice -> landed 2, the other three results 0; Add(parley_agent_tokens_total, {workspace: ws1, model: m, direction: input}, 120) -> that series 120 and no series with workspace ''; Set(parley_events_seq, {}, 41) then Set(..., 42) -> 42; Set(parley_changes_open, {workspace: ws1}, 3) -> ws1 3 and no workspace '' series; Observe(parley_land_attempts, {}, 2) and Observe(..., 21) -> buckets le 1: 0, le 2: 1, le 3: 1, le 5: 1, le 8: 1, le 13: 1, +Inf: 2, sum 23, count 2; Observe(parley_http_request_duration_seconds, {method: GET, path: /x}, 0.005) -> le 0.005 bucket 1 (a value equal to a bound falls in that bucket): assert parse(expose(reg)) has expected and every other family equals a fresh registry's"
+          }
+        },
+        {
+          "id": "REQ-9.3",
+          "pattern": "event_driven",
+          "condition": "a package has registered a source for a counter or gauge of the catalogue",
+          "action": "call the source once at every exposition and export the samples it returns for that metric, with value 0 for every closed label combination the source did not return",
+          "contract": "the registration returns no error; two scrapes with different source results show the two results; the source is not called between scrapes",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/metrics/registry_test.go, a table over {parley_jobqueue_depth with samples {rebuild, queued}: 4 and {rebuild, dead_letter}: 1 -> those two and the other four statuses 0; parley_changes_open with {ws1: 2, ws2: 5}; parley_git_requests_total (a counter kept by its owner) with {upload-pack, ok}: 7; parley_forks_active with 3}: reg.RegisterSource(name, fn); assert parse(expose(reg)) has the samples; change what fn returns; assert the next expose shows the new values; assert fn's call count == the number of exposes"
+          }
+        },
+        {
+          "id": "REQ-9.4",
+          "pattern": "event_driven",
+          "condition": "a package calls `SetFamily` on a gauge with a complete set of samples",
+          "action": "replace every series of that gauge by the given samples, so that a series not in the new set is no longer exported, and keep the zero series of closed label combinations",
+          "contract": "the call returns no error; after `SetFamily(parley_agent_sessions_active, {})` the metric is exported with its empty-label placeholder again",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/metrics/registry_test.go: SetFamily(parley_agent_sessions_active, {ws1: 2, ws2: 1}); assert series == {ws1: 2, ws2: 1}; SetFamily(..., {ws1: 2}); assert series == {ws1: 2}; SetFamily(..., {}); assert series == {'': 0}; SetFamily(parley_audit_records, {session: 3}); assert the other eight kinds are exported with 0"
+          }
+        },
+        {
+          "id": "REQ-9.5",
+          "pattern": "unwanted",
+          "condition": "a report, a `SetFamily` or a source registration names a metric outside the catalogue, gives label names other than the metric's, gives a value outside a closed label's set, uses a call that does not fit the metric's type, registers a source for a histogram or a second source for one metric, or adds a negative amount to a counter",
+          "action": "refuse the call and change nothing",
+          "contract": "the call returns a non-nil error naming the metric; the exposition is byte-identical to the one before the call; the process does not panic",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/metrics/registry_test.go, a table of bad calls: Add('parley_nope', {}, 1); Add(parley_lands_total, {}, 1); Add(parley_lands_total, {result: landed, extra: x}, 1); Add(parley_lands_total, {result: maybe}, 1); Add(parley_lands_total, {result: landed}, -1); Set(parley_lands_total, {result: landed}, 1); Add(parley_events_seq, {}, 1); Observe(parley_events_seq, {}, 1); Add(parley_land_attempts, {}, 1); RegisterSource(parley_land_attempts, fn); RegisterSource(parley_forks_active, fn) twice; SetFamily(parley_lands_total, ...): before = expose(reg); err = call; assert err != nil and err text contains the metric name; assert expose(reg) == before"
+          }
+        },
+        {
+          "id": "REQ-9.6",
+          "pattern": "unwanted",
+          "condition": "a registered source returns an error, panics, or returns a sample with a label value outside a closed set while the exposition is being written",
+          "action": "export that metric with its zero series for this scrape, log the failure with the metric's name, and export every other metric as usual",
+          "contract": "`GET /metrics` still answers HTTP 200 with all 27 metrics; the failing metric's samples are all 0; the invalid sample is absent; the next scrape calls the source again",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/metrics/registry_test.go, a table over source behaviours {returns an error, panics, returns {type: rebuild, status: bogus}: 1 beside a valid sample}: text = expose(reg); assert text has 27 '# TYPE' lines; for the first two assert every parley_jobqueue_depth sample == 0 and the captured log names parley_jobqueue_depth; for the third assert the valid sample is exported and no series has status 'bogus'; make the source healthy; assert the next expose shows its values"
+          }
+        },
+        {
+          "id": "REQ-9.7",
+          "pattern": "ubiquitous",
+          "action": "for any number of reports and expositions made at the same time from different goroutines, apply every report exactly once and write every exposition as a well-formed document",
+          "contract": "after N concurrent `Add(…, 1)` calls on one series the series equals N; no exposition taken meanwhile fails to parse",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/metrics/registry_test.go, run under the race detector: 50 goroutines each call Add(parley_lands_total, {result: landed}, 1) 200 times and Observe(parley_land_attempts, {}, 1) 200 times while 5 goroutines call expose(reg) and parse it; assert no parse error; assert the final landed value == 10000 and the histogram count == 10000"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-10",
+      "title": "The `/metrics` endpoint and HTTP request metrics",
+      "rationale": "An operator's monitoring scrapes one URL without a credential and learns how the hub's HTTP surface behaves.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-10.1",
+          "pattern": "event_driven",
+          "condition": "any client sends `GET /metrics`, with no `Authorization` header or with any value in it",
+          "action": "answer the Prometheus text exposition of all 27 metrics, in the order of the catalogue, each family with one `# HELP` line and one `# TYPE` line followed by its samples sorted by label values",
+          "contract": "HTTP 200 with `Content-Type` of media type `text/plain` with parameter `version=0.0.4`; the body parses as Prometheus text format 0.0.4; two scrapes with no report between them differ only in the samples of the HTTP request metrics",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 with its data directory in t.TempDir()"
+            ],
+            "pseudocode": "in internal/metrics/handler_test.go, a table over Authorization {absent, 'Bearer garbage', a valid API key}: r = get('/metrics'); assert r.status == 200; mt, params = parse media type of r.header('Content-Type'); assert mt == 'text/plain' and params.version == '0.0.4'; fams = parse(r.body); assert names(fams) == the 27 catalogue names in catalogue order; assert each family is preceded by exactly one '# HELP' and one '# TYPE' line; assert the samples of parley_scm_requests_total are sorted by (op, result); assert a request to '/api/v1/metrics' answers 404"
+          }
+        },
+        {
+          "id": "REQ-10.2",
+          "pattern": "ubiquitous",
+          "action": "for any label value, write it in the exposition with a backslash escaped as `\\\\`, a double quote as `\\\"` and a line feed as `\\n`, so that the document stays one sample per line",
+          "contract": "a sample whose label value holds those characters parses back to the original value",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/metrics/expose_test.go, a table of model label values {'a\"b', 'a\\\\b', 'line1<LF>line2', 'plain', 'é'}: Add(parley_agent_tokens_total, {workspace: ws1, model: v, direction: input}, 1); text = expose(reg); assert the sample occupies one line; assert parse(text) yields a series whose model label == v"
+          }
+        },
+        {
+          "id": "REQ-10.3",
+          "pattern": "event_driven",
+          "condition": "`parleyd` has answered an HTTP request on any route: a REST route, a git route, a webhook ingress route, `/healthz`, `/readyz`, `/version` or `/metrics`",
+          "action": "add 1 to `parley_http_requests_total` with `method` the request's method, `path` the path of the router pattern that matched (the route template, never the concrete URL) or `unmatched` when no pattern matched, and `status` the three-digit status that was sent, and observe the request's duration in seconds on `parley_http_request_duration_seconds` with the same `method` and `path`",
+          "contract": "two requests to the same route with different path parameter values grow one series by 2; the histogram's `_count` for that `method` and `path` grows by 2",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a metrics registry and the instrumentation wrapped around a net/http router",
+              "a test clock fixed at 2026-06-01T12:00:00Z"
+            ],
+            "pseudocode": "in internal/metrics/http_test.go, behind the instrumentation a router with the patterns 'GET /api/v1/workspaces/{slug}/sync', 'GET /git/{org}/{repo}/info/refs' and 'GET /healthz' and a handler that advances the test clock by 30 ms: get('/api/v1/workspaces/a/sync'); get('/api/v1/workspaces/b/sync'); get('/git/o/r.git/info/refs') answered 401; get('/healthz'); get('/no/such/path') answered 404; post('/healthz') answered 405: assert value(parley_http_requests_total{method=GET, path=/api/v1/workspaces/{slug}/sync, status=200}) == 2; assert the git series has status '401' and its pattern as path; assert {method=GET, path=unmatched, status=404} == 1; assert no series has a path label containing '/a/' or 'no/such'; assert parley_http_request_duration_seconds_count{method=GET, path=/api/v1/workspaces/{slug}/sync} == 2, its le=0.05 bucket == 2 and its le=0.025 bucket == 0; and in handler_test.go against the in-process hub: get('/metrics') twice; assert the second body shows parley_http_requests_total{method=GET, path=/metrics, status=200} >= 1"
+          }
+        },
+        {
+          "id": "REQ-10.4",
+          "pattern": "unwanted",
+          "condition": "`/metrics` is called with a method other than `GET` or `HEAD`",
+          "action": "refuse the request and write no exposition",
+          "contract": "HTTP 405 with an `Allow` header that names `GET`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 with its data directory in t.TempDir()"
+            ],
+            "pseudocode": "in internal/metrics/handler_test.go, a table over methods {POST, PUT, DELETE, PATCH}: r = request(method, '/metrics'); assert r.status == 405 and r.header('Allow') contains 'GET'; assert r.body has no '# TYPE' line"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "An operator audits a workspace from the shell",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "ingests one run event for a run of workspace `demo` with POST /api/v1/workspaces/demo/runs/:run_id/events"
+        },
+        {
+          "actor": "parleyd",
+          "action": "stores the run event; a hub event of `demo` was written earlier by the event component"
+        },
+        {
+          "actor": "operator",
+          "action": "runs `parley audit query --workspace demo` with the admin token"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends GET /api/v1/audit?workspace=demo with the credential"
+        },
+        {
+          "actor": "parleyd",
+          "action": "authenticates, validates the filters, reads the hub events under the visibility rule and the run events of `demo`, merges them newest first and answers the list envelope"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints the list as JSON on stdout and exits 0"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the parleyd HTTP server with the conventions of package 02",
+          "authentication and the access rule of packages 04 and 07",
+          "the telemetry store and ingestion route of package 50",
+          "the event component and store of package 52",
+          "the audit query of internal/audit",
+          "the parley CLI of internal/cli run in-process against the hub's address"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with its data directory in t.TempDir()",
+          "workspace `demo` registered the way the end-to-end tests of package 10 register a workspace, which leaves at least one hub event with workspace `demo`",
+          "an agent credential with write access to `demo` and the admin token"
+        ],
+        "end_state": [
+          "the ingestion answered 201",
+          "the command exited 0 with one JSON document on stdout and nothing on stderr",
+          "the document's items hold the ingested run event with source `agent` and at least one item with source `hub`, all with workspace `demo`",
+          "the items are ordered by time descending"
+        ],
+        "pseudocode": "in test/e2e/audit_test.go: post('/api/v1/workspaces/demo/runs/'+run+'/events', {event_type: 'tool.started'}, agentCred) -> 201; code = cli.Run(ctx, ['audit', 'query', '--workspace', 'demo'], stdout, stderr) with the admin token; assert code == 0 and stderr == ''; items = json(stdout).items; assert any(i.source == 'agent' and i.type == 'tool.started' and i.run_id == run); assert any(i.source == 'hub' and i.seq > 0); assert all(i.workspace == 'demo'); assert times(items) are non-increasing"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "A developer inspects what one node of a run did",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "ingests the traces of node `coder` for one run of workspace `demo`"
+        },
+        {
+          "actor": "parleyd",
+          "action": "stores the trace records"
+        },
+        {
+          "actor": "developer",
+          "action": "sends GET /api/v1/workspaces/demo/runs/:run_id/traces with an API key"
+        },
+        {
+          "actor": "parleyd",
+          "action": "checks read access, validates the run id and answers the traces of that run in ascending (timestamp, id) order"
+        },
+        {
+          "actor": "developer",
+          "action": "sends GET /api/v1/workspaces/demo/runs/:run_id/transcript?node_id=coder"
+        },
+        {
+          "actor": "parleyd",
+          "action": "orders the node's traces by timestamp and sequence, maps each to a role, skips session.result and answers the conversation"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the parleyd HTTP server with the conventions of package 02",
+          "authentication and the access rule of packages 04 and 07",
+          "the telemetry store and ingestion routes of package 50",
+          "the per-run read routes of internal/telemetry"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with its data directory in t.TempDir()",
+          "workspace `demo` owned by the developer",
+          "an agent credential with write access to `demo`"
+        ],
+        "end_state": [
+          "the traces list answered 200 with the four ingested traces in ascending order",
+          "the transcript answered 200 with three items whose roles are system, assistant, tool_use",
+          "nothing was written by the two reads: a second traces read answers the same body"
+        ],
+        "pseudocode": "in test/e2e/audit_test.go: post four traces (session.init, assistant.message with data.content 'hello', tool.use with data.tool_name 'bash', session.result) to '/api/v1/workspaces/demo/runs/'+run+'/traces' with node_id 'coder'; t = get('.../traces', devKey); assert t.status == 200 and len(t.items) == 4 and timestamps ascend; tr = get('.../transcript?node_id=coder', devKey); assert [i.role for i in tr.items] == ['system', 'assistant', 'tool_use']; assert tr.items[1].content == 'hello' and tr.items[2].tool_name == 'bash'; assert get('.../traces', devKey).body == t.body"
+      }
+    },
+    {
+      "id": "PATH-3",
+      "title": "Retention prunes old records at start and the operator watches it on /metrics",
+      "steps": [
+        {
+          "actor": "operator",
+          "action": "sets `[audit].max_age = \"1d\"` in the configuration file and starts `parleyd` on a data directory that holds run events older than one day"
+        },
+        {
+          "actor": "parleyd",
+          "action": "validates the retention keys, starts the maintenance loop, and runs the `retention` task right after start: the eleven steps in order"
+        },
+        {
+          "actor": "parleyd",
+          "action": "deletes the run events older than one day, recomputes the record gauges and sets `parley_retention_last_run_timestamp_seconds`"
+        },
+        {
+          "actor": "operator",
+          "action": "sends GET /metrics without a credential"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers the text exposition of all 27 metrics, with the last-run timestamp, the record counts and the count of the scrape itself"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the hub composition of package 03 with its configuration loader and maintenance loop",
+          "the transactional and analytical stores on disk",
+          "the retention run and its steps in internal/audit",
+          "the metrics registry, the HTTP instrumentation and the /metrics handler of internal/metrics",
+          "the parleyd HTTP server"
+        ],
+        "setup": [
+          "a data directory in t.TempDir() prepared by a first in-process hub: workspace `demo`, one run event with a timestamp three days ago and one with a timestamp of now, ingested through the route of package 50",
+          "a configuration file with [audit] max_age = \"1d\"",
+          "the hub restarted in-process on 127.0.0.1:0 on the same data directory"
+        ],
+        "end_state": [
+          "the run event of three days ago is gone and the one of now remains, as GET …/runs/:run_id/events shows",
+          "GET /metrics answered 200 without a credential with media type text/plain and version 0.0.4",
+          "the body holds all 27 metric names",
+          "parley_retention_last_run_timestamp_seconds is greater than 0 and every parley_retention_errors_total series is 0",
+          "parley_audit_records{kind=\"run_event\"} is 1"
+        ],
+        "pseudocode": "in test/e2e/metrics_test.go: start hub 1, ingest the two run events, stop it; write config with audit.max_age '1d'; start hub 2 on the same directory; poll get('/metrics') until parley_retention_last_run_timestamp_seconds > 0 (at most 10 s); m = parse(body); assert the 27 catalogue names are all families of m; assert every parley_retention_errors_total sample == 0; assert m['parley_audit_records']{kind=run_event} == 1; ids = get('/api/v1/workspaces/demo/runs/'+run+'/events', ownerKey).items; assert ids == [the new event]; assert content type media type == 'text/plain' with version '0.0.4'"
+      }
+    }
+  ],
+  "external_apis": [
+    {
+      "package": "github.com/spf13/cobra",
+      "version": "v1.10.2",
+      "verified": true,
+      "symbols": [
+        {
+          "name": "Command.AddCommand",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) AddCommand(cmds ...*Command)"
+        },
+        {
+          "name": "Command.Flags",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) Flags() *pflag.FlagSet"
+        },
+        {
+          "name": "NoArgs",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func NoArgs(cmd *Command, args []string) error"
+        }
+      ]
+    },
+    {
+      "package": "github.com/spf13/pflag",
+      "version": "v1.0.10",
+      "verified": true,
+      "symbols": [
+        {
+          "name": "FlagSet.StringVar",
+          "import_path": "github.com/spf13/pflag",
+          "signature": "func (f *FlagSet) StringVar(p *string, name string, value string, usage string)"
+        },
+        {
+          "name": "FlagSet.IntVar",
+          "import_path": "github.com/spf13/pflag",
+          "signature": "func (f *FlagSet) IntVar(p *int, name string, value int, usage string)"
+        },
+        {
+          "name": "FlagSet.Changed",
+          "import_path": "github.com/spf13/pflag",
+          "signature": "func (f *FlagSet) Changed(name string) bool"
+        }
+      ]
+    }
+  ]
+}

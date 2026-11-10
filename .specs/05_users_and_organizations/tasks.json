@@ -1,0 +1,348 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "05",
+  "spec_name": "users_and_organizations",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/identity/... ./internal/cli/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "04",
+      "reason": "uses its users, orgs and memberships tables, its credentials, the authenticated caller (admin token, API key or PAT with its user), the refusal of blocked users, the needs-a-user mark and the exported personal-organization function that POST /users calls"
+    },
+    {
+      "spec": "09",
+      "reason": "builds its CLI commands on the client, output and exit-code helpers of the CLI foundation"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Create users with a personal organization behind the admin check",
+      "criteria": [
+        "REQ-3",
+        "REQ-2.1",
+        "REQ-2.2"
+      ],
+      "steps": [
+        "Extend the test hub helper package 04 wrote in internal/identity/testhub_test.go (a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04, served with httptest) with this package's routes, a replaceable clock, and seeded callers (the admin token, an API key and a PAT for admin-role root, an API key and a PAT for role-user alice); then add this task's behaviours to internal/identity/orgs_test.go, admincheck_test.go and handlers_users_test.go as table-driven tests and confirm they fail",
+        "Use the users, orgs and memberships tables that package 04's schema step created, with their columns and uniqueness rules; add no table, no column and no schema step",
+        "Use the personal-organization function package 04 exports from internal/identity (an open transaction, the user's fields and the role in; the user, the personal org with its derived slug and the membership created, or a conflict error out); write no slug function here",
+        "Call that function from the create handler inside one store transaction with role user and status active, and let the transaction roll back on its conflict error (the username, the e-mail or the provider identity is taken, an org has the username as its name, or no slug is free)",
+        "Leave the OAuth callback of package 04, its first-admin promotion and its tests as they are: both paths now create users through the one function",
+        "Write the admin check in internal/identity/admincheck.go and install it, through the composition in internal/hub/identity.go, as one of the access checks of package 02's access position, applying to routes registered with this package's admin mark: it passes the admin token and an API-key caller whose user has role admin at the time of the request, and answers 403 forbidden to every other caller, PATs included, before validation and before any lookup",
+        "Register POST /api/v1/users as an admin route that creates a resource: require username, email, provider and provider_id as non-empty strings and full_name, when present, as a string (400 invalid_request otherwise), call the create function in a transaction, map its conflict error to 409 conflict, and answer 201 with the User object of ten members",
+        "Never promote in this handler, also when the e-mail equals the bootstrap admin e-mail",
+        "Take every timestamp from the clock the identity component is built with, so tests can advance it"
+      ],
+      "touches": [
+        "internal/identity/orgs.go",
+        "internal/identity/orgs_test.go",
+        "internal/identity/admincheck.go",
+        "internal/identity/admincheck_test.go",
+        "internal/identity/handlers_users.go",
+        "internal/identity/handlers_users_test.go",
+        "internal/identity/testhub_test.go",
+        "internal/hub/identity.go"
+      ],
+      "done_when": [
+        "`go test ./internal/identity/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Serve the caller's own profile",
+      "criteria": [
+        "REQ-1.1",
+        "REQ-1.2",
+        "REQ-1.3",
+        "REQ-1.5"
+      ],
+      "steps": [
+        "Add this task's behaviours to internal/identity/handlers_user_test.go and confirm they fail",
+        "Register GET /api/v1/user declaring the scope users:read and PATCH /api/v1/user declaring users:write, both with package 04's needs-a-user mark, so that the admin token is answered 403 forbidden with package 04's message \"this route needs a user\"",
+        "GET answers 200 with the caller's User object: exactly the ten members, timestamps in RFC 3339 UTC with whole seconds",
+        "PATCH requires a string full_name member (400 invalid_request when it is absent, null or not a string), stores it, the empty string included, sets updated_at from the clock and answers 200 with the updated User object",
+        "Put the admin-token refusal in a table test over the routes that need a user; the task that adds GET /api/v1/user/orgs adds its row"
+      ],
+      "touches": [
+        "internal/identity/handlers_user.go",
+        "internal/identity/handlers_user_test.go",
+        "internal/identity/users.go",
+        "internal/identity/users_test.go"
+      ],
+      "depends_on": [
+        1
+      ],
+      "done_when": [
+        "`go test ./internal/identity/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Read and update users by selector",
+      "criteria": [
+        "REQ-4",
+        "REQ-2.3",
+        "REQ-2.4"
+      ],
+      "steps": [
+        "Add this task's behaviours to internal/identity/users_test.go and handlers_users_test.go and confirm they fail",
+        "Write the user selector: a value in hyphenated UUID form is looked up as an id only, any other value containing @ as an e-mail only, every other value as a username only, each compared exactly; no match is a not-found error that handlers answer as 404 not_found",
+        "Register GET /api/v1/users as an admin list route: active users only unless the query parameter include_blocked is exactly true, ordered by created_at descending then id descending, paged with the list helper of package 02",
+        "Register GET /api/v1/users/:id as an admin route answering the User object of an active or blocked user",
+        "Register PATCH /api/v1/users/:id as an admin route with the same body rule as PATCH /api/v1/user",
+        "Add the new routes to the admin-check table in internal/identity/admincheck_test.go, each with an existing and a missing target, and to the selector tables"
+      ],
+      "touches": [
+        "internal/identity/users.go",
+        "internal/identity/users_test.go",
+        "internal/identity/handlers_users.go",
+        "internal/identity/handlers_users_test.go",
+        "internal/identity/admincheck_test.go"
+      ],
+      "depends_on": [
+        1
+      ],
+      "done_when": [
+        "`go test ./internal/identity/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Promote, demote, block and unblock users",
+      "criteria": [
+        "REQ-5.1",
+        "REQ-5.2",
+        "REQ-5.3",
+        "REQ-5.4",
+        "REQ-5.6"
+      ],
+      "steps": [
+        "Add this task's behaviours to internal/identity/handlers_users_test.go and confirm they fail",
+        "Register POST /api/v1/users/:id/promote, /demote, /block and /unblock as admin routes that read no body and answer 200 with the User object",
+        "When the user is already in the requested role or status, write nothing and answer the stored object, updated_at unchanged; otherwise set the role or status and updated_at",
+        "Write the last-admin guard as one store function that, in a single write transaction, counts the users with role admin and status active and applies the change only when the target is not the only one; demote calls it and answers 409 conflict when it refuses. The delete task reuses it",
+        "Block and unblock change the status only: no credential is revoked or restored, and block applies no last-admin guard",
+        "Add the four routes to the admin-check table and to the user-selector tables"
+      ],
+      "touches": [
+        "internal/identity/users.go",
+        "internal/identity/users_test.go",
+        "internal/identity/handlers_users.go",
+        "internal/identity/handlers_users_test.go",
+        "internal/identity/admincheck_test.go"
+      ],
+      "depends_on": [
+        2,
+        3
+      ],
+      "done_when": [
+        "`go test ./internal/identity/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Create, read and update organizations",
+      "criteria": [
+        "REQ-7",
+        "REQ-8.1",
+        "REQ-8.2",
+        "REQ-8.3",
+        "REQ-2.5",
+        "REQ-2.6"
+      ],
+      "steps": [
+        "Add this task's behaviours to internal/identity/orgs_test.go and handlers_orgs_test.go and confirm they fail",
+        "Write the org selector: a value in hyphenated UUID form is an id, every other value a slug, compared exactly; no match is answered 404 not_found",
+        "Register POST /api/v1/orgs as an admin route that creates a resource: name a string non-empty after trimming and stored trimmed; slug a string of 1 to 128 characters of a-z, 0-9, underscore and hyphen that starts and ends with a letter or digit; url an optional string, default empty; owner_id an optional string that must be the id of an existing user; 400 invalid_request otherwise; 409 conflict when the trimmed name or the slug is taken; answer 201 with the Org object of eight members and create no membership",
+        "Register GET /api/v1/orgs as an admin list route: active orgs only unless include_blocked is exactly true, ordered by name ascending byte-wise, paged with the list helper of package 02",
+        "Register GET /api/v1/orgs/:id declaring the scope orgs:read, open to every authenticated caller: an admin (the admin token or an API key of an admin-role user) receives any existing org; any other caller receives the org only when the caller's user is a member and the org is active, and otherwise 404 not_found",
+        "Register PATCH /api/v1/orgs/:id as an admin route: at least one of name and url must be present; name must be a string non-empty after trimming and url a string (400 otherwise); a slug member is ignored; a name that another org has is 409 conflict and nothing is written; the org's own current name is accepted; set updated_at and answer 200 with the Org object",
+        "Add the admin routes to the admin-check table and start the org-selector tables with the routes of this task"
+      ],
+      "touches": [
+        "internal/identity/orgs.go",
+        "internal/identity/orgs_test.go",
+        "internal/identity/handlers_orgs.go",
+        "internal/identity/handlers_orgs_test.go",
+        "internal/identity/admincheck_test.go"
+      ],
+      "depends_on": [
+        1
+      ],
+      "done_when": [
+        "`go test ./internal/identity/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Manage memberships and list the caller's organizations",
+      "criteria": [
+        "REQ-9",
+        "REQ-1.4",
+        "REQ-1.6"
+      ],
+      "steps": [
+        "Add this task's behaviours to internal/identity/handlers_orgs_test.go and handlers_user_test.go and confirm they fail",
+        "Register GET /api/v1/orgs/:id/members declaring the scope orgs:read, with the same visibility rule as GET /api/v1/orgs/:id; list items of org_id, user_id, username, email and the membership's created_at, ordered by username ascending byte-wise, paged with the list helper",
+        "Register PUT /api/v1/orgs/:id/members/:user_id as an admin route: resolve the org and the user by their selectors (404 not_found for either), insert the membership with created_at from the clock unless it exists, leave an existing one untouched, answer 204 without a body; blocked users and blocked orgs are accepted",
+        "Register DELETE /api/v1/orgs/:id/members/:user_id as an admin route: 404 not_found when the org, the user or the membership is missing; otherwise delete the membership, leave owner_id alone and answer 204",
+        "Register GET /api/v1/user/orgs declaring the scope orgs:read, as a route that needs a user: list the active orgs the caller is a member of, ordered by name, as a list whose items array is empty and not null when there are none",
+        "Write the scope test: install in the scope position of the pipeline a check that refuses a PAT whose permissions lack the scope the route declares, and assert 403 insufficient_scope without the scope and 200 with it on GET and PATCH /api/v1/user, GET /api/v1/user/orgs, GET /api/v1/orgs/:id and GET /api/v1/orgs/:id/members",
+        "Add GET /api/v1/user/orgs to the admin-token table of the routes that need a user, the two member-changing routes to the admin-check table, and the member routes to both selector tables"
+      ],
+      "touches": [
+        "internal/identity/orgs.go",
+        "internal/identity/orgs_test.go",
+        "internal/identity/handlers_orgs.go",
+        "internal/identity/handlers_orgs_test.go",
+        "internal/identity/handlers_user.go",
+        "internal/identity/handlers_user_test.go",
+        "internal/identity/admincheck_test.go"
+      ],
+      "depends_on": [
+        2,
+        3,
+        5
+      ],
+      "done_when": [
+        "`go test ./internal/identity/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Block, unblock and delete organizations",
+      "criteria": [
+        "REQ-8.4",
+        "REQ-8.5",
+        "REQ-8.6",
+        "REQ-8.7",
+        "REQ-8.8"
+      ],
+      "steps": [
+        "Add this task's behaviours to internal/identity/handlers_orgs_test.go, and the remover behaviours of the org delete to internal/identity/removers_test.go, and confirm they fail",
+        "Register POST /api/v1/orgs/:id/block and /unblock as admin routes that read no body: set the status and updated_at and answer 200 with the Org object; when the org is already in the requested status write nothing and answer the stored object",
+        "Keep the memberships of a blocked org; confirm that the org leaves GET /api/v1/user/orgs and the default GET /api/v1/orgs while blocked and returns to both after unblock",
+        "Register DELETE /api/v1/orgs/:id as an admin route: delete the org and its memberships in one transaction, personal and blocked orgs included, keep every user, and answer 204 without a body",
+        "Create internal/identity/removers.go, which this package owns: RegisterUserRemover and RegisterOrgRemover each take a function of a store transaction and an id that returns an error, and keep the registered functions in registration order; packages 39 and 40 register theirs through internal/hub and add nothing to this file",
+        "Inside the transaction of the org delete, before the org record is removed, call every registered org remover with that transaction and the org's id; a remover's error rolls the whole delete back and the route answers 500 internal; a 404 calls none; with none registered the delete is unchanged",
+        "Make the not-found answer of GET /api/v1/orgs/:id and GET /api/v1/orgs/:id/members one and the same response for a missing org, a non-member and a member of a blocked org: same status, error_type and message, produced by one code path",
+        "Add the three routes to the admin-check table and to the org-selector tables"
+      ],
+      "touches": [
+        "internal/identity/orgs.go",
+        "internal/identity/orgs_test.go",
+        "internal/identity/handlers_orgs.go",
+        "internal/identity/handlers_orgs_test.go",
+        "internal/identity/admincheck_test.go",
+        "internal/identity/removers.go",
+        "internal/identity/removers_test.go"
+      ],
+      "depends_on": [
+        6
+      ],
+      "done_when": [
+        "`go test ./internal/identity/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Delete users without losing the last admin",
+      "criteria": [
+        "REQ-6",
+        "REQ-5.5"
+      ],
+      "steps": [
+        "Add this task's behaviours to internal/identity/handlers_users_test.go, and the remover behaviours of the user delete to internal/identity/removers_test.go, and confirm they fail; run the concurrency test with the race detector",
+        "Register DELETE /api/v1/users/:id as an admin route answering 204 without a body, or 404 not_found when the selector matches no user",
+        "In one write transaction: apply the last-admin guard of the role task (409 conflict and nothing deleted when the target is the only user with role admin and status active), delete the user's API keys and PATs, bound ones included, delete the user's memberships, set owner_id to null and updated_at to now on every org the user owned, and delete the user",
+        "Inside that transaction, after the last-admin guard and before the user record is removed, call every user remover registered through RegisterUserRemover of internal/identity/removers.go with the transaction and the user's id; a remover's error rolls the whole delete back and the route answers 500 internal; a 404 or 409 calls none; org removers are not called, because the orgs are kept",
+        "Keep every org, the personal org included, and touch no workspace record",
+        "Prove atomicity under concurrency: with exactly two active admins, concurrent demote and demote, and concurrent delete and demote, end with exactly one refusal and one active admin, over 25 fresh hubs",
+        "Add the route to the admin-check table and to the user-selector tables"
+      ],
+      "touches": [
+        "internal/identity/users.go",
+        "internal/identity/users_test.go",
+        "internal/identity/handlers_users.go",
+        "internal/identity/handlers_users_test.go",
+        "internal/identity/admincheck_test.go",
+        "internal/identity/removers.go",
+        "internal/identity/removers_test.go"
+      ],
+      "depends_on": [
+        4,
+        6,
+        7
+      ],
+      "done_when": [
+        "`go test -race ./internal/identity/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Add the user, orgs and admin users commands",
+      "criteria": [
+        "REQ-10.1",
+        "REQ-10.2",
+        "REQ-10.5",
+        "REQ-10.6",
+        "REQ-10.7"
+      ],
+      "steps": [
+        "Add this task's behaviours to internal/cli/user_test.go, orgs_test.go and admin_users_test.go against an httptest server that records each request and answers from a table, and confirm they fail",
+        "Declare every command through the command helper of package 09 (internal/cli/command.go) with its description, method, path, arguments and auth value (user for parley user and parley orgs, admin for parley admin), so that settings, the request, the 2xx body on stdout, the hub's envelope on stderr with exit status 1 and usage errors with exit status 2 all come from package 09's client, printers and exit-code mapping; write no client code here",
+        "Pass user-supplied arguments as the :param values of the declared path, so that package 09's segment encoder sends a slash in an argument as %2F",
+        "Add the group parley user with show (GET /user) and update (PATCH /user); --full-name is required and an empty value is sent as an empty string",
+        "Add the group parley orgs with list (GET /user/orgs), show <org> (GET /orgs/<org>) and members <org> (GET /orgs/<org>/members), each taking exactly the arguments shown",
+        "Add the group parley admin with the group users: list with --include-blocked (sends include_blocked=true only when given), show <user>, create with the required flags --username, --email, --provider, --provider-id and the optional --full-name (sent only when given), update <user> with the required --full-name, delete <user>, promote, demote, block and unblock <user> (POST without a body)",
+        "Check required flags and argument counts before any request, so that a usage error sends nothing; a group run without a subcommand prints help and exits 0",
+        "Send no limit or cursor from the list commands"
+      ],
+      "touches": [
+        "internal/cli/user.go",
+        "internal/cli/user_test.go",
+        "internal/cli/orgs.go",
+        "internal/cli/orgs_test.go",
+        "internal/cli/admin_users.go",
+        "internal/cli/admin_users_test.go",
+        "internal/cli/root.go"
+      ],
+      "depends_on": [
+        1
+      ],
+      "done_when": [
+        "`go test ./internal/cli/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Add the admin orgs commands",
+      "criteria": [
+        "REQ-10.3",
+        "REQ-10.4"
+      ],
+      "steps": [
+        "Add this task's behaviours to internal/cli/admin_orgs_test.go and confirm they fail",
+        "Add the group orgs under parley admin: list with --include-blocked, create with the required --name and --slug and the optional --url and --owner (sent as owner_id), each optional member sent only when its flag is given",
+        "Add update <org> with --name and --url: send only the members whose flags were given, an explicitly empty --url included, and report a usage error without a request when neither flag is given",
+        "Add delete <org>, block <org> and unblock <org>, and the group members with list <org>, add <org> <user> (PUT) and remove <org> <user> (DELETE)",
+        "Rely on package 09's printer for the empty JSON object and newline when the hub answers 204, for admin users delete, admin orgs delete, members add and members remove, and assert it in the tests",
+        "Add the admin orgs commands to the usage-error and path-encoding tables of the previous task"
+      ],
+      "touches": [
+        "internal/cli/admin_orgs.go",
+        "internal/cli/admin_orgs_test.go",
+        "internal/cli/admin_users_test.go",
+        "test/e2e/identity_test.go"
+      ],
+      "done_when": [
+        "`go test ./internal/cli/... -count=1` passes"
+      ]
+    }
+  ]
+}

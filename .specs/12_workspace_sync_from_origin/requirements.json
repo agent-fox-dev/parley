@@ -1,0 +1,856 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "12",
+  "spec_name": "workspace_sync_from_origin",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Who may sync a workspace, and in which state",
+      "rationale": "Sync moves branches and talks to origin with the workspace's credential, so it is a write that only a repository workspace in a usable state may take.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "a caller with write access sends POST /api/v1/workspaces/:slug/sync, with no body, for a repository workspace in status ready whose setting sync_enabled is true",
+          "action": "run the sync and answer with the workspace object, re-read after the sync, plus the member branches",
+          "contract": "HTTP 200 with the workspace object plus branches: a list of {name: string, result: string, local_sha: 40 hex, origin_sha: 40 hex}",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sync fixture: an origin bare repository and a hub bare repository cloned from it, both made with git in t.TempDir(), and a repository workspace record in status ready in a real store in t.TempDir(), with origin and hub equal on one branch main",
+              "the route mounted on the real router of internal/server with the access middleware of internal/access"
+            ],
+            "pseudocode": "in internal/workspace/sync_handler_test.go, TestSyncRoute_AnswersWorkspaceWithBranches: r = POST /api/v1/workspaces/my-project/sync as the owner; assert r.status == 200; assert r.json.slug == 'my-project'; assert r.json.branches == [{name: 'main', result: 'up_to_date', local_sha: head, origin_sha: head}]; repeat with the admin token and assert 200"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "unwanted",
+          "condition": "the caller is a PAT without the scope workspaces:write, an org member without write access, or a caller with no access to the workspace",
+          "action": "refuse the request without fetching origin, moving a ref, changing a workspace field or emitting an event",
+          "contract": "HTTP 403 with error_type insufficient_scope for the PAT; HTTP 403 with error_type forbidden for the org member; HTTP 404 with error_type not_found, identical to the answer for an unknown slug, for a caller with no access; the fetch is not started",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sync fixture: an origin bare repository and a hub bare repository cloned from it, both made with git in t.TempDir(), and a repository workspace record in status ready in a real store in t.TempDir()",
+              "a recording fetcher in place of the git fetch"
+            ],
+            "pseudocode": "in internal/workspace/sync_handler_test.go, TestSyncRoute_RefusesCallersWithoutWriteAccess, a table over {PAT with only workspaces:read -> 403 insufficient_scope, org member -> 403 forbidden, user outside the organization -> 404 not_found, unknown slug -> 404 not_found}: r = POST .../sync; assert r.status and r.json.error_type; assert the outsider's body equals the unknown slug's body; assert fetcher.calls == 0 and the workspace record and the recorded events are unchanged"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "unwanted",
+          "condition": "the query parameter reset_to_origin is present with a value other than true or false",
+          "action": "refuse the request without fetching origin",
+          "contract": "HTTP 400 with error_type invalid_request; the fetch is not started",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub sync operation that records its reset argument"
+            ],
+            "pseudocode": "in internal/workspace/sync_handler_test.go, TestSyncRoute_ValidatesResetToOrigin, a table over the query {reset_to_origin=yes, reset_to_origin=1, reset_to_origin=TRUE, reset_to_origin=} expecting 400 invalid_request and fetcher.calls == 0, and over {absent, reset_to_origin=false, reset_to_origin=true} expecting 200 with the sync called with reset false, false, true"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "unwanted",
+          "condition": "the workspace is a task fork",
+          "action": "refuse the request without fetching anything",
+          "contract": "HTTP 400 with error_type fork_has_no_origin; the fetch is not started",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace record of kind fork with parent my-project"
+            ],
+            "pseudocode": "in internal/workspace/sync_handler_test.go, TestSyncRoute_RefusesFork: r = POST /api/v1/workspaces/my-project--task1/sync as the fork's owner; assert r.status == 400; assert r.json.error_type == 'fork_has_no_origin'; assert fetcher.calls == 0"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "unwanted",
+          "condition": "the workspace is in status pending or cloning, or a reclone, archive or delete of it is running, or its status is failed or archived",
+          "action": "refuse the request by the workspace's status without fetching origin",
+          "contract": "HTTP 409 with error_type workspace_busy for pending, cloning and a running reclone, archive or delete; HTTP 409 with error_type workspace_not_ready for failed; HTTP 409 with error_type workspace_archived for archived; the fetch is not started",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/sync_handler_test.go, TestSyncRoute_RefusesByStatus, a table over {pending -> workspace_busy, cloning -> workspace_busy, ready with a reclone running -> workspace_busy, ready with an archive running -> workspace_busy, failed -> workspace_not_ready, archived -> workspace_archived}: r = POST .../sync as the owner; assert r.status == 409; assert r.json.error_type; assert fetcher.calls == 0 and the record's status is unchanged"
+          }
+        },
+        {
+          "id": "REQ-1.6",
+          "pattern": "unwanted",
+          "condition": "the workspace's setting sync_enabled is false",
+          "action": "refuse the request without fetching origin",
+          "contract": "HTTP 400 with error_type sync_disabled; the fetch is not started",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a ready repository workspace whose stored setting sync_enabled is false"
+            ],
+            "pseudocode": "in internal/workspace/sync_handler_test.go, TestSyncRoute_RefusesWhenSyncDisabled: r = POST .../sync as the owner; assert r.status == 400; assert r.json.error_type == 'sync_disabled'; assert fetcher.calls == 0; set sync_enabled back to true and assert the next POST is 200"
+          }
+        },
+        {
+          "id": "REQ-1.7",
+          "pattern": "ubiquitous",
+          "action": "for any request that fails more than one of the checks, answer with the first failing check in the order: task fork, status, sync_enabled",
+          "contract": "one error envelope whose error_type is that of the first failing check",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/sync_handler_test.go, TestSyncRoute_CheckOrder, a table over {archived and sync_enabled false -> 409 workspace_archived, failed and sync_enabled false -> 409 workspace_not_ready, cloning and sync_enabled false -> 409 workspace_busy, archived with reset_to_origin=yes -> 400 invalid_request, org member on an archived workspace -> 403 forbidden}: assert r.status and r.json.error_type"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Fetching origin's branches and tags",
+      "rationale": "Everything sync decides rests on an exact, current picture of origin, taken with the credential the workspace has now.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "a sync request has passed its checks",
+          "action": "fetch every branch and tag of origin with the origin credential read from the workspace's secrets at that moment",
+          "contract": "one fetch of origin per sync, carrying the credential the resolver returned for that sync",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub origin credential resolver (the interface package 10 provides) and a recording fetcher"
+            ],
+            "pseudocode": "in internal/workspace/sync_test.go, TestSync_FetchesWithCurrentCredential: resolver returns token 'A'; Sync(ws); assert fetcher.calls[0].credential == basic('x-token-auth', 'A') and fetcher.calls[0].url == ws.git_url; resolver now returns user 'u', password 'p'; Sync(ws); assert fetcher.calls[1].credential == basic('u', 'p'); resolver returns no credential; Sync(ws); assert fetcher.calls[2].credential is anonymous"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "event_driven",
+          "condition": "the fetch of origin succeeds",
+          "action": "record origin's head of every branch on origin as refs/remotes/origin/<name> and remove the record of every branch origin no longer has",
+          "contract": "after the fetch, the set of refs under refs/remotes/origin/ equals origin's branches and each points at origin's head; no ref under refs/heads/ is changed by the fetch",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "an origin bare repository with branches main, release/1.x and feat/a and a hub bare repository cloned from an earlier state of it, made with git in t.TempDir()"
+            ],
+            "pseudocode": "in internal/gitrepo/fetch_test.go, TestFetchOrigin_RecordsOriginHeads: FetchOrigin(hub, originPath, anonymous); assert ref(hub, 'refs/remotes/origin/main') == originHead('main') and the same for release/1.x and feat/a; assert refs under refs/heads of hub are unchanged; delete feat/a on origin, add a commit to main on origin; FetchOrigin again; assert refs/remotes/origin/feat/a does not exist and refs/remotes/origin/main == the new head"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "event_driven",
+          "condition": "the fetch succeeds and origin has a tag that the hub does not have",
+          "action": "create the tag in the hub at origin's value",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sync fixture: an origin bare repository and a hub bare repository cloned from it, both made with git in t.TempDir(), and a repository workspace record in status ready in a real store in t.TempDir(), with tag v1 on both sides"
+            ],
+            "pseudocode": "in internal/workspace/sync_test.go, TestSync_CreatesNewTagsAndKeepsExisting: on origin create tag v2 and an annotated tag v3; Sync(ws); assert ref(hub, 'refs/tags/v2') == origin's v2 and ref(hub, 'refs/tags/v3') == origin's v3 tag object"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "ubiquitous",
+          "action": "for any tag that exists in the hub before a sync, leave it at the same value after the sync, whether origin has the tag at another value, has deleted it or never had it",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sync fixture: an origin bare repository and a hub bare repository cloned from it, both made with git in t.TempDir(), and a repository workspace record in status ready in a real store in t.TempDir(), with tag v1 on both sides"
+            ],
+            "pseudocode": "in internal/workspace/sync_test.go, extending TestSync_CreatesNewTagsAndKeepsExisting with a table over {origin re-points v1 to another commit, origin deletes v1, a tag hubonly exists only in the hub}: before = ref(hub, tag); r = Sync(ws); assert r completed without error; assert ref(hub, tag) == before"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "A sync that cannot fetch",
+      "rationale": "When origin cannot be reached the workspace must stay exactly as it was, and its owner must be able to read why.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "unwanted",
+          "condition": "the fetch of origin fails because origin refuses the credential, the network fails or origin refuses the request",
+          "action": "move no branch, create no tag, leave the origin heads, last_sync_at, head_sha and origin_head_sha as they were, set sync_error to the failure text, emit no event and answer with an upstream error",
+          "contract": "HTTP 502 with error_type upstream_error; the workspace's sync_error is a non-empty text; every ref of the hub's repository is unchanged; no parley.workspace.sync event is emitted",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sync fixture: an origin bare repository and a hub bare repository cloned from it, both made with git in t.TempDir(), and a repository workspace record in status ready in a real store in t.TempDir(), where origin has new commits and a new tag",
+              "a recording event emitter"
+            ],
+            "pseudocode": "in internal/workspace/sync_test.go, TestSync_FetchFailureChangesNothing, a table over {the origin path does not exist, the origin answers 401 to the credential (an httptest server), the origin closes the connection}: before = all refs of hub and the record; r = POST .../sync; assert r.status == 502; assert r.json.error_type == 'upstream_error'; assert all refs of hub == before.refs; assert record.sync_error != '' and record.last_sync_at == before.last_sync_at and record.head_sha == before.head_sha and record.origin_head_sha == before.origin_head_sha; assert no event was recorded"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "unwanted",
+          "condition": "the workspace's secrets cannot be read when the origin credential is resolved",
+          "action": "fail the sync as a fetch failure without attempting an anonymous fetch",
+          "contract": "HTTP 502 with error_type upstream_error; sync_error is set; no fetch is started",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub origin credential resolver that fails and a recording fetcher"
+            ],
+            "pseudocode": "in internal/workspace/sync_test.go, TestSync_SecretReadFailureNeverFetchesAnonymously: resolver returns an error; r = POST .../sync; assert r.status == 502 and r.json.error_type == 'upstream_error'; assert fetcher.calls == 0; assert record.sync_error != ''"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "unwanted",
+          "condition": "the fetch of origin has not finished 2 minutes after it started",
+          "action": "stop the git subprocess and fail the sync as a fetch failure",
+          "contract": "HTTP 502 with error_type upstream_error; sync_error is set; no git subprocess of the fetch is left running; every ref of the hub's repository is unchanged",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/gitrepo/fetch_test.go, TestFetchOrigin_StopsAtDeadline: err = FetchOrigin(hub, url of an httptest server that accepts the request and never answers, anonymous) with the deadline option set to 200 ms; assert err is the deadline error within 2 s; assert no git child process of the test is left running; assert the refs of hub are unchanged. In internal/workspace/sync_test.go, TestSync_FetchDeadlineIsTwoMinutes: assert the deadline Sync passes to the fetcher is 2 minutes and that a fetcher returning the deadline error gives 502 upstream_error with sync_error set"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "ubiquitous",
+          "action": "for any fetch failure text, store sync_error and return the response message with the origin credential replaced by [redacted], URL userinfo removed and a length of at most 1024 bytes",
+          "contract": "sync_error and the error envelope's message never contain the credential or URL userinfo and are at most 1024 bytes",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub resolver returning the token 's3cr3t' and a fetcher returning the table's error"
+            ],
+            "pseudocode": "in internal/workspace/sync_test.go, TestSync_FailureTextIsScrubbed, a table over fetcher errors {\"fatal: unable to access 'https://x-token-auth:s3cr3t@example.test/r.git/': 403\", a text containing the token 's3cr3t' alone, a 5000-byte text}: POST .../sync; assert neither record.sync_error nor r.json.message contains 's3cr3t' or '@example.test'; assert len(record.sync_error) <= 1024 and len(r.json.message) <= 1024"
+          }
+        },
+        {
+          "id": "REQ-3.5",
+          "pattern": "event_driven",
+          "condition": "a sync completes on a workspace whose sync_error was set by an earlier failed sync",
+          "action": "clear sync_error to null and set last_sync_at",
+          "check": {
+            "same_as": "PATH-2"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "One result per origin branch",
+      "rationale": "The caller must be able to tell, branch by branch, what sync did and what it deliberately left alone.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "a branch exists on origin and the hub has no branch of that name",
+          "action": "create the branch in the hub at origin's head and report the result created",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sync fixture: an origin bare repository and a hub bare repository cloned from it, both made with git in t.TempDir(), and a repository workspace record in status ready in a real store in t.TempDir()"
+            ],
+            "pseudocode": "in internal/workspace/sync_test.go, TestSync_PerBranchResults: build origin and hub so that, relative to a common commit, new-b exists only on origin; same has equal heads; ff has one more commit on origin; ahead-b has one more commit in the hub; div has one different commit on each side; r = Sync(ws, reset=false); assert results by name == {new-b: created, same: up_to_date, ff: fast_forward, ahead-b: ahead, div: diverged}; assert hub heads: new-b == origin's, ff == origin's, same, ahead-b and div unchanged; assert r completed without error; then r2 = Sync(ws, reset=true); assert results == {new-b: up_to_date, same: up_to_date, ff: up_to_date, ahead-b: ahead, div: reset}; assert hub head of div == origin's head of div and the hub's former commit on div is not an ancestor of it; assert hub head of ahead-b is still the hub's commit"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "event_driven",
+          "condition": "the hub's head and origin's head of a branch are equal",
+          "action": "leave the branch as it is and report the result up_to_date",
+          "check": {
+            "same_as": "REQ-4.1"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "event_driven",
+          "condition": "the hub's head of a branch is an ancestor of origin's head and differs from it",
+          "action": "move the branch to origin's head and report the result fast_forward",
+          "check": {
+            "same_as": "REQ-4.1"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "event_driven",
+          "condition": "origin's head of a branch is an ancestor of the hub's head and differs from it",
+          "action": "leave the branch as it is and report the result ahead, with or without reset_to_origin=true",
+          "check": {
+            "same_as": "REQ-4.1"
+          }
+        },
+        {
+          "id": "REQ-4.5",
+          "pattern": "event_driven",
+          "condition": "each side of a branch has commits the other lacks and reset_to_origin=true was not given",
+          "action": "leave the branch as it is, report the result diverged, process every other branch and complete the sync",
+          "contract": "HTTP 200; the branch's entry has result diverged and local_sha equal to the hub's unchanged head",
+          "check": {
+            "same_as": "REQ-4.1"
+          }
+        },
+        {
+          "id": "REQ-4.6",
+          "pattern": "event_driven",
+          "condition": "each side of a branch has commits the other lacks and reset_to_origin=true was given",
+          "action": "move the branch to origin's head and report the result reset",
+          "check": {
+            "same_as": "REQ-4.1"
+          }
+        },
+        {
+          "id": "REQ-4.7",
+          "pattern": "ubiquitous",
+          "action": "for any branch that exists in the hub and not on origin, whether it never existed on origin or was deleted there, leave the branch unchanged and leave it out of branches",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sync fixture: an origin bare repository and a hub bare repository cloned from it, both made with git in t.TempDir(), and a repository workspace record in status ready in a real store in t.TempDir(), where the hub has a branch local-only that origin never had and a branch gone that was deleted on origin after the clone"
+            ],
+            "pseudocode": "in internal/workspace/sync_test.go, TestSync_LeavesHubOnlyBranchesAlone: r = Sync(ws) with reset=false and again with reset=true; assert ref(hub, 'refs/heads/local-only') and ref(hub, 'refs/heads/gone') are unchanged; assert neither name appears in r.branches"
+          }
+        },
+        {
+          "id": "REQ-4.8",
+          "pattern": "ubiquitous",
+          "action": "for any completed sync, return branches with exactly one entry per branch on origin, ordered by name, where local_sha is the hub's head of the branch after the sync and origin_sha is origin's head, both as full 40-character commit ids",
+          "contract": "branches: [{name, result, local_sha, origin_sha}] sorted by name in byte order; [] when origin has no branches",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a sync fixture: an origin bare repository and a hub bare repository cloned from it, both made with git in t.TempDir(), and a repository workspace record in status ready in a real store in t.TempDir()"
+            ],
+            "pseudocode": "in internal/workspace/sync_test.go, TestSync_BranchesListShape: r = Sync(ws) on an origin with branches {release/1.x, main, exp, a/b}; assert names(r.branches) == ['a/b', 'exp', 'main', 'release/1.x']; for each entry assert local_sha == ref(hub, 'refs/heads/' + name) read after the sync, origin_sha == origin's head, and both match ^[0-9a-f]{40}$; on an origin with no branches assert r.branches == [] and the JSON member is [] and not null"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Protected branches under sync",
+      "rationale": "Sync is one of the three ways a protected branch may move, and a protected branch that is ahead of origin is the normal result of landing.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "ubiquitous",
+          "action": "for any protected branch, apply the results created, fast_forward and reset as for an unprotected branch, with the setting protect.owner_push true or false",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sync fixture: an origin bare repository and a hub bare repository cloned from it, both made with git in t.TempDir(), and a repository workspace record in status ready in a real store in t.TempDir(), whose default branch main is protected by the default of protected_branches"
+            ],
+            "pseudocode": "in internal/workspace/sync_test.go, TestSync_MovesProtectedBranches, a table over protect.owner_push {true, false} and the cases {origin adds a commit to main -> fast_forward, main diverged with reset=true -> reset, origin adds release/2 with protected_branches ['main', 'release/*'] -> created}: r = Sync(ws); assert the result; assert ref(hub, 'refs/heads/' + name) == origin's head"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "event_driven",
+          "condition": "a protected branch has commits in the hub that origin does not have and origin's head is an ancestor of the hub's",
+          "action": "report the result ahead, leave the branch unchanged, complete the sync and leave sync_error null",
+          "contract": "HTTP 200; the branch's entry has result ahead; sync_error is null",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sync fixture: an origin bare repository and a hub bare repository cloned from it, both made with git in t.TempDir(), and a repository workspace record in status ready in a real store in t.TempDir(), whose default branch main is protected"
+            ],
+            "pseudocode": "in internal/workspace/sync_test.go, TestSync_ProtectedBranchAheadIsNormal: add a commit to main in the hub only; r = Sync(ws) without and with reset; assert r completed without error; assert the main entry has result ahead and local_sha == the hub's commit; assert ref(hub, 'refs/heads/main') is unchanged. That sync_error stays null and the event lists main under ahead is asserted by the 'main ahead' row of TestSync_RecordsCompletion"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Sync beside other writers",
+      "rationale": "Landings, pushes and other syncs run at the same time as a sync; none may lose an update and none may make the sync fail as busy.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "ubiquitous",
+          "action": "for any branch that sync creates or moves, update the ref with a compare-and-swap that expects the head sync compared with origin's (or the absence of the branch for a creation), and change nothing when the ref has another value",
+          "contract": "the compare-and-swap returns a distinguishable ref-moved error and leaves the ref unchanged when its current value is not the expected one",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a bare repository with three commits made with git in t.TempDir()"
+            ],
+            "pseudocode": "in internal/gitrepo/refs_test.go, TestCompareAndSwapRef, a table over {expected old equals current -> ref moves and nil error, expected old differs from current -> ErrRefMoved and ref unchanged, expected absent and ref absent -> ref created, expected absent and ref exists -> ErrRefMoved and ref unchanged}: err = CompareAndSwapRef(repo, 'refs/heads/b', new, expectedOld); assert err and ref(repo, 'refs/heads/b')"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "unwanted",
+          "condition": "a branch's compare-and-swap fails because the branch moved in the hub after sync compared it",
+          "action": "leave the other writer's head in place, evaluate that branch again against its new head and report the result of the last evaluation",
+          "contract": "the branch's entry reports the result computed against the new head; local_sha is the hub's head after the sync; no commit of the other writer is removed from the branch",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sync fixture: an origin bare repository and a hub bare repository cloned from it, both made with git in t.TempDir(), and a repository workspace record in status ready in a real store in t.TempDir()",
+              "a hook on the sync operation, for tests, that is called after a branch is evaluated and before its ref is swapped"
+            ],
+            "pseudocode": "in internal/workspace/sync_test.go, TestSync_ReevaluatesBranchThatMoved, a table using the test hook that runs between a branch's evaluation and its swap: {hub main at A, origin at B (child of A), hook moves hub main to C (child of B) -> result ahead, hub main == C}, {hook moves hub main to D (another child of A) -> result diverged, hub main == D}, {hook moves hub main to B -> result up_to_date}, {branch absent in hub, hook creates it at A -> result fast_forward, head == B}: r = Sync(ws); assert the result, the head and that r completed without error"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "unwanted",
+          "condition": "the compare-and-swap of one branch has failed on 5 evaluations in one sync",
+          "action": "stop the sync without writing last_sync_at, sync_error, head_sha or origin_head_sha and without emitting an event, keeping the branch moves already made",
+          "contract": "HTTP 500 with error_type internal and a message that names the branch; no parley.workspace.sync event",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a sync fixture: an origin bare repository and a hub bare repository cloned from it, both made with git in t.TempDir(), and a repository workspace record in status ready in a real store in t.TempDir(), where origin is ahead on branches aa and zz",
+              "the evaluation hook of TestSync_ReevaluatesBranchThatMoved"
+            ],
+            "pseudocode": "in internal/workspace/sync_test.go, TestSync_GivesUpAfterFiveEvaluations: the hook moves branch zz to a new child of its common ancestor on every call; r = POST .../sync; assert r.status == 500 and r.json.error_type == 'internal' and r.json.message contains 'zz'; assert hook.calls == 5; assert record.last_sync_at is unchanged; assert no event was recorded; assert branch aa, processed before zz, is at origin's head"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "event_driven",
+          "condition": "two sync requests for the same workspace run at the same time",
+          "action": "complete both syncs, leaving every branch that could be fast-forwarded or created at origin's head",
+          "contract": "HTTP 200 for both requests; neither is answered 409 workspace_busy",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sync fixture: an origin bare repository and a hub bare repository cloned from it, both made with git in t.TempDir(), and a repository workspace record in status ready in a real store in t.TempDir()"
+            ],
+            "pseudocode": "in internal/workspace/sync_test.go, TestSync_TwoConcurrentSyncs: start two POST .../sync requests from two goroutines released together, 20 rounds with a fresh origin commit on each of 5 branches per round; assert both statuses == 200 in every round and neither error_type is workspace_busy; assert every hub branch == origin's head; assert each branch's two reported results are one of {fast_forward, up_to_date}; assert record.status == 'ready' before and after"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "ubiquitous",
+          "action": "for any sync, whether it completes, is refused or fails, leave the workspace's status unchanged",
+          "check": {
+            "same_as": "REQ-6.4"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "What a completed sync records",
+      "rationale": "The workspace's sync fields and the event are how owners, agents and other parts of the hub learn that origin's state was taken in.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "event_driven",
+          "condition": "a sync completes, including when branches are ahead or diverged",
+          "action": "set last_sync_at to the completion time, sync_error to null, head_sha to the hub's head of the default branch and origin_head_sha to origin's head of the default branch, or null when origin has no such branch, and return these values in the response",
+          "contract": "the stored workspace and the response body carry last_sync_at (RFC 3339, UTC, whole seconds), sync_error null, head_sha and origin_head_sha",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sync fixture: an origin bare repository and a hub bare repository cloned from it, both made with git in t.TempDir(), and a repository workspace record in status ready in a real store in t.TempDir()",
+              "an injected clock"
+            ],
+            "pseudocode": "in internal/workspace/sync_test.go, TestSync_RecordsCompletion, a table over {all branches up_to_date, main ahead, a branch diverged, main fast_forward, origin has deleted the default branch}: set record.sync_error = 'old'; r = POST .../sync at a fixed clock; assert r.status == 200; reread the record; assert last_sync_at == the clock's time in RFC 3339 UTC with whole seconds; assert sync_error == null; assert head_sha == ref(hub, 'refs/heads/main'); assert origin_head_sha == origin's head of main (null in the last case); assert r.json carries the same four values"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "event_driven",
+          "condition": "a sync completes",
+          "action": "emit exactly one parley.workspace.sync event whose actor is the caller and whose metadata lists the branch names per result and every ref the sync created or moved",
+          "contract": "event type parley.workspace.sync; metadata {created, fast_forward, ahead, diverged, reset: sorted lists of branch names; updated: list of {ref: full ref name, before: 40 hex or null, after: 40 hex}, sorted by ref}; a branch that is up_to_date is in no list",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sync fixture: an origin bare repository and a hub bare repository cloned from it, both made with git in t.TempDir(), and a repository workspace record in status ready in a real store in t.TempDir()",
+              "a recording event emitter in place of the event component of package 52"
+            ],
+            "pseudocode": "in internal/workspace/sync_test.go, TestSync_EmitsOneEvent: with the branch set of TestSync_PerBranchResults plus a new tag v2 on origin, POST .../sync?reset_to_origin=false; assert exactly one event of type parley.workspace.sync with workspace == slug and actor == the caller; assert metadata.created == ['new-b'], fast_forward == ['ff'], ahead == ['ahead-b'], diverged == ['div'], reset == []; assert metadata.updated == [{ref: 'refs/heads/ff', before: old, after: new}, {ref: 'refs/heads/new-b', before: null, after: head}, {ref: 'refs/tags/v2', before: null, after: tag}] in ref order; assert 'same' appears in no list; a second sync emits a second event whose lists are all empty except ahead and diverged"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "event_driven",
+          "condition": "the caller disconnects after the sync request has passed its checks",
+          "action": "run the sync to completion with the same branch moves, workspace fields and event as when the caller waits",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sync fixture: an origin bare repository and a hub bare repository cloned from it, both made with git in t.TempDir(), and a repository workspace record in status ready in a real store in t.TempDir(), where origin is ahead on branch ff",
+              "a fetcher wrapper that signals when the fetch has started"
+            ],
+            "pseudocode": "in internal/workspace/sync_handler_test.go, TestSyncRoute_CompletesAfterDisconnect: start POST .../sync with a cancellable request context; the fetcher blocks until the test cancels the context, then continues; wait for the handler to return; assert ref(hub, 'refs/heads/ff') == origin's head; assert record.last_sync_at is set; assert one parley.workspace.sync event was recorded"
+          }
+        },
+        {
+          "id": "REQ-7.4",
+          "pattern": "event_driven",
+          "condition": "a sync creates or moves a branch by created, fast_forward or reset",
+          "action": "report the move once, after the ref has changed, to every registered branch-move observer with the workspace slug, the branch name, the head before (absent for a creation), the head after and the cause sync",
+          "contract": "one observer call per moved branch: (workspace slug, branch name, before, after, cause 'sync'); no call for up_to_date, ahead or diverged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a sync fixture: an origin bare repository and a hub bare repository cloned from it, both made with git in t.TempDir(), and a repository workspace record in status ready in a real store in t.TempDir()"
+            ],
+            "pseudocode": "in internal/workspace/sync_test.go, TestSync_NotifiesBranchMoveObservers: register two recording observers; Sync(ws, reset=true) on the branch set of TestSync_PerBranchResults; assert each observer received exactly {(slug, 'new-b', absent, head, 'sync'), (slug, 'ff', old, new, 'sync'), (slug, 'div', old, new, 'sync')}; assert none for 'same' and 'ahead-b'; assert inside each call that ref(hub, 'refs/heads/' + branch) == after; with no observer registered assert Sync returns the same result"
+          }
+        },
+        {
+          "id": "REQ-7.5",
+          "pattern": "unwanted",
+          "condition": "a branch-move observer returns an error",
+          "action": "keep the branch at its new head, call the remaining observers, log the failure and complete the sync",
+          "contract": "HTTP 200; the branch's entry reports the move; the ref is at origin's head",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a sync fixture: an origin bare repository and a hub bare repository cloned from it, both made with git in t.TempDir(), and a repository workspace record in status ready in a real store in t.TempDir(), where origin is ahead on branch ff"
+            ],
+            "pseudocode": "in internal/workspace/sync_test.go, TestSync_ObserverFailureDoesNotFailSync: register a failing observer before a recording one; r = POST .../sync; assert r.status == 200; assert ref(hub, 'refs/heads/ff') == origin's head; assert the recording observer was called for 'ff'; assert the log buffer holds one line naming the branch and the failure"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "Branches a carry-patch workspace keeps out of sync",
+      "rationale": "The integration branch and patch branches of a carry-patch workspace are maintained by the rebuild and patch rules, which the plain per-branch pass must not overrule.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "optional",
+          "condition": "the workspace's workspace_mode is carry_patch",
+          "action": "leave the integration branch out of the per-branch pass: not compare it, not move it and not list it in branches, while still fetching origin's head for it",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sync fixture: an origin bare repository and a hub bare repository cloned from it, both made with git in t.TempDir(), and a repository workspace record in status ready in a real store in t.TempDir()"
+            ],
+            "pseudocode": "in internal/workspace/sync_test.go, TestSync_SkipsCarryPatchBranches: record.workspace_mode = 'carry_patch', record.integration_branch = 'integration'; origin and hub have diverged heads on integration and origin is ahead on main; r = Sync(ws, reset=true); assert ref(hub, 'refs/heads/integration') is unchanged; assert names(r.branches) == ['main']; assert ref(hub, 'refs/remotes/origin/integration') == origin's head; assert the event's updated has no entry for integration; with workspace_mode 'standard' and the same refs assert integration is reported reset"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "optional",
+          "condition": "an excluded-branch provider is registered and the workspace's workspace_mode is carry_patch",
+          "action": "leave every branch the provider names for the workspace out of the per-branch pass in the same way as the integration branch",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a sync fixture: an origin bare repository and a hub bare repository cloned from it, both made with git in t.TempDir(), and a repository workspace record in status ready in a real store in t.TempDir(), with workspace_mode carry_patch"
+            ],
+            "pseudocode": "in internal/workspace/sync_test.go, extending TestSync_SkipsCarryPatchBranches: register a provider returning ['patch/a', 'patch/b'] for the slug; origin is ahead on patch/a, has a new branch patch/b and is ahead on feat; r = Sync(ws); assert ref(hub, 'refs/heads/patch/a') is unchanged and refs/heads/patch/b does not exist; assert names(r.branches) == ['feat', 'main']; assert the provider was called once with the slug"
+          }
+        },
+        {
+          "id": "REQ-8.3",
+          "pattern": "unwanted",
+          "condition": "the excluded-branch provider returns an error",
+          "action": "stop the sync before the per-branch pass, moving no branch, writing no sync field and emitting no event",
+          "contract": "HTTP 500 with error_type internal; no ref under refs/heads/ is changed; no parley.workspace.sync event",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a sync fixture: an origin bare repository and a hub bare repository cloned from it, both made with git in t.TempDir(), and a repository workspace record in status ready in a real store in t.TempDir(), with workspace_mode carry_patch and origin ahead on main"
+            ],
+            "pseudocode": "in internal/workspace/sync_test.go, TestSync_ExcludedBranchProviderFailure: the provider returns an error; r = POST .../sync; assert r.status == 500 and r.json.error_type == 'internal'; assert all refs under refs/heads of hub are unchanged; assert record.last_sync_at is unchanged; assert no event was recorded"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-9",
+      "title": "The parley workspace sync command",
+      "rationale": "Owners and scripts sync from the shell and need an exit code that says whether a branch diverged.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-9.1",
+          "pattern": "event_driven",
+          "condition": "a user runs parley workspace sync <slug>",
+          "action": "send POST /api/v1/workspaces/<slug>/sync with the slug as one percent-encoded path segment and a request timeout of 3 minutes, adding reset_to_origin=true when --reset-to-origin is given, print the answer as one JSON document on stdout and exit 0",
+          "contract": "stdout: the sync answer as one JSON document; exit 0. On a hub error: the error envelope as received on stderr, nothing on stdout, exit 1. On a wrong argument count: exit 2 and no request",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub (net/http/httptest) that records requests and answers from a script, and the command run through the root command of internal/cli with captured stdout, stderr and exit code"
+            ],
+            "pseudocode": "in internal/cli/workspace_test.go, TestWorkspaceSync_PostsAndPrints: run ['workspace', 'sync', 'my-project']; assert the stub saw one POST /api/v1/workspaces/my-project/sync with no query and no body; assert stdout parses as the stub's answer and exit == 0; run with --reset-to-origin and assert the query is reset_to_origin=true; run with slug 'a/b' and assert the raw path ends /workspaces/a%2Fb/sync; assert the command's HTTP client timeout is 3 minutes; run with the stub answering 502 upstream_error and assert stdout is empty, stderr is the envelope as received and exit == 1; run with no slug and with two arguments and assert exit == 2 and no request"
+          }
+        },
+        {
+          "id": "REQ-9.2",
+          "pattern": "optional",
+          "condition": "--fail-on-diverged is given",
+          "action": "after printing the answer, name the diverged branches on stderr and exit 3 when any entry of branches has result diverged or the member patches_diverged is present and not empty, and exit 0 otherwise",
+          "contract": "stdout carries the answer in every case; exit 3 with the diverged branch names on stderr when a branch or patch diverged; exit 0 otherwise",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub (net/http/httptest) that records requests and answers from a script, and the command run through the root command of internal/cli with captured stdout, stderr and exit code"
+            ],
+            "pseudocode": "in internal/cli/workspace_test.go, TestWorkspaceSync_FailOnDiverged, a table over (flag, answer): {flag, branches with exp diverged -> exit 3, stderr contains 'exp'}, {flag, no diverged entry and patches_diverged ['patch/a'] -> exit 3, stderr contains 'patch/a'}, {flag, nothing diverged and patches_diverged [] -> exit 0}, {flag, no patches_diverged member -> exit 0}, {no flag, exp diverged -> exit 0, stderr empty}: assert stdout parses as the full answer in every row"
+          }
+        },
+        {
+          "id": "REQ-9.3",
+          "pattern": "optional",
+          "condition": "--wait is given and the sync answer has a non-null rebuild_job_id",
+          "action": "poll GET /api/v1/workspaces/<slug>/rebuilds/<rebuild_job_id> every --poll-interval until the job's status is completed, dead_letter or cancelled, then print one document, the sync answer with the added member rebuild holding the final job record, and exit 0 for completed",
+          "contract": "stdout: exactly one JSON document, the sync answer plus rebuild; exit 0 when the job is completed; status failed does not end the wait; without a rebuild_job_id the command behaves as without --wait",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub (net/http/httptest) that records requests and answers from a script, and the command run through the root command of internal/cli with captured stdout, stderr and exit code"
+            ],
+            "pseudocode": "in internal/cli/workspace_test.go, TestWorkspaceSync_WaitsForRebuild: the stub answers the sync with rebuild_job_id 'j1' and the job reads with statuses [queued, running, failed, running, completed]; run with --wait --poll-interval 10ms; assert 5 GETs of /api/v1/workspaces/my-project/rebuilds/j1; assert stdout is one JSON document equal to the sync answer plus rebuild == the last job record; assert exit == 0; with rebuild_job_id null and with the member absent assert no GET, stdout == the sync answer and exit == 0; with --wait --timeout 0s assert exit == 2 and no request"
+          }
+        },
+        {
+          "id": "REQ-9.4",
+          "pattern": "unwanted",
+          "condition": "the awaited rebuild job ends in dead_letter or cancelled, or the wait passes --timeout, or a poll is answered with a hub error",
+          "action": "report the failed wait and exit 1, also when --fail-on-diverged is given and a branch diverged",
+          "contract": "exit 1 in every case, never 3; dead_letter or cancelled: the sync answer plus rebuild on stdout and error_type wait_failed on stderr; timeout: nothing on stdout and error_type wait_timeout on stderr; hub error while polling: that error envelope on stderr",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub (net/http/httptest) that records requests and answers from a script, and the command run through the root command of internal/cli with captured stdout, stderr and exit code"
+            ],
+            "pseudocode": "in internal/cli/workspace_test.go, TestWorkspaceSync_FailedWait, a table over {job ends dead_letter, job ends cancelled}: run with --wait --fail-on-diverged against an answer with a diverged branch; assert stdout is the sync answer plus rebuild; assert stderr carries error_type wait_failed; assert exit == 1. Then the job stays running with --timeout 50ms --poll-interval 10ms: assert stdout is empty, stderr carries error_type wait_timeout and exit == 1. Then the job read answers 500: assert stderr is that envelope and exit == 1"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-10",
+      "title": "An extension point for the carry-patch part of sync",
+      "rationale": "Package 36 adds an upstream fetch, the refresh of patch branches and extra answer members to the sync of a carry-patch workspace. It is built after this package, so sync calls it through an interface declared here and package 36 changes no code of this package.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-10.1",
+          "pattern": "optional",
+          "condition": "a sync extension is registered and the workspace's workspace_mode is carry_patch",
+          "action": "call the extension's first stage once after the fetch of origin has succeeded and before any tag or branch is created or moved, and its second stage once after the per-branch pass and before the completion is recorded, both on a context that is not cancelled when the caller disconnects, and call neither stage for a workspace whose workspace_mode is standard",
+          "contract": "per sync of a carry_patch workspace: one first-stage call that sees refs/remotes/origin/ updated and refs/heads/ and refs/tags/ unchanged, then one second-stage call that receives the list of per-branch results; zero calls for a standard workspace; with no extension registered the answer has no extra member",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a sync fixture: an origin bare repository and a hub bare repository cloned from it, both made with git in t.TempDir(), and a repository workspace record in status ready in a real store in t.TempDir(), with origin ahead on main and a new tag on origin",
+              "a recording sync extension registered with RegisterSyncExtension"
+            ],
+            "pseudocode": "in internal/workspace/sync_extension_test.go, TestSyncExtension_StagesRunInOrder: with workspace_mode carry_patch, r = POST .../sync; assert r.status == 200; assert ext.calls == ['first', 'second']; assert at the first call ref(hub, 'refs/remotes/origin/main') == origin's head and ref(hub, 'refs/heads/main') == the old head and the new tag did not exist; assert the second call received the result list with main fast_forward, the caller and reset_to_origin false; cancel the request's context during the first stage and assert both stages still ran with a live context. With workspace_mode standard: assert ext.calls == []. With no extension registered on a carry_patch workspace: assert r.status == 200 and the answer's members are those of the workspace object plus branches"
+          }
+        },
+        {
+          "id": "REQ-10.2",
+          "pattern": "unwanted",
+          "condition": "the first stage of a sync extension returns an error",
+          "action": "end the sync as a failed fetch: move no branch, create no tag, skip the second stage, set sync_error to the scrubbed text of the error, leave last_sync_at, head_sha and origin_head_sha as they were and emit no event",
+          "contract": "HTTP 502 with error_type upstream_error and the scrubbed error text as message; sync_error equals that text; every ref under refs/heads/ and refs/tags/ is unchanged; the second stage is not called; no parley.workspace.sync event",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the fixture of the stage-order test, with a sync extension whose first stage returns the error 'upstream fetch failed: https://user:pw@up.example/x'"
+            ],
+            "pseudocode": "in internal/workspace/sync_extension_test.go, TestSyncExtension_FirstStageFailure: before = refs under refs/heads and refs/tags of hub and the record; r = POST .../sync; assert r.status == 502 and r.json.error_type == 'upstream_error'; assert r.json.message contains 'upstream fetch failed' and does not contain 'pw'; assert record.sync_error == r.json.message; assert refs == before.refs; assert record.last_sync_at == before.last_sync_at; assert ext.calls == ['first']; assert no event was recorded"
+          }
+        },
+        {
+          "id": "REQ-10.3",
+          "pattern": "event_driven",
+          "condition": "the second stage of a sync extension returns extra members for the answer, with or without a value for upstream_head_sha",
+          "action": "add each extra member to the top level of the 200 answer beside the members of the workspace object and branches, never replacing one of those, and write a returned upstream_head_sha to the workspace in the same store transaction as last_sync_at",
+          "contract": "HTTP 200 whose body holds the workspace object's members, branches and every extra member with the value the stage returned; the workspace's upstream_head_sha equals the returned value, or is unchanged when none was returned",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the fixture of the stage-order test, with a sync extension whose second stage returns the members {origin_fetched: true, patches_diverged: [], slug: 'other'} and the upstream_head_sha value H"
+            ],
+            "pseudocode": "in internal/workspace/sync_extension_test.go, TestSyncExtension_SecondStageAddsMembers: r = POST .../sync; assert r.status == 200; assert r.json.origin_fetched == true and r.json.patches_diverged == []; assert r.json.slug == 'my-project' and r.json.branches is the per-branch list; assert r.json.upstream_head_sha == H and the stored record's upstream_head_sha == H and last_sync_at is set; with a second stage that returns no upstream_head_sha value: assert the stored upstream_head_sha is unchanged"
+          }
+        },
+        {
+          "id": "REQ-10.4",
+          "pattern": "unwanted",
+          "condition": "the second stage of a sync extension returns an error",
+          "action": "stop the sync without recording its completion: write no last_sync_at, sync_error, head_sha, origin_head_sha or upstream_head_sha, emit no event, and keep the branch moves already made",
+          "contract": "HTTP 500 with error_type internal and the scrubbed error text as message; last_sync_at, sync_error and upstream_head_sha are unchanged; no parley.workspace.sync event; a branch the per-branch pass fast-forwarded stays at origin's head",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the fixture of the stage-order test, with a sync extension whose second stage returns the error 'refresh of patch branch p1 failed'"
+            ],
+            "pseudocode": "in internal/workspace/sync_extension_test.go, TestSyncExtension_SecondStageFailure: before = the record; r = POST .../sync; assert r.status == 500 and r.json.error_type == 'internal' and r.json.message contains 'p1'; assert record.last_sync_at == before.last_sync_at and record.sync_error == before.sync_error and record.upstream_head_sha == before.upstream_head_sha; assert ref(hub, 'refs/heads/main') == origin's head; assert no event was recorded"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "A developer syncs a workspace from the shell and is told which branch diverged",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "runs parley workspace sync my-project after origin gained a commit on release/1.x, a new branch exp and a new tag, while main in the hub has a commit origin lacks"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends POST /api/v1/workspaces/my-project/sync with the developer's API key and a 3-minute timeout"
+        },
+        {
+          "actor": "parleyd",
+          "action": "authenticates the caller, finds write access, a ready repository workspace and sync_enabled true, and fetches origin with the workspace's origin credential"
+        },
+        {
+          "actor": "origin",
+          "action": "serves its branches and tags to the fetch"
+        },
+        {
+          "actor": "parleyd",
+          "action": "fast-forwards release/1.x, creates exp and the tag by compare-and-swap, leaves main untouched, records the sync fields and emits parley.workspace.sync"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers 200 with the workspace object and branches: exp created, main ahead, release/1.x fast_forward"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints the answer on stdout and exits 0"
+        },
+        {
+          "actor": "developer",
+          "action": "after exp has moved on both sides, runs parley workspace sync my-project --fail-on-diverged"
+        },
+        {
+          "actor": "parleyd",
+          "action": "leaves exp untouched and answers 200 with exp diverged"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints the answer, names exp on stderr and exits 3"
+        },
+        {
+          "actor": "developer",
+          "action": "runs parley workspace sync my-project --reset-to-origin and reads exp reported as reset"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the parley CLI command tree of internal/cli with its real HTTP client",
+          "a hub started in-process on 127.0.0.1:0 with its real router, authentication and access middleware",
+          "the sync operation of internal/workspace",
+          "internal/gitrepo running the git binary",
+          "the SQLite store of internal/store",
+          "the event log of internal/event",
+          "an origin git repository served over HTTPS to the hub"
+        ],
+        "setup": [
+          "a hub started in-process as the end-to-end tests of package 01 start it, against a data directory in t.TempDir()",
+          "an origin repository with branches main and release/1.x and tag v1, served by the test origin server that the clone end-to-end test of package 10 uses, with a required token",
+          "the workspace my-project created through POST /workspaces with that token and waited for until ready",
+          "a commit added to main in the hub's copy only, as a landing would leave it; then on origin a commit on release/1.x, a branch exp and a tag v2"
+        ],
+        "end_state": [
+          "after the first run the hub's release/1.x and exp equal origin's heads, tag v2 exists in the hub and main still has the hub-only commit",
+          "GET /workspaces/my-project shows last_sync_at set, sync_error null and head_sha equal to the hub's head of main",
+          "the event log holds one parley.workspace.sync event for the first run whose created is ['exp'], fast_forward is ['release/1.x'] and ahead is ['main']",
+          "the second run exits 3 with exp in stderr and the hub's exp unchanged",
+          "after the third run the hub's exp equals origin's head and the answer reports exp as reset"
+        ],
+        "pseudocode": "in test/e2e/workspace_sync_test.go, TestWorkspaceSync_FromTheShell: out, code = parley('workspace', 'sync', 'my-project'); assert code == 0; assert results(out.branches) == {exp: created, main: ahead, 'release/1.x': fast_forward}; assert git ls-remote of the hub's git URL (or the repository on disk) shows the heads above and refs/tags/v2; assert events(type parley.workspace.sync) has one entry with those lists; move exp on origin and in the hub; out, code, err = parley('workspace', 'sync', 'my-project', '--fail-on-diverged'); assert code == 3 and 'exp' in err; out, code = parley('workspace', 'sync', 'my-project', '--reset-to-origin'); assert code == 0 and result(out, 'exp') == 'reset' and hub exp == origin exp"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "An agent's sync fails while origin is unreachable and succeeds when it is back",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "sends POST /api/v1/workspaces/my-project/sync with a PAT that has workspaces:write while origin is unreachable"
+        },
+        {
+          "actor": "parleyd",
+          "action": "passes the checks, fails to fetch origin, moves nothing and stores the scrubbed failure text in sync_error"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers 502 with error_type upstream_error and emits no event"
+        },
+        {
+          "actor": "origin",
+          "action": "becomes reachable again with one new commit on main"
+        },
+        {
+          "actor": "agent",
+          "action": "sends the same request again"
+        },
+        {
+          "actor": "parleyd",
+          "action": "fetches origin, fast-forwards main, sets last_sync_at, clears sync_error, emits parley.workspace.sync and answers 200"
+        },
+        {
+          "actor": "agent",
+          "action": "reads GET /workspaces/my-project and sees sync_error null and head_sha equal to origin_head_sha"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "a hub started in-process on 127.0.0.1:0 with its real router, authentication and access middleware",
+          "the sync operation of internal/workspace",
+          "internal/gitrepo running the git binary",
+          "the secrets of the workspace and the origin credential resolver",
+          "the SQLite store of internal/store",
+          "the event log of internal/event",
+          "an origin git repository served over HTTPS to the hub"
+        ],
+        "setup": [
+          "a hub started in-process against a data directory in t.TempDir()",
+          "the workspace my-project, ready, cloned from the test origin server with a required token",
+          "a PAT of the workspace's owner with the scope workspaces:write",
+          "the test origin server stopped before the first request and started again, with a new commit on main, before the second"
+        ],
+        "end_state": [
+          "the first answer is 502 upstream_error; the workspace then shows a non-empty sync_error that does not contain the origin token, and last_sync_at unchanged",
+          "no parley.workspace.sync event exists after the first request",
+          "the second answer is 200 with main reported fast_forward",
+          "the workspace then shows sync_error null, last_sync_at set, and head_sha and origin_head_sha both equal to origin's new head of main",
+          "exactly one parley.workspace.sync event exists"
+        ],
+        "pseudocode": "in test/e2e/workspace_sync_test.go, TestWorkspaceSync_OriginDownThenUp: origin.stop(); r = post('/workspaces/my-project/sync', pat); assert r.status == 502 and r.json.error_type == 'upstream_error'; ws = get('/workspaces/my-project'); assert ws.sync_error != null and token not in ws.sync_error; assert count(events, 'parley.workspace.sync') == 0; origin.commit('main'); origin.start(); r = post(same); assert r.status == 200 and result(r, 'main') == 'fast_forward'; ws = get(...); assert ws.sync_error == null and ws.head_sha == ws.origin_head_sha == origin.head('main'); assert count(events, 'parley.workspace.sync') == 1"
+      }
+    }
+  ],
+  "external_apis": [
+    {
+      "package": "github.com/spf13/cobra",
+      "version": "v1",
+      "verified": false,
+      "symbols": [
+        {
+          "name": "Command",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "type Command struct { Use string; Short string; Args PositionalArgs; RunE func(cmd *Command, args []string) error; ... }"
+        },
+        {
+          "name": "ExactArgs",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func ExactArgs(n int) PositionalArgs"
+        },
+        {
+          "name": "Command.Flags",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) Flags() *pflag.FlagSet"
+        }
+      ]
+    }
+  ]
+}

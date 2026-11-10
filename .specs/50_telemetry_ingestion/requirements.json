@@ -1,0 +1,806 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "50",
+  "spec_name": "telemetry_ingestion",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Access and preconditions of the ingestion routes",
+      "rationale": "Telemetry is written by agents with narrow credentials; a route that stored records for a stranger, or told a stranger which workspaces exist, would break the hub's access promise.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "ubiquitous",
+          "action": "for any request to one of the eight ingestion routes (POST /api/v1/workspaces/{slug}/runs/{run_id}/events, /events/batch, /sessions/outcomes, /tools/calls, /tools/errors, /traces, /traces/batch, /postmortem), require the scope audit:write from a PAT caller and the access need write on the workspace named by the slug, and store the record for the admin token, the workspace's owner with an API key and the owner with a PAT that holds audit:write",
+          "contract": "HTTP 201 for a valid single record and HTTP 200 for a valid batch from each of the three callers",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a workspace demo in status ready in an organization with an owner and one other member, served through the real router, scope check and access component, with an analytical store on SQLite in t.TempDir()",
+              "one valid body per route and the run id 20260102_030405_a1b2c3"
+            ],
+            "pseudocode": "in internal/telemetry/access_test.go, a table over the eight routes and the callers {admin token, owner API key, owner PAT with audit:write}: r = post(route, validBody(route), caller); assert r.status == 201 for the six single routes and 200 for the two batch routes"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "unwanted",
+          "condition": "a PAT that does not hold audit:write calls an ingestion route",
+          "action": "refuse the request and store nothing, with the same answer for an existing workspace and for a slug that names none",
+          "contract": "HTTP 403 with error_type insufficient_scope; the record tables are unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the workspace demo and the routes of the caller table"
+            ],
+            "pseudocode": "in internal/telemetry/access_test.go, a table over the eight routes and the PATs {only audit:read, only sessions:write} on the slugs {demo, no-such-workspace}: r = post(route, validBody(route), pat); assert r.status == 403; assert r.json.error.error_type == 'insufficient_scope'; assert countAllRecords() == 0"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "unwanted",
+          "condition": "an ingestion route names a workspace that does not exist, or one on which the caller has no access level",
+          "action": "refuse the request for every caller, the admin token included, with one answer that is byte-identical in both cases, and store nothing",
+          "contract": "HTTP 404 with error_type not_found and message 'workspace not found'",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the workspace demo, a user outside its organization, and the admin token"
+            ],
+            "pseudocode": "in internal/telemetry/access_test.go, a table over the eight routes: a = post(route on 'no-such-workspace', body, adminToken); b = post(route on 'no-such-workspace', body, outsider); c = post(route on 'demo', body, outsider); assert each status == 404 and error_type == 'not_found' and message == 'workspace not found'; assert b.body == c.body; assert countAllRecords() == 0"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "unwanted",
+          "condition": "a member of the workspace's organization who is not its owner calls an ingestion route",
+          "action": "refuse the request and store nothing, also when the workspace is archived",
+          "contract": "HTTP 403 with error_type forbidden",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the workspace demo and an archived workspace old in the same organization; the member holds an API key"
+            ],
+            "pseudocode": "in internal/telemetry/access_test.go, a table over the eight routes and the slugs {demo, old}: r = post(route, validBody(route), member); assert r.status == 403; assert r.json.error.error_type == 'forbidden'; assert countAllRecords() == 0"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "unwanted",
+          "condition": "the run_id in the path does not consist of eight digits, an underscore, six digits, an underscore and six lower-case hexadecimal digits, or a run_id member in the body of a single-record route differs from the one in the path",
+          "action": "refuse the request and store nothing",
+          "contract": "HTTP 400 with error_type invalid_request and a message that contains 'run_id'",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the workspace demo and its owner"
+            ],
+            "pseudocode": "in internal/telemetry/access_test.go, a table over the eight routes and the path run ids {'run1', '20260102_030405_A1B2C3', '20260102_030405_a1b2c', '2026010_030405_a1b2c3', '20260102-030405-a1b2c3', '20260102_030405_a1b2c3x'}: assert status == 400, error_type == 'invalid_request', message contains 'run_id'; then for the six single routes with the path 20260102_030405_a1b2c3 and the body member run_id '20260102_030405_ffffff': the same assertions; and with the body member equal to the path: status == 201; assert nothing was stored by a refused request"
+          }
+        },
+        {
+          "id": "REQ-1.6",
+          "pattern": "unwanted",
+          "condition": "a caller with write access calls an ingestion route on an archived workspace with a valid request",
+          "action": "refuse the request and store nothing",
+          "contract": "HTTP 409 with error_type workspace_archived",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the archived workspace old; its owner and the admin token"
+            ],
+            "pseudocode": "in internal/telemetry/access_test.go, a table over the eight routes and the callers {owner, admin token}: r = post(route on old, validBody(route), caller); assert r.status == 409; assert r.json.error.error_type == 'workspace_archived'; assert countAllRecords() == 0"
+          }
+        },
+        {
+          "id": "REQ-1.7",
+          "pattern": "state_driven",
+          "condition": "the workspace is in status pending, cloning, ready or failed, or is a task fork in one of those statuses",
+          "action": "accept ingestion from a caller with write access and store the record under the slug of the path",
+          "contract": "HTTP 201 with workspace equal to the slug of the path",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "four workspaces of one owner, one in each of the statuses pending, cloning, ready and failed, and a task fork demo--task1 of demo owned by the same user"
+            ],
+            "pseudocode": "in internal/telemetry/access_test.go, a table over the five slugs: r = post('/events', {event_type: 'run.start'}, owner); assert r.status == 201; assert r.json.workspace == slug"
+          }
+        },
+        {
+          "id": "REQ-1.8",
+          "pattern": "ubiquitous",
+          "action": "for any request that fails more than one check, answer with the first failure in the order scope, workspace access, request validation, archived workspace",
+          "contract": "a PAT without audit:write on an unknown slug gets 403 insufficient_scope; an outsider with a malformed run_id gets 404 not_found; an owner sending an invalid body to an archived workspace gets 400 invalid_request",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the workspaces demo and old with the callers of the tables above"
+            ],
+            "pseudocode": "in internal/telemetry/access_test.go, a table of three requests to POST /events: {PAT with only audit:read, slug no-such-workspace, run id 'bad' -> 403 insufficient_scope}, {outsider, slug demo, run id 'bad' -> 404 not_found}, {owner, slug old, body {} -> 400 invalid_request}: assert status and error_type as listed"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Run event ingestion",
+      "rationale": "The run event is the record an auditor reads first; its defaults and its normalised form decide whether a run can be ordered and filtered later.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "an authorised caller posts a valid run event to POST /api/v1/workspaces/{slug}/runs/{run_id}/events with an id that names no stored run event",
+          "action": "store the run event in the analytical store and return the stored record with every member present, an optional member that was not sent being null",
+          "contract": "HTTP 201 with body {id, workspace, run_id, timestamp, ingested_at, event_type, severity, node_id, session_id, payload}; workspace and run_id are those of the path; ingested_at is the hub's time in RFC 3339 UTC with whole seconds; payload is a JSON object or null, never a string holding JSON",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the workspace demo and its owner; a fixed clock at 2026-01-02T03:04:05Z; an analytical store on SQLite in t.TempDir()"
+            ],
+            "pseudocode": "in internal/telemetry/events_test.go: r = post('/events', {id: u1, event_type: 'run.start', severity: 'warning', node_id: 'n1', session_id: s1, timestamp: '2026-01-02T03:00:00Z', payload: {a: {b: 1}}}); assert r.status == 201; assert r.json equals the sent members plus workspace 'demo', run_id of the path, ingested_at '2026-01-02T03:04:05Z'; assert r.json.payload.a.b == 1; r2 = post('/events', {event_type: 'run.start'}); assert r2.status == 201; assert r2.json.node_id == null and session_id == null and payload == null; assert the store holds two run events of the run"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "event_driven",
+          "condition": "a run event is posted without an id or without a timestamp",
+          "action": "generate a version 4 UUID as the id, and use the hub's time at ingestion as the timestamp",
+          "contract": "the returned id matches the lower-case 8-4-4-4-12 hexadecimal form with version digit 4 and differs between two requests; the returned timestamp equals ingested_at",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a fixed clock at 2026-01-02T03:04:05Z"
+            ],
+            "pseudocode": "in internal/telemetry/events_test.go: a = post('/events', {event_type: 'x'}).json; b = post('/events', {event_type: 'x'}).json; assert a.id matches ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$; assert a.id != b.id; assert a.timestamp == '2026-01-02T03:04:05Z' == a.ingested_at"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "event_driven",
+          "condition": "a run event is posted without a severity",
+          "action": "set the severity from the event type: error for session.fail; warning for run.limit_reached, git.conflict, harvest.empty and review.parse_failure; info for every other type; and keep a severity that was sent",
+          "contract": "the returned severity is the one the table gives",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/telemetry/events_test.go, a table {session.fail -> error, run.limit_reached -> warning, git.conflict -> warning, harvest.empty -> warning, review.parse_failure -> warning, run.start -> info, session.failed -> info, sandbox.exec -> info}: assert post('/events', {event_type: t}).json.severity == want; and assert post('/events', {event_type: 'session.fail', severity: 'critical'}).json.severity == 'critical'"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "ubiquitous",
+          "action": "for any client-supplied identifier or timestamp of a telemetry record, accept a UUID in any letter case and return it in lower case, and accept an RFC 3339 timestamp with any offset and return it in UTC with a Z suffix, with fractional seconds cut to microseconds and without trailing zeros",
+          "contract": "id 'AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE' is returned as 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'; timestamp '2026-01-02T05:04:05.1234567+02:00' is returned as '2026-01-02T03:04:05.123456Z'; '2026-01-02T03:04:05.500Z' as '2026-01-02T03:04:05.5Z'; '2026-01-02T03:04:05Z' unchanged",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/telemetry/validate_test.go, a table over the normalising functions for a UUID {upper case, mixed case, lower case -> lower case} and a timestamp {the three cases of the contract, '2026-01-01T22:04:05-05:00' -> '2026-01-02T03:04:05Z'}; and in internal/telemetry/events_test.go: r = post('/events', {id: upper, session_id: upper2, event_type: 'x', timestamp: '2026-01-02T05:04:05.1234567+02:00'}); assert r.json.id == lower(upper); assert r.json.session_id == lower(upper2); assert r.json.timestamp == '2026-01-02T03:04:05.123456Z'"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "unwanted",
+          "condition": "a run event body violates a rule of its members",
+          "action": "refuse the request, name the offending member in the message and store nothing",
+          "contract": "HTTP 400 with error_type invalid_request and a message that contains the member's name; the run event table is unchanged",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/telemetry/events_test.go, a table of bodies and the member each message must contain: {{} -> event_type, {event_type: ''} -> event_type, {event_type: 7} -> event_type, {event_type: 'x', severity: 'fatal'} -> severity, {event_type: 'x', id: 'not-a-uuid'} -> id, {event_type: 'x', id: '0123456789abcdef0123456789abcdef'} -> id, {event_type: 'x', session_id: 'abc'} -> session_id, {event_type: 'x', timestamp: '2026-01-02 03:04:05'} -> timestamp, {event_type: 'x', timestamp: 1767323045} -> timestamp, {event_type: 'x', node_id: 256 characters} -> node_id, {event_type: 'x', payload: [1]} -> payload, {event_type: 'x', payload: 'text'} -> payload}: r = post('/events', body); assert r.status == 400; assert r.json.error.error_type == 'invalid_request'; assert r.json.error.message contains member; assert countRunEvents() == 0; and a body that is a JSON array or the text 'null' -> 400 invalid_request"
+          }
+        },
+        {
+          "id": "REQ-2.6",
+          "pattern": "ubiquitous",
+          "action": "for any record body, treat a member whose value is JSON null as absent, ignore members the record kind does not define, and accept a node_id of exactly 255 characters",
+          "contract": "HTTP 201; a null optional member is returned as null or as its default; a null required member is answered like a missing one with HTTP 400 invalid_request",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/telemetry/events_test.go: r = post('/events', {event_type: 'session.fail', id: null, severity: null, timestamp: null, node_id: null, payload: null, colour: 'blue'}); assert r.status == 201; assert r.json.id is a generated UUID; assert r.json.severity == 'error'; assert r.json.payload == null; assert 'colour' not in r.json; assert post('/events', {event_type: null}).status == 400; assert post('/events', {event_type: 'x', node_id: 255 characters}).status == 201"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Session outcomes, tool calls, tool errors and traces",
+      "rationale": "These four kinds carry what a run did step by step; each has its own required members and the trace has a closed set of types that the transcript is rebuilt from.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "an authorised caller posts a valid session outcome with a new id to POST /api/v1/workspaces/{slug}/runs/{run_id}/sessions/outcomes",
+          "action": "store the session outcome and return the stored record, without checking that session_id names a stored session",
+          "contract": "HTTP 201 with body {id, workspace, run_id, timestamp, ingested_at, session_id, status, node_id, duration_ms, token_usage}; token_usage is returned as the JSON value that was sent (object, array, number, string or boolean) or null",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the workspace demo and its owner; no session exists"
+            ],
+            "pseudocode": "in internal/telemetry/records_test.go: r = post('/sessions/outcomes', {session_id: s1, status: 'completed', node_id: 'n1', duration_ms: 0, token_usage: {input: 10, by_model: [1, 2]}}); assert r.status == 201; assert r.json.status == 'completed' and duration_ms == 0 and token_usage.by_model[1] == 2; r2 = post('/sessions/outcomes', {session_id: s1, status: 'anything-goes'}); assert r2.status == 201 and r2.json.duration_ms == null and r2.json.token_usage == null"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "event_driven",
+          "condition": "an authorised caller posts a valid tool call with a new id to POST /api/v1/workspaces/{slug}/runs/{run_id}/tools/calls",
+          "action": "store the tool call and return the stored record",
+          "contract": "HTTP 201 with body {id, workspace, run_id, timestamp, ingested_at, tool_name, node_id, session_id, duration_ms, input, output}; input and output are returned as the JSON values that were sent, or null",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the workspace demo and its owner"
+            ],
+            "pseudocode": "in internal/telemetry/records_test.go: r = post('/tools/calls', {tool_name: 'bash', duration_ms: 12, input: {cmd: ['ls', '-l']}, output: 'text'}); assert r.status == 201; assert r.json.input.cmd[1] == '-l'; assert r.json.output == 'text'; assert r.json.session_id == null; assert post('/tools/calls', {tool_name: 255 characters}).status == 201"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "event_driven",
+          "condition": "an authorised caller posts a valid tool error with a new id to POST /api/v1/workspaces/{slug}/runs/{run_id}/tools/errors",
+          "action": "store the tool error and return the stored record",
+          "contract": "HTTP 201 with body {id, workspace, run_id, timestamp, ingested_at, tool_name, error_msg, error_code, node_id, session_id}",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the workspace demo and its owner"
+            ],
+            "pseudocode": "in internal/telemetry/records_test.go: r = post('/tools/errors', {tool_name: 'bash', error_msg: 'exit 1', error_code: 'E_EXIT'}); assert r.status == 201; assert r.json.error_msg == 'exit 1' and error_code == 'E_EXIT'; assert post('/tools/errors', {tool_name: 'bash', error_msg: 'x'}).json.error_code == null"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "event_driven",
+          "condition": "an authorised caller posts a valid trace record with a new id to POST /api/v1/workspaces/{slug}/runs/{run_id}/traces",
+          "action": "store the trace record and return the stored record",
+          "contract": "HTTP 201 with body {id, workspace, run_id, timestamp, ingested_at, event_type, node_id, session_id, sequence, data}; event_type is one of session.init, assistant.message, tool.use, tool.error, session.result; data is returned as the JSON value that was sent, or null",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the workspace demo and its owner"
+            ],
+            "pseudocode": "in internal/telemetry/records_test.go, a table over the five trace event types: r = post('/traces', {event_type: t, node_id: 'n1', sequence: 0, data: {content: 'hello', tool_name: 'bash'}}); assert r.status == 201; assert r.json.event_type == t and sequence == 0 and data.content == 'hello'; and assert post('/traces', {event_type: 'tool.use'}).json.sequence == null"
+          }
+        },
+        {
+          "id": "REQ-3.5",
+          "pattern": "unwanted",
+          "condition": "the body of a session outcome, tool call, tool error or trace violates a rule of its members",
+          "action": "refuse the request, name the offending member in the message and store nothing",
+          "contract": "HTTP 400 with error_type invalid_request and a message that contains the member's name; the table of the kind is unchanged",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/telemetry/records_test.go, a table of route, body and the member the message must contain: outcomes {{status: 'ok'} -> session_id, {session_id: s1} -> status, {session_id: 'abc', status: 'ok'} -> session_id, {session_id: s1, status: ''} -> status, {session_id: s1, status: 'ok', duration_ms: -1} -> duration_ms, {session_id: s1, status: 'ok', duration_ms: 1.5} -> duration_ms, {session_id: s1, status: 'ok', duration_ms: '3'} -> duration_ms}; tool calls {{} -> tool_name, {tool_name: 256 characters} -> tool_name, {tool_name: 'bash', duration_ms: -5} -> duration_ms, {tool_name: 'bash', session_id: 'zz'} -> session_id}; tool errors {{tool_name: 'bash'} -> error_msg, {error_msg: 'x'} -> tool_name, {tool_name: 'bash', error_msg: ''} -> error_msg, {tool_name: 'bash', error_msg: 'x', error_code: 5} -> error_code}; traces {{} -> event_type, {event_type: 'user.message'} -> event_type, {event_type: 'tool.use', sequence: -1} -> sequence, {event_type: 'tool.use', sequence: 2.5} -> sequence, {event_type: 'tool.use', timestamp: 'yesterday'} -> timestamp, {event_type: 'tool.use', id: 'x'} -> id}: r = post(route, body); assert r.status == 400; assert r.json.error.error_type == 'invalid_request'; assert r.json.error.message contains member; assert the kind's table is empty"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Idempotent records",
+      "rationale": "Agents retry over unreliable links; a retry must neither duplicate a record nor silently attach an id to a second run.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "a valid single-record request carries an id that already names a record of the same kind in the same workspace and run",
+          "action": "answer with the stored record and change nothing, also when the members of the replayed body differ from the stored ones",
+          "contract": "HTTP 200 with a body equal to the body of the original 201; the stored record and the number of records are unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the workspace demo and its owner; a clock that advances between requests"
+            ],
+            "pseudocode": "in internal/telemetry/idempotency_test.go, a table over the five single-record kinds (run event, session outcome, tool call, tool error, trace): first = post(route, bodyWith(id: u1)); assert first.status == 201; again = post(route, the same body); assert again.status == 200 and again.json == first.json; changed = post(route, bodyWith(id: u1, other member values, another timestamp)); assert changed.status == 200 and changed.json == first.json; assert count(kind) == 1"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "unwanted",
+          "condition": "a valid single-record request carries an id that names a record of the same kind in another workspace or in another run of the same workspace",
+          "action": "refuse the request and leave the stored record unchanged",
+          "contract": "HTTP 409 with error_type conflict",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "two workspaces demo and other of one owner; run ids 20260102_030405_a1b2c3 and 20260102_030405_ffffff"
+            ],
+            "pseudocode": "in internal/telemetry/idempotency_test.go, a table over the five single-record kinds: post(route on demo run A, bodyWith(id: u1)) -> 201; r = post(route on demo run B, bodyWith(id: u1)); assert r.status == 409 and r.json.error.error_type == 'conflict'; r = post(route on other run A, bodyWith(id: u1)); assert r.status == 409 and error_type == 'conflict'; assert count(kind) == 1 and the stored record still has workspace demo and run A"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "ubiquitous",
+          "action": "for any id, compare it with stored ids without regard to letter case, and keep the ids of different record kinds apart, so that one UUID may name a run event and a tool call",
+          "contract": "a replay that spells the id in upper case answers HTTP 200 with the stored record; the same UUID posted as a run event and then as a tool call answers HTTP 201 twice",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the workspace demo and its owner"
+            ],
+            "pseudocode": "in internal/telemetry/idempotency_test.go: a = post('/events', {id: lower, event_type: 'x'}); assert a.status == 201; b = post('/events', {id: upper(lower), event_type: 'x'}); assert b.status == 200 and b.json.id == lower; c = post('/tools/calls', {id: lower, tool_name: 'bash'}); assert c.status == 201; assert countRunEvents() == 1 and countToolCalls() == 1"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "event_driven",
+          "condition": "several requests with the same new id for the same kind, workspace and run arrive at the same time",
+          "action": "store the record exactly once and answer every request with that record",
+          "contract": "exactly one HTTP 201 and HTTP 200 for every other request, all with the same body",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the workspace demo and its owner; a real analytical store on SQLite"
+            ],
+            "pseudocode": "in internal/telemetry/idempotency_test.go: start 8 goroutines that each post('/events', {id: u1, event_type: 'x', node_id: 'n' + i}); collect the answers; assert the count of status 201 == 1 and of status 200 == 7; assert every body equals the body of the 201; assert countRunEvents() == 1"
+          }
+        },
+        {
+          "id": "REQ-4.5",
+          "pattern": "unwanted",
+          "condition": "a request with the id of a stored record carries a body that violates a rule of its members",
+          "action": "refuse the request like any invalid body, before looking the id up",
+          "contract": "HTTP 400 with error_type invalid_request; the stored record is unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stored run event with id u1 in the workspace demo"
+            ],
+            "pseudocode": "in internal/telemetry/idempotency_test.go: r = post('/events', {id: u1, event_type: 'x', severity: 'fatal'}); assert r.status == 400 and r.json.error.error_type == 'invalid_request'; assert the stored run event u1 equals what was stored"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Postmortem of a run",
+      "rationale": "A run that stopped at a limit explains itself once; the first explanation is the record and later ones must not overwrite it.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "an authorised caller posts a valid postmortem to POST /api/v1/workspaces/{slug}/runs/{run_id}/postmortem and the run has none in this workspace",
+          "action": "store the postmortem and return the stored record, with schema_version 1 and with blocked_tasks and session_history as [] when they were not sent, the id generated by the hub and timestamp and ingested_at set to the hub's time",
+          "contract": "HTTP 201 with body {id, workspace, run_id, timestamp, ingested_at, schema_version, run_status, started_at, completed_at, task_summary, cost_summary, blocked_tasks, session_history}; started_at and completed_at are normalised to UTC; task_summary and cost_summary are JSON objects and blocked_tasks and session_history JSON arrays",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the workspace demo and its owner; a fixed clock at 2026-01-02T03:04:05Z"
+            ],
+            "pseudocode": "in internal/telemetry/postmortem_test.go, a table over the four run_status values {stalled, block_limit, cost_limit, session_limit}, each on its own run id: r = post('/postmortem', {run_status: s, started_at: '2026-01-02T03:00:00+01:00', completed_at: '2026-01-02T02:30:00Z', task_summary: {total: 4, done: 3}, cost_summary: {}}); assert r.status == 201; assert r.json.schema_version == 1; assert r.json.started_at == '2026-01-02T02:00:00Z'; assert r.json.blocked_tasks == [] and session_history == []; assert r.json.task_summary.done == 3; assert r.json.timestamp == r.json.ingested_at == '2026-01-02T03:04:05Z'; assert r.json.id is a lower-case UUID; and with schema_version: 1, blocked_tasks: [{id: 't1'}], session_history: [1], id: 'ignored', on a further run: status 201, blocked_tasks[0].id == 't1', id is a generated UUID"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "event_driven",
+          "condition": "a valid postmortem is posted for a run that already has one in this workspace",
+          "action": "answer with the stored postmortem and change nothing, whatever the new body holds",
+          "contract": "HTTP 200 with a body equal to the body of the original 201; one postmortem is stored for the workspace and run",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a stored postmortem of run A in demo with run_status stalled"
+            ],
+            "pseudocode": "in internal/telemetry/postmortem_test.go: r = post('/postmortem' on run A, a valid body with run_status 'cost_limit' and another task_summary); assert r.status == 200; assert r.json == the body of the first 201; assert r.json.run_status == 'stalled'; assert countPostmortems(demo, A) == 1"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "ubiquitous",
+          "action": "for any run id, keep one postmortem per workspace, so that the same run id in two workspaces has two independent postmortems",
+          "contract": "HTTP 201 for the first postmortem of the run id in each workspace, with different ids",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "two workspaces demo and other of one owner"
+            ],
+            "pseudocode": "in internal/telemetry/postmortem_test.go: a = post('/postmortem' on demo run A, valid); b = post('/postmortem' on other run A, valid); assert a.status == 201 and b.status == 201; assert a.json.id != b.json.id; assert b.json.workspace == 'other'"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "unwanted",
+          "condition": "a postmortem body carries a schema_version other than 1",
+          "action": "refuse the request and store nothing",
+          "contract": "HTTP 400 with error_type unknown_schema_version",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/telemetry/postmortem_test.go, a table over schema_version {0, 2, '1', 1.5} in an otherwise valid body: r = post('/postmortem', body); assert r.status == 400; assert r.json.error.error_type == 'unknown_schema_version'; assert countPostmortems() == 0; and schema_version null -> 201 with schema_version 1"
+          }
+        },
+        {
+          "id": "REQ-5.5",
+          "pattern": "unwanted",
+          "condition": "a postmortem body violates another rule of its members",
+          "action": "refuse the request, name the offending member in the message and store nothing, also when the run already has a postmortem",
+          "contract": "HTTP 400 with error_type invalid_request and a message that contains the member's name",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/telemetry/postmortem_test.go, a table that takes a valid body and changes one member, with the member the message must contain: {run_status removed -> run_status, run_status 'crashed' -> run_status, started_at removed -> started_at, completed_at removed -> completed_at, completed_at 'now' -> completed_at, task_summary removed -> task_summary, task_summary [] -> task_summary, task_summary {} -> task_summary, task_summary {total: null} -> task_summary, cost_summary removed -> cost_summary, cost_summary 'free' -> cost_summary, blocked_tasks {} -> blocked_tasks, session_history 'none' -> session_history}: assert status == 400, error_type == 'invalid_request', message contains member, countPostmortems() == 0; then store a valid postmortem and post the body without run_status again: assert status == 400"
+          }
+        },
+        {
+          "id": "REQ-5.6",
+          "pattern": "event_driven",
+          "condition": "several valid postmortems for the same workspace and run arrive at the same time",
+          "action": "store exactly one of them and answer every request with it",
+          "contract": "exactly one HTTP 201 and HTTP 200 for every other request, all with the same body",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the workspace demo and its owner; a real analytical store on SQLite"
+            ],
+            "pseudocode": "in internal/telemetry/postmortem_test.go: start 8 goroutines that each post('/postmortem' on run A, a valid body with its own cost_summary); assert the count of status 201 == 1 and of status 200 == 7; assert every body equals the body of the 201; assert countPostmortems(demo, A) == 1"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Batch ingestion of run events and traces",
+      "rationale": "An agent that buffers telemetry sends it in bulk; one bad item must not cost it the batch, and a retry of the whole batch must be safe.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "an authorised caller posts a JSON array of 1 to 1000 valid items with new ids to POST /api/v1/workspaces/{slug}/runs/{run_id}/events/batch or /traces/batch",
+          "action": "store every item as a record of the run, with the defaults and normalisation of a single record, and report the count",
+          "contract": "HTTP 200 with body {accepted: <number of items>, duplicates: 0, errors: []}; errors is an empty array, not null",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the workspace demo and its owner; a real analytical store on SQLite"
+            ],
+            "pseudocode": "in internal/telemetry/batch_test.go, a table over the two batch routes and the sizes {1, 3, 1000}: r = post(route, n valid items, some without id, one run event of type session.fail without severity); assert r.status == 200; assert r.json == {accepted: n, duplicates: 0, errors: []}; assert count(kind, demo, run) == n; assert the session.fail event is stored with severity 'error' and an item without id with a generated UUID"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "event_driven",
+          "condition": "a batch holds items that are invalid beside valid ones",
+          "action": "skip each invalid item, report it in errors with its zero-based index, its id (lower-cased when the item carries a valid UUID, else null) and a message that names the offending member, and store the valid items",
+          "contract": "HTTP 200 with accepted equal to the number of valid new items and one errors entry {index, id, message} per invalid item, in index order; an item that is not a JSON object, and an item whose run_id member differs from the path, are invalid",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the workspace demo and its owner"
+            ],
+            "pseudocode": "in internal/telemetry/batch_test.go: r = post('/events/batch', [valid, {id: U2 in upper case, severity: 'x', event_type: 'e'}, 'text', {id: 'bad', event_type: 'e'}, {event_type: 'e', run_id: '20260102_030405_ffffff'}, valid]); assert r.status == 200; assert r.json.accepted == 2 and duplicates == 0; assert r.json.errors has indexes [1, 2, 3, 4]; assert errors[0].id == lower(U2) and errors[0].message contains 'severity'; assert errors[1].id == null; assert errors[2].id == null and message contains 'id'; assert errors[3].message contains 'run_id'; assert countRunEvents() == 2; and the same shape on '/traces/batch' with a trace of event_type 'user.message' -> errors entry naming event_type"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "event_driven",
+          "condition": "a batch holds an item whose id already names a record of the same kind in this workspace and run, or repeats the id of an earlier item of the same batch",
+          "action": "count the item in duplicates, leave the stored record unchanged and store the other valid items",
+          "contract": "HTTP 200 with duplicates equal to the number of such items; a batch sent a second time answers {accepted: 0, duplicates: <number of valid items>, errors: <the same entries>}",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a stored run event u1 in demo run A with node_id 'first'"
+            ],
+            "pseudocode": "in internal/telemetry/batch_test.go: batch = [{id: u1, event_type: 'e', node_id: 'second'}, {id: u2, event_type: 'e', node_id: 'a'}, {id: u2, event_type: 'e', node_id: 'b'}, {id: u3, event_type: 'e'}]; r = post('/events/batch', batch); assert r.json == {accepted: 2, duplicates: 2, errors: []}; assert stored(u1).node_id == 'first'; assert stored(u2).node_id == 'a'; r2 = post('/events/batch', batch); assert r2.json == {accepted: 0, duplicates: 4, errors: []}; assert countRunEvents() == 3"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "unwanted",
+          "condition": "a batch holds an item whose id names a record of the same kind in another workspace or run",
+          "action": "report the item in errors, leave the stored record unchanged and store the other valid items",
+          "contract": "HTTP 200 with an errors entry carrying the item's index and id; the item is counted neither in accepted nor in duplicates",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a stored trace u1 in demo run B and a stored trace u2 in the workspace other, run A"
+            ],
+            "pseudocode": "in internal/telemetry/batch_test.go: r = post('/traces/batch' on demo run A, [{id: u1, event_type: 'tool.use'}, {id: u2, event_type: 'tool.use'}, {id: u3, event_type: 'tool.use'}]); assert r.status == 200; assert r.json.accepted == 1 and duplicates == 0; assert r.json.errors has indexes [0, 1] with ids [u1, u2]; assert stored(u1).run_id == run B"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "unwanted",
+          "condition": "the body of a batch route is not a JSON array, or is an empty array",
+          "action": "refuse the request and store nothing",
+          "contract": "HTTP 400 with error_type invalid_request",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/telemetry/batch_test.go, a table over the two batch routes and the bodies {[], {event_type: 'e'}, 'text', 7, null, text that is not JSON}: r = post(route, body); assert r.status == 400; assert r.json.error.error_type == 'invalid_request'; assert count(kind) == 0"
+          }
+        },
+        {
+          "id": "REQ-6.6",
+          "pattern": "unwanted",
+          "condition": "a batch holds more than 1000 items",
+          "action": "refuse the whole request and store nothing, whether or not its items are valid",
+          "contract": "HTTP 413 with error_type payload_too_large; a batch of exactly 1000 items is accepted with HTTP 200",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "items small enough that 1001 of them stay under the hub's request body limit"
+            ],
+            "pseudocode": "in internal/telemetry/batch_test.go, a table over the two batch routes: r = post(route, 1001 valid items); assert r.status == 413; assert r.json.error.error_type == 'payload_too_large'; assert count(kind) == 0; r = post(route, 1000 valid items); assert r.status == 200 and r.json.accepted == 1000"
+          }
+        },
+        {
+          "id": "REQ-6.7",
+          "pattern": "event_driven",
+          "condition": "every item of a batch is invalid",
+          "action": "answer with one error per item and store nothing",
+          "contract": "HTTP 200 with body {accepted: 0, duplicates: 0, errors: [one entry per item]}",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/telemetry/batch_test.go: r = post('/events/batch', [{}, {event_type: ''}, 5]); assert r.status == 200; assert r.json.accepted == 0 and duplicates == 0; assert len(r.json.errors) == 3 with indexes [0, 1, 2]; assert countRunEvents() == 0"
+          }
+        },
+        {
+          "id": "REQ-6.8",
+          "pattern": "unwanted",
+          "condition": "storing the accepted items of a batch fails after some of them were written",
+          "action": "store none of the batch's items",
+          "contract": "HTTP 500 with error_type internal; no record of the batch is in the store, and the same batch sent again after the fault is gone answers HTTP 200 with accepted equal to the number of its valid items",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a real analytical store wrapped so that the third insert of a transaction returns an error once"
+            ],
+            "pseudocode": "in internal/telemetry/batch_test.go: r = post('/events/batch', 5 valid items with ids); assert r.status == 500 and r.json.error.error_type == 'internal'; assert countRunEvents() == 0; r2 = post('/events/batch', the same items); assert r2.json == {accepted: 5, duplicates: 0, errors: []}"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "Write timeout",
+      "rationale": "An agent must never hang on its own telemetry; a slow store is answered with a clear, retryable refusal that leaves nothing half-written.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "unwanted",
+          "condition": "the write of a single record or of a batch does not finish within [audit].write_timeout",
+          "action": "abandon the write, store nothing of the request and tell the caller to retry",
+          "contract": "HTTP 503 with error_type unavailable and the header Retry-After: 5; no record of the request is in the store, for a batch none of its items",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a real analytical store wrapped so that a write blocks until its context is cancelled; [audit].write_timeout set to 100ms"
+            ],
+            "pseudocode": "in internal/telemetry/timeout_test.go, a table over the eight routes: start = now(); r = post(route, validBody(route)); assert r.status == 503; assert r.json.error.error_type == 'unavailable'; assert r.header('Retry-After') == '5'; assert now() - start < 2s; assert countAllRecords() == 0"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "event_driven",
+          "condition": "a request that was answered with the write timeout is sent again with the same ids after the store has recovered",
+          "action": "store the records as new",
+          "contract": "HTTP 201 for a single record and HTTP 200 with accepted equal to the number of valid items for a batch, with duplicates 0",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the blocking store wrapper of the timeout table, switched off after the first answer"
+            ],
+            "pseudocode": "in internal/telemetry/timeout_test.go: post('/events', {id: u1, event_type: 'e'}) -> 503; unblock the store; r = post('/events', {id: u1, event_type: 'e'}); assert r.status == 201; and for a batch of 3 items with ids: first answer 503, second answer {accepted: 3, duplicates: 0, errors: []}"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "ubiquitous",
+          "action": "read the write limit from the configuration key [audit].write_timeout, a duration with the default 2s and the smallest allowed value 100ms",
+          "contract": "without the key the limit is 2 seconds; '100ms', '500ms', '2s' and '1m' are accepted and applied",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/telemetry/config_test.go, a table over the configuration texts {no [audit] table -> 2s, write_timeout = '100ms' -> 100ms, '500ms' -> 500ms, '2s' -> 2s, '1m' -> 60s}: cfg = load the text through the configuration loader with this package's key registered; assert telemetry's write limit read from cfg == want"
+          }
+        },
+        {
+          "id": "REQ-7.4",
+          "pattern": "unwanted",
+          "condition": "[audit].write_timeout is malformed or below 100ms",
+          "action": "stop the start of the hub before it listens",
+          "contract": "the configuration load returns an error whose message contains 'audit.write_timeout'; parleyd exits with status 1",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/telemetry/config_test.go, a table over write_timeout {'99ms', '0s', '-1s', 'soon', '2', 5, ''}: err = load the configuration text with this package's key registered; assert err != nil; assert err message contains 'audit.write_timeout'"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "Record of sandbox use",
+      "rationale": "What was run inside a sandbox belongs to the audit record of the run, but command output and file content may hold secrets and must never be stored.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "the sandbox component reports to the recorder that an exec, an attach, an upload or a download has ended in a sandbox whose session exists and has a run_id",
+          "action": "store one run event of the sandbox's workspace under the session's run_id and session_id, with event_type sandbox.exec, sandbox.attach, sandbox.upload or sandbox.download, severity info, a generated id and the time the operation started as its timestamp",
+          "contract": "the stored payload holds exactly: for an exec sandbox_id, actor_type, actor_id, command (a list of strings), exit_code, timed_out, duration_ms; for an attach sandbox_id, actor_type, actor_id, duration_ms; for an upload or download sandbox_id, actor_type, actor_id, path, bytes",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a real analytical store on SQLite; a session lookup that returns run id 20260102_030405_a1b2c3 for session s1; a fixed clock at 2026-01-02T03:04:05Z"
+            ],
+            "pseudocode": "in internal/telemetry/sandbox_test.go, a table over the four operations, each reported with workspace 'demo--task1', sandbox 'sbx1', session s1, actor_type 'user', actor_id 'u1' and started at 2026-01-02T03:00:00.25Z: exec {command: ['go', 'test'], exit_code: 1, timed_out: false, duration_ms: 1500}, attach {duration_ms: 60000}, upload and download {path: '/work/a.txt', bytes: 12}: recorder.Record(op); ev = the one run event of the workspace and run; assert ev.event_type == 'sandbox.' + kind; assert ev.session_id == s1; assert ev.severity == 'info'; assert ev.timestamp == '2026-01-02T03:00:00.25Z'; assert ev.ingested_at == '2026-01-02T03:04:05Z'; assert the key set of ev.payload equals the set of the contract and its values equal the reported ones"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "event_driven",
+          "condition": "an operation is reported for a sandbox that has no session, whose session has no run_id, or whose session id names no stored session",
+          "action": "store no record and report no failure",
+          "contract": "the recorder returns; the run event table is unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a session lookup that knows s1 with a run id, s2 without one, and no s3"
+            ],
+            "pseudocode": "in internal/telemetry/sandbox_test.go, a table over the reported session {none, s2, s3} and the four operations: recorder.Record(op); assert countRunEvents() == 0; assert nothing was logged at error level"
+          }
+        },
+        {
+          "id": "REQ-8.3",
+          "pattern": "unwanted",
+          "condition": "the write of a sandbox use record fails, exceeds [audit].write_timeout, or the session lookup fails",
+          "action": "log one line that names the workspace, the sandbox and the event type, and return to the sandbox component without reporting a failure, so that the operation's own outcome is unchanged",
+          "contract": "the recorder returns no error value and does not panic; no run event is stored; one log line holds the workspace slug, the sandbox id and the event type and no member of the payload other than sandbox_id",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a recorder over a store that returns an error, over one that blocks until its context is cancelled with a limit of 100ms, and over a session lookup that returns an error; a logger that captures its lines"
+            ],
+            "pseudocode": "in internal/telemetry/sandbox_test.go, a table over the three faults: recorder.Record(exec with command ['echo', 'hunter2']); assert the call returned within 2s; assert countRunEvents() == 0; assert len(log lines) == 1; assert the line contains 'demo--task1', 'sbx1' and 'sandbox.exec'; assert the line does not contain 'hunter2'"
+          }
+        },
+        {
+          "id": "REQ-8.4",
+          "pattern": "ubiquitous",
+          "action": "for any operation reported to the recorder, accept only the members of the payload table as input, so that stdin, command output, terminal content, file content and environment values cannot reach the store, and write no hub event",
+          "contract": "the stored run events of sandbox use hold no member beyond those of the payload table, and the event log is unchanged by a recorded operation",
+          "check": {
+            "same_as": "PATH-2"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-9",
+      "title": "Notification of stored run events",
+      "rationale": "The hub counts ingested run events by type; the counter lives in another component and must see each stored run event once and no replay.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-9.1",
+          "pattern": "event_driven",
+          "condition": "a run event is newly stored by the single route, by a batch or by the sandbox recorder",
+          "action": "tell every registered run event observer once, after the record is stored, the event_type of the stored run event",
+          "contract": "each observer receives one call per newly stored run event with its event_type; a batch of n accepted run events gives n calls, each with its own type",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "two registered observers that collect the types they are told; a real analytical store"
+            ],
+            "pseudocode": "in internal/telemetry/observer_test.go: post('/events', {event_type: 'run.start'}); post('/events/batch', [{event_type: 'a'}, {event_type: 'b'}, {event_type: 'a'}]); recorder.Record(exec for a session with a run id); assert each observer's collected types, sorted, == ['a', 'a', 'b', 'run.start', 'sandbox.exec']"
+          }
+        },
+        {
+          "id": "REQ-9.2",
+          "pattern": "ubiquitous",
+          "action": "for any request that stores no new run event (a replay, a duplicate or invalid batch item, a refused request, a write that failed or timed out) and for any record of another kind, tell the observers nothing",
+          "contract": "the observers' call count is unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "one registered observer; a stored run event u1"
+            ],
+            "pseudocode": "in internal/telemetry/observer_test.go: n = observer.calls; post('/events', {id: u1, event_type: 'x'}) (replay, 200); post('/events', {}) (400); post('/events/batch', [{id: u1, event_type: 'x'}, {}]); post('/traces', {event_type: 'tool.use'}); post('/tools/calls', {tool_name: 'bash'}); post('/events', valid) against the blocking store (503); assert observer.calls == n"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "An agent pushes run telemetry and safely sends it twice",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "posts a run event with an id to POST /api/v1/workspaces/demo/runs/20260102_030405_a1b2c3/events, using a PAT that holds audit:write"
+        },
+        {
+          "actor": "parleyd",
+          "action": "checks the scope and the write access, validates the body, stores the run event in the analytical store and answers 201 with the stored record"
+        },
+        {
+          "actor": "agent",
+          "action": "posts five trace records, one of them with an unknown event_type, to …/traces/batch, and the run's postmortem to …/postmortem"
+        },
+        {
+          "actor": "parleyd",
+          "action": "stores the four valid traces together and answers 200 with accepted 4 and one error; stores the postmortem and answers 201"
+        },
+        {
+          "actor": "agent",
+          "action": "loses the answers and sends all three requests again"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers 200 with the stored run event, 200 with duplicates 4 and the same error, and 200 with the stored postmortem, storing nothing new"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parleyd HTTP server with its middleware",
+          "authentication and scope check",
+          "access component",
+          "telemetry ingestion handlers",
+          "analytical store on SQLite",
+          "transactional store on SQLite"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with an empty data directory",
+          "a workspace record demo in status ready owned by a user who holds a PAT with the scope audit:write"
+        ],
+        "end_state": [
+          "the analytical store holds one run event, four traces and one postmortem for the workspace demo and the run",
+          "the second answer for the run event and for the postmortem equals the body of the first",
+          "the second batch answer is {accepted: 0, duplicates: 4, errors: [one entry with index of the invalid item]}"
+        ],
+        "pseudocode": "in test/e2e/telemetry_test.go: hub = startHub(t); ev = post(hub, '/api/v1/workspaces/demo/runs/' + run + '/events', {id: u1, event_type: 'run.start'}, pat); assert ev.status == 201; b = post(…'/traces/batch', five traces, the third with event_type 'user.message'); assert b.json.accepted == 4 and b.json.errors[0].index == 2; pm = post(…'/postmortem', valid); assert pm.status == 201; ev2 = post(…'/events', the same body); assert ev2.status == 200 and ev2.json == ev.json; b2 = post(…'/traces/batch', the same array); assert b2.json.accepted == 0 and b2.json.duplicates == 4 and len(b2.json.errors) == 1; pm2 = post(…'/postmortem', valid); assert pm2.status == 200 and pm2.json == pm.json; open the hub's analytical store file and assert the row counts 1, 4 and 1"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "The hub records what was run in a sandbox of a run",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "opens a session with run_id 20260102_030405_a1b2c3 on the task fork demo--task1 with POST /api/v1/sessions"
+        },
+        {
+          "actor": "parleyd",
+          "action": "stores the session and answers 201 with its id"
+        },
+        {
+          "actor": "agent",
+          "action": "runs a command in a sandbox that belongs to that session"
+        },
+        {
+          "actor": "parleyd",
+          "action": "its sandbox component reports the ended exec to the telemetry recorder with the sandbox id, the session id, the actor, the start time, the argument list, the exit code and the duration"
+        },
+        {
+          "actor": "parleyd",
+          "action": "reads the session's run_id, stores one run event of type sandbox.exec for demo--task1 under that run and session, and writes no hub event"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parleyd HTTP server with its middleware",
+          "session routes and session store",
+          "telemetry sandbox recorder as wired in parleyd's composition",
+          "analytical store on SQLite",
+          "transactional store on SQLite"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with an empty data directory",
+          "a workspace demo and its task fork demo--task1, owned by a user with an API key",
+          "the sandbox runtime is not started: the test calls the recorder that the hub's composition hands to the sandbox component, in place of a real exec"
+        ],
+        "end_state": [
+          "the analytical store holds exactly one run event for demo--task1 and the run, with event_type sandbox.exec, the session's id and the start time as timestamp",
+          "its payload holds exactly sandbox_id, actor_type, actor_id, command, exit_code, timed_out and duration_ms",
+          "a second exec reported for a session without run_id adds no run event",
+          "the number of hub events in the event log is the same before and after the two reports"
+        ],
+        "pseudocode": "in test/e2e/telemetry_test.go: hub = startHub(t); s = post(hub, '/api/v1/sessions', {workspace_slug: 'demo--task1', run_id: run}, key).json; before = count of hub events; hub.SandboxRecorder().Record(exec{workspace: 'demo--task1', sandbox: 'sbx1', session: s.id, actor_type: 'user', actor_id: user, started: t0, command: ['go', 'test'], exit_code: 0, timed_out: false, duration_ms: 900}); rows = run events of ('demo--task1', run) read from the hub's analytical store file; assert len(rows) == 1; assert rows[0].event_type == 'sandbox.exec' and session_id == s.id and timestamp == t0; assert keys(rows[0].payload) == {sandbox_id, actor_type, actor_id, command, exit_code, timed_out, duration_ms}; s2 = a session without run_id; Record(exec for s2); assert the row count is still 1; assert count of hub events == before"
+      }
+    }
+  ]
+}

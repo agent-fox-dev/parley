@@ -1,0 +1,894 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "08",
+  "spec_name": "workspace_bound_tokens",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Minting a bound token over REST",
+      "rationale": "A developer needs one call that yields a token for an agent which is bound from the first moment, and never a token that exists without its binding.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "the owner of a workspace that is not archived sends POST /api/v1/workspaces/:slug/tokens with an API key, or with an unbound PAT that holds tokens:manage and every requested permission, and a body that passes the validation of POST /user/tokens",
+          "action": "create a PAT owned by the caller's user and bound to that workspace, and return the token object with its value",
+          "contract": "HTTP 201 with a Token object {token_id, user_id, name, permissions, paths, workspace, expires_at, revoked_at, created_at, token}: workspace equals the slug, user_id is the caller's user, revoked_at is null, paths is null when the body gave none, expires_at is created_at plus the body's expires in days (90 when absent, null when 0), and token matches ^parley_pat_[a-z0-9]{8}_[a-z0-9]{32}$ with token_id as its middle part; a later request that presents token is authenticated as that PAT",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check and the access rule installed, a store in t.TempDir(), a recording event emitter, user alice with an API key, and workspace w1 owned by alice"
+            ],
+            "pseudocode": "in internal/access/bound_tokens_test.go, a table over callers {alice's API key, alice's unbound PAT with [tokens:manage, git:read]} and bodies {{name:'agent', permissions:['git:read']}, the same with expires:0, the same with expires:30 and paths:['docs/**']}: r = post('/api/v1/workspaces/w1/tokens', body); assert r.status == 201; assert r.json.workspace == 'w1'; assert r.json.user_id == alice.id; assert r.json.revoked_at == null; assert r.json.token matches the pattern and contains r.json.token_id; assert r.json.expires_at == null for expires 0, else created_at + days; assert the store holds one PAT with that token_id whose workspace is 'w1'; assert authenticate(r.json.token).token_id == r.json.token_id"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "event_driven",
+          "condition": "a bound token is minted through POST /api/v1/workspaces/:slug/tokens",
+          "action": "record exactly one parley.token.bind event in the same store transaction as the token",
+          "contract": "one event handed to the event emitter with type parley.token.bind, workspace the bound slug, actor_id the minting user, actor_type api_key or pat according to the calling credential, resource_type token, resource_id the token id, action bind, and metadata {token_id, workspace, permissions, paths (or null), expires_at (or null)}; no member of the event holds the token value or its secret part",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check and the access rule installed, a store in t.TempDir(), a recording event emitter, user alice with an API key, and workspace w1 owned by alice"
+            ],
+            "pseudocode": "in internal/access/bound_tokens_test.go, a table over callers {API key, unbound PAT with tokens:manage and git:read}: r = post('/api/v1/workspaces/w1/tokens', {name:'agent', permissions:['git:read']}); evs = emitter.events(); assert len(evs) == 1; e = evs[0]; assert e.type == 'parley.token.bind' and e.workspace == 'w1' and e.actor_id == alice.id; assert e.actor_type == 'api_key' or 'pat' per the caller; assert e.resource_type == 'token' and e.resource_id == r.json.token_id and e.action == 'bind'; assert e.metadata == {token_id: r.json.token_id, workspace:'w1', permissions:['git:read'], paths:null, expires_at:r.json.expires_at}; assert the JSON of e does not contain r.json.token nor its secret part; assert the emitter received the event with the same transaction the token row was written in"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "unwanted",
+          "condition": "writing the token or recording the parley.token.bind event fails while POST /api/v1/workspaces/:slug/tokens is being served",
+          "action": "roll back the whole mint and answer with a hub failure, leaving neither a token nor an event",
+          "contract": "HTTP 500 with error_type internal and a message that does not contain the cause; the store holds no new PAT, bound or unbound; no parley.token.bind event was committed",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check and the access rule installed, a store in t.TempDir(), a recording event emitter, user alice with an API key, and workspace w1 owned by alice"
+            ],
+            "pseudocode": "in internal/access/bound_tokens_test.go, a table over the failing step {the event emitter returns errors.New('emitter down'), the token insert fails}: before = count(PATs); r = post('/api/v1/workspaces/w1/tokens', validBody); assert r.status == 500; assert r.json.error.error_type == 'internal'; assert not contains(r.body, 'emitter down'); assert count(PATs) == before; assert count(PATs where workspace is null) is unchanged; assert emitter.committed() is empty"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "unwanted",
+          "condition": "the owner sends POST /api/v1/workspaces/:slug/tokens with a body that fails the validation of POST /user/tokens",
+          "action": "refuse the request and create nothing",
+          "contract": "HTTP 400 with error_type invalid_request; the store holds no new PAT and no event is recorded",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check and the access rule installed, a store in t.TempDir(), a recording event emitter, user alice with an API key, and workspace w1 owned by alice"
+            ],
+            "pseudocode": "in internal/access/bound_tokens_test.go, a table over bodies {no name, name of 256 characters, permissions: [], permissions: ['nope:read'], expires: 45, paths: [], paths with 51 globs, paths: ['/abs/**'], a JSON array in place of the object}: r = post('/api/v1/workspaces/w1/tokens', body) with alice's API key; assert r.status == 400; assert r.json.error.error_type == 'invalid_request'; assert count(PATs) == 0; assert emitter.events() is empty"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "unwanted",
+          "condition": "an unbound PAT sends POST /api/v1/workspaces/:slug/tokens without holding tokens:manage, or asks for a permission it does not hold exactly, or for paths that its own paths do not cover",
+          "action": "refuse the request before the workspace is looked up and create nothing",
+          "contract": "HTTP 403 with error_type insufficient_scope, the same for an existing workspace and for an unknown slug; for a subset-rule violation the message names the first offending permission or path; the store holds no new PAT",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check and the access rule installed, a store in t.TempDir(), a recording event emitter, user alice with an API key, and workspace w1 owned by alice"
+            ],
+            "pseudocode": "in internal/access/bound_tokens_test.go, a table over {PAT [git:read] (no tokens:manage) on w1 and on 'nosuch'; PAT [tokens:manage, git:write] asking for git:read; PAT [tokens:manage, git:read] with paths ['src/**'] asking for paths ['docs/**']; the same PAT asking for no paths}: r = post('/api/v1/workspaces/' + slug + '/tokens', body); assert r.status == 403; assert r.json.error.error_type == 'insufficient_scope'; for the subset cases assert contains(r.json.error.message, 'git:read') or 'docs/**'; assert count(bound PATs) == 0"
+          }
+        },
+        {
+          "id": "REQ-1.6",
+          "pattern": "unwanted",
+          "condition": "the admin token sends POST /api/v1/workspaces/:slug/tokens",
+          "action": "refuse the request, because a bound token needs a user as its owner, and create nothing",
+          "contract": "HTTP 403 with error_type forbidden and the message \"this route needs a user\" (the message package 04 gives the admin token wherever a user is needed), for a valid body and for an invalid one, and for an existing workspace in any state; the store holds no new PAT",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check and the access rule installed, a store in t.TempDir(), a recording event emitter, user alice with an API key, and workspace w1 owned by alice",
+              "an admin token is configured; workspace w2 is archived"
+            ],
+            "pseudocode": "in internal/access/bound_tokens_test.go, a table over {valid body on w1, body without name on w1, valid body on archived workspace w2}: r = post('/api/v1/workspaces/' + slug + '/tokens', body) with the admin token; assert r.status == 403; assert r.json.error.error_type == 'forbidden'; assert count(PATs) == 0"
+          }
+        },
+        {
+          "id": "REQ-1.7",
+          "pattern": "unwanted",
+          "condition": "a user credential sends POST /api/v1/workspaces/:slug/tokens for a workspace on which its user is not the owner",
+          "action": "answer as the workspace access rule answers a route with need owner, and create nothing",
+          "contract": "HTTP 404 with error_type not_found and message workspace not found, with the same body for an existing workspace the caller cannot read and for an unknown slug; HTTP 403 with error_type forbidden for an org member who can read the workspace; in both cases also when the body is invalid or the workspace is archived; the store holds no new PAT",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check and the access rule installed, a store in t.TempDir(), a recording event emitter, user alice with an API key, and workspace w1 owned by alice",
+              "users bob (no relation to w1) and carol (member of the active org of w1 and w2)"
+            ],
+            "pseudocode": "in internal/access/bound_tokens_test.go, a table over {bob (no access) on w1, bob on 'nosuch', carol (member of w1's org) on w1, carol on w1 with an invalid body, carol on archived org workspace w2}: r = post(...) with the caller's API key; for bob assert r.status == 404 and r.json.error.error_type == 'not_found' and r.json.error.message == 'workspace not found' and the two bob bodies are equal; for carol assert r.status == 403 and r.json.error.error_type == 'forbidden'; assert count(PATs) == 0"
+          }
+        },
+        {
+          "id": "REQ-1.8",
+          "pattern": "unwanted",
+          "condition": "the owner sends POST /api/v1/workspaces/:slug/tokens with a valid body for a workspace that is archived",
+          "action": "refuse the request and create nothing",
+          "contract": "HTTP 409 with error_type workspace_archived; the store holds no new PAT and no event is recorded",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check and the access rule installed, a store in t.TempDir(), a recording event emitter, user alice with an API key, and workspace w1 owned by alice",
+              "workspace w2 is owned by alice and archived"
+            ],
+            "pseudocode": "in internal/access/bound_tokens_test.go: r = post('/api/v1/workspaces/w2/tokens', validBody) with alice's API key; assert r.status == 409; assert r.json.error.error_type == 'workspace_archived'; assert count(PATs) == 0; assert emitter.events() is empty"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "One minting component and a binding that never changes",
+      "rationale": "Fork creation and the sandbox's hub credential must mint bound tokens under the same rules and inside their own transactions, and a token's binding must be a fact nobody can edit afterwards.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "another component of the hub calls the minting component of internal/access inside a store transaction with an owner, the creating credential, a workspace slug, a name, permissions, paths and an expiry given in days or as an instant",
+          "action": "write a PAT of that owner bound to the slug and record parley.token.bind through the event emitter in that same transaction, and return the token object and its value to the caller",
+          "contract": "returns (Token, value, nil) with Token.workspace equal to the slug and Token.expires_at equal to the given instant or to now plus the given days (null for 0 days); when the caller commits, the store holds the token and the emitter holds one parley.token.bind event for it; when the caller rolls back, the store holds no such token and the emitter holds no committed event",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a store in t.TempDir() with user alice and workspace w1; a recording event emitter that tracks the transaction of each event"
+            ],
+            "pseudocode": "in internal/access/mint_test.go, a table over {commit, rollback} x {expiry 30 days, expiry instant now+2h, expiry 0}: tx = store.begin(); tok, value, err = MintBound(ctx, tx, {owner: alice, creator: alice's API key, workspace:'w1', name:'hub', permissions:['git:read','git:write'], paths:null, expiry}); assert err == nil; assert tok.workspace == 'w1'; assert tok.expires_at per the case; assert value contains tok.token_id; commit or roll back; on commit assert store.pat(tok.token_id).workspace == 'w1' and emitter.committed() has one parley.token.bind with resource_id tok.token_id; on rollback assert store.pat(tok.token_id) is absent and emitter.committed() is empty"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "unwanted",
+          "condition": "the minting component is called with a name, permissions, paths or expiry in days that fail the validation of package 06, or with a PAT as the creating credential that does not hold a requested permission exactly or whose paths do not cover the requested paths",
+          "action": "return the error of package 06 for that case and write nothing in the caller's transaction",
+          "contract": "returns an error that the server pipeline renders as HTTP 400 invalid_request (validation) or HTTP 403 insufficient_scope naming the first offending permission or path (subset rule); no token row and no event were written in the transaction",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a store in t.TempDir() with user alice and workspace w1; a recording event emitter"
+            ],
+            "pseudocode": "in internal/access/mint_test.go, a table over {name '', permissions [], permissions ['nope:x'], days 45, creator PAT [git:write] asking git:read, creator PAT with paths ['src/**'] asking paths null, creator PAT with paths ['src/*'] asking ['src/**']}: tx = store.begin(); _, _, err = MintBound(ctx, tx, input); assert err != nil; assert errorType(err) == 'invalid_request' for the first four and 'insufficient_scope' for the others; assert count(PATs in tx) == 0; assert emitter.events() is empty"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "event_driven",
+          "condition": "a caller repeats a successful POST /api/v1/workspaces/:slug/tokens within 24 hours with the same Idempotency-Key header and the same body",
+          "action": "answer with the original token object without its value and mint nothing",
+          "contract": "HTTP 200 with the body of the first response minus the member token; the store still holds exactly one PAT bound to the workspace and the emitter holds exactly one parley.token.bind event",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check and the access rule installed, a store in t.TempDir(), a recording event emitter, user alice with an API key, and workspace w1 owned by alice"
+            ],
+            "pseudocode": "in internal/access/bound_tokens_test.go: h = {'Idempotency-Key': 'k1'}; r1 = post('/api/v1/workspaces/w1/tokens', body, h); r2 = post('/api/v1/workspaces/w1/tokens', body, h); assert r1.status == 201 and r2.status == 200; assert 'token' not in r2.json; assert r2.json == r1.json without 'token'; assert count(PATs where workspace == 'w1') == 1; assert len(emitter.events()) == 1"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "ubiquitous",
+          "action": "for any bound token, keep its workspace and its paths unchanged through every route that changes or reads a token",
+          "contract": "after PUT, PATCH and DELETE on /api/v1/user/tokens/:token_id/permissions by the owner's API key, and after revocation, the token object returned by GET /api/v1/user/tokens/:token_id and by GET /api/v1/workspaces/:slug/tokens carries the workspace and paths it was minted with; a workspace member in a permissions body is ignored",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check and the access rule installed, a store in t.TempDir(), a recording event emitter, user alice with an API key, and workspace w1 owned by alice",
+              "the token routes of package 06 are registered"
+            ],
+            "pseudocode": "in internal/access/bound_tokens_test.go: t = mint on w1 with permissions ['git:read','git:write'] and paths ['docs/**']; put('/api/v1/user/tokens/' + t.token_id + '/permissions', {permissions:['git:read'], workspace:'w9', paths:['**']}); patch(..., {permissions:['changes:read']}); delete(..., {permissions:['changes:read']}); for each step g = get('/api/v1/user/tokens/' + t.token_id); assert g.json.workspace == 'w1' and g.json.paths == ['docs/**']; delete('/api/v1/user/tokens/' + t.token_id); l = get('/api/v1/workspaces/w1/tokens'); assert l.json.items[0].workspace == 'w1' and l.json.items[0].paths == ['docs/**'] and l.json.items[0].revoked_at != null"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Listing the tokens bound to a workspace",
+      "rationale": "The owner must be able to see every token that can reach a workspace, including the ones that no longer work, to audit and revoke them.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "the owner of a workspace in any state sends GET /api/v1/workspaces/:slug/tokens with an API key or with an unbound PAT that holds tokens:read",
+          "action": "return every token bound to that workspace, live, revoked or expired, oldest first, without any token value",
+          "contract": "HTTP 200 with {items, next_cursor}: items holds one Token object per PAT whose workspace is the slug, ordered by created_at ascending and then token_id ascending; no item has a member token; tokens bound to other workspaces and unbound tokens are absent; items is [] and next_cursor is null when no token is bound; with limit=1 the pages follow next_cursor and visit every item exactly once",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check and the access rule installed, a store in t.TempDir(), a recording event emitter, user alice with an API key, and workspace w1 owned by alice",
+              "w1 has three bound tokens: t1 live, t2 revoked, t3 expired; w2 (archived) has one; alice also has one unbound PAT"
+            ],
+            "pseudocode": "in internal/access/bound_tokens_test.go, a table over callers {alice's API key, alice's unbound PAT [tokens:read]} and workspaces {w1 active, w2 archived, w3 with no bound token}: r = get('/api/v1/workspaces/' + slug + '/tokens'); assert r.status == 200; for w1 assert ids(r.json.items) == [t1, t2, t3] in creation order (t1 and t2 share created_at and are ordered by token_id); assert t2 has revoked_at != null and t3 has expires_at in the past; assert no item has 'token'; assert the id of the w2 token and of the unbound token are not in w1's items; for w3 assert r.json.items == [] and r.json.next_cursor == null; page with limit=1 and assert the concatenated ids == [t1, t2, t3]"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "event_driven",
+          "condition": "the admin token sends GET /api/v1/workspaces/:slug/tokens for any existing workspace",
+          "action": "return the tokens bound to that workspace as it does for the owner",
+          "contract": "HTTP 200 with the same items, in the same order, as the owner's request for that workspace",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check and the access rule installed, a store in t.TempDir(), a recording event emitter, user alice with an API key, and workspace w1 owned by alice",
+              "an admin token is configured"
+            ],
+            "pseudocode": "in internal/access/bound_tokens_test.go, a table over workspaces {w1 owned by alice, w2 archived}: a = get('/api/v1/workspaces/' + slug + '/tokens') with the admin token; o = the same with alice's API key; assert a.status == 200; assert a.json.items == o.json.items"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "unwanted",
+          "condition": "GET /api/v1/workspaces/:slug/tokens is sent by an unbound PAT without tokens:read, by a user without access to the workspace, for an unknown slug, or by an org member who is not the owner",
+          "action": "refuse the request and return no token",
+          "contract": "HTTP 403 with error_type insufficient_scope for the PAT without tokens:read, for an existing workspace and for an unknown slug alike; HTTP 404 with error_type not_found and message workspace not found, with equal bodies, for a caller without access and for an unknown slug; HTTP 403 with error_type forbidden for the org member; no response body holds a token_id",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check and the access rule installed, a store in t.TempDir(), a recording event emitter, user alice with an API key, and workspace w1 owned by alice",
+              "users bob (no access) and carol (member of w1's org); w1 has bound token t1"
+            ],
+            "pseudocode": "in internal/access/bound_tokens_test.go, a table over {alice's PAT [git:read] on w1 -> 403 insufficient_scope; the same on 'nosuch' -> 403 insufficient_scope; bob's API key on w1 -> 404 not_found; bob on 'nosuch' -> 404 not_found; carol (org member) on w1 -> 403 forbidden}: r = get(...); assert r.status and r.json.error.error_type per the row; assert the two bob bodies are equal and their message == 'workspace not found'; assert not contains(r.body, t1)"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "What a binding covers",
+      "rationale": "The promise of a bound token is that it reaches its workspace and the forks made with it and that every other workspace does not exist for it.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "a bound PAT sends a request to a route under /api/v1/workspaces/:slug whose slug is the workspace the token is bound to, in any state of that workspace including archived",
+          "action": "pass the request to the route's own checks and give its handler the binding: the bound slug and the relation bound",
+          "contract": "the response is the one the route gives an unbound PAT of the same user with the same permissions; the handler reads {bound_workspace: slug, relation: bound} from the request context; no parley.token.bound_refused event is emitted",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler with authentication, the binding guard, the scope check and the access rule installed, a store in t.TempDir(), a recording event emitter, and a probe route GET /api/v1/workspaces/:slug/probe with need read and scope git:read that answers 200 with the binding it finds in the request context",
+              "alice owns w1 and archived w2 and holds a PAT [git:read] bound to each"
+            ],
+            "pseudocode": "in internal/access/guard_test.go, a table over workspaces {w1 active, w2 archived}: b = get('/api/v1/workspaces/' + slug + '/probe') with the PAT bound to slug; u = the same with alice's unbound PAT [git:read]; assert b.status == 200 and u.status == 200; assert b.json.binding == {bound_workspace: slug, relation: 'bound'}; assert u.json.binding == null; assert emitter.events() is empty"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "event_driven",
+          "condition": "a bound PAT sends a request that names a task fork of the workspace it is bound to, and the fork's record names this token as the token that created it",
+          "action": "pass the request to the route's own checks and give its handler the binding with the relation created_fork",
+          "contract": "the probe answers HTTP 200 with binding {bound_workspace: the parent's slug, relation: created_fork}; no parley.token.bound_refused event is emitted",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler with authentication, the binding guard, the scope check and the access rule installed, a store in t.TempDir(), a recording event emitter, and a probe route GET /api/v1/workspaces/:slug/probe with need read and scope git:read that answers 200 with the binding it finds in the request context",
+              "alice holds tokA and tokB, both [git:read] and bound to w1; fork f1 of w1 is recorded as created by tokA"
+            ],
+            "pseudocode": "in internal/access/guard_test.go: r = get('/api/v1/workspaces/f1/probe') with tokA; assert r.status == 200; assert r.json.binding == {bound_workspace:'w1', relation:'created_fork'}; assert emitter.events() is empty"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "unwanted",
+          "condition": "a bound PAT sends a request that names a task fork of the workspace it is bound to, and the fork's record names another token or no token as its creator",
+          "action": "refuse the request as it refuses any workspace outside the binding",
+          "contract": "HTTP 404 with error_type not_found and message workspace not found, also when the token's user owns the fork",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler with authentication, the binding guard, the scope check and the access rule installed, a store in t.TempDir(), a recording event emitter, and a probe route GET /api/v1/workspaces/:slug/probe with need read and scope git:read that answers 200 with the binding it finds in the request context",
+              "alice holds tokA and tokB bound to w1; forks f2, f3 and f4 of w1 as the table names them"
+            ],
+            "pseudocode": "in internal/access/guard_test.go, a table over {tokA on f2 (created by tokB of the same user), tokA on f3 (created with alice's API key, no token recorded), tokA on f4 (created by bob's token)}: r = get('/api/v1/workspaces/' + fork + '/probe'); assert r.status == 404; assert r.json.error.error_type == 'not_found'; assert r.json.error.message == 'workspace not found'"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "unwanted",
+          "condition": "a bound PAT sends a request that names a workspace that is neither covered by its binding nor the parent of the fork it is bound to, whether or not that workspace exists and whatever access the token's user has on it",
+          "action": "refuse the request before the scope check and the access rule run",
+          "contract": "HTTP 404 with error_type not_found and message workspace not found; the body for an existing workspace the user owns, for an existing workspace the user cannot read and for an unknown slug is the same; the answer is 404 also when the token lacks the route's scope",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler with authentication, the binding guard, the scope check and the access rule installed, a store in t.TempDir(), a recording event emitter, and a probe route GET /api/v1/workspaces/:slug/probe with need read and scope git:read that answers 200 with the binding it finds in the request context",
+              "alice owns w1 and w5, bob owns w6; one more token is bound to fork f1 of w1 and fork f9 is another fork of w1"
+            ],
+            "pseudocode": "in internal/access/guard_test.go, a table over tokens {bound to w1 with [git:read], bound to w1 with [changes:read] only} and slugs {w5 owned by alice, w6 owned by bob, 'nosuch', sibling fork of the bound fork's parent}: r = get('/api/v1/workspaces/' + slug + '/probe'); assert r.status == 404; assert r.json.error.error_type == 'not_found'; assert r.json.error.message == 'workspace not found'; assert all bodies are equal"
+          }
+        },
+        {
+          "id": "REQ-4.5",
+          "pattern": "ubiquitous",
+          "action": "for any request of a bound PAT that the binding guard passes, apply the scope check and the workspace access rule exactly as for an unbound PAT of the same user with the same permissions, so that a binding removes access and never grants it",
+          "contract": "a bound PAT whose user no longer has access to the bound workspace gets HTTP 404 not_found from the access rule; a bound PAT without the route's scope on its own workspace gets HTTP 403 insufficient_scope; neither answer produces a parley.token.bound_refused event",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler with authentication, the binding guard, the scope check and the access rule installed, a store in t.TempDir(), a recording event emitter, and a probe route GET /api/v1/workspaces/:slug/probe with need read and scope git:read that answers 200 with the binding it finds in the request context",
+              "org workspace w7 and user carol as the table names them; a second probe route with need write"
+            ],
+            "pseudocode": "in internal/access/guard_test.go, a table over {token of carol bound to org workspace w7 after carol was removed from the org -> 404 not_found; token bound to w1 with [changes:read] on the probe (needs git:read) -> 403 insufficient_scope; token of carol (member) bound to w7 on a probe route with need write -> 403 forbidden}: b = request with the bound PAT; u = the same request with an unbound PAT of the same user and permissions; assert b.status == u.status and b.body == u.body; assert emitter.events() is empty"
+          }
+        },
+        {
+          "id": "REQ-4.6",
+          "pattern": "event_driven",
+          "condition": "a route asks internal/access for the readable set or the covered set of a caller that is a bound PAT",
+          "action": "return the covered workspaces of the binding (the bound workspace and the forks recorded as created by the token) and the readable set of the token's user cut down to them",
+          "contract": "CoveredSet returns the slugs sorted: [W and the forks this token created] for a token bound to W, [F] for a token bound to a fork F; the readable set of the bound PAT equals the readable set of its user intersected with the covered set; for an API key, the admin token and an unbound PAT the readable set is the one package 07 defines, unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a store in t.TempDir() with alice owning w1 and w5, forks f1 (created by tokA), f2 (created by tokB's sibling) of w1, org workspace w7"
+            ],
+            "pseudocode": "in internal/access/coverage_test.go, a table over {tokA bound to w1 (created f1) -> ['f1','w1']; tokB bound to w1 (created nothing) -> ['w1']; tokF bound to fork f1 -> ['f1']; token of carol bound to w7 after carol left the org -> covered ['w7'], readable []}: assert CoveredSet(ctx, tok) == expected; assert ReadableSet(ctx, callerOf(tok)) == intersect(ReadableSet(ctx, unboundCallerOf(tok.user)), expected); assert ReadableSet for alice's API key contains w1, w5 and every fork of w1"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "A fork-bound token on the fork's parent",
+      "rationale": "An agent working in a task fork must be able to open, follow and land its own changes in the parent and see what others are doing there, and must be able to do nothing else in the parent.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "a PAT bound to a task fork sends a request that names the fork's parent on one of the 25 contributor routes under /api/v1/workspaces/:slug (POST changes; GET changes; GET changes/:number; GET changes/by-commit/:sha; PATCH changes/:number; POST changes/:number/abandon; POST changes/:number/restore; POST changes/:number/restack; GET changes/:number/versions; GET changes/:number/versions/:version; GET changes/:number/diff; GET changes/:number/stack; POST changes/:number/land; GET changes/:number/lands; GET lands/:id; GET changes/:number/conflict; GET changes/:number/conflict/file; GET changes/:number/approvals; GET changes/:number/checks; GET policy; POST policy/evaluate; GET activity; GET changes/:number/overlaps; GET claims; GET claims/:id)",
+          "action": "pass the request to the route's own checks and give its handler the binding with the relation parent_of_bound_fork and the fork's slug",
+          "contract": "the route's handler runs and reads {bound_workspace: the fork's slug, relation: parent_of_bound_fork} from the request context; the response is the handler's; no parley.token.bound_refused event is emitted",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler with authentication, the binding guard, the scope check and the access rule installed, a store in t.TempDir(), a recording event emitter, and a probe route GET /api/v1/workspaces/:slug/probe with need read and scope git:read that answers 200 with the binding it finds in the request context",
+              "alice owns p1 and its fork f1; tokF is bound to f1 with every scope the routes need; the test registers each of the 25 method-and-pattern pairs with a probe handler"
+            ],
+            "pseudocode": "in internal/access/guard_test.go, a table with one row per contributor route (25 rows, method and concrete path on p1 such as GET /api/v1/workspaces/p1/changes/7/versions/2): r = request with tokF; assert r.status == 200; assert r.json.binding == {bound_workspace:'f1', relation:'parent_of_bound_fork'}; assert emitter.events() is empty; assert the table has 25 rows and each row's pattern is in the guard's contributor list"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "unwanted",
+          "condition": "a PAT bound to a task fork sends a request that names the fork's parent on any route that is not one of the 25 contributor routes",
+          "action": "refuse the request before the scope check and the access rule run",
+          "contract": "HTTP 403 with error_type token_bound; the route's handler does not run",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler with authentication, the binding guard, the scope check and the access rule installed, a store in t.TempDir(), a recording event emitter, and a probe route GET /api/v1/workspaces/:slug/probe with need read and scope git:read that answers 200 with the binding it finds in the request context",
+              "alice owns p1 and its fork f1; tokF is bound to f1; the test registers each listed route with a probe handler"
+            ],
+            "pseudocode": "in internal/access/guard_test.go, a table over routes on p1 {GET /probe, GET /lands, PUT /policy, POST /changes/7/approvals, DELETE /changes/7/approvals/a1, PUT /changes/7/checks/ci, POST /changes/7/revert, POST /claims, PATCH /claims/c1, DELETE /claims/c1, POST /tokens, GET /tokens, POST /forks}: r = request with tokF; assert r.status == 403; assert r.json.error.error_type == 'token_bound'; assert the probe handler's call count is unchanged"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "unwanted",
+          "condition": "a PAT bound to a registered workspace, or to a fork, sends a request on a contributor route that names a workspace other than the parent of the fork it is bound to",
+          "action": "apply the coverage rule alone, so that the contributor routes open nothing but the bound fork's own parent",
+          "contract": "HTTP 404 with error_type not_found and message workspace not found for: a token bound to fork f1 of p1 on GET changes of another workspace p2, a token bound to p1 on GET changes of p2, and a token bound to fork f1 on GET changes of f1's sibling fork",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler with authentication, the binding guard, the scope check and the access rule installed, a store in t.TempDir(), a recording event emitter, and a probe route GET /api/v1/workspaces/:slug/probe with need read and scope git:read that answers 200 with the binding it finds in the request context",
+              "alice owns p1, p2 and the forks f1 and f9 of p1; GET /api/v1/workspaces/:slug/changes is registered with a probe handler"
+            ],
+            "pseudocode": "in internal/access/guard_test.go, a table over {tokF (bound to f1) on /workspaces/p2/changes -> 404; tokP (bound to p1) on /workspaces/p2/changes -> 404; tokF on /workspaces/f9/changes (sibling fork) -> 404; tokP on /workspaces/p1/changes -> 200 relation bound}: r = get(path); assert r.status per the row; for 404 assert r.json.error.message == 'workspace not found'"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "The binding guard on every other route and on git",
+      "rationale": "A leaked agent token must not read or change its owner's identity, mint further tokens or reach the hub's cross-workspace routes beyond what its workspace needs.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "a bound PAT sends a request to one of the 11 allowlisted routes that name no workspace (GET /workspaces, GET /events, GET /events/log, GET /audit, GET /sandbox-profiles, POST /sessions, GET /sessions, GET /sessions/:id, POST /sessions/:id/complete, POST /sessions/:id/usage, GET /sessions/:id/usage, all under /api/v1)",
+          "action": "pass the request to the route's own checks and give its handler the binding, from which the handler obtains the covered set to confine its result",
+          "contract": "the route's handler runs; it reads the bound slug from the request context and CoveredSet returns the covered slugs for it; no parley.token.bound_refused event is emitted",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler with authentication, the binding guard, the scope check and the access rule installed, a store in t.TempDir(), a recording event emitter, and a probe route GET /api/v1/workspaces/:slug/probe with need read and scope git:read that answers 200 with the binding it finds in the request context",
+              "the test registers each of the 11 routes with a probe handler that answers the binding and CoveredSet"
+            ],
+            "pseudocode": "in internal/access/guard_test.go, a table with one row per allowlisted route (11 rows): r = request with tokA (bound to w1, created f1); assert r.status == 200; assert r.json.binding.bound_workspace == 'w1'; assert r.json.covered == ['f1','w1']; assert emitter.events() is empty"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "unwanted",
+          "condition": "a bound PAT sends a request to an existing route that names no workspace and is not on the allowlist, which includes every identity route",
+          "action": "refuse the request before the scope check runs, whatever scopes the token holds",
+          "contract": "HTTP 403 with error_type token_bound; the route's handler does not run, so a bound token can neither read nor revoke itself nor mint a token",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler with authentication, the binding guard, the scope check and the access rule installed, a store in t.TempDir(), a recording event emitter, and a probe route GET /api/v1/workspaces/:slug/probe with need read and scope git:read that answers 200 with the binding it finds in the request context",
+              "the identity routes of packages 04 to 06 are registered; POST /workspaces and GET /sandboxes are registered with probe handlers"
+            ],
+            "pseudocode": "in internal/access/guard_test.go, a table over {GET /user, PATCH /user, GET /user/orgs, GET /user/keys, GET /user/tokens, POST /user/tokens, GET /user/tokens/<own id>, DELETE /user/tokens/<own id>, PUT /user/tokens/<own id>/permissions, GET /orgs, GET /users, POST /workspaces, GET /sandboxes} under /api/v1 and tokens {bound PAT with every registered scope, bound PAT with [git:read]}: r = request; assert r.status == 403; assert r.json.error.error_type == 'token_bound'; assert the handler's call count is unchanged; assert store.pat(own id).revoked_at == null"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "unwanted",
+          "condition": "a bound PAT sends a request that names a workspace its binding covers on a route that was registered as refusing bound tokens, which includes POST and GET /api/v1/workspaces/:slug/tokens",
+          "action": "refuse the request before the scope check runs",
+          "contract": "HTTP 403 with error_type token_bound, with and without the route's scope on the token; no token is minted and no token list is returned; the same routes answer HTTP 404 not_found to the same token for a workspace outside its binding",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check and the access rule installed, a store in t.TempDir(), a recording event emitter, user alice with an API key, and workspace w1 owned by alice",
+              "alice also owns w5"
+            ],
+            "pseudocode": "in internal/access/bound_tokens_test.go, a table over tokens {bound to w1 with [tokens:manage, tokens:read, git:read], bound to w1 with [git:read]} and requests {POST /api/v1/workspaces/w1/tokens with a valid body, GET /api/v1/workspaces/w1/tokens}: r = request; assert r.status == 403; assert r.json.error.error_type == 'token_bound'; assert count(PATs bound to w1) is unchanged; then the same two requests on w5: assert r.status == 404 and r.json.error.error_type == 'not_found'"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "ubiquitous",
+          "action": "for any request made with an API key, the admin token or an unbound PAT, let the binding guard pass the request unchanged and place no binding in the request context",
+          "contract": "the response equals the response of the same hub with no binding guard installed; the handler reads no binding; no parley.token.bound_refused event is emitted",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler with authentication, the binding guard, the scope check and the access rule installed, a store in t.TempDir(), a recording event emitter, and a probe route GET /api/v1/workspaces/:slug/probe with need read and scope git:read that answers 200 with the binding it finds in the request context"
+            ],
+            "pseudocode": "in internal/access/guard_test.go, a table over credentials {alice's API key, the admin token, alice's unbound PAT [git:read]} and routes {GET /workspaces/w1/probe, GET /workspaces/w5/probe, GET /user (not for the admin token), GET /workspaces/nosuch/probe}: with = response of the hub with the guard; without = response of a hub built without the guard; assert with.status == without.status and with.body == without.body; for the probe assert with.json.binding == null; assert emitter.events() is empty"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "unwanted",
+          "condition": "a request that carries a bound PAT fails a check that runs before the binding guard: the path is unknown, the method is not allowed on the path, or the token's id is presented with a wrong secret, a revoked token or an expired token",
+          "action": "answer with that earlier check's answer and not run the binding guard",
+          "contract": "HTTP 404 not_found for an unknown path and HTTP 405 method_not_allowed with an Allow header for a wrong method, as for any caller; HTTP 401 unauthenticated for the wrong secret, the revoked and the expired token, also when the path names a workspace outside the binding; no parley.token.bound_refused event is emitted",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler with authentication, the binding guard, the scope check and the access rule installed, a store in t.TempDir(), a recording event emitter, and a probe route GET /api/v1/workspaces/:slug/probe with need read and scope git:read that answers 200 with the binding it finds in the request context",
+              "alice owns w1 and w5; tokens bound to w1 in the states the table names"
+            ],
+            "pseudocode": "in internal/access/guard_test.go, a table over {valid bound PAT on GET /api/v1/nosuch -> 404 not_found; valid bound PAT on DELETE /api/v1/workspaces/w5/probe -> 405 with Allow; bound token id with a wrong secret on /workspaces/w5/probe -> 401; revoked bound PAT on /workspaces/w5/probe -> 401; expired bound PAT on GET /user -> 401}: r = request; assert r.status and r.json.error.error_type per the row; assert emitter.events() is empty"
+          }
+        },
+        {
+          "id": "REQ-6.6",
+          "pattern": "event_driven",
+          "condition": "the git server asks the binding guard for its decision on a request with a bound PAT for the repository of a workspace slug",
+          "action": "return pass when the binding covers the slug and otherwise a refusal with status 404, which it reports as a refusal with surface git",
+          "contract": "GuardGit returns pass, with the binding, for the bound workspace and for a fork the token created; it returns refuse with status 404 for any other slug, existing or not, including the parent of the fork the token is bound to; for an API key, the admin token and an unbound PAT it returns pass with no binding; each refuse is handed to the refusal reporter with surface git, status 404, the request's method and the matched git route pattern",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a store in t.TempDir() with alice owning w1, w5 and fork f1 of w1; a recording refusal reporter"
+            ],
+            "pseudocode": "in internal/access/guard_test.go, a table over {tokA on w1 -> pass; tokA on f1 (created by tokA) -> pass; tokA on w5 -> refuse 404; tokA on 'nosuch' -> refuse 404; tokF (bound to f1) on its parent w1 -> refuse 404; alice's API key on w5 -> pass, no binding}: d = GuardGit(ctx, caller, slug, method, pattern); assert d.pass and d.status per the row; for refusals assert reporter.last == {surface:'git', status:404, requested_workspace: slug, method, route: pattern}"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "Reporting refusals as rate-limited events",
+      "rationale": "A refused request from a bound token is a sign of a confused or compromised agent that the workspace owner wants to see, without one looping agent flooding the event log.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "event_driven",
+          "condition": "the binding guard refuses a request of a bound PAT and no parley.token.bound_refused event was emitted for that token in the preceding 60 seconds",
+          "action": "emit one parley.token.bound_refused event for the refusal through the event emitter",
+          "contract": "one event with type parley.token.bound_refused, workspace the bound slug, actor_id the token's user, actor_type pat, resource_type token, resource_id the token id, action bound_refused, and metadata {token_id, bound_workspace, method, route, status, surface, suppressed}: route is the route pattern the router matched, status is the HTTP status the guard answered (403 or 404), surface is api or git, suppressed is 0 for a token's first event; metadata has requested_workspace, holding the slug exactly as the caller typed it, only when the request named a workspace",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the hub handler of the guard tests with a recording event emitter and a refusal limiter whose clock the test advances; tokA and tokB are bound to w1"
+            ],
+            "pseudocode": "in internal/access/refusal_test.go, a table over refusals by a fresh token {GET /api/v1/workspaces/w5/probe -> status 404, requested_workspace 'w5'; GET /api/v1/workspaces/NoSuch/probe -> 404, 'NoSuch'; GET /api/v1/user -> 403, no requested_workspace member; POST /api/v1/workspaces/w1/tokens -> 403, 'w1'; GuardGit on w5 -> 404, surface git}: evs = emitter.events(); assert len(evs) == 1; e = evs[0]; assert e.type == 'parley.token.bound_refused' and e.workspace == 'w1' and e.actor_id == alice.id and e.actor_type == 'pat' and e.resource_type == 'token' and e.resource_id == tok.token_id and e.action == 'bound_refused'; assert e.metadata.status, surface, method per the row; assert e.metadata.route == the matched pattern (for example '/api/v1/workspaces/:slug/probe'); assert e.metadata.suppressed == 0; assert ('requested_workspace' in e.metadata) per the row; also: a limiter built anew (as after a restart) emits on its first refusal"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "state_driven",
+          "condition": "less than 60 seconds have passed since a parley.token.bound_refused event was emitted for a token",
+          "action": "emit no event for a further refusal of that token and add 1 to the token's count of suppressed refusals",
+          "contract": "the event emitter receives nothing for the refusal; the HTTP answer of the refused request is the same as for a reported one",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the hub handler of the guard tests with a recording event emitter and a refusal limiter whose clock the test advances; tokA and tokB are bound to w1"
+            ],
+            "pseudocode": "in internal/access/refusal_test.go: refuse tokA at t0 (event 1); refuse tokA at t0+1s, t0+30s and t0+59s with requests {other workspace, identity route, other workspace}; assert each response has the status and body of the first refusal of its kind; assert len(emitter.events()) == 1"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "event_driven",
+          "condition": "the binding guard refuses a request of a bound PAT 60 seconds or more after the last parley.token.bound_refused event of that token, and refusals were suppressed in between",
+          "action": "emit one event whose suppressed member is the number of refusals not reported since the previous event, and start the count again at 0",
+          "contract": "the second event of the token has metadata.suppressed equal to the number of suppressed refusals and otherwise describes the refusal that triggered it; an event emitted after a further 60 seconds with no refusal in between has suppressed 0",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the hub handler of the guard tests with a recording event emitter and a refusal limiter whose clock the test advances; tokA and tokB are bound to w1"
+            ],
+            "pseudocode": "in internal/access/refusal_test.go: refuse tokA at t0, t0+1s, t0+30s, t0+59s, then at t0+60s; evs = emitter.events(); assert len(evs) == 2; assert evs[1].metadata.suppressed == 3; assert evs[1].metadata.route and status describe the request at t0+60s; refuse tokA at t0+120s; assert emitter.events()[2].metadata.suppressed == 0"
+          }
+        },
+        {
+          "id": "REQ-7.4",
+          "pattern": "ubiquitous",
+          "action": "for any two bound tokens, limit and count the refusal events of each independently of the other",
+          "contract": "a refusal of token B inside the minute of token A's event emits an event for B with suppressed 0; B's refusals never change the suppressed count carried on A's next event",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the hub handler of the guard tests with a recording event emitter and a refusal limiter whose clock the test advances; tokA and tokB are bound to w1"
+            ],
+            "pseudocode": "in internal/access/refusal_test.go: refuse tokA at t0; refuse tokB at t0+1s; refuse tokA at t0+2s; refuse tokB at t0+3s and t0+4s; assert events at this point == [A, B]; refuse tokA at t0+61s and tokB at t0+62s; evs = emitter.events(); assert the second A event has suppressed 1 and the second B event has suppressed 2"
+          }
+        },
+        {
+          "id": "REQ-7.5",
+          "pattern": "unwanted",
+          "condition": "the event emitter returns an error, or panics, while a parley.token.bound_refused event is being emitted",
+          "action": "answer the refused request exactly as it would have been answered had the emit succeeded, and not retry the emit",
+          "contract": "the HTTP status and body of the refusal (404 not_found or 403 token_bound) are unchanged; the request is not answered 500; the next refusal of that token within 60 seconds calls the emitter zero times",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the hub handler of the guard tests with a recording event emitter and a refusal limiter whose clock the test advances; tokA and tokB are bound to w1",
+              "the event emitter fails as the table names"
+            ],
+            "pseudocode": "in internal/access/refusal_test.go, a table over emitters {returns errors.New('log full'), panics}: r = get('/api/v1/workspaces/w5/probe') with tokA; assert r.status == 404 and r.json.error.error_type == 'not_found'; r2 = get('/api/v1/user') with tokA 1s later; assert r2.status == 403 and r2.json.error.error_type == 'token_bound'; assert emitter.calls == 1"
+          }
+        },
+        {
+          "id": "REQ-7.6",
+          "pattern": "ubiquitous",
+          "action": "for any request of a bound PAT that passes the binding guard, or that is answered by a check other than the binding guard (authentication, the scope check, the access rule), or whose allowlisted route leaves workspaces outside the binding out of its result, emit no parley.token.bound_refused event and leave the token's suppressed count unchanged",
+          "contract": "the event emitter receives no event for these requests, and a refusal of the same token that follows carries suppressed 0",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the hub handler of the guard tests with a recording event emitter and a refusal limiter whose clock the test advances; tokA and tokB are bound to w1"
+            ],
+            "pseudocode": "in internal/access/refusal_test.go: with tokA send {GET /workspaces/w1/probe (pass), GET /workspaces (allowlist, result confined), GET /workspaces/w1/probe with a token lacking git:read (403 insufficient_scope), a wrong secret (401), the token of a user who lost access (404 from the access rule)}; assert emitter.events() is empty; then refuse tokA once; assert emitter.events()[0].metadata.suppressed == 0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "Revoking bound tokens when their workspace is removed",
+      "rationale": "A token must not outlive the workspace it was made for, and the removal and the revocation must not be separable by a crash.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "a component that removes workspaces (workspace delete, fork expiry) calls the revoking component of internal/access inside its store transaction with the slugs being removed",
+          "action": "revoke every live token bound to one of those slugs in that transaction and return the revoked token ids",
+          "contract": "returns the ids of the tokens it revoked, sorted ascending, as a non-nil list that is empty when there were none or when no slug was given; after commit each returned token has revoked_at set to the time of the call; tokens that were already revoked or expired keep their revoked_at and are not returned; tokens bound to other workspaces and unbound tokens are unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a store in t.TempDir(); w1 has two live bound tokens, one revoked and one expired; fork f1 has one live bound token; w5 has one live bound token; alice has one unbound token; an injectable clock"
+            ],
+            "pseudocode": "in internal/access/revoke_test.go, a table over slug lists {['w1'], ['w1','f1'], ['w3'] (no bound token), []}: tx = store.begin(); ids, err = RevokeBoundTo(ctx, tx, slugs); tx.commit(); assert err == nil; assert ids != nil; assert ids == sorted ids of the live tokens bound to the slugs; for each id assert store.pat(id).revoked_at == now (whole seconds); assert the already revoked token of w1 keeps its earlier revoked_at and is not in ids; assert the expired token of w1 has revoked_at == null and is not in ids; assert the token bound to w5 and alice's unbound token have revoked_at == null"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "unwanted",
+          "condition": "the transaction in which the revoking component was called is rolled back, or the component's own write fails",
+          "action": "leave every token as it was before the call",
+          "contract": "after a rollback no token's revoked_at has changed; when its write fails the component returns a non-nil error and a nil list, and the caller's transaction can still be rolled back",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the store of the previous check; a store wrapper that fails updates on demand"
+            ],
+            "pseudocode": "in internal/access/revoke_test.go, a table over {caller rolls back after a successful call, the store fails the update}: before = snapshot(revoked_at of every PAT); tx = store.begin(); ids, err = RevokeBoundTo(ctx, tx, ['w1']); for the failing store assert err != nil and ids == nil; tx.rollback(); assert snapshot(revoked_at of every PAT) == before"
+          }
+        },
+        {
+          "id": "REQ-8.3",
+          "pattern": "event_driven",
+          "condition": "a request presents a bound token after the transaction that revoked it was committed",
+          "action": "refuse the request at authentication on every route",
+          "contract": "HTTP 401 with error_type unauthenticated on a route of the token's former workspace, on a route of another workspace and on an allowlisted route; no parley.token.bound_refused event is emitted",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler with authentication, the binding guard, the scope check and the access rule installed, a store in t.TempDir(), a recording event emitter, and a probe route GET /api/v1/workspaces/:slug/probe with need read and scope git:read that answers 200 with the binding it finds in the request context"
+            ],
+            "pseudocode": "in internal/access/revoke_test.go: tok = mint on w1; assert get('/api/v1/workspaces/w1/probe').status == 200; tx = store.begin(); RevokeBoundTo(ctx, tx, ['w1']); tx.commit(); a table over {GET /api/v1/workspaces/w1/probe, GET /api/v1/workspaces/w5/probe, GET /api/v1/workspaces}: r = request with tok; assert r.status == 401; assert r.json.error.error_type == 'unauthenticated'; assert emitter.events() holds no bound_refused event"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-9",
+      "title": "The token binding sweep",
+      "rationale": "If a removal ever leaves a bound token behind, the token must stop working within one maintenance interval and not stay live for ever.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-9.1",
+          "pattern": "event_driven",
+          "condition": "the token binding sweep runs",
+          "action": "revoke, in one store transaction, every live token whose bound workspace has no workspace record, and report how many it revoked",
+          "contract": "returns (n, nil) where n is the number of tokens revoked; each of them has revoked_at set to the time of the sweep; a second sweep right after returns (0, nil)",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a store in t.TempDir() holding: two live tokens bound to slug 'gone' (no workspace record); one live token bound to active w1; one live token bound to archived w2; one live unbound token; one revoked and one expired token bound to 'gone'; an injectable clock"
+            ],
+            "pseudocode": "in internal/access/sweep_test.go: n, err = SweepBindings(ctx); assert err == nil and n == 2; assert store.pat(orphan1).revoked_at == now and store.pat(orphan2).revoked_at == now; assert the PATs of the next criterion are unchanged; n2, _ = SweepBindings(ctx); assert n2 == 0"
+          }
+        },
+        {
+          "id": "REQ-9.2",
+          "pattern": "ubiquitous",
+          "action": "for any token that is unbound, or bound to a workspace that has a record in any state including archived, or already revoked or expired, leave the token unchanged when the token binding sweep runs",
+          "check": {
+            "same_as": "REQ-9.1"
+          }
+        },
+        {
+          "id": "REQ-9.3",
+          "pattern": "unwanted",
+          "condition": "the store fails while the token binding sweep runs",
+          "action": "roll the sweep back and return the failure to the maintenance loop",
+          "contract": "returns (0, err) with a non-nil error; no token's revoked_at has changed; the function returns and does not terminate the process",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the store of the previous check wrapped so that it fails updates on demand"
+            ],
+            "pseudocode": "in internal/access/sweep_test.go: before = snapshot(revoked_at of every PAT); n, err = SweepBindings(ctx) on a store wrapper that fails the second update; assert err != nil and n == 0; assert snapshot == before"
+          }
+        },
+        {
+          "id": "REQ-9.4",
+          "pattern": "event_driven",
+          "condition": "a maintenance pass of parleyd runs",
+          "action": "run the token binding sweep as the maintenance task named token_binding_sweep",
+          "check": {
+            "same_as": "PATH-3"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-10",
+      "title": "Bound tokens from the command line",
+      "rationale": "A developer mints and reviews an agent's token from the terminal, in a script as easily as by hand.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-10.1",
+          "pattern": "event_driven",
+          "condition": "a developer runs parley tokens create with --name, --permissions and a non-empty --workspace <slug>, with or without --paths and --expires",
+          "action": "send POST /api/v1/workspaces/<slug>/tokens, with the slug percent-encoded as one path segment, in place of POST /api/v1/user/tokens, and print the answered token",
+          "contract": "exactly one request: POST to /api/v1/workspaces/<encoded slug>/tokens with Authorization: Bearer <credential> and the JSON body {name, permissions (the comma-separated list as an array), expires (90 unless given), paths (only when --paths was given)}; stdout is the response's Token object including token as one JSON document indented by 2 spaces and a newline; stderr holds a warning that the token value will not be shown again; exit status 0",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server that records each request and answers as the row names; the CLI is run through the Run function of internal/cli with --endpoint-url set to the server and --api-key k",
+              "the server answers 201 with a Token whose workspace is the slug and whose token is a PAT value"
+            ],
+            "pseudocode": "in internal/cli/tokens_test.go, a table over args {--name a --permissions git:read,git:write --workspace w1; the same with --paths 'docs/**' --paths 'src/*.go,README.md' --expires 30; --workspace 'a/b'}: code = Run(ctx, ['tokens','create', ...args], stdout, stderr); assert code == 0; assert len(server.requests) == 1; q = server.requests[0]; assert q.method == 'POST'; assert q.rawPath == '/api/v1/workspaces/w1/tokens' (and '/api/v1/workspaces/a%2Fb/tokens' for the third row); assert q.header.Authorization == 'Bearer k'; assert q.json == {name:'a', permissions:['git:read','git:write'], expires:90} or with expires:30 and paths:['docs/**','src/*.go','README.md']; assert json(stdout) == the served Token and stdout is indented by 2 spaces and ends with a newline; assert contains(stderr, 'not be shown again')"
+          }
+        },
+        {
+          "id": "REQ-10.2",
+          "pattern": "event_driven",
+          "condition": "a developer runs parley tokens list with a non-empty --workspace <slug>",
+          "action": "send GET /api/v1/workspaces/<slug>/tokens in place of GET /api/v1/user/tokens and print the response body",
+          "contract": "exactly one request: GET to /api/v1/workspaces/<encoded slug>/tokens with the credential; stdout is the response's {items, next_cursor} document indented by 2 spaces and a newline; stderr is empty; exit status 0; without --workspace the request goes to /api/v1/user/tokens",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server that records each request and answers as the row names; the CLI is run through the Run function of internal/cli with --endpoint-url set to the server and --api-key k",
+              "the server answers 200 with {items:[two Token objects], next_cursor:null}"
+            ],
+            "pseudocode": "in internal/cli/tokens_test.go, a table over {['tokens','list','--workspace','w1'] -> GET /api/v1/workspaces/w1/tokens; ['tokens','list'] -> GET /api/v1/user/tokens}: code = Run(ctx, args, stdout, stderr); assert code == 0; assert server.requests[0].method == 'GET' and server.requests[0].path per the row; assert json(stdout) == the served list; assert stderr == ''"
+          }
+        },
+        {
+          "id": "REQ-10.3",
+          "pattern": "unwanted",
+          "condition": "the hub answers parley tokens create --workspace or parley tokens list --workspace with an error",
+          "action": "print the hub's error envelope on stderr as received and print no result",
+          "contract": "exit status 1; stderr holds the envelope with the hub's code, message and error_type; stdout is empty; no warning about a token value is printed",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server that records each request and answers as the row names; the CLI is run through the Run function of internal/cli with --endpoint-url set to the server and --api-key k"
+            ],
+            "pseudocode": "in internal/cli/tokens_test.go, a table over commands {create --workspace w1, list --workspace w1} and served errors {403 token_bound, 403 insufficient_scope, 404 not_found, 409 workspace_archived}: code = Run(...); assert code == 1; assert stdout == ''; assert json(stderr).error.error_type == the served type and .code == the served status; assert not contains(stderr, 'not be shown again')"
+          }
+        },
+        {
+          "id": "REQ-10.4",
+          "pattern": "unwanted",
+          "condition": "a developer runs parley tokens create or parley tokens list with --workspace given an empty value",
+          "action": "fail before any request, so that a bound token is never silently replaced by an unbound one",
+          "contract": "exit status 2; stderr holds the error envelope with code 0 and error_type usage_error and names --workspace; stdout is empty; the hub receives no request",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server that records each request and answers as the row names; the CLI is run through the Run function of internal/cli with --endpoint-url set to the server and --api-key k"
+            ],
+            "pseudocode": "in internal/cli/tokens_test.go, a table over {['tokens','create','--name','a','--permissions','git:read','--workspace',''], ['tokens','list','--workspace','']}: code = Run(ctx, args, stdout, stderr); assert code == 2; assert json(stderr).error.error_type == 'usage_error' and json(stderr).error.code == 0; assert contains(stderr, '--workspace'); assert stdout == ''; assert len(server.requests) == 0"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "A developer mints a bound token from the CLI and an agent is confined by it",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "runs parley tokens create --name agent --permissions git:read --workspace w1 with an API key"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends POST /api/v1/workspaces/w1/tokens with the body built from the flags"
+        },
+        {
+          "actor": "parleyd",
+          "action": "authenticates the API key, finds the caller is the owner of w1, writes the bound token and the parley.token.bind event in one transaction and answers 201"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints the token object with its value on stdout and the show-once warning on stderr"
+        },
+        {
+          "actor": "agent",
+          "action": "presents the token value on a route of w1, on a route of another workspace of the same owner and on GET /api/v1/user"
+        },
+        {
+          "actor": "parleyd",
+          "action": "passes the first request to the route, answers the second 404 workspace not found and the third 403 token_bound"
+        },
+        {
+          "actor": "developer",
+          "action": "runs parley tokens list --workspace w1 and sees the token without its value"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parley CLI command tree and HTTP client",
+          "HTTP server pipeline of internal/server",
+          "authentication",
+          "scope check",
+          "workspace access rule",
+          "binding guard",
+          "bound-token routes",
+          "store",
+          "the event component of internal/event (package 52)"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with a store in a temporary directory, user alice with an API key, and the workspaces w1 and w5 owned by alice",
+          "the test registers one probe route GET /api/v1/workspaces/:slug/probe (need read, scope git:read) to stand for the workspace routes of later packages; events go to the real event component of package 52, and the test reads them back from its event log by position"
+        ],
+        "end_state": [
+          "the CLI's stdout parses as a Token whose workspace is w1 and whose token authenticates",
+          "with that token the probe answers 200 on w1 and 404 not_found on w5, and GET /api/v1/user answers 403 token_bound",
+          "parley tokens list --workspace w1 prints one item with that token_id and no token member",
+          "the event log of package 52 holds one parley.token.bind event for the token"
+        ],
+        "pseudocode": "in test/e2e/bound_tokens_test.go: out = parley('tokens','create','--name','agent','--permissions','git:read','--workspace','w1'); tok = json(out.stdout); assert out.code == 0 and tok.workspace == 'w1'; assert get('/api/v1/workspaces/w1/probe', tok.token).status == 200; r = get('/api/v1/workspaces/w5/probe', tok.token); assert r.status == 404 and r.json.error.error_type == 'not_found'; u = get('/api/v1/user', tok.token); assert u.status == 403 and u.json.error.error_type == 'token_bound'; l = json(parley('tokens','list','--workspace','w1').stdout); assert len(l.items) == 1 and l.items[0].token_id == tok.token_id and 'token' not in l.items[0]; assert the event log read through internal/event holds one parley.token.bind with resource_id tok.token_id"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "An agent leaves its binding repeatedly and the owner gets rate-limited refusal events",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "sends three requests with a bound token within one minute: to another workspace, to an unknown slug and to GET /api/v1/user/tokens"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers 404, 404 and 403 token_bound from the binding guard, emits one parley.token.bound_refused event for the first refusal and counts the other two"
+        },
+        {
+          "actor": "agent",
+          "action": "sends one more request to another workspace after the minute has passed"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers 404 and emits a second parley.token.bound_refused event with suppressed 2"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "HTTP server pipeline of internal/server",
+          "authentication",
+          "binding guard",
+          "refusal limiter",
+          "store",
+          "the event component of internal/event (package 52)"
+        ],
+        "setup": [
+          "the in-process hub of PATH-1 with the event component of package 52 and a limiter clock the test advances",
+          "a token bound to w1"
+        ],
+        "end_state": [
+          "the four responses are 404, 404, 403 and 404",
+          "the event log holds exactly two parley.token.bound_refused events for the token; the first has suppressed 0, the second has suppressed 2, and both have workspace w1"
+        ],
+        "pseudocode": "in test/e2e/bound_tokens_test.go: assert get('/api/v1/workspaces/w5/probe', tok).status == 404; assert get('/api/v1/workspaces/nosuch/probe', tok).status == 404; assert get('/api/v1/user/tokens', tok).status == 403; clock.advance(61s); assert get('/api/v1/workspaces/w5/probe', tok).status == 404; evs = the events of type parley.token.bound_refused read from the event log through internal/event; assert len(evs) == 2; assert evs[0].metadata.suppressed == 0 and evs[1].metadata.suppressed == 2; assert evs[0].workspace == 'w1' and evs[0].metadata.requested_workspace == 'w5'"
+      }
+    },
+    {
+      "id": "PATH-3",
+      "title": "A maintenance pass revokes a token whose workspace is gone",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "holds a live token bound to a workspace whose record was removed without revoking the token"
+        },
+        {
+          "actor": "parleyd",
+          "action": "runs a maintenance pass, which runs the task named token_binding_sweep and revokes the token"
+        },
+        {
+          "actor": "agent",
+          "action": "sends a request with the token"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers 401 unauthenticated"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "maintenance task registry",
+          "token binding sweep",
+          "authentication",
+          "HTTP server pipeline of internal/server",
+          "store"
+        ],
+        "setup": [
+          "the in-process hub of PATH-1 with its maintenance tasks registered as parleyd registers them",
+          "a live token bound to w1 and a live token bound to slug 'gone', which has no workspace record (the test removes the record directly in the store)"
+        ],
+        "end_state": [
+          "after one maintenance pass the token bound to 'gone' has revoked_at set and a request with it answers 401",
+          "the token bound to w1 still answers 200 on the probe route of w1",
+          "the registry lists a task named token_binding_sweep"
+        ],
+        "pseudocode": "in test/e2e/bound_tokens_test.go: assert 'token_binding_sweep' in hub.maintenance.taskNames(); hub.maintenance.runPass(ctx); r = get('/api/v1/workspaces/gone/probe', orphanTok); assert r.status == 401 and r.json.error.error_type == 'unauthenticated'; assert get('/api/v1/workspaces/w1/probe', liveTok).status == 200"
+      }
+    }
+  ]
+}

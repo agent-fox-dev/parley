@@ -1,0 +1,340 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "47",
+  "spec_name": "sandbox_lifecycle_and_checkpoints",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/sandbox/... ./internal/cli/... ./internal/hub/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "45",
+      "reason": "provides the sandbox record with its conditional transitions, credential and secret resolution, the hub credential, the quota check, the provisioning work with its policy composer and restorer, the delete and purge hooks this package runs, the scrubbing function, the get route and the sandbox command group"
+    },
+    {
+      "spec": "09",
+      "reason": "provides the command declaration, HTTP client, output, exit codes and the shared --wait that the five commands are built on"
+    },
+    {
+      "spec": "52",
+      "reason": "provides the event writer through which every sandbox event is written with its state change"
+    },
+    {
+      "spec": "14",
+      "reason": "provides the Teardown set in which the sandbox remover, the archive observer and the remover of owned data are registered, and RemoveOwned through which a removed fork reaches them"
+    },
+    {
+      "spec": "06",
+      "reason": "owns and exports the operations that revoke one token by its id and set the expiry of one token by its id"
+    },
+    {
+      "spec": "16",
+      "reason": "declares the sandbox collaborator whose two operations this package exports"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Save a sandbox's working directory as a checkpoint",
+      "criteria": [
+        "REQ-1",
+        "REQ-9.3"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/sandbox/checkpoint_test.go and internal/sandbox/scrub_test.go as table-driven tests over the fake runtime client of package 44, with its exec and file transfer backed by a real directory and the real git command (the fake's host-directory mode), and confirm they fail",
+        "Pass every runtime error text this package stores, emits, logs or returns through the scrubbing function of package 45 for the sandbox, which replaces the sandbox's resolved secret values and its hub credential and cuts the result to 1,024 bytes; write no second scrubbing function",
+        "Build the checkpoint operation in internal/sandbox/checkpoint.go: it takes a sandbox and an actor, returns the stored checkpoint, and does nothing at all (no exec, no event, checkpoint stays null) for a sandbox without a hub credential (hub_access none)",
+        "Through the runtime client's exec, as the workload user in the working directory, ask git whether the directory is a work tree; when it is not, or the sandbox was created with checkout false, store {at, ok: true, error: null, refs: []} and write the event",
+        "List the local branches with their heads and keep those whose head commit the workspace's repository does not have, asked through internal/gitrepo for the sandbox's workspace (for a fork, through the fork storage of package 15)",
+        "When `git status --porcelain` reports changes, build the extra commit without touching the sandbox's index, branch or working tree: add everything git does not ignore to a temporary index file, leaving out untracked files above the size limit (100 MiB by default, an option of the component so tests can lower it), write the tree and create a commit whose only parent is the current head; name the entry after the checked-out branch, or HEAD when none is checked out",
+        "Create one git bundle of the kept heads and the extra commit inside the sandbox, read it through the runtime client's file download into a temporary file on the hub, fetch it into the workspace's repository and set refs/parley/sandboxes/<sandbox id>/<branch> for each entry in one update; remove the bundle on both sides afterwards",
+        "Store {at, ok, error, refs} on the sandbox and write one parley.sandbox.checkpoint event with metadata {ok, refs, error} in the same transaction through the event writer of package 52, with the given actor; at is the clock's time in whole seconds UTC, refs are sorted by branch, error is `skipped: ` plus the skipped paths joined by `, ` when files were left out",
+        "Bound the whole attempt to 5 minutes with a context; on any failure store no ref, keep the refs of the previous successful checkpoint in the record, set ok false and the scrubbed reason, write the event, and return the failure to the caller without changing the sandbox's state",
+        "Add 1 to parley_sandbox_checkpoints_total through the metrics recorder of package 44 for every attempt: result ok when a ref was stored, empty when the checkpoint is ok without refs, failed otherwise; nothing for a sandbox without a hub credential",
+        "Add nothing that creates a change, a version or a push event: the refs are written directly through internal/gitrepo, not through the push path"
+      ],
+      "touches": [
+        "internal/sandbox/checkpoint.go",
+        "internal/sandbox/checkpoint_test.go",
+        "internal/sandbox/scrub_test.go",
+        "internal/sandbox/"
+      ],
+      "done_when": [
+        "`go test ./internal/sandbox/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Serve the checkpoint route",
+      "criteria": [
+        "REQ-2.1",
+        "REQ-2.2",
+        "REQ-2.3"
+      ],
+      "steps": [
+        "Add the route's behaviours to internal/sandbox/checkpoint_test.go with net/http/httptest and confirm they fail",
+        "Register POST /api/v1/workspaces/{slug}/sandboxes/{id}/checkpoint on the router behind the route guard of package 44 with the need sandboxes:write and write access, loading the sandbox by id within the workspace as the get route of package 45 does (unknown, foreign or removed id: 404 sandbox_not_found)",
+        "Answer 409 sandbox_not_ready for every state but ready, before any runtime call",
+        "Call the checkpoint operation with the caller as actor; on success answer 200 with the sandbox object as package 45 renders it; for a sandbox with hub_access none answer 200 with checkpoint null",
+        "When the operation returns a failure answer 502 sandbox_runtime_error through the runtime-error answer of package 44 with the scrubbed reason as its message; the failure is already recorded on the sandbox by the operation"
+      ],
+      "touches": [
+        "internal/sandbox/checkpoint.go",
+        "internal/sandbox/checkpoint_test.go",
+        "internal/sandbox/routes.go"
+      ],
+      "done_when": [
+        "`go test ./internal/sandbox/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Stop a sandbox on request",
+      "criteria": [
+        "REQ-3.1",
+        "REQ-3.2",
+        "REQ-3.3"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/sandbox/stop_test.go and confirm they fail",
+        "Build the stop operation in internal/sandbox/stop.go taking a sandbox, a reason (api, idle or archived) and an actor; for a sandbox that is not ready it returns the sandbox unchanged without any call",
+        "For a ready sandbox take a checkpoint first when the profile snapshot's checkpoint flag is true; a checkpoint failure is ignored here because the operation recorded it",
+        "Ask the runtime client to release the sandbox's compute while keeping its working directory with StopSandbox of package 44's runtime client; when the runtime is unreachable or returns an error, the kind unsupported included, return a runtime error and change nothing",
+        "In one store transaction apply the transition ready to stopped through the conditional transition of package 45 with state_reason set to the reason, revoke the hub credential through the token revocation that package 45's credential component uses, RevokeTokenByID(tx, token_id) of package 06, and write parley.sandbox.stop with metadata {reason}; when the conditional transition finds another state, write nothing and return the sandbox as it is now",
+        "Register POST /api/v1/workspaces/{slug}/sandboxes/{id}/stop behind the route guard with sandboxes:write and write access; answer 200 with the sandbox object in every state, and 502 sandbox_runtime_error when the operation returned a runtime error",
+        "Take the admin token as a permitted caller of this route, as the guard of package 44 allows for stop and delete"
+      ],
+      "touches": [
+        "internal/sandbox/stop.go",
+        "internal/sandbox/stop_test.go",
+        "internal/sandbox/routes.go"
+      ],
+      "done_when": [
+        "`go test ./internal/sandbox/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Start a stopped or ended sandbox again",
+      "criteria": [
+        "REQ-4"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/sandbox/start_test.go and confirm they fail",
+        "Build the start operation in internal/sandbox/start.go: for a provisioning or ready sandbox return it unchanged; for a deleted one return the sandbox_deleted refusal (409)",
+        "Refuse with 409 workspace_archived when the sandbox's workspace is archived and with 409 parent_archived when it is a fork whose parent is archived, using the workspace state check package 45 uses at creation",
+        "Resolve the sandbox's credentials and exposed secrets again with the resolution step of package 45, fed from the sandbox's stored snapshot instead of the live profile; the snapshot package 45 stores tells required names from optional ones; a missing required name is 422 credential_missing with the names and scopes searched, an unreadable secret store is 503 secrets_unavailable, a missing optional name is dropped from the sandbox's credentials or exposed_secrets",
+        "In one transaction: run the quota check that package 45 exports, the same function creation calls (the count and the transition are atomic; over a limit is 429 sandbox_capacity with limit, maximum and current), mint a new hub credential through package 45's credential component with the scopes and paths of the recorded hub_access, the sandbox's creator as owner and the sandbox's expires_at as expiry (skip this for hub_access none), apply the conditional transition from stopped, completed or failed to provisioning, clear exit_code, state_reason and ended_at, and write parley.sandbox.start with the caller as actor",
+        "Queue the sandbox for the durable provisioning work of package 45 in the same transaction, marked as a start so that the work registers the freshly resolved values with the runtime, calls StartSandbox with the policy value of the policy composer registered with package 45 instead of CreateSandbox, and calls RunMain again when the sandbox has a command",
+        "Do not consult the configured profile by name: a sandbox whose profile was removed from the configuration starts from its snapshot",
+        "Register POST /api/v1/workspaces/{slug}/sandboxes/{id}/start behind the route guard with sandboxes:write and write access; answer 200 with the sandbox object"
+      ],
+      "touches": [
+        "internal/sandbox/start.go",
+        "internal/sandbox/start_test.go",
+        "internal/sandbox/routes.go",
+        "internal/sandbox/"
+      ],
+      "done_when": [
+        "`go test ./internal/sandbox/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Seed a working directory from a checkpoint",
+      "criteria": [
+        "REQ-5"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/sandbox/restore_test.go and confirm they fail",
+        "Build the restore operation in internal/sandbox/restore.go: given a target sandbox whose checkout is done and a source checkpoint (its refs list and the source sandbox id), it returns nil at once when the list is empty",
+        "Resolve every refs/parley/sandboxes/<source id>/<branch> of the list in the workspace's repository; a ref that does not resolve is a failure whose text names the ref",
+        "Create one bundle of those refs on the hub through internal/gitrepo, write it into the target sandbox through the runtime client's file upload, fetch from it with git inside the sandbox through exec, and remove the bundle on both sides",
+        "For each entry set the local branch to the checkpointed commit; for a dirty entry set it to the parent of the checkpointed commit; when the branch is the one checked out, move the working tree and index to the new head",
+        "For a dirty entry whose branch is checked out, write the tree of the extra commit into the working tree only, leaving the index at the branch head, so that modified files show as modified, new files as untracked and deleted files as deleted; when another branch is checked out, do nothing more for that entry",
+        "Connect the operation to the provisioning work of package 45 at two places: after the checkout of a sandbox created with restore_from (source: the named sandbox's checkpoint), and in a start when the runtime client reports that the sandbox's working directory is gone (redo the checkout step of package 45, then restore from the sandbox's own checkpoint); the status of GetSandbox says whether the runtime still holds the working directory; register the operation as the restorer of package 45; leave the validation of restore_from to package 45",
+        "On a failure of the restore end the provisioning as package 45 ends a failed checkout: state failed with reason checkout_failed, parley.sandbox.fail with the scrubbed error, and removal at the runtime of what a create made"
+      ],
+      "touches": [
+        "internal/sandbox/restore.go",
+        "internal/sandbox/restore_test.go",
+        "internal/sandbox/"
+      ],
+      "done_when": [
+        "`go test ./internal/sandbox/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Delete a sandbox on request",
+      "criteria": [
+        "REQ-7.1",
+        "REQ-7.2",
+        "REQ-7.3",
+        "REQ-7.4",
+        "REQ-6.5",
+        "REQ-2.5",
+        "REQ-3.4"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/sandbox/delete_test.go, the admin-token rows to internal/sandbox/lifecycle_access_test.go and the racing cases to internal/sandbox/stop_test.go, and confirm they fail",
+        "Use the two hook lists package 45 declares in internal/sandbox/hooks.go and register nothing with them: run the delete hooks, with the transaction and the sandbox id, in the transaction that marks a record deleted, and the purge hooks in every transaction that removes a record",
+        "Build the delete operation in internal/sandbox/delete.go taking a sandbox, a reason (api, expired or workspace_deleted), an actor and a checkpoint switch; for a deleted sandbox it returns at once",
+        "Take a checkpoint only when the switch is on, the reason is not workspace_deleted and the sandbox is ready; ignore its failure",
+        "Delete the sandbox and every provider registered for it at the runtime with DeleteSandbox and DeleteProvider; when the runtime is unreachable or returns an error, go on: reconciliation removes the remains",
+        "In one transaction apply the conditional transition from any state but deleted to deleted with state_reason and ended_at, revoke the hub credential, run the delete hooks and write parley.sandbox.delete with metadata {reason}; when the transition finds the record already deleted, write nothing",
+        "Register DELETE /api/v1/workspaces/{slug}/sandboxes/{id} behind the route guard with sandboxes:write and write access, admin token permitted; read the checkpoint query (true or false; anything else is 400 invalid_request; absent means the profile snapshot's checkpoint flag); answer 204 with an empty body, also for an already deleted sandbox",
+        "Make sure every transition this package applies (stop, start, delete, and later expiry, idle and reconcile) goes through the conditional transition on the expected state and writes its event only when the transition applied, and run the racing tests with the race detector"
+      ],
+      "touches": [
+        "internal/sandbox/delete.go",
+        "internal/sandbox/delete_test.go",
+        "internal/sandbox/lifecycle_access_test.go",
+        "internal/sandbox/stop_test.go",
+        "internal/sandbox/routes.go"
+      ],
+      "done_when": [
+        "`go test -race ./internal/sandbox/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Extend a sandbox and enforce idle and time limits",
+      "criteria": [
+        "REQ-6.1",
+        "REQ-6.2",
+        "REQ-6.3",
+        "REQ-6.4",
+        "REQ-3.5",
+        "REQ-2.4"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/sandbox/extend_test.go, internal/sandbox/timers_test.go and the access table to internal/sandbox/lifecycle_access_test.go, and confirm they fail",
+        "Register PATCH /api/v1/workspaces/{slug}/sandboxes/{id} behind the route guard with sandboxes:write and write access; accept the members ttl, purpose and labels, each optional; 409 sandbox_deleted for a deleted sandbox",
+        "Validate before changing anything, answering 400 invalid_request: ttl is a duration string of at least 1 minute and at most the profile ttl recorded in the sandbox's snapshot; purpose has at most 200 characters; labels pass the label validator of package 45",
+        "Apply in one transaction: expires_at is the clock's time plus ttl, cut to the fork's expires_at on a task fork; the hub credential's expiry moves to the same instant (through SetTokenExpiryByID(tx, token_id, instant), the operation of internal/identity that sets the expiry of one token by its id, which package 06 owns and exports, in the same transaction; edit no file of internal/identity); purpose and labels are replaced when present; no event is written; answer 200 with the sandbox object",
+        "Build the idle pass in internal/sandbox/timers.go: for every ready sandbox with idle_timeout_seconds above 0 whose last_activity_at is more than that many seconds before the clock's time, call the stop operation with reason idle and actor system; a runtime failure leaves the sandbox for the next pass",
+        "Build the expiry pass: for every sandbox not deleted whose expires_at is at or before the clock's time, call the delete operation with actor system; when the sandbox's workspace is a fork whose own expires_at is at or before the clock's time, use reason workspace_deleted with the checkpoint switch off, otherwise reason expired with the switch set to the profile snapshot's checkpoint flag",
+        "Run both passes from one background loop registered with the hub's background work of package 03: the idle pass every minute, the expiry pass every minute and whenever a timer set to the earliest expires_at of a live sandbox fires; re-arm the timer after a create, a start, a PATCH of ttl and a delete; use the replaceable clock for ticks and timers",
+        "Verify the access table over all five lifecycle routes now that they exist: disabled feature, missing scope, read-only member, no read access, and unknown, foreign or removed ids, each without a runtime call or a state change"
+      ],
+      "touches": [
+        "internal/sandbox/extend.go",
+        "internal/sandbox/extend_test.go",
+        "internal/sandbox/timers.go",
+        "internal/sandbox/timers_test.go",
+        "internal/sandbox/lifecycle_access_test.go",
+        "internal/sandbox/routes.go"
+      ],
+      "done_when": [
+        "`go test ./internal/sandbox/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Follow the workspace: archive, deletion and record cleanup",
+      "criteria": [
+        "REQ-3.6",
+        "REQ-7.5",
+        "REQ-7.6",
+        "REQ-7.7"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/sandbox/teardown_test.go and internal/sandbox/cleanup_test.go and confirm they fail",
+        "In internal/sandbox/teardown.go build the sandbox remover: given workspace slugs it calls the delete operation for every sandbox of those slugs that is not deleted, with reason workspace_deleted, actor system and the checkpoint switch off; it returns an error only when a record could not be written",
+        "Build the query that reports whether a slug has a sandbox in state provisioning or ready",
+        "Build the archive observer: given a workspace slug and the slugs of its forks it calls the stop operation with reason archived and actor system for every ready sandbox of them, goes on after a failure and returns one error naming the sandboxes it could not stop",
+        "Build the remover of owned data: given a transaction and one slug it runs the purge hooks of package 45 for each sandbox record of the slug and removes the records in that transaction; for a fork it also deletes the fork's refs under refs/parley/sandboxes/ through the fork storage of package 15; it revokes no token and returns an error only, as the Remover of package 14 is declared",
+        "In internal/sandbox/cleanup.go build the task that removes every deleted record whose ended_at is more than 24 hours before the clock's time, running the purge hooks for the id in the same transaction, and register it with the maintenance task registry of package 03 under the name sandbox_record_cleanup",
+        "In internal/hub/sandbox.go register these collaborators only in the Teardown set of package 14 (internal/workspace/teardown.go): the SandboxRemover (takes the slugs), an ArchiveObserver in its list of archive observers (takes the slug and the fork slugs) and a Remover of owned data (takes the transaction and one slug and returns an error only); register nothing with internal/fork, because a fork that is deleted or expires reaches the remover of owned data through RemoveOwned of package 14, which package 16 calls; export the delete of a slug's sandboxes (reason, checkpoint switch) and the provisioning-or-ready query with the method set of the sandbox collaborator package 16 declares, and pass them where the composition builds package 16's removal component"
+      ],
+      "touches": [
+        "internal/sandbox/teardown.go",
+        "internal/sandbox/teardown_test.go",
+        "internal/sandbox/cleanup.go",
+        "internal/sandbox/cleanup_test.go",
+        "internal/hub/sandbox.go"
+      ],
+      "done_when": [
+        "`go test ./internal/sandbox/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Reconcile sandbox records with the runtime",
+      "criteria": [
+        "REQ-8"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/sandbox/reconcile_test.go and confirm they fail",
+        "Build the reconcile pass in internal/sandbox/reconcile.go: it first asks the runtime client for every sandbox and provider that carries this hub's label, with each sandbox's phase (running, restarting or reconnecting, main process exited with a code); through ListSandboxes and ListProviders of package 44's runtime client, whose sandbox status carries the state and the end of the main process; when the runtime cannot be reached, skip every runtime-dependent step, log one line and still run the expiry pass",
+        "For a ready record whose main process exited: take a checkpoint when the snapshot's checkpoint flag is true, ask the runtime to release the compute, then in one transaction apply ready to completed (code 0) or failed with reason exit (other codes), set exit_code and ended_at, revoke the hub credential and write parley.sandbox.exit with metadata {exit_code} and actor system",
+        "For a ready record the runtime reports as restarting or reconnecting: apply ready to provisioning and set a stored marker that the runtime caused it; for a provisioning record with that marker that the runtime reports as running: apply provisioning to ready and clear the marker; write no event in either case and never touch a provisioning record without the marker",
+        "For a ready record, or a provisioning record for which the provisioning work of package 45 recorded the creation at the runtime, that the runtime's list does not contain: apply the transition to failed with reason runtime_error and ended_at, revoke the hub credential and write parley.sandbox.fail with metadata {reason, error} and actor system",
+        "Delete at the runtime every labelled sandbox and provider whose sandbox id has no record or a deleted record; touch nothing without the hub's label and nothing of a live record",
+        "End the pass with the idle pass and the expiry pass, so that work overdue after a hub outage is done",
+        "Register the first pass as a start hook of package 03 that always returns nil, and the repeating pass as background work that runs every [sandbox].reconcile_interval of package 44's configuration on the replaceable clock"
+      ],
+      "touches": [
+        "internal/sandbox/reconcile.go",
+        "internal/sandbox/reconcile_test.go",
+        "internal/sandbox/"
+      ],
+      "done_when": [
+        "`go test ./internal/sandbox/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Leave sandboxes alone when the hub stops or restarts",
+      "criteria": [
+        "REQ-9.1",
+        "REQ-9.2"
+      ],
+      "steps": [
+        "Add the shutdown behaviour to internal/sandbox/shutdown_test.go and the restart scenario to test/e2e/sandbox_lifecycle_test.go and confirm they fail",
+        "Make the idle, expiry and reconcile loops end when the context of the hub's background work is cancelled, with a grace of 15 seconds; a pass in progress stops before its next runtime call and a checkpoint in progress is abandoned without recording a failure",
+        "Add no shutdown step that stops, deletes or otherwise changes a sandbox or a provider at the runtime, and none that changes a sandbox record",
+        "Compose the pieces in internal/hub/sandbox.go when the configuration has a [sandbox] section: the start hook, the background loops, the maintenance task and the routes of this package; with sandboxes disabled register none of the background work",
+        "Start a hub twice on one data directory with one fake runtime in the end-to-end test and check that a ready sandbox is ready after the second start and that an exit during the outage is recorded by the start pass"
+      ],
+      "touches": [
+        "internal/sandbox/shutdown_test.go",
+        "internal/sandbox/timers.go",
+        "internal/sandbox/reconcile.go",
+        "internal/hub/sandbox.go",
+        "test/e2e/sandbox_lifecycle_test.go"
+      ],
+      "done_when": [
+        "`go test ./internal/sandbox/... -count=1` passes",
+        "`go test ./test/e2e/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 11,
+      "title": "Add the lifecycle commands to the CLI",
+      "criteria": [
+        "REQ-10"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/cli/sandbox_test.go against an httptest server and confirm they fail",
+        "Declare in internal/cli/sandbox.go, with the command declaration of package 09 and under the sandbox group package 45 created, the commands checkpoint, stop, start, extend and delete, each taking exactly the two positional arguments <workspace-slug> and <id>; a wrong count is a usage error (exit 2) before any request",
+        "checkpoint sends POST …/checkpoint and stop sends POST …/stop; both print the response body",
+        "start sends POST …/start and takes --wait, --timeout and --poll-interval; with --wait hand the answered sandbox to the shared wait of package 09 polling GET …/sandboxes/{id}, with terminal states ready and completed as successful and failed, stopped and deleted as unsuccessful",
+        "extend takes the required flag --ttl <duration> and sends PATCH …/sandboxes/{id} with body {\"ttl\": value}; a missing --ttl is a usage error",
+        "delete takes --no-checkpoint, sends DELETE …/sandboxes/{id} with the query checkpoint=false only when the flag is given, and prints {\"id\":\"<id>\",\"status\":\"deleted\"} on a 204",
+        "Give each command its help text and route through the help mechanism of package 09; build every path with the client's segment encoding"
+      ],
+      "touches": [
+        "internal/cli/sandbox.go",
+        "internal/cli/sandbox_test.go",
+        "test/e2e/sandbox_lifecycle_test.go"
+      ],
+      "done_when": [
+        "`go test ./internal/cli/... -count=1` passes"
+      ]
+    }
+  ]
+}

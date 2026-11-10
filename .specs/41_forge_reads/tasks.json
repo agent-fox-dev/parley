@@ -1,0 +1,297 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "41",
+  "spec_name": "forge_reads",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/forge/... ./internal/cli/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "10",
+      "reason": "reads the workspace record (git_url, workspace_mode, upstream_url, kind, parent), the settings reader and the origin credential resolution"
+    },
+    {
+      "spec": "39",
+      "reason": "reads the workspace secrets a forge credential is made of and whether FORGE_WEBHOOK_SECRET exists"
+    },
+    {
+      "spec": "09",
+      "reason": "the read commands are built on the CLI's HTTP client, output and exit codes"
+    },
+    {
+      "spec": "11",
+      "reason": "registers the settings forge_api_url and upstream_forge_api_url and the PATCH route the end-to-end flow sets them with"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Resolve a remote target into repository, forge kind, API URL and credential",
+      "criteria": [
+        "REQ-1.1",
+        "REQ-1.2",
+        "REQ-1.3",
+        "REQ-1.6",
+        "REQ-1.7"
+      ],
+      "steps": [
+        "Add the resolution behaviours to internal/forge/resolve_test.go as table-driven tests and confirm they fail",
+        "Add the remote URL parser: accept https, http, ssh and git URLs and the scp form user@host:owner/name; lower-case the host, drop a leading www. and any port, ignore userinfo, remove one trailing .git; name is the last path segment, owner the segments before it joined by /; fewer than two segments means no repository",
+        "Add the forge kind decision: the API URL setting first when it contains exactly one of github and gitlab, then the host by the same test, else unknown; compare in lower case",
+        "Add the API URL rule: the setting with one trailing / removed, else https://api.github.com for github.com, https://<host>/api/v3 for another GitHub host, https://<host>/api/v4 for GitLab; append /api/v4 to a GitLab URL that does not end in it",
+        "Add the setting check used at request time: an absolute https URL with a host and without userinfo, query and fragment; an empty setting is valid and means the default",
+        "Add credential resolution on package 39's Get(scope, scope id, name), taken as a one-method reader so tests can supply a map: for origin use package 10's ResolveOriginCredential (a non-empty GIT_PAT, else GIT_USERNAME with GIT_PASSWORD, the password being the token); for upstream try UPSTREAM_GIT_PAT when set and not empty, then UPSTREAM_GIT_USERNAME with UPSTREAM_GIT_PASSWORD when both are set and not empty, then the origin resolution, which is the order of package 31; a user name without a password is skipped; read on every call, keep nothing between calls; return a read failure as an error",
+        "Add one Resolve operation that takes a workspace record, a target and the two settings and returns repository, kind, API URL and credential, or the typed failures forge_api_url_invalid and forge_unknown in that order; export it, with ParseRemote, for packages 42 and 43",
+        "Read no process environment variable anywhere in this resolution"
+      ],
+      "touches": [
+        "internal/forge/resolve.go",
+        "internal/forge/resolve_test.go",
+        "internal/forge/types.go"
+      ],
+      "done_when": [
+        "`go test ./internal/forge/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Send forge requests under the outbound call rules",
+      "criteria": [
+        "REQ-4.1",
+        "REQ-4.3",
+        "REQ-4.4",
+        "REQ-4.7"
+      ],
+      "steps": [
+        "Add internal/forge/forgetest: a fake forge on net/http/httptest (TLS and plain) with a GitHub mode and a GitLab mode, which records every request (method, path, query, headers) and lets a test set the entities it holds and script the next answers (status, headers, body, delay, redirect); packages 42 and 43 reuse it",
+        "Add the client behaviours to internal/forge/client_test.go and confirm they fail",
+        "Add the forge client: constructed once with the HTTP transport (a parameter, so the hub's composition and tests can supply one that trusts a test certificate), the clock, the deadline (30 s in production), the response size limit (8,388,608 bytes in production) and the build version from internal/buildinfo",
+        "Set User-Agent: parleyd/<version> on every request, Authorization: Bearer <token> when the credential kind is pat or basic and no authentication header otherwise; add Accept: application/vnd.github+json on GitHub",
+        "Read HTTPS_PROXY, HTTP_PROXY and NO_PROXY once when the client is built, through golang.org/x/net/http/httpproxy, and use the result as the transport's proxy function",
+        "Follow a redirect only when scheme, host and port equal those of the request and fewer than 10 redirects were followed; otherwise stop before contacting the target and return a typed redirect failure",
+        "Give each request its own deadline and return a typed timeout failure when it passes; read the body up to the size limit plus one byte and return a typed unreadable failure when the limit is passed",
+        "Detect a rate-limited answer (429, or 403 with X-RateLimit-Remaining: 0 or a Retry-After header) and its stated wait (Retry-After seconds, else X-RateLimit-Reset or RateLimit-Reset minus the clock's now); when the wait is at most the time left of the request's deadline, sleep through the clock and send the request once more with a new deadline; otherwise, or when the retry is rate limited, return a typed rate-limit failure carrying the last stated wait",
+        "Make the request run on a context of its own bounded by the deadline, so that package 42 can let a write finish after its caller disconnects"
+      ],
+      "touches": [
+        "internal/forge/client.go",
+        "internal/forge/client_test.go",
+        "internal/forge/forgetest/fake.go",
+        "go.mod",
+        "go.sum"
+      ],
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Run the shared checks of a forge route and act on a fork's parent",
+      "criteria": [
+        "REQ-2",
+        "REQ-3.1",
+        "REQ-3.2",
+        "REQ-3.3",
+        "REQ-1.4",
+        "REQ-1.5",
+        "REQ-1.8"
+      ],
+      "steps": [
+        "Add the route behaviours to internal/forge/route_test.go over net/http/httptest, with the fake forge counting requests, and confirm they fail",
+        "Add a route helper that registers a forge route on the router of package 02 with its scope (forge:read here; package 42 passes forge:write) and its access need (read here), so that scope check and access rule run in the order of PLAT-FR-013 before the handler",
+        "When the slug names a task fork, switch to the fork's parent as the workspace whose record, settings and secrets are used, and require the route's need on the parent from the access component by the level of the user behind the credential; answer 403 forbidden without it; do not apply a token's binding to the parent's slug",
+        "Parse target: absent or origin selects origin; upstream selects upstream when the workspace is a carry-patch workspace with an upstream_url, else 400 workspace_mode_mismatch; given twice or any other value is 400 invalid_request",
+        "Add ParseNumber for :number (digits only, no sign, no leading zero, 1 to 2,147,483,647; failure message 'number must be a positive decimal integer') and export it for the CLI and package 42",
+        "Run the handler's steps in the fixed order target, path and query parameters, forge configuration, call: the helper takes a parameter-validation callback from each route and calls Resolve only after it passed, so a request refused earlier never reaches the client",
+        "Map the Resolve failures to 422 forge_api_url_invalid and 422 forge_unknown (the message names forge_api_url or upstream_forge_api_url when the kind is unknown) and a secret read failure to 500 internal",
+        "Apply no state precondition on reads: do not call the status guard of package 10, so pending, failed, archived and busy workspaces are served; leave a hook where package 42 adds the archived checks and the credential check for writes",
+        "Register the forge component in internal/hub/hub.go with the workspace store, the settings reader, the secret reader, the access component and the client"
+      ],
+      "touches": [
+        "internal/forge/route.go",
+        "internal/forge/route_test.go",
+        "internal/forge/service.go",
+        "internal/hub/hub.go"
+      ],
+      "depends_on": [
+        2
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Map forge failures to hub errors and scrub their messages",
+      "criteria": [
+        "REQ-6",
+        "REQ-4.2",
+        "REQ-4.5",
+        "REQ-4.6",
+        "REQ-4.8"
+      ],
+      "steps": [
+        "Add the failure behaviours to internal/forge/errors_test.go and internal/forge/client_test.go, driving them through a read route against the fake forge, and confirm they fail",
+        "Add one mapping from a client failure to status and error_type, first match wins: redirect failure 502 forge_error; timeout 504 forge_timeout; rate limit 429 forge_rate_limited; forge 404 as 404 forge_not_found; 401 as 502 forge_unauthenticated; 403 as 502 forge_forbidden; other 4xx as 422 forge_rejected; 5xx, an over-long body or a body that is not the expected JSON as 502 forge_error; a connection failure (name resolution, TCP, TLS) as 502 forge_unreachable",
+        "Build the message 'the forge answered <status>: <message>', taking the forge's message from the body member message, else error, a non-string value in its JSON form; use a description without that prefix when the forge gave no answer",
+        "Pass every message through internal/scrub with the credential's token as a known secret, so the token becomes [redacted], URL userinfo is removed and the text is at most 1,024 bytes; do the same for any text the component logs",
+        "Raise the error through package 02's error helper with the new error types forge_timeout, forge_rate_limited, forge_not_found, forge_unauthenticated, forge_forbidden, forge_rejected, forge_error and forge_unreachable; on 429 set Retry-After to the stated wait rounded up to whole seconds, and leave the header out when no wait was stated",
+        "Export the mapping as a function that returns error_type and message without writing a response, for the issue thread's comments_error and for the events of package 42",
+        "Confirm with the environment test that a workspace without secrets is read anonymously while GITHUB_TOKEN, GH_TOKEN, GITLAB_TOKEN, GITHUB_API_URL and GITLAB_API_URL are set"
+      ],
+      "touches": [
+        "internal/forge/errors.go",
+        "internal/forge/errors_test.go",
+        "internal/forge/client.go",
+        "internal/forge/client_test.go"
+      ],
+      "depends_on": [
+        3
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Serve the diagnostic route GET /workspaces/:slug/forge",
+      "criteria": [
+        "REQ-5",
+        "REQ-3.4"
+      ],
+      "steps": [
+        "Add the diagnostic behaviours to internal/forge/status_test.go and confirm they fail",
+        "Register GET /api/v1/workspaces/{slug}/forge through the route helper with scope forge:read and need read; ignore a target parameter",
+        "Build the document from Resolve's parts without calling the client: forge (unknown when the kind is unknown or there is no repository), api_url (null when unknown), repository (null when the URL names none), credential (the kind only, never the token)",
+        "Set upstream to the same four members resolved for the target upstream when the workspace is a carry-patch workspace with an upstream_url, else null",
+        "Answer 422 forge_api_url_invalid when forge_api_url, or upstream_forge_api_url where upstream applies, fails the setting check; report every other resolution failure inside the document",
+        "Set webhook.configured to whether package 39's Get finds the workspace secret FORGE_WEBHOOK_SECRET with a value that is not empty, using the value for nothing else; a secret that cannot be read answers 500 internal; webhook.url from server.external_url with a trailing / removed plus /hooks/forge/<slug>, null when external_url is empty",
+        "Add SetLastDeliveryProvider to the forge component in internal/forge/service.go: the provider is a function of a context and a workspace slug that returns the newest delivery time, whether there is one, and an error; set webhook.last_delivery_at from it in RFC 3339 UTC with whole seconds, null when it reports none or none is registered, and answer 500 internal when it returns an error; package 43 registers the provider and does not change this handler",
+        "For a fork's slug describe the parent throughout, the parent's slug in webhook.url included"
+      ],
+      "touches": [
+        "internal/forge/status.go",
+        "internal/forge/status_test.go",
+        "internal/forge/service.go"
+      ],
+      "depends_on": [
+        3
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Read the repository and list issues with forge paging",
+      "criteria": [
+        "REQ-7"
+      ],
+      "steps": [
+        "Add the behaviours to internal/forge/issues_test.go, internal/forge/page_test.go, internal/forge/github_test.go and internal/forge/gitlab_test.go and confirm they fail",
+        "Add the result types repository and issue to internal/forge/types.go, with timestamps rendered through package 02's time format (UTC, whole seconds), an absent timestamp as null and an absent body as an empty string",
+        "Add the GitHub and GitLab repository reads and their mapping as the PRD's Design Decisions give it (permissions, private, the three allow_* members with null for a member the forge leaves out); address a GitLab project by its URL-encoded owner/name path",
+        "Add forge paging in internal/forge/page.go on package 02's list helper: the cursor's position holds the next forge page, the page size and an optional anchor; a request with a cursor uses the cursor's page size and a limit given with it must equal that size; next_cursor is null when the response's Link header names no rel=\"next\"; items is never null",
+        "Refuse with 400 invalid_request a limit that is not an integer from 1 to 200, a cursor that cannot be decoded and a cursor whose fingerprint (route, path parameters, query parameters other than cursor and limit) differs",
+        "Add the issue list: validate state, sort, direction, labels and assignee (each at most once; empty label names and an empty assignee refused) before resolution; send the defaults open, created and desc; translate to each forge's parameter names and values",
+        "Drop entries GitHub marks with a pull_request member after the forge has paged, without refilling the page",
+        "Register GET /api/v1/workspaces/{slug}/forge/repository and GET /api/v1/workspaces/{slug}/issues through the route helper; keep no forge response between requests"
+      ],
+      "touches": [
+        "internal/forge/types.go",
+        "internal/forge/page.go",
+        "internal/forge/page_test.go",
+        "internal/forge/github.go",
+        "internal/forge/github_test.go",
+        "internal/forge/gitlab.go",
+        "internal/forge/gitlab_test.go",
+        "internal/forge/issues.go",
+        "internal/forge/issues_test.go"
+      ],
+      "depends_on": [
+        4
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Read an issue thread and its comments",
+      "criteria": [
+        "REQ-8"
+      ],
+      "steps": [
+        "Add the thread and comment behaviours to internal/forge/issues_test.go, internal/forge/github_test.go and internal/forge/gitlab_test.go and confirm they fail",
+        "Add the comment type and both forges' comment reads, oldest first (GitLab notes with sort=asc and order_by=created_at, system notes dropped after paging); build a GitLab comment's url from the API URL's scheme and host, the repository path, /-/issues/<iid> and #note_<id>",
+        "Add the single issue read; set is_pr from GitHub's pull_request member and to false on GitLab",
+        "Add GET /api/v1/workspaces/{slug}/issues/{number}: read the issue; a failure there is the route's error; then read the first comments page with page size 100",
+        "When the comments read fails, still answer 200 with comments [], comments_next_cursor null and comments_error {error_type, message} from the exported failure mapping; otherwise comments_error is null",
+        "Issue comments_next_cursor as a cursor of the comments route for the same slug, number and target with page size 100 and next page 2, null when the forge names no next page",
+        "Add GET /api/v1/workspaces/{slug}/issues/{number}/comments as a list route on the forge paging of the previous task"
+      ],
+      "touches": [
+        "internal/forge/issues.go",
+        "internal/forge/issues_test.go",
+        "internal/forge/github.go",
+        "internal/forge/github_test.go",
+        "internal/forge/gitlab.go",
+        "internal/forge/gitlab_test.go",
+        "internal/forge/types.go"
+      ],
+      "depends_on": [
+        6
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Read pull requests, their files, checks and reviews",
+      "criteria": [
+        "REQ-9"
+      ],
+      "steps": [
+        "Add the pull request behaviours to internal/forge/pulls_test.go and confirm they fail",
+        "Add the types pull request, pull request state, changed file, check run and review",
+        "Add the pull request read for both forges with the state mapping (merged when the forge reports it merged; GitLab opened and locked are open) and the state route as a projection of it",
+        "Add the files list: GitHub's file statuses mapped to added, modified, deleted and renamed; GitLab's diffs mapped by new_file, deleted_file and renamed_file, additions and deletions counted from the lines of the diff text that begin with + and -",
+        "Add the checks list: on GitHub read the pull request, then the check runs of its head commit; on GitLab read the merge request's pipelines, take the first, then its jobs; an absent head or pipeline list answers an empty list; store the commit id or pipeline id as the cursor's anchor and use it for later pages; map statuses and conclusions as the PRD's Design Decisions give them",
+        "Add the reviews list: GitHub reviews with the state in lower case, pending ones dropped; GitLab approvals first with submitted_at null and an empty body, then non-system notes as commented, oldest first",
+        "Page GitLab reviews so that no page exceeds limit: approvals fill pages first; the page on which they end is filled with notes, and notes are requested in pages of the size that page had left (limit when nothing was left over); keep that size and the phase in the cursor",
+        "Register the five routes under /api/v1/workspaces/{slug}/pulls/{number} through the route helper"
+      ],
+      "touches": [
+        "internal/forge/pulls.go",
+        "internal/forge/pulls_test.go",
+        "internal/forge/github.go",
+        "internal/forge/gitlab.go",
+        "internal/forge/types.go",
+        "internal/forge/page.go"
+      ],
+      "depends_on": [
+        6
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Add the read commands of parley forge, issue and pr",
+      "criteria": [
+        "REQ-10"
+      ],
+      "steps": [
+        "Add the command behaviours to internal/cli/forge_test.go, internal/cli/issue_test.go and internal/cli/pr_test.go against an httptest hub that records method, raw path and raw query, and confirm they fail",
+        "Add the command groups forge (status, repository), issue (list, get, comments) and pr (get, state, files, checks, reviews) on the HTTP client, output and exit-code helpers of package 09; a group without a subcommand prints help",
+        "Check the argument count and the <number> argument with the number rule of internal/forge before any request; a violation is a usage error with exit code 2",
+        "Send the slug and the number as single percent-encoded path segments through package 09's path helper",
+        "Add --target to every command except forge status, --limit and --cursor to the five list commands, and --state, --label (repeatable) and --assignee to issue list; send a query parameter only for a flag that was given; join the --label values with commas into one labels parameter",
+        "Print the hub's answer as package 09 prints any JSON result; leave hub errors to package 09's error output",
+        "Add test/e2e/forge_read_test.go with the two end-to-end flows of the PRD: the hub started in-process with a forge transport that trusts the fake forge, the workspace created over the API, forge_api_url set by PATCH, and for the second flow a fork record written through the workspace store"
+      ],
+      "touches": [
+        "internal/cli/forge.go",
+        "internal/cli/forge_test.go",
+        "internal/cli/issue.go",
+        "internal/cli/issue_test.go",
+        "internal/cli/pr.go",
+        "internal/cli/pr_test.go",
+        "internal/cli/root.go",
+        "test/e2e/forge_read_test.go"
+      ],
+      "depends_on": [
+        5,
+        7,
+        8
+      ]
+    }
+  ]
+}

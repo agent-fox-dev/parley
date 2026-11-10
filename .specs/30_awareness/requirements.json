@@ -1,0 +1,774 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "30",
+  "spec_name": "awareness",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Access and addressing of the awareness routes",
+      "rationale": "An agent that holds only a fork must be able to see and announce work on the parent, and an org member must be able to claim, without either gaining any write to the repository.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "ubiquitous",
+          "action": "for any request to GET /api/v1/workspaces/{slug}/activity, GET …/changes/{number}/overlaps, GET …/claims or GET …/claims/{id}, require the scope changes:read from a PAT caller and the access need read on the workspace named by the slug, in the hub's order of checks",
+          "contract": "HTTP 403 with error_type insufficient_scope for a PAT without changes:read or changes:write, whether or not the workspace exists; HTTP 404 with error_type not_found, byte-identical to the answer for an unknown slug, for a caller without read access; otherwise the route's own answer",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a workspace demo in an organization with an owner and one other member, one open change 1 and one active claim, served through the real router, scope check and access component"
+            ],
+            "pseudocode": "in internal/awareness/routes_test.go, a table over the four read routes and the callers {PAT with only git:read -> 403 insufficient_scope, the same PAT on an unknown slug -> 403 insufficient_scope, user outside the organization -> 404 not_found, member of the organization with an API key -> 200, owner with a PAT holding changes:read -> 200, admin token -> 200}: r = do(route, caller); assert r.status and r.json.error.error_type as listed; assert the stranger's body equals the body for the slug 'no-such-workspace'"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "ubiquitous",
+          "action": "for any request to POST …/claims, PATCH …/claims/{id} or DELETE …/claims/{id}, require the scope changes:write from a PAT caller and the access need read, so that a member of the workspace's organization may create, renew and release claims",
+          "contract": "HTTP 403 with error_type insufficient_scope for a PAT that holds changes:read but not changes:write; HTTP 404 not_found for a caller without read access; HTTP 201 for a member's valid POST",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the workspace demo of the read-route table"
+            ],
+            "pseudocode": "in internal/awareness/routes_test.go, a table over the three write routes and the callers {PAT with only changes:read -> 403 insufficient_scope, user outside the organization -> 404 not_found, member with an API key -> POST 201, then PATCH 200 and DELETE 204 on the member's own claim}: assert the status and error_type as listed; assert the claim table is unchanged after each refusal"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "event_driven",
+          "condition": "an awareness route is addressed with the slug of a task fork",
+          "action": "decide access on the fork and serve the route on the data of the fork's parent: the parent's index, change numbers and claims, with a new claim stored on the parent",
+          "contract": "the response equals the one the parent's slug gives the same caller; a claim created through the fork has workspace_slug equal to the parent's slug",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a parent workspace demo with default branch main and two open overlapping changes 1 and 2",
+              "a task fork demo--task1 of demo owned by the caller"
+            ],
+            "pseudocode": "in internal/awareness/routes_test.go: c = POST /workspaces/demo--task1/claims {paths:['api/**'], intent:'x'}; assert c.status == 201; assert c.json.claim.workspace_slug == 'demo'; assert ids(GET /workspaces/demo/claims) contains c.json.claim.id; assert GET /workspaces/demo--task1/claims/{id} is 200; assert GET /workspaces/demo--task1/changes/1/overlaps equals GET /workspaces/demo/changes/1/overlaps; assert GET /workspaces/demo--task1/activity?paths=api/** equals the same query on demo"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "unwanted",
+          "condition": "a caller who is neither the user who created the claim, nor the owner of the workspace the claim is stored on, nor the admin token sends PATCH or DELETE for a claim",
+          "action": "refuse the request and leave the claim unchanged",
+          "contract": "HTTP 403 with error_type forbidden; the claim's state, intent and expires_at are unchanged and no event is emitted",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "an active claim created by a member of the organization that owns demo"
+            ],
+            "pseudocode": "in internal/awareness/claim_routes_test.go, a table over PATCH {ttl:'2h'} and DELETE and the callers {the creator with a second credential of the same user -> 200 / 204, the workspace owner -> 200 / 204, the admin token -> 200 / 204, another member of the organization -> 403 forbidden}: assert status and error_type; for the 403 rows assert GET of the claim returns the body it returned before and the event log has no new parley.claim.release"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "unwanted",
+          "condition": "GET, PATCH or DELETE names a claim id that is not a claim stored on the workspace the route acts on (an unknown UUID, a string that is not a UUID, or the id of a claim of another workspace)",
+          "action": "refuse the request",
+          "contract": "HTTP 404 with error_type claim_not_found",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/awareness/claim_routes_test.go, a table over the methods {GET, PATCH, DELETE} and the ids {a random UUID, 'not-a-uuid', the id of a claim stored on workspace other}: r = do(method, '/workspaces/demo/claims/' + id); assert r.status == 404; assert r.json.error.error_type == 'claim_not_found'"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Overlap index of changes by touched file",
+      "rationale": "Activity and overlaps must answer from a complete picture of which in-flight change touches which file, and keeping that picture must never slow down the push that changes it.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "the index worker reads a parley.change.version event (a new version or a retarget) of a change",
+          "action": "record the change in the index under its workspace and current target branch as in flight, with the complete set of files that differ between the base_sha and the head_sha of its current version, replacing the set recorded before, counting a renamed file under both its old and its new path and applying no limit to the number of files",
+          "contract": "the index holds exactly the files of the current version for the change; a version touching 2,001 files is recorded with 2,001 files",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "an event source and a change reader backed by fixtures, the real git wrapper and a real SQLite store"
+            ],
+            "pseudocode": "in internal/awareness/index_test.go, with a real repository made by git init in t.TempDir(): version 1 edits c.go and renames a.go to b.go; run one worker pass; assert files(index, demo, 1) == {a.go, b.go, c.go}; version 2 edits only d.go on the same base; run a pass; assert files == {d.go}; a retarget event to branch release; run a pass; assert target(index, demo, 1) == 'release'; a change whose version adds 2,001 files; run a pass; assert len(files) == 2001"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "event_driven",
+          "condition": "the index worker reads a parley.change.land, parley.change.abandon or parley.change.restore event of a change",
+          "action": "on land mark the change as landed with its landed commit and landing time and keep its files; on abandon take the change out of the in-flight set; on restore put it back in flight with the files of its current version",
+          "contract": "a landed or abandoned change appears in no overlaps list and in no changes list of an activity answer; a landed change appears in landed; a restored change appears in both again",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/awareness/index_test.go: changes 1 and 2 in flight on main, both touching api/a.go; feed abandon(2); pass; assert inFlight(index, demo, 'main') == [1]; feed restore(2); pass; assert inFlight(index, demo, 'main') == [1, 2] and files(index, demo, 2) == {api/a.go}; feed land(2) with landed_sha S and landed_at T; pass; assert inFlight(index, demo, 'main') == [1]; assert landed(index, demo, 'main') == [{number: 2, landed_sha: S, landed_at: T}] and files(index, demo, 2) == {api/a.go}"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "ubiquitous",
+          "action": "for any push, commit or API call that creates a version or changes a change's state, answer it without waiting for the index update, and update the index later from the event log",
+          "contract": "the request's status and body are the same with the index worker stopped as with it running; the index holds the change only after a worker pass",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub assembled in-process with the real change routes of package 22, the real event log and the awareness worker under manual control"
+            ],
+            "pseudocode": "in internal/awareness/worker_test.go: with no worker running, r = POST /workspaces/demo/changes for a branch touching api/a.go; assert r.status == 201; assert inFlight(index, demo, 'main') == []; run one worker pass; assert inFlight(index, demo, 'main') == [r.json.number]; assert files(index, demo, r.json.number) == {api/a.go}"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "ubiquitous",
+          "action": "for any event it processes, write the index update, the overlap events and claim updates it causes and the position of the event in one transaction, and after a restart continue with the first event after the stored position",
+          "contract": "each event is applied exactly once: after a restart in the middle of a backlog the index and the stored position equal those of an uninterrupted run, and nothing an event caused is written twice",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/awareness/worker_test.go: feed five version events for changes 1 and 2; process the first two; close and reopen the store; build a new worker; run passes until idle; assert position(worker) == seq of the fifth event; assert the index equals the index of a run without the restart; assert the fixture change reader was asked for each of the five events once; make the transaction of one further event fail once (a store that returns an error at commit); assert the stored position did not advance and the index is unchanged; run a pass; assert the event is applied"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "unwanted",
+          "condition": "the files of a change's current version cannot be listed because a commit of the version is not in the repository or the git command fails",
+          "action": "record the change with an empty set of files, log the failure with the workspace and the change number, advance past the event and continue with the next event",
+          "contract": "the worker pass returns no error and processes the following events; the change appears in no overlap entry; no parley.change.overlap is emitted for it",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/awareness/index_test.go: feed a version event of change 3 whose head_sha is 40 zeros, followed by a version event of change 4; err = pass(); assert err == nil; assert files(index, demo, 3) == {}; assert files(index, demo, 4) is not empty; assert position(worker) == seq of the second event"
+          }
+        },
+        {
+          "id": "REQ-2.6",
+          "pattern": "event_driven",
+          "condition": "parleyd starts",
+          "action": "register the index worker as background work that looks for new events every second until shutdown, and stop it within its grace when the hub shuts down",
+          "contract": "a version recorded while the hub runs is in the index at most one worker interval plus one pass later; after shutdown no pass is running",
+          "check": {
+            "same_as": "PATH-1"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Overlaps of a change",
+      "rationale": "A developer deciding the order in which changes should land needs, for one change, every other in-flight change that touches the same files.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "a caller sends GET …/changes/{number}/overlaps for a change in state draft or open",
+          "action": "return one overlap entry for every other draft or open change of the workspace that has the same target branch and at least one indexed file in common with it, ordered by count descending and then by number ascending, as a list paged by limit and cursor",
+          "contract": "HTTP 200 with body {items: [overlap entry…], next_cursor: string or null}",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "index: change 1 (open, main) touches a, b, c, d; change 2 (draft, main) touches a; change 3 (open, main) touches a, b, c; change 4 (open, main) touches d; change 5 (open, release) touches a; change 6 (abandoned, main) touches a; change 7 (open, main) touches z"
+            ],
+            "pseudocode": "in internal/awareness/overlaps_test.go: r = GET /workspaces/demo/changes/1/overlaps; assert r.status == 200; assert [(i.change.number, i.count) for i in r.json.items] == [(3, 3), (2, 1), (4, 1)]; assert r.json.next_cursor == null; with limit=2 assert two items and a next_cursor whose page holds change 4"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "ubiquitous",
+          "action": "for any two changes in one stack, that is two changes that reach the same bottom change by following depends_on, treat them as not overlapping whatever files they share",
+          "contract": "neither change appears in the other's overlaps list and no parley.change.overlap is emitted for the pair",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/awareness/overlaps_test.go, a table over stacks with all changes touching api/a.go: {2 depends on 1 -> overlaps(1) excludes 2 and overlaps(2) excludes 1; 3 depends on 2 depends on 1 -> overlaps(3) excludes 1 and 2; 4 and 5 both depend on 1 -> overlaps(4) excludes 5; 6 has no depends_on -> overlaps(1) contains 6 and overlaps(6) contains 1, 2, 3, 4 and 5}"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "ubiquitous",
+          "action": "for any overlap entry, return change as the summary {number, ref, title, intent cut to its first 500 characters, state, author, session_id, version, updated_at, mergeable, landing: {status}}, paths as the files in common in ascending byte order cut to the first 100, paths_truncated as true exactly when there are more than 100 files in common, and count as the number of files in common",
+          "contract": "overlap entry: {change: {number: int, ref: string, title: string, intent: string of at most 500 characters, state: string, author: object, session_id: string or null, version: int, updated_at: timestamp, mergeable: string, landing: {status: string}}, paths: string[] of at most 100, paths_truncated: bool, count: int}",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/awareness/entry_test.go, a table over the number of common files {1, 100, 101, 2500} and an intent of {0, 500, 501} characters: e = entry(other, common); assert len(e.paths) == min(n, 100); assert e.paths is sorted ascending; assert e.paths_truncated == (n > 100); assert e.count == n; assert len(e.change.intent) == min(len(intent), 500); assert keys(e.change) == the eleven listed members; assert e.change.ref == 'demo#' + number"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "event_driven",
+          "condition": "a caller sends GET …/changes/{number}/overlaps for a change in state landed or abandoned",
+          "action": "return an empty list",
+          "contract": "HTTP 200 with body {items: [], next_cursor: null}",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/awareness/overlaps_test.go, a table over a landed and an abandoned change whose files other open changes also touch: r = GET …/changes/{n}/overlaps; assert r.status == 200; assert r.json.items == []; assert r.json.next_cursor == null"
+          }
+        },
+        {
+          "id": "REQ-3.5",
+          "pattern": "unwanted",
+          "condition": "the number in GET …/changes/{number}/overlaps names no change of the workspace the route acts on, or is not a positive integer",
+          "action": "refuse the request",
+          "contract": "HTTP 404 with error_type change_not_found",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/awareness/overlaps_test.go, a table over the numbers {'999', '0', '-1', 'abc'}: r = GET /workspaces/demo/changes/{n}/overlaps; assert r.status == 404; assert r.json.error.error_type == 'change_not_found'"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Overlap events",
+      "rationale": "An agent that is already working must be told when another change starts to touch its files, once, without polling.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "an index update makes two changes overlap for which no announced pair is recorded",
+          "action": "emit one parley.change.overlap event for each of the two changes, naming the other, and record the pair as announced, in the transaction of the index update",
+          "contract": "two events of type parley.change.overlap, each with resource_type change, resource_id the change's number as a decimal string, workspace the target workspace, actor system, session_id the session of the change it is written on, and metadata {number, with: {number, ref} of the other change, with_session_id: the other change's session or null, paths: the files in common in ascending order cut to 100, count}",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a real event log on SQLite and the index worker under manual control"
+            ],
+            "pseudocode": "in internal/awareness/overlap_events_test.go: change 1 (session s1) touches api/a.go and api/b.go; feed version 1 of change 2 (session s2) touching api/a.go and x.go; pass; ev = events of type parley.change.overlap; assert len(ev) == 2; e1 = the one with resource_id '1'; assert e1.actor.actor_type == 'system'; assert e1.session_id == s1; assert e1.metadata == {number: 1, with: {number: 2, ref: 'demo#2'}, with_session_id: s2, paths: ['api/a.go'], count: 1}; assert the event with resource_id '2' names {number: 1, ref: 'demo#1'} and with_session_id s1; a pair with 150 common files has metadata.count == 150 and len(metadata.paths) == 100"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "state_driven",
+          "condition": "a pair of changes is recorded as announced and an index update leaves the two overlapping",
+          "action": "emit no further parley.change.overlap for the pair",
+          "contract": "the number of parley.change.overlap events for the pair stays 2 however many versions either change gets",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/awareness/overlap_events_test.go: after the announcement of changes 1 and 2, feed versions 2, 3 and 4 of change 2, each touching api/a.go and a different second file; pass; assert count(events of type parley.change.overlap) == 2; close and reopen the store, build a new worker, feed version 5 of change 2 touching api/a.go; pass; assert the count is still 2"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "event_driven",
+          "condition": "an index update leaves an announced pair without a file in common, with different target branches, or with one of the two changes landed or abandoned",
+          "action": "forget the pair, so that a later index update that makes the two overlap is announced again with two new events",
+          "contract": "after the two stop overlapping and overlap again, four parley.change.overlap events exist for the pair in total",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/awareness/overlap_events_test.go, a table over the way the pair stops {a version of change 2 that no longer touches api/a.go, a retarget of change 2 to release, abandon of change 2} followed by the way it returns {a version touching api/a.go again, a retarget back to main, restore}: after the stop assert count(overlap events) == 2 and pairs(index) == []; after the return assert count == 4"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "event_driven",
+          "condition": "one index update makes a change overlap several other changes at once",
+          "action": "announce each new pair separately",
+          "contract": "2 × k events for k new pairs: one on the updated change per partner and one on each partner",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/awareness/overlap_events_test.go: changes 1, 2 and 3 touch a.go, b.go and c.go and do not overlap; feed a version of change 4 touching a.go, b.go and c.go; pass; ev = overlap events; assert len(ev) == 6; assert sorted(e.metadata.with.number for e in ev if e.resource_id == '4') == [1, 2, 3]; assert each of the resource ids '1', '2', '3' has one event naming 4"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Activity query",
+      "rationale": "Before an agent starts, one call must tell it who is working on its paths, who has announced work there and what landed there since it forked.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "a caller sends GET …/activity with one or more globs in paths, given as a comma list, as a repeated parameter or both",
+          "action": "return target_branch as the target parameter or else the default branch of the workspace the route acts on, target_sha as the head commit of that branch or null when the workspace has no such branch, and changes as the draft and open changes on that target branch that have an indexed file matching any of the globs, each as an overlap entry whose paths and count are its matching files, ordered by count descending and then by number ascending",
+          "contract": "HTTP 200 with body {target_branch: string, target_sha: 40-character commit id or null, changes: [overlap entry…], claims: [claim…], landed: [landed item…]}; all three lists are arrays, never null",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a repository with branches main (default) and release",
+              "index: change 1 (open, main) touches api/a.go and api/b.go; change 2 (draft, main) touches api/a.go; change 3 (open, main) touches docs/x.md; change 4 (open, release) touches api/a.go; change 5 (abandoned, main) touches api/a.go"
+            ],
+            "pseudocode": "in internal/awareness/activity_test.go, a table over the queries {paths=api/** -> changes [(1, 2), (2, 1)]; paths=docs/**,api/a.go -> [(1, 1), (2, 1), (3, 1)] ; paths=docs/**&paths=api/b.go -> [(1, 1), (3, 1)]; paths=api/**&target=release -> [(4, 1)] with target_branch 'release'; paths=api/**&target=nosuch -> changes [] and target_sha null; paths=vendor/** -> changes [], claims [], landed []}: r = GET /workspaces/demo/activity?…; assert r.status == 200; assert [(e.change.number, e.count)] as listed; for the first row assert r.json.target_branch == 'main' and r.json.target_sha == head of main and entry 1 has paths ['api/a.go', 'api/b.go']"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "ubiquitous",
+          "action": "for any two globs, treat them as able to match the same files exactly when one of them, used as a pattern, matches the literal prefix of the other, the literal prefix being the glob's text before its first asterisk",
+          "contract": "a symmetric yes or no for each pair of globs",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/awareness/glob_test.go, a table of pairs checked in both orders: {('api/**', 'api/v1/*.go') yes; ('api/**', 'api/**') yes; ('src/*.go', 'src/main.go') yes; ('src/*.go', 'src/**') yes; ('*.md', '**') yes; ('docs/new/**', 'docs/**') yes; ('docs/**', 'src/**') no; ('**/*.go', 'src/x.py') no; ('src/*.go', 'src/x/y.go') no; ('api/a.go', 'api/a.go') yes; ('api/a.go', 'api/b.go') no}: assert canOverlap(a, b) == expected; assert canOverlap(b, a) == expected"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "event_driven",
+          "condition": "a caller sends GET …/activity and the workspace has claims",
+          "action": "return in claims every claim on the target branch that is active and not past its expires_at and has a glob able to match the same files as a requested glob, newest first",
+          "contract": "claims: the claim objects ordered by created_at descending and then id descending; released, expired and fulfilled claims, claims past expires_at and claims on another target branch are absent",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/awareness/activity_test.go: claims on main: A paths ['api/v1/*.go'] created first, B paths ['api/**'] created a second later, C paths ['docs/**'], D paths ['api/**'] released, E paths ['api/**'] with expires_at one second before now and stored state active; claim F paths ['api/**'] on release; r = GET …/activity?paths=api/**; assert ids(r.json.claims) == [B, A]; r = GET …/activity?paths=api/**&target=release; assert ids(r.json.claims) == [F]"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "event_driven",
+          "condition": "a caller sends GET …/activity",
+          "action": "return in landed the changes that landed on the target branch after since and touched a file matching any glob, newest first and at most 100, where since is a 40-character commit id (the changes whose landed commit is not reachable from it), an RFC 3339 timestamp (the changes landed after it) or, when absent, 24 hours before the request",
+          "contract": "landed: [{number: int, ref: string, title: string, landed_sha: string, landed_at: timestamp, session_id: string or null, paths: the matching files in ascending order cut to 100}…] ordered by landed_at descending and then number descending",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/awareness/activity_test.go, with a real repository whose main holds the landed commits of changes 10 (30 hours ago), 11 (2 hours ago) and 12 (1 hour ago), all touching api/a.go, and change 13 (30 minutes ago) touching docs/x.md, a table over since {absent -> [12, 11]; the timestamp 48 hours ago -> [12, 11, 10]; the landed_sha of 11 -> [12]; the landed_sha of 12 -> []; the timestamp of now -> []}: r = GET …/activity?paths=api/**&since=…; assert numbers(r.json.landed) as listed; assert r.json.landed[0] has exactly the seven members and paths ['api/a.go']; with 101 landed changes touching api/a.go inside the window assert len(landed) == 100 and the oldest is absent"
+          }
+        },
+        {
+          "id": "REQ-5.5",
+          "pattern": "optional",
+          "condition": "the request carries exclude_session or exclude_change",
+          "action": "leave out of changes, claims and landed every item whose session_id equals exclude_session, and leave out the change with the number exclude_change from changes and landed together with every claim whose change equals that number",
+          "contract": "the lists hold no item of the excluded session and no item of the excluded change; all other items are unchanged",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/awareness/activity_test.go: changes 1 (session s1) and 2 (session s2) touch api/a.go; claims A (session s1, change 1) and B (session s2) on api/**; landed change 12 of session s1; a table {exclude_session=s1 -> changes [2], claims [B], landed []; exclude_change=1 -> changes [2], claims [B], landed [12]; exclude_change=12 -> changes [1, 2], landed []; both exclude_session=s2 and exclude_change=1 -> changes [], claims []}: assert the lists as listed"
+          }
+        },
+        {
+          "id": "REQ-5.6",
+          "pattern": "unwanted",
+          "condition": "GET …/activity has no paths value or only empty ones, more than 50 globs, a glob that is empty, longer than 255 characters or begins with a slash, a since that is neither 40 hexadecimal characters nor an RFC 3339 timestamp, a since commit id that the workspace's repository does not hold, or an exclude_change that is not a positive integer",
+          "action": "refuse the request",
+          "contract": "HTTP 400 with error_type invalid_request; a request with exactly 50 globs is answered 200",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/awareness/activity_test.go, a table over the queries {no paths; paths=; paths=a,,b; 51 globs; a glob of 256 characters; paths=/abs/**; since=yesterday; since=abc123; since=40 zeros; exclude_change=0; exclude_change=x}: r = GET …/activity?…; assert r.status == 400; assert r.json.error.error_type == 'invalid_request'; and 50 globs each of 255 characters: assert r.status == 200"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Claim creation",
+      "rationale": "An agent must be able to announce what it is about to work on before it has any code, and learn in the same call who is already there.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "a caller sends POST …/claims with a valid body",
+          "action": "store a claim with a new UUID as id, the slug of the workspace the route acts on, the given paths and intent, target_branch as given or else that workspace's default branch, by as the caller's actor type, id and username, session_id as given or null, change null, state active, created_at the time of the request and expires_at that time plus ttl or, without ttl, plus [awareness].default_claim_ttl; emit parley.claim.create in the same transaction; and answer with the claim and the activity for the claim's paths and target branch without the claim itself",
+          "contract": "HTTP 201 with body {claim: {id, workspace_slug, paths, target_branch, intent, by: {actor_type, actor_id, username}, session_id, change, expires_at, state, created_at}, activity: {target_branch, target_sha, changes, claims, landed}}; one event parley.claim.create with resource_type claim, resource_id the id, workspace the claim's workspace_slug, the caller as actor and metadata {paths, intent, target_branch, expires_at}",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "workspace demo with default branch main and an open change 1 touching api/a.go in the index",
+              "[awareness] at its defaults",
+              "a real event log on SQLite"
+            ],
+            "pseudocode": "in internal/awareness/claim_create_test.go with the clock fixed at T: r = POST /workspaces/demo/claims {paths: ['api/**'], intent: 'rework handlers'}; assert r.status == 201; cl = r.json.claim; assert keys(cl) == the eleven members; assert cl.id is a UUID; assert cl.target_branch == 'main'; assert cl.state == 'active'; assert cl.change == null and cl.session_id == null; assert cl.created_at == T and cl.expires_at == T + 1h; assert cl.by.actor_id == the caller's user id; assert numbers(r.json.activity.changes) == [1]; assert cl.id not in ids(r.json.activity.claims); ev = last event; assert ev.type == 'parley.claim.create' and ev.resource_id == cl.id and ev.metadata == {paths: ['api/**'], intent: 'rework handlers', target_branch: 'main', expires_at: cl.expires_at}; with ttl '5m' and target_branch 'release' assert expires_at == T + 5m and target_branch == 'release'"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "ubiquitous",
+          "action": "for any claim, accept it whatever other claims exist on the same or intersecting paths, and show each of two such claims in the other's activity",
+          "contract": "HTTP 201 for the second claim on the same paths; its activity.claims holds the first claim",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/awareness/claim_create_test.go: a = POST …/claims {paths: ['api/**'], intent: 'a', session_id: s1}; b = POST …/claims {paths: ['api/**'], intent: 'b', session_id: s2}; assert b.status == 201; assert ids(b.json.activity.claims) == [a.json.claim.id]; assert ids(GET …/activity?paths=api/**&exclude_session=s1 .claims) == [b.json.claim.id]"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "unwanted",
+          "condition": "the body of POST …/claims has paths that is missing, not an array, empty, longer than 50 entries or holds an entry that is not a string, is empty, is longer than 255 characters or begins with a slash; an intent that is missing, not a string, empty or longer than 2,000 characters; a ttl that is not a duration string, is shorter than 1 second or exceeds [awareness].max_claim_ttl; a target_branch that is not a string, is empty or is longer than 255 characters; or a session_id that is not a string",
+          "action": "refuse the request, store no claim and emit no event",
+          "contract": "HTTP 400 with error_type invalid_request; the number of stored claims is unchanged; a body with 50 globs, an intent of 2,000 characters and a ttl equal to the maximum is answered 201",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/awareness/claim_create_test.go, a table over the bodies {no paths; paths: 'api/**'; paths: []; 51 globs; paths: [1]; paths: ['']; a glob of 256 characters; paths: ['/abs']; no intent; intent: ''; intent of 2,001 characters; intent: 5; ttl: 'soon'; ttl: '0s'; ttl: '-5m'; ttl: '24h1s' ; ttl: 3600; target_branch: ''; target_branch of 256 characters; session_id: 7}: r = POST …/claims; assert r.status == 400; assert r.json.error.error_type == 'invalid_request'; assert count(claims) == 0; assert count(events) == 0; then {50 globs, intent of 2,000 characters, ttl: '24h'}: assert r.status == 201"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "unwanted",
+          "condition": "the session_id of POST …/claims fails the session-linking rule: the session does not exist, was created by another user while the caller is not the admin token, or belongs to a workspace that is neither the addressed workspace nor its parent nor one of its forks",
+          "action": "refuse the request and store nothing",
+          "contract": "HTTP 400 with error_type unknown_session; no claim stored and no event emitted",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/awareness/claim_create_test.go, with a session-link check stubbed to accept only 's-ok' and with no check wired at all, a table {session_id 's-ok' -> 201 and claim.session_id == 's-ok'; session_id 's-other' -> 400 unknown_session; no check wired and session_id 's-ok' -> 400 unknown_session; no check wired and no session_id -> 201}: assert status and error_type; assert count(claims) grows only on 201"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "unwanted",
+          "condition": "POST …/claims arrives while the workspace the claim would be stored on already has [awareness].max_claims_per_workspace active claims, or while the session named by session_id already has 50 active claims",
+          "action": "refuse the request and store nothing, counting only claims in state active that are not past their expires_at",
+          "contract": "HTTP 429 with error_type claim_limit_reached; the number of stored claims is unchanged",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/awareness/claim_create_test.go: with max_claims_per_workspace = 3 create 3 claims without a session; assert the 4th is 429 claim_limit_reached; release one; assert the next is 201; advance the clock past another claim's expires_at without running the expiry; assert the next is 201; with the default limit create 50 claims with session_id s1; assert the 51st with s1 is 429 claim_limit_reached; assert one with session_id s2 and one without session_id are 201; assert claims made through a fork's slug count against the parent's limit"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "Reading, renewing and releasing claims",
+      "rationale": "Long tasks renew their claim, finished ones release it, and everyone can see which claims are live.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "event_driven",
+          "condition": "a caller sends GET …/claims/{id} for a claim stored on the workspace the route acts on",
+          "action": "return the claim, reporting the state expired for a claim that is stored as active and whose expires_at is not after the time of the request",
+          "contract": "HTTP 200 with the claim object of eleven members; state is one of active, released, expired, fulfilled",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/awareness/claim_routes_test.go: create a claim with ttl '5m' at T; r = GET …/claims/{id} at T + 4m59s; assert r.status == 200 and r.json.state == 'active'; at T + 5m without running the expiry assert r.json.state == 'expired'; assert keys(r.json) == the eleven members"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "event_driven",
+          "condition": "a caller sends GET …/claims",
+          "action": "return the claims stored on the workspace the route acts on that are in the state given by state (default active), carry the session given by session_id when present and have a glob able to match the same files as the glob given by path when present, ordered by created_at descending and then id descending, paged by limit and cursor",
+          "contract": "HTTP 200 with body {items: [claim…], next_cursor: string or null}; HTTP 400 with error_type invalid_request for a state other than active, released, expired or fulfilled",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/awareness/claim_routes_test.go: claims A (active, s1, ['api/**']), B (active, s2, ['docs/**']) created later, C (released, s1, ['api/**']), D (active by state but past expires_at); a table {no query -> [B, A]; state=released -> [C]; state=expired -> [D]; session_id=s1 -> [A]; path=api/v1/*.go -> [A]; state=fulfilled -> []; limit=1 -> [B] with a next_cursor whose page is [A]; state=bogus -> 400 invalid_request}: assert ids(items) or the error as listed"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "event_driven",
+          "condition": "a permitted caller sends PATCH …/claims/{id} for an active claim with ttl, intent or both",
+          "action": "with ttl set expires_at to the time of the request plus ttl, with intent replace the intent, leave every other member unchanged, emit no event and return the claim",
+          "contract": "HTTP 200 with the updated claim object",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/awareness/claim_routes_test.go with the clock at T + 30m for a claim created at T with the default ttl, a table {ttl: '2h' -> expires_at == T + 2h30m, intent unchanged; intent: 'new' -> intent == 'new', expires_at == T + 1h; ttl: '24h', intent: 'x' -> expires_at == T + 24h30m and intent == 'x'}: r = PATCH …/claims/{id}; assert r.status == 200; assert the members as listed; assert paths, target_branch, by, session_id, created_at and state are unchanged; assert no event was written"
+          }
+        },
+        {
+          "id": "REQ-7.4",
+          "pattern": "unwanted",
+          "condition": "the body of PATCH …/claims/{id} carries neither ttl nor intent, a ttl that is not a duration string, is shorter than 1 second or exceeds [awareness].max_claim_ttl, or an intent that is not a string, is empty or is longer than 2,000 characters",
+          "action": "refuse the request and leave the claim unchanged",
+          "contract": "HTTP 400 with error_type invalid_request; the claim reads as before",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/awareness/claim_routes_test.go, a table over the bodies {{}; ttl: 'x'; ttl: '0s'; ttl: '25h'; intent: ''; intent of 2,001 characters; intent: 4}: before = GET claim; r = PATCH; assert r.status == 400; assert r.json.error.error_type == 'invalid_request'; assert GET claim == before"
+          }
+        },
+        {
+          "id": "REQ-7.5",
+          "pattern": "unwanted",
+          "condition": "PATCH …/claims/{id} names a claim that is released, fulfilled, expired, or stored as active but past its expires_at",
+          "action": "refuse the request and leave the claim unchanged",
+          "contract": "HTTP 409 with error_type claim_not_active",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/awareness/claim_routes_test.go, a table over claims in the states {released, fulfilled, expired by the expiry run, active with expires_at one second ago}: r = PATCH …/claims/{id} {ttl: '1h'}; assert r.status == 409; assert r.json.error.error_type == 'claim_not_active'; assert the stored expires_at is unchanged"
+          }
+        },
+        {
+          "id": "REQ-7.6",
+          "pattern": "event_driven",
+          "condition": "a permitted caller sends DELETE …/claims/{id} for an active claim",
+          "action": "set the claim's state to released and emit parley.claim.release in the same transaction",
+          "contract": "HTTP 204 with an empty body; the claim reads with state released; one event parley.claim.release with resource_type claim, resource_id the id, the caller as actor and metadata {paths}",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a real event log on SQLite"
+            ],
+            "pseudocode": "in internal/awareness/claim_routes_test.go: r = DELETE …/claims/{id}; assert r.status == 204; assert len(r.body) == 0; assert GET …/claims/{id} .state == 'released'; ev = last event; assert ev.type == 'parley.claim.release'; assert ev.resource_id == id; assert ev.metadata == {paths: ['api/**']}; assert GET …/activity?paths=api/** .claims == []"
+          }
+        },
+        {
+          "id": "REQ-7.7",
+          "pattern": "event_driven",
+          "condition": "a permitted caller sends DELETE …/claims/{id} for a claim that is not active",
+          "action": "change nothing and emit nothing",
+          "contract": "HTTP 204 with an empty body; the claim's state is unchanged and the event log has no new event",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/awareness/claim_routes_test.go, a table over claims in the states {released, expired, fulfilled}: n = count(events); r = DELETE …/claims/{id}; assert r.status == 204; assert GET claim .state is the state before; assert count(events) == n"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "Claim lifetime in the background",
+      "rationale": "A crashed agent's claim must disappear by itself, a claim must follow the change it led to, and ended claims must not accumulate for ever.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "the claim expiry run fires, once every minute while parleyd runs",
+          "action": "set every claim that is stored as active and whose expires_at is not after the current time to expired and emit one parley.claim.expire for each, the state and its event in one transaction",
+          "contract": "each such claim reads with state expired; one event parley.claim.expire per claim with resource_type claim, resource_id the id, workspace the claim's workspace_slug, actor system and metadata {paths}; a second run emits nothing for the same claims",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a real event log on SQLite"
+            ],
+            "pseudocode": "in internal/awareness/expiry_test.go with a controlled clock: claims A (expires T + 5m), B (expires T + 2h), C (released); set the clock to T + 6m; run the expiry once; assert stored state of A == 'expired'; assert B is active and C released; ev = events of type parley.claim.expire; assert len(ev) == 1; assert ev[0].resource_id == A and ev[0].actor.actor_type == 'system' and ev[0].metadata == {paths: A.paths}; run again; assert len(events of type parley.claim.expire) == 1"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "event_driven",
+          "condition": "the index worker reads the parley.change.version event of version 1 of a change that carries a session_id",
+          "action": "set change to that change's number on every claim of the same session that is active, stored on the change's workspace, on the change's target branch and has change null",
+          "contract": "those claims read with change equal to the number; claims of other sessions, on other target branches, not active or already linked are unchanged",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/awareness/claim_link_test.go: claims A (s1, main), B (s1, release), C (s2, main), D (s1, main, released), E (s1, main, change 3); feed version 1 of change 7 (session s1, target main); pass; assert A.change == 7; assert B.change == null and C.change == null and D.change == null; assert E.change == 3; feed version 2 of change 8 (session s1, main) without its version 1; pass; assert no claim has change 8"
+          }
+        },
+        {
+          "id": "REQ-8.3",
+          "pattern": "event_driven",
+          "condition": "the index worker reads a parley.change.land or parley.change.abandon event of a change",
+          "action": "set every active claim whose change is that change's number to fulfilled, without emitting an event",
+          "contract": "those claims read with state fulfilled and are absent from activity; a claim linked to the change that is already released or expired keeps its state",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/awareness/claim_link_test.go, a table over the events {land, abandon}: claims A (active, change 7), B (released, change 7), C (active, change 9); feed the event for change 7; pass; assert A.state == 'fulfilled'; assert B.state == 'released'; assert C.state == 'active'; assert no parley.claim.* event was written; feed restore(7); pass; assert A.state == 'fulfilled'"
+          }
+        },
+        {
+          "id": "REQ-8.4",
+          "pattern": "event_driven",
+          "condition": "the maintenance loop runs the task claim_cleanup",
+          "action": "remove every claim that became released, expired or fulfilled 7 days ago or earlier and keep every other claim",
+          "contract": "GET …/claims/{id} of a removed claim answers HTTP 404 with error_type claim_not_found; active claims and claims that ended less than 7 days ago still read",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/awareness/cleanup_test.go with a controlled clock at T: claims A released at T - 7d, B expired at T - 7d - 1s, C fulfilled at T - 8d, D released at T - 7d + 1s, E active and created at T - 30d with expires_at in the future; run the task registered under the name claim_cleanup; assert ids(all stored claims) == [D, E]; assert GET …/claims/{A} is 404 claim_not_found"
+          }
+        },
+        {
+          "id": "REQ-8.5",
+          "pattern": "ubiquitous",
+          "action": "read [awareness].default_claim_ttl (duration, default 1h), [awareness].max_claim_ttl (duration, default 24h) and [awareness].max_claims_per_workspace (integer, default 1000) from the configuration and refuse to start when a duration is not positive, default_claim_ttl exceeds max_claim_ttl or max_claims_per_workspace is below 1",
+          "contract": "with no [awareness] section the three defaults apply; an invalid value stops the start with exit status 1 and an error line that names the key",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/awareness/config_test.go, a table over configuration texts {none -> 1h, 24h, 1000; default_claim_ttl = '30m' -> 30m; max_claim_ttl = '0s' -> error naming awareness.max_claim_ttl; default_claim_ttl = '2d' with max_claim_ttl = '24h' -> error naming awareness.default_claim_ttl; max_claims_per_workspace = 0 -> error naming awareness.max_claims_per_workspace; default_claim_ttl = 'soon' -> error naming awareness.default_claim_ttl; an unregistered key awareness.other -> error}: load through the configuration loader with this package's keys registered; assert the values or the error text"
+          }
+        },
+        {
+          "id": "REQ-8.6",
+          "pattern": "ubiquitous",
+          "action": "for any claim and any overlap, leave the opening of changes, the recording of versions, pushes, commits, policy evaluation and landing unaffected",
+          "contract": "a change that touches paths another session has claimed, or that overlaps another change, is opened and versioned with the same status and body as without the claim or the overlap",
+          "check": {
+            "same_as": "PATH-1"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-9",
+      "title": "CLI commands for awareness",
+      "rationale": "Agents and scripts ask about activity and manage claims from the shell, and need an exit status that says whether something overlaps.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-9.1",
+          "pattern": "event_driven",
+          "condition": "a user runs parley activity <slug> or parley change overlaps <slug> <number> with valid flags",
+          "action": "send GET /api/v1/workspaces/<slug>/activity with paths (one comma-joined value), target, since, exclude_session and exclude_change taken from --paths, --target, --since, --exclude-session and --exclude-change, or GET /api/v1/workspaces/<slug>/changes/<number>/overlaps, and print the response body",
+          "contract": "one JSON document on stdout and exit status 0; a hub error is printed on stderr as received with exit status 1",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/activity_test.go and internal/cli/change_overlaps_test.go, against an httptest server that records requests, a table {['activity', 'demo', '--paths', 'api/**,docs/**'] -> GET /api/v1/workspaces/demo/activity with paths == 'api/**,docs/**' and no other parameter; the same with --target release --since <sha> --exclude-session s1 --exclude-change 4 -> the five parameters; ['change', 'overlaps', 'demo', '7'] -> GET /api/v1/workspaces/demo/changes/7/overlaps}: assert method, path and query; assert stdout is the served body indented by 2 spaces; assert exit == 0; with the server answering 404 change_not_found assert exit == 1 and the envelope on stderr"
+          }
+        },
+        {
+          "id": "REQ-9.2",
+          "pattern": "optional",
+          "condition": "--fail-on-overlap is given to parley activity or parley change overlaps",
+          "action": "print the response body first and then, when changes or claims of the activity answer holds an item, or items of the overlaps answer holds an item, report condition_not_met on stderr and exit with status 3",
+          "contract": "exit status 3 with the result on stdout and an envelope with error_type condition_not_met on stderr when something overlaps; exit status 0 when the lists are empty; without the flag exit status 0 in both cases",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/activity_test.go and internal/cli/change_overlaps_test.go, a table over the served bodies {activity with changes [x] and claims [] -> 3; changes [] and claims [y] -> 3; changes [] and claims [] and landed [z] -> 0; overlaps with items [x] -> 3; overlaps with items [] -> 0} with the flag, and the first and fourth rows without the flag -> 0: assert exit; assert stdout is the body in every row; for exit 3 assert stderr.json.error.error_type == 'condition_not_met' and stderr.json.error.code == 0"
+          }
+        },
+        {
+          "id": "REQ-9.3",
+          "pattern": "event_driven",
+          "condition": "a user runs parley claim create, parley claim list, parley claim renew or parley claim release with valid arguments",
+          "action": "send for create POST …/claims with paths (the comma list split into an array), intent and, when their flags are given, target_branch, ttl and session_id; for list GET …/claims with state, session_id, path, limit and cursor from the flags given; for renew PATCH …/claims/<id> with ttl from --ttl or else 1h; for release DELETE …/claims/<id>; and print the response body, or {} for release",
+          "contract": "one JSON document on stdout and exit status 0; for release the document is {}",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/claim_test.go, against a recording httptest server, a table {['claim', 'create', 'demo', '--paths', 'api/**,docs/**', '--intent', 'rework'] -> POST /api/v1/workspaces/demo/claims with body {paths: ['api/**', 'docs/**'], intent: 'rework'} and no other member; the same with --target release --ttl 30m --session s1 -> also target_branch, ttl and session_id; ['claim', 'list', 'demo'] -> GET …/claims with no query; ['claim', 'list', 'demo', '--state', 'expired', '--session', 's1', '--path', 'api/**', '--limit', '10', '--cursor', 'c'] -> the five parameters; ['claim', 'renew', 'demo', ID] -> PATCH …/claims/ID with body {ttl: '1h'}; ['claim', 'renew', 'demo', ID, '--ttl', '4h'] -> {ttl: '4h'}; ['claim', 'release', 'demo', ID] -> DELETE …/claims/ID answered 204 and stdout '{}'}: assert method, path, query and body; assert exit == 0"
+          }
+        },
+        {
+          "id": "REQ-9.4",
+          "pattern": "unwanted",
+          "condition": "parley activity or parley claim create is run without --paths, parley claim create without --intent, any of the six commands with a wrong number of arguments, or parley change overlaps or --exclude-change with a value that is not a positive integer",
+          "action": "fail before sending any request",
+          "contract": "exit status 2, nothing on stdout, an envelope with code 0 and error_type usage_error on stderr, and no HTTP request",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/activity_test.go, internal/cli/change_overlaps_test.go and internal/cli/claim_test.go, a table over the argument lists {['activity', 'demo']; ['activity']; ['activity', 'demo', '--paths', 'a', '--exclude-change', 'x']; ['change', 'overlaps', 'demo']; ['change', 'overlaps', 'demo', 'abc']; ['change', 'overlaps', 'demo', '0']; ['claim', 'create', 'demo', '--intent', 'x']; ['claim', 'create', 'demo', '--paths', 'a']; ['claim', 'renew', 'demo']; ['claim', 'release', 'demo']; ['claim', 'list']}: assert exit == 2; assert stdout == ''; assert stderr.json.error.error_type == 'usage_error'; assert the server recorded 0 requests"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "Two agents meet on one file and each is told about the other",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "opens change 1 with POST /api/v1/workspaces/demo/changes from a branch that edits api/handler.go"
+        },
+        {
+          "actor": "agent",
+          "action": "a second agent runs parley claim create demo --paths 'api/**' --intent 'rework handlers' --session <its session>"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends POST /api/v1/workspaces/demo/claims and prints the answer"
+        },
+        {
+          "actor": "parleyd",
+          "action": "stores the claim, emits parley.claim.create and answers 201 with the claim and an activity that lists change 1"
+        },
+        {
+          "actor": "agent",
+          "action": "the second agent opens change 2 from a branch that also edits api/handler.go, naming its session"
+        },
+        {
+          "actor": "parleyd",
+          "action": "opens change 2 as it would without the claim and the overlap, and answers 201"
+        },
+        {
+          "actor": "parleyd",
+          "action": "the index worker reads the version events, records the files of both changes, sets change 2 on the claim and emits one parley.change.overlap on each change"
+        },
+        {
+          "actor": "agent",
+          "action": "the first agent runs parley change overlaps demo 1 --fail-on-overlap"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints the list with the entry for change 2, reports condition_not_met and exits 3"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parley CLI command tree",
+          "parleyd HTTP server with its middleware",
+          "access component",
+          "change routes and change store",
+          "event log",
+          "awareness index worker running as background work",
+          "git wrapper on a real repository",
+          "transactional store on SQLite"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with an empty data directory",
+          "a workspace demo cloned from a local origin served by internal/gitrepo/gitrepotest, with the branches feat-a and feat-b pushed to the hub, each one commit on main that edits api/handler.go",
+          "two users of the owning organization, each with an API key and one session on demo"
+        ],
+        "end_state": [
+          "the claim reads with state active and change 2",
+          "GET /api/v1/workspaces/demo/changes/1/overlaps holds one entry with change.number 2, paths ['api/handler.go'] and count 1, and the overlaps of change 2 hold change 1",
+          "the event log holds exactly two parley.change.overlap events, one with resource_id '1' naming change 2 and one with resource_id '2' naming change 1, and one parley.claim.create",
+          "parley change overlaps demo 1 --fail-on-overlap exits 3 with the list on stdout",
+          "the POST that opened change 2 answered 201"
+        ],
+        "pseudocode": "in test/e2e/awareness_test.go: hub = startHub(t); demo with feat-a and feat-b; c1 = POST /changes {source: {branch: 'feat-a'}, session_id: sA} as user A; assert c1.status == 201; poll GET …/activity?paths=api/** until numbers(changes) == [1] (at most 10 s); out = runCLI as user B ('claim', 'create', 'demo', '--paths', 'api/**', '--intent', 'rework handlers', '--session', sB); assert out.exit == 0; cl = json(out.stdout); assert numbers(cl.activity.changes) == [1]; c2 = POST /changes {source: {branch: 'feat-b'}, session_id: sB} as user B; assert c2.status == 201; poll GET /events/log filtered to parley.change.overlap until it holds 2 items (at most 10 s); assert the two resource ids are {'1', '2'} and each metadata.with.number is the other; assert GET …/claims/{cl.claim.id} .change == 2; o = runCLI as user A ('change', 'overlaps', 'demo', '1', '--fail-on-overlap'); assert o.exit == 3; assert json(o.stdout).items[0].change.number == 2 and .count == 1"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "A crashed agent's claim expires and is removed",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "sends POST /api/v1/workspaces/demo/claims with paths ['docs/**'] and ttl 5m, then stops"
+        },
+        {
+          "actor": "parleyd",
+          "action": "stores the claim with expires_at five minutes later and emits parley.claim.create"
+        },
+        {
+          "actor": "parleyd",
+          "action": "six minutes later the claim expiry run sets the claim to expired and emits parley.claim.expire"
+        },
+        {
+          "actor": "agent",
+          "action": "another agent sends GET /api/v1/workspaces/demo/activity?paths=docs/** and receives no claim"
+        },
+        {
+          "actor": "parleyd",
+          "action": "seven days later the maintenance loop runs claim_cleanup and removes the claim"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parleyd HTTP server with its middleware",
+          "claim store on SQLite",
+          "claim expiry background work",
+          "maintenance loop with the claim_cleanup task",
+          "event log"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with a controlled clock",
+          "a workspace demo and a user with an API key who can read it"
+        ],
+        "end_state": [
+          "after the clock passed expires_at and the expiry ran, the claim reads with state expired and activity for docs/** has an empty claims list",
+          "the event log holds one parley.claim.create and one parley.claim.expire for the claim's id",
+          "after the clock moved 7 days further and a maintenance pass ran, GET …/claims/{id} answers 404 claim_not_found"
+        ],
+        "pseudocode": "in test/e2e/awareness_test.go: hub = startHub(t, clock); r = POST /workspaces/demo/claims {paths: ['docs/**'], intent: 'write docs', ttl: '5m'}; id = r.json.claim.id; assert ids(GET …/activity?paths=docs/** .claims) == [id]; clock.advance(6m); hub.runClaimExpiry(); assert GET …/claims/{id} .state == 'expired'; assert GET …/activity?paths=docs/** .claims == []; assert types(GET /events/log for resource claim/id) == ['parley.claim.create', 'parley.claim.expire']; clock.advance(7d); hub.runMaintenancePass(); assert GET …/claims/{id} .status == 404"
+      }
+    }
+  ],
+  "external_apis": [
+    {
+      "package": "github.com/spf13/cobra",
+      "version": "v1",
+      "verified": false,
+      "symbols": [
+        {
+          "name": "Command",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "type Command struct { Use string; Short string; Args PositionalArgs; RunE func(cmd *Command, args []string) error; ... }"
+        },
+        {
+          "name": "Command.AddCommand",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) AddCommand(cmds ...*Command)"
+        },
+        {
+          "name": "Command.Flags",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) Flags() *pflag.FlagSet"
+        }
+      ]
+    }
+  ]
+}

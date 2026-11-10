@@ -1,0 +1,188 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "26",
+  "spec_name": "conflict_reports_and_resolution",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/land/... ./internal/gitrepo/... ./internal/change/... ./internal/cli/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "09",
+      "reason": "builds its CLI commands on the client, output and exit-code helpers of the CLI foundation"
+    },
+    {
+      "spec": "24",
+      "reason": "extends the restack operation and its route with resolutions, and through it uses changes, versions, the replay, the access rule, the HTTP conventions and the CLI foundation"
+    },
+    {
+      "spec": "25",
+      "reason": "reuses the attribution of landed changes in internal/land/conflict.go and the commit mapping from landed commits to changes it reads, and serves its read routes beside the land routes"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Build the conflict report from a failed replay step",
+      "criteria": [
+        "REQ-1.1",
+        "REQ-1.2",
+        "REQ-1.3",
+        "REQ-1.6"
+      ],
+      "steps": [
+        "Add the report behaviours to internal/land/conflict_test.go and internal/gitrepo/conflict_test.go, each on repositories made with git init in t.TempDir(), and confirm they fail",
+        "In internal/gitrepo, complete what the replay of packages 20, 21 and 25 already returns for a step that does not apply, so that it describes every conflicted path: the blob id, mode and path of the file in the parent of the commit, in the tree replayed so far and in the commit, each absent where the file does not exist, plus what git said about the path (content, add/add, modify/delete, rename, distinct modes, binary, submodule, file/directory). git merge-tree --write-tree (git 2.38) reports all of this without a working directory; extend the existing replay and add no second one",
+        "Use ConflictReport, the type package 20 declares in internal/gitrepo/conflictreport.go, with its seven members and the six members of a file entry, and declare no second type; make its encoding write every member (null or an empty list, never left out) and full 40-character commit ids where it does not yet",
+        "Complete the build function beside the type: it takes the repository, the onto commit, the head and the base, runs or receives the replay, and on the first commit that does not apply returns the report with files ordered by path and change null; a replay that applies returns no report; internal/land/conflict.go of package 25 keeps only the attribution and the change member of a stack land",
+        "Classify each path into exactly one kind by the fixed order submodule, binary, rename, add_add, modify_delete, delete_modify, mode, content; the target is ours and the change is theirs; a file against a directory is add_add",
+        "Run every replay without touching a ref and remove any temporary directory or index on every exit, including an error from git",
+        "Make every producer built before this package return that one type through that one build function: comparison (package 20), server-side rebase (21), mergeability (23), restack (24) and landing (25); internal/change and internal/scm receive the attribution of task 2 as a function value from parleyd because they cannot import internal/land; landing keeps setting the change member in a stack land"
+      ],
+      "touches": [
+        "internal/gitrepo/conflict.go",
+        "internal/gitrepo/conflict_test.go",
+        "internal/gitrepo/conflictreport.go",
+        "internal/land/conflict.go",
+        "internal/land/conflict_test.go",
+        "internal/change/",
+        "internal/scm/",
+        "cmd/parleyd/"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Name the landed changes a conflict collided with",
+      "criteria": [
+        "REQ-1.4",
+        "REQ-1.5"
+      ],
+      "steps": [
+        "Add the landed-change behaviours to internal/land/conflict_test.go with a lookup backed by a table, and confirm they fail",
+        "Reuse the attribution function package 25 adds in internal/land/conflict.go, which fills landed_changes and landed_by through a lookup from a commit id to the landed change it belongs to ({number, title, landed_sha, session_id}); the production lookup reads the commit mapping of package 25; add no second attribution, and extend that function where a behaviour of this task is missing",
+        "When base_sha is an ancestor of target_sha, list the commits between them with the paths each touched, keep those touching a conflicted path, and resolve each through the lookup; a commit with no change contributes nothing",
+        "Fill landed_changes ordered by number without duplicates, and each entry's landed_by with the ascending numbers for that path",
+        "When base_sha is not an ancestor of target_sha, or the lookup returns an error, return the report with landed_changes and every landed_by as empty lists and no error"
+      ],
+      "touches": [
+        "internal/land/conflict.go",
+        "internal/land/conflict_test.go",
+        "internal/land/landed_lookup.go"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Serve GET …/changes/:number/conflict",
+      "criteria": [
+        "REQ-2"
+      ],
+      "steps": [
+        "Add the route's behaviours to internal/land/conflict_handlers_test.go with net/http/httptest and confirm they fail",
+        "Register GET /api/v1/workspaces/{slug}/changes/{number}/conflict with the server of package 02, needing the scope changes:read and read access to the workspace through the access component of package 07",
+        "Look the change up by number in the workspace; answer 404 change_not_found for an unknown number, and for a caller whose token is bound to a fork when the change's source workspace is not that fork (ask the binding component of package 08 what the token covers)",
+        "Add one function that returns the current result of a change, used by this route and by the file route: for a landed or abandoned change the stored report or none; for a draft or open change the stored report when mergeable is conflict and its target_sha and head_sha equal the present onto commit and the change's head; otherwise a trial replay of the change's own commits onto the onto commit",
+        "Take as onto commit the head of the change below for a change with depends_on, and the head of the target branch otherwise; when the target branch of a draft or open change does not exist, answer 409 with error_type conflict",
+        "Answer 200 with {mergeable, conflict}, conflict being null when clean; write nothing to the change and emit no event"
+      ],
+      "touches": [
+        "internal/land/conflict_handlers.go",
+        "internal/land/conflict_handlers_test.go",
+        "internal/land/current_conflict.go"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Serve GET …/changes/:number/conflict/file",
+      "criteria": [
+        "REQ-3"
+      ],
+      "steps": [
+        "Add the route's behaviours to internal/land/conflict_handlers_test.go and the marker text behaviour to internal/gitrepo/conflict_test.go, and confirm they fail",
+        "Register GET /api/v1/workspaces/{slug}/changes/{number}/conflict/file with the same scope, access, change lookup and fork-token rule as the report route",
+        "Answer 400 invalid_request when the query has no path or an empty one",
+        "Take the current result through the function of the report route; answer 404 path_not_found when the path is not an entry of it or the change is clean, and 409 not_text_conflict when the entry's kind is not content",
+        "In internal/gitrepo, produce the merged text of three blobs with two-way conflict markers labelled target and change (for example with git merge-file -p and the labels target, base, change), from the entry's base, ours and theirs",
+        "Answer 200 with Content-Type text/plain; charset=utf-8 and the text as the whole body"
+      ],
+      "touches": [
+        "internal/land/conflict_handlers.go",
+        "internal/land/conflict_handlers_test.go",
+        "internal/gitrepo/conflict.go",
+        "internal/gitrepo/conflict_test.go"
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Accept resolutions in the restack",
+      "criteria": [
+        "REQ-4"
+      ],
+      "steps": [
+        "Add the resolution behaviours to internal/change/resolutions_test.go against the restack route of package 24 on real repositories, and confirm they fail",
+        "Parse and validate the resolutions member of the restack body before any replay: a list; each entry a path that is not empty, does not start with / and has no empty, . or .. segment; exactly one of content, content_base64 and delete: true; valid standard base64; no path twice. Any violation answers 400 invalid_request",
+        "Extend the replay used by the restack in internal/gitrepo with a resolver: at a commit that does not apply, when every conflicted path has a resolution, build that commit's tree from the cleanly merged result with each conflicted path replaced by the given bytes (or removed for delete), and continue with the next commit; the same resolution is used at every commit where its path conflicts",
+        "Give a resolved file the mode it has in the change's commit, else in the tree replayed so far, else 100644",
+        "Ignore a resolution whose path does not conflict at a commit, and all of them when the change is already built on its onto commit (status up_to_date)",
+        "When a conflicted path has no resolution, stop as the restack of package 24 does: 409 rebase_conflict with the conflict report of this package in details, no branch moved, no version recorded",
+        "On success move the source branch by compare-and-swap and record the restack version as the manual restack of package 24 does, through the version recording of package 22 with created_by the caller, so that policy and mergeability are evaluated for it as for any version; answer 200 with status restacked and the change"
+      ],
+      "touches": [
+        "internal/change/resolutions.go",
+        "internal/change/resolutions_test.go",
+        "internal/change/",
+        "internal/gitrepo/conflict.go",
+        "internal/gitrepo/conflict_test.go"
+      ],
+      "depends_on": [
+        2
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Add parley change conflict",
+      "criteria": [
+        "REQ-5"
+      ],
+      "steps": [
+        "Add the command's behaviours to internal/cli/change_test.go against an httptest hub that records method, raw path and query, and confirm they fail",
+        "Add conflict under the change command group of internal/cli/change.go, with exactly two arguments and the flags --file <path> and --fail-on-conflict, using the HTTP client, output and exit-code helpers of package 09",
+        "Without --file: GET the report route and print the body; with --fail-on-conflict and mergeable conflict, still print the body on stdout, then report condition_not_met on stderr and exit 3",
+        "With --file: GET the file route with the path as the encoded query parameter path and copy the response body to stdout unchanged, without JSON encoding and without adding a newline",
+        "Reject --file together with --fail-on-conflict as a usage error before any request"
+      ],
+      "touches": [
+        "internal/cli/change.go",
+        "internal/cli/change_test.go"
+      ],
+      "depends_on": [
+        4
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Add parley change resolve",
+      "criteria": [
+        "REQ-6"
+      ],
+      "steps": [
+        "Add the command's behaviours to internal/cli/change_test.go against an httptest hub that records the request body, and confirm they fail",
+        "Add resolve under the change command group of internal/cli/change.go, with exactly two arguments and the repeatable flags --file <repo-path>=<local-file> and --delete <repo-path>",
+        "Split each --file value at its first =; fail as a usage error, before any request, when no flag is given, a value has no =, either side is empty, a local file cannot be read, or a repository path occurs twice across both flags",
+        "Send POST to the restack route with resolutions holding {path, content_base64} for each --file (the file's bytes in standard base64) and {path, delete: true} for each --delete; print the response body and exit 0",
+        "Leave a hub error to the helpers of package 09: the envelope, with the conflict report of a 409 rebase_conflict in details, goes to stderr and the exit status is 1",
+        "Add test/e2e/conflict_resolution_test.go with the end-to-end flow of the PRD: start the hub in-process on a loopback port the system picks, make two changes that edit the same line, land the first, and drive conflict, conflict --file and resolve through the CLI command tree"
+      ],
+      "touches": [
+        "internal/cli/change.go",
+        "internal/cli/change_test.go",
+        "test/e2e/conflict_resolution_test.go"
+      ],
+      "depends_on": [
+        5,
+        6
+      ]
+    }
+  ]
+}

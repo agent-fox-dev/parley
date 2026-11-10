@@ -1,0 +1,223 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "50",
+  "spec_name": "telemetry_ingestion",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/telemetry/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "49",
+      "reason": "reads a session's run_id for the sandbox use record and opens a session in the end-to-end test; through it uses the access rule, the scope check, the router and error envelope, the analytical store and the configuration key registry"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Ingest a single run event behind the ingestion gate",
+      "criteria": [
+        "REQ-1",
+        "REQ-2"
+      ],
+      "steps": [
+        "Add the run event behaviours to internal/telemetry/events_test.go and internal/telemetry/validate_test.go and the gate behaviours to internal/telemetry/access_test.go, served through the real router, scope check and access component with SQLite stores in t.TempDir() and a replaceable clock, and confirm they fail; write the gate tables so that each later task adds its routes and a valid body per route to one shared list",
+        "Add the shared value rules of telemetry records as functions that return the name of the offending member on a violation: the run id format, a UUID in the 8-4-4-4-12 form in any case normalised to lower case, an RFC 3339 timestamp with any offset normalised to UTC and cut to microseconds, a label of at most 255 characters, a non-empty required string, an integer of at least 0 that rejects fractions and strings, and a JSON object; treat JSON null as absent and ignore unknown members",
+        "Render a client timestamp in UTC with a Z suffix and without trailing zeros in its fractional part, and hub times with whole seconds",
+        "Register this package's schema step for the run event table with the analytical store of package 03: id as the key, workspace, run id, timestamp, ingested_at and the run event members, the payload kept as JSON text",
+        "Build one ingestion gate that every ingestion route is registered through: it declares the scope audit:write and the access need write with the route registration of the server, then checks the run id of the path, then runs the route's own validation, then refuses an archived workspace with 409 workspace_archived, in that order, and accepts every other workspace status and task forks",
+        "Check a run_id member of a single-record body against the path inside validation and answer 400 invalid_request naming run_id when it differs",
+        "Add POST /api/v1/workspaces/{slug}/runs/{run_id}/events: validate the body, apply the severity default table and the id and timestamp defaults, store the run event and answer 201 with every member present and absent optional members as null; register it as a creating POST with the idempotency helper of the server",
+        "Answer a store failure with 500 internal and store nothing",
+        "Wire the telemetry routes into parleyd's composition in internal/hub with the real analytical store, access component and clock"
+      ],
+      "touches": [
+        "internal/telemetry/validate.go",
+        "internal/telemetry/validate_test.go",
+        "internal/telemetry/schema.go",
+        "internal/telemetry/store.go",
+        "internal/telemetry/gate.go",
+        "internal/telemetry/access_test.go",
+        "internal/telemetry/events.go",
+        "internal/telemetry/events_test.go",
+        "internal/telemetry/routes.go",
+        "internal/hub/"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Ingest session outcomes, tool calls, tool errors and traces",
+      "criteria": [
+        "REQ-3"
+      ],
+      "steps": [
+        "Add the behaviours of the four kinds to internal/telemetry/records_test.go and their four routes with a valid body each to the gate tables of internal/telemetry/access_test.go, and confirm they fail",
+        "Register schema steps for the four tables in the analytical store, each keyed by id, with token_usage, input, output and data kept as JSON text so that any JSON value is returned as it was sent",
+        "Add POST …/sessions/outcomes: session_id (a UUID) and status are required; node_id, duration_ms and token_usage are optional; session_id is not looked up among the stored sessions",
+        "Add POST …/tools/calls: tool_name is required and at most 255 characters; node_id, session_id, duration_ms, input and output are optional",
+        "Add POST …/tools/errors: tool_name and error_msg are required; error_code, node_id and session_id are optional strings",
+        "Add POST …/traces: event_type is required and one of session.init, assistant.message, tool.use, tool.error, session.result; node_id, session_id, sequence and data are optional",
+        "Register the four routes through the ingestion gate and as creating POSTs, and answer 201 with the stored record and 400 invalid_request naming the member on a violation"
+      ],
+      "touches": [
+        "internal/telemetry/schema.go",
+        "internal/telemetry/store.go",
+        "internal/telemetry/records.go",
+        "internal/telemetry/records_test.go",
+        "internal/telemetry/routes.go",
+        "internal/telemetry/access_test.go"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Make every single record idempotent on its id",
+      "criteria": [
+        "REQ-4"
+      ],
+      "steps": [
+        "Add the replay, conflict, letter-case, cross-kind and concurrency behaviours to internal/telemetry/idempotency_test.go as tables over the five single-record kinds, and confirm they fail",
+        "Give the store one insert operation per kind that, in one transaction, either inserts the record or reports the record already stored under that id, so that concurrent inserts of one id store exactly one record",
+        "After validation, when the id names a stored record of the same kind with the same workspace and run, answer 200 with the stored record and write nothing, whatever the replayed body holds",
+        "When the stored record of that id has another workspace or another run, answer 409 conflict and write nothing",
+        "Compare ids in their lower-case form, and keep each kind's ids in its own table so that one UUID may name records of two kinds",
+        "Keep validation ahead of the lookup, so that an invalid body with a known id answers 400"
+      ],
+      "touches": [
+        "internal/telemetry/store.go",
+        "internal/telemetry/events.go",
+        "internal/telemetry/records.go",
+        "internal/telemetry/idempotency_test.go"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Store one postmortem per workspace and run",
+      "criteria": [
+        "REQ-5"
+      ],
+      "steps": [
+        "Add the postmortem behaviours to internal/telemetry/postmortem_test.go and the route with a valid body to the gate tables of internal/telemetry/access_test.go, and confirm they fail",
+        "Register a schema step for the postmortem table in the analytical store, unique on workspace and run id, with task_summary, cost_summary, blocked_tasks and session_history kept as JSON text",
+        "Validate the body: run_status is required and one of stalled, block_limit, cost_limit, session_limit; started_at and completed_at are required RFC 3339 timestamps, normalised to UTC, their order unchecked; task_summary is a required JSON object whose key total is present and not null; cost_summary is a required JSON object; blocked_tasks and session_history are JSON arrays that default to an empty array",
+        "Answer a schema_version other than the number 1 with 400 and error_type unknown_schema_version; treat an absent or null schema_version as 1",
+        "Generate the id and set timestamp and ingested_at to the hub's time; ignore an id or timestamp member of the body",
+        "Insert the postmortem or report the stored one in one transaction: the first request of a workspace and run answers 201, every later valid request 200 with the stored record, also when several arrive at once",
+        "Register POST …/postmortem through the ingestion gate and as a creating POST"
+      ],
+      "touches": [
+        "internal/telemetry/schema.go",
+        "internal/telemetry/store.go",
+        "internal/telemetry/postmortem.go",
+        "internal/telemetry/postmortem_test.go",
+        "internal/telemetry/routes.go",
+        "internal/telemetry/access_test.go"
+      ],
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Ingest run events and traces in batches",
+      "criteria": [
+        "REQ-6"
+      ],
+      "steps": [
+        "Add the batch behaviours to internal/telemetry/batch_test.go and the two batch routes with a valid body each to the gate tables of internal/telemetry/access_test.go, and confirm they fail",
+        "Read the body as a JSON array: answer 400 invalid_request when it is not an array or is empty, and 413 payload_too_large when it holds more than 1000 items, storing nothing in either case",
+        "Validate each item with the validation of the single record of its kind, including a run_id member that must equal the path; an item that is not a JSON object is invalid",
+        "Report each invalid item as an errors entry with its zero-based index, its id in lower case when the item carries a valid UUID and null otherwise, and the message of the violation",
+        "Classify each valid item against the store and against the earlier items of the batch: an id stored in this workspace and run, or already seen in the batch, counts as a duplicate; an id stored in another workspace or run is an errors entry; the rest are accepted",
+        "Store the accepted items in one transaction of the analytical store, so that a failure leaves none of them stored, and answer such a failure with 500 internal",
+        "Answer 200 with accepted, duplicates and errors, errors in index order and an empty array when there are none",
+        "Register POST …/events/batch and POST …/traces/batch through the ingestion gate, without the idempotency helper"
+      ],
+      "touches": [
+        "internal/telemetry/batch.go",
+        "internal/telemetry/batch_test.go",
+        "internal/telemetry/store.go",
+        "internal/telemetry/routes.go",
+        "internal/telemetry/access_test.go"
+      ],
+      "depends_on": [
+        3
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Bound every ingestion write by the configured timeout",
+      "criteria": [
+        "REQ-7"
+      ],
+      "steps": [
+        "Add the timeout behaviours to internal/telemetry/timeout_test.go, with a store wrapper that blocks a write until its context is cancelled, and the configuration behaviours to internal/telemetry/config_test.go, and confirm they fail",
+        "Register the key audit.write_timeout with the configuration key registry of package 03: a duration, default 2s, valid from 100ms upwards, so that a malformed or smaller value stops the start with an error that names the key",
+        "Run the write of each of the eight routes under a context that ends after the configured limit, covering the lookup and the insert of a single record and the whole transaction of a batch",
+        "When the limit is reached, roll the transaction back and answer 503 unavailable with the header Retry-After: 5",
+        "Hand the configured limit to the telemetry component in parleyd's composition"
+      ],
+      "touches": [
+        "internal/telemetry/config.go",
+        "internal/telemetry/config_test.go",
+        "internal/telemetry/store.go",
+        "internal/telemetry/routes.go",
+        "internal/telemetry/timeout_test.go",
+        "internal/hub/"
+      ],
+      "depends_on": [
+        4,
+        5
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Record sandbox use as run events",
+      "criteria": [
+        "REQ-8"
+      ],
+      "steps": [
+        "Add the recorder behaviours to internal/telemetry/sandbox_test.go, with a fixture session lookup and a capturing logger, and the sandbox flow to test/e2e/telemetry_test.go, and confirm they fail",
+        "Define the recorder's input as four operation values that hold only the members of the payload table plus the workspace slug, the sandbox id, an optional session id, actor_type, actor_id and the start time: exec with the argument list, exit code, timed-out flag and duration; attach with the duration; upload and download with path and byte count; the input has no place for stdin, output, terminal content, file content or environment values",
+        "Define the narrow session lookup the recorder needs: the run id of a session by id, with a result for 'no such session' and for 'no run id' that is not an error",
+        "On a report, look the session up; without a session id, without a stored session or without a run id, return and store nothing",
+        "Otherwise store one run event under the session's run id and session id with event_type sandbox.exec, sandbox.attach, sandbox.upload or sandbox.download, severity info, a generated id, the start time as timestamp and the payload of the table, under the write timeout and without any access or workspace status check",
+        "The recorder returns no error: on a lookup failure, a store failure or the timeout it logs one line with the workspace slug, the sandbox id and the event type, and nothing else of the payload",
+        "In parleyd's composition, back the session lookup with the session component of package 49 and expose the recorder so that the end-to-end test can call it; when internal/sandbox holds the operation observer registry of package 46, register an adapter there that turns its operation record (kind, sandbox id, workspace, session id, actor, start time, duration_ms and the kind's members) into the recorder's operation value and calls Record"
+      ],
+      "touches": [
+        "internal/telemetry/sandbox.go",
+        "internal/telemetry/sandbox_test.go",
+        "internal/hub/",
+        "test/e2e/telemetry_test.go"
+      ],
+      "depends_on": [
+        6
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Notify observers of each stored run event",
+      "criteria": [
+        "REQ-9"
+      ],
+      "steps": [
+        "Add the observer behaviours to internal/telemetry/observer_test.go and the agent's ingestion flow to test/e2e/telemetry_test.go, and confirm they fail",
+        "Add the registration for run event observers on the telemetry component, OnRunEvent: an observer is a function that takes the event_type of one stored run event",
+        "Call every observer once per newly stored run event after the write has committed: for the single route on a 201, for a batch once per accepted run event with that item's type, for the sandbox recorder once per stored record",
+        "Call no observer for a replay, a duplicate, an invalid item, a refused request, a failed or timed-out write, or a record of another kind",
+        "Expose OnRunEvent from parleyd's composition; package 51 registers an observer there that reports parley_audit_events_total with source agent to its recorder, and this package imports nothing of internal/metrics"
+      ],
+      "touches": [
+        "internal/telemetry/observer.go",
+        "internal/telemetry/observer_test.go",
+        "internal/telemetry/events.go",
+        "internal/telemetry/batch.go",
+        "internal/telemetry/sandbox.go",
+        "internal/hub/",
+        "test/e2e/telemetry_test.go"
+      ]
+    }
+  ]
+}

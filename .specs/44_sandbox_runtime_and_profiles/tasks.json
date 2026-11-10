@@ -1,0 +1,275 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "44",
+  "spec_name": "sandbox_runtime_and_profiles",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/sandbox/... ./internal/cli/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "03",
+      "reason": "uses the configuration loader and its registry, the start hooks, the scrubber and the hub composition"
+    },
+    {
+      "spec": "07",
+      "reason": "uses the workspace access decision for the read and write needs of sandbox routes, and through it the router, authentication and the scope check"
+    },
+    {
+      "spec": "09",
+      "reason": "builds parley sandbox profiles on the CLI's HTTP client, output, exit codes and command declaration"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Load and validate the [sandbox] section, reporting every failure together",
+      "criteria": [
+        "REQ-1.2",
+        "REQ-1.3",
+        "REQ-1.4",
+        "REQ-1.5",
+        "REQ-1.6",
+        "REQ-1.7",
+        "REQ-1.8"
+      ],
+      "steps": [
+        "Add the behaviours of the owned criteria to internal/sandbox/config_test.go as table-driven tests and confirm they fail",
+        "Use the whole-section registration of package 03, RegisterSection(name, validator) of internal/config/registry.go, a file package 03 owns and this package does not edit: a registered section's parsed content, after environment references are replaced, is handed to the registrant's validator, whose single error fails the load; read whether the file held the section, and its content, through cfg.Section(name)",
+        "Register the section 'sandbox' from internal/sandbox with RegisterSection: the file having the section turns the feature on; without it the loaded value reports enabled false and nothing else is checked",
+        "Decode the scalar keys of the section with the defaults of the PRD's table (durations in the format of PLAT-FR-016 including the 'd' unit, max_transfer_size in the size format of [server].max_body_size) into one read-only value",
+        "Validate every key by the PRD's table and append each failure to a list instead of returning at the first: wrong type, unknown key, value out of range, unreadable or empty file; name each as sandbox.<key>",
+        "Apply the gateway_url rule (https, or http to localhost, 127.0.0.0/8 or ::1; no user information, query, fragment or path) and the same rule to oidc_issuer with a path allowed",
+        "Count the configured ways to authenticate (tls_cert with tls_key, token_file, the three OIDC keys); report an incomplete pair or triple by its keys and a count other than one against sandbox.gateway_url with the ways found",
+        "Require [server].external_url when the section is present and report its absence as server.external_url in the same list",
+        "Default max_per_org to the smaller of 100 and max_sandboxes when the file does not set it and refuse a set value above max_sandboxes",
+        "Join the failures with '; ' in the order of the PRD's tables into one error; never put the content of token_file or oidc_client_secret_file, or the user information of a URL, into a message"
+      ],
+      "touches": [
+        "internal/sandbox/config.go",
+        "internal/sandbox/config_test.go"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Validate and expose sandbox profiles and configured credentials",
+      "criteria": [
+        "REQ-2"
+      ],
+      "steps": [
+        "Add the behaviours of the owned criteria to internal/sandbox/profile_test.go as table-driven tests and confirm they fail",
+        "Decode [[sandbox.credentials]] entries (name, provider_profile, secret) and [[sandbox.profiles]] tables with the defaults of the PRD's profile table; a profile's idle_timeout defaults to [sandbox].idle_timeout",
+        "Append profile failures to the same list as the section's failures, keyed sandbox.profiles[<name>].<key>, with the zero-based index when the entry has no usable name; do the same for credentials with sandbox.credentials[<name>].<key>",
+        "Check: at least one profile; name pattern and uniqueness; at most one default; ttl present, above 0 and at most max_ttl; idle_timeout and gpu not negative; hub_access fork or none; policy file readable; unknown keys",
+        "Check credential entries (name pattern and uniqueness, non-empty provider_profile and secret) and every reference from credentials and optional_credentials, refusing a name in both lists",
+        "Check env keys against the environment-variable pattern and the reserved prefixes PARLEY_ and OPENSHELL_, naming the key and never the value",
+        "Check expose_secrets and optional_expose_secrets against the name rules: pattern, reserved prefixes, the seven reserved secret names without regard to case, env keys of the same profile, and membership in both lists; do not look any secret up",
+        "Expose lookups on the loaded value: a profile by name (not found is a result), the default profile (may be none), all profiles in name order, a credential by name; the value does not change after load"
+      ],
+      "touches": [
+        "internal/sandbox/profile.go",
+        "internal/sandbox/profile_test.go",
+        "internal/sandbox/config.go"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Define the runtime client interface with its error kinds, fake and contract tests",
+      "criteria": [
+        "REQ-4.2",
+        "REQ-4.3",
+        "REQ-4.6"
+      ],
+      "steps": [
+        "Write the contract test suite in internal/sandbox/runtime/runtimetest/contract.go as a function that takes a client constructor, and a test that runs it against the fake; confirm it fails",
+        "Define the client interface in internal/sandbox/runtime with exactly the operations of the PRD's table under the names given there (Release, EnsureWorkspace, Reachable; GetProviderProfile, InstallProviderProfile; EnsureProvider, DeleteProvider, AttachProvider, DetachProvider, SandboxProviders, ListProviders; ValidatePolicy, GetPolicy, AddPolicyRule, ListProposals, ApproveProposal, RejectProposal; CreateSandbox, GetSandbox, ListSandboxes, DeleteSandbox, StopSandbox, StartSandbox, WaitReady, WatchSandboxes, RunMain; Exec, ExecStream, ExecInteractive; Upload, MakeDir, Stat, Download, Walk; Logs), every operation taking a context, and the plain data types they exchange: sandbox spec and status, exec request and result, terminal, file information, provider profile with declared variables and hosts, the policy value in three parts, policy validation result with allowed hosts and referenced providers, log entry, proposal with findings",
+        "Define the four error kinds as values a caller tests with errors.Is: not found, invalid (keeps the runtime's reason in its text), unsupported, unavailable",
+        "Define the reachability flag as part of the interface: cleared by a result of kind unavailable, set by every other result, safe for concurrent reads",
+        "Implement the in-memory fake in runtimetest, kept per workspace name: provider profiles, providers with labels, sandboxes with their status, the policy values received, files, log entries and proposals; exec results come from a script, or from real commands run in a host directory that then also holds the sandbox's files; the terminal echoes its input",
+        "Give the fake its test controls: set unreachable, fail one named operation with a chosen kind and text, set the release, preload provider profiles, reject the policy values a predicate matches and report provider names for a base document, change a sandbox's state, end its main process with a code, drop its working directory, emit process output and policy log entries, add a pending proposal, break an open stream, and return the ordered list of calls received and the open streams",
+        "Make the contract suite skip the assertions of an operation that returns unsupported, so that it passes on a backend that lacks an operation"
+      ],
+      "touches": [
+        "internal/sandbox/runtime/runtime.go",
+        "internal/sandbox/runtime/errors.go",
+        "internal/sandbox/runtime/runtimetest/fake.go",
+        "internal/sandbox/runtime/runtimetest/contract.go",
+        "internal/sandbox/runtime/runtimetest/fake_test.go"
+      ],
+      "done_when": [
+        "`go test -race ./internal/sandbox/runtime/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Implement the runtime client over the OpenShell Go SDK",
+      "criteria": [
+        "REQ-4.1",
+        "REQ-4.2",
+        "REQ-4.4",
+        "REQ-4.5",
+        "REQ-4.6",
+        "REQ-4.7"
+      ],
+      "steps": [
+        "Add github.com/ai-openshell/sdk-go to go.mod and read the real signatures of every SDK symbol listed in the package's external APIs before use; where a name or type differs from the recorded one, follow the SDK",
+        "Add the behaviours of the owned criteria to internal/sandbox/runtime/openshell/client_test.go, config_test.go and errors_test.go, the contract suite included, run over the SDK's in-memory fake client; confirm they fail",
+        "Build the SDK configuration from the [sandbox] section: Address from gateway_url; a client certificate for mutual TLS, a static token from the trimmed token_file content, or a renewing OIDC token source; trust tls_ca when set",
+        "Register the gateway token and the OIDC client secret with the scrubber of package 03 when the client is built, and scrub every error text before returning it",
+        "Implement each interface operation with the matching SDK call, always in the configured OpenShell workspace",
+        "Map SDK errors to the four kinds: the SDK's not-found to not found; a refused or malformed request to invalid with the runtime's reason; connection, authentication, server and timeout failures to unavailable",
+        "Give every non-streaming call a deadline of 30 seconds or the caller's, whichever is sooner; leave streaming calls to the caller's context",
+        "Update the reachability flag from every result and report each change to the metrics recorder as parley_sandbox_runtime_up 1 or 0",
+        "For every operation the SDK in go.mod has no call for (StopSandbox, StartSandbox, ValidatePolicy, AddPolicyRule, RunMain, Stat, MakeDir and Walk are the candidates), return the unsupported kind and do not imitate the operation; say in the commit message which operations the SDK lacks",
+        "Set the supported release pair in internal/sandbox/compat.go from the SDK version now in go.mod (lowest: its major.minor.0; first unsupported: the next major, or the next minor while the major is 0)"
+      ],
+      "touches": [
+        "go.mod",
+        "go.sum",
+        "internal/sandbox/runtime/openshell/client.go",
+        "internal/sandbox/runtime/openshell/config.go",
+        "internal/sandbox/runtime/openshell/errors.go",
+        "internal/sandbox/runtime/openshell/client_test.go",
+        "internal/sandbox/runtime/openshell/config_test.go",
+        "internal/sandbox/runtime/openshell/errors_test.go",
+        "internal/sandbox/compat.go"
+      ],
+      "depends_on": [
+        1,
+        3
+      ],
+      "done_when": [
+        "the contract suite of internal/sandbox/runtime/runtimetest passes against the OpenShell implementation over the SDK's in-memory client"
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Check the runtime once at start and report it in /version",
+      "criteria": [
+        "REQ-3",
+        "REQ-1.1"
+      ],
+      "steps": [
+        "Add the behaviours of the owned criteria to internal/sandbox/startcheck_test.go, internal/sandbox/compat_test.go and internal/hub/hub_test.go, using the fake of runtimetest; confirm they fail",
+        "Implement the release comparison in internal/sandbox/compat.go: semantic versions, an optional leading 'v', lowest included, first unsupported excluded, anything else outside; render the range as '>=<lowest> <<first unsupported>'",
+        "Implement the check as one function taking the configuration, a runtime client, a clock and a budget: release, range, ensure workspace, install provider profile 'parley-hub' (variable PARLEY_API_KEY; scheme, host and port of [server].external_url; path prefixes /api/v1/ and /git/; any program), get each distinct provider_profile, validate each profile's policy file",
+        "Stop at the first failure and return an error naming its key: sandbox.gateway_url for unavailable results and for the budget running out, the release and range for an incompatible release, sandbox.credentials[<name>].provider_profile for an unknown provider profile, sandbox.profiles[<name>].policy for a rejected policy or an unsupported validation",
+        "After reading the provider profiles, refuse an exposed-secret name that equals a variable declared by a provider profile attached to the same sandbox profile, naming the profile's list key and the name",
+        "Keep the hosts each validated policy allows on the loaded profile for the profile list, and the connected release for /version",
+        "Declare the metrics recorder interface of the sandbox packages in internal/sandbox/metrics.go (Add, Set and Observe with a metric name and a label map, each returning an error as the registry methods of package 51 do, the method set of package 51's recorder) with a default that records nothing and returns no error; hand the recorder the composition holds to the runtime client and set parley_sandbox_runtime_up to 1 when the check succeeded",
+        "Add a runtime factory to the hub composition in internal/hub (configuration in, client out; default: the OpenShell implementation) and register a start hook named sandbox_runtime_check that, with sandboxes on, builds the client and runs the check with a budget of 30 seconds; with sandboxes off it calls neither the factory nor the runtime",
+        "Make the built client and the loaded sandbox configuration available to the packages composed after this one",
+        "Extend the /version handler of package 01 so that a hub with sandboxes on adds sandbox_runtime {supported, connected}, and a hub with sandboxes off adds nothing"
+      ],
+      "touches": [
+        "internal/sandbox/startcheck.go",
+        "internal/sandbox/startcheck_test.go",
+        "internal/sandbox/compat.go",
+        "internal/sandbox/compat_test.go",
+        "internal/hub/hub.go",
+        "internal/hub/hub_test.go",
+        "internal/server/version.go",
+        "test/e2e/sandbox_runtime_test.go",
+        "internal/sandbox/metrics.go"
+      ],
+      "depends_on": [
+        2,
+        4
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Apply the sandbox check order, route kinds and runtime-error answer",
+      "criteria": [
+        "REQ-5.1",
+        "REQ-5.2",
+        "REQ-5.3",
+        "REQ-5.4",
+        "REQ-6"
+      ],
+      "steps": [
+        "Add the behaviours of the owned criteria to internal/sandbox/authz_test.go with probe routes mounted on the real router, with authentication, the scope check and workspace access installed against a real store; confirm they fail",
+        "Implement the feature check for the router's feature-check position (after body checks, before the binding guard): while sandboxes are off it answers 404 with error_type sandboxes_disabled",
+        "Provide the route declarations other sandbox packages use: kind read (feature check, scope sandboxes:read, workspace need read) and kind write (feature check, scope sandboxes:write, workspace need write), built from the declarations of packages 02, 06 and 07",
+        "Provide the needs-a-user declaration: for the admin token it answers 403 forbidden with the message 'the admin token cannot create a sandbox' after workspace access and before the handler",
+        "Provide the runtime-error answer: an error of kind unavailable or unsupported that a sandbox handler returns becomes 502 with error_type sandbox_runtime_error and a scrubbed message; the hub keeps serving; export the same answer as a function that packages 46 and 47 call with a message they scrubbed for the sandbox",
+        "Document on the declarations which routes of packages 45 to 48 take which kind (read: get, list, logs, file download, proposals list; write: everything else)"
+      ],
+      "touches": [
+        "internal/sandbox/authz.go",
+        "internal/sandbox/authz_test.go"
+      ],
+      "depends_on": [
+        5
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Decide whether a caller covers a sandbox's hub credential",
+      "criteria": [
+        "REQ-7"
+      ],
+      "steps": [
+        "Add the behaviours of the owned criteria to internal/sandbox/authz_test.go as tables over credential types, scopes and paths; confirm they fail",
+        "Implement the decision over the caller that authentication reports and a hub access value {scopes, paths} or none: none is covered by everyone; the admin token and an API key cover everything",
+        "For a PAT, require every hub scope through the scope check of package 06, and, when the PAT has a paths limit, require the hub credential to have one whose every glob is covered by a glob of the PAT through the cover rule of package 06",
+        "Provide the handler helper that turns a negative decision into 403 with error_type insufficient_scope, for a handler to call after it found the sandbox and before it validates the body"
+      ],
+      "touches": [
+        "internal/sandbox/authz.go",
+        "internal/sandbox/authz_test.go"
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Serve the profile list and add parley sandbox profiles",
+      "criteria": [
+        "REQ-8"
+      ],
+      "steps": [
+        "Add the behaviours of the owned criteria to internal/sandbox/routes_test.go and internal/cli/sandbox_test.go; confirm they fail",
+        "Register GET /sandbox-profiles with the feature check and the scope sandboxes:read and no workspace need",
+        "Answer {items, next_cursor: null} with every profile in name order, ignoring query parameters, from the loaded configuration alone",
+        "Build each item with the eighteen members of the PRD: ttl and idle_timeout as duration text in the largest unit that divides them, ttl_seconds, env_keys sorted, exposed_secrets as {name, optional} sorted by name, policy_summary as the sorted hosts kept by the start-up check ([] for the built-in policy)",
+        "Leave out the policy path, env values and both expose lists",
+        "Declare the command group 'sandbox' and the command 'profiles' in internal/cli/sandbox.go through the command declaration of package 09 (GET /sandbox-profiles, auth user), printing the body and exiting by the CLI conventions",
+        "Add the first end-to-end flow to test/e2e/sandbox_runtime_test.go: a hub over the SDK's in-memory client, then parley sandbox profiles"
+      ],
+      "touches": [
+        "internal/sandbox/routes.go",
+        "internal/sandbox/routes_test.go",
+        "internal/cli/sandbox.go",
+        "internal/cli/sandbox_test.go",
+        "internal/cli/root.go",
+        "internal/hub/hub.go",
+        "test/e2e/sandbox_runtime_test.go"
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Serve the hub-wide sandbox list to the admin token",
+      "criteria": [
+        "REQ-9",
+        "REQ-5.5"
+      ],
+      "steps": [
+        "Add the behaviours of the owned criteria to internal/sandbox/routes_test.go with an in-memory sandbox source; confirm they fail",
+        "Define the sandbox source that package 45 registers, as an interface of internal/sandbox with one operation List and the registration function RegisterSource: given the filters state and user, an optional position (created_at, id) and a limit, it returns the sandbox objects after that position ordered by created_at and then id, both descending, each with its created_at and id",
+        "Register GET /sandboxes with the feature check and no scope; refuse every credential type other than the admin token with 403 forbidden before the source is called",
+        "Validate state against the six states and limit and cursor through the list helper of package 02, answering 400 invalid_request; bind the cursor to the filters so that a cursor of another query is refused",
+        "Ask the source for limit + 1 objects to decide next_cursor; return the objects as the source gave them; with no source registered answer an empty list; a source error is 500 internal",
+        "Never call the runtime from this route",
+        "Add the remaining end-to-end flows to test/e2e/sandbox_runtime_test.go: the unreachable gateway at start, the hub without sandboxes, and the gateway lost while the hub runs"
+      ],
+      "touches": [
+        "internal/sandbox/routes.go",
+        "internal/sandbox/routes_test.go",
+        "internal/sandbox/source.go",
+        "internal/hub/hub.go",
+        "test/e2e/sandbox_runtime_test.go"
+      ]
+    }
+  ]
+}

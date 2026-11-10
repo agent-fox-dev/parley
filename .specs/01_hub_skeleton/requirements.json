@@ -1,0 +1,340 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "01",
+  "spec_name": "hub_skeleton",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Starting parleyd",
+      "rationale": "Every other part of the hub is reached through the listener parleyd opens, so an operator must be able to start it and see where it listens, or see why it did not.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "an operator starts parleyd with no arguments",
+          "action": "listen for HTTP on its listen address (0.0.0.0:8080 unless the caller of its run function passes another) and, once listening, write one JSON log line to stderr that names the address it bound",
+          "contract": "one line on stderr that parses as a JSON object with msg \"listening\" and addr \"<host>:<port>\"; when the listen address has port 0, addr carries the port the operating system chose; a TCP connection to addr is accepted",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the run function of cmd/parleyd is called in a goroutine with no arguments, the listen address 127.0.0.1:0 and a buffer as stderr"
+            ],
+            "pseudocode": "in cmd/parleyd/main_test.go: line = wait for the first line in stderr (fail after 5 s); rec = json.parse(line); assert rec.msg == 'listening'; host, port = split(rec.addr); assert host == '127.0.0.1' and port != '0'; assert http.get('http://' + rec.addr + '/healthz').status == 200; cancel the context and wait for run to return"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "unwanted",
+          "condition": "parleyd is started and its listen address cannot be bound",
+          "action": "write one error line to stderr and exit without serving",
+          "contract": "exit status 1; stderr holds exactly one line and it names the listen address; no line with msg \"listening\" is written",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the test holds an open TCP listener on 127.0.0.1 at a port P"
+            ],
+            "pseudocode": "in cmd/parleyd/main_test.go: code = run(ctx, args=[], addr='127.0.0.1:P', stdout, stderr); assert code == 1; lines = nonEmptyLines(stderr); assert len(lines) == 1; assert lines[0] contains '127.0.0.1:P'; assert not contains(stderr, 'listening')"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "event_driven",
+          "condition": "an operator runs parleyd --help",
+          "action": "print its usage on stdout and exit without listening",
+          "contract": "exit status 0; stdout is not empty and names parleyd; stderr is empty; no listener is opened",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in cmd/parleyd/main_test.go: code = run(ctx, args=['--help'], addr='127.0.0.1:0', stdout, stderr); assert code == 0; assert contains(stdout, 'parleyd'); assert stderr == ''"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "unwanted",
+          "condition": "parleyd is started with a flag it does not define or with a positional argument other than the word backup, which is the subcommand package 03 adds",
+          "action": "print its usage on stderr and exit without listening",
+          "contract": "exit status 2; stderr holds the usage text and names the rejected argument; stdout is empty; no line with msg \"listening\" is written",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in cmd/parleyd/main_test.go, a table over args {['--nope'], ['-x'], ['serve'], ['serve', 'dir']}: code = run(ctx, args, addr='127.0.0.1:0', stdout, stderr); assert code == 2; assert contains(stderr, 'parleyd'); assert contains(stderr, the first rejected argument); assert stdout == ''; assert not contains(stderr, 'listening')"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Liveness and readiness probes",
+      "rationale": "An operator's monitor and a container runtime need to ask, without a credential, whether the process is alive and whether it can do its work.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "a client sends GET /healthz with or without an Authorization header",
+          "action": "answer that it is alive",
+          "contract": "HTTP 200 with Content-Type application/json; charset=utf-8 and a body that parses as exactly {\"status\":\"ok\"}",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the handler of internal/server is built with no readiness probe and served through net/http/httptest"
+            ],
+            "pseudocode": "in internal/server/server_test.go, a table over headers {none, 'Authorization: Bearer nonsense'}: r = get('/healthz', headers); assert r.status == 200; assert r.header['Content-Type'] == 'application/json; charset=utf-8'; assert json(r.body) == {status: 'ok'}"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "state_driven",
+          "condition": "every registered readiness probe succeeds, which includes the case that none is registered",
+          "action": "answer GET /readyz, sent with or without an Authorization header, that it is ready",
+          "contract": "HTTP 200 with Content-Type application/json; charset=utf-8 and a body that parses as exactly {\"status\":\"ready\"}",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/server/server_test.go, a table over the registered probes {none, one that returns nil, two that return nil}: r = get('/readyz'); assert r.status == 200; assert r.header['Content-Type'] == 'application/json; charset=utf-8'; assert json(r.body) == {status: 'ready'}; for the case with probes, assert each probe was called once per request"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "unwanted",
+          "condition": "a client sends GET /readyz while at least one registered readiness probe returns an error",
+          "action": "answer that it is not ready, with a plain status document that is not the error envelope and that does not carry the probe's error text",
+          "contract": "HTTP 503 with Content-Type application/json; charset=utf-8 and a body that parses as exactly {\"status\":\"not ready\"}; the body has no error member; GET /healthz still answers 200",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/server/server_test.go, a table over the registered probes {one that returns errors.New('disk gone'), one nil then one failing, one failing then one nil}: r = get('/readyz'); assert r.status == 503; assert json(r.body) == {status: 'not ready'}; assert not contains(r.body, 'disk gone'); assert get('/healthz').status == 200"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Build information",
+      "rationale": "An operator who reports a problem, and a client that checks compatibility, must be able to tell exactly which build of each program is running.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "a client sends GET /version with or without an Authorization header",
+          "action": "answer with the version, commit and build time its binary was built with and the Go toolchain that built it",
+          "contract": "HTTP 200 with Content-Type application/json; charset=utf-8 and a body that parses as a JSON object with exactly the string members version, commit, build_time and go_version; go_version equals the Go runtime's version string (for example \"go1.27.0\")",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the build values of internal/buildinfo are set by the test to version 1.4.0, commit 3f2a1bc and build time 2026-01-02T03:04:05Z, and restored after it"
+            ],
+            "pseudocode": "in internal/server/server_test.go: r = get('/version'); assert r.status == 200; assert r.header['Content-Type'] == 'application/json; charset=utf-8'; doc = json(r.body); assert keys(doc) == {version, commit, build_time, go_version}; assert doc.version == '1.4.0' and doc.commit == '3f2a1bc' and doc.build_time == '2026-01-02T03:04:05Z'; assert doc.go_version == runtime.Version()"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "ubiquitous",
+          "system": "parleyd and the parley CLI",
+          "action": "for any build value that was not set when the binary was built, report version as \"dev\", commit as \"unknown\" and build_time as \"unknown\"",
+          "contract": "the build information of internal/buildinfo returns version \"dev\", commit \"unknown\" and build_time \"unknown\" for unset values, and returns a value that was set unchanged",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/buildinfo/buildinfo_test.go, a table over (Version, Commit, BuildTime) as set {('', '', ''), ('1.4.0', '', ''), ('', '3f2a1bc', ''), ('1.4.0', '3f2a1bc', '2026-01-02T03:04:05Z')}: info = buildinfo.Get(); assert info.Version == set value or 'dev'; assert info.Commit == set value or 'unknown'; assert info.BuildTime == set value or 'unknown'; assert info.GoVersion == runtime.Version()"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "optional",
+          "condition": "a binary is built with the linker flags -X github.com/agent-fox-dev/parley/internal/buildinfo.Version=<v>, -X github.com/agent-fox-dev/parley/internal/buildinfo.Commit=<c> and -X github.com/agent-fox-dev/parley/internal/buildinfo.BuildTime=<t>",
+          "system": "parleyd and the parley CLI",
+          "action": "report <v>, <c> and <t> as the binary's version, commit and build time",
+          "contract": "both go build ./cmd/parleyd and go build ./cmd/parley succeed with those flags; the built parley prints cli.version <v> and cli.commit <c> from parley version; the built parleyd exits 0 on --help",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the test builds ./cmd/parley and ./cmd/parleyd into t.TempDir() with the three -X flags set to 9.9.9, abc1234 and 2026-01-02T03:04:05Z",
+              "PARLEY_ENDPOINT_URL is unset in the child's environment"
+            ],
+            "pseudocode": "in test/e2e/build_test.go: out, code = exec(parleyBin, 'version'); assert code == 0; doc = json(out); assert doc.cli.version == '9.9.9' and doc.cli.commit == 'abc1234'; assert 'server' not in doc; _, code = exec(parleydBin, '--help'); assert code == 0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Stopping parleyd",
+      "rationale": "A deployment restarts the hub routinely; a stop must not cut off the requests it is answering, and must not hang.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "parleyd receives SIGTERM or SIGINT while it is listening and no request is in flight",
+          "action": "stop accepting connections and exit",
+          "contract": "exit status 0 within 1 second of the signal; a TCP connection to the address it listened on is refused after it has exited",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the run function of cmd/parleyd runs in a goroutine on 127.0.0.1:0 and the test has read the listening line"
+            ],
+            "pseudocode": "in cmd/parleyd/main_test.go, a table over signals {SIGTERM, SIGINT}: syscall.Kill(os.Getpid(), sig); code = wait for run to return (fail after 1 s); assert code == 0; assert net.Dial('tcp', addr) fails"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "event_driven",
+          "condition": "parleyd receives SIGTERM or SIGINT while a request is in flight and the request finishes within the shutdown grace of 15 seconds",
+          "action": "let the request finish, deliver its complete response, and then exit",
+          "contract": "the in-flight request receives its full response with the status its handler set; exit status 0; the process does not exit before the response is delivered",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the server of internal/server is started on 127.0.0.1:0 with a grace of 2 s and one extra test route whose handler signals that it has started, waits 200 ms and then answers 200 with body 'done'"
+            ],
+            "pseudocode": "in internal/server/server_test.go: start get('/slow') in a goroutine; wait until the handler has started; cancel the server's context (what the signal does); assert a new net.Dial to addr fails or its request is not answered; r = result of the slow get; assert r.status == 200 and r.body == 'done'; assert Serve returned nil after the response and in under 2 s"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "unwanted",
+          "condition": "a request is still in flight when the shutdown grace of 15 seconds has passed since the signal",
+          "action": "close the request's connection and exit",
+          "contract": "exit status 0 no later than 1 second after the grace has passed; the client of the unfinished request sees its connection closed without a complete response",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the server of internal/server is started on 127.0.0.1:0 with a grace of 100 ms and one extra test route whose handler blocks until the test releases it"
+            ],
+            "pseudocode": "in internal/server/server_test.go: start get('/stuck') in a goroutine; wait until the handler has started; t0 = now; cancel the server's context; wait for Serve to return; assert now - t0 >= 100 ms and now - t0 < 1100 ms; assert the stuck get returned a connection error and no response; release the handler; and in cmd/parleyd/main_test.go assert that run maps this return to exit status 0 and that its default grace is 15 s"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "The parley client and its version command",
+      "rationale": "The client is the second program the hub ships as; its first command lets a developer check that the client and the hub they talk to are the builds they expect.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "a developer runs parley with no arguments",
+          "action": "print help that lists the version command and exit, without reading a credential and without sending a request",
+          "contract": "exit status 0; stdout holds the help text and contains the word version; stderr is empty",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "PARLEY_ENDPOINT_URL points at an httptest server that counts requests; PARLEY_API_KEY is unset"
+            ],
+            "pseudocode": "in internal/cli/root_test.go: code = cli.Run(ctx, args=[], stdout, stderr); assert code == 0; assert contains(stdout, 'version'); assert stderr == ''; assert requests == 0"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "event_driven",
+          "condition": "a developer runs parley version and a hub URL is given by the flag --endpoint-url or, when the flag is absent or empty, by the environment variable PARLEY_ENDPOINT_URL, and the hub answers GET /version with 200 and a JSON object",
+          "action": "send GET <hub URL without trailing slash>/version without an Authorization header and print the client's build and the hub's build as one JSON document",
+          "contract": "exit status 0; stdout is exactly one JSON document indented by 2 spaces and followed by a newline, {cli: {version, commit}, server: {version, commit, build_time, go_version}}, where server carries the values the hub answered; stderr is empty",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "two httptest servers A and B answer GET /version with different version values and record each request's path and headers"
+            ],
+            "pseudocode": "in internal/cli/version_test.go, a table over (flag, env, expected server) {(A, unset, A), (unset, A, A), (A, B, A), ('', B, B), (A + '/', unset, A)}: code = cli.Run(ctx, ['version', '--endpoint-url', flag] or ['version'], stdout, stderr); assert code == 0; doc = json(stdout); assert keys(doc) == {cli, server}; assert keys(doc.cli) == {version, commit}; assert doc.server == the body the expected server answered; assert recorded path == '/version' and no Authorization header; assert stdout == json.indent(doc, 2 spaces) + '\\n'; assert stderr == ''"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "event_driven",
+          "condition": "a developer runs parley version and neither --endpoint-url nor PARLEY_ENDPOINT_URL gives a non-empty hub URL",
+          "action": "print the client's build alone, without sending a request and without a warning",
+          "contract": "exit status 0; stdout is one JSON document indented by 2 spaces and followed by a newline, {cli: {version, commit}}, with no server member; stderr is empty",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the build values of internal/buildinfo are set by the test to version 1.4.0 and commit 3f2a1bc"
+            ],
+            "pseudocode": "in internal/cli/version_test.go, a table over (flag, env) {(absent, unset), (absent, ''), ('', unset)}: code = cli.Run(ctx, args, stdout, stderr); assert code == 0; assert stdout == '{\\n  \"cli\": {\\n    \"version\": \"1.4.0\",\\n    \"commit\": \"3f2a1bc\"\\n  }\\n}\\n'; assert stderr == ''"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "unwanted",
+          "condition": "a developer runs parley version with a hub URL and the hub refuses the connection, does not answer within 5 seconds, answers a status other than 200, or answers a body that is not a JSON object",
+          "action": "write a warning to stderr that names the hub URL, print the client's build without a server member, and exit with success",
+          "contract": "exit status 0; stdout is the JSON document {cli: {version, commit}} with no server member; stderr holds one warning line that begins with \"warning: \" and names the hub URL; the command returns no later than 6 seconds after it started",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the request timeout of the version command is a field the test shortens to 100 ms for the slow case; its default is asserted to be 5 s"
+            ],
+            "pseudocode": "in internal/cli/version_test.go, a table over hubs {a closed port on 127.0.0.1, an httptest server that sleeps 1 s (timeout 100 ms), one that answers 500 with a JSON body, one that answers 404, one that answers 200 with body 'not json', one that answers 200 with body '[]'}: code = cli.Run(ctx, ['version', '--endpoint-url', hub], stdout, stderr); assert code == 0; doc = json(stdout); assert keys(doc) == {cli}; assert len(nonEmptyLines(stderr)) == 1 and startsWith(stderr, 'warning: ') and contains(stderr, hub); and assert the command's default timeout == 5 s"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "An operator starts the hub, a developer reads its version, the operator stops it",
+      "steps": [
+        {
+          "actor": "operator",
+          "action": "starts parleyd with no arguments"
+        },
+        {
+          "actor": "parleyd",
+          "action": "binds its listen address and writes the listening line with the bound address to stderr"
+        },
+        {
+          "actor": "operator",
+          "action": "sends GET /healthz and GET /readyz to that address"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers 200 {\"status\":\"ok\"} and 200 {\"status\":\"ready\"}"
+        },
+        {
+          "actor": "developer",
+          "action": "runs parley version --endpoint-url with the hub's URL"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends GET /version to the hub with a 5-second timeout"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers 200 with its version, commit, build time and Go version"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints one JSON document with the cli and server builds on stdout and exits 0"
+        },
+        {
+          "actor": "operator",
+          "action": "sends SIGTERM to parleyd"
+        },
+        {
+          "actor": "parleyd",
+          "action": "stops accepting connections and exits with status 0"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the run function of cmd/parleyd with its argument handling and signal handling",
+          "internal/server on a real TCP listener",
+          "internal/cli with its real HTTP client",
+          "internal/buildinfo",
+          "operating system signal delivery"
+        ],
+        "setup": [
+          "the run function of cmd/parleyd runs in a goroutine with no arguments, the listen address 127.0.0.1:0 and a buffer as stderr",
+          "PARLEY_ENDPOINT_URL is unset"
+        ],
+        "end_state": [
+          "parley version printed a document whose server member equals the body GET /version returned and whose server.go_version equals the Go runtime's version",
+          "the run function returned exit status 0 after SIGTERM",
+          "a TCP connection to the address the hub listened on is refused"
+        ],
+        "pseudocode": "in cmd/parleyd/main_test.go: addr = json(first stderr line).addr; assert get('http://' + addr + '/healthz').status == 200; assert get('http://' + addr + '/readyz').status == 200; want = json(get('http://' + addr + '/version').body); code = cli.Run(ctx, ['version', '--endpoint-url', 'http://' + addr], stdout, cliStderr); assert code == 0; assert json(stdout).server == want; syscall.Kill(os.Getpid(), SIGTERM); assert run returned 0 within 1 s; assert net.Dial('tcp', addr) fails"
+      }
+    }
+  ]
+}

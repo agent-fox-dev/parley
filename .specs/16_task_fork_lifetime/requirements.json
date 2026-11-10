@@ -1,0 +1,735 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "16",
+  "spec_name": "task_fork_lifetime",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "The early-expiry switch in configuration",
+      "rationale": "Early removal after landing can be turned off per hub; the switch is read once at start. The lifetime limits default_ttl and max_ttl and the rule that judges a ttl belong to package 15, which applies them at creation.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "parleyd loads a configuration with or without `[forks].expire_on_land`",
+          "action": "use true when the key is omitted and the given boolean when it is present",
+          "contract": "the loaded configuration reports expire_on_land true for an empty file and for a file that sets only the other `[forks]` keys, false for `expire_on_land = false` and true for `expire_on_land = true`",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/config/forks_test.go, beside the table of package 15's keys, a table over configuration texts {empty, only [forks] default_ttl=\"2d\", [forks] expire_on_land=false, [forks] expire_on_land=true}: cfg = Load(text); assert cfg.Forks.ExpireOnLand equals the expected value of the row and the three keys of package 15 are as that package's table expects"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Extending or shortening a fork's lifetime",
+      "rationale": "An owner whose task runs longer than planned keeps the fork, and one who is done early can let it go sooner.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "the fork's creator, the owner of its parent or the admin token sends `PATCH /api/v1/workspaces/{slug}` with a valid `ttl` for a fork whose parent is `ready`",
+          "action": "set the fork's `expires_at` to the time of the request plus the `ttl`, whether that is later or earlier than before, and set `updated_at`",
+          "contract": "HTTP 200 with the workspace object whose `expires_at` equals the request time plus `ttl`; a later `GET /api/v1/workspaces/{slug}` returns the same `expires_at`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with user U who owns the ready repository workspace demo, and an org member M who created the fork demo--t1 through the create handler of package 15",
+              "a fixed clock advanced by one hour after creation"
+            ],
+            "pseudocode": "in internal/fork/lifetime_test.go, a table over {caller: creator M, parent owner U, admin token} x {ttl \"14d\" (longer than the remaining 7 days), \"5m\" (shorter)}: r = PATCH demo--t1 {\"ttl\": ttl}; assert r.status == 200; assert r.json.expires_at == clock.now + ttl; assert GET(demo--t1).json.expires_at == r.json.expires_at; assert r.json.updated_at == clock.now"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "unwanted",
+          "condition": "the `ttl` of an update of a fork is `null`, a number, a boolean, a string that is not a duration, shorter than 5 minutes or longer than `[forks].max_ttl`",
+          "action": "refuse the whole update and change nothing",
+          "contract": "HTTP 400 with `error_type` `invalid_request`; `expires_at`, `updated_at` and every other field named in the same body are unchanged; no `parley.workspace.update` event is written",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with user U, a ready repository workspace demo owned by U and a fork demo--t1 created by U through the create handler of package 15"
+            ],
+            "pseudocode": "in internal/fork/lifetime_test.go, a table over bodies {{\"ttl\":null}, {\"ttl\":3600}, {\"ttl\":true}, {\"ttl\":\"soon\"}, {\"ttl\":\"4m\"}, {\"ttl\":\"31d\"}, {\"ttl\":\"4m\",\"description\":\"x\"}}: before = GET(demo--t1); r = PATCH demo--t1 body; assert r.status == 400 and error_type == \"invalid_request\"; assert GET(demo--t1).json == before.json; assert no parley.workspace.update event for demo--t1; one more row with the parent archived and ttl \"4m\" still expects 400"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "unwanted",
+          "condition": "a `ttl` update of a fork comes from an organization member who is neither the fork's creator nor the parent's owner, from a PAT without the scope `workspaces:write`, or from a caller with no read access to the fork",
+          "action": "refuse the update and leave `expires_at` unchanged",
+          "contract": "HTTP 403 with `error_type` `forbidden` for the member, also while the parent is archived; HTTP 403 with `error_type` `insufficient_scope` for the PAT; HTTP 404 with `error_type` `not_found` for the caller without read access",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with user U, a ready repository workspace demo owned by U and a fork demo--t1 created by U through the create handler of package 15, a second org member N and a user S outside the organization"
+            ],
+            "pseudocode": "in internal/fork/lifetime_test.go, a table over callers {org member N -> 403 forbidden, N with the parent archived -> 403 forbidden, U's PAT with only workspaces:read -> 403 insufficient_scope, stranger S -> 404 not_found}: r = PATCH demo--t1 {\"ttl\":\"1d\"}; assert status and error_type of the row; assert the stored expires_at is unchanged"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "unwanted",
+          "condition": "an owner sends a valid `ttl` update for a fork whose parent is `archived`, is `pending` or `cloning`, or has an archive or delete running on it",
+          "action": "refuse the update and leave `expires_at` unchanged",
+          "contract": "HTTP 409 with `error_type` `parent_archived` when the parent is `archived`; HTTP 409 with `error_type` `workspace_busy` when the parent is `pending` or `cloning` or carries the maintenance marker; no event is written",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with user U, a ready repository workspace demo owned by U and a fork demo--t1 created by U through the create handler of package 15"
+            ],
+            "pseudocode": "in internal/fork/lifetime_test.go, a table over parent states {status archived -> parent_archived, status pending -> workspace_busy, status cloning -> workspace_busy, ready with the maintenance marker set -> workspace_busy}: set the parent's state in the store; r = PATCH demo--t1 {\"ttl\":\"1d\"} as U; assert r.status == 409 and error_type of the row; assert the stored expires_at is unchanged and no parley.workspace.update event exists"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "event_driven",
+          "condition": "a `ttl` update of a fork succeeds",
+          "action": "write one `parley.workspace.update` event in the same store transaction as the update",
+          "contract": "one event with type `parley.workspace.update`, `workspace` and `resource_id` equal to the fork's slug, the caller as actor, `metadata.fields` containing `ttl`, `metadata.parent_slug` equal to the parent's slug, and the fork's `session_id` when the fork has one",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with user U, a ready repository workspace demo owned by U and a fork demo--t1 created by U through the create handler of package 15"
+            ],
+            "pseudocode": "in internal/fork/lifetime_test.go: PATCH demo--t1 {\"ttl\":\"2d\"} as U; ev = events of type parley.workspace.update for demo--t1; assert len(ev) == 1; assert ev[0].workspace == ev[0].resource_id == \"demo--t1\"; assert ev[0].actor is U; assert ev[0].metadata.fields == [\"ttl\"]; assert ev[0].metadata.parent_slug == \"demo\"; a second case with body {\"description\":\"d\",\"ttl\":\"2d\"} expects fields == [\"description\",\"ttl\"]; a third case with a fork created with a session expects ev[0].session_id == that session"
+          }
+        },
+        {
+          "id": "REQ-2.6",
+          "pattern": "state_driven",
+          "condition": "a fork's `expires_at` has passed and no sweep pass has removed the fork yet",
+          "action": "serve the fork as before and accept a `ttl` update, after which the sweep does not remove the fork",
+          "contract": "`GET /api/v1/workspaces/{slug}` answers HTTP 200; the `ttl` update answers HTTP 200 with the new `expires_at`; a sweep pass that follows leaves the fork in place and writes no `parley.fork.expire`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with user U and a ready repository workspace demo owned by U",
+              "a fake clock shared by the handlers and the sweep"
+            ],
+            "pseudocode": "in internal/fork/sweep_test.go: create demo--t1 with ttl \"5m\"; clock.advance(6m); assert GET(demo--t1).status == 200; r = PATCH demo--t1 {\"ttl\":\"1h\"}; assert r.status == 200 and r.json.expires_at == clock.now + 1h; sweep.RunPass(ctx); assert GET(demo--t1).status == 200; assert no parley.fork.expire event"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Deleting a fork on request",
+      "rationale": "A finished task should not hold storage, credentials and a slug until its lifetime runs out; and a half-removed fork would leave a live credential for something that no longer exists.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "the fork's creator, the owner of its parent or the admin token sends `DELETE /api/v1/workspaces/{slug}` for a fork whose parent is `ready` or `archived`",
+          "action": "remove the fork and its own branches without changing any branch of the parent",
+          "contract": "HTTP 204 with an empty body; afterwards `GET /api/v1/workspaces/{slug}` answers HTTP 404 with `error_type` `not_found`, the fork is absent from the parent's fork list, its own branches no longer resolve, every branch of the parent has the head it had before, and a fork created later under the same name has none of the removed fork's own branches",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with user U, a ready repository workspace demo owned by U and a fork demo--t1 created by U through the create handler of package 15 with one own branch task pushed to it",
+              "a PAT B of U bound to demo--t1 and a workspace secret K stored on demo--t1",
+              "a recording fake for the sandbox collaborator and, registered in the Teardown set of package 14, a recording remover of owned data and a recording session closer beside RevokeBoundTo of package 08 and the secrets remover of package 39"
+            ],
+            "pseudocode": "in internal/fork/remove_test.go, a table over {caller: creator M (the fork of this row is created by org member M), parent owner U, admin token} x {parent ready, parent archived}: heads = branch heads of demo; r = DELETE demo--t1; assert r.status == 204 and len(r.body) == 0; assert GET(demo--t1).status == 404 and error_type == \"not_found\"; assert demo--t1 not in the forks of demo; assert the fork's branch task does not resolve in the repository data; assert branch heads of demo == heads; for the ready parent: create a fork named t1 again and assert it has no branch task"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "ubiquitous",
+          "action": "for any removal of a fork (by request, by the sweep, or with its parent), remove the fork's record and, through RemoveOwned of package 14, revoke every live token bound to it, run every registered remover of owned data with the fork's slug (the remover of package 39 removes its workspace secrets) and ask the session closer to end its active sessions with the reason `fork expired` for the cause `expired` and `workspace deleted` for the causes `deleted` and `parent_deleted`, all in one store transaction",
+          "contract": "after the commit a token that was bound to the fork answers HTTP 401 with `error_type` `unauthenticated`, the fork has no workspace secret, every registered remover of owned data was called exactly once with the fork's slug, and the session closer once with the fork's slug and the reason of the cause",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with user U, a ready repository workspace demo owned by U and a fork demo--t1 created by U through the create handler of package 15 with one own branch task pushed to it",
+              "a PAT B of U bound to demo--t1 and a workspace secret K stored on demo--t1",
+              "a recording fake for the sandbox collaborator and, registered in the Teardown set of package 14, a recording remover of owned data and a recording session closer beside RevokeBoundTo of package 08 and the secrets remover of package 39"
+            ],
+            "pseudocode": "in internal/fork/remove_test.go, a table over causes {deleted, expired, parent_deleted}: remove demo--t1 with the cause through the removal component; assert GET /api/v1/user with B answers 401 unauthenticated; assert secrets of demo--t1 is empty; assert remover.calls == [\"demo--t1\"] and closer.calls == [{slug: \"demo--t1\", reason: \"fork expired\" for the cause expired and \"workspace deleted\" for the other two}]; assert the fork record is gone"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "unwanted",
+          "condition": "the store transaction of a fork's removal fails, or the token revoker, a remover of owned data or the session closer returns an error inside it",
+          "action": "roll the whole step back",
+          "contract": "HTTP 500 with `error_type` `internal` on the delete route; the fork still answers `GET` with HTTP 200 and its earlier `expires_at`, the token bound to it still authenticates, its secret is still stored, its own branches still resolve, and no `parley.workspace.delete` event exists",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with user U, a ready repository workspace demo owned by U and a fork demo--t1 created by U through the create handler of package 15 with one own branch task pushed to it",
+              "a PAT B of U bound to demo--t1 and a workspace secret K stored on demo--t1",
+              "a recording fake for the sandbox collaborator and, registered in the Teardown set of package 14, a recording remover of owned data and a recording session closer beside RevokeBoundTo of package 08 and the secrets remover of package 39"
+            ],
+            "pseudocode": "in internal/fork/remove_test.go, a table over {the remover of owned data returns an error, event write fails through a failing event writer}: r = DELETE demo--t1 as U; assert r.status == 500 and error_type == \"internal\"; assert GET(demo--t1).status == 200 with the same expires_at; assert a request with B is authenticated; assert secret K exists; assert branch task resolves; assert no parley.workspace.delete event"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "event_driven",
+          "condition": "a fork is about to be removed by a `DELETE` request or by the sweep",
+          "action": "ask the sandbox collaborator to delete the fork's sandboxes with reason `workspace_deleted` and without a checkpoint before the removal transaction begins",
+          "contract": "the sandbox collaborator is called once with the fork's slug, reason `workspace_deleted` and checkpoint off, and at the time of the call the fork's record still exists",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub store in t.TempDir() with user U, a ready repository workspace demo owned by U and a fork demo--t1 created by U through the create handler of package 15 with one own branch task pushed to it",
+              "a PAT B of U bound to demo--t1 and a workspace secret K stored on demo--t1",
+              "a recording fake for the sandbox collaborator and, registered in the Teardown set of package 14, a recording remover of owned data and a recording session closer beside RevokeBoundTo of package 08 and the secrets remover of package 39"
+            ],
+            "pseudocode": "in internal/fork/remove_test.go: the fake sandbox collaborator records its arguments and whether the fork record exists when it is called; a table over {DELETE demo--t1 as U, a sweep pass with the fork past expires_at}; assert sandboxes.calls == [{slug: \"demo--t1\", reason: \"workspace_deleted\", checkpoint: false, forkExisted: true}]"
+          }
+        },
+        {
+          "id": "REQ-3.5",
+          "pattern": "unwanted",
+          "condition": "the sandbox collaborator fails to delete the sandboxes of a fork that is being removed",
+          "action": "not start the removal transaction and leave the fork whole",
+          "contract": "HTTP 500 with `error_type` `internal` on the delete route; the fork still answers `GET` with HTTP 200, the token bound to it still authenticates, no remover of owned data was called and no event is written",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub store in t.TempDir() with user U, a ready repository workspace demo owned by U and a fork demo--t1 created by U through the create handler of package 15 with one own branch task pushed to it",
+              "a PAT B of U bound to demo--t1 and a workspace secret K stored on demo--t1",
+              "a recording fake for the sandbox collaborator and, registered in the Teardown set of package 14, a recording remover of owned data and a recording session closer beside RevokeBoundTo of package 08 and the secrets remover of package 39"
+            ],
+            "pseudocode": "in internal/fork/remove_test.go: sandboxes.fail = true; r = DELETE demo--t1 as U; assert r.status == 500 and error_type == \"internal\"; assert GET(demo--t1).status == 200; assert a request with B is authenticated; assert remover.calls is empty; assert no parley.workspace.delete event"
+          }
+        },
+        {
+          "id": "REQ-3.6",
+          "pattern": "event_driven",
+          "condition": "a fork is deleted by a `DELETE` request",
+          "action": "write one `parley.workspace.delete` event in the removal transaction",
+          "contract": "one event with type `parley.workspace.delete`, `workspace` and `resource_id` equal to the fork's slug, the caller as actor, `metadata.kind` `fork`, `metadata.parent_slug` equal to the parent's slug, `metadata.revoked_tokens` holding the ids of the tokens revoked in ascending order, no `deleted_forks` member, and the fork's `session_id` when the fork has one; no `parley.fork.expire` event",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with user U, a ready repository workspace demo owned by U and a fork demo--t1 created by U through the create handler of package 15 with one own branch task pushed to it",
+              "a PAT B of U bound to demo--t1 and a workspace secret K stored on demo--t1",
+              "a recording fake for the sandbox collaborator and, registered in the Teardown set of package 14, a recording remover of owned data and a recording session closer beside RevokeBoundTo of package 08 and the secrets remover of package 39"
+            ],
+            "pseudocode": "in internal/fork/remove_test.go: bind two PATs B1 and B2 to demo--t1; DELETE demo--t1 as U; ev = events for workspace demo--t1 of type parley.workspace.delete; assert len(ev) == 1; assert ev[0].resource_id == \"demo--t1\" and ev[0].actor is U; assert ev[0].metadata.kind == \"fork\" and ev[0].metadata.parent_slug == \"demo\"; assert ev[0].metadata.revoked_tokens == sorted([B.id, B1.id, B2.id]); assert \"deleted_forks\" not in ev[0].metadata; assert no parley.fork.expire event; a second case with a fork created with a session expects ev[0].session_id == that session"
+          }
+        },
+        {
+          "id": "REQ-3.7",
+          "pattern": "unwanted",
+          "condition": "a `DELETE` of a fork comes from an organization member who is neither the fork's creator nor the parent's owner, from a PAT without the scope `workspaces:write`, from a caller with no read access, or arrives while the fork's parent is `pending` or `cloning` or has an archive or delete running on it",
+          "action": "refuse the request and leave the fork whole",
+          "contract": "HTTP 403 with `error_type` `forbidden` for the member; HTTP 403 with `error_type` `insufficient_scope` for the PAT; HTTP 404 with `error_type` `not_found` for the caller without read access; HTTP 409 with `error_type` `workspace_busy` for the busy parent; the fork still answers `GET` with HTTP 200 and no event is written",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with user U, a ready repository workspace demo owned by U and a fork demo--t1 created by U through the create handler of package 15 with one own branch task pushed to it",
+              "a PAT B of U bound to demo--t1 and a workspace secret K stored on demo--t1",
+              "a recording fake for the sandbox collaborator and, registered in the Teardown set of package 14, a recording remover of owned data and a recording session closer beside RevokeBoundTo of package 08 and the secrets remover of package 39",
+              "a second org member N and a user S outside the organization"
+            ],
+            "pseudocode": "in internal/fork/remove_test.go, a table over {org member N -> 403 forbidden, U's PAT with only workspaces:read -> 403 insufficient_scope, stranger S -> 404 not_found, U with parent pending -> 409 workspace_busy, U with parent cloning -> 409 workspace_busy, U with the parent's maintenance marker set -> 409 workspace_busy}: r = DELETE demo--t1; assert status and error_type of the row; assert GET(demo--t1) as U answers 200; assert no parley.workspace.delete event"
+          }
+        },
+        {
+          "id": "REQ-3.8",
+          "pattern": "unwanted",
+          "condition": "a `DELETE` names a fork that has already been removed, or two `DELETE` requests for one fork run at the same time",
+          "action": "remove the fork at most once",
+          "contract": "a `DELETE` after the removal answers HTTP 404 with `error_type` `not_found`; of two concurrent requests one answers HTTP 204 and the other HTTP 404, and exactly one `parley.workspace.delete` event exists",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with user U, a ready repository workspace demo owned by U and a fork demo--t1 created by U through the create handler of package 15 with one own branch task pushed to it",
+              "a PAT B of U bound to demo--t1 and a workspace secret K stored on demo--t1",
+              "a recording fake for the sandbox collaborator and, registered in the Teardown set of package 14, a recording remover of owned data and a recording session closer beside RevokeBoundTo of package 08 and the secrets remover of package 39"
+            ],
+            "pseudocode": "in internal/fork/remove_test.go: start two goroutines that each DELETE demo--t1 as U and collect the statuses; assert sorted(statuses) == [204, 404]; assert count(parley.workspace.delete events for demo--t1) == 1; assert the remover of owned data was called once; then DELETE demo--t1 again and assert 404 not_found"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Removing forks with their parent",
+      "rationale": "A fork cannot outlive the repository it shares history with, and the parent's delete must stay one step that happens entirely or not at all.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "the delete of a repository workspace (package 14) calls RemoveForksOf of the registered fork remover inside its store transaction",
+          "action": "remove every fork of that workspace with cause `parent_deleted`, return the removed fork slugs in ascending order, and discard the forks' own branches only after the transaction has committed",
+          "contract": "the step returns the slugs of all forks of the parent sorted ascending (an empty list for a parent without forks) and a function that discards their repository data; after the commit no fork of the parent has a record and every token bound to one of them answers HTTP 401",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with user U and a ready repository workspace demo owned by U",
+              "a recording fake for the sandbox collaborator and, registered in the Teardown set of package 14, a recording remover of owned data and a recording session closer beside RevokeBoundTo of package 08 and the secrets remover of package 39; the step does not call the sandbox collaborator, because the parent's delete has removed the sandboxes before"
+            ],
+            "pseudocode": "in internal/fork/remove_test.go: create forks demo--b, demo--a, demo--c with a bound PAT each; tx = store.Begin(); slugs, discard, err = RemoveForksOf(ctx, tx, \"demo\", actor U); assert err == nil; assert slugs == [\"demo--a\",\"demo--b\",\"demo--c\"]; assert the own branches of the three forks still resolve; tx.Commit(); discard(); assert no workspace record with parent demo; assert each bound PAT answers 401; assert the own branches no longer resolve; assert the recording remover of owned data was called once for each of the three slugs and the session closer with the reason \"workspace deleted\"; then through the real route of package 14 with this package's fork remover registered: archive demo2 with two forks and DELETE it; assert 204, both fork records gone and the parent's parley.workspace.delete event carries deleted_forks with both slugs; a second case on a parent without forks expects slugs == [] and no event"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "event_driven",
+          "condition": "a fork is removed by the fork removal step of its parent's delete",
+          "action": "write one `parley.workspace.delete` event for that fork in the parent's transaction",
+          "contract": "one `parley.workspace.delete` event per fork with `workspace` equal to the fork's slug, the actor of the parent's delete as actor, `metadata.kind` `fork`, `metadata.parent_slug` equal to the parent's slug and `metadata.revoked_tokens` holding only that fork's revoked token ids in ascending order; no `parley.fork.expire` event",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the three-fork store of the removal step test"
+            ],
+            "pseudocode": "in internal/fork/remove_test.go, continuing the three-fork case: ev = events of type parley.workspace.delete; assert the set of ev.workspace == {demo--a, demo--b, demo--c}; for each: assert actor is U, metadata.kind == \"fork\", metadata.parent_slug == \"demo\", metadata.revoked_tokens == [the id of that fork's PAT]; assert no parley.fork.expire event"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "unwanted",
+          "condition": "the parent's delete transaction is rolled back after the fork removal step ran in it",
+          "action": "leave every fork as it was before the step",
+          "contract": "every fork of the parent still answers `GET` with HTTP 200, every token bound to a fork still authenticates, every fork secret is still stored, the forks' own branches still resolve, and no `parley.workspace.delete` event exists",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the three-fork store of the removal step test"
+            ],
+            "pseudocode": "in internal/fork/remove_test.go: tx = store.Begin(); RemoveForksOf(ctx, tx, \"demo\", actor U); tx.Rollback(); for each of the three forks assert GET answers 200, its bound PAT authenticates and its own branch resolves; assert count(parley.workspace.delete events) == 0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Expiry sweep",
+      "rationale": "Forks must disappear without anyone deleting them, and the record must say that the hub, not a person, removed each one.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "a sweep pass runs",
+          "action": "remove, with cause `expired`, every fork whose `expires_at` is at or before the current time, including forks of an archived parent, and leave every other fork in place",
+          "contract": "after the pass `GET /api/v1/workspaces/{slug}` answers HTTP 404 for each fork that was past `expires_at` and HTTP 200 for each fork that was not",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with user U and a ready repository workspace demo owned by U",
+              "a fake clock shared by the handlers and the sweep",
+              "recording fakes for the sandbox collaborator and the change reader and, registered in the Teardown set of package 14, a recording remover of owned data and a recording session closer beside RevokeBoundTo of package 08 and the secrets remover of package 39"
+            ],
+            "pseudocode": "in internal/fork/sweep_test.go, a table over forks {expires_at = now-1s -> removed, expires_at = now -> removed, expires_at = now+1s -> kept, expires_at = now-1s on an archived parent -> removed}: create the forks, move the clock; sweep.RunPass(ctx); assert GET status per row; assert the remover of owned data was called for each removed fork and the session closer with the reason \"fork expired\", and neither for a kept one"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "event_driven",
+          "condition": "the sweep removes a fork",
+          "action": "write one `parley.fork.expire` event in the removal transaction and no `parley.workspace.delete` event",
+          "contract": "one event with type `parley.fork.expire`, actor `system`, `workspace` and `resource_id` equal to the fork's slug, `metadata.parent_slug` equal to the parent's slug, `metadata.reason` `ttl` or `landed`, `metadata.expires_at` equal to the fork's `expires_at` at removal, `metadata.revoked_tokens` in ascending order, and the fork's `session_id` when the fork has one",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with user U and a ready repository workspace demo owned by U",
+              "a fake clock shared by the handlers and the sweep",
+              "recording fakes for the sandbox collaborator and the change reader and, registered in the Teardown set of package 14, a recording remover of owned data and a recording session closer beside RevokeBoundTo of package 08 and the secrets remover of package 39"
+            ],
+            "pseudocode": "in internal/fork/sweep_test.go, a table over {fork past expires_at -> reason ttl, fork meeting the early-expiry conditions with expires_at in the future -> reason landed}: bind two PATs to the fork; sweep.RunPass(ctx); ev = events for the fork's slug; assert exactly one of type parley.fork.expire and none of type parley.workspace.delete; assert ev.actor == \"system\"; assert ev.metadata.parent_slug == \"demo\", ev.metadata.reason == row reason, ev.metadata.expires_at == the fork's stored expires_at, ev.metadata.revoked_tokens == sorted ids; a case with a fork created with a session expects that session_id on the event"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "ubiquitous",
+          "action": "run one sweep pass right after start, one every 60 seconds after that and one as the task `fork expiry` of the hourly maintenance loop, and never run two passes at the same time",
+          "contract": "with a fake ticker, start triggers one pass and each 60-second tick one more; the maintenance task registry lists a task named `fork expiry`; a pass requested while another pass is running returns at once without removing anything",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub store in t.TempDir() with user U and a ready repository workspace demo owned by U",
+              "a fake clock shared by the handlers and the sweep",
+              "recording fakes for the sandbox collaborator and the change reader and, registered in the Teardown set of package 14, a recording remover of owned data and a recording session closer beside RevokeBoundTo of package 08 and the secrets remover of package 39"
+            ],
+            "pseudocode": "in internal/fork/sweep_test.go: start the sweep loop with a fake ticker and a pass counter; assert passes == 1 after start; tick; assert passes == 2; assert the maintenance registry given to the sweep holds a task named \"fork expiry\" whose run triggers a pass; block a pass inside the sandbox fake, call RunPass from a second goroutine and assert it returns with the skipped result while the counter of removals stays unchanged"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "unwanted",
+          "condition": "the removal of one fork fails during a sweep pass, because the sandbox collaborator, a remover of owned data or the store returns an error",
+          "action": "log the failure, leave that fork whole, go on with the remaining forks of the pass and try the fork again in the next pass",
+          "contract": "every other expired fork of the pass is removed with its event; the failing fork still answers `GET` with HTTP 200 and has no `parley.fork.expire` event; the next pass, with the failure gone, removes it and writes exactly one `parley.fork.expire` event for it",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with user U and a ready repository workspace demo owned by U",
+              "a fake clock shared by the handlers and the sweep",
+              "recording fakes for the sandbox collaborator and the change reader and, registered in the Teardown set of package 14, a recording remover of owned data and a recording session closer beside RevokeBoundTo of package 08 and the secrets remover of package 39"
+            ],
+            "pseudocode": "in internal/fork/sweep_test.go, a table over the failing part {sandbox collaborator, remover of owned data}: three expired forks a, b, c with the fake failing for b only; sweep.RunPass(ctx); assert GET a and c answer 404 and GET b answers 200; assert count(parley.fork.expire for b) == 0; assert a log record names b; clear the failure; sweep.RunPass(ctx); assert GET b answers 404 and count(parley.fork.expire for b) == 1"
+          }
+        },
+        {
+          "id": "REQ-5.5",
+          "pattern": "unwanted",
+          "condition": "a fork that is due for removal by the sweep has a parent that is `pending` or `cloning` or has an archive or delete running on it",
+          "action": "leave the fork for a later pass",
+          "contract": "the fork still answers and no `parley.fork.expire` event is written in that pass; the first pass after the parent has left that state removes the fork",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with user U and a ready repository workspace demo owned by U",
+              "a fake clock shared by the handlers and the sweep",
+              "recording fakes for the sandbox collaborator and the change reader and, registered in the Teardown set of package 14, a recording remover of owned data and a recording session closer beside RevokeBoundTo of package 08 and the secrets remover of package 39"
+            ],
+            "pseudocode": "in internal/fork/sweep_test.go, a table over parent states {pending, cloning, ready with the maintenance marker set}: expire the fork; sweep.RunPass(ctx); assert the fork record exists and no parley.fork.expire event; set the parent ready without marker; sweep.RunPass(ctx); assert the fork record is gone and one parley.fork.expire event exists"
+          }
+        },
+        {
+          "id": "REQ-5.6",
+          "pattern": "event_driven",
+          "condition": "the hub shuts down while a sweep pass is running",
+          "action": "complete or roll back the removal in progress, start no further removal and end the pass",
+          "contract": "the pass returns after its context is cancelled; each fork of the pass is either removed with its `parley.fork.expire` event or whole without one; the sweep loop starts no pass afterwards",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub store in t.TempDir() with user U and a ready repository workspace demo owned by U",
+              "a fake clock shared by the handlers and the sweep",
+              "recording fakes for the sandbox collaborator and the change reader and, registered in the Teardown set of package 14, a recording remover of owned data and a recording session closer beside RevokeBoundTo of package 08 and the secrets remover of package 39"
+            ],
+            "pseudocode": "in internal/fork/sweep_test.go: three expired forks; the sandbox fake cancels the context while it handles the second fork; sweep.RunPass(ctx); assert it returns; for each fork assert (record gone and one parley.fork.expire event) or (record present and no event); assert the third fork is present; tick the fake ticker and assert no further pass starts"
+          }
+        },
+        {
+          "id": "REQ-5.7",
+          "pattern": "unwanted",
+          "condition": "discarding the repository data of a removed fork fails after the removal transaction has committed",
+          "action": "keep the removal, log the failure and repeat the discard in each later sweep pass until it succeeds",
+          "contract": "the removal's answer and event are as for a successful discard; after a later sweep pass in which the discard succeeds, the removed fork's own branches no longer resolve in the repository data",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with user U and a ready repository workspace demo owned by U",
+              "a fake clock shared by the handlers and the sweep",
+              "recording fakes for the sandbox collaborator and the change reader and, registered in the Teardown set of package 14, a recording remover of owned data and a recording session closer beside RevokeBoundTo of package 08 and the secrets remover of package 39",
+              "a fork demo--t1 with one own branch task"
+            ],
+            "pseudocode": "in internal/fork/sweep_test.go: make the discard fail once through an injected failing repository function; r = DELETE demo--t1 as U; assert r.status == 204 and one parley.workspace.delete event; assert GET(demo--t1).status == 404; sweep.RunPass(ctx); assert the fork's branch task does not resolve in the repository data and no pending discard is recorded"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Early expiry after landing",
+      "rationale": "Once a fork's work is in the parent or given up, the fork has no use; a day of grace lets its owner still look at it or reopen the work.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "optional",
+          "condition": "`[forks].expire_on_land` is true",
+          "action": "remove in a sweep pass, with reason `landed`, every fork not yet past `expires_at` that is the source of at least one change, whose changes are all `landed` or `abandoned`, whose every existing own branch is the source of such a change, whose last activity is at least 24 hours old and which has no sandbox in state `provisioning` or `ready`",
+          "contract": "after the pass the fork answers HTTP 404 and one `parley.fork.expire` event with `metadata.reason` `landed` exists when all five conditions hold; the fork answers HTTP 200 and no event exists when any one of them does not",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with user U and a ready repository workspace demo owned by U",
+              "a fake clock shared by the handlers and the sweep",
+              "recording fakes for the sandbox collaborator and the change reader and, registered in the Teardown set of package 14, a recording remover of owned data and a recording session closer beside RevokeBoundTo of package 08 and the secrets remover of package 39",
+              "`[forks].expire_on_land` true unless the row says otherwise",
+              "a fork demo--t1 with `expires_at` 7 days ahead and own branches as the row says"
+            ],
+            "pseudocode": "in internal/fork/early_test.go, a table with the fake change reader and sandbox collaborator, each row giving changes [{source branch, state}], own branches, hours since last activity and sandbox states -> removed?: {[] / [task] / 48h / none -> kept}, {[(task, open)] / [task] / 48h -> kept}, {[(task, draft)] -> kept}, {[(task, landed)] / [task, spike] / 48h -> kept}, {[(task, landed)] / [task] / 23h59m -> kept}, {[(task, landed)] / [task] / 24h -> removed}, {[(task, landed), (fix, abandoned)] / [task, fix] / 30h -> removed}, {[(task, landed)] / [] (branch deleted) / 30h -> removed}, {[(task, landed), (task, open)] / [task] / 30h -> kept}, {[(task, landed)] / [task] / 30h / sandbox provisioning -> kept}, {same / sandbox ready -> kept}, {same / sandbox stopped -> removed}: sweep.RunPass(ctx); assert the fork record and the parley.fork.expire event with reason landed per row"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "event_driven",
+          "condition": "an activity is recorded for a fork: a push to it, a change opened from it, or a change of it landing, being abandoned or being restored",
+          "action": "restart the 24 hours of early expiry from the instant of that activity",
+          "contract": "after an activity recorded at time T, a sweep pass before T plus 24 hours leaves a fork in place that meets every other condition, and a pass at T plus 24 hours removes it",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with user U and a ready repository workspace demo owned by U",
+              "a fake clock shared by the handlers and the sweep",
+              "recording fakes for the sandbox collaborator and the change reader and, registered in the Teardown set of package 14, a recording remover of owned data and a recording session closer beside RevokeBoundTo of package 08 and the secrets remover of package 39",
+              "`[forks].expire_on_land` true unless the row says otherwise",
+              "a fork demo--t1 with `expires_at` 7 days ahead and own branches as the row says"
+            ],
+            "pseudocode": "in internal/fork/early_test.go: the fork has change (task, landed) and own branch task, last activity 30h ago; RecordActivity(\"demo--t1\") at T = clock.now; sweep.RunPass(ctx); assert the fork exists; clock.advance(23h59m); sweep.RunPass(ctx); assert the fork exists; clock.advance(1m); sweep.RunPass(ctx); assert the fork is gone with reason landed; a row for a fork just created (activity = creation time) with a landed change expects kept before 24h"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "state_driven",
+          "condition": "a fork has a sandbox in state `provisioning` or `ready`",
+          "action": "not remove the fork early, and still remove it when its `expires_at` passes",
+          "check": {
+            "same_as": "REQ-6.1"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "optional",
+          "condition": "`[forks].expire_on_land` is false",
+          "action": "remove no fork before its `expires_at`",
+          "contract": "a fork that meets all five early-expiry conditions answers HTTP 200 after a sweep pass and has no `parley.fork.expire` event; it is removed with reason `ttl` by the first pass after `expires_at`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with user U and a ready repository workspace demo owned by U",
+              "a fake clock shared by the handlers and the sweep",
+              "recording fakes for the sandbox collaborator and the change reader and, registered in the Teardown set of package 14, a recording remover of owned data and a recording session closer beside RevokeBoundTo of package 08 and the secrets remover of package 39",
+              "`[forks].expire_on_land` true unless the row says otherwise",
+              "a fork demo--t1 with `expires_at` 7 days ahead and own branches as the row says"
+            ],
+            "pseudocode": "in internal/fork/early_test.go: expire_on_land false; the fork has change (task, landed), own branch task, activity 48h ago, no sandbox; sweep.RunPass(ctx); assert the fork exists and the change reader was not asked; clock.advance(8d); sweep.RunPass(ctx); assert the fork is gone and the event's metadata.reason == \"ttl\""
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "event_driven",
+          "condition": "a sweep pass finds a fork that is past `expires_at` and also meets the early-expiry conditions",
+          "action": "remove the fork once, with reason `ttl`",
+          "contract": "exactly one `parley.fork.expire` event for the fork, with `metadata.reason` `ttl`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with user U and a ready repository workspace demo owned by U",
+              "a fake clock shared by the handlers and the sweep",
+              "recording fakes for the sandbox collaborator and the change reader and, registered in the Teardown set of package 14, a recording remover of owned data and a recording session closer beside RevokeBoundTo of package 08 and the secrets remover of package 39",
+              "`[forks].expire_on_land` true unless the row says otherwise",
+              "a fork demo--t1 with `expires_at` 7 days ahead and own branches as the row says"
+            ],
+            "pseudocode": "in internal/fork/early_test.go: the fork has change (task, landed), own branch task, activity 48h ago; clock.advance(8d); sweep.RunPass(ctx); ev = parley.fork.expire events for demo--t1; assert len(ev) == 1 and ev[0].metadata.reason == \"ttl\"; a row with a ready sandbox and expires_at passed also expects removal with reason ttl"
+          }
+        },
+        {
+          "id": "REQ-6.6",
+          "pattern": "unwanted",
+          "condition": "the change reader or the sandbox collaborator returns an error when the sweep asks about a fork",
+          "action": "not remove that fork early in this pass, log the failure and go on with the remaining forks",
+          "contract": "the fork still answers HTTP 200 and has no event after the pass; another fork of the same pass that meets the conditions is removed with reason `landed`; the failing fork is still removed with reason `ttl` once its `expires_at` has passed",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with user U and a ready repository workspace demo owned by U",
+              "a fake clock shared by the handlers and the sweep",
+              "recording fakes for the sandbox collaborator and the change reader and, registered in the Teardown set of package 14, a recording remover of owned data and a recording session closer beside RevokeBoundTo of package 08 and the secrets remover of package 39",
+              "`[forks].expire_on_land` true unless the row says otherwise",
+              "a fork demo--t1 with `expires_at` 7 days ahead and own branches as the row says"
+            ],
+            "pseudocode": "in internal/fork/early_test.go, a table over the failing reader {change reader, sandbox collaborator state query}: forks a and b both meet the conditions; the fake fails for a only; sweep.RunPass(ctx); assert a exists with no event and b is gone with reason landed; assert a log record names a; clock.advance(8d) with the sandbox deletion of the fake working; sweep.RunPass(ctx); assert a is gone with reason ttl"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "Fork lifetime commands",
+      "rationale": "Agents and people work from the shell; the two owner actions must be one command each and must not be able to hit a repository workspace by mistake.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "event_driven",
+          "condition": "a user runs `parley fork extend <slug> --ttl <duration>` with a slug that contains `--`",
+          "action": "send `PATCH /api/v1/workspaces/<slug>` with the JSON body `{\"ttl\": \"<duration>\"}` and print the fork from the response",
+          "contract": "one request with method PATCH, the slug as one percent-encoded path segment and exactly the member `ttl` in the body; stdout holds the response's workspace object as one JSON document; exit status 0",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server that records each request and answers as the row says",
+              "the CLI root of internal/cli run in-process with the server's URL and a credential"
+            ],
+            "pseudocode": "in internal/cli/fork_test.go: server answers 200 with a workspace object; code, out, errOut = run(\"fork\", \"extend\", \"demo--t1\", \"--ttl\", \"2d\"); assert code == 0; assert server.requests == [{PATCH, \"/api/v1/workspaces/demo--t1\", body {\"ttl\":\"2d\"}}]; assert json(out) == the server's object; assert errOut == \"\""
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "event_driven",
+          "condition": "a user runs `parley fork delete <slug>` with a slug that contains `--`",
+          "action": "send `DELETE /api/v1/workspaces/<slug>` without asking for a confirmation flag and, on HTTP 204, print the confirmation document",
+          "contract": "one request with method DELETE and no body; stdout holds `{\"status\": \"deleted\", \"slug\": \"<slug>\"}` as one JSON document; exit status 0",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server that records each request and answers as the row says",
+              "the CLI root of internal/cli run in-process with the server's URL and a credential"
+            ],
+            "pseudocode": "in internal/cli/fork_test.go: server answers 204; code, out, _ = run(\"fork\", \"delete\", \"demo--t1\"); assert code == 0; assert server.requests == [{DELETE, \"/api/v1/workspaces/demo--t1\"}]; assert json(out) == {\"status\":\"deleted\",\"slug\":\"demo--t1\"}"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "unwanted",
+          "condition": "`parley fork extend` or `parley fork delete` is given a slug without `--`, no slug, more than one slug, or `parley fork extend` is run without `--ttl` or with an empty `--ttl`",
+          "action": "send no request and report a usage error",
+          "contract": "exit status 2; stderr holds an error envelope with `code` 0 and `error_type` `usage_error`; stdout is empty; the hub receives no request",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server that records each request and answers as the row says",
+              "the CLI root of internal/cli run in-process with the server's URL and a credential"
+            ],
+            "pseudocode": "in internal/cli/fork_test.go, a table over argument lists {fork extend demo --ttl 2d, fork delete demo, fork delete, fork delete demo--a demo--b, fork extend demo--t1, fork extend demo--t1 --ttl \"\", fork delete demo--t1 --confirm (unknown flag)}: code, out, errOut = run(args); assert code == 2; assert json(errOut).error.code == 0 and json(errOut).error.error_type == \"usage_error\"; assert out == \"\"; assert len(server.requests) == 0"
+          }
+        },
+        {
+          "id": "REQ-7.4",
+          "pattern": "unwanted",
+          "condition": "the hub answers `parley fork extend` or `parley fork delete` with an error",
+          "action": "print the hub's error envelope as received and print nothing on stdout",
+          "contract": "exit status 1; stderr holds the envelope the hub sent, including its `error_type`; stdout is empty",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server that records each request and answers as the row says",
+              "the CLI root of internal/cli run in-process with the server's URL and a credential"
+            ],
+            "pseudocode": "in internal/cli/fork_test.go, a table over {extend with the server answering 409 parent_archived, extend answering 400 invalid_request, delete answering 404 not_found, delete answering 409 workspace_busy}: code, out, errOut = run(args); assert code == 1; assert json(errOut).error.error_type == the row's type and json(errOut).error.code == the row's status; assert out == \"\""
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "An agent extends its fork and later deletes it from the shell",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "runs `parley fork extend demo--t1 --ttl 2d` with a token bound to the fork"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends PATCH /api/v1/workspaces/demo--t1 with the ttl"
+        },
+        {
+          "actor": "parleyd",
+          "action": "checks access and the parent's state, sets expires_at to now plus 2 days and writes parley.workspace.update"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints the fork with its new expires_at and exits 0"
+        },
+        {
+          "actor": "agent",
+          "action": "runs `parley fork delete demo--t1` when the task is done"
+        },
+        {
+          "actor": "parleyd",
+          "action": "removes the fork, its secrets and own branches through the removers of owned data, revokes the bound token and writes parley.workspace.delete in one transaction"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints the confirmation document and exits 0"
+        },
+        {
+          "actor": "agent",
+          "action": "reads the fork again with the same token and is answered 401"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parley CLI command tree and HTTP client",
+          "parleyd HTTP server with authentication, binding guard and access rule",
+          "the ttl update and the fork removal in internal/fork, registered as the fork remover of package 14",
+          "transactional store",
+          "event log",
+          "git repository storage"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 as the end-to-end tests of package 01 do",
+          "a developer U, a repository workspace demo cloned from a test origin and ready, a fork demo--t1 created by U with a bound token that carries workspaces:write, and one own branch pushed to the fork"
+        ],
+        "end_state": [
+          "after the extend the fork's expires_at is two days after the command ran",
+          "after the delete GET /api/v1/workspaces/demo--t1 as U answers 404 and the bound token answers 401",
+          "the event log holds one parley.workspace.update and one parley.workspace.delete for demo--t1, the second naming the bound token in revoked_tokens",
+          "the branches of demo have the heads they had before"
+        ],
+        "pseudocode": "in test/e2e/fork_lifetime_test.go: out = parley(token, \"fork\", \"extend\", \"demo--t1\", \"--ttl\", \"2d\"); assert exit 0 and out.expires_at within 5s of now+48h; out = parley(token, \"fork\", \"delete\", \"demo--t1\"); assert exit 0 and out == {status: deleted, slug: demo--t1}; assert GET(U, /workspaces/demo--t1).status == 404; assert GET(token, /user).status == 401; ev = GET(U, /events/log?workspace=demo--t1); assert types of ev contain parley.workspace.update and parley.workspace.delete with metadata.revoked_tokens == [token id]; assert heads of demo unchanged"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "A fork reaches the end of its lifetime and the sweep removes it",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "creates a fork of demo with ttl 5m through POST /api/v1/workspaces/demo/forks"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers 201 with expires_at five minutes after created_at"
+        },
+        {
+          "actor": "parleyd",
+          "action": "runs a sweep pass six minutes later, finds the fork past expires_at, removes it and writes parley.fork.expire with reason ttl and actor system"
+        },
+        {
+          "actor": "developer",
+          "action": "reads the fork and is answered 404, and finds the parley.fork.expire event in the event log of the parent"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parleyd HTTP server",
+          "fork creation handler",
+          "expiry sweep loop in internal/fork",
+          "transactional store",
+          "event log",
+          "git repository storage"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with a clock the test can advance and the sweep loop running",
+          "a developer U and a ready repository workspace demo cloned from a test origin"
+        ],
+        "end_state": [
+          "the fork answers 404 after the sweep pass",
+          "the event log holds exactly one parley.fork.expire for the fork with reason ttl and no parley.workspace.delete for it",
+          "the workspace demo and its branches are unchanged"
+        ],
+        "pseudocode": "in test/e2e/fork_lifetime_test.go: r = POST(U, /workspaces/demo/forks, {name: \"t2\", ttl: \"5m\"}); assert r.status == 201 and expires_at - created_at == 5m; clock.advance(6m); trigger the sweep's ticker and wait for the pass to end; assert GET(U, /workspaces/demo--t2).status == 404; ev = events of type parley.fork.expire for demo--t2; assert len(ev) == 1 and ev[0].metadata.reason == \"ttl\" and ev[0].actor == \"system\"; assert no parley.workspace.delete for demo--t2; assert GET(U, /workspaces/demo).status == 200"
+      }
+    }
+  ],
+  "external_apis": [
+    {
+      "package": "github.com/spf13/cobra",
+      "version": "v1",
+      "verified": false,
+      "symbols": [
+        {
+          "name": "Command",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "type Command struct { Use string; Short string; Args PositionalArgs; RunE func(cmd *Command, args []string) error; ... }"
+        },
+        {
+          "name": "ExactArgs",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func ExactArgs(n int) PositionalArgs"
+        },
+        {
+          "name": "Command.MarkFlagRequired",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) MarkFlagRequired(name string) error"
+        },
+        {
+          "name": "Command.Flags",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) Flags() *pflag.FlagSet"
+        }
+      ]
+    }
+  ]
+}

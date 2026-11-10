@@ -1,0 +1,1020 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "47",
+  "spec_name": "sandbox_lifecycle_and_checkpoints",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Saving a working directory as a checkpoint",
+      "rationale": "An agent's uncommitted and unpushed work must survive the end of the compute it was made on.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "a checkpoint is taken of a `ready` sandbox whose working directory is a git repository",
+          "action": "store a ref `refs/parley/sandboxes/<sandbox id>/<branch>` in the sandbox's workspace for every local branch whose head commit the workspace's repository does not have and for the checked-out branch when the working tree has uncommitted changes, saving those changes (new files that git does not ignore included, ignored files excluded) as one extra commit on top of the branch head, and leave the branch heads, the index and the working tree inside the sandbox as they were",
+          "contract": "the sandbox's `checkpoint` is `{at: the clock's time in whole seconds UTC, ok: true, error: null, refs: [{branch, sha, dirty}]}` sorted by branch, where each `sha` is the 40-character id the ref resolves to and `dirty` is true only for a ref that ends in the extra commit; one `parley.sandbox.checkpoint` event exists with `resource_type` `sandbox`, `resource_id` the sandbox id, the sandbox's `workspace` and `session_id`, and metadata `{ok, refs, error}` equal to the record's",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork",
+              "a sandbox S on demo--t1 in state ready, created by U through the create operation of package 45, with branch t1 checked out in its working directory and a live hub credential H"
+            ],
+            "pseudocode": "in internal/sandbox/checkpoint_test.go, a table over the working directory {clean and every branch head already in the fork: refs == []; one unpushed commit on t1: refs == [{t1, head of t1, false}]; unpushed commits on t1 and on a second local branch x: two refs sorted x after t1; t1 pushed, a modified tracked file, a new file new.txt and a file build.log matched by .gitignore: refs == [{t1, sha, true}], the commit at sha has the head of t1 as its only parent, its tree holds the modification and new.txt and not build.log; no branch checked out with a modified file: refs == [{HEAD, sha, true}]}: before = (branch heads, `git status --porcelain`, index tree) read in the sandbox directory; cp = Checkpoint(S, actor system); assert cp.ok and cp.error == nil and cp.at == clock.Now(); for each expected ref assert the workspace repository resolves refs/parley/sandboxes/<S.id>/<branch> to its sha; assert (branch heads, status, index tree) in the sandbox directory == before; assert exactly one parley.sandbox.checkpoint event with metadata equal to the stored checkpoint and actor system"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "ubiquitous",
+          "action": "for any checkpoint, create no change, no version and no event other than `parley.sandbox.checkpoint`, and keep every ref it stored resolvable for as long as the workspace exists",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork",
+              "a sandbox S on demo--t1 in state ready, created by U through the create operation of package 45, with branch t1 checked out in its working directory and a live hub credential H"
+            ],
+            "pseudocode": "in internal/sandbox/checkpoint_test.go: take a checkpoint of S with one unpushed commit and a dirty tree; assert the event log gained exactly one event and its type is parley.sandbox.checkpoint; assert the branches under refs/heads of demo--t1 and of demo have the heads they had before; take a second checkpoint after one more commit; assert the ref now resolves to the new sha; delete S through the delete operation; assert refs/parley/sandboxes/<S.id>/t1 still resolves in the workspace repository"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "optional",
+          "condition": "the sandbox has no repository to save (it was created with `checkout: false`, its working directory is not a git repository, or its profile has `hub_access: none`)",
+          "action": "store no ref, and record `ok: true` with no refs for a sandbox with a hub credential, or no checkpoint at all for a sandbox with `hub_access: none`",
+          "contract": "with a hub credential: `checkpoint` is `{at, ok: true, error: null, refs: []}` and one `parley.sandbox.checkpoint` event with `ok: true` and `refs: []` exists; with `hub_access: none`: `checkpoint` stays null, no event is written and no command is run in the sandbox",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork"
+            ],
+            "pseudocode": "in internal/sandbox/checkpoint_test.go, a table over {created with checkout false, working directory holds files and no .git, profile with hub_access none}: cp = Checkpoint(S, actor system); for the first two rows assert stored checkpoint == {at: now, ok: true, error: nil, refs: []} and one checkpoint event; for the third assert S.checkpoint == nil, no event, fake runtime recorded no exec; in every row assert no ref exists under refs/parley/sandboxes/<S.id>/"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "unwanted",
+          "condition": "the working tree holds an untracked file larger than 100 MiB when a checkpoint is taken",
+          "action": "leave that file out of the extra commit and save every other uncommitted change",
+          "contract": "`checkpoint.ok` is true, `checkpoint.error` is `skipped: ` followed by the skipped paths separated by `, `, the commit the dirty ref resolves to does not contain the skipped file and contains the other changes; a file of exactly 100 MiB is saved",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork",
+              "a sandbox S on demo--t1 in state ready, created by U through the create operation of package 45, with branch t1 checked out in its working directory and a live hub credential H"
+            ],
+            "pseudocode": "in internal/sandbox/checkpoint_test.go, with the size limit of the checkpoint component lowered to 1 KiB by its test option, a table over an untracked file big.bin of {1025 bytes: skipped; 1024 bytes: saved} beside a small new file a.txt: cp = Checkpoint(S); assert cp.ok; skipped row: assert cp.error == \"skipped: big.bin\" and the tree at the dirty sha has a.txt and no big.bin; saved row: assert cp.error == nil and the tree has both; and one assertion that the default limit of the component is 100 * 1024 * 1024 bytes by checkpointing with the default and a sparse file one byte larger"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "unwanted",
+          "condition": "a checkpoint cannot be completed (the runtime cannot be reached, a git command fails in the sandbox, the transfer fails, or the attempt has run for 5 minutes)",
+          "action": "store no new ref, record the failure on the sandbox and let the operation that asked for the checkpoint continue",
+          "contract": "`checkpoint` is `{at: now, ok: false, error: the scrubbed reason of at most 1,024 bytes, refs: the refs of the last successful checkpoint or []}`; one `parley.sandbox.checkpoint` event with `ok: false` and the same `error` exists; no ref under `refs/parley/sandboxes/<sandbox id>/` was created or moved; a stop or a deletion that triggered the attempt still ends in `stopped` or `deleted`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork",
+              "a sandbox S on demo--t1 in state ready, created by U through the create operation of package 45, with branch t1 checked out in its working directory and a live hub credential H"
+            ],
+            "pseudocode": "in internal/sandbox/checkpoint_test.go, a table over the fault {fake runtime unreachable, exec of git exits 128 with stderr text, the bundle download returns an error after half the bytes, exec blocks until the clock passed 5 minutes} x {first checkpoint, a successful checkpoint with refs [{t1, a, false}] exists}: refsBefore = for-each-ref refs/parley/sandboxes in the workspace repository; cp = Checkpoint(S); assert cp.ok == false and cp.error != \"\" and len(cp.error) <= 1024; assert cp.refs == [] in the first column and [{t1, a, false}] in the second; assert refs after == refsBefore; assert one event with ok false; then call Delete(S, reason api) with the fault still in place and assert S.state == deleted"
+          }
+        },
+        {
+          "id": "REQ-1.6",
+          "pattern": "ubiquitous",
+          "action": "for any checkpoint attempt, add 1 to `parley_sandbox_checkpoints_total` through the metrics recorder of package 44, with `result` `ok` when at least one ref was stored, `empty` when the checkpoint is ok without refs, and `failed` when it could not be completed",
+          "contract": "the recorder receives exactly one Add of `parley_sandbox_checkpoints_total` per attempt with the result of that attempt; a sandbox with `hub_access: none`, for which no attempt is made, adds nothing",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the checkpoint operation of internal/sandbox over the fake runtime client of package 44 in its host-directory mode, a hub store in t.TempDir() and a recording metrics recorder"
+            ],
+            "pseudocode": "in internal/sandbox/checkpoint_test.go, a table over {a ready sandbox with an unpushed commit -> ok; a sandbox created with checkout false -> empty; a clean working directory with nothing unpushed -> empty; the fake fails Exec as unavailable -> failed; a sandbox with hub_access none -> no Add}: run the checkpoint operation; assert recorder.adds('parley_sandbox_checkpoints_total') == [{result: row.result}] or [] for the last row"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Checkpoint on request and access to the lifecycle routes",
+      "rationale": "An agent saves its work at a moment it chooses, and only callers who may write to the workspace may change a sandbox's life.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "a caller with `sandboxes:write` and write access sends `POST /api/v1/workspaces/{slug}/sandboxes/{id}/checkpoint` for a `ready` sandbox",
+          "action": "take a checkpoint with the caller as the event's actor and answer with the sandbox",
+          "contract": "HTTP 200 with the sandbox object whose `checkpoint.at` is the time of this request and whose `state` is still `ready`; for a sandbox with `hub_access: none` HTTP 200 with `checkpoint` null",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork",
+              "a sandbox S on demo--t1 in state ready, created by U through the create operation of package 45, with branch t1 checked out in its working directory and a live hub credential H",
+              "the sandbox routes mounted on an httptest server with the route guard of package 44; U calls with an API key"
+            ],
+            "pseudocode": "in internal/sandbox/checkpoint_test.go: write an uncommitted file in the sandbox directory; r = POST checkpoint as U; assert r.status == 200 and r.json.state == \"ready\" and r.json.checkpoint.ok == true and r.json.checkpoint.at == clock.Now() and r.json.checkpoint.refs[0].dirty == true; assert the checkpoint event's actor is U; second row with a sandbox of a hub_access none profile: assert r.status == 200 and r.json.checkpoint == null"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "unwanted",
+          "condition": "the checkpoint route is called for a sandbox whose state is `provisioning`, `stopped`, `completed`, `failed` or `deleted`",
+          "action": "refuse the request without contacting the runtime",
+          "contract": "HTTP 409 with `error_type` `sandbox_not_ready`; the sandbox's `checkpoint` is unchanged and no event is written",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork",
+              "the sandbox routes mounted on an httptest server with the route guard of package 44; U calls with an API key"
+            ],
+            "pseudocode": "in internal/sandbox/checkpoint_test.go, a table over the five states (records put into the state through the store): r = POST checkpoint as U; assert r.status == 409 and r.json.error.error_type == \"sandbox_not_ready\"; assert the stored checkpoint equals the one before; assert the fake runtime recorded no call and the event writer no event"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "unwanted",
+          "condition": "the checkpoint the route asked for fails",
+          "action": "record the failure on the sandbox and answer with the reason",
+          "contract": "HTTP 502 with `error_type` `sandbox_runtime_error` and a `message` that contains the scrubbed reason; a later read of the sandbox shows `checkpoint.ok` false with the same reason in `checkpoint.error` and `state` `ready`",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork",
+              "a sandbox S on demo--t1 in state ready, created by U through the create operation of package 45, with branch t1 checked out in its working directory and a live hub credential H",
+              "the sandbox routes mounted on an httptest server with the route guard of package 44; U calls with an API key"
+            ],
+            "pseudocode": "in internal/sandbox/checkpoint_test.go, a table over {fake runtime unreachable, exec of git exits 128 with stderr \"fatal: bad object\"}: r = POST checkpoint as U; assert r.status == 502 and r.json.error.error_type == \"sandbox_runtime_error\"; stored = load S; assert stored.checkpoint.ok == false and stored.state == \"ready\" and r.json.error.message contains stored.checkpoint.error"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "unwanted",
+          "condition": "one of `POST /api/v1/workspaces/{slug}/sandboxes/{id}/checkpoint`, `POST …/stop`, `POST …/start`, `DELETE /api/v1/workspaces/{slug}/sandboxes/{id}` and `PATCH /api/v1/workspaces/{slug}/sandboxes/{id}` is called while sandboxes are disabled, by a PAT without `sandboxes:write`, by a member with read-only access, by a user without read access to the workspace, or with an id that is unknown, belongs to another workspace or names a record already removed",
+          "action": "refuse the request before any runtime call or state change",
+          "contract": "sandboxes disabled: HTTP 404 `sandboxes_disabled`; PAT without the scope: HTTP 403 `insufficient_scope`; read-only member: HTTP 403 `forbidden`; no read access: HTTP 404 `not_found`; unknown, foreign or removed id: HTTP 404 `sandbox_not_found`; in every case the record is unchanged, no event is written and the runtime is not called",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork",
+              "a sandbox S on demo--t1 in state ready, created by U through the create operation of package 45, with branch t1 checked out in its working directory and a live hub credential H",
+              "the sandbox routes mounted on an httptest server with the route guard of package 44; U calls with an API key",
+              "a second workspace other with a sandbox, an org member M, a user X"
+            ],
+            "pseudocode": "in internal/sandbox/lifecycle_access_test.go, a table over the five routes x {hub configured without [sandbox]: 404 sandboxes_disabled; U's PAT with sandboxes:read only: 403 insufficient_scope; org member M with read access: 403 forbidden; user X outside the organization: 404 not_found; id sbx_ + 32 zeros: 404 sandbox_not_found; id of a sandbox on workspace other: 404 sandbox_not_found; id of a deleted record that the test removed from the store: 404 sandbox_not_found}: assert status and error.error_type; assert the record of S is equal to before, the event writer recorded nothing and the fake runtime recorded no call"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "event_driven",
+          "condition": "the admin token calls the stop route or the delete route of any workspace's sandbox",
+          "action": "carry out the stop or the deletion as for a caller with write access",
+          "contract": "stop: HTTP 200 with `state` `stopped`; delete: HTTP 204; the event's actor is the admin token",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork",
+              "a sandbox S on demo--t1 in state ready, created by U through the create operation of package 45, with branch t1 checked out in its working directory and a live hub credential H",
+              "the sandbox routes mounted on an httptest server with the route guard of package 44; U calls with an API key"
+            ],
+            "pseudocode": "in internal/sandbox/lifecycle_access_test.go: r = POST stop with the admin token; assert r.status == 200 and r.json.state == \"stopped\"; r = DELETE with the admin token; assert r.status == 204; assert both events carry the admin actor"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Stopping a sandbox",
+      "rationale": "A sandbox nobody is using should hold no compute and no live credential, and its work must be kept.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "a caller with write access sends `POST /api/v1/workspaces/{slug}/sandboxes/{id}/stop` for a `ready` sandbox",
+          "action": "take a checkpoint (when the profile's `checkpoint` is true), release the sandbox's compute at the runtime without removing its working directory, revoke the hub credential and record `stopped` with reason `api` together with one `parley.sandbox.stop` event",
+          "contract": "HTTP 200 with the sandbox object: `state` `stopped`, `state_reason` `api`, `checkpoint.at` the time of the request; the event has metadata `{reason: \"api\"}` and the caller as actor; a request authenticated with the revoked hub credential answers HTTP 401 `unauthenticated`; the runtime received one stop call and no delete call for the sandbox",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork",
+              "a sandbox S on demo--t1 in state ready, created by U through the create operation of package 45, with branch t1 checked out in its working directory and a live hub credential H",
+              "the sandbox routes mounted on an httptest server with the route guard of package 44; U calls with an API key"
+            ],
+            "pseudocode": "in internal/sandbox/stop_test.go: write an uncommitted file; r = POST stop as U; assert r.status == 200 and r.json.state == \"stopped\" and r.json.state_reason == \"api\" and r.json.checkpoint.ok and r.json.checkpoint.at == clock.Now(); assert the fake runtime calls for S, in order, end with a stop and contain no delete, and the checkpoint exec came before the stop; assert authenticating with H answers 401 unauthenticated; assert one parley.sandbox.stop event {reason: api}, actor U; second row with a profile whose checkpoint is false: assert state stopped, checkpoint null and no checkpoint event"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "optional",
+          "condition": "the stop route is called for a sandbox whose state is not `ready`",
+          "action": "change nothing and answer with the sandbox as it is",
+          "contract": "HTTP 200 with the sandbox object in its unchanged state; no event is written, no credential is revoked and the runtime is not called",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork",
+              "the sandbox routes mounted on an httptest server with the route guard of package 44; U calls with an API key"
+            ],
+            "pseudocode": "in internal/sandbox/stop_test.go, a table over {provisioning, stopped, completed, failed, deleted}: before = load S; r = POST stop as U; assert r.status == 200 and r.json.state == before.state and r.json.updated_at == before.updated_at; assert no event and no runtime call"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "unwanted",
+          "condition": "the runtime cannot be reached, or refuses, when the hub releases the compute of a sandbox being stopped",
+          "action": "leave the sandbox `ready` with its hub credential and report the failure",
+          "contract": "HTTP 502 with `error_type` `sandbox_runtime_error` on the stop route; the sandbox's `state` is `ready`, the hub credential still authenticates and no `parley.sandbox.stop` event exists; an idle stop that fails this way is tried again at the next minute's pass",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork",
+              "a sandbox S on demo--t1 in state ready, created by U through the create operation of package 45, with branch t1 checked out in its working directory and a live hub credential H",
+              "the sandbox routes mounted on an httptest server with the route guard of package 44; U calls with an API key"
+            ],
+            "pseudocode": "in internal/sandbox/stop_test.go, a table over {fake runtime unreachable, fake runtime returns an error from stop}: r = POST stop as U; assert r.status == 502 and error_type == \"sandbox_runtime_error\"; assert load(S).state == \"ready\"; assert H authenticates; assert no stop event; then for an idle sandbox run the idle pass twice with the fault and once without: assert it is ready after the first two and stopped with reason idle after the third"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "ubiquitous",
+          "action": "for any set of stop, delete, expiry, idle and reconcile actions that race on one sandbox, apply each state transition only when the record is still in the state the action expected, so that each transition happens once and writes one event",
+          "contract": "after N concurrent stop requests on one `ready` sandbox exactly one `parley.sandbox.stop` event exists and every request answered HTTP 200; after a stop racing a delete the sandbox is `deleted` with exactly one `parley.sandbox.delete` event and at most one `parley.sandbox.stop` event",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork",
+              "a sandbox S on demo--t1 in state ready, created by U through the create operation of package 45, with branch t1 checked out in its working directory and a live hub credential H",
+              "the sandbox routes mounted on an httptest server with the route guard of package 44; U calls with an API key"
+            ],
+            "pseudocode": "in internal/sandbox/stop_test.go, run with the race detector: start 8 goroutines that POST stop on S at once; assert all answered 200; assert count(parley.sandbox.stop events of S) == 1 and the fake runtime recorded at most one effective stop; second case on a fresh sandbox: one goroutine POST stop, one DELETE, repeated 20 times: assert final state deleted, count(delete events) == 1, count(stop events) <= 1"
+          }
+        },
+        {
+          "id": "REQ-3.5",
+          "pattern": "event_driven",
+          "condition": "the idle pass, which runs every minute, finds a `ready` sandbox with `idle_timeout_seconds` above 0 whose `last_activity_at` is more than that many seconds before the clock's time",
+          "action": "stop it as a stop request does, with reason `idle` and actor `system`",
+          "contract": "the sandbox is `stopped` with `state_reason` `idle`, a checkpoint was taken, its hub credential is revoked and one `parley.sandbox.stop` event with metadata `{reason: \"idle\"}` and actor `system` exists; a sandbox idle for exactly its timeout, a sandbox with `idle_timeout_seconds` 0 and a sandbox that is not `ready` are left as they are",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork"
+            ],
+            "pseudocode": "in internal/sandbox/timers_test.go, a table over (idle_timeout_seconds, clock minus last_activity_at, state) {(1800, 1801s, ready): stopped/idle; (1800, 1800s, ready): unchanged; (0, 100000s, ready): unchanged; (1800, 4000s, provisioning): unchanged; (1800, 4000s, completed): unchanged}: run the idle pass once; assert state and state_reason; for the stopped row assert the checkpoint event precedes one stop event {reason: idle} with actor system and the hub credential of the sandbox no longer authenticates; and assert the loop calls the pass once per minute by advancing the test clock 3 minutes and counting passes == 3"
+          }
+        },
+        {
+          "id": "REQ-3.6",
+          "pattern": "event_driven",
+          "condition": "the archive observer is told that a workspace was archived, with the slugs of its forks",
+          "action": "stop every `ready` sandbox of that workspace and of those forks with a checkpoint, reason `archived` and actor `system`, and leave sandboxes in other states as they are",
+          "contract": "each such sandbox is `stopped` with `state_reason` `archived` and one `parley.sandbox.stop` event with metadata `{reason: \"archived\"}`; a sandbox whose runtime stop fails stays `ready` and the observer returns an error naming it after trying the others",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork"
+            ],
+            "pseudocode": "in internal/sandbox/teardown_test.go: sandboxes A (ready, on demo), B (ready, on demo--t1), C (stopped, on demo--t1), D (ready, on workspace other); call the archive observer with (demo, [demo--t1]); assert A and B are stopped with reason archived and each has a checkpoint and one stop event with actor system; assert C and D are unchanged; second case: the fake runtime fails the stop of A only: assert B is stopped, A is ready and the observer returned an error whose text contains A's id"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Starting a sandbox again",
+      "rationale": "A stopped or ended sandbox still holds the agent's working directory; starting it again is cheaper than building a new one.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "a caller with write access sends `POST /api/v1/workspaces/{slug}/sandboxes/{id}/start` for a sandbox in state `stopped`, `completed` or `failed`",
+          "action": "resolve the sandbox's credentials and exposed secrets again, apply the sandbox quotas, mint a new hub credential with the scopes and paths recorded in `hub_access`, record `provisioning` with `exit_code`, `state_reason` and `ended_at` cleared together with one `parley.sandbox.start` event, and hand the sandbox to the provisioning work of package 45, which starts it at the runtime with the policy value of the policy composer registered with that package",
+          "contract": "HTTP 200 with the sandbox object in `state` `provisioning`; the event's actor is the caller; when the provisioning work has run, the sandbox is `ready`, the runtime was given the secret values as they are now (a value rotated while the sandbox was stopped is the one used), the main `command` was started again when the sandbox has one, and the earlier hub credential still answers HTTP 401",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork",
+              "a configured credential model whose secret is stored on demo with value v1, attached to the profile as required",
+              "a sandbox S on demo--t1 with command [\"agent\",\"run\"] brought into the row's state"
+            ],
+            "pseudocode": "in internal/sandbox/start_test.go, a table over the state before {stopped by the stop route, completed with exit_code 0, failed with exit_code 3 and reason exit}: rotate the secret of credential model from v1 to v2; r = POST start as U; assert r.status == 200 and r.json.state == \"provisioning\" and r.json.exit_code == null and r.json.state_reason == null and r.json.ended_at == null; assert one parley.sandbox.start event with actor U; run the provisioning work of package 45 to completion; assert load(S).state == \"ready\"; assert the fake runtime's provider for model holds v2; assert the fake runtime started command [\"agent\",\"run\"] a second time; assert H answers 401 and the sandbox's new hub credential authenticates with the scopes of S.hub_access and expires at S.expires_at; and one row with the profile agent removed from the configuration: start still answers 200"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "optional",
+          "condition": "the start route is called for a sandbox that is already `provisioning` or `ready`",
+          "action": "change nothing and answer with the sandbox as it is",
+          "contract": "HTTP 200 with the sandbox object in its unchanged state; no event is written and no credential is minted",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork",
+              "the sandbox routes mounted on an httptest server with the route guard of package 44; U calls with an API key"
+            ],
+            "pseudocode": "in internal/sandbox/start_test.go, a table over {provisioning, ready}: tokens = count of U's tokens; r = POST start as U; assert r.status == 200 and r.json.state == row state; assert no parley.sandbox.start event and count of U's tokens == tokens"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "unwanted",
+          "condition": "a start is requested for a `deleted` sandbox, on an archived workspace, on a fork whose parent is archived, when a required credential's secret or a required exposed secret resolves nowhere, when the secret store cannot be read, or when a sandbox quota would be exceeded",
+          "action": "refuse the start and leave the sandbox as it was",
+          "contract": "deleted: HTTP 409 `sandbox_deleted`; archived workspace: HTTP 409 `workspace_archived`; archived parent: HTTP 409 `parent_archived`; missing required secret: HTTP 422 `credential_missing` naming the credentials or secrets and the scopes searched; unreadable secret store: HTTP 503 `secrets_unavailable`; quota: HTTP 429 `sandbox_capacity` with `limit`, `maximum` and `current` in the error object; in every case the state, `state_reason` and `exit_code` are unchanged, no hub credential was minted, no `parley.sandbox.start` event exists and the runtime was not called",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork",
+              "the sandbox routes mounted on an httptest server with the route guard of package 44; U calls with an API key",
+              "a stopped sandbox S whose profile attaches the required credential model, an optional credential extra and the required exposed secret NPM_TOKEN"
+            ],
+            "pseudocode": "in internal/sandbox/start_test.go, a table over {S deleted: 409 sandbox_deleted; S stopped on repository workspace demo, demo archived: 409 workspace_archived; S stopped on demo--t1, demo archived: 409 parent_archived; secret of required credential model deleted: 422 credential_missing and error names model; secret of required exposed secret NPM_TOKEN deleted: 422 credential_missing and error names NPM_TOKEN; secret store opened without its encryption key: 503 secrets_unavailable; max_per_user 1 and U has another ready sandbox: 429 sandbox_capacity with limit == \"max_per_user\", maximum == 1, current == 1}: before = load S; r = POST start as U; assert status, error_type and the named members; assert load(S) == before; assert no start event, no new token of U, no runtime call; and one row where the secret of an optional credential is deleted: 200, and after provisioning S.credentials no longer lists it"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "ubiquitous",
+          "action": "for any sandbox that is `stopped`, `completed` or `failed`, leave it out of the quota counts until a start is accepted, and count it from the moment the start records `provisioning`",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork",
+              "the sandbox routes mounted on an httptest server with the route guard of package 44; U calls with an API key"
+            ],
+            "pseudocode": "in internal/sandbox/start_test.go with max_per_workspace 2: sandboxes A ready, B stopped, C stopped on the family of demo; assert POST start B answers 200; assert POST start C answers 429 sandbox_capacity with limit == \"max_per_workspace\" and current == 2; stop A; assert POST start C answers 200"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Seeding a working directory from a checkpoint",
+      "rationale": "A checkpoint is only worth taking if the next sandbox can pick the work up where it was left.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "the provisioning work prepares the working directory of a new sandbox that was created with `restore_from` naming a sandbox that has a checkpoint",
+          "action": "after the checkout, set each branch of the source's `checkpoint.refs` in the working directory to its checkpointed commit, and for a dirty ref set the branch to the commit under the extra one and put that commit's changes back into the working tree uncommitted when the branch is the one checked out",
+          "contract": "in the new sandbox's working directory every branch of the checkpoint resolves to its checkpointed commit (for a dirty ref: to the parent of `sha`), `git status --porcelain` lists exactly the files that were uncommitted in the source (modified files as modified, new files as untracked, deleted files as deleted), the index equals the branch head, and the source sandbox's record and refs are unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork",
+              "a source sandbox on demo--t1 with branch t1 checked out"
+            ],
+            "pseudocode": "in internal/sandbox/restore_test.go: in the source directory commit c1 on t1 (unpushed), create branch x with commit c2, then on t1 modify a.txt, add new.txt and delete old.txt without committing; checkpoint the source and delete it; create sandbox N on demo--t1 with restore_from == source id through the create operation of package 45 and run the provisioning work; in N's directory assert rev-parse t1 == c1 and rev-parse x == c2 and the checked-out branch is t1; assert status --porcelain == [\" M a.txt\", \" D old.txt\", \"?? new.txt\"] in any order; assert `git diff --cached` is empty; assert the source's refs under refs/parley/sandboxes/<source id>/ resolve as before; and one row where N checks out branch other-branch: assert t1 == c1, the working tree is clean and refs/parley/sandboxes/<source id>/t1 still holds the changes"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "event_driven",
+          "condition": "the provisioning work of a start finds that the runtime no longer has the sandbox's working directory",
+          "action": "rebuild the working directory from the checkout and the sandbox's own latest checkpoint by the same rule as a restore",
+          "contract": "the started sandbox is `ready` and its working directory holds the checkpointed branches and the uncommitted changes as REQ-5.1 states; when the runtime still has the working directory it is used as it is and no restore runs",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork",
+              "a sandbox S on demo--t1 in state ready, created by U through the create operation of package 45, with branch t1 checked out in its working directory and a live hub credential H",
+              "the sandbox routes mounted on an httptest server with the route guard of package 44; U calls with an API key"
+            ],
+            "pseudocode": "in internal/sandbox/restore_test.go: S has an unpushed commit c1 on t1 and an untracked file new.txt; stop S; table over {the fake runtime drops the working directory, the fake runtime keeps it and a file kept.ign matched by .gitignore is in it}: POST start and run the provisioning work; assert S.state == \"ready\"; dropped row: assert rev-parse t1 == c1 and status lists \"?? new.txt\"; kept row: assert kept.ign still exists and the fake runtime recorded no bundle upload"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "optional",
+          "condition": "the checkpoint to seed from has no refs",
+          "action": "leave the working directory as the checkout produced it",
+          "contract": "the sandbox becomes `ready` with a clean working tree on its checkout branch and no transfer from the hub's checkpoint refs took place",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork"
+            ],
+            "pseudocode": "in internal/sandbox/restore_test.go, a table over the source checkpoint {ok true with refs [], ok false with refs []}: create N with restore_from and run the provisioning work; assert N.state == \"ready\" and status --porcelain is empty and the fake runtime recorded no bundle upload"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "unwanted",
+          "condition": "a ref of the checkpoint to seed from no longer exists in the workspace's repository, or a git command of the restore fails in the sandbox",
+          "action": "end the provisioning of that sandbox as failed and remove what was created at the runtime for a new sandbox",
+          "contract": "the sandbox is `failed` with `state_reason` `checkout_failed`; one `parley.sandbox.fail` event with metadata `reason` `checkout_failed` and a scrubbed `error` of at most 1,024 bytes that names the missing ref or the failed step exists; the source sandbox is unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork",
+              "a deleted source sandbox with checkpoint refs [{t1, sha, true}]"
+            ],
+            "pseudocode": "in internal/sandbox/restore_test.go, a table over {delete refs/parley/sandboxes/<source id>/t1 from the workspace repository as a reclone does, fake runtime exec of the fetch from the bundle exits 1}: create N with restore_from and run the provisioning work; assert N.state == \"failed\" and N.state_reason == \"checkout_failed\"; assert one parley.sandbox.fail event of N with reason checkout_failed and len(error) <= 1024; first row: assert error contains \"refs/parley/sandboxes/\"; assert the fake runtime no longer has a sandbox for N; assert the source record equals the one before"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Extending a sandbox and ending it at its time limit",
+      "rationale": "Every sandbox must end at a time the operator bounded, and an agent that needs longer must be able to ask within that bound.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "a caller with write access sends `PATCH /api/v1/workspaces/{slug}/sandboxes/{id}` with any of `ttl`, `purpose` and `labels` for a sandbox that is not `deleted`",
+          "action": "set `expires_at` to the clock's time plus `ttl`, cut to the fork's `expires_at` when the sandbox is on a task fork, move the hub credential's expiry to the same instant, replace `purpose` and `labels` with the given values, and leave members that are absent unchanged",
+          "contract": "HTTP 200 with the sandbox object: `expires_at` equals now plus `ttl` (or the fork's `expires_at` when that is earlier), `hub_access.expires_at` equals `expires_at` when the sandbox has a hub credential, `purpose` and `labels` as sent; a `ttl` of exactly `1m` and one of exactly the profile's `ttl` as recorded at creation are accepted, as is a `ttl` that makes `expires_at` earlier than it was; no event is written",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork",
+              "a sandbox S on demo--t1 in state ready, created by U through the create operation of package 45, with branch t1 checked out in its working directory and a live hub credential H",
+              "the sandbox routes mounted on an httptest server with the route guard of package 44; U calls with an API key"
+            ],
+            "pseudocode": "in internal/sandbox/extend_test.go with the clock at T, profile ttl 4h and the fork expiring at T+3h, a table over the body {ttl \"1m\": expires_at == T+1m; ttl \"2h\": T+2h; ttl \"4h\": T+3h (cut to the fork); purpose \"x\" repeated 200 times: purpose stored, expires_at unchanged; labels {\"team\":\"a\"}: labels replaced, purpose unchanged; ttl \"30m\" with purpose \"p\": both applied} x state {ready, stopped}: r = PATCH as U; assert r.status == 200 and the members above; for ttl rows on a ready sandbox assert r.json.hub_access.expires_at == r.json.expires_at and the stored token of H expires then; assert no event was written; and one row on repository workspace demo with ttl \"4h\": expires_at == T+4h"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "unwanted",
+          "condition": "the PATCH body has a `ttl` that is not a duration, is shorter than 1 minute or is longer than the profile's `ttl` as recorded at creation, a `purpose` longer than 200 characters, `labels` that break the label rules, or the sandbox is `deleted`",
+          "action": "refuse the request and change nothing",
+          "contract": "HTTP 400 with `error_type` `invalid_request` for a body violation; HTTP 409 with `error_type` `sandbox_deleted` for a deleted sandbox; the record, the hub credential's expiry and the expiry timer are unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork",
+              "a sandbox S on demo--t1 in state ready, created by U through the create operation of package 45, with branch t1 checked out in its working directory and a live hub credential H",
+              "the sandbox routes mounted on an httptest server with the route guard of package 44; U calls with an API key"
+            ],
+            "pseudocode": "in internal/sandbox/extend_test.go, a table over the body {ttl \"59s\", ttl \"4h1m\" with profile ttl 4h, ttl \"soon\", ttl 3600 as a JSON number, purpose of 201 characters, labels with 17 entries, labels {\"parley.x\":\"a\"}, labels {\"-bad\":\"a\"}, labels {\"k\": a value of 257 bytes}}: r = PATCH as U; assert r.status == 400 and error_type == \"invalid_request\"; assert load(S) equals the record before; then with S deleted and body {ttl \"1h\"}: assert 409 sandbox_deleted"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "event_driven",
+          "condition": "the clock reaches the `expires_at` of a sandbox in any state but `deleted`",
+          "action": "take a checkpoint when the sandbox is `ready` and its profile's `checkpoint` is true, then delete the sandbox as a delete request does, with reason `expired` and actor `system`, without waiting for the runtime to act",
+          "contract": "the sandbox is `deleted` with `state_reason` `expired` and `ended_at` set; one `parley.sandbox.delete` event with metadata `{reason: \"expired\"}` and actor `system` exists; for a `ready` sandbox the checkpoint event precedes it; the hub credential answers HTTP 401; a sandbox whose `expires_at` is later than the clock's time is untouched",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork"
+            ],
+            "pseudocode": "in internal/sandbox/timers_test.go, a table over the state at expiry {provisioning, ready with an uncommitted file, stopped, completed, failed}: set the clock to expires_at; run the expiry pass; assert state == deleted and state_reason == \"expired\" and ended_at == clock.Now(); assert one delete event {reason: expired} with actor system; ready row: assert a checkpoint ref with dirty true exists and its event precedes the delete event; assert the fake runtime has no sandbox for S; second sandbox with expires_at one second later: assert untouched; and assert the timer fires the pass: arm the loop, advance the test clock to the earliest expires_at and assert the pass ran without a minute tick; after a PATCH that moves expires_at assert the timer is armed for the new instant"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "optional",
+          "condition": "an expiring sandbox is on a task fork whose own `expires_at` is at or before the clock's time",
+          "action": "delete the sandbox with reason `workspace_deleted` and take no checkpoint",
+          "contract": "the sandbox is `deleted` with `state_reason` `workspace_deleted`; one `parley.sandbox.delete` event with metadata `{reason: \"workspace_deleted\"}` exists; no `parley.sandbox.checkpoint` event was written at that time and no ref under `refs/parley/sandboxes/<sandbox id>/` was created",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork"
+            ],
+            "pseudocode": "in internal/sandbox/timers_test.go: fork demo--t1 and ready sandbox S (with an uncommitted file) both expire at T; set the clock to T; run the expiry pass; assert S.state == deleted and S.state_reason == \"workspace_deleted\"; assert no checkpoint event and no ref under refs/parley/sandboxes/<S.id>/; assert one delete event {reason: workspace_deleted}; second row with the fork expiring at T+1s: reason == \"expired\" and a checkpoint exists"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "unwanted",
+          "condition": "the runtime cannot be reached when a sandbox expires",
+          "action": "record the deletion at once and leave the runtime's remains to reconciliation",
+          "contract": "the sandbox is `deleted` with `state_reason` `expired`, its hub credential answers HTTP 401, and the runtime's sandbox and providers for it are removed by the first reconcile pass that reaches the runtime",
+          "check": {
+            "same_as": "REQ-7.4"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "Deleting a sandbox",
+      "rationale": "A deleted sandbox must leave nothing running and no live credential, whether or not the runtime answers, and a sandbox never outlives its workspace.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "event_driven",
+          "condition": "a caller with write access sends `DELETE /api/v1/workspaces/{slug}/sandboxes/{id}` for a sandbox that is not `deleted`",
+          "action": "take a checkpoint when the sandbox is `ready` and checkpointing applies, remove the sandbox and its providers at the runtime, revoke the hub credential, and record `deleted` with reason `api` and `ended_at` together with one `parley.sandbox.delete` event",
+          "contract": "HTTP 204 with an empty body; a read of the sandbox within 24 hours answers HTTP 200 with `state` `deleted` and `state_reason` `api`; the event has metadata `{reason: \"api\"}` and the caller as actor; the hub credential answers HTTP 401; the runtime holds no sandbox and no provider for the id",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork",
+              "the sandbox routes mounted on an httptest server with the route guard of package 44; U calls with an API key",
+              "a sandbox S on demo--t1 brought into the row's state, with one provider at the fake runtime"
+            ],
+            "pseudocode": "in internal/sandbox/delete_test.go, a table over the state {provisioning, ready, stopped, completed, failed}: r = DELETE as U; assert r.status == 204 and len(r.body) == 0; g = load S; assert g.state == \"deleted\" and g.state_reason == \"api\" and g.ended_at == clock.Now(); assert one delete event {reason: api} with actor U; assert the fake runtime lists no sandbox and no provider labelled with S.id; ready row: assert H answers 401 and a checkpoint event precedes the delete event; and assert the functions registered as delete hooks ran once with S.id inside the deleting transaction"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "ubiquitous",
+          "action": "for any deletion by request, take the checkpoint only when the sandbox is `ready` and the `checkpoint` query parameter is true, or is absent and the profile's `checkpoint` is true, and refuse a `checkpoint` value that is neither `true` nor `false`",
+          "contract": "checkpoint taken: a `parley.sandbox.checkpoint` event precedes the delete event; not taken: none is written by the deletion; a value other than `true` or `false`: HTTP 400 `invalid_request` and the sandbox is not deleted",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork",
+              "the sandbox routes mounted on an httptest server with the route guard of package 44; U calls with an API key"
+            ],
+            "pseudocode": "in internal/sandbox/delete_test.go, a table over (state, profile checkpoint, query) {(ready, true, absent): taken; (ready, false, absent): not; (ready, true, checkpoint=false): not; (ready, false, checkpoint=true): taken; (stopped, true, checkpoint=true): not; (ready, true, checkpoint=maybe): 400 invalid_request and state still ready}: r = DELETE with the query; assert status; count checkpoint events written during the call == 1 for taken, 0 otherwise"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "optional",
+          "condition": "the delete route is called for a sandbox that is already `deleted` and whose record still exists",
+          "action": "change nothing and answer as for a deletion",
+          "contract": "HTTP 204 with an empty body; no second `parley.sandbox.delete` event is written and the runtime is not called",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork",
+              "a sandbox S on demo--t1 in state ready, created by U through the create operation of package 45, with branch t1 checked out in its working directory and a live hub credential H",
+              "the sandbox routes mounted on an httptest server with the route guard of package 44; U calls with an API key"
+            ],
+            "pseudocode": "in internal/sandbox/delete_test.go: DELETE S twice as U; assert both answer 204; assert count(delete events of S) == 1; assert the fake runtime recorded no call during the second request; assert ended_at is that of the first deletion"
+          }
+        },
+        {
+          "id": "REQ-7.4",
+          "pattern": "unwanted",
+          "condition": "the runtime cannot be reached, or fails, while a sandbox is being deleted by request or by expiry",
+          "action": "record `deleted` at once, revoke the hub credential on the hub and leave the runtime's sandbox and providers to be removed by reconciliation",
+          "contract": "the delete route answers HTTP 204; the sandbox is `deleted` with its reason and one delete event; the hub credential answers HTTP 401; a failed checkpoint attempt is recorded in `checkpoint.error`; after the runtime is reachable again one reconcile pass leaves no sandbox and no provider for the id at the runtime",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork",
+              "a sandbox S on demo--t1 in state ready, created by U through the create operation of package 45, with branch t1 checked out in its working directory and a live hub credential H",
+              "the sandbox routes mounted on an httptest server with the route guard of package 44; U calls with an API key"
+            ],
+            "pseudocode": "in internal/sandbox/delete_test.go, a table over {DELETE by U: reason api, the expiry pass with the clock at expires_at: reason expired} x {fake runtime unreachable, fake runtime reachable and its delete returns an error}: perform the deletion; route rows: assert r.status == 204; assert S.state == deleted with the row's reason and one delete event; assert H answers 401; unreachable rows: assert S.checkpoint.ok == false; make the fake runtime reachable and healthy; run one reconcile pass; assert the fake runtime lists no sandbox and no provider labelled with S.id"
+          }
+        },
+        {
+          "id": "REQ-7.5",
+          "pattern": "event_driven",
+          "condition": "the sandbox remover is called with the slugs of a workspace that is being deleted and of its forks, or with the slug of a fork that is being removed",
+          "action": "delete every sandbox of those slugs that is not `deleted`, with reason `workspace_deleted`, actor `system` and no checkpoint, and report through its query whether a slug has a sandbox in state `provisioning` or `ready`",
+          "contract": "every such sandbox is `deleted` with `state_reason` `workspace_deleted` and one delete event with metadata `{reason: \"workspace_deleted\"}`; no checkpoint event is written; the remover returns nil also when the runtime cannot be reached and an error only when a record could not be written; the query answers true for a slug with a `provisioning` or `ready` sandbox and false when all its sandboxes are `stopped`, `completed`, `failed` or `deleted` or it has none",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork",
+              "a second workspace other"
+            ],
+            "pseudocode": "in internal/sandbox/teardown_test.go: sandboxes A ready on demo, B provisioning on demo--t1, C stopped on demo--t1, D ready on workspace other; assert HasLive(demo--t1) == true and HasLive(demo) == true; err = RemoveSandboxes([demo, demo--t1]); assert err == nil; assert A, B, C are deleted with reason workspace_deleted and actor system and D is ready; assert no checkpoint event; assert HasLive(demo--t1) == false; table over the query {only stopped, only completed, only failed, only deleted, none}: false; second case with the fake runtime unreachable: err == nil and the sandboxes are deleted; third case with a store that fails the write: err != nil"
+          }
+        },
+        {
+          "id": "REQ-7.6",
+          "pattern": "event_driven",
+          "condition": "the remover of owned data is called inside the removal transaction of a workspace or a fork",
+          "action": "remove the sandbox records of that slug in the given transaction and, for a fork, delete its refs under `refs/parley/sandboxes/`, running the purge hooks of package 45 for each removed record, revoking no token and returning an error only",
+          "contract": "after the commit no sandbox record of the slug exists and a later workspace with the same slug lists no sandbox; no ref under `refs/parley/sandboxes/` of the removed fork resolves; after a rollback of the transaction the records are still there",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork"
+            ],
+            "pseudocode": "in internal/sandbox/teardown_test.go: demo--t1 has two deleted sandbox records and a checkpoint ref; table over {commit, rollback}: tx = begin; RemoveOwnedData(tx, demo--t1); end tx by the row; commit row: assert count(records of demo--t1) == 0 and for-each-ref refs/parley/sandboxes of the fork is empty and the functions registered as purge hooks ran once per record; rollback row: assert count(records) == 2"
+          }
+        },
+        {
+          "id": "REQ-7.7",
+          "pattern": "event_driven",
+          "condition": "the hourly maintenance task `sandbox_record_cleanup` runs",
+          "action": "remove every `deleted` sandbox record whose `ended_at` is more than 24 hours before the clock's time, running the purge hooks of package 45 for its id in the same transaction, and keep every other record",
+          "contract": "a removed id answers HTTP 404 with `error_type` `sandbox_not_found` on every sandbox route; a record deleted exactly 24 hours ago and records in any other state, however old, still answer HTTP 200",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork",
+              "the sandbox routes mounted on an httptest server with the route guard of package 44; U calls with an API key"
+            ],
+            "pseudocode": "in internal/sandbox/cleanup_test.go with the clock at T, a table over (state, ended_at) {(deleted, T-24h-1s): removed; (deleted, T-24h): kept; (deleted, T-1h): kept; (stopped, T-30d): kept; (failed, T-30d): kept}: run the task registered under the name sandbox_record_cleanup; removed row: assert GET of the id answers 404 sandbox_not_found and the purge hook recorded the id once; kept rows: assert GET answers 200 and the purge hook recorded nothing"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "Reconciling records with the runtime",
+      "rationale": "The runtime owns the sandboxes and the hub owns their records; after any interruption the two must agree again without a person.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "a reconcile pass, which runs once at start before the listener is bound and then every `[sandbox].reconcile_interval`, finds a `ready` sandbox whose main process the runtime reports as exited",
+          "action": "take a checkpoint (when the profile's `checkpoint` is true), release the sandbox's compute at the runtime without removing its working directory, revoke the hub credential and record `completed` for exit code 0 or `failed` with reason `exit` for any other code, with `exit_code` and `ended_at`, together with one `parley.sandbox.exit` event",
+          "contract": "exit code 0: `state` `completed`, `state_reason` null; another code: `state` `failed`, `state_reason` `exit`; `exit_code` is the reported code; the event has metadata `{exit_code}` and actor `system`; the checkpoint event precedes it; the record stays readable and the runtime still holds the working directory until `expires_at`; no `parley.sandbox.fail` event is written",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork",
+              "a ready sandbox S with command [\"agent\",\"run\"] and a live hub credential H"
+            ],
+            "pseudocode": "in internal/sandbox/reconcile_test.go, a table over the exit code the fake runtime reports {0: completed, null reason; 1: failed, exit; 137: failed, exit}: leave an uncommitted file in the directory; run one reconcile pass; assert state, state_reason, exit_code and ended_at == clock.Now(); assert events of S in order == [parley.sandbox.checkpoint, parley.sandbox.exit{exit_code}] with actor system; assert the fake runtime recorded a stop and no delete for S and still has its working directory; assert H answers 401; run a second pass: assert no further event; and assert the loop: with reconcile_interval 1m advance the test clock 3 minutes and count passes == 3 after the start pass"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "event_driven",
+          "condition": "a reconcile pass finds a `ready` sandbox that the runtime reports as restarting or reconnecting, or a sandbox it earlier moved to `provisioning` for that cause that the runtime reports as running again",
+          "action": "record `provisioning` in the first case and `ready` in the second, writing no event, revoking nothing and leaving sandboxes that package 45's provisioning work holds in `provisioning` untouched",
+          "contract": "the sandbox reads `provisioning` while the runtime restarts it and `ready` afterwards; its hub credential authenticates throughout; the event log gains no event; a sandbox in `provisioning` after a create or a start is not moved to `ready` by the pass",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork",
+              "a sandbox S on demo--t1 in state ready, created by U through the create operation of package 45, with branch t1 checked out in its working directory and a live hub credential H"
+            ],
+            "pseudocode": "in internal/sandbox/reconcile_test.go: fake runtime reports S as restarting; pass; assert S.state == \"provisioning\" and H authenticates and no event; fake reports running; pass; assert S.state == \"ready\" and no event; second sandbox P left in provisioning by a start whose provisioning work has not run, fake reports it running: pass; assert P.state == \"provisioning\""
+          }
+        },
+        {
+          "id": "REQ-8.3",
+          "pattern": "unwanted",
+          "condition": "a reconcile pass that reached the runtime finds a `ready` record, or a `provisioning` record whose sandbox was already created at the runtime, that the runtime does not know",
+          "action": "record `failed` with reason `runtime_error` and `ended_at`, revoke the hub credential and write one `parley.sandbox.fail` event",
+          "contract": "`state` `failed`, `state_reason` `runtime_error`; the event has metadata `reason` `runtime_error` and a scrubbed `error`; the hub credential answers HTTP 401; records in `stopped`, `completed` or `failed` that the runtime does not know, and `provisioning` records not yet created at the runtime, are unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork"
+            ],
+            "pseudocode": "in internal/sandbox/reconcile_test.go, a table over the record {ready: failed; provisioning with its runtime creation recorded: failed; provisioning without it: unchanged; stopped: unchanged; completed: unchanged; failed with reason exit: unchanged}: remove the sandbox from the fake runtime; run one pass; failed rows: assert state == failed and state_reason == \"runtime_error\" and one fail event {reason: runtime_error} with actor system and the credential answers 401; unchanged rows: assert the record equals the one before and no event"
+          }
+        },
+        {
+          "id": "REQ-8.4",
+          "pattern": "event_driven",
+          "condition": "a reconcile pass finds sandboxes or providers at the runtime that carry this hub's label and belong to no record in a state other than `deleted`",
+          "action": "delete them at the runtime and leave everything else there untouched",
+          "contract": "after the pass the runtime holds no labelled sandbox or provider without a live record; sandboxes and providers of live records, and objects without this hub's label, are still there",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork",
+              "a sandbox S on demo--t1 in state ready, created by U through the create operation of package 45, with branch t1 checked out in its working directory and a live hub credential H"
+            ],
+            "pseudocode": "in internal/sandbox/reconcile_test.go: the fake runtime holds: sandbox and provider of live record S; a labelled sandbox and provider whose record is deleted; a labelled sandbox and provider with an id no record has; a sandbox and a provider without the hub's label; run one pass; assert the fake runtime's remaining objects == {S's sandbox, S's provider, the unlabelled sandbox, the unlabelled provider}; assert no record changed"
+          }
+        },
+        {
+          "id": "REQ-8.5",
+          "pattern": "event_driven",
+          "condition": "the hub starts after a time in which idle timeouts or `expires_at` instants passed",
+          "action": "do the overdue idle stops and expiries in the reconcile pass of the start",
+          "contract": "when the start pass has ended, every sandbox whose `expires_at` passed is `deleted` with reason `expired` and every `ready` sandbox idle for longer than its timeout is `stopped` with reason `idle`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork"
+            ],
+            "pseudocode": "in internal/sandbox/reconcile_test.go: with component 1 create sandboxes E (expires at T+1h) and I (ready, idle timeout 30m, last activity T, expires at T+4h); discard component 1 without stopping anything; set the clock to T+2h; build component 2 on the same store and fake runtime and run its start hook; assert E.state == deleted with reason expired and I.state == stopped with reason idle"
+          }
+        },
+        {
+          "id": "REQ-8.6",
+          "pattern": "unwanted",
+          "condition": "the runtime cannot be reached during a reconcile pass",
+          "action": "change no record except by expiry, mark none `failed`, end the pass without an error that stops the hub, and try again at the next interval",
+          "contract": "every record that is not past `expires_at` equals the one before the pass; no `parley.sandbox.fail`, `exit` or `stop` event is written; a start hook that meets an unreachable runtime returns nil; the next pass that reaches the runtime applies what is due",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork"
+            ],
+            "pseudocode": "in internal/sandbox/reconcile_test.go: S ready with its main process exited at the runtime, X ready and removed from the runtime; make the fake runtime unreachable; assert the start hook returns nil; run two passes; assert S and X equal their records before and no fail, exit or stop event exists; make the runtime reachable; run one pass; assert S is completed and X is failed with runtime_error"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-9",
+      "title": "Hub stop and restart, and runtime error text",
+      "rationale": "Operators upgrade the hub while agents work, and an error from the runtime must never carry a secret into a record, an event or a response.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-9.1",
+          "pattern": "event_driven",
+          "condition": "the hub is told to shut down while sandboxes exist in any state",
+          "action": "end its idle, expiry and reconcile work within the shutdown grace and make no call to the runtime that stops, deletes or changes a sandbox or a provider",
+          "contract": "between the shutdown notification and the end of the process the runtime receives no stop, delete, exec or provider call from this package; every sandbox record equals the one before the shutdown; the background work returns within 15 seconds",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork"
+            ],
+            "pseudocode": "in internal/sandbox/shutdown_test.go: sandboxes in {provisioning, ready, stopped, completed}; start the background work of the component with a context; mark the fake runtime's call log; cancel the context; assert the work returned within 15 seconds of real time; assert the call log gained no stop, delete, exec or provider call; assert every record equals the one before"
+          }
+        },
+        {
+          "id": "REQ-9.2",
+          "pattern": "ubiquitous",
+          "action": "for any stop, crash or restart of the hub, leave every sandbox at the runtime as it is, so that after the restart a `ready` sandbox is still `ready` and its main process was not stopped",
+          "check": {
+            "same_as": "PATH-3"
+          }
+        },
+        {
+          "id": "REQ-9.3",
+          "pattern": "ubiquitous",
+          "action": "for any runtime error text this package stores on a sandbox, writes into an event, logs or returns in a response, replace every resolved secret value of the sandbox and its hub credential with `[redacted]` and cut the text to 1,024 bytes, by passing it through the scrubbing function of package 45",
+          "contract": "`checkpoint.error`, the `error` metadata of `parley.sandbox.checkpoint` and `parley.sandbox.fail`, the `message` of a `502 sandbox_runtime_error` answer and the hub's log line contain neither a secret value nor the hub credential, contain `[redacted]` where one stood, and are at most 1,024 bytes long",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a sandbox component in internal/sandbox over a hub store in t.TempDir(), a clock the test sets, a recording event writer, and the fake runtime client of package 44 whose exec and file transfer act on a real directory under t.TempDir() with the real git command",
+              "user U, a ready repository workspace demo created with git init and one commit on main, a fork demo--t1 of it owned by U, and a profile agent with ttl 4h, idle_timeout 30m, checkpoint true and hub_access fork",
+              "a sandbox S on demo--t1 in state ready, created by U through the create operation of package 45, with branch t1 checked out in its working directory and a live hub credential H",
+              "the sandbox routes mounted on an httptest server with the route guard of package 44; U calls with an API key",
+              "the secret of the sandbox's credential model resolves to sk-secret-value-1234"
+            ],
+            "pseudocode": "in internal/sandbox/scrub_test.go, a table over the text the fake runtime fails with {\"auth failed for sk-secret-value-1234\", text containing the hub credential of S, text containing both, a text of 5,000 bytes ending in the secret, a text without any secret} x the sink {checkpoint.error after a failed checkpoint, metadata.error of the checkpoint event, metadata.error of the fail event after a failed restore, message of the 502 answer of the checkpoint route, the line captured from the hub's logger}: assert the sink's text does not contain \"sk-secret-value-1234\" nor the credential; assert it contains \"[redacted]\" when the input held one within the first 1,024 bytes; assert len <= 1024; assert the text without a secret is unchanged up to 1,024 bytes"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-10",
+      "title": "Lifecycle commands of the CLI",
+      "rationale": "Agents and people drive a sandbox's life from scripts; each lifecycle call needs a command that behaves like every other parley command.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-10.1",
+          "pattern": "event_driven",
+          "condition": "a user runs `parley sandbox checkpoint <workspace-slug> <id>`, `parley sandbox stop <workspace-slug> <id>`, `parley sandbox start <workspace-slug> <id>`, `parley sandbox extend <workspace-slug> <id> --ttl <duration>` or `parley sandbox delete <workspace-slug> <id> [--no-checkpoint]`",
+          "action": "send the command's one request and print the result as JSON on stdout",
+          "contract": "checkpoint: `POST /api/v1/workspaces/{slug}/sandboxes/{id}/checkpoint`; stop: `POST …/stop`; start: `POST …/start`; extend: `PATCH …/sandboxes/{id}` with body `{\"ttl\": \"<duration>\"}`; delete: `DELETE …/sandboxes/{id}`, with query `checkpoint=false` when `--no-checkpoint` is given and no query otherwise; stdout is the response body, and for delete `{\"id\":\"<id>\",\"status\":\"deleted\"}`; exit status 0; a hub error is printed as received on stderr with exit status 1 and nothing on stdout",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the CLI root of package 09 with its HTTP client pointed at the test server"
+            ],
+            "pseudocode": "in internal/cli/sandbox_test.go against an httptest server that records requests and answers a sandbox document (204 for DELETE), a table over {checkpoint demo--t1 sbx_1: POST /api/v1/workspaces/demo--t1/sandboxes/sbx_1/checkpoint; stop: POST …/stop; start: POST …/start; extend --ttl 2h: PATCH …/sandboxes/sbx_1 body {\"ttl\":\"2h\"}; delete: DELETE …/sandboxes/sbx_1 with empty query; delete --no-checkpoint: DELETE with query checkpoint=false}: run the command; assert the recorded method, path, query and body; assert exit 0; assert stdout parses to the answered document, and for delete equals {\"id\":\"sbx_1\",\"status\":\"deleted\"}; then with the server answering 409 sandbox_deleted to start: assert exit 1, stdout empty and stderr holds the envelope with error_type sandbox_deleted"
+          }
+        },
+        {
+          "id": "REQ-10.2",
+          "pattern": "optional",
+          "condition": "`parley sandbox start` is given `--wait`",
+          "action": "poll `GET /api/v1/workspaces/{slug}/sandboxes/{id}` with the shared wait of the CLI until the sandbox is `ready`, `completed`, `failed`, `stopped` or `deleted` or `--timeout` passes",
+          "contract": "`ready` or `completed`: the final sandbox on stdout and exit status 0; `failed`, `stopped` or `deleted`: the final sandbox on stdout, `wait_failed` on stderr and exit status 1; timeout: nothing on stdout, `wait_timeout` on stderr and exit status 1; a `--timeout` or `--poll-interval` that is not positive: exit status 2 and no request",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the CLI root of package 09 with its HTTP client pointed at the test server"
+            ],
+            "pseudocode": "in internal/cli/sandbox_test.go, a table over the states the test server answers to successive GETs after start answered provisioning {[provisioning, ready]: exit 0 and stdout.state == ready; [completed]: exit 0; [failed]: exit 1 and stderr error_type wait_failed and stdout.state == failed; [stopped]: exit 1 wait_failed; [deleted]: exit 1 wait_failed; provisioning forever with --timeout 50ms --poll-interval 10ms: exit 1, stderr wait_timeout, stdout empty}; and {--timeout 0, --poll-interval -1s}: exit 2 and the server recorded no request"
+          }
+        },
+        {
+          "id": "REQ-10.3",
+          "pattern": "unwanted",
+          "condition": "a lifecycle command is run with a missing or extra positional argument, or `parley sandbox extend` is run without `--ttl`",
+          "action": "fail before sending any request",
+          "contract": "exit status 2; stderr holds the error envelope with `code` 0 and `error_type` `usage_error`; stdout is empty; the hub receives no request",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the CLI root of package 09 with its HTTP client pointed at the test server"
+            ],
+            "pseudocode": "in internal/cli/sandbox_test.go, a table over the arguments {sandbox stop demo--t1, sandbox stop, sandbox start demo--t1 sbx_1 extra, sandbox extend demo--t1 sbx_1, sandbox delete demo--t1, sandbox checkpoint}: run; assert exit 2; assert stderr parses to an envelope with code 0 and error_type usage_error; assert stdout is empty and the test server recorded no request"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "An agent stops its sandbox with unsaved work and starts it again",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "runs `parley sandbox stop demo--t1 <id>` while its working directory holds an uncommitted file"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends POST /api/v1/workspaces/demo--t1/sandboxes/<id>/stop"
+        },
+        {
+          "actor": "parleyd",
+          "action": "checks scope and access, has git run in the sandbox through the runtime client and stores refs/parley/sandboxes/<id>/t1 in the fork"
+        },
+        {
+          "actor": "OpenShell gateway",
+          "action": "releases the sandbox's compute and keeps its working directory"
+        },
+        {
+          "actor": "parleyd",
+          "action": "revokes the hub credential, records stopped with reason api and writes parley.sandbox.checkpoint and parley.sandbox.stop"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints the stopped sandbox and exits 0"
+        },
+        {
+          "actor": "agent",
+          "action": "runs `parley sandbox start demo--t1 <id> --wait`"
+        },
+        {
+          "actor": "parleyd",
+          "action": "resolves the secrets again, mints a new hub credential, records provisioning, writes parley.sandbox.start and provisions the sandbox until it is ready"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "polls the sandbox until it is ready, prints it and exits 0"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parley CLI command tree and HTTP client",
+          "parleyd HTTP server with authentication, binding guard, route guard and access rule",
+          "sandbox lifecycle and checkpoint code in internal/sandbox with the provisioning work of package 45",
+          "transactional store",
+          "event log",
+          "git repository storage of the fork"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 as the end-to-end tests of package 01 do, configured with a [sandbox] section, the profile agent and the fake runtime client of package 44 whose exec and file transfer run real git in directories under t.TempDir()",
+          "a developer U, a repository workspace demo cloned from a test origin of internal/gitrepo/gitrepotest and ready, and a fork demo--t1 with a bound token that carries sandboxes:write and sandboxes:read",
+          "a ready sandbox created with `parley sandbox create demo--t1 --wait`, in whose directory the test writes notes.txt"
+        ],
+        "end_state": [
+          "after the stop the sandbox reads stopped with reason api and the fork's repository resolves refs/parley/sandboxes/<id>/t1 to a commit whose tree holds notes.txt",
+          "after the start the sandbox reads ready and notes.txt is still in its working directory",
+          "the event log holds parley.sandbox.checkpoint, parley.sandbox.stop and parley.sandbox.start for the sandbox, in that order",
+          "the hub credential that was live before the stop answers 401"
+        ],
+        "pseudocode": "in test/e2e/sandbox_lifecycle_test.go: id = parley(token, \"sandbox\", \"create\", \"demo--t1\", \"--wait\").id; write notes.txt in the fake runtime's directory of id; out = parley(token, \"sandbox\", \"stop\", \"demo--t1\", id); assert exit 0 and out.state == \"stopped\" and out.checkpoint.refs[0].dirty; assert `git cat-file -e refs/parley/sandboxes/<id>/t1:notes.txt` succeeds in the fork's repository; out = parley(token, \"sandbox\", \"start\", \"demo--t1\", id, \"--wait\"); assert exit 0 and out.state == \"ready\"; assert notes.txt exists in the directory; ev = GET(U, /events/log?workspace=demo--t1); assert the sandbox's event types contain [parley.sandbox.checkpoint, parley.sandbox.stop, parley.sandbox.start] in order"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "A sandbox expires and its work is restored into a new one",
+      "steps": [
+        {
+          "actor": "parleyd",
+          "action": "finds at expires_at that the ready sandbox has reached its time limit"
+        },
+        {
+          "actor": "parleyd",
+          "action": "takes a checkpoint of the unpushed commit and the uncommitted file into the fork"
+        },
+        {
+          "actor": "OpenShell gateway",
+          "action": "removes the sandbox and its providers"
+        },
+        {
+          "actor": "parleyd",
+          "action": "revokes the hub credential, records deleted with reason expired and writes parley.sandbox.delete"
+        },
+        {
+          "actor": "developer",
+          "action": "runs `parley sandbox create demo--t1 --restore-from <id> --wait`"
+        },
+        {
+          "actor": "parleyd",
+          "action": "creates the new sandbox, checks the fork out and restores the checkpointed branch and the uncommitted file into its working directory"
+        },
+        {
+          "actor": "developer",
+          "action": "reads the old sandbox and sees it deleted, and finds the work in the new one"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parleyd HTTP server and the sandbox background work started by the hub composition",
+          "expiry, delete, checkpoint and restore code in internal/sandbox with the create and provisioning work of package 45",
+          "transactional store",
+          "event log",
+          "git repository storage of the fork",
+          "parley CLI"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 as the end-to-end tests of package 01 do, configured with a [sandbox] section, the profile agent and the fake runtime client of package 44 whose exec and file transfer run real git in directories under t.TempDir(), and a clock the test advances",
+          "a developer U, a repository workspace demo cloned from a test origin of internal/gitrepo/gitrepotest and ready, and a fork demo--t1 with a bound token that carries sandboxes:write and sandboxes:read",
+          "a ready sandbox with ttl 1m in whose directory the test commits c1 on t1 and writes an untracked file notes.txt"
+        ],
+        "end_state": [
+          "the first sandbox reads deleted with reason expired and checkpoint.ok true",
+          "the new sandbox reads ready with restored_from equal to the first id; in its directory t1 resolves to c1 and notes.txt is an untracked file",
+          "the event log holds parley.sandbox.checkpoint then parley.sandbox.delete with reason expired for the first sandbox"
+        ],
+        "pseudocode": "in test/e2e/sandbox_lifecycle_test.go: id = create with --ttl 1m --wait; commit c1 and write notes.txt in its directory; advance the clock 61s; poll GET sandbox until state == \"deleted\" (at most 5s); assert state_reason == \"expired\" and checkpoint.ok; n = parley(key, \"sandbox\", \"create\", \"demo--t1\", \"--restore-from\", id, \"--wait\"); assert exit 0 and n.state == \"ready\" and n.restored_from == id; in n's directory assert rev-parse t1 == c1 and status --porcelain == [\"?? notes.txt\"]"
+      }
+    },
+    {
+      "id": "PATH-3",
+      "title": "An operator restarts the hub while a sandbox runs",
+      "steps": [
+        {
+          "actor": "operator",
+          "action": "stops parleyd while a sandbox is ready and its main process runs"
+        },
+        {
+          "actor": "parleyd",
+          "action": "ends its sandbox background work and exits without calling the runtime"
+        },
+        {
+          "actor": "OpenShell gateway",
+          "action": "keeps the sandbox running; its main process exits with code 0 while the hub is down"
+        },
+        {
+          "actor": "operator",
+          "action": "starts parleyd again on the same data directory"
+        },
+        {
+          "actor": "parleyd",
+          "action": "runs its start reconcile pass: checkpoints the sandbox, records completed with exit code 0, writes parley.sandbox.exit and deletes a labelled runtime sandbox that has no record"
+        },
+        {
+          "actor": "operator",
+          "action": "reads the sandboxes: the second one, whose main process still runs, is ready as before"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the hub composition of internal/hub with its start hooks, background work and shutdown",
+          "reconcile and checkpoint code in internal/sandbox",
+          "transactional store reopened from the same data directory",
+          "event log"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 as the end-to-end tests of package 01 do, configured with a [sandbox] section, the profile agent and the fake runtime client of package 44 whose exec and file transfer run real git in directories under t.TempDir(); the fake runtime outlives the hub instance",
+          "a developer U, a repository workspace demo cloned from a test origin of internal/gitrepo/gitrepotest and ready, and a fork demo--t1 with a bound token that carries sandboxes:write and sandboxes:read",
+          "two ready sandboxes A and B, each with a main command, and one sandbox at the fake runtime that carries the hub's label and has no record"
+        ],
+        "end_state": [
+          "between the shutdown and the second start the fake runtime recorded no stop, delete or exec call",
+          "after the second start A reads completed with exit_code 0 and a checkpoint, and B reads ready with its main process still running at the fake runtime",
+          "the labelled runtime sandbox without a record is gone",
+          "the event log holds one parley.sandbox.exit for A and no event for B since its parley.sandbox.ready"
+        ],
+        "pseudocode": "in test/e2e/sandbox_lifecycle_test.go: start hub 1; create A and B with a command and --wait; mark the fake runtime's call log; shut hub 1 down; assert the log gained no stop, delete or exec call; make the fake runtime report A's main process exited 0 and add an orphan sandbox with the hub's label; start hub 2 on the same data directory and fake runtime; a = GET A; assert a.state == \"completed\" and a.exit_code == 0 and a.checkpoint.ok; b = GET B; assert b.state == \"ready\" and the fake runtime reports B's main process running; assert the orphan is not listed by the fake runtime"
+      }
+    }
+  ]
+}

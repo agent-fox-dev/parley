@@ -1,0 +1,1004 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "03",
+  "spec_name": "server_lifecycle_and_configuration",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Configuration file",
+      "rationale": "An operator configures the hub in one file, and a typing mistake in it must stop the start instead of being ignored.",
+      "system": "configuration loader",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "the configuration is loaded with an environment and a working directory",
+          "action": "read the file $XDG_CONFIG_HOME/config.toml when XDG_CONFIG_HOME is set and non-empty and the file config.toml in the working directory otherwise, once, and report the path it used and that path's directory as the config dir",
+          "contract": "the loaded configuration carries the absolute path of the file that was looked for and the config dir; values come from that file and from no other",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "two temporary directories, work and xdg; the environment is a map passed to the loader, not the process environment"
+            ],
+            "pseudocode": "in internal/config/config_test.go, a table over (XDG_CONFIG_HOME, files present) {(unset, work/config.toml with port 1111), ('', work/config.toml with port 1111), (xdg, xdg/config.toml with port 2222 and work/config.toml with port 1111), (xdg, only work/config.toml with port 1111)}: cfg, err = config.Load(env, workDir); assert err == nil; assert cfg.Path == expected absolute path; assert cfg.Dir == dir(cfg.Path); assert cfg.Server.Port == {1111, 1111, 2222, 8080}"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "event_driven",
+          "condition": "the configuration is loaded and the file does not exist",
+          "action": "use the default of every key",
+          "contract": "no error; server.bind '0.0.0.0', server.port 8080, server.external_url '', server.max_body_size 1048576 bytes, workspace.workers 4, logging.level info, logging.log_health_probes false, limits.requests_per_minute 600, no OAuth provider; database.path and workspace.path as the path resolution of REQ-3.1 gives them",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/config/config_test.go, a table over {no file, an empty file, a file holding only a comment}: cfg, err = config.Load(env{}, emptyDir); assert err == nil; assert each value above; assert len(cfg.OAuth.Providers) == 0"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "event_driven",
+          "condition": "the file sets keys of [server], [database], [workspace], [logging] and [limits] to valid values",
+          "action": "return those values, reading max_body_size as a positive integer followed by KB, MB or GB in any letter case with powers of 1024, and logging.level in any letter case",
+          "contract": "no error; each key carries the value of the file; max_body_size is reported in bytes; logging.level is reported in lower case",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/config/config_test.go, a table of (key, file value, expected): (server.port, 0, 0), (server.port, 65535, 65535), (server.bind, '127.0.0.1', same), (server.external_url, 'https://hub.example', same), (server.max_body_size, '1KB', 1024), ('512kb', 524288), ('2Mb', 2097152), ('1GB', 1073741824), (workspace.workers, 1, 1), (workspace.workers, 64, 64), (logging.level, 'TRACE', 'trace'), ('Debug', 'debug'), ('warn', 'warn'), ('ERROR', 'error'), (logging.log_health_probes, true, true), (limits.requests_per_minute, 0, 0), (limits.requests_per_minute, 7, 7): cfg, err = config.Load(env{}, dirWith(file)); assert err == nil; assert value == expected"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "unwanted",
+          "condition": "the file is not valid TOML, or holds a section nobody registered, a key nobody registered, a value of the wrong type or a value outside the valid set of its key",
+          "action": "refuse the whole file and return an error that names the offending key as section.key, or the line for invalid TOML",
+          "contract": "config.Load returns no configuration and an error whose text contains the section.key named in the case (the line number for invalid TOML); it never returns a partly filled configuration",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/config/config_test.go, a table of (file text, text the error must contain): ('[server\\nport = 1', 'line 1'), ('[nosuch]\\nx = 1', 'nosuch'), ('[server]\\nprot = 1', 'server.prot'), ('top = 1', 'top'), ('[server]\\nport = \"80\"', 'server.port'), ('[server]\\nport = -1', 'server.port'), ('[server]\\nport = 65536', 'server.port'), ('[server]\\nbind = \"\"', 'server.bind'), ('[server]\\nexternal_url = \"hub.example\"', 'server.external_url'), max_body_size in {'0MB', '-1MB', '1.5MB', '1TB', '1 MB', 'MB', '1024', ''} -> 'server.max_body_size', ('[workspace]\\nworkers = 0', 'workspace.workers'), ('[database]\\npath = \"\"', 'database.path'), ('[logging]\\nlevel = \"loud\"', 'logging.level'), ('[logging]\\nlog_health_probes = \"yes\"', 'logging.log_health_probes'), ('[limits]\\nrequests_per_minute = -1', 'limits.requests_per_minute'), ('[[oauth.providers]]\\nname = \"gitlab\"\\nclient_id = \"a\"\\nclient_secret = \"b\"', 'oauth.providers'), provider without client_id -> 'client_id', provider with client_secret '' -> 'client_secret', two providers both named github -> 'oauth.providers', provider with token_url 'ftp://x' -> 'token_url', provider with an extra key 'tenant' -> 'tenant': cfg, err = config.Load(env{}, dirWith(text)); assert cfg == nil; assert err != nil; assert contains(err.Error(), expected)"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "event_driven",
+          "condition": "the file holds one or more [[oauth.providers]] tables, each with a name of github or google that no other table uses, a non-empty client_id and a non-empty client_secret",
+          "action": "return the providers in file order, each with the authorize_url, token_url and userinfo_url of the file where given and the provider's public endpoints otherwise",
+          "contract": "no error; for github the defaults are https://github.com/login/oauth/authorize, https://github.com/login/oauth/access_token and https://api.github.com/user; for google they are https://accounts.google.com/o/oauth2/v2/auth, https://oauth2.googleapis.com/token and https://openidconnect.googleapis.com/v1/userinfo",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/config/config_test.go, a table over files {github alone, google alone, google then github, github with authorize_url, token_url and userinfo_url set to https://ghe.example/...}: cfg, err = config.Load(env{}, dirWith(file)); assert err == nil; assert names in file order; assert client_id and client_secret as written; assert the three URLs equal the override where given and the defaults above otherwise"
+          }
+        },
+        {
+          "id": "REQ-1.6",
+          "pattern": "optional",
+          "condition": "another package has registered a key with its section, name, type, default and validation rule before the configuration is loaded",
+          "action": "accept that key in the file, return its default when the file does not set it, and apply the registered validation rule to a value the file sets, also when the section is one that this package or a third package registered keys in",
+          "contract": "a registered key is read back by section and name with the file's value or the default; a value its rule refuses fails the load with an error containing section.key; a key of the same section that nobody registered still fails the load",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/config/config_test.go: reg = config.NewRegistry(); reg.Register(Key{Section: 'forks', Name: 'max_per_workspace', Type: Int, Default: 200, Validate: atLeast(1)}); reg.Register(Key{Section: 'limits', Name: 'max_things', Type: Int, Default: 5}); a table over files {none -> forks.max_per_workspace 200 and limits.max_things 5, '[forks]\\nmax_per_workspace = 9' -> 9, '[limits]\\nmax_things = 2\\nrequests_per_minute = 3' -> 2 and 3, '[forks]\\nmax_per_workspace = 0' -> error containing 'forks.max_per_workspace', '[forks]\\nother = 1' -> error containing 'forks.other'}: cfg, err = reg.Load(env{}, dirWith(file)); assert as listed"
+          }
+        },
+        {
+          "id": "REQ-1.7",
+          "pattern": "unwanted",
+          "condition": "a package registers a section.key that is already registered",
+          "action": "refuse the second registration and fail the load",
+          "contract": "the load returns no configuration and an error whose text contains the duplicated section.key",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/config/config_test.go, a table over second registrations {('forks', 'default_ttl') registered twice by the test, ('server', 'port') which this package owns}: reg.Register(key); cfg, err = reg.Load(env{}, emptyDir); assert cfg == nil; assert contains(err.Error(), section + '.' + name)"
+          }
+        },
+        {
+          "id": "REQ-1.8",
+          "pattern": "unwanted",
+          "condition": "the configuration file exists and cannot be read",
+          "action": "fail the load without falling back to defaults",
+          "contract": "the load returns no configuration and an error whose text contains the file's path",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/config/config_test.go, a table over {config.toml is a directory, config.toml is a regular file with mode 0000 (skipped when the test runs as root)}: cfg, err = config.Load(env{}, dir); assert cfg == nil; assert contains(err.Error(), filepath.Join(dir, 'config.toml'))"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Environment references in configuration",
+      "rationale": "Secrets such as OAuth client secrets are given to the hub through its environment, not written into the file.",
+      "system": "configuration loader",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "a string value of the file contains ${NAME} for a variable that is set, or $$",
+          "action": "replace each ${NAME} by the value of the environment variable NAME, each $$ by one $, leave a $ that is followed by neither { nor $ as it is, and validate the resulting value as it validates a literal one",
+          "contract": "the loaded value is the replaced text; a variable set to the empty string yields the empty string; the same holds for string values inside [[oauth.providers]] tables and for registered keys of other packages",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/config/env_test.go, with env {HOST: 'hub.example', SECRET: 's3cr3t', EMPTY: '', LVL: 'debug'}, a table of (file value, key, expected): ('https://${HOST}', server.external_url, 'https://hub.example'), ('${SECRET}', client_secret of a provider, 's3cr3t'), ('a${EMPTY}b${SECRET}', client_id, 'abs3cr3t'), ('pa$$word', client_secret, 'pa$word'), ('$${SECRET}', client_secret, '${SECRET}'), ('cost $5', client_secret, 'cost $5'), ('${LVL}', logging.level, 'debug'), ('${HOST}', a registered string key x.y, 'hub.example'): cfg, err = config.Load(env, dirWith(file)); assert err == nil; assert value == expected"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "unwanted",
+          "condition": "a string value contains ${NAME} and the environment has no variable NAME",
+          "action": "fail the load",
+          "contract": "the load returns no configuration and an error whose text contains the variable's name and the section.key of the value that referred to it",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/config/env_test.go, a table over {('[server]\\nexternal_url = \"https://${NOPE}\"', 'NOPE', 'server.external_url'), (a provider with client_secret '${GH_SECRET}', 'GH_SECRET', 'client_secret')} with an empty environment: cfg, err = config.Load(env{}, dirWith(file)); assert cfg == nil; assert contains(err.Error(), variable) and contains(err.Error(), key)"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "unwanted",
+          "condition": "a string value contains ${ with no closing }, or ${NAME} where NAME does not match [A-Za-z_][A-Za-z0-9_]*",
+          "action": "fail the load as for an invalid value",
+          "contract": "the load returns no configuration and an error whose text contains the section.key of the value",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/config/env_test.go, a table over values of server.external_url {'https://${HOST', '${}', '${1ST}', '${A B}', '${A-B}'} with env {HOST: 'h'}: cfg, err = config.Load(env, dirWith(file)); assert cfg == nil; assert contains(err.Error(), 'server.external_url')"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "ubiquitous",
+          "action": "for any value of an environment variable, replace references only inside string values and only after the file has been parsed, so that the variable's content never adds, removes or renames a key or a section and never reaches a key name, an integer or a boolean",
+          "contract": "with a variable whose value holds TOML syntax, the loaded configuration has the same keys as without it, and the string value holds the variable's content byte for byte; an expanded value that is invalid for its key fails the load with an error containing section.key; the error text does not contain the variable's value",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/config/env_test.go, with env {EVIL: '\"\\n[server]\\nport = 1\\n', BAD: 'ftp://x', LVL: 'loud'}: cfg = Load of a file with a provider whose client_secret is '${EVIL}' and no [server] table; assert cfg.Server.Port == 8080; assert provider.ClientSecret == env.EVIL; then a table of invalid expansions {server.external_url = '${BAD}' -> error contains 'server.external_url', logging.level = '${LVL}' -> error contains 'logging.level'}; and a file with the table header '[${LVL}]' -> error (an unknown section named literally '${LVL}')"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Data directory and stores",
+      "rationale": "Everything the hub knows lives under one data directory in embedded stores, so that the hub needs no external database and a backup is a copy.",
+      "system": "store",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "the configuration is loaded",
+          "action": "resolve database.path and workspace.path: the defaults are data/parley.db and data/workspaces under the working directory, or parley.db and workspaces under $XDG_DATA_HOME when XDG_DATA_HOME is set and non-empty; a configured bare file name is placed under $XDG_DATA_HOME when that is set; every other relative path is resolved against the working directory; an absolute path is kept",
+          "contract": "both paths are reported as absolute paths; the data directory is the directory of the database path; the analytical store's path is analytics.db in the data directory",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/config/config_test.go, a table of (XDG_DATA_HOME, database.path in file, workspace.path in file) -> (database, workspaces): (unset, none, none) -> (work/data/parley.db, work/data/workspaces); ('', none, none) -> same; (xdg, none, none) -> (xdg/parley.db, xdg/workspaces); (xdg, 'hub.db', 'repos') -> (xdg/hub.db, xdg/repos); (unset, 'hub.db', 'repos') -> (work/hub.db, work/repos); (xdg, 'var/hub.db', 'var/repos') -> (work/var/hub.db, work/var/repos); (xdg, '/abs/hub.db', '/abs/repos') -> unchanged: cfg, _ = config.Load(env, work); assert cfg.Database.Path, cfg.Workspace.Path, cfg.DataDir() == dir(database), cfg.AnalyticsPath() == join(dir(database), 'analytics.db')"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "event_driven",
+          "condition": "the stores are opened and the data directory or the workspace root does not exist",
+          "action": "create the data directory and the workspace root, with missing parents, each with mode 0700, and create the transactional store at the database path and the analytical store at analytics.db beside it",
+          "contract": "after the open both directories exist with permission bits 0700, both store files exist, and each store answers a query; a directory that existed before keeps the mode it had",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/store/store_test.go: st, err = store.Open(ctx, store.Options{DatabasePath: tmp/a/b/parley.db, WorkspaceRoot: tmp/c/workspaces}, noSteps); assert err == nil; assert mode(tmp/a/b) & 0777 == 0700; assert mode(tmp/c/workspaces) & 0777 == 0700; assert exists(tmp/a/b/parley.db) and exists(tmp/a/b/analytics.db); assert st.Ping(ctx) == nil; st.Close(); then with tmp/d created by the test with mode 0750: Open with DatabasePath tmp/d/parley.db; assert mode(tmp/d) & 0777 == 0750"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "event_driven",
+          "condition": "the stores are opened with a list of registered schema steps, each with a unique name and a target store",
+          "action": "apply every step the target store has not recorded, in registration order, each in one transaction together with the record of its name, and skip every recorded step",
+          "contract": "after the first open every step ran once, in registration order; a second open with the same list runs none; an open with one more step appended runs only that step and the rows written before it are still there",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/store/store_test.go: steps = [main:'t1' creates table a, analytics:'t2' creates table b, main:'t3' inserts a row into a], each appending its name to a slice ran; Open; assert ran == ['t1', 't2', 't3']; Close; ran = []; Open with the same steps; assert ran == []; Close; Open with steps + [main:'t4' adds a column to a]; assert ran == ['t4']; assert the row inserted by t3 is still in a; assert table b exists in the analytical store and not in the transactional one"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "unwanted",
+          "condition": "a schema step returns an error, or two registered steps have the same name",
+          "action": "roll the failing step back, keep the steps applied before it, apply no later step, and fail the open",
+          "contract": "store.Open returns no store and an error whose text contains the step's name; a later open with a corrected list applies the failed step and the ones after it and none before it; with a duplicated name no step is applied at all",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/store/store_test.go: steps = ['ok1' creates table a, 'boom' creates table x then returns an error, 'ok3' creates table c]; st, err = Open; assert st == nil; assert contains(err.Error(), 'boom'); open the file directly with database/sql: assert table a exists, table x does not, table c does not; then Open with 'boom' corrected: assert ran == ['boom', 'ok3']; and Open on a fresh directory with ['dup', 'dup']: assert error contains 'dup' and no table was created"
+          }
+        },
+        {
+          "id": "REQ-3.5",
+          "pattern": "event_driven",
+          "condition": "a caller runs a function in a transaction of the transactional store",
+          "action": "commit everything the function wrote when it returns nil, and discard everything it wrote when it returns an error or panics, returning that error to the caller",
+          "contract": "after a nil return the rows are visible to the next reader; after an error return or a panic none of the function's rows is visible, the caller receives the function's error (for a panic an error that carries the panic value), and the store accepts the next transaction",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "an open store with one step that creates table a"
+            ],
+            "pseudocode": "in internal/store/store_test.go, a table over function endings {return nil, return errBoom after two inserts, panic('x') after two inserts}: err = st.Tx(ctx, fn); count = rows in table a; assert (err == nil and count == 2) for the first case; assert (errors.Is(err, errBoom) and count == 0) for the second; assert (err != nil and contains(err.Error(), 'x') and count == 0) for the third; then assert st.Tx(ctx, insertOne) == nil"
+          }
+        },
+        {
+          "id": "REQ-3.6",
+          "pattern": "ubiquitous",
+          "action": "for any two transactions that run at the same time on the transactional store, complete both, without failing either because the other is running",
+          "contract": "32 goroutines that each run 25 transactions inserting one row all return nil, and the table holds 800 rows afterwards",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "an open store with one step that creates table a"
+            ],
+            "pseudocode": "in internal/store/store_test.go: run 32 goroutines, each calling st.Tx(ctx, insertOne) 25 times and collecting errors; assert no error (in particular no 'database is locked'); assert count(a) == 800"
+          }
+        },
+        {
+          "id": "REQ-3.7",
+          "pattern": "unwanted",
+          "condition": "the data directory or the workspace root cannot be created, or a store file exists and is not a database the engine can open",
+          "action": "fail the open without creating or changing a store file",
+          "contract": "store.Open returns no store and an error whose text contains the path that failed; a file that was not a database has the same bytes as before",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/store/store_test.go, a table over {DatabasePath under a path whose parent is a regular file, WorkspaceRoot under a path whose parent is a regular file, DatabasePath pointing at a file holding 4096 bytes of the text 'not a database'}: st, err = store.Open(ctx, opts, noSteps); assert st == nil; assert contains(err.Error(), the failing path); for the third case assert the file's bytes are unchanged"
+          }
+        },
+        {
+          "id": "REQ-3.8",
+          "pattern": "state_driven",
+          "condition": "the hub is listening",
+          "action": "answer GET /readyz with ready while both stores answer a query, and with not ready when either does not",
+          "contract": "HTTP 200 with body {\"status\":\"ready\"} while both stores answer; HTTP 503 with body {\"status\":\"not ready\"} after a store has been closed; GET /healthz answers 200 in both states",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub is started in-process: hub.Run runs in a goroutine with an environment map, a temporary working directory holding a config.toml with [server] bind '127.0.0.1' and port 0, and buffers as stdout and stderr"
+            ],
+            "pseudocode": "in internal/hub/hub_test.go: assert get('/readyz').status == 200 and json == {status: 'ready'}; close the analytical store through the handle the test obtained from the hub; r = get('/readyz'); assert r.status == 503 and json(r.body) == {status: 'not ready'}; assert get('/healthz').status == 200; repeat on a second hub closing the transactional store"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Start sequence, flags and logging",
+      "rationale": "An operator must be able to rely on one start order and on a start that either serves or says in one line why it does not.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "unwanted",
+          "condition": "parleyd is started with a flag it does not define, with --admin-email and no value, with a positional argument other than backup, or with backup followed by no directory or by more than one",
+          "action": "print its usage on stderr and exit without loading configuration, opening data or listening",
+          "contract": "exit status 2; stderr holds the usage text, which names --admin-email, --reset-admin-token and backup <directory>; stdout is empty; no file or directory is created in the working directory or the config dir",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in cmd/parleyd/main_test.go, replacing the row ['backup', 'dir'] of the existing rejected-arguments table of package 01, a table over args {['--nope'], ['-x'], ['serve'], ['--admin-email'], ['backup'], ['backup', 'a', 'b'], ['backup', 'a', '--nope']}: code = run(ctx, args, env{}, emptyDir, stdout, stderr); assert code == 2; assert contains(stderr, '--admin-email') and contains(stderr, '--reset-admin-token') and contains(stderr, 'backup <directory>'); assert stdout == ''; assert listDir(emptyDir) == []"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "event_driven",
+          "condition": "an operator runs parleyd --help",
+          "action": "print usage that names both flags and the backup subcommand on stdout and exit",
+          "contract": "exit status 0; stdout names --admin-email, --reset-admin-token and backup <directory>; stderr is empty; no file or directory is created",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in cmd/parleyd/main_test.go, extending the --help test of package 01: code = run(ctx, ['--help'], env{}, emptyDir, stdout, stderr); assert code == 0; assert contains(stdout, '--admin-email') and contains(stdout, '--reset-admin-token') and contains(stdout, 'backup <directory>'); assert stderr == ''; assert listDir(emptyDir) == []"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "event_driven",
+          "condition": "parleyd is started with no subcommand",
+          "action": "load and validate the configuration, then open the data, then run the bootstrap, then run every registered start hook in registration order, each to completion, then start the maintenance loop, and only then bind the listener on [server].bind and [server].port",
+          "contract": "each stage begins after the stage before it has finished; when the first start hook runs the stores are open and migrated; no TCP connection to the listen address is accepted before the last start hook has returned; the first maintenance pass starts after the last start hook and does not have to finish before the listener is bound",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a temporary working directory with a config.toml setting bind 127.0.0.1 and a free port chosen by the test"
+            ],
+            "pseudocode": "in internal/hub/hub_test.go: register start hooks h1 and h2 that append to a shared log, check that st.Ping(ctx) == nil, and (h2) block until the test releases it; register a maintenance task under 'fork_expiry' that appends 'pass' and then blocks until released; start the hub with a fixed free port P in config; while h2 blocks assert net.Dial('127.0.0.1:P') fails and the log == ['h1', 'h2']; release h2; wait for the listening line; assert log[0:3] == ['h1', 'h2', 'pass'] and get('/healthz').status == 200 while the task still blocks; release the task"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "event_driven",
+          "condition": "the listener is bound",
+          "action": "write one JSON log line to stderr with msg listening, the bound host and port as addr, the configuration file's path as config and the data directory as data_dir",
+          "contract": "exactly one line with msg 'listening'; addr carries the port the operating system chose when [server].port is 0; config is the absolute path that was looked for, also when the file does not exist; data_dir is the absolute directory of database.path; a TCP connection to addr is accepted",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/hub/hub_test.go, extending what cmd/parleyd/main_test.go of package 01 asserts for the listening line, a table over {config.toml present in XDG_CONFIG_HOME with port 0 and database.path set, no config file and the environment giving XDG_DATA_HOME (the default port 8080 replaced through a test option)}: rec = json(the line with msg 'listening'); assert count of such lines == 1; assert rec.addr has host and a port != 0; assert rec.config == absolute expected path; assert rec.data_dir == absolute dir of the database path; assert get('http://' + rec.addr + '/healthz').status == 200"
+          }
+        },
+        {
+          "id": "REQ-4.5",
+          "pattern": "unwanted",
+          "condition": "any stage before listening fails: the configuration is invalid, the data cannot be opened, a schema step fails, the bootstrap refuses, a start hook returns an error, or the listener cannot be bound",
+          "action": "stop the start at that stage, run no later stage, close what was opened, and exit",
+          "contract": "exit status 1; stderr holds exactly one non-empty line, a JSON object at level error whose text names the cause (the configuration key, the path, the step, the token file, the hook's name or the listen address); no line with msg 'listening' is written; a start hook registered after the failing one is not called",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/hub/hub_test.go, a table of (arrangement, text the line must contain, stages that must not have run): ('[server]\\nprot = 1' in config.toml, 'server.prot', store not created: no data directory exists afterwards), (database.path under a regular file, that path, hooks not called), (a schema step 'boom' that fails, 'boom', hooks not called), (a start hook named 'resume-clones' returning errors.New('disk gone') followed by a second hook, 'resume-clones', second hook not called and no maintenance task called), (the configured port held open by the test, the address, -): code = hub.Run(ctx, opts); assert code == 1; lines = nonEmptyLines(stderr); assert len(lines) == 1; rec = json(lines[0]); assert rec.level == 'ERROR'; assert contains(lines[0], expected); assert not contains(stderr, 'listening')"
+          }
+        },
+        {
+          "id": "REQ-4.6",
+          "pattern": "state_driven",
+          "condition": "the hub runs with a configured [logging].level",
+          "action": "write every log line as one JSON object per line on stderr and drop every line whose level is below the configured one, where the order from lowest to highest is trace, debug, info, warn, error",
+          "contract": "for each configured level, lines at that level and above appear on stderr and lines below it do not; every line parses as a JSON object with the members time, level and msg; nothing is written to stdout",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/hub/logging_test.go, a table over configured levels {trace, debug, info, warn, error}: log = hub.NewLogger(buffer, level, scrubber); emit one line at each of the five levels with msg 'm-<level>'; assert the set of msgs in the buffer == the levels at or above the configured one; assert every line parses as JSON with time, level and msg"
+          }
+        },
+        {
+          "id": "REQ-4.7",
+          "pattern": "event_driven",
+          "condition": "the hub builds its HTTP server from a loaded configuration",
+          "action": "give the server the configured body limit in bytes, the configured requests per minute and the configured health-probe logging as its options, together with the readiness probe of the stores",
+          "contract": "the options the hub passes carry max_body_size in bytes, requests_per_minute and log_health_probes exactly as loaded, for the defaults (1048576, 600, false) and for configured values",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/hub/hub_test.go, a table over configurations {none, '[server]\\nmax_body_size = \"2KB\"\\n[limits]\\nrequests_per_minute = 7\\n[logging]\\nlog_health_probes = true'}: opts = hub.ServerOptions(cfg, st); assert opts.MaxBodySize == {1048576, 2048}; assert opts.RequestsPerMinute == {600, 7}; assert opts.LogHealthProbes == {false, true}; assert len(opts.ReadinessProbes) == 1"
+          }
+        },
+        {
+          "id": "REQ-4.8",
+          "pattern": "event_driven",
+          "condition": "a create POST was answered with a 2xx status and recorded under an Idempotency-Key, the hub is stopped and started again on the same data directory, and the same caller sends the same request with the same key less than 24 hours after the first",
+          "action": "answer the replay from the idempotency record kept in the transactional store, without running the route's handler",
+          "contract": "HTTP 200 with the body recorded before the restart, without the route's show-once members; the handler call count after the restart is 0; the same key sent after the clock has advanced 24 hours runs the handler again",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process through internal/hub on a temporary data directory with a clock the test advances",
+              "one test create route registered on the composition, POST /api/v1/things, declared as a create route with the show-once member token, whose handler counts its calls and answers 201 {id, token}",
+              "an authenticator installed by the test that reports caller u1"
+            ],
+            "pseudocode": "in internal/hub/idempotency_test.go: r1 = post('/api/v1/things', body, key='k'); assert r1.status == 201 and r1.json.token != ''; stop the hub with its context and wait for Run to return 0; start a new hub on the same data directory with the same route; r2 = post('/api/v1/things', body, key='k'); assert r2.status == 200; assert r2.json.id == r1.json.id; assert 'token' not in r2.json; assert handler.calls == 0 in the second hub; advance the clock 24h; r3 = post('/api/v1/things', body, key='k'); assert r3.status == 201 and handler.calls == 1"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "First-boot admin token",
+      "rationale": "The operator needs a credential to administer a hub that has no users yet, and that credential must exist in clear text only in a file the operator removes.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "parleyd is started without --admin-email and without --reset-admin-token on a hub that has no admin token hash stored and no token file",
+          "action": "start and serve without creating an admin token",
+          "contract": "the listening line is written; no file admin_token exists in the config dir; the store holds no admin token hash and no admin e-mail",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/hub/bootstrap_test.go: start the hub with no flags; wait for the listening line; assert not exists(configDir/admin_token); stop the hub; open the store: assert identity.AdminSettings(ctx, st) reports no hash and no e-mail"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "event_driven",
+          "condition": "parleyd is started with --admin-email <address> on a hub that has no admin token hash stored",
+          "action": "store the address, generate a new admin token, store its hash, write the token to the file admin_token in the config dir, log the file's absolute path at warn level with an instruction to save the token and delete the file, and exit without serving",
+          "contract": "exit status 0; the file <config dir>/admin_token has permission bits 0600 and its content matches ^parley_admin_[0-9a-f]{64}$ with no trailing newline; the store holds the address and the lowercase hex SHA-256 of the file's content; stderr holds a line at level WARN that contains the file's absolute path; no line with msg 'listening' is written; a token file that existed before is overwritten",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/hub/bootstrap_test.go, a table over {no token file before, a token file holding 'stale' before}: code = hub.Run(ctx, opts with Args ['--admin-email', 'a@x']); assert code == 0; tok = readFile(configDir/admin_token); assert regexp(^parley_admin_[0-9a-f]{64}$).match(tok); assert mode & 0777 == 0600; s = identity.AdminSettings(ctx, st); assert s.Email == 'a@x'; assert s.TokenHash == hex(sha256(tok)); warn = the stderr line with level 'WARN'; assert contains(warn, abs(configDir/admin_token)); assert not contains(stderr, 'listening')"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "event_driven",
+          "condition": "parleyd is started with --reset-admin-token, whether or not a hash is stored and whether or not the token file exists",
+          "action": "generate a new admin token, replace the stored hash with the new token's hash, write the token file, overwriting an existing one, log its absolute path at warn level, and exit without serving; store the address of --admin-email as well when it is given and no hash was stored before",
+          "contract": "exit status 0; the token file holds a token that differs from every earlier one, with permission bits 0600; the store holds exactly one hash, that of the new token, so the hash of the earlier token is no longer stored; no line with msg 'listening' is written",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/hub/bootstrap_test.go, a table over starting states {not bootstrapped and no file, bootstrapped with the file deleted, bootstrapped with the file still there, not bootstrapped with Args also holding '--admin-email b@x'}: old = hash stored before (or none); code = hub.Run(ctx, opts with '--reset-admin-token'); assert code == 0; tok = readFile(admin_token); assert format and mode as above; s = identity.AdminSettings(ctx, st); assert s.TokenHash == hex(sha256(tok)); assert s.TokenHash != old; for the fourth case assert s.Email == 'b@x'; for the bootstrapped cases assert s.Email is the address of the first bootstrap; assert not contains(stderr, 'listening')"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "unwanted",
+          "condition": "parleyd is started without --reset-admin-token on a hub that has an admin token hash stored while the file admin_token exists in the config dir",
+          "action": "refuse to start, leaving the file and the stored hash as they are",
+          "contract": "exit status 1; stderr holds exactly one line and it contains the token file's absolute path; no line with msg 'listening' is written; the file's content and the stored hash are unchanged; no start hook is called",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/hub/bootstrap_test.go, a table over Args {[], ['--admin-email', 'c@x']} after a first run with '--admin-email a@x': code = hub.Run(ctx, opts); assert code == 1; lines = nonEmptyLines(stderr); assert len(lines) == 1 and contains(lines[0], abs(admin_token)); assert readFile(admin_token) == the token of the first run; assert stored hash and e-mail unchanged; assert the registered start hook was not called"
+          }
+        },
+        {
+          "id": "REQ-5.5",
+          "pattern": "event_driven",
+          "condition": "parleyd is started without --reset-admin-token on a hub that has an admin token hash stored and no token file exists",
+          "action": "start and serve, ignoring --admin-email when it is given",
+          "contract": "the listening line is written; no token file is created; the stored e-mail and hash are the ones of the bootstrap",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/hub/bootstrap_test.go, a table over Args {[], ['--admin-email', 'c@x']} after a first run with '--admin-email a@x' and deletion of the token file: start the hub; wait for the listening line; assert not exists(admin_token); s = identity.AdminSettings(ctx, st); assert s.Email == 'a@x' and s.TokenHash == the hash of the first run"
+          }
+        },
+        {
+          "id": "REQ-5.6",
+          "pattern": "ubiquitous",
+          "action": "for any run that generates an admin token, keep the token out of everything it writes except the token file, and store only the token's hash",
+          "contract": "neither stdout nor stderr contains the token or its 64-character hexadecimal part; no file under the data directory contains the token; two runs never produce the same token",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/hub/bootstrap_test.go, over the runs {'--admin-email a@x' on a new hub, then '--reset-admin-token' with logging.level trace}: tok = readFile(admin_token); hexPart = tok without 'parley_admin_'; assert not contains(stdout + stderr, hexPart); for every file under the data directory assert not contains(bytes, hexPart); assert the two tokens differ"
+          }
+        },
+        {
+          "id": "REQ-5.7",
+          "pattern": "unwanted",
+          "condition": "a run that has to write the token file cannot write it",
+          "action": "store neither the new hash nor the address, and exit without serving",
+          "contract": "exit status 1; stderr holds exactly one line and it contains the token file's path; the stored hash and e-mail are what they were before the run (none on a new hub); no line with msg 'listening' is written",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/hub/bootstrap_test.go, a table over {'--admin-email a@x' on a new hub, '--reset-admin-token' on a bootstrapped hub}, with admin_token created by the test as a non-empty directory so that it cannot be replaced by a file: before = identity.AdminSettings(ctx, st); code = hub.Run(ctx, opts); assert code == 1; assert len(nonEmptyLines(stderr)) == 1 and contains(stderr, 'admin_token'); assert identity.AdminSettings(ctx, st) == before"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Hourly maintenance loop",
+      "rationale": "Retention and cleanup must happen without an operator, and one broken task must not stop the rest.",
+      "system": "maintenance loop",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "the maintenance loop is started",
+          "action": "run one pass at once and one further pass at each tick of its timer, whose interval is one hour and is not read from configuration",
+          "contract": "one pass has run before the first tick; each tick that arrives while no pass runs starts exactly one pass; the loop's default interval is 1 hour and no configuration key changes it",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a registry with one counting task; the loop's ticks come from a channel the test owns"
+            ],
+            "pseudocode": "in internal/maintenance/loop_test.go: loop = maintenance.New(reg, logger); ticks = make(chan time.Time); go loop.Run(ctx, ticks); wait until the counting task ran once; send a tick; wait; assert count == 2; send a tick; assert count == 3; assert maintenance.Interval == time.Hour; and in internal/config/config_test.go the unknown-key table already refuses '[maintenance]\\ninterval = \"1m\"'"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "event_driven",
+          "condition": "a pass runs",
+          "action": "run the registered tasks one after the other in the order retention, secret_reencryption, claim_cleanup, forge_delivery_pruning, token_binding_sweep, patch_purge, fork_expiry, sandbox_record_cleanup, skip a name nobody registered, and then run every task registered under another name in registration order",
+          "contract": "the order of task calls in a pass is the fixed order above regardless of the order of registration; a task starts only after the task before it has returned; each registered task is called exactly once per pass",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/maintenance/loop_test.go, a table over registration orders {the eight names reversed, ['fork_expiry', 'extra_b', 'retention', 'extra_a'], ['extra_a'] alone, none}: each task appends its name to a log and asserts that no other task is running; run one pass; assert log == {the eight in the fixed order, ['retention', 'fork_expiry', 'extra_b', 'extra_a'], ['extra_a'], []}"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "unwanted",
+          "condition": "a task returns an error or panics during a pass",
+          "action": "log the failure with the task's name and go on with the next task of the pass, and with the next pass at the next tick",
+          "contract": "one log line at level ERROR with the members task (the task's name) and error (the scrubbed error text or panic value); every task after the failing one is called in the same pass; the process does not exit; the next tick starts a pass in which the failing task is called again",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/maintenance/loop_test.go, a table over failures of 'claim_cleanup' {returns errors.New('db gone https://u:p@h/x'), panics with 'kaboom'} with 'retention' before it and 'fork_expiry' after it: run a pass; assert log == ['retention', 'claim_cleanup', 'fork_expiry']; rec = the logged line with level 'ERROR'; assert rec.task == 'claim_cleanup'; assert contains(rec.error, 'db gone https://h/x') or contains(rec.error, 'kaboom'); assert not contains(rec.error, 'u:p'); send a tick; assert 'claim_cleanup' was called a second time"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "state_driven",
+          "condition": "a pass is running",
+          "action": "start no second pass, and drop a tick that arrives before the pass has ended",
+          "contract": "at no time do two passes run; a tick during a pass starts nothing, also after the pass has ended; the first tick after the pass has ended starts the next pass",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/maintenance/loop_test.go: the single task counts its calls, records the highest number of concurrent calls and blocks until released; start the loop (pass 1 blocks); send two ticks without blocking the sender; release the task; wait 50 ms; assert calls == 1; send a tick; wait until calls == 2; assert the highest number of concurrent calls == 1"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "unwanted",
+          "condition": "two tasks are registered under the same name, or a task is registered with an empty name",
+          "action": "refuse the registration",
+          "contract": "the registration returns an error whose text contains the name; the registry holds the first task only; a hub whose composition makes such a registration exits with status 1 and one error line before listening",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/maintenance/loop_test.go, a table over second registrations {'retention' twice, 'extra' twice, ''}: err = reg.Register(name, fn2); assert err != nil and contains(err.Error(), name); run a pass; assert fn2 was not called; and in internal/hub/hub_test.go: a hub composed with a duplicate registration returns exit status 1 with one stderr line containing the name and no listening line"
+          }
+        },
+        {
+          "id": "REQ-6.6",
+          "pattern": "event_driven",
+          "condition": "the loop's context is cancelled while a pass runs",
+          "action": "cancel the context of the running task, start no further task of the pass and no further pass, and return when the running task has returned",
+          "contract": "the running task observes its context as done; the tasks after it in the order are not called; Run returns within 1 second of the task's return; a tick sent after the cancellation starts nothing",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/maintenance/loop_test.go: 'retention' blocks on ctx.Done() and then returns ctx.Err(); 'fork_expiry' appends to the log; start the loop; wait until 'retention' runs; cancel; assert Run returned within 1 s; assert log does not contain 'fork_expiry'; assert no ERROR line is logged for a task that ended with the cancellation"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "Bounded shutdown",
+      "rationale": "A restart or upgrade must take a known time, and nothing durable may be lost by it.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "event_driven",
+          "condition": "parleyd receives SIGTERM or SIGINT while it is listening",
+          "action": "stop accepting connections, fire the shutdown notification, cancel the context of every registered piece of background work and of the maintenance loop, wait for in-flight requests for at most 15 seconds and for each piece of background work for at most its registered grace, close the stores after both, and exit",
+          "contract": "exit status 0; every piece of background work saw its context cancelled and had returned before the stores were closed; a TCP connection to the listen address is refused afterwards; with nothing in flight the exit comes within 1 second of the signal",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/hub/shutdown_test.go, a table over signals {SIGTERM, SIGINT} delivered to the test process: register background work w (grace 2 s) that waits for ctx.Done(), then checks st.Ping(ctx2) == nil and records 'w-stopped'; start the hub; send the signal; code = wait for Run (fail after 1 s); assert code == 0; assert 'w-stopped' recorded and its ping succeeded; assert net.Dial(addr) fails; assert st.Ping fails with a closed-store error afterwards"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "unwanted",
+          "condition": "a piece of background work has not returned when its registered grace has passed, or requests and background work together are still running 30 seconds after the signal",
+          "action": "stop waiting for it, close the stores and exit",
+          "contract": "exit status 0; the exit comes no later than 1 second after the longest grace that applied and never later than 31 seconds after the signal; a registered grace above 30 seconds is treated as 30 seconds",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/hub/shutdown_test.go, with the hub's time limits scaled through test options (request grace 150 ms, total 300 ms; the defaults are asserted to be 15 s and 30 s), a table of (background work, expected exit window): (ignores its context, grace 100 ms) -> [100 ms, 1100 ms); (ignores its context, grace 10 min) -> [300 ms, 1300 ms); (a request handler that never returns, no background work) -> [150 ms, 1150 ms): t0 = now; cancel the hub's context; code = wait for Run; assert code == 0; assert now - t0 inside the window"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "event_driven",
+          "condition": "the signal arrives while a handler holds a long-lived response open and watches the hub's shutdown notification",
+          "action": "fire the notification at the moment the signal is handled, before the 15-second request grace starts to run out, so that the handler ends its response",
+          "contract": "the client's response ends with the status the handler set and without a connection error; the process exits with status 0 within 1 second of the signal, not after the request grace",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/hub/shutdown_test.go: register a test route whose handler writes 200 and a first chunk, then blocks on hub.ShuttingDown() and returns; start the hub with the default 15 s request grace; open the stream and read the first chunk; t0 = now; cancel the hub's context; assert the client reads EOF with no error; code = wait for Run; assert code == 0 and now - t0 < 1 s"
+          }
+        },
+        {
+          "id": "REQ-7.4",
+          "pattern": "ubiquitous",
+          "action": "for any transaction that was committed before the signal, keep its effect across the stop and the next start",
+          "contract": "after a stop by signal and a new start on the same data directory, every row committed before the signal is read back, and every registered start hook is called again at the new start",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/hub/shutdown_test.go: start the hub with a schema step creating table a and a start hook that counts its calls; commit 100 rows through st.Tx; cancel the hub's context right after the last commit returns; wait for exit status 0; start a second hub on the same directories; assert count(a) == 100; assert the hook was called twice in total"
+          }
+        },
+        {
+          "id": "REQ-7.5",
+          "pattern": "unwanted",
+          "condition": "a second SIGTERM or SIGINT arrives while the shutdown is in progress",
+          "action": "go on with the shutdown that is in progress, without restarting any grace",
+          "contract": "exit status 0; the exit comes no later than it would have come without the second signal",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/hub/shutdown_test.go, through cmd/parleyd's run function with time limits scaled as above: background work that ignores its context with grace 200 ms; send SIGTERM to the test process; 50 ms later send SIGINT; code = wait for run; assert code == 0; assert elapsed since the first signal in [200 ms, 1200 ms)"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "Scrubbing credentials from text",
+      "rationale": "A log line, an event or an error message is read by people and systems that must never receive a credential.",
+      "system": "scrubber",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "text is scrubbed and it contains a secret value that was registered with the scrubber or passed with the call",
+          "action": "replace every occurrence of every such value by [redacted], replacing a longer value before a shorter one, and ignoring an empty value and a value that is a part of the text [redacted]",
+          "contract": "the result contains [redacted] at each place a value stood and none of the values; text without a value is returned unchanged",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/scrub/scrub_test.go, with registered values {'hunter2-token', 'hunter2', '', 'red'} and a per-call value 'once-only', a table of (input, expected): ('auth failed for hunter2', 'auth failed for [redacted]'), ('hunter2 and hunter2-token', '[redacted] and [redacted]'), ('x once-only y', 'x [redacted] y'), ('nothing here', 'nothing here'), ('a red door', 'a red door'), ('', ''): assert s.Scrub(input, perCall...) == expected; and assert s.Scrub('x once-only y') == 'x once-only y' when the value is not passed"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "event_driven",
+          "condition": "text is scrubbed and it contains a credential in one of the hub's own formats, registered or not",
+          "action": "replace each admin token (parley_admin_ and 64 lowercase hex characters), each personal access token (parley_pat_, 8 characters of [a-z0-9], _, 32 characters of [a-z0-9]) and each API key (parley_, 8 characters of [0-9A-Za-z], _, 32 characters of [0-9A-Za-z]) by [redacted]",
+          "contract": "the result contains none of the credentials and [redacted] in the place of each; words that only start like a credential are kept",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/scrub/scrub_test.go, a table of (input, expected) built from generated credentials A (admin), P (PAT), K (API key): ('token ' + A + ' rejected', 'token [redacted] rejected'), ('Bearer ' + P, 'Bearer [redacted]'), ('key=' + K + ';', 'key=[redacted];'), (A + ' ' + P + ' ' + K, '[redacted] [redacted] [redacted]'), ('parley_admin_token is a file', unchanged), ('parley_pat_short_1', unchanged), ('see parley_docs', unchanged): assert scrub.New().Scrub(input) == expected"
+          }
+        },
+        {
+          "id": "REQ-8.3",
+          "pattern": "event_driven",
+          "condition": "text is scrubbed and it contains a URL with user information",
+          "action": "remove the user information, which is everything between :// and the last @ that comes before the next /, whitespace or end of text, together with that @, for any scheme and for every such URL in the text",
+          "contract": "https://user:pass@host/path becomes https://host/path; the rest of the URL and of the text is kept byte for byte; a URL without user information and an @ outside a URL authority are kept",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/scrub/scrub_test.go, a table of (input, expected): ('https://user:pass@host/x', 'https://host/x'), ('fatal: unable to access https://x-token:abc@github.com/o/r.git/: 403', 'fatal: unable to access https://github.com/o/r.git/: 403'), ('ssh://git@host:22/r', 'ssh://host:22/r'), ('http://u@h', 'http://h'), ('https://user:p@ss@host/x', 'https://host/x'), ('a https://u:p@h1/ b https://v:q@h2/ c', 'a https://h1/ b https://h2/ c'), ('https://host/a@b', unchanged), ('mail bob@example.com', unchanged), ('https://host/x', unchanged): assert scrub.New().Scrub(input) == expected"
+          }
+        },
+        {
+          "id": "REQ-8.4",
+          "pattern": "event_driven",
+          "condition": "text is scrubbed and the result of the replacements is longer than 1024 bytes",
+          "action": "cut the result to the longest prefix of at most 1024 bytes that ends on a character boundary of its UTF-8 encoding",
+          "contract": "the result is at most 1024 bytes long and is valid UTF-8 when the input was; a result of exactly 1024 bytes is not cut; the cut is applied after the replacements, so a secret that starts before byte 1024 of the input never survives in part",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/scrub/scrub_test.go, a table of (input, expected length): (1024 x 'a', 1024), (1025 x 'a', 1024), (1023 x 'a' + 'é' (2 bytes), 1023), (1022 x 'a' + '€' (3 bytes) + 'z', 1022), (1021 x 'a' + '€', 1024), (5000 x 'é', 1024): out = Scrub(input); assert len(out) == expected; assert utf8.ValidString(out); assert hasPrefix(input, out); and with registered value V = 'SECRETSECRET': out = Scrub(1018 x 'a' + V + 'tail'); assert not contains(out, 'SECRET'); assert len(out) <= 1024"
+          }
+        },
+        {
+          "id": "REQ-8.5",
+          "pattern": "unwanted",
+          "condition": "the text, after the replacements and the removal of user information, still contains a registered or passed secret value, a credential in one of the hub's formats or a URL with user information",
+          "action": "discard the text and return the marker alone",
+          "contract": "the result is exactly [redacted]",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/scrub/scrub_test.go, a table of (registered values, input): ({'mid', 'x[redacted]y'}, 'say xmidy now') where replacing the first value produces the second; ({'https://h/secretpath'}, 'go https://u:p@h/secretpath') where removing the user information produces a registered value: assert Scrub(input) == '[redacted]'"
+          }
+        },
+        {
+          "id": "REQ-8.6",
+          "pattern": "ubiquitous",
+          "action": "for any text and any set of registered values, return a result that is at most 1024 bytes long, contains no registered value that the scrubber does not ignore, no credential in one of the hub's formats and no URL user information, and that scrubbing a second time leaves unchanged",
+          "contract": "len(Scrub(t)) <= 1024; Scrub(Scrub(t)) == Scrub(t); no registered value of the generated set that is not empty and not a part of [redacted] occurs in Scrub(t)",
+          "check": {
+            "kind": "property",
+            "pseudocode": "in internal/scrub/scrub_test.go, with testing/quick or a seeded generator over 2000 cases: values = 0 to 5 random strings of 1 to 40 bytes over the alphabet 'abc[]redt:/@ é'; t = a random concatenation of 0 to 300 pieces drawn from {a value, a generated admin token, PAT or API key, 'https://u:p@h/x', random text over the same alphabet}; out = Scrub(t); assert len(out) <= 1024; assert Scrub(out) == out; for each value v that is not empty and not a substring of '[redacted]': assert not contains(out, v); assert no hub credential pattern and no '://…@' authority matches in out"
+          }
+        },
+        {
+          "id": "REQ-8.7",
+          "pattern": "state_driven",
+          "condition": "the hub runs",
+          "action": "pass the message and every string attribute of every log line, and the one error line of a failed start, through the scrubber before writing them, with the client_secret of every configured OAuth provider registered as a secret value, and write no Authorization header and no request body to the log",
+          "contract": "a log line emitted with a registered value, a hub credential or a URL with user information in its message or in an attribute shows [redacted] or the stripped URL in their place; a failed start whose error text contains a configured client_secret shows [redacted]; attribute keys and the members time and level are unchanged",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/hub/logging_test.go: s = scrub.New(); s.Add('hunter2'); log = hub.NewLogger(buffer, 'info', s); log.Info('clone failed for https://u:hunter2@h/r.git', 'err', 'bad token ' + generatedPAT, 'attempt', 3); rec = json(line); assert rec.msg == 'clone failed for https://h/r.git'; assert rec.err == 'bad token [redacted]'; assert rec.attempt == 3; and in internal/hub/hub_test.go: start a hub whose config.toml has a provider with client_secret '${GH}' (env GH = 'topsecret-value') and a start hook returning errors.New('provider said: topsecret-value'); assert exit status 1; assert not contains(stderr, 'topsecret-value'); assert contains(stderr, '[redacted]')"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-9",
+      "title": "Backup of a running hub",
+      "rationale": "An operator must be able to take a backup without stopping the hub and trust that it restores.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-9.1",
+          "pattern": "event_driven",
+          "condition": "an operator runs parleyd backup <directory> with the environment and working directory of the hub, and the directory is empty or does not exist",
+          "action": "read the configuration as the server does, create the directory when it is missing, and write into it a copy of the transactional store under the database file's own name, a copy of the analytical store as analytics.db and a copy of the workspace root under its own directory name, then write one log line and exit",
+          "contract": "exit status 0; stdout is empty; the directory holds exactly those three entries; each store copy opens as a database and holds every row that was committed before the command started; the command works the same whether or not a hub is running on the data",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub data directory created by a first start with a schema step creating table a in the transactional store and table b in the analytical store"
+            ],
+            "pseudocode": "in internal/hub/backup_test.go, a table over {hub running, hub stopped} x {target missing, target an existing empty directory}: commit 10 rows to table a and 3 rows to the analytical table b; code = hub.Run(ctx, opts with Args ['backup', target]); assert code == 0; assert stdout == ''; assert sorted(listDir(target)) == ['analytics.db', 'parley.db', 'workspaces']; open target/parley.db with database/sql: assert count(a) == 10; open target/analytics.db: assert count(b) == 3; when the hub is running assert get('/readyz').status == 200 after the command"
+          }
+        },
+        {
+          "id": "REQ-9.2",
+          "pattern": "unwanted",
+          "condition": "the directory given to parleyd backup exists and is not empty, or the path is not a directory",
+          "action": "refuse without writing anything",
+          "contract": "exit status 1; stderr holds exactly one line and it contains the directory's path; the directory's content is unchanged; the hub's data is unchanged",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/hub/backup_test.go, a table over targets {a directory holding one file 'keep', a directory holding one empty subdirectory, a regular file}: before = snapshot of names and bytes under target; code = hub.Run(ctx, opts with Args ['backup', target]); assert code == 1; assert len(nonEmptyLines(stderr)) == 1 and contains(stderr, target); assert names and bytes under target == before"
+          }
+        },
+        {
+          "id": "REQ-9.3",
+          "pattern": "ubiquitous",
+          "action": "for any backup taken while transactions are being committed, write store copies that hold whole transactions only: every transaction is in the copy with all of its rows or with none",
+          "contract": "with writers that insert 10 rows per transaction during the backup, the row count of the copy is a multiple of 10 and at least the count committed before the command started; the copy passes the engine's integrity check; no writer's transaction fails because of the backup",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a running in-process hub with a schema step creating table a"
+            ],
+            "pseudocode": "in internal/hub/backup_test.go: commit 50 transactions of 10 rows; start 4 goroutines that keep committing transactions of 10 rows each tagged with a transaction id until told to stop, collecting errors; code = hub.Run(ctx, backup opts); stop the writers; assert code == 0; assert no writer error; open the copy: n = count(a); assert n % 10 == 0 and n >= 500; assert every transaction id in the copy has exactly 10 rows; assert the result of 'PRAGMA integrity_check' == 'ok'"
+          }
+        },
+        {
+          "id": "REQ-9.4",
+          "pattern": "event_driven",
+          "condition": "parleyd backup runs and the workspace root holds repositories",
+          "action": "copy every file and directory under the workspace root into the snapshot with the same relative path and content, copying each repository's refs before its objects",
+          "contract": "each repository in the snapshot is read by stock git: git fsck succeeds and each ref resolves to the same commit id as in the source; an empty workspace root gives an empty directory in the snapshot",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the workspace root holds two bare repositories created by the test with git init --bare in nested directories acme/one.git and two.git, each with two commits on main pushed from a clone in t.TempDir()"
+            ],
+            "pseudocode": "in internal/hub/backup_test.go: code = hub.Run(ctx, backup opts); assert code == 0; for r in {acme/one.git, two.git}: assert exec('git', '-C', target/workspaces/r, 'fsck').code == 0; assert exec('git', '-C', target/workspaces/r, 'rev-parse', 'refs/heads/main') == the same command on the source; and with an empty workspace root: assert listDir(target/workspaces) == []"
+          }
+        },
+        {
+          "id": "REQ-9.5",
+          "pattern": "unwanted",
+          "condition": "parleyd backup runs and the configuration is invalid, the database file does not exist, or a copy fails part-way",
+          "action": "remove everything the command wrote, leave the hub's data unchanged, and exit",
+          "contract": "exit status 1; stderr holds exactly one line that names the cause (the configuration key, or the path that failed); the target directory is empty or absent afterwards; no database file is created at database.path",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/hub/backup_test.go, a table of (arrangement, text the line must contain): (config.toml with '[server]\\nprot = 1', 'server.prot'), (a working directory in which no hub was ever started, the database path), (a workspace root holding a file with mode 0000 so that the copy fails after the stores were copied; skipped when run as root, that file's path): code = hub.Run(ctx, opts with Args ['backup', target]); assert code == 1; assert len(nonEmptyLines(stderr)) == 1 and contains(stderr, expected); assert not exists(target) or listDir(target) == []; for the second case assert not exists(database path)"
+          }
+        },
+        {
+          "id": "REQ-9.6",
+          "pattern": "ubiquitous",
+          "action": "for any run of parleyd backup, leave the hub's data and process untouched: bind no listener, run no bootstrap, no start hook and no maintenance task, apply no schema step, and write nothing under the data directory or the config dir",
+          "contract": "no line with msg 'listening' is written; registered start hooks, maintenance tasks and pending schema steps are not called; the --admin-email and --reset-admin-token flags are refused together with backup with exit status 2; no admin_token file is created",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/hub/backup_test.go: on a stopped hub's data, compose the backup run with one start hook, one maintenance task and one additional schema step 'later' that record their calls; code = hub.Run(ctx, opts with Args ['backup', target]); assert code == 0; assert no call was recorded; assert not contains(stderr, 'listening'); assert not exists(configDir/admin_token); open the source database: assert step 'later' is not recorded; and assert hub.Run with Args ['--reset-admin-token', 'backup', target] returns 2"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-10",
+      "title": "Whole-section registration",
+      "rationale": "A package whose section holds tables and lists, and whose rules ask for every mistake to be reported together, must be able to own the checking of its whole section.",
+      "system": "configuration loader",
+      "criteria": [
+        {
+          "id": "REQ-10.1",
+          "pattern": "optional",
+          "condition": "another package has registered a section by name with a validator before the configuration is loaded",
+          "action": "accept that section in the file without checking its keys against the key registry and, when the file holds the section, hand its parsed content, after the environment references in its string values are replaced, to the validator exactly once, and report whether the file held the section and the content the validator was given",
+          "contract": "with the section in the file the load succeeds when the validator returns no error, the validator was called once with the section's keys, tables and arrays of tables as parsed and with every ${NAME} in a string value at any depth replaced, and no key inside the section is refused as unregistered; without the section the validator is not called, the load succeeds and the section is reported absent; a reference inside the section to a variable that is not set fails the load with an error containing the variable's name and the section's name, and the validator is not called; the keys of every other section are checked as before",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/config/section_test.go: reg = config.NewRegistry(); calls = []; reg.RegisterSection('sandbox', func(section) error { calls.append(section); return nil }); a table over files {none -> len(calls) == 0 and cfg.Section('sandbox') reports absent, '[sandbox]\\ngateway_url = \"https://${HOST}\"\\nanything = 1\\n[sandbox.profiles.default]\\nimage = \"img\"\\n[[sandbox.credentials]]\\nname = \"a\"\\ntoken = \"pa$$${SECRET}\"' with env {HOST: 'gw.example', SECRET: 's'} -> err == nil, len(calls) == 1, calls[0].gateway_url == 'https://gw.example', calls[0].anything == 1, calls[0].profiles.default.image == 'img', calls[0].credentials[0].token == 'pa$s', cfg.Section('sandbox') reports present with the same content, '[sandbox]\\ngateway_url = \"${NOPE}\"' with an empty environment -> error containing 'NOPE' and 'sandbox' and len(calls) == 0, '[sandbox]\\nx = 1\\n[server]\\nprot = 1' -> error containing 'server.prot'}: cfg, err = reg.Load(env, dirWith(file)); assert as listed"
+          }
+        },
+        {
+          "id": "REQ-10.2",
+          "pattern": "unwanted",
+          "condition": "the validator of a registered section returns an error for the section the file holds",
+          "action": "fail the load with that one error, so that every failure the validator listed is reported together",
+          "contract": "the load returns no configuration and an error whose text contains the validator's message unchanged, every failure it lists included; the validator was called once",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/config/section_test.go: reg.RegisterSection('sandbox', func(section) error { return errors.New('sandbox.gateway_url: missing; sandbox.profiles[default].image: empty; sandbox.nosuch: unknown key') }); cfg, err = reg.Load(env{}, dirWith('[sandbox]\\nnosuch = 1')); assert cfg == nil; assert err != nil; assert contains(err.Error(), 'sandbox.gateway_url: missing; sandbox.profiles[default].image: empty; sandbox.nosuch: unknown key'); assert the validator ran once"
+          }
+        },
+        {
+          "id": "REQ-10.3",
+          "pattern": "unwanted",
+          "condition": "a package registers a section that is already registered as a whole, registers as a whole a section in which a key is registered, or registers a key in a section registered as a whole",
+          "action": "refuse the second registration and fail the load",
+          "contract": "the load returns no configuration and an error whose text contains the section's name; no validator is called",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/config/section_test.go, a table over registrations {RegisterSection('sandbox', v) twice, Register(Key{Section: 'forks', Name: 'default_ttl', ...}) then RegisterSection('forks', v), RegisterSection('sandbox', v) then Register(Key{Section: 'sandbox', Name: 'x', ...}), RegisterSection('server', v) which this package registers keys in}: cfg, err = reg.Load(env{}, emptyDir); assert cfg == nil; assert contains(err.Error(), section); assert v was not called"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "An operator boots a new hub, takes the admin token, runs the hub and stops it",
+      "steps": [
+        {
+          "actor": "operator",
+          "action": "writes config.toml with an OAuth provider whose client_secret is ${GH_SECRET} and runs parleyd --admin-email=a@x"
+        },
+        {
+          "actor": "parleyd",
+          "action": "loads and validates the configuration, replacing ${GH_SECRET} from the environment, creates the data directory with mode 0700 and opens and migrates both stores"
+        },
+        {
+          "actor": "parleyd",
+          "action": "stores the e-mail and the hash of a new admin token, writes the token to <config dir>/admin_token with mode 0600, logs the file's path at warn level and exits 0 without listening"
+        },
+        {
+          "actor": "operator",
+          "action": "starts parleyd again while the token file still exists"
+        },
+        {
+          "actor": "parleyd",
+          "action": "refuses to start with exit status 1 and one error line naming the token file"
+        },
+        {
+          "actor": "operator",
+          "action": "saves the token, deletes the file and starts parleyd"
+        },
+        {
+          "actor": "parleyd",
+          "action": "runs the registered start hooks, starts the maintenance loop, binds [server].bind:[server].port and logs the listening line with addr, config and data_dir"
+        },
+        {
+          "actor": "operator",
+          "action": "sends GET /readyz and receives 200, then sends SIGTERM"
+        },
+        {
+          "actor": "parleyd",
+          "action": "stops accepting connections, stops the maintenance loop and background work, closes the stores and exits with status 0"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the run function of cmd/parleyd with its flag handling and signal handling",
+          "internal/hub",
+          "internal/config reading a real file and a real environment map",
+          "internal/store on real SQLite files",
+          "internal/identity admin settings",
+          "internal/maintenance",
+          "internal/server on a real TCP listener",
+          "internal/scrub behind the logger"
+        ],
+        "setup": [
+          "a temporary directory used as XDG_CONFIG_HOME, XDG_DATA_HOME and working directory, holding a config.toml with bind 127.0.0.1, port 0 and one github provider with client_secret '${GH_SECRET}'",
+          "the environment map gives GH_SECRET",
+          "one start hook and one maintenance task under 'fork_expiry' that record their calls are registered"
+        ],
+        "end_state": [
+          "the first run returned 0 and left an admin_token file with mode 0600 whose SHA-256 is the stored hash",
+          "the second run returned 1 without listening",
+          "the third run listened, called the start hook once and the maintenance task once, and answered GET /readyz with 200",
+          "after SIGTERM the third run returned 0, the listen address refuses connections, and no output of any run contains the token or the value of GH_SECRET"
+        ],
+        "pseudocode": "in test/e2e/lifecycle_test.go: code = run(ctx, ['--admin-email', 'a@x'], env, dir, out, errb); assert code == 0; tok = readFile(dir/admin_token); assert mode == 0600; code = run(ctx, [], env, dir, out, errb2); assert code == 1 and contains(errb2, 'admin_token'); remove(dir/admin_token); go run(ctx, [], env, dir, out, errb3); rec = json(the listening line of errb3); assert rec.config == dir/config.toml and rec.data_dir == dir; assert get('http://' + rec.addr + '/readyz').status == 200; assert hook calls == 1 and task calls == 1; syscall.Kill(os.Getpid(), SIGTERM); assert run returned 0 within 2 s; assert net.Dial(rec.addr) fails; assert none of the buffers contains tok or env.GH_SECRET"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "An operator backs up a hub while it runs",
+      "steps": [
+        {
+          "actor": "operator",
+          "action": "runs parleyd backup <directory> with the hub's environment and working directory while the hub serves and commits transactions"
+        },
+        {
+          "actor": "parleyd",
+          "action": "as the backup command, reads the configuration, finds the directory empty, and copies the transactional store and the analytical store, each as one consistent read"
+        },
+        {
+          "actor": "parleyd",
+          "action": "copies the repositories under the workspace root, refs before objects, writes one log line and exits 0"
+        },
+        {
+          "actor": "operator",
+          "action": "sends GET /readyz to the running hub and receives 200"
+        },
+        {
+          "actor": "operator",
+          "action": "starts a second parleyd whose configuration points database.path and workspace.path at the snapshot"
+        },
+        {
+          "actor": "parleyd",
+          "action": "opens the snapshot's stores, applies no schema step, listens and answers GET /readyz with 200"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the run function of cmd/parleyd for the server and for the backup subcommand",
+          "internal/hub",
+          "internal/store on real SQLite files, read by the backup while the server writes",
+          "the git command on real bare repositories",
+          "internal/server on a real TCP listener"
+        ],
+        "setup": [
+          "a running in-process hub with a schema step creating table a, 100 committed rows, a writer goroutine committing transactions of 10 rows, and one bare repository with two commits under the workspace root"
+        ],
+        "end_state": [
+          "the backup run returned 0 and the target holds parley.db, analytics.db and workspaces",
+          "the first hub still answers GET /readyz with 200 and its writer saw no error",
+          "a second hub started on the snapshot logged the listening line, answers GET /readyz with 200, and reads a row count from table a that is a multiple of 10 and at least 100",
+          "git fsck succeeds on the repository in the snapshot"
+        ],
+        "pseudocode": "in test/e2e/lifecycle_test.go: code = run(ctx, ['backup', target], env, dir, out, errb); assert code == 0; assert get(hub1 + '/readyz').status == 200; stop the writer and assert it had no error; write dir2/config.toml with database.path = target/parley.db, workspace.path = target/workspaces, bind 127.0.0.1, port 0; go run(ctx, [], env2, dir2, out, errb2); rec = json(listening line); assert get('http://' + rec.addr + '/readyz').status == 200; n = count(a) through a direct read of target/parley.db after stopping hub 2; assert n % 10 == 0 and n >= 100; assert exec('git', '-C', target/workspaces/r.git, 'fsck').code == 0"
+      }
+    },
+    {
+      "id": "PATH-3",
+      "title": "The hourly timer runs a maintenance pass in which one task fails",
+      "steps": [
+        {
+          "actor": "parleyd",
+          "action": "reaches the next tick of its hourly timer while no pass is running and starts a pass"
+        },
+        {
+          "actor": "parleyd",
+          "action": "runs the registered tasks in the fixed order; the claim_cleanup task returns an error"
+        },
+        {
+          "actor": "parleyd",
+          "action": "writes one log line at level ERROR with the task's name and the scrubbed error text, and runs the remaining tasks of the pass"
+        },
+        {
+          "actor": "operator",
+          "action": "reads the hub's log and finds the failing task's name, with no credential in the line"
+        },
+        {
+          "actor": "parleyd",
+          "action": "starts the next pass at the next tick and calls the failing task again"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "internal/hub starting the real maintenance loop",
+          "internal/maintenance with its registry and timer",
+          "the scrubbing logger writing JSON lines",
+          "internal/store, which the tasks write to"
+        ],
+        "setup": [
+          "a hub started in-process with the loop's interval set to 100 ms through a test option",
+          "three registered tasks: retention inserts a row, claim_cleanup returns an error whose text holds https://u:p@h/x, fork_expiry inserts a row"
+        ],
+        "end_state": [
+          "after 350 ms at least three passes ran: retention and fork_expiry each inserted at least three rows",
+          "stderr holds at least three lines at level ERROR with task 'claim_cleanup' whose error contains https://h/x and not u:p",
+          "the hub is still listening and answers GET /healthz with 200"
+        ],
+        "pseudocode": "in internal/hub/hub_test.go: start the hub; sleep 350 ms; assert count(rows by 'retention') >= 3 and count(rows by 'fork_expiry') >= 3; errs = stderr lines with level 'ERROR'; assert len(errs) >= 3; for each: assert rec.task == 'claim_cleanup' and contains(rec.error, 'https://h/x') and not contains(rec.error, 'u:p'); assert get('/healthz').status == 200"
+      }
+    }
+  ],
+  "external_apis": [
+    {
+      "package": "github.com/BurntSushi/toml",
+      "version": "v1.6.0",
+      "verified": true,
+      "symbols": [
+        {
+          "name": "Decode",
+          "import_path": "github.com/BurntSushi/toml",
+          "signature": "func Decode(data string, v any) (MetaData, error)"
+        },
+        {
+          "name": "MetaData.Keys",
+          "import_path": "github.com/BurntSushi/toml",
+          "signature": "func (md *MetaData) Keys() []Key"
+        },
+        {
+          "name": "Key.String",
+          "import_path": "github.com/BurntSushi/toml",
+          "signature": "func (k Key) String() string"
+        }
+      ]
+    },
+    {
+      "package": "modernc.org/sqlite",
+      "version": "v1.60.1",
+      "verified": true,
+      "symbols": [
+        {
+          "name": "driver name",
+          "import_path": "modernc.org/sqlite",
+          "signature": "sql.Open(\"sqlite\", dsn string) (*sql.DB, error); the package registers the driver under the name \"sqlite\" on import; the dsn accepts _pragma=<name>(<value>) and _txlock=<mode> query parameters"
+        }
+      ]
+    },
+    {
+      "package": "modernc.org/sqlite",
+      "version": "v1.60.1",
+      "verified": false,
+      "symbols": [
+        {
+          "name": "VACUUM INTO",
+          "import_path": "modernc.org/sqlite",
+          "signature": "db.ExecContext(ctx, \"VACUUM INTO ?\", path string) writes a transactionally consistent copy of the database to a new file while other connections write"
+        }
+      ]
+    }
+  ]
+}

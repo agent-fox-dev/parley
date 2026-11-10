@@ -1,0 +1,223 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "32",
+  "spec_name": "patch_maintenance",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/carrypatch/... ./internal/gitrepo/... ./internal/cli/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "31",
+      "reason": "maintains the patches that package registers: its patch record and store, carry-patch route guard, patch read routes, single-branch origin fetch, carry-patch git runner, the RebuildEnqueuer interface with its default, and the parley patch command group"
+    },
+    {
+      "spec": "09",
+      "reason": "builds the five parley patch commands on its HTTP client, output, exit codes and shared --wait"
+    },
+    {
+      "spec": "52",
+      "reason": "writes every parley.patch.* event through its event component, in the transaction of the state change"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Update a patch's status, position and text fields",
+      "criteria": [
+        "REQ-1",
+        "REQ-2"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/carrypatch/patch_update_test.go and internal/carrypatch/maintain_guard_test.go and confirm they fail; build the shared patch fixture there (a carry-patch workspace 'carry' in status ready in a real store in t.TempDir(), patches A, B, C at positions 1..3, the real event log of internal/event, a controllable clock, a recording rebuild enqueuer) on top of the fixtures package 31 left in internal/carrypatch",
+        "Write the guard tests as tables over a list of routes that holds PATCH /api/v1/workspaces/:slug/patches/:id now; tasks 2, 3 and 4 add their routes to that list, so the four refusal tables cover all five routes when task 4 is done",
+        "Mount PATCH /api/v1/workspaces/:slug/patches/:id behind the carry-patch route guard of package 31 with scope patches:write and write access; the guard gives the refusals in this order: insufficient_scope, not_found or forbidden, then the handler's shape validation, then workspace_mode_mismatch, then the workspace status answers of WS-FR-007. The guard of package 31 is a function a handler calls after its own shape validation, so the handler validates first and then calls it",
+        "Decode the body so that absent, null and present members are distinguishable; a body that is not a JSON object or a member of the wrong JSON type is 400 invalid_request; branch_name and unknown members are dropped. Validate the shape before the guard's mode and status checks: status in {active, disabled, merged_upstream, conflict}, position an integer of at least 1",
+        "After the guard, in one store transaction: load the patch by id within the workspace (absent, of another workspace or not a UUID: 404 not_found with message 'patch not found'); a deleted patch is 409 patch_deleted; a position above the number of non-deleted patches is 400 invalid_request",
+        "In the same transaction work out which of status, position, description and upstream_pr_url differ from the stored values (an empty string means null for the two text fields); when none differs, write nothing and answer 200 with the stored patch",
+        "Apply the changes: a status other than conflict sets conflict_files to []; a position change removes the patch from the order, inserts it at the new position and renumbers the non-deleted patches 1..N; set updated_at from the clock",
+        "Write one parley.patch.update through the event component of package 52 inside the same transaction, with the caller as actor and metadata branch_name, changed and, for a status change, from, to and reason 'api'; a failed event write rolls the change back and answers 500",
+        "Answer 200 with the full patch object as the get route of package 31 renders it; queue no rebuild",
+        "Put the position renumbering in one function of internal/carrypatch that update, delete, restore and reorder all use, and make every position-changing transaction take the store's write lock at its start so that concurrent requests run one after the other"
+      ],
+      "touches": [
+        "internal/carrypatch/patch_update.go",
+        "internal/carrypatch/patch_update_test.go",
+        "internal/carrypatch/patch_order.go",
+        "internal/carrypatch/maintain_guard_test.go",
+        "internal/carrypatch/routes.go",
+        "cmd/parleyd/"
+      ],
+      "done_when": [
+        "`go test ./internal/carrypatch/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Soft-delete a patch and restore it",
+      "criteria": [
+        "REQ-3",
+        "REQ-4"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/carrypatch/patch_remove_test.go and confirm they fail; add DELETE /patches/:id and POST /patches/:id/restore to the route list of internal/carrypatch/maintain_guard_test.go",
+        "Mount DELETE /api/v1/workspaces/:slug/patches/:id and POST /api/v1/workspaces/:slug/patches/:id/restore behind the same guard as the update route (scope patches:write, write access, carry-patch mode, workspace status); an unknown patch id is 404 not_found with message 'patch not found'; a request body on either route is ignored",
+        "Delete, in one transaction: when the patch is already deleted answer 204 and write nothing; otherwise set status deleted, deleted_at from the clock, position null and conflict_files [], renumber the remaining non-deleted patches through the shared renumbering function, and write one parley.patch.delete with metadata branch_name and reason 'api'; answer 204 with an empty body",
+        "Delete touches no git ref: the patch branch and refs/parley/replaced/<branch> stay as they are",
+        "Restore, in one transaction: a patch that is not deleted is 409 patch_not_deleted; a non-deleted patch of the workspace with the same branch_name is 409 patch_exists; otherwise set status active, position to the count of non-deleted patches plus one, deleted_at null, conflict_files [] and updated_at from the clock, and write one parley.patch.restore with metadata branch_name and position; answer 200 with the patch",
+        "Restore does not look at why the patch was deleted, so a patch a rebuild removed as merged upstream is restored the same way",
+        "A failed event write rolls the delete or the restore back and answers 500; neither operation queues a rebuild"
+      ],
+      "touches": [
+        "internal/carrypatch/patch_remove.go",
+        "internal/carrypatch/patch_remove_test.go",
+        "internal/carrypatch/maintain_guard_test.go",
+        "internal/carrypatch/routes.go"
+      ],
+      "done_when": [
+        "`go test ./internal/carrypatch/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Reorder the patch list in one step and keep the order gap-free",
+      "criteria": [
+        "REQ-5"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/carrypatch/patch_reorder_test.go and internal/carrypatch/patch_order_test.go and confirm they fail; add POST /patches/reorder to the route list of internal/carrypatch/maintain_guard_test.go",
+        "Mount POST /api/v1/workspaces/:slug/patches/reorder behind the same guard as the update route; register it so that the router does not take the word 'reorder' for a patch id",
+        "Shape validation, before the mode and status checks: the body is a JSON object whose patch_ids is an array of strings, else 400 invalid_request",
+        "In one transaction read the non-deleted patches and check the list against them, answering 400 invalid_request on the first failure: an id given twice (message names the id); an id that names no patch of the workspace (names the id); the id of a deleted patch (names the id); a count that differs from the number of non-deleted patches (message gives the number of ids given and the number expected)",
+        "Renumber the patches 1..N in list order in the same transaction, setting updated_at only on patches whose position changed, and write exactly one parley.patch.reorder whose resource id is the first id of the list and whose metadata is patch_ids; emit it also when the order equals the current one",
+        "A workspace with no non-deleted patch accepts patch_ids [] with 200, no items and no event",
+        "Answer 200 with {items: all non-deleted patches in the new order, next_cursor: null}",
+        "Write the order property test over seeded random sequences of update-position, delete, restore and reorder requests, valid and invalid, and the concurrency test that sends position-changing requests from 16 goroutines; both drive the routes of tasks 1 to 3 against one real store, and the concurrency test passes under the race detector"
+      ],
+      "touches": [
+        "internal/carrypatch/patch_reorder.go",
+        "internal/carrypatch/patch_reorder_test.go",
+        "internal/carrypatch/patch_order.go",
+        "internal/carrypatch/patch_order_test.go",
+        "internal/carrypatch/maintain_guard_test.go",
+        "internal/carrypatch/routes.go"
+      ],
+      "done_when": [
+        "`go test ./internal/carrypatch/... -count=1 -race` passes"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Reset a patch branch to origin's tip",
+      "criteria": [
+        "REQ-6",
+        "REQ-7",
+        "REQ-1"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/carrypatch/patch_reset_test.go and internal/gitrepo/remote_test.go and confirm they fail; build the reset fixture (an origin served by internal/gitrepo/gitrepotest, a hub bare repository cloned from it, the workspace and patch A in a real store, a stub origin credential resolver, a recording rebuild enqueuer); add POST /patches/:id/reset-to-origin to the route list of internal/carrypatch/maintain_guard_test.go, which now covers all five routes",
+        "Use the single-branch origin fetch package 31 exports from internal/gitrepo/remote.go (it fetches refs/heads/<branch> of origin, forced, into refs/remotes/origin/<branch> and nothing else, and returns origin's tip or a distinguishable 'no such branch on origin' error) and run it, like every git operation of this package, through the carry-patch git runner of package 31; add here only what the tests of this task show it lacks: the credential never in the process arguments, terminal prompts disabled, the branch name passed so that it cannot be read as an option",
+        "Mount POST /api/v1/workspaces/:slug/patches/:id/reset-to-origin behind the same guard as the update route; the body is ignored; an unknown patch is 404 not_found; a patch in merged_upstream or deleted is 409 patch_status_invalid before origin is contacted",
+        "Take the fetcher and the origin credential resolver as narrow interfaces of the reset operation so that tests can replace them, and the rebuild enqueuer as the interface RebuildEnqueuer that package 31 declares in internal/carrypatch; parleyd wires the real fetcher and the resolver of package 10",
+        "Resolve the origin credential at the time of the call and fetch the branch under a 2-minute deadline taken from the clock; 'no such branch' is 409 missing_on_origin; a resolver error, any other fetch error and the deadline are 502 origin_fetch_failed with the message as the runner of package 31 cleaned it, in which URL user information reads '***@'; none of these changes a ref outside refs/remotes/origin or any patch field",
+        "Read the hub's tip of refs/heads/<branch> and choose the action as the first that applies: no such branch (created), equal tips (none), hub tip an ancestor of origin's (fast_forwarded), otherwise replaced",
+        "For replaced, first write the hub's tip to refs/parley/replaced/<branch>, overwriting an earlier value, through WriteBackupRef, the one function that writes a backup ref, which this task adds to internal/carrypatch/backup_ref.go and exports for the sync of package 36; then, for every action but none, move refs/heads/<branch> to origin's tip with the compare-and-swap of internal/gitrepo against the tip that was compared (against 'absent' for created)",
+        "A lost compare-and-swap (ErrRefMoved of internal/gitrepo) is 409 ref_moved with details.current_sha set to the branch's current commit; the backup ref stays, and no patch field, event or rebuild follows",
+        "In one store transaction after the ref work: when the setting patch_branch_source is origin set origin_sync_state in_sync, origin_sha to origin's tip and origin_synced_at from the clock; write parley.patch.reset with metadata branch_name, action, local_sha (null for created), origin_sha and replaced_sha (the tip saved by this call, else null), and for replaced also parley.patch.replace with branch_name, replaced_sha, origin_sha and trigger 'reset_to_origin'",
+        "Answer 200 with the patch plus action, rebuild_triggered false and, when refs/parley/replaced/<branch> exists after the call, replaced_sha read from that ref; the rebuild trigger is added by task 5",
+        "Provide a test hook between reading the hub's tip and the compare-and-swap so that the lost-race test can move the branch at that point"
+      ],
+      "touches": [
+        "internal/carrypatch/patch_reset.go",
+        "internal/carrypatch/patch_reset_test.go",
+        "internal/carrypatch/maintain_guard_test.go",
+        "internal/carrypatch/routes.go",
+        "cmd/parleyd/",
+        "internal/gitrepo/remote.go",
+        "internal/gitrepo/remote_test.go",
+        "internal/carrypatch/backup_ref.go"
+      ],
+      "done_when": [
+        "`go test ./internal/carrypatch/... ./internal/gitrepo/... -count=1` passes with the real git binary"
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Queue a rebuild after a reset that moved the branch",
+      "criteria": [
+        "REQ-8"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/carrypatch/patch_reset_test.go and confirm they fail",
+        "Queue through RebuildEnqueuer of package 31: EnqueueRebuild with the workspace's slug and options that carry the caller's user id as submitted_by, the caller as the event's actor and no strategy or fail mode (the workspace settings apply); its result names the queued job's id, or says that nothing was queued because the workspace already has a job that is queued, running or failed",
+        "After the outcome of a reset is recorded, call the enqueuer when all three hold: the action is created, fast_forwarded or replaced; the patch's status is active or conflict; the workspace setting auto_rebuild_after_sync, read at this moment, is true",
+        "On a job id answer with rebuild_triggered true and rebuild_job_id; on the duplicate result answer 200 with rebuild_triggered false and no rebuild_job_id member; on any other enqueue error log one error record naming the workspace and answer the same way; in every other case do not call the enqueuer",
+        "Wire nothing for the enqueue: the reset reads the registered RebuildEnqueuer when it runs, which is package 31's default (queues nothing, reports no job, so the route answers rebuild_triggered false) until package 33 registers its implementation"
+      ],
+      "touches": [
+        "internal/carrypatch/patch_reset.go",
+        "internal/carrypatch/patch_reset_test.go",
+        "cmd/parleyd/"
+      ],
+      "done_when": [
+        "`go test ./internal/carrypatch/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Add the CLI commands that update, remove, restore and reorder patches",
+      "criteria": [
+        "REQ-9"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/cli/patch_test.go and confirm they fail; the tests run the command tree in-process against an httptest server that records requests, with PARLEY_CONFIG_DIR set to an empty temporary directory",
+        "In internal/cli/patch.go, beside the add, list and show commands of package 31, declare four commands through the command helper of package 09, each with the auth value user: update (PATCH /workspaces/:slug/patches/:id), remove (DELETE, same path), restore (POST …/patches/:id/restore) and reorder (POST /workspaces/:slug/patches/reorder)",
+        "parley patch update takes exactly two arguments and the flags --status, --position (integer), --description and --upstream-pr; build the body from the flags that were given on the command line, tested by whether the flag was set and not by its value, so that an empty string is sent; --upstream-pr is sent as upstream_pr_url; --status is sent as typed",
+        "With none of the four flags given, parley patch update sends nothing and fails with usage_error (exit 2)",
+        "parley patch remove prints {\"status\":\"removed\",\"patch_id\":\"<id>\"} on the 204 answer, with the id as the user typed it",
+        "parley patch restore sends no body and prints the response",
+        "parley patch reorder takes the slug and at least one patch id, sends {patch_ids: the ids in argument order} and prints the response; with no patch id it is a usage error",
+        "All requests, path-segment encoding, output and exit statuses come from the client and output code of package 09; add no second HTTP client"
+      ],
+      "touches": [
+        "internal/cli/patch.go",
+        "internal/cli/patch_test.go"
+      ],
+      "depends_on": [
+        3
+      ],
+      "done_when": [
+        "`go test ./internal/cli/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Add parley patch reset-to-origin with --wait",
+      "criteria": [
+        "REQ-10"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/cli/patch_test.go and confirm they fail",
+        "In internal/cli/patch.go declare parley patch reset-to-origin <workspace-slug> <patch-id> through the command helper of package 09 (POST /workspaces/:slug/patches/:id/reset-to-origin, auth user) with the shared flags --wait, --timeout and --poll-interval of package 09",
+        "Without --wait, or when the response has no rebuild_job_id, print the response as received and send no further request",
+        "With --wait and a rebuild_job_id, hand the shared wait of package 09 the poll request GET /workspaces/:slug/rebuilds/:id, the terminal states completed, dead_letter and cancelled, and completed as the only successful one; queued, running and failed are not terminal",
+        "Print the command's own final document: the reset response, with its members and their values untouched, plus the member rebuild holding the final job record as the hub returned it; the shared wait decides stdout, wait_failed, wait_timeout and the exit status",
+        "Add test/e2e/patch_maintenance_test.go with the two end-to-end tests of the execution paths: the list maintained from the shell, and the reset of a diverged patch branch; both start the hub in-process as package 01's end-to-end tests do and create the carry-patch workspace and its patches through the routes and commands of package 31"
+      ],
+      "touches": [
+        "internal/cli/patch.go",
+        "internal/cli/patch_test.go",
+        "test/e2e/patch_maintenance_test.go"
+      ],
+      "depends_on": [
+        5,
+        6
+      ],
+      "done_when": [
+        "`go test ./internal/cli/... ./test/e2e/... -count=1` passes"
+      ]
+    }
+  ]
+}

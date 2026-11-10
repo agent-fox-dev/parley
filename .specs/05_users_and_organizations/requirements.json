@@ -1,0 +1,1111 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "05",
+  "spec_name": "users_and_organizations",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "The caller's own profile",
+      "rationale": "A person signed in to the hub needs to see who the hub thinks they are, correct their display name, and see which organizations they belong to.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "a caller authenticated as a user sends GET /api/v1/user",
+          "action": "answer with that user's User object",
+          "contract": "HTTP 200 with a JSON object holding exactly the members id, username, email, full_name, role, status, provider, provider_id, created_at, updated_at; id is the caller's user id; created_at and updated_at are RFC 3339 UTC with whole seconds",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity"
+            ],
+            "pseudocode": "in internal/identity/handlers_user_test.go, a table over the callers {KU, PU}: r = get('/api/v1/user', caller); assert r.status == 200; assert keys(r.json) == the ten User members; assert r.json.username == 'alice' and r.json.role == 'user' and r.json.status == 'active'; assert r.json.created_at matches ^\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\dZ$"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "event_driven",
+          "condition": "a caller authenticated as a user sends PATCH /api/v1/user with a JSON body whose full_name is a string",
+          "action": "store the string as the user's full_name, the empty string clearing it, set updated_at to the time of the change and answer with the updated User object",
+          "contract": "HTTP 200 with the User object whose full_name equals the string sent; every other member except updated_at is unchanged; a following GET /api/v1/user returns the same object",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity"
+            ],
+            "pseudocode": "in internal/identity/handlers_user_test.go, a table over full_name {'Alice A.', ''}: before = get('/api/v1/user', KU).json; r = patch('/api/v1/user', KU, {full_name: v}); assert r.status == 200; assert r.json.full_name == v; assert r.json without full_name and updated_at == before without them; assert r.json.updated_at >= before.updated_at; assert get('/api/v1/user', KU).json == r.json"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "unwanted",
+          "condition": "a PATCH /api/v1/user body has no full_name member or a full_name that is not a string",
+          "action": "reject the request and leave the user unchanged",
+          "contract": "HTTP 400 with error_type invalid_request; a following GET /api/v1/user returns the object as it was before, updated_at included",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity"
+            ],
+            "pseudocode": "in internal/identity/handlers_user_test.go, a table over the bodies {{}, {full_name: 5}, {full_name: null}, {name: 'x'}}: before = get('/api/v1/user', KU).json; r = patch('/api/v1/user', KU, body); assert r.status == 400; assert r.json.error.error_type == 'invalid_request'; assert get('/api/v1/user', KU).json == before"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "event_driven",
+          "condition": "a caller authenticated as a user sends GET /api/v1/user/orgs",
+          "action": "list the orgs with status active that the caller is a member of, ordered by name ascending, leaving out blocked orgs and orgs the caller is not a member of",
+          "contract": "HTTP 200 with {items: Org[], next_cursor}; each item holds exactly the members id, name, slug, url, owner_id, status, created_at, updated_at; items is an empty array, not null, for a user with no membership in an active org",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity",
+              "orgs: alice's personal org 'alice'; active orgs 'zeta' and 'beta' with alice as member; blocked org 'blocked-co' with alice as member; active org 'other' without alice"
+            ],
+            "pseudocode": "in internal/identity/handlers_user_test.go: names = [i.name for i in get('/api/v1/user/orgs', KU).json.items]; assert names == ['alice', 'beta', 'zeta']; assert keys(items[0]) == the eight Org members; then delete all of alice's memberships through the store and assert get('/api/v1/user/orgs', KU).json.items == [] and next_cursor == null"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "unwanted",
+          "condition": "the caller of GET /api/v1/user, PATCH /api/v1/user or GET /api/v1/user/orgs is the admin token",
+          "action": "refuse the request, because the admin token has no user",
+          "contract": "HTTP 403 with error_type forbidden and the message \"this route needs a user\", the one answer package 04 gives the admin token on a route that needs a user",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity"
+            ],
+            "pseudocode": "in internal/identity/handlers_user_test.go, a table over {GET /user, PATCH /user with {full_name: 'x'}, GET /user/orgs}: r = do(method, path, ADMIN, body); assert r.status == 403; assert r.json.error.error_type == 'forbidden'"
+          }
+        },
+        {
+          "id": "REQ-1.6",
+          "pattern": "unwanted",
+          "condition": "the caller is a PAT that does not hold the scope the route declares: users:read for GET /api/v1/user, users:write for PATCH /api/v1/user, orgs:read for GET /api/v1/user/orgs, GET /api/v1/orgs/:id and GET /api/v1/orgs/:id/members",
+          "action": "refuse the request before reading or changing anything",
+          "contract": "HTTP 403 with error_type insufficient_scope; for PATCH /api/v1/user the user's full_name is unchanged; the same request by a PAT holding the declared scope is answered 200",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity",
+              "the test installs, in the scope position of the pipeline, a check that refuses a PAT whose permissions do not contain the scope the route declares; alice is a member of the org the two org routes name"
+            ],
+            "pseudocode": "in internal/identity/handlers_user_test.go, a table over the five routes with their declared scope S: r = do(route, pat of alice without S); assert r.status == 403; assert r.json.error.error_type == 'insufficient_scope'; r2 = do(route, pat of alice with only S); assert r2.status == 200; after the refused PATCH assert get('/api/v1/user', KU).json.full_name is unchanged"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "The admin check and selectors",
+      "rationale": "Identity administration is for the operator and the users the operator promoted, and an operator names a person by whatever they have at hand: an id, an e-mail or a username.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "unwanted",
+          "condition": "the caller of an admin route (POST /users, GET /users, GET|PATCH|DELETE /users/:id, POST /users/:id/promote|demote|block|unblock, POST /orgs, GET /orgs, PATCH|DELETE /orgs/:id, POST /orgs/:id/block|unblock, PUT|DELETE /orgs/:id/members/:user_id, all under /api/v1) is neither the admin token nor an API key whose user has role admin",
+          "action": "refuse the request before validating its body and before looking up the user or org it names, changing nothing",
+          "contract": "HTTP 403 with error_type forbidden, the same for an existing target, a missing target and an invalid body; the store holds the same users, orgs and memberships as before",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity"
+            ],
+            "pseudocode": "in internal/identity/admincheck_test.go, a table over every admin route (18 method and path pairs) x the callers {KU, PU, PA} x the targets {existing, missing} with an empty JSON object as body where the method takes one: snap = snapshot of users, orgs and memberships; r = do(route, caller); assert r.status == 403; assert r.json.error.error_type == 'forbidden'; assert snapshot() == snap"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "event_driven",
+          "condition": "the caller of an admin route is the admin token or an API key whose user has role admin",
+          "action": "pass the admin check and carry out the route",
+          "contract": "the route's success status (200 for GET /api/v1/users) instead of 403; the role is read at each request, so an API key whose user no longer has role admin gets 403 forbidden on its next request",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity"
+            ],
+            "pseudocode": "in internal/identity/admincheck_test.go, a table over the callers {ADMIN, KA}: assert get('/api/v1/users', caller).status == 200; then set root's role to user through the store and assert get('/api/v1/users', KA).status == 403 and get('/api/v1/users', ADMIN).status == 200"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "ubiquitous",
+          "action": "for any user route parameter :id or :user_id, resolve a value in hyphenated UUID form as a user id, any other value containing @ as an e-mail, and every other value as a username, comparing exactly",
+          "contract": "the three forms of one user's selector reach the same user: GET /api/v1/users/<uuid>, /users/<email> and /users/<username> return the same User object",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity",
+              "alice has e-mail alice@example.com"
+            ],
+            "pseudocode": "in internal/identity/handlers_users_test.go: u = get('/api/v1/users/alice', ADMIN).json; a table over the selectors {u.id, 'alice@example.com', 'alice'} x the routes {GET /users/:id, PATCH /users/:id with {full_name: 'x'}}: r = do(route, ADMIN); assert r.status == 200 and r.json.id == u.id; the routes added by later tasks (promote, demote, block, unblock, DELETE, members) join this table as they arrive"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "unwanted",
+          "condition": "an admin's request names a user by a selector that matches no user",
+          "action": "answer that the user was not found and change nothing",
+          "contract": "HTTP 404 with error_type not_found",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity",
+              "an active org acme exists"
+            ],
+            "pseudocode": "in internal/identity/handlers_users_test.go, a table over the selectors {a random UUID, 'nobody@example.com', 'nobody', 'ALICE' (usernames compare exactly), alice's e-mail in upper case} x the routes {GET, PATCH, DELETE /users/:id, POST /users/:id/promote, demote, block, unblock, PUT and DELETE /orgs/acme/members/:user_id}: r = do(route, ADMIN); assert r.status == 404; assert r.json.error.error_type == 'not_found'"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "ubiquitous",
+          "action": "for any org route parameter :id, resolve a value in hyphenated UUID form as an org id and every other value as an org slug, comparing exactly",
+          "contract": "GET /api/v1/orgs/<uuid> and GET /api/v1/orgs/<slug> return the same Org object",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity",
+              "an active org with name 'Acme Inc' and slug acme exists"
+            ],
+            "pseudocode": "in internal/identity/handlers_orgs_test.go: o = get('/api/v1/orgs/acme', ADMIN).json; assert get('/api/v1/orgs/' + o.id, ADMIN).json == o; a table over the selectors {o.id, 'acme'} x the routes {GET /orgs/:id, PATCH /orgs/:id with {url: 'u'}}: r = do(route, ADMIN); assert r.status == 200 and r.json.id == o.id; the org routes added by later tasks (block, unblock, DELETE, members) join this table as they arrive"
+          }
+        },
+        {
+          "id": "REQ-2.6",
+          "pattern": "unwanted",
+          "condition": "an admin's request names an org by a selector that matches no org",
+          "action": "answer that the org was not found and change nothing",
+          "contract": "HTTP 404 with error_type not_found",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity",
+              "an active org with name 'Acme Inc' and slug acme exists"
+            ],
+            "pseudocode": "in internal/identity/handlers_orgs_test.go, a table over the selectors {a random UUID, 'nope', 'ACME', 'Acme Inc' (the name is not a selector)} x the routes {GET, PATCH with {url: 'u'}, DELETE /orgs/:id, POST /orgs/:id/block, unblock, GET /orgs/:id/members, PUT and DELETE /orgs/:id/members/alice}: r = do(route, ADMIN); assert r.status == 404; assert r.json.error.error_type == 'not_found'"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Creating a user with a personal organization",
+      "rationale": "An operator must be able to add a person before that person ever signs in, and every user needs an org of their own so that there is always somewhere to put their workspaces.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "an admin sends POST /api/v1/users with non-empty strings username, email, provider and provider_id and an optional string full_name",
+          "action": "create, in one transaction, the user with role user and status active (also when the e-mail equals the bootstrap admin e-mail), an org whose name is the username, whose slug is derived from the username and whose owner_id is the user, and the user's membership of that org",
+          "contract": "HTTP 201 with the User object (role user, status active, full_name as sent or the empty string, a new UUID as id); the store holds an org with the derived slug, name == username, owner_id == the user's id and status active, and exactly one membership of that org, the user's",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity",
+              "the hub's bootstrap admin e-mail is boss@example.com and no user has it"
+            ],
+            "pseudocode": "in internal/identity/handlers_users_test.go, a table over the bodies {carol with full_name 'Carol C', dave without full_name, erin with the bootstrap admin e-mail}: r = post('/api/v1/users', ADMIN, body); assert r.status == 201; assert keys(r.json) == the ten User members; assert r.json.role == 'user' and r.json.status == 'active'; o = the org read from the store by slug lower(body.username); assert o.name == body.username and o.owner_id == r.json.id and o.status == 'active'; m = the memberships of o in the store; assert len(m) == 1 and m[0].user_id == r.json.id"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "ubiquitous",
+          "action": "for any user created through POST /api/v1/users, give the personal org the slug that the personal-organization rule of package 04 derives from the username and the user's id, by calling that package's exported function and without a second implementation of the rule",
+          "contract": "the org created for each username has the slug package 04's rule gives: Alice.Smith -> alice-smith; 42bob -> u-42bob; -_ab_- -> ab; a -> u-<first 8 characters of the created user's id>",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/identity/handlers_users_test.go, a table over the (username, want) pairs {('Alice.Smith', 'alice-smith'), ('42bob', 'u-42bob'), ('-_ab_-', 'ab'), ('a', 'u-' + id8)}: u = post('/api/v1/users', ADMIN, body with that username).json; o = the org in the store whose owner_id == u.id; id8 = first 8 characters of u.id; assert o.slug == want; assert o.name == username"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "event_driven",
+          "condition": "a user is being created and the derived slug is already the slug of an org",
+          "action": "give the personal org the first free slug of <slug>-1, <slug>-2, up to <slug>-10, in that order",
+          "contract": "HTTP 201; the personal org's slug is <slug>-N for the smallest N from 1 to 10 that no org uses",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity",
+              "an org with name 'Frank Corp' and slug frank exists"
+            ],
+            "pseudocode": "in internal/identity/handlers_users_test.go: u = post('/api/v1/users', ADMIN, user Frank).json; o = the org in the store whose owner_id == u.id; assert o.slug == 'frank-1' and o.name == 'Frank'; then, with orgs of slug 'gina' and 'gina-1' under other names, create user gina and assert her org's slug == 'gina-2'; with orgs of slug 'hal' and 'hal-1' to 'hal-9', create user hal and assert slug == 'hal-10'"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "unwanted",
+          "condition": "a POST /api/v1/users body lacks username, email, provider or provider_id, carries one of them as an empty string, or carries one of them or full_name as a value that is not a string",
+          "action": "reject the request and create nothing",
+          "contract": "HTTP 400 with error_type invalid_request; the numbers of users, orgs and memberships are unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity"
+            ],
+            "pseudocode": "in internal/identity/handlers_users_test.go, a table over the bodies {each of the four required members missing, each of the four as '', username: 7, full_name: 7, {}}: n = counts(users, orgs, memberships); r = post('/api/v1/users', ADMIN, body); assert r.status == 400; assert r.json.error.error_type == 'invalid_request'; assert counts() == n"
+          }
+        },
+        {
+          "id": "REQ-3.5",
+          "pattern": "unwanted",
+          "condition": "a POST /api/v1/users body is valid and its username, its e-mail or its pair of provider and provider_id belongs to an existing user, or an org already has the username as its name, or the derived slug and all of <slug>-1 to <slug>-10 are taken",
+          "action": "reject the request and create nothing: no user, no org and no membership",
+          "contract": "HTTP 409 with error_type conflict; the numbers of users, orgs and memberships are unchanged; GET /api/v1/users/<the requested username> is still 404 when the username was free",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity"
+            ],
+            "pseudocode": "in internal/identity/handlers_users_test.go, a table over the cases {username alice taken, e-mail alice@example.com taken, (provider, provider_id) of alice taken with a new username and e-mail, an org named 'henry' exists and the body's username is henry, orgs with the slugs ivy, ivy-1 ... ivy-10 exist under other names and the body's username is ivy}: n = counts(users, orgs, memberships); r = post('/api/v1/users', ADMIN, body); assert r.status == 409; assert r.json.error.error_type == 'conflict'; assert counts() == n; for the last three cases assert get('/api/v1/users/' + body.username, ADMIN).status == 404; and a body with alice's provider and a new provider_id answers 201"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Reading and updating users as an admin",
+      "rationale": "An operator has to find a user before acting on them, and blocked users should stay out of the everyday list without becoming unreachable.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "an admin sends GET /api/v1/users without include_blocked=true",
+          "action": "list the users with status active, newest first (created_at descending, then id descending), in pages",
+          "contract": "HTTP 200 with {items: User[], next_cursor}; no item has status blocked; with limit=2 and five active users, three requests following next_cursor return each active user exactly once in that order and the last next_cursor is null",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity",
+              "five active users created with distinct created_at and one blocked user"
+            ],
+            "pseudocode": "in internal/identity/handlers_users_test.go: all = get('/api/v1/users', ADMIN).json.items; assert every item.status == 'active'; assert all is sorted by (created_at desc, id desc); page through get('/api/v1/users?limit=2&cursor=...') and assert the concatenated ids == ids(all) and the last next_cursor == null; a table over include_blocked {'false', '1', 'yes'}: assert ids(get('/api/v1/users?include_blocked=' + v, ADMIN)) == ids(all)"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "optional",
+          "condition": "the GET /api/v1/users request carries the query parameter include_blocked=true",
+          "action": "list blocked users together with active ones, in the same order",
+          "contract": "HTTP 200; items holds every user, the blocked one among them with status blocked",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity",
+              "five active users and one blocked user"
+            ],
+            "pseudocode": "in internal/identity/handlers_users_test.go beside the test above: items = get('/api/v1/users?include_blocked=true', ADMIN).json.items; assert len(items) == number of users in the store; assert exactly one item has status 'blocked'; assert items is sorted by (created_at desc, id desc)"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "event_driven",
+          "condition": "an admin sends GET /api/v1/users/:id for an existing user, active or blocked",
+          "action": "answer with that user's User object",
+          "contract": "HTTP 200 with the ten User members; a blocked user is returned with status blocked",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity",
+              "a blocked user mallory exists"
+            ],
+            "pseudocode": "in internal/identity/handlers_users_test.go, a table over {alice (active), mallory (blocked)}: r = get('/api/v1/users/' + name, ADMIN); assert r.status == 200; assert keys(r.json) == the ten User members; assert r.json.username == name and r.json.status == want"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "event_driven",
+          "condition": "an admin sends PATCH /api/v1/users/:id with a JSON body whose full_name is a string",
+          "action": "store the string as that user's full_name, the empty string clearing it, set updated_at and answer with the updated User object",
+          "contract": "HTTP 200 with the User object whose full_name equals the string sent; GET /api/v1/users/:id returns the same object",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity"
+            ],
+            "pseudocode": "in internal/identity/handlers_users_test.go, a table over full_name {'Alice B.', ''}: r = patch('/api/v1/users/alice', KA, {full_name: v}); assert r.status == 200; assert r.json.full_name == v; assert get('/api/v1/users/alice', ADMIN).json == r.json"
+          }
+        },
+        {
+          "id": "REQ-4.5",
+          "pattern": "unwanted",
+          "condition": "a PATCH /api/v1/users/:id body has no full_name member or a full_name that is not a string",
+          "action": "reject the request and leave the user unchanged",
+          "contract": "HTTP 400 with error_type invalid_request; GET /api/v1/users/:id returns the object as it was before",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity"
+            ],
+            "pseudocode": "in internal/identity/handlers_users_test.go, a table over the bodies {{}, {full_name: 5}, {full_name: null}}: before = get('/api/v1/users/alice', ADMIN).json; r = patch('/api/v1/users/alice', ADMIN, body); assert r.status == 400; assert r.json.error.error_type == 'invalid_request'; assert get('/api/v1/users/alice', ADMIN).json == before"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Role and status of a user",
+      "rationale": "The operator decides who may administer identity and who may use the hub at all, and a demotion must never leave the hub with no active admin user.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "an admin sends POST /api/v1/users/:id/promote for a user with role user, or POST /api/v1/users/:id/demote for a user with role admin who is not the only active admin",
+          "action": "set the user's role to admin on promote and to user on demote, set updated_at, and answer with the User object",
+          "contract": "HTTP 200 with the User object carrying the new role; status and every other member except updated_at are unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity"
+            ],
+            "pseudocode": "in internal/identity/handlers_users_test.go: before = get('/api/v1/users/alice', ADMIN).json; r = post('/api/v1/users/alice/promote', ADMIN); assert r.status == 200 and r.json.role == 'admin'; assert r.json without role and updated_at == before without them; r = post('/api/v1/users/alice/demote', KA); assert r.status == 200 and r.json.role == 'user'; assert get('/api/v1/users/alice', ADMIN).json.role == 'user'"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "event_driven",
+          "condition": "an admin sends POST /api/v1/users/:id/block for an active user or POST /api/v1/users/:id/unblock for a blocked user",
+          "action": "set the user's status to blocked on block and to active on unblock, set updated_at, revoke no credential, and answer with the User object",
+          "contract": "HTTP 200 with the User object carrying the new status; role is unchanged; while blocked, a request with the user's API key is answered 403 forbidden; after unblock, the same API key is answered 200 on GET /api/v1/user",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity"
+            ],
+            "pseudocode": "in internal/identity/handlers_users_test.go: r = post('/api/v1/users/alice/block', ADMIN); assert r.status == 200 and r.json.status == 'blocked' and r.json.role == 'user'; assert get('/api/v1/user', KU).status == 403; r = post('/api/v1/users/alice/unblock', ADMIN); assert r.status == 200 and r.json.status == 'active'; assert get('/api/v1/user', KU).status == 200"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "event_driven",
+          "condition": "an admin sends promote, demote, block or unblock for a user who is already in the requested role or status",
+          "action": "change nothing and answer with the unchanged User object",
+          "contract": "HTTP 200 with a User object equal in every member, updated_at included, to the one GET /api/v1/users/:id returned before the request",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity",
+              "a blocked user mallory exists; the hub's clock is a test clock"
+            ],
+            "pseudocode": "in internal/identity/handlers_users_test.go, a table over {(promote, root), (demote, alice), (block, mallory), (unblock, alice)}: before = get('/api/v1/users/' + name, ADMIN).json; advance the test clock by 2 s; r = post('/api/v1/users/' + name + '/' + verb, ADMIN); assert r.status == 200; assert r.json == before"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "unwanted",
+          "condition": "an admin sends POST /api/v1/users/:id/demote for the only user who has both role admin and status active",
+          "action": "refuse the demotion and leave the user's role admin",
+          "contract": "HTTP 409 with error_type conflict; GET /api/v1/users/:id still returns role admin",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity"
+            ],
+            "pseudocode": "in internal/identity/handlers_users_test.go, a table over the cases {root is the only admin; root and a blocked admin oscar exist}: a table over the callers {ADMIN, KA}: r = post('/api/v1/users/root/demote', caller); assert r.status == 409; assert r.json.error.error_type == 'conflict'; assert get('/api/v1/users/root', ADMIN).json.role == 'admin'; in the second case assert post('/api/v1/users/oscar/demote', ADMIN).status == 200"
+          }
+        },
+        {
+          "id": "REQ-5.5",
+          "pattern": "ubiquitous",
+          "action": "for any set of concurrent demote and delete requests aimed at active admin users, decide each request's last-admin check and its change in one transaction, so that the requests that would leave no active admin user are refused",
+          "contract": "with exactly two active admin users and one concurrent demote request for each, exactly one request is answered 200 and the other 409 conflict, and exactly one active admin user remains",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity",
+              "root and ruth are the only users with role admin and both are active"
+            ],
+            "pseudocode": "in internal/identity/handlers_users_test.go, run with the race detector, repeated 25 times on a fresh hub: start two goroutines behind one barrier, a = post('/api/v1/users/root/demote', ADMIN), b = post('/api/v1/users/ruth/demote', ADMIN); assert sorted([a.status, b.status]) == [200, 409]; assert count(users where role == 'admin' and status == 'active') == 1; the same with delete('/api/v1/users/root', ADMIN) against the demote of ruth: assert the two statuses are {204, 409} or {200, 409} and exactly one active admin remains"
+          }
+        },
+        {
+          "id": "REQ-5.6",
+          "pattern": "event_driven",
+          "condition": "an admin sends POST /api/v1/users/:id/block for the only user who has both role admin and status active",
+          "action": "block the user, because blocking has no last-admin safeguard",
+          "contract": "HTTP 200 with the User object with status blocked and role admin; the admin token still passes the admin check and can unblock the user",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity"
+            ],
+            "pseudocode": "in internal/identity/handlers_users_test.go: r = post('/api/v1/users/root/block', ADMIN); assert r.status == 200 and r.json.status == 'blocked' and r.json.role == 'admin'; assert post('/api/v1/users/root/unblock', ADMIN).json.status == 'active'"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Deleting a user",
+      "rationale": "When a person leaves, the operator removes them and everything that would let them in again, without destroying the orgs and work they leave behind.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "an admin sends DELETE /api/v1/users/:id for an existing user who is not the only active admin",
+          "action": "delete the user together with the user's API keys, PATs and memberships and clear owner_id on the orgs the user owned, all in one transaction",
+          "contract": "HTTP 204 with an empty body; GET /api/v1/users/:id by id, e-mail and username is 404 not_found; the user is absent from GET /api/v1/users?include_blocked=true",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity"
+            ],
+            "pseudocode": "in internal/identity/handlers_users_test.go, a table over the targets {alice (role user), mallory (blocked), oscar (blocked admin, root is active admin), ruth (active admin, root is active admin)}: u = get('/api/v1/users/' + name, ADMIN).json; r = delete('/api/v1/users/' + name, ADMIN); assert r.status == 204 and r.body == ''; for sel in {u.id, u.email, u.username}: assert get('/api/v1/users/' + sel, ADMIN).status == 404; assert u.id not in ids(get('/api/v1/users?include_blocked=true&limit=200', ADMIN))"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "event_driven",
+          "condition": "a user who owns orgs and is a member of orgs is deleted",
+          "action": "keep every org, the user's personal org among them, with owner_id null where the user was the owner, and remove the user from every member list",
+          "contract": "after the 204: GET /api/v1/orgs/<personal org slug> is 200 with owner_id null and an updated_at not earlier than before; GET /api/v1/orgs/<slug>/members of every org the user belonged to no longer lists the user and still lists the other members; an org owned by another user keeps its owner_id",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity",
+              "org acme has owner_id alice and members alice and bob; alice and bob each have a personal org"
+            ],
+            "pseudocode": "in internal/identity/handlers_users_test.go: delete('/api/v1/users/alice', ADMIN); assert get('/api/v1/orgs/alice', ADMIN).json.owner_id == null; assert get('/api/v1/orgs/acme', ADMIN).json.owner_id == null; assert usernames(get('/api/v1/orgs/acme/members', ADMIN)) == ['bob']; assert get('/api/v1/orgs/alice/members', ADMIN).json.items == []; assert get('/api/v1/orgs/bob', ADMIN).json.owner_id == bob.id"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "event_driven",
+          "condition": "a user who has API keys and PATs is deleted",
+          "action": "delete every API key and every PAT of the user, bound PATs included, so that none of them authenticates again",
+          "contract": "after the 204: a request with any API key or PAT the user had is answered HTTP 401 with error_type unauthenticated; the credentials of other users still authenticate",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity"
+            ],
+            "pseudocode": "in internal/identity/handlers_users_test.go: delete('/api/v1/users/alice', ADMIN); for cred in {KU, PU, a PAT of alice stored with a workspace binding}: r = get('/api/v1/user', cred); assert r.status == 401 and r.json.error.error_type == 'unauthenticated'; assert count(stored API keys and PATs with user_id == alice.id) == 0; assert get('/api/v1/user', KA).status == 200"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "unwanted",
+          "condition": "an admin sends DELETE /api/v1/users/:id for the only user who has both role admin and status active",
+          "action": "refuse the deletion and delete nothing",
+          "contract": "HTTP 409 with error_type conflict; the user, the user's API keys, PATs and memberships and the owner_id of the user's orgs are as before",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity",
+              "root is the only active admin; a blocked admin oscar exists"
+            ],
+            "pseudocode": "in internal/identity/handlers_users_test.go, a table over the callers {ADMIN, KA (root deleting itself)}: snap = snapshot of users, orgs, memberships, API keys and PATs; r = delete('/api/v1/users/root', caller); assert r.status == 409; assert r.json.error.error_type == 'conflict'; assert snapshot() == snap; assert get('/api/v1/users', KA).status == 200"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "event_driven",
+          "condition": "a user is deleted while other packages have registered user removers through RegisterUserRemover",
+          "action": "call every registered user remover once, in registration order, with the transaction of the delete and the user's id, before the user record is removed, and roll the whole delete back when a remover returns an error",
+          "contract": "when every remover returns nil: HTTP 204, each remover was called exactly once with the deleted user's id, and what a remover wrote through the transaction is committed together with the delete; when a remover returns an error: HTTP 500 with error_type internal, and the user, the user's API keys, PATs and memberships, the owner_id of the user's orgs and everything an earlier remover wrote through the transaction are as before; a refused delete (404, 409) calls no remover; with no remover registered the delete behaves as REQ-6.1 says",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity",
+              "a test table owned(owner_id) with one row for alice, created directly in the store; org acme has owner_id alice and members alice and bob"
+            ],
+            "pseudocode": "in internal/identity/removers_test.go: calls = []; identity.RegisterUserRemover(func(tx, id) error { calls.append(('a', id)); delete from owned where owner_id == id through tx; return nil }); identity.RegisterUserRemover(func(tx, id) error { calls.append(('b', id)); return failB }); case failB = an error: snap = snapshot of users, orgs, memberships, API keys, PATs and owned; r = delete('/api/v1/users/alice', ADMIN); assert r.status == 500 and r.json.error.error_type == 'internal'; assert calls == [('a', alice.id), ('b', alice.id)]; assert snapshot() == snap; case failB = nil on a fresh hub: r = delete('/api/v1/users/alice', ADMIN); assert r.status == 204; assert calls == [('a', alice.id), ('b', alice.id)]; assert count(owned) == 0; assert get('/api/v1/users/alice', ADMIN).status == 404; case root the only active admin: delete('/api/v1/users/root', ADMIN) is 409 and delete('/api/v1/users/nobody', ADMIN) is 404, and calls stays empty"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "Creating and updating organizations",
+      "rationale": "Orgs are how the operator groups people around shared repositories, so the operator creates them, names them and corrects their details.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "event_driven",
+          "condition": "an admin sends POST /api/v1/orgs with a name that is non-empty after trimming, a slug of 1 to 128 characters of [a-z0-9_-] that starts and ends with a letter or digit, and optionally a string url and an owner_id that is an existing user's id",
+          "action": "create the org with status active, the name trimmed of leading and trailing white space, url defaulting to the empty string and owner_id defaulting to null, and create no membership",
+          "contract": "HTTP 201 with the Org object holding exactly the members id, name, slug, url, owner_id, status, created_at, updated_at; GET /api/v1/orgs/<slug> returns the same object; the org has no membership, also when owner_id was given",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity"
+            ],
+            "pseudocode": "in internal/identity/handlers_orgs_test.go, a table over the bodies {{name: 'Acme', slug: 'acme'}, {name: '  Beta Co ', slug: 'b', url: 'https://b.example', owner_id: alice.id}, {name: 'L', slug: 128 characters 'a'}, {name: 'M', slug: 'a_-9'}}: r = post('/api/v1/orgs', ADMIN, body); assert r.status == 201; assert keys(r.json) == the eight Org members; assert r.json.name == trim(body.name) and r.json.slug == body.slug and r.json.status == 'active'; assert r.json.url == (body.url or '') and r.json.owner_id == (body.owner_id or null); assert get('/api/v1/orgs/' + body.slug, ADMIN).json == r.json; assert count(memberships of the org in the store) == 0"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "unwanted",
+          "condition": "a POST /api/v1/orgs body has a missing, non-string or white-space-only name, a missing or non-string slug, a slug that is empty, longer than 128 characters, holds a character outside [a-z0-9_-] or starts or ends with - or _, a url that is not a string, or an owner_id that is not the id of an existing user",
+          "action": "reject the request and create no org",
+          "contract": "HTTP 400 with error_type invalid_request; the number of orgs is unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity"
+            ],
+            "pseudocode": "in internal/identity/handlers_orgs_test.go, a table over the bodies {no name, name '   ', name 5, no slug, slug '', slug of 129 characters, slug 'Acme', slug 'a.b', slug '-ab', slug 'ab_', slug '_', url 5, owner_id a random UUID, owner_id 'alice' (a username is not an id), owner_id 5}, each otherwise valid: n = count(orgs); r = post('/api/v1/orgs', ADMIN, body); assert r.status == 400; assert r.json.error.error_type == 'invalid_request'; assert count(orgs) == n"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "unwanted",
+          "condition": "a valid POST /api/v1/orgs body carries a name, after trimming, or a slug that an existing org already has",
+          "action": "reject the request and create no org",
+          "contract": "HTTP 409 with error_type conflict; the number of orgs is unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity",
+              "an org with name 'Acme Inc' and slug acme exists"
+            ],
+            "pseudocode": "in internal/identity/handlers_orgs_test.go, a table over the bodies {{name: 'Acme Inc', slug: 'other'}, {name: ' Acme Inc ', slug: 'other'}, {name: 'Other', slug: 'acme'}, {name: 'alice', slug: 'other'} (the name of alice's personal org)}: n = count(orgs); r = post('/api/v1/orgs', ADMIN, body); assert r.status == 409; assert r.json.error.error_type == 'conflict'; assert count(orgs) == n; and {name: 'acme inc', slug: 'other'} answers 201 because names compare exactly"
+          }
+        },
+        {
+          "id": "REQ-7.4",
+          "pattern": "event_driven",
+          "condition": "an admin sends PATCH /api/v1/orgs/:id with a body that carries a name that is a string non-empty after trimming, a url that is a string, or both",
+          "action": "replace the members sent, the name trimmed, leave the slug and every member not sent unchanged, ignore a slug member in the body, set updated_at, and answer with the updated Org object",
+          "contract": "HTTP 200 with the Org object; slug and id equal their values before the request; GET /api/v1/orgs/:id returns the same object",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity",
+              "an org with name 'Acme Inc' and slug acme exists"
+            ],
+            "pseudocode": "in internal/identity/handlers_orgs_test.go, a table over the bodies {{name: 'Acme 2'}, {url: 'https://a.example'}, {url: ''}, {name: ' Acme 3 ', url: 'u'}, {name: 'Acme 4', slug: 'changed'}, {name: the org's current name}}: before = get('/api/v1/orgs/acme', ADMIN).json; r = patch('/api/v1/orgs/acme', ADMIN, body); assert r.status == 200; assert r.json.slug == 'acme' and r.json.id == before.id; assert r.json.name == (trim(body.name) if sent else before.name); assert r.json.url == (body.url if sent else before.url); assert get('/api/v1/orgs/acme', ADMIN).json == r.json"
+          }
+        },
+        {
+          "id": "REQ-7.5",
+          "pattern": "unwanted",
+          "condition": "a PATCH /api/v1/orgs/:id body carries neither name nor url, a name that is not a string or is empty after trimming, or a url that is not a string",
+          "action": "reject the request and leave the org unchanged",
+          "contract": "HTTP 400 with error_type invalid_request; GET /api/v1/orgs/:id returns the object as it was before",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity",
+              "an org with slug acme exists"
+            ],
+            "pseudocode": "in internal/identity/handlers_orgs_test.go, a table over the bodies {{}, {slug: 'x'}, {name: ''}, {name: '  '}, {name: 5}, {url: 5}, {name: 'ok', url: 5}}: before = get('/api/v1/orgs/acme', ADMIN).json; r = patch('/api/v1/orgs/acme', ADMIN, body); assert r.status == 400; assert r.json.error.error_type == 'invalid_request'; assert get('/api/v1/orgs/acme', ADMIN).json == before"
+          }
+        },
+        {
+          "id": "REQ-7.6",
+          "pattern": "unwanted",
+          "condition": "a valid PATCH /api/v1/orgs/:id body carries a name that, after trimming, is the name of another org",
+          "action": "reject the request and leave the org unchanged, the url included when one was sent",
+          "contract": "HTTP 409 with error_type conflict; GET /api/v1/orgs/:id returns the object as it was before",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity",
+              "orgs with slug acme and with name 'Beta' exist"
+            ],
+            "pseudocode": "in internal/identity/handlers_orgs_test.go, a table over the bodies {{name: 'Beta'}, {name: ' Beta ', url: 'new'}}: before = get('/api/v1/orgs/acme', ADMIN).json; r = patch('/api/v1/orgs/acme', ADMIN, body); assert r.status == 409; assert r.json.error.error_type == 'conflict'; assert get('/api/v1/orgs/acme', ADMIN).json == before"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "Reading, blocking and deleting organizations",
+      "rationale": "Members need to see the org they are in, nobody else may learn that it exists, and the operator needs a way to suspend an org and a way to remove it.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "an admin sends GET /api/v1/orgs without include_blocked=true",
+          "action": "list the orgs with status active ordered by name ascending, comparing names byte-wise, in pages",
+          "contract": "HTTP 200 with {items: Org[], next_cursor}; no item has status blocked; with limit=2 the pages follow one another by next_cursor without repeating or skipping an org",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity",
+              "active orgs named 'alpha', 'Zed', 'beta' and the personal orgs of the seeded users; one blocked org 'blocked-co'"
+            ],
+            "pseudocode": "in internal/identity/handlers_orgs_test.go: items = get('/api/v1/orgs?limit=200', ADMIN).json.items; assert every item.status == 'active'; assert names(items) == sorted byte-wise(names(items)) and 'Zed' comes before 'alpha'; page with limit=2 and assert the concatenated ids == ids(items)"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "optional",
+          "condition": "the GET /api/v1/orgs request carries the query parameter include_blocked=true",
+          "action": "list blocked orgs together with active ones, in the same order",
+          "contract": "HTTP 200; items holds every org, each blocked one with status blocked",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity",
+              "one blocked org 'blocked-co' among active orgs"
+            ],
+            "pseudocode": "in internal/identity/handlers_orgs_test.go beside the test above: items = get('/api/v1/orgs?include_blocked=true&limit=200', KA).json.items; assert len(items) == count(orgs); assert 'blocked-co' in names(items) with status 'blocked'; assert names(items) is sorted byte-wise; a table over include_blocked {'false', '1'}: assert 'blocked-co' not in names"
+          }
+        },
+        {
+          "id": "REQ-8.3",
+          "pattern": "event_driven",
+          "condition": "GET /api/v1/orgs/:id is sent by an admin for any existing org, or by a member of the org while the org is active",
+          "action": "answer with the Org object",
+          "contract": "HTTP 200 with the eight Org members; an admin receives a blocked org with status blocked",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity",
+              "alice is a member of the active org acme and of the blocked org blocked-co; root is a member of neither"
+            ],
+            "pseudocode": "in internal/identity/handlers_orgs_test.go, a table over (caller, org) {(ADMIN, acme), (KA, acme), (KU, acme), (PU, acme), (KU, alice's personal org), (ADMIN, blocked-co), (KA, blocked-co)}: r = get('/api/v1/orgs/' + slug, caller); assert r.status == 200; assert keys(r.json) == the eight Org members; assert r.json.slug == slug"
+          }
+        },
+        {
+          "id": "REQ-8.4",
+          "pattern": "unwanted",
+          "condition": "GET /api/v1/orgs/:id or GET /api/v1/orgs/:id/members is sent by a caller who is not an admin and the org does not exist, or the caller is not a member of it, or the org is blocked",
+          "action": "answer as if the org did not exist, with a response that does not differ between the three cases",
+          "contract": "HTTP 404 with error_type not_found; status, error_type and message are identical for a missing org, an org the caller is not a member of and a blocked org the caller is a member of",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity",
+              "alice is a member of the blocked org blocked-co and not of the active org other; root is a member of neither"
+            ],
+            "pseudocode": "in internal/identity/handlers_orgs_test.go, a table over the routes {GET /orgs/:id, GET /orgs/:id/members} x the callers {KU, PU}: missing = get(route with 'nope', caller); other = get(route with 'other', caller); blocked = get(route with 'blocked-co', caller); assert missing.status == 404 and missing.json.error.error_type == 'not_found'; assert other.status == 404 and other.json.error == missing.json.error; assert blocked.status == 404 and blocked.json.error == missing.json.error; and for PA, the PAT of admin-role root: assert get(route with 'other', PA).status == 404"
+          }
+        },
+        {
+          "id": "REQ-8.5",
+          "pattern": "event_driven",
+          "condition": "an admin sends POST /api/v1/orgs/:id/block for an active org or POST /api/v1/orgs/:id/unblock for a blocked org",
+          "action": "set the org's status to blocked on block and to active on unblock, set updated_at, keep its memberships, and answer with the Org object",
+          "contract": "HTTP 200 with the Org object carrying the new status; while blocked the org is absent from its members' GET /api/v1/user/orgs and from GET /api/v1/orgs without include_blocked=true; after unblock it is listed in both again with the same members",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity",
+              "alice is the only member of the active org acme"
+            ],
+            "pseudocode": "in internal/identity/handlers_orgs_test.go: r = post('/api/v1/orgs/acme/block', ADMIN); assert r.status == 200 and r.json.status == 'blocked'; assert 'acme' not in slugs(get('/api/v1/user/orgs', KU)); assert 'acme' not in slugs(get('/api/v1/orgs?limit=200', ADMIN)); r = post('/api/v1/orgs/acme/unblock', KA); assert r.json.status == 'active'; assert 'acme' in slugs(get('/api/v1/user/orgs', KU)); assert usernames(get('/api/v1/orgs/acme/members', ADMIN)) == ['alice']"
+          }
+        },
+        {
+          "id": "REQ-8.6",
+          "pattern": "event_driven",
+          "condition": "an admin sends block for an org that is already blocked or unblock for an org that is already active",
+          "action": "change nothing and answer with the unchanged Org object",
+          "contract": "HTTP 200 with an Org object equal in every member, updated_at included, to the one GET /api/v1/orgs/:id returned before the request",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity",
+              "an active org acme and a blocked org blocked-co exist; the hub's clock is a test clock"
+            ],
+            "pseudocode": "in internal/identity/handlers_orgs_test.go, a table over {(block, blocked-co), (unblock, acme)}: before = get('/api/v1/orgs/' + slug, ADMIN).json; advance the test clock by 2 s; r = post('/api/v1/orgs/' + slug + '/' + verb, ADMIN); assert r.status == 200; assert r.json == before"
+          }
+        },
+        {
+          "id": "REQ-8.7",
+          "pattern": "event_driven",
+          "condition": "an admin sends DELETE /api/v1/orgs/:id for an existing org, a personal org and a blocked org included",
+          "action": "delete the org and all its memberships in one transaction and keep the users who were members or owner",
+          "contract": "HTTP 204 with an empty body; GET /api/v1/orgs/:id by id and by slug is 404 not_found for admins; the org is absent from its former members' GET /api/v1/user/orgs; GET /api/v1/users/<former member> is still 200; a new org may take the deleted org's name and slug",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity"
+            ],
+            "pseudocode": "in internal/identity/handlers_orgs_test.go, a table over the orgs {acme (members alice, bob), alice's personal org, blocked-co}: o = get('/api/v1/orgs/' + slug, ADMIN).json; r = delete('/api/v1/orgs/' + slug, ADMIN); assert r.status == 204 and r.body == ''; assert get('/api/v1/orgs/' + slug, ADMIN).status == 404 and get('/api/v1/orgs/' + o.id, ADMIN).status == 404; assert slug not in slugs(get('/api/v1/user/orgs', KU)); assert count(memberships with org_id == o.id) == 0; assert get('/api/v1/users/alice', ADMIN).status == 200; assert post('/api/v1/orgs', ADMIN, {name: o.name, slug: o.slug}).status == 201"
+          }
+        },
+        {
+          "id": "REQ-8.8",
+          "pattern": "event_driven",
+          "condition": "an org is deleted while other packages have registered org removers through RegisterOrgRemover",
+          "action": "call every registered org remover once, in registration order, with the transaction of the delete and the org's id, before the org record is removed, and roll the whole delete back when a remover returns an error",
+          "contract": "when every remover returns nil: HTTP 204, each remover was called exactly once with the deleted org's id, and what a remover wrote through the transaction is committed together with the delete; when a remover returns an error: HTTP 500 with error_type internal, and the org, its memberships and everything an earlier remover wrote through the transaction are as before; a delete answered 404 calls no remover; a user delete calls no org remover and an org delete calls no user remover; with no remover registered the delete behaves as REQ-8.7 says",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity",
+              "a test table owned(owner_id) with one row for org acme, created directly in the store; acme has members alice and bob"
+            ],
+            "pseudocode": "in internal/identity/removers_test.go: calls = []; userCalls = 0; identity.RegisterUserRemover(func(tx, id) error { userCalls++; return nil }); identity.RegisterOrgRemover(func(tx, id) error { calls.append(('a', id)); delete from owned where owner_id == id through tx; return nil }); identity.RegisterOrgRemover(func(tx, id) error { calls.append(('b', id)); return failB }); case failB = an error: snap = snapshot of orgs, memberships and owned; r = delete('/api/v1/orgs/acme', ADMIN); assert r.status == 500 and r.json.error.error_type == 'internal'; assert calls == [('a', acme.id), ('b', acme.id)]; assert snapshot() == snap; case failB = nil on a fresh hub: r = delete('/api/v1/orgs/acme', ADMIN); assert r.status == 204; assert calls == [('a', acme.id), ('b', acme.id)]; assert count(owned) == 0; assert get('/api/v1/orgs/acme', ADMIN).status == 404; assert userCalls == 0; delete('/api/v1/orgs/no-such-org', ADMIN) is 404 and adds no call"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-9",
+      "title": "Organization membership",
+      "rationale": "A membership is what later lets a person read an org's workspaces, so the operator adds and removes members and the members can see who is in the org with them.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-9.1",
+          "pattern": "event_driven",
+          "condition": "GET /api/v1/orgs/:id/members is sent by an admin for any existing org, or by a member of the org while the org is active",
+          "action": "list the org's memberships ordered by username ascending, comparing byte-wise, in pages",
+          "contract": "HTTP 200 with {items, next_cursor}; each item holds exactly the members org_id, user_id, username, email, created_at, where created_at is the time the membership was created, not the user's created_at; an org without members answers items []",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity",
+              "org acme has members carol, alice and bob added in that order at distinct times; an active org empty has no members; a blocked org blocked-co exists"
+            ],
+            "pseudocode": "in internal/identity/handlers_orgs_test.go, a table over the callers {ADMIN, KA, KU, PU}: r = get('/api/v1/orgs/acme/members', caller); assert r.status == 200; assert usernames(r) == ['alice', 'bob', 'carol']; assert keys(items[0]) == {org_id, user_id, username, email, created_at}; assert items[0].org_id == acme.id; assert items[0].created_at == the time alice was added (test clock) and != alice's user created_at; assert get('/api/v1/orgs/acme/members?limit=2', ADMIN).json.next_cursor != null; assert get('/api/v1/orgs/empty/members', ADMIN).json.items == []; assert get('/api/v1/orgs/blocked-co/members', ADMIN).status == 200"
+          }
+        },
+        {
+          "id": "REQ-9.2",
+          "pattern": "event_driven",
+          "condition": "an admin sends PUT /api/v1/orgs/:id/members/:user_id for an existing org and an existing user who is not a member",
+          "action": "create the membership with created_at set to the current time",
+          "contract": "HTTP 204 with an empty body; the user appears in GET /api/v1/orgs/:id/members, and the org appears in the user's GET /api/v1/user/orgs while the org is active; a blocked user and a blocked org are accepted",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity",
+              "an active org acme without members, a blocked org blocked-co and a blocked user mallory exist"
+            ],
+            "pseudocode": "in internal/identity/handlers_orgs_test.go, a table over (org, user selector) {(acme, 'alice'), (acme, bob's id), (acme, carol's e-mail), (acme, 'mallory' who is blocked), (blocked-co, 'alice')}: r = put('/api/v1/orgs/' + org + '/members/' + selector, ADMIN); assert r.status == 204 and r.body == ''; assert the user's username in usernames(get('/api/v1/orgs/' + org + '/members', ADMIN)); for (acme, alice) assert 'acme' in slugs(get('/api/v1/user/orgs', KU)) and get('/api/v1/orgs/acme', KU).status == 200"
+          }
+        },
+        {
+          "id": "REQ-9.3",
+          "pattern": "event_driven",
+          "condition": "an admin sends PUT /api/v1/orgs/:id/members/:user_id for a user who is already a member of the org",
+          "action": "leave the existing membership as it is",
+          "contract": "HTTP 204; the member list has one entry for the user and its created_at is unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity",
+              "alice is a member of acme; the hub's clock is a test clock"
+            ],
+            "pseudocode": "in internal/identity/handlers_orgs_test.go: before = get('/api/v1/orgs/acme/members', ADMIN).json.items; advance the test clock by 2 s; r = put('/api/v1/orgs/acme/members/' + alice.email, ADMIN); assert r.status == 204; assert get('/api/v1/orgs/acme/members', ADMIN).json.items == before"
+          }
+        },
+        {
+          "id": "REQ-9.4",
+          "pattern": "event_driven",
+          "condition": "an admin sends DELETE /api/v1/orgs/:id/members/:user_id for a user who is a member of the org",
+          "action": "delete the membership, keep the user and the org, and leave the org's owner_id unchanged also when the removed member is the owner",
+          "contract": "HTTP 204 with an empty body; the user is absent from the member list; GET /api/v1/orgs/:id by that user's API key is now 404 not_found; the org's owner_id is as before",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity"
+            ],
+            "pseudocode": "in internal/identity/handlers_orgs_test.go: assert get('/api/v1/orgs/alice', KU).status == 200; r = delete('/api/v1/orgs/alice/members/alice', ADMIN); assert r.status == 204 and r.body == ''; assert get('/api/v1/orgs/alice/members', ADMIN).json.items == []; assert get('/api/v1/orgs/alice', KU).status == 404; assert get('/api/v1/orgs/alice', ADMIN).json.owner_id == alice.id; assert get('/api/v1/users/alice', ADMIN).status == 200"
+          }
+        },
+        {
+          "id": "REQ-9.5",
+          "pattern": "unwanted",
+          "condition": "an admin sends DELETE /api/v1/orgs/:id/members/:user_id for an existing org and an existing user who is not a member of it",
+          "action": "answer that the membership was not found and change nothing",
+          "contract": "HTTP 404 with error_type not_found; the org's member list is unchanged; a second DELETE of a membership that was just deleted is also 404",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the helper newTestHub(t) in internal/identity/testhub_test.go: a store in t.TempDir(), the request pipeline of package 02 with the authenticator of package 04 and this package's routes, served through net/http/httptest; seeded callers ADMIN (the admin token), KA (API key of root, role admin), KU (API key of alice, role user), PA (PAT of root holding every scope), PU (PAT of alice holding every scope); every further user, org, membership, role and status a setup names is written directly through the store functions of internal/identity",
+              "alice is a member of acme and bob is not"
+            ],
+            "pseudocode": "in internal/identity/handlers_orgs_test.go: before = get('/api/v1/orgs/acme/members', ADMIN).json.items; r = delete('/api/v1/orgs/acme/members/bob', ADMIN); assert r.status == 404 and r.json.error.error_type == 'not_found'; assert get('/api/v1/orgs/acme/members', ADMIN).json.items == before; assert delete('/api/v1/orgs/acme/members/alice', ADMIN).status == 204; assert delete('/api/v1/orgs/acme/members/alice', ADMIN).status == 404"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-10",
+      "title": "Commands for users and organizations",
+      "rationale": "Operators and scripts work from a terminal, so every user and org route has a command that sends exactly one request and prints exactly what the hub answered.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-10.1",
+          "pattern": "event_driven",
+          "condition": "a user runs parley user show, parley user update --full-name <string>, parley orgs list, parley orgs show <org> or parley orgs members <org>",
+          "action": "send one request with the caller's credential as a Bearer token (GET /api/v1/user; PATCH /api/v1/user with body {\"full_name\": <string>}, also when the string is empty; GET /api/v1/user/orgs; GET /api/v1/orgs/<org>; GET /api/v1/orgs/<org>/members) and print the response body",
+          "contract": "exit status 0; stdout is the hub's response body as one JSON document indented by 2 spaces and ending in a newline; stderr is empty; exactly one request was sent",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "an httptest server that records every request (method, escaped path, query, Authorization header, body) and answers from a table; the command tree of internal/cli run in-process with --endpoint-url set to the server and --api-key K, stdout and stderr captured, PARLEY_CONFIG_DIR pointing at an empty t.TempDir()"
+            ],
+            "pseudocode": "in internal/cli/user_test.go and internal/cli/orgs_test.go, a table over the five commands with their expected (method, path, body): code = run(args); assert code == 0; assert len(server.requests) == 1; req = server.requests[0]; assert (req.method, req.path) == want; assert req.authorization == 'Bearer K'; assert json(req.body) == want.body (for user update --full-name '' the body is {full_name: ''}); assert stdout == indent2(server.answer) + '\\n'; assert stderr == ''"
+          }
+        },
+        {
+          "id": "REQ-10.2",
+          "pattern": "event_driven",
+          "condition": "an operator runs one of parley admin users list [--include-blocked], show <user>, create --username --email --provider --provider-id [--full-name], update <user> --full-name <string>, delete <user>, promote <user>, demote <user>, block <user> or unblock <user>",
+          "action": "send one request (GET /api/v1/users, with the query include_blocked=true only when the flag is given; GET /api/v1/users/<user>; POST /api/v1/users with the flags as body members, full_name only when its flag is given; PATCH /api/v1/users/<user> with {\"full_name\": <string>}; DELETE /api/v1/users/<user>; POST /api/v1/users/<user>/promote, /demote, /block, /unblock without a body) and print the response body",
+          "contract": "exit status 0; stdout is the hub's response body as one JSON document indented by 2 spaces; exactly one request was sent with the method, path, query and body named",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "an httptest server that records every request (method, escaped path, query, Authorization header, body) and answers from a table; the command tree of internal/cli run in-process with --endpoint-url set to the server and --api-key K, stdout and stderr captured, PARLEY_CONFIG_DIR pointing at an empty t.TempDir()"
+            ],
+            "pseudocode": "in internal/cli/admin_users_test.go, a table over the nine commands (list twice: with and without --include-blocked; create twice: with and without --full-name): code = run(args); assert code == 0; req = the one recorded request; assert (req.method, req.path, req.query) == want; assert json(req.body) == want.body or req.body == '' where none is wanted; assert the create body has the members username, email, provider, provider_id and has full_name only when the flag was given; assert stdout == indent2(server.answer) + '\\n'"
+          }
+        },
+        {
+          "id": "REQ-10.3",
+          "pattern": "event_driven",
+          "condition": "an operator runs one of parley admin orgs list [--include-blocked], create --name --slug [--url] [--owner <user id>], update <org> [--name] [--url], delete <org>, block <org>, unblock <org>, members list <org>, members add <org> <user> or members remove <org> <user>",
+          "action": "send one request (GET /api/v1/orgs, with the query include_blocked=true only when the flag is given; POST /api/v1/orgs with name and slug and with url and owner_id only when their flags are given; PATCH /api/v1/orgs/<org> with only the members whose flags are given; DELETE /api/v1/orgs/<org>; POST /api/v1/orgs/<org>/block, /unblock; GET /api/v1/orgs/<org>/members; PUT and DELETE /api/v1/orgs/<org>/members/<user>) and print the response body",
+          "contract": "exit status 0; stdout is the hub's response body as one JSON document indented by 2 spaces; exactly one request was sent with the method, path, query and body named",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "an httptest server that records every request (method, escaped path, query, Authorization header, body) and answers from a table; the command tree of internal/cli run in-process with --endpoint-url set to the server and --api-key K, stdout and stderr captured, PARLEY_CONFIG_DIR pointing at an empty t.TempDir()"
+            ],
+            "pseudocode": "in internal/cli/admin_orgs_test.go, a table over the nine commands (create with and without --url and --owner; update with --name only, --url only, --url '' and both): code = run(args); assert code == 0; req = the one recorded request; assert (req.method, req.path, req.query) == want; assert json(req.body) == want.body; assert --owner X is sent as owner_id X; assert update --url '' sends {url: ''} and no name member"
+          }
+        },
+        {
+          "id": "REQ-10.4",
+          "pattern": "event_driven",
+          "condition": "the hub answers HTTP 204 to parley admin users delete, parley admin orgs delete, parley admin orgs members add or parley admin orgs members remove",
+          "action": "print an empty JSON object",
+          "contract": "exit status 0; stdout is exactly {} followed by a newline; stderr is empty",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "an httptest server that records every request (method, escaped path, query, Authorization header, body) and answers from a table; the command tree of internal/cli run in-process with --endpoint-url set to the server and --api-key K, stdout and stderr captured, PARLEY_CONFIG_DIR pointing at an empty t.TempDir()"
+            ],
+            "pseudocode": "in internal/cli/admin_users_test.go and internal/cli/admin_orgs_test.go, a table over the four commands with the server answering 204 without a body: code = run(args); assert code == 0; assert stdout == '{}\\n'; assert stderr == ''"
+          }
+        },
+        {
+          "id": "REQ-10.5",
+          "pattern": "unwanted",
+          "condition": "a command of this package is run without a required flag (--full-name on user update and admin users update; any of --username, --email, --provider, --provider-id on admin users create; --name or --slug on admin orgs create; both --name and --url absent on admin orgs update) or with a number of positional arguments other than the one it takes",
+          "action": "report a usage error and send no request",
+          "contract": "exit status 2; stderr holds the error envelope with code 0 and error_type usage_error; stdout is empty; the hub received no request",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "an httptest server that records every request (method, escaped path, query, Authorization header, body) and answers from a table; the command tree of internal/cli run in-process with --endpoint-url set to the server and --api-key K, stdout and stderr captured, PARLEY_CONFIG_DIR pointing at an empty t.TempDir()"
+            ],
+            "pseudocode": "in internal/cli/admin_users_test.go, internal/cli/admin_orgs_test.go and internal/cli/user_test.go, a table over the argument lists {user update; admin users update alice; admin users create with each one of the four required flags left out; admin orgs create --name A; admin orgs create --slug a; admin orgs update acme; orgs show; orgs show a b; admin users delete; admin orgs members add acme; admin users promote a b}: code = run(args); assert code == 2; assert json(stderr).error.code == 0 and json(stderr).error.error_type == 'usage_error'; assert stdout == ''; assert len(server.requests) == 0"
+          }
+        },
+        {
+          "id": "REQ-10.6",
+          "pattern": "unwanted",
+          "condition": "the hub answers a command of this package with an error status",
+          "action": "print the hub's error envelope as received and no result",
+          "contract": "exit status 1; stderr holds the envelope with the hub's code, message and error_type unchanged; stdout is empty",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "an httptest server that records every request (method, escaped path, query, Authorization header, body) and answers from a table; the command tree of internal/cli run in-process with --endpoint-url set to the server and --api-key K, stdout and stderr captured, PARLEY_CONFIG_DIR pointing at an empty t.TempDir()"
+            ],
+            "pseudocode": "in internal/cli/admin_users_test.go, a table over (command, answer) {(admin users demote root, 409 conflict), (admin users show nobody, 404 not_found), (admin users list, 403 forbidden), (user show, 401 unauthenticated), (admin orgs create --name A --slug a, 400 invalid_request)}: code = run(args); assert code == 1; assert json(stderr).error == the envelope the server sent; assert stdout == ''"
+          }
+        },
+        {
+          "id": "REQ-10.7",
+          "pattern": "ubiquitous",
+          "action": "for any <user> or <org> argument, send the argument as exactly one percent-encoded path segment",
+          "contract": "the hub's router receives one segment whose decoded value equals the argument: a/b is sent as a%2Fb, and an e-mail such as a+b@example.com decodes to itself",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "an httptest server that records every request (method, escaped path, query, Authorization header, body) and answers from a table; the command tree of internal/cli run in-process with --endpoint-url set to the server and --api-key K, stdout and stderr captured, PARLEY_CONFIG_DIR pointing at an empty t.TempDir()"
+            ],
+            "pseudocode": "in internal/cli/admin_users_test.go, a table over the arguments {'a/b', 'a+b@example.com', 'a b', 'x?y#z', '0f8fad5b-d9cb-469f-a165-70867728950e'} x the commands {admin users show <arg>, orgs show <arg>, admin orgs members add acme <arg>}: run(args); req = the one recorded request; segs = split(req.escapedPath, '/'); assert len(segs) == the route's segment count; assert unescape(last(segs)) == arg; for 'a/b' assert last(segs) == 'a%2Fb'"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "An operator sets up a team and a member sees their org",
+      "steps": [
+        {
+          "actor": "operator",
+          "action": "runs parley admin users create for alice and for bob with the admin token"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends POST /api/v1/users for each and prints the User objects"
+        },
+        {
+          "actor": "parleyd",
+          "action": "creates each user with a personal org, owner and first membership in one transaction"
+        },
+        {
+          "actor": "operator",
+          "action": "runs parley admin orgs create --name 'Acme Inc' --slug acme and parley admin orgs members add acme alice"
+        },
+        {
+          "actor": "parleyd",
+          "action": "stores the org and the membership and answers 201 and 204"
+        },
+        {
+          "actor": "org member",
+          "action": "alice runs parley orgs list and parley orgs members acme with her API key and sees her personal org, acme and herself as member"
+        },
+        {
+          "actor": "developer",
+          "action": "bob runs parley orgs show acme with his API key"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers bob 404 not_found, as for an org that does not exist"
+        },
+        {
+          "actor": "operator",
+          "action": "runs parley admin orgs block acme, then parley admin users delete alice"
+        },
+        {
+          "actor": "parleyd",
+          "action": "hides acme from member lists of orgs, then deletes alice with her credentials and memberships and clears owner_id on her personal org"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parleyd started in-process on 127.0.0.1:0 with its real store in a temporary data directory",
+          "the request pipeline of package 02 and the authenticator of package 04",
+          "the handlers and store code of internal/identity",
+          "the command tree of internal/cli with its real HTTP client"
+        ],
+        "setup": [
+          "the hub is bootstrapped with an admin token T",
+          "after the two users exist, the test issues one API key each for alice and bob through the key-issuing function of internal/identity that the OAuth callback uses"
+        ],
+        "end_state": [
+          "parley orgs list as alice printed exactly the orgs alice and acme before the block and exactly alice after it",
+          "parley orgs show acme as bob exited 1 with error_type not_found on stderr",
+          "after the delete, parley admin users show alice exits 1 with not_found, alice's API key is answered 401, parley admin orgs members list acme prints no items and parley admin orgs show alice prints owner_id null"
+        ],
+        "pseudocode": "in test/e2e/identity_test.go: hub = startHub(t); cli = func(cred, args...) (code, stdout, stderr); cli(T, 'admin','users','create','--username','alice','--email','alice@example.com','--provider','github','--provider-id','1'); same for bob; cli(T, 'admin','orgs','create','--name','Acme Inc','--slug','acme'); assert cli(T, 'admin','orgs','members','add','acme','alice').stdout == '{}\\n'; ka, kb = issueKey(alice), issueKey(bob); assert slugs(cli(ka, 'orgs','list')) == ['acme', 'alice']; assert usernames(cli(ka, 'orgs','members','acme')) == ['alice']; c = cli(kb, 'orgs','show','acme'); assert c.code == 1 and json(c.stderr).error.error_type == 'not_found'; cli(T, 'admin','orgs','block','acme'); assert slugs(cli(ka, 'orgs','list')) == ['alice']; assert cli(T, 'admin','users','delete','alice').stdout == '{}\\n'; assert cli(T, 'admin','users','show','alice').code == 1; assert cli(ka, 'user','show').code == 1; assert json(cli(T, 'admin','orgs','members','list','acme').stdout).items == []; assert json(cli(T, 'admin','orgs','show','alice').stdout).owner_id == null"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "The last active admin can be neither demoted nor deleted",
+      "steps": [
+        {
+          "actor": "operator",
+          "action": "runs parley admin users promote alice with the admin token"
+        },
+        {
+          "actor": "parleyd",
+          "action": "sets alice's role to admin and answers the User object"
+        },
+        {
+          "actor": "operator",
+          "action": "runs parley admin users demote alice and parley admin users delete alice"
+        },
+        {
+          "actor": "parleyd",
+          "action": "counts the active admin users in the same transaction as each change, finds alice to be the only one and answers 409 conflict to both"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints each envelope on stderr and exits 1"
+        },
+        {
+          "actor": "operator",
+          "action": "runs parley admin users promote bob, then parley admin users demote alice"
+        },
+        {
+          "actor": "parleyd",
+          "action": "demotes alice, because bob is an active admin, and answers the User object with role user"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parleyd started in-process on 127.0.0.1:0 with its real store in a temporary data directory",
+          "the request pipeline of package 02 and the authenticator of package 04",
+          "the handlers and store code of internal/identity",
+          "the command tree of internal/cli with its real HTTP client"
+        ],
+        "setup": [
+          "the hub is bootstrapped with an admin token T",
+          "users alice and bob exist with role user; no user has role admin"
+        ],
+        "end_state": [
+          "the first demote and the delete of alice each exited 1 with error_type conflict on stderr and nothing on stdout",
+          "the second demote exited 0 and printed alice with role user",
+          "parley admin users list shows bob with role admin and alice with role user, both active"
+        ],
+        "pseudocode": "in test/e2e/identity_test.go: assert json(cli(T, 'admin','users','promote','alice').stdout).role == 'admin'; for verb in ['demote', 'delete']: c = cli(T, 'admin','users',verb,'alice'); assert c.code == 1 and c.stdout == '' and json(c.stderr).error.error_type == 'conflict'; cli(T, 'admin','users','promote','bob'); c = cli(T, 'admin','users','demote','alice'); assert c.code == 0 and json(c.stdout).role == 'user'; roles = {u.username: u.role for u in json(cli(T, 'admin','users','list').stdout).items}; assert roles == {alice: 'user', bob: 'admin'}"
+      }
+    }
+  ],
+  "external_apis": [
+    {
+      "package": "github.com/spf13/cobra",
+      "version": "v1.10.2",
+      "verified": true,
+      "symbols": [
+        {
+          "name": "Command.AddCommand",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) AddCommand(cmds ...*Command)"
+        },
+        {
+          "name": "Command.Flags",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) Flags() *pflag.FlagSet"
+        },
+        {
+          "name": "Command.MarkFlagRequired",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) MarkFlagRequired(name string) error"
+        },
+        {
+          "name": "ExactArgs",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func ExactArgs(n int) PositionalArgs"
+        },
+        {
+          "name": "NoArgs",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func NoArgs(cmd *Command, args []string) error"
+        }
+      ]
+    },
+    {
+      "package": "github.com/spf13/pflag",
+      "version": "v1.0.10",
+      "verified": true,
+      "symbols": [
+        {
+          "name": "FlagSet.Changed",
+          "import_path": "github.com/spf13/pflag",
+          "signature": "func (f *FlagSet) Changed(name string) bool"
+        },
+        {
+          "name": "FlagSet.StringVar",
+          "import_path": "github.com/spf13/pflag",
+          "signature": "func (f *FlagSet) StringVar(p *string, name string, value string, usage string)"
+        },
+        {
+          "name": "FlagSet.BoolVar",
+          "import_path": "github.com/spf13/pflag",
+          "signature": "func (f *FlagSet) BoolVar(p *bool, name string, value bool, usage string)"
+        }
+      ]
+    }
+  ]
+}

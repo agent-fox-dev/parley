@@ -1,0 +1,262 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "38",
+  "spec_name": "carry_patch_rerere_and_maintenance",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/carrypatch/... ./internal/gitrepo/... ./internal/cli/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "09",
+      "reason": "builds the three commands on the CLI's HTTP client, output and exit codes"
+    },
+    {
+      "spec": "34",
+      "reason": "lists, counts and forgets the remembered-resolution entries it stores, through the reads and the removal it exports, discards its scratch working trees at start with the operation it exports, and verifies the git limits on its rebuilds; through it uses the job queue of 33 and the patch store, route guard, integration branch accessor and git runner of 31"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "List the remembered resolutions of a workspace",
+      "criteria": [
+        "REQ-1.1",
+        "REQ-1.3",
+        "REQ-1.4"
+      ],
+      "steps": [
+        "Add the list behaviours to internal/carrypatch/rerere_test.go and confirm they fail; write the entries through the remembered-resolution entry store of package 34 (internal/carrypatch/rerere_entries.go) and their conflict directories directly into the rr-cache of a bare repository made with git init in t.TempDir()",
+        "In internal/carrypatch/rerere.go build the list on the reads package 34 exports: the entries of a workspace (id, path, recorded_at from the store) with resolved read from git for each id; keep no second record of an entry, in a file or in a table",
+        "List an entry with resolved false when the copy is missing or git cannot say whether a resolution exists for its id; never fail the list for that",
+        "Order the entries by recorded_at descending, then id ascending",
+        "Return no entries, without an error, when the workspace has no entry",
+        "Register GET /api/v1/workspaces/{slug}/rerere with the scope workspaces:read and read access, behind the carry-patch route guard of package 31 as a read route, the way package 31 registers its patch routes",
+        "Page the answer with the list helper of package 02 (limit, cursor, items never null, next_cursor null on the last page), with a cursor that encodes the position in the order above",
+        "Never start a git process that contacts a remote and never write to the store or the copy in this route"
+      ],
+      "touches": [
+        "internal/carrypatch/rerere.go",
+        "internal/carrypatch/rerere_test.go",
+        "internal/carrypatch/routes.go",
+        "internal/hub/"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "List the entries a rebuild records and resolves",
+      "criteria": [
+        "REQ-1.2"
+      ],
+      "steps": [
+        "Add the behaviour to internal/carrypatch/rerere_test.go with the real rebuild executor of package 34, a test upstream and a patch that conflicts in src/net/dial.go, and confirm it fails",
+        "Change nothing in the rebuild executor: package 34 writes the entry (id, path, recorded_at) when git records a conflict and updates recorded_at when a resolution is learned; this package only reads it",
+        "Confirm that after the first rebuild the list shows one entry with the conflicted file as path and resolved false",
+        "Confirm that after the later rebuild that sees the conflict resolved, the same id lists with resolved true, its path and a recorded_at that is not earlier"
+      ],
+      "touches": [
+        "internal/carrypatch/rerere.go",
+        "internal/carrypatch/rerere_test.go"
+      ],
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Forget remembered resolutions by id or by path",
+      "criteria": [
+        "REQ-2"
+      ],
+      "steps": [
+        "Add the forget behaviours to internal/carrypatch/rerere_test.go and confirm they fail",
+        "Register DELETE /api/v1/workspaces/{slug}/rerere/{pathspec...} with the scope workspaces:write and write access, behind the carry-patch route guard of package 31 as a write route; the pathspec is the percent-decoded remainder of the path and may contain slashes",
+        "Refuse an empty pathspec and one that starts with '-' with 400 invalid_request before the guard's mode and status checks and before anything is read",
+        "Read the entries as the list does; when the pathspec equals an entry's id select that entry alone; otherwise select every entry whose path equals the pathspec byte for byte",
+        "When nothing is selected answer 404 not_found with the message `resolution not found`",
+        "Remove each selected entry by its own id: its stored record through the removal package 34 exports, and git's record of it (the directory rr-cache/<id> of the copy) through a forget operation this task adds to internal/gitrepo/rerere.go and runs through the carry-patch git runner of package 31; never build a file path from the caller's value",
+        "Treat an entry that is already gone when it is removed as removed, so that two forgets at the same time answer 204 and 204 or 404, never 500",
+        "Answer 204 with no body; write no event, queue no rebuild, and touch no job, patch or ref",
+        "Verify with the real rebuild executor that a rebuild started after the forget of a resolved entry reports the patch as conflict and records the conflict again as unresolved"
+      ],
+      "touches": [
+        "internal/carrypatch/rerere.go",
+        "internal/carrypatch/rerere_test.go",
+        "internal/carrypatch/routes.go",
+        "internal/gitrepo/rerere.go",
+        "internal/gitrepo/rerere_test.go"
+      ],
+      "depends_on": [
+        2
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Answer the patch-status summary from stored state",
+      "criteria": [
+        "REQ-3"
+      ],
+      "steps": [
+        "Add the patch-status behaviours to internal/carrypatch/patchstatus_test.go and confirm they fail",
+        "Register GET /api/v1/workspaces/{slug}/patch-status with the scope workspaces:read and read access, behind the carry-patch route guard of package 31 as a read route",
+        "Fill workspace_slug, workspace_mode, status, git_url, upstream_url, integration_branch (read through IntegrationBranch of package 31, which holds the deploy fallback), clone_error, sync_error, upstream_head_sha and last_sync_at from the workspace record of package 10, null where unset",
+        "Fill integration_head_sha by resolving refs/heads/<that name> in the copy to a full commit id; null when the ref or the copy does not exist",
+        "Fill last_rebuild with the newest rebuild job of the workspace by created_at in any status, and last_completed_rebuild with the newest one whose status is completed, each as id, status, created_at, completed_at, or null; read them through the job queue of package 33",
+        "Fill patches with every non-deleted patch in position order from the patch store of package 31, with the nine members of the PRD's table; never page it",
+        "Compute last_rebuild_result for each patch as the status of its entry in the patch_results of the newest job, by created_at, that has an entry for that patch id; null when no job has one",
+        "Fill summary with the eight counts: non-deleted patches in total and by the four statuses, the number of remembered-resolution entries package 34 stores for the workspace, and the non-deleted patches whose origin_sync_state is diverged or missing_on_origin; every count present, 0 when nothing is counted",
+        "Start no git process that contacts a remote, write nothing, and answer in every workspace status, also without a copy"
+      ],
+      "touches": [
+        "internal/carrypatch/patchstatus.go",
+        "internal/carrypatch/patchstatus_test.go",
+        "internal/carrypatch/routes.go"
+      ],
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Refuse callers and workspaces the three routes do not serve",
+      "criteria": [
+        "REQ-4"
+      ],
+      "steps": [
+        "Add the refusal tables to internal/carrypatch/routes_access_test.go for the three routes and confirm which rows fail",
+        "Make sure each route declares its scope and access need to the server's middleware of package 02 and the access component of package 07, so that a missing scope answers 403 insufficient_scope before the workspace is looked up and a caller without access gets the 404 of an unknown slug",
+        "Make sure the member with read access only gets 403 forbidden on the DELETE and 200 on the two GET routes",
+        "Make sure all three routes answer 400 workspace_mode_mismatch for a standard workspace and for every task fork through the guard of package 31",
+        "Make sure the DELETE answers the status refusals of the guard (409 workspace_busy, workspace_not_ready, workspace_archived) and that the two GET routes answer in every status",
+        "Fix the order on the DELETE: pathspec validation, then workspace mode, then workspace status"
+      ],
+      "touches": [
+        "internal/carrypatch/routes.go",
+        "internal/carrypatch/routes_access_test.go"
+      ],
+      "depends_on": [
+        3,
+        4
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Add the rerere and patch-status commands to the CLI",
+      "criteria": [
+        "REQ-5"
+      ],
+      "steps": [
+        "Add the command behaviours to internal/cli/rerere_test.go and internal/cli/patchstatus_test.go against an httptest hub that records the raw request path, and confirm they fail",
+        "Declare the command group `rerere` with `list <workspace-slug>` and `forget <workspace-slug> <id-or-path>` through the command helper of package 09, each with exactly its arguments",
+        "`rerere list` sends GET /workspaces/:slug/rerere and prints the response through the output helper of package 09",
+        "`rerere forget` builds the request path by splitting the argument at slashes, percent-encoding each part as one segment and joining the parts with slashes again; it sends DELETE and on a 204 prints the JSON document with status forgotten and pathspec set to the argument as given",
+        "Attach `patch-status <workspace-slug>` to the `workspace` command group that package 10 creates; it sends GET /workspaces/:slug/patch-status and prints the response",
+        "Leave hub errors, usage errors and exit statuses to the helpers of package 09: a hub error goes to stderr as received with exit 1, a wrong number of arguments is a usage_error with exit 2 and no request"
+      ],
+      "touches": [
+        "internal/cli/rerere.go",
+        "internal/cli/rerere_test.go",
+        "internal/cli/patchstatus.go",
+        "internal/cli/patchstatus_test.go",
+        "internal/cli/root.go"
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Limit remote git operations to https and ssh and to 10 minutes",
+      "criteria": [
+        "REQ-6"
+      ],
+      "steps": [
+        "Add the transport behaviours to internal/gitrepo/safety_test.go and the time-limit behaviours to internal/carrypatch/gitlimit_test.go and confirm they fail",
+        "In internal/gitrepo/safety.go add the transport check: before git is started for an operation that contacts a remote, accept a URL of the form https://… , ssh://… or git@host:path and refuse every other form with an error that wraps ErrTransportRefused and names the scheme",
+        "Start every git process that contacts a remote with git's allowed protocols restricted to https and ssh in its environment, so that a redirect or a remote helper cannot leave them; keep the test certificate option of package 10's test origin working",
+        "Build on the carry-patch git runner of package 31 (internal/carrypatch/gitrun.go), through which every git operation of packages 31 to 38 runs: it gives each operation its own deadline of 10 minutes, replaceable by a test option, and on expiry stops the git process together with the processes it started and returns an error that wraps ErrGitTimeout; add the transport restriction of this task to it and change nothing else in it unless a check of this task fails",
+        "Confirm that the rebuild executor of package 34, which runs every git operation through that runner, ends an attempt whose operation passed the limit as a retryable failure with an error text that says the time limit was passed, and marks no patch as skipped, conflict or success",
+        "Add the carry-patch error mapper for the request handlers of this package and the test route of the time-limit check: ErrGitTimeout answers 500 internal; packages 35 and 36 do not depend on this package and map the runner's error themselves (preview to 500 internal, sync through its hook's error), so nothing is exported to them",
+        "Leave the shorter deadlines other packages set on single fetches as they are: the runner applies the smaller of the caller's deadline and its own",
+        "Verify that the limit is per operation with a rebuild whose delayed operations each stay under a shortened limit while their sum passes it"
+      ],
+      "touches": [
+        "internal/gitrepo/safety.go",
+        "internal/gitrepo/safety_test.go",
+        "internal/carrypatch/gitrun.go",
+        "internal/carrypatch/gitlimit_test.go",
+        "internal/carrypatch/"
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Keep credentials out of git text and caller values out of git options",
+      "criteria": [
+        "REQ-7"
+      ],
+      "steps": [
+        "Add the text and argument behaviours to internal/gitrepo/safety_test.go and the end-to-end credential behaviour to internal/carrypatch/gitsafety_test.go and confirm they fail",
+        "Complete SanitizeGitText, which package 31 put into internal/gitrepo/safety.go for its runner: it replaces the user information of every URL in a text by `***@`, removes every given credential value wherever it occurs, leaves the git@host:path form and plain mail addresses alone, and gives the same result when applied twice",
+        "Confirm that the runner of package 31 applies it to the output of every failed git operation before the text becomes an error, with the credential values that were resolved for that operation, so that API error messages, job error texts and event metadata built from the error carry `***@` and no credential",
+        "Keep handing credentials to git outside the URL and the argument list, as package 10 does, so that they are not visible in a process listing or in git's own messages",
+        "Add the argument guard: every exported operation of internal/gitrepo that carry-patch code calls with a caller-supplied branch name, commit id or path refuses a value that begins with '-' with an error that wraps ErrInvalidArgument, before a process is started",
+        "Pass every accepted value to git in a position where git reads it as a revision, a ref or a path: after the end-of-options marker for revisions, as a full ref name for branches, and after the path separator for paths",
+        "Verify with an upstream that echoes the received credential in its 401 answer that the value is in neither the job error, nor any event, nor the log buffer, nor an API error body"
+      ],
+      "touches": [
+        "internal/gitrepo/safety.go",
+        "internal/gitrepo/safety_test.go",
+        "internal/carrypatch/gitrun.go",
+        "internal/carrypatch/gitsafety_test.go"
+      ],
+      "depends_on": [
+        7
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Discard at start what an interrupted rebuild left in the repositories",
+      "criteria": [
+        "REQ-8"
+      ],
+      "steps": [
+        "Add the start behaviours to internal/carrypatch/recovery_test.go with the real job queue of package 33 and the real executor of package 34, and confirm they fail",
+        "Write no queue behaviour here: returning running jobs to queued at start, stopping claims at shutdown and the 30-second grace are package 33's (its Recover start hook and its Run background work), with their criteria",
+        "In internal/carrypatch/recovery.go add the start work: for every carry-patch workspace call the exported operation of internal/gitrepo/scratch.go with which the rebuild executor of package 34 discards scratch working trees (it removes every entry under <repository>/parley-rebuild/ and prunes the working-tree list); the executor creates no ref for a run, so no ref is deleted; never touch refs/heads, refs/remotes or refs/parley/replaced",
+        "Run the operation through the carry-patch git runner of package 31",
+        "Log a leftover that cannot be removed and a workspace whose copy is missing with the workspace's slug, go on with the next workspace and return no error",
+        "Register the start work as a start hook on the composition of internal/hub, beside the Recover hook of package 33, so that it has finished before the job workers start as background work",
+        "Verify on a second hub over the same store and repository that a job interrupted by a stop, once the queue of package 33 has returned it to queued, runs from the first patch again and publishes once"
+      ],
+      "touches": [
+        "internal/carrypatch/recovery.go",
+        "internal/carrypatch/recovery_test.go",
+        "internal/hub/"
+      ],
+      "depends_on": [
+        8
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Purge patches that have been deleted for more than 7 days",
+      "criteria": [
+        "REQ-9"
+      ],
+      "steps": [
+        "Add the purge behaviours to internal/carrypatch/purge_test.go with a fake clock and confirm they fail",
+        "In internal/carrypatch/purge.go add the task: select, over all workspaces whatever their status, the patches with status deleted whose deleted_at is more than 7 days before the clock's now; a patch deleted exactly 7 days ago is not selected",
+        "For each selected patch open one store transaction and remove the record only if it still has status deleted and is still due; when no row was removed (a restore came first) leave the backup ref alone and go on",
+        "Inside the same transaction, when no non-deleted patch of the workspace uses the branch, delete refs/parley/replaced/<branch> in the copy through internal/gitrepo; a workspace without a copy, or a ref that does not exist, counts as deleted; then commit",
+        "When the ref deletion or the store write fails, roll the transaction back, log the workspace's slug and the patch id, go on with the remaining patches and return an error at the end of the pass so that the maintenance loop logs the task as failed",
+        "Never delete refs/heads/<branch>, never renumber positions (deleted patches have none) and write no event",
+        "Register the task under the name patch_purge with the maintenance task registry of package 03 on the composition of internal/hub",
+        "Add a test hook between selection and removal so that the check of a restore at the same moment can restore the patch in between"
+      ],
+      "touches": [
+        "internal/carrypatch/purge.go",
+        "internal/carrypatch/purge_test.go",
+        "internal/hub/"
+      ]
+    }
+  ]
+}

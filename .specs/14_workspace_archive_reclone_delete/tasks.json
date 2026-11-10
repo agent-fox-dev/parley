@@ -1,0 +1,266 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "14",
+  "spec_name": "workspace_archive_reclone_delete",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/workspace/... ./internal/gitrepo/... ./internal/cli/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "08",
+      "reason": "wires RevokeBoundTo of that package as the token revoker of the removal step, so that the delete events name the revoked tokens"
+    },
+    {
+      "spec": "09",
+      "reason": "builds its CLI commands on the client, output and exit-code helpers of the CLI foundation"
+    },
+    {
+      "spec": "10",
+      "reason": "uses the workspace record, the state guard's maintenance marker, the clone-work entry point, origin credential resolution and the copy operations of internal/gitrepo that package 10 delivers"
+    },
+    {
+      "spec": "11",
+      "reason": "waits and smoke checks read the workspace through GET /workspaces/:slug"
+    },
+    {
+      "spec": "13",
+      "reason": "uses the push mode of the test origin (SmartOrigin) with its switches to refuse an update and to stall, which that package adds to internal/gitrepo/gitrepotest"
+    },
+    {
+      "spec": "52",
+      "reason": "emits its hub events through the event log component"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Offer every branch to origin as a fast-forward safety copy",
+      "criteria": [
+        "REQ-2.1",
+        "REQ-2.2",
+        "REQ-2.3",
+        "REQ-2.4"
+      ],
+      "steps": [
+        "Add the behaviours of the safety copy to internal/workspace/safetycopy_test.go and internal/gitrepo/pushall_test.go and confirm they fail; use the one test origin helper of the repository, internal/gitrepo/gitrepotest of package 10, in the push mode (SmartOrigin) and with the refuse and stall switches that package 13 added; extend the helper no further here",
+        "In internal/gitrepo add an operation that pushes a given list of branches of a bare copy to the same-named branches of a remote URL in one git subprocess, without force, without tags and without deletions, with the credential passed the way package 10 passes it to git, and that returns one result for each branch: pushed, up to date or rejected",
+        "Make the operation honour its context: when the context ends, the git subprocess is stopped and the results gathered so far are returned",
+        "In internal/workspace add the safety copy: list the branches under refs/heads/ of the workspace's copy, drop the integration branch when workspace_mode is carry_patch, resolve the origin credential from the workspace's secrets through package 10's resolver, and call the push operation under a 2-minute deadline that tests can shorten",
+        "When the workspace has no copy on disk (status failed), offer nothing and report ok without calling git",
+        "When the credential cannot be read, do not call git and report failed; never fall back to an anonymous push",
+        "Reduce the per-branch results to one outcome: ok, partial or failed, by the table in the PRD; a connection or authentication failure with no accepted branch is failed",
+        "For every accepted branch, set refs/remotes/origin/<name> of the hub's copy to the pushed commit with SetOriginHead of internal/gitrepo (package 10); leave the origin heads of refused branches as they are",
+        "Return the outcome and never an error to the caller; log a failure with the slug after passing the text through the hub's scrubber"
+      ],
+      "touches": [
+        "internal/gitrepo/pushall.go",
+        "internal/gitrepo/pushall_test.go",
+        "internal/workspace/safetycopy.go",
+        "internal/workspace/safetycopy_test.go"
+      ],
+      "done_when": [
+        "`go test ./internal/gitrepo/... ./internal/workspace/... -count=1` passes with a real `git` on the PATH"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Archive a repository workspace",
+      "criteria": [
+        "REQ-3.1",
+        "REQ-3.2",
+        "REQ-3.3",
+        "REQ-3.4",
+        "REQ-3.5",
+        "REQ-2.5"
+      ],
+      "steps": [
+        "Add the archive behaviours to internal/workspace/archive_test.go and confirm they fail",
+        "Add the set and release side of the maintenance marker in internal/workspace/maintenance.go: an in-memory entry for each slug that package 10's state guard reads; setting it fails when it is already set; a helper runs a function with the marker held and always releases it",
+        "Register POST /api/v1/workspaces/{slug}/archive with the scope workspaces:write and write access through the access component, as package 10 registers its routes; ignore any request body",
+        "Refuse in this order: a fork with 400 not_supported_on_fork; a set marker with 409 workspace_busy; status archived with 409 workspace_archived; status pending or cloning with 409 workspace_busy",
+        "With the marker held, run the safety copy, then in one store transaction set status archived, clear clone_error and write parley.workspace.archive through the event component with metadata head_sha, origin_push and forks (the count of fork records whose parent is the workspace)",
+        "When the transaction fails, answer 500 internal and leave the status as it was",
+        "Answer 200 with the workspace response object built the way package 10 builds it",
+        "Do not open, change or remove the copy in the archive path apart from the safety copy's read of its branches",
+        "Detach the work from the request's cancellation once the checks have passed, so that a caller who disconnects does not stop it"
+      ],
+      "touches": [
+        "internal/workspace/maintenance.go",
+        "internal/workspace/archive.go",
+        "internal/workspace/archive_test.go",
+        "internal/workspace/safetycopy_test.go"
+      ],
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 3,
+      "title": "End sessions and notify observers when a workspace is archived",
+      "criteria": [
+        "REQ-3.6",
+        "REQ-3.7",
+        "REQ-3.8"
+      ],
+      "steps": [
+        "Add the session and observer behaviours to internal/workspace/archive_test.go and confirm they fail",
+        "In internal/workspace/teardown.go define the collaborators other packages supply, as one set (Teardown) that the hub's composition fills at start and of which an empty one is valid: SandboxRemover (takes the slugs), TokenRevoker (takes the transaction and slugs and returns the ids of the tokens it revoked), Remover of owned data (takes the transaction and one slug and returns an error), SessionCloser (takes the transaction, the slugs and a reason), ArchiveObserver (takes the slug and the fork slugs) and ForkRemover",
+        "Declare ForkRemover as the one interface between this package and package 16, with two methods: DeleteFork(ctx, slug, caller), which serves DELETE for a fork and returns nil or an API error, and RemoveForksOf(ctx, transaction, parent slug, actor), which removes every fork of a parent inside the parent's delete transaction, writes each fork's parley.workspace.delete event and returns the removed slugs and a function that discards the forks' repository data after the commit",
+        "Export RemoveOwned(ctx, transaction, slug, reason): it calls the token revoker for the slug, every remover of owned data in registration order and the session closer with the slug and the reason, and returns the revoked token ids sorted ascending; the removal step of this package and the fork removal of package 16 both remove a workspace's owned data through it and through nothing else",
+        "Inside the archive's transaction call the session closer with the slugs of the workspace and of all its forks and the reason `workspace archived`, under a savepoint",
+        "When the closer returns an error, roll back to the savepoint, log the error with the slug, and commit the archive",
+        "After the commit call every archive observer in registration order; log an observer's error and go on to the next",
+        "Call no observer and no closer when the archive is refused",
+        "Build the set on the composition value of internal/hub (package 03), in internal/hub/workspace.go and not in cmd/parleyd, and pass it into the workspace component, so that later packages register theirs from their own internal/hub/<area>.go; register there the collaborators of the packages this one depends on: RevokeBoundTo of package 08 as the token revoker and secret.RemoveWorkspace of package 39 (reached through package 10; package 39 cannot depend on this package and does not register itself) as a remover of owned data; the other removers register themselves: variables (40), forge deliveries (43), event webhooks (53), sessions (49), sandboxes and sandbox rules (47, 48), changes (22), policy (27), claims (30), patches, jobs and rerere records (31, 33, 34)"
+      ],
+      "touches": [
+        "internal/workspace/teardown.go",
+        "internal/workspace/archive.go",
+        "internal/workspace/archive_test.go",
+        "internal/hub/workspace.go"
+      ],
+      "depends_on": [
+        2
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Reactivate an archived workspace",
+      "criteria": [
+        "REQ-4"
+      ],
+      "steps": [
+        "Add the reactivate behaviours to internal/workspace/reactivate_test.go and confirm they fail",
+        "Register POST /api/v1/workspaces/{slug}/reactivate with the scope workspaces:write and write access; ignore any request body",
+        "Refuse in this order: a fork with 400 not_supported_on_fork; a set marker with 409 workspace_busy; any status other than archived with 409 workspace_not_archived",
+        "In one transaction set status pending, clear clone_error and write parley.workspace.reactivate with empty metadata; on failure answer 500 internal with the status still archived",
+        "After the commit wake the clone workers through package 10's entry point and answer 200 with the workspace response object",
+        "Cover with the real clone workers that a valid kept copy leads to ready without a request to origin, and that a removed or damaged copy leads to a fresh clone in which hub-only commits are absent"
+      ],
+      "touches": [
+        "internal/workspace/reactivate.go",
+        "internal/workspace/reactivate_test.go"
+      ],
+      "depends_on": [
+        2
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Reclone a repository workspace",
+      "criteria": [
+        "REQ-5"
+      ],
+      "steps": [
+        "Add the reclone behaviours to internal/workspace/reclone_test.go and confirm they fail",
+        "Register POST /api/v1/workspaces/{slug}/reclone with the scope workspaces:write and write access; ignore any request body",
+        "Refuse in this order: a fork with 400 fork_has_no_origin; a set marker with 409 workspace_busy; status archived with 409 workspace_archived; status pending or cloning with 409 workspace_busy; at least one fork record with 409 has_forks",
+        "With the marker held, run the safety copy",
+        "In one transaction set status pending, clear sync_error and origin_head_sha, replace the record's instance id (package 10 compares it when it checks an existing copy), and write parley.workspace.reclone with metadata origin_push; leave head_sha, default_branch and last_sync_at as they are",
+        "When the transaction fails answer 500 internal and leave the record and the copy as they were",
+        "After the commit remove the copy from disk through internal/gitrepo, which removes the origin heads (refs/remotes/origin/*) with it, then wake the clone workers through package 10's entry point; keep the removal step replaceable in tests, so that a stop between commit and removal can be reproduced",
+        "Answer 200 with the workspace response object; detach the work from the request's cancellation once the checks have passed",
+        "Call no remover of owned data: change records and every other package's data stay"
+      ],
+      "touches": [
+        "internal/workspace/reclone.go",
+        "internal/workspace/reclone_test.go"
+      ],
+      "depends_on": [
+        2
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Delete an archived workspace with its forks in one step",
+      "criteria": [
+        "REQ-6.1",
+        "REQ-6.2",
+        "REQ-6.5",
+        "REQ-6.6",
+        "REQ-6.7",
+        "REQ-7"
+      ],
+      "steps": [
+        "Add the delete behaviours to internal/workspace/delete_test.go and confirm they fail; the tests register stub collaborators that record their calls and write test rows through the transaction they are given",
+        "Register DELETE /api/v1/workspaces/{slug} with the scope workspaces:write and write access",
+        "For a repository workspace refuse a set marker with 409 workspace_busy and any status other than archived with 409 workspace_not_archived",
+        "With the marker held, collect the slugs of the forks in ascending order and call the sandbox remover with the workspace's slug and theirs; on its error answer 500 internal and change nothing",
+        "Run the removal step as one store transaction: when a fork remover is registered call its RemoveForksOf with the transaction, the workspace's slug and the caller, and keep the slugs and the discard function it returns; otherwise, for each fork in ascending slug order, call RemoveOwned with the reason `workspace deleted`, delete the fork's record with its settings and write its event; then do the same three things for the workspace itself",
+        "Fill each parley.workspace.delete event this package writes with kind, parent_slug and revoked_tokens (the ids RemoveOwned returned for that slug, an empty list when none), and the workspace's event, written last, also with deleted_forks: the fork slugs sorted ascending, taken from RemoveForksOf when a fork remover is registered",
+        "On any error inside the step roll the transaction back, answer 500 internal and leave the repository data in place",
+        "After the commit discard the workspace's repository data through internal/gitrepo and call the discard function a fork remover returned; never call it after a rollback; log a failure with the slug and the path and still answer 204",
+        "Answer 204 with an empty body; delete no row of the event log or of the audit store",
+        "Detach the work from the request's cancellation once the checks have passed"
+      ],
+      "touches": [
+        "internal/workspace/delete.go",
+        "internal/workspace/delete_test.go",
+        "internal/workspace/teardown.go"
+      ],
+      "depends_on": [
+        3
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Hold exclusive maintenance and the access rules across the four routes",
+      "criteria": [
+        "REQ-1",
+        "REQ-6.3",
+        "REQ-6.4"
+      ],
+      "steps": [
+        "Add the shared behaviours to internal/workspace/maintenance_test.go and the fork hand-off to internal/workspace/delete_test.go and confirm which fail",
+        "Make DELETE on a fork slug call DeleteFork of the registered fork remover with the slug and the caller, after the scope and access checks of the route, and answer 204 with an empty body when it returns nil and its API error unchanged otherwise; answer 500 internal when no fork remover is registered; do not run the removal step of a repository workspace for a fork",
+        "Check that archive, reactivate, reclone and delete each answer 409 workspace_busy while the marker of their workspace is set, for every stored status, and that package 10's state guard reports busy for it",
+        "Make setting the marker atomic, so that of two calls arriving together one runs and the other answers 409 workspace_busy; calls on different workspaces do not wait for each other",
+        "Release the marker on every way out of archive, reclone and delete: success, refusal after it was set, failed transaction, failed collaborator and a panic that the server's recovery turns into 500",
+        "Check on all four routes that an organization member gets 403 forbidden whatever the status, a caller with no access and an unknown slug get the same 404 not_found, a token without workspaces:write gets 403 insufficient_scope, and that none of these contacts origin or a collaborator",
+        "Check for archive, reclone and delete that a request whose context is cancelled after the checks still ends in the same stored state as a connected one"
+      ],
+      "touches": [
+        "internal/workspace/maintenance.go",
+        "internal/workspace/maintenance_test.go",
+        "internal/workspace/delete.go",
+        "internal/workspace/delete_test.go",
+        "internal/workspace/archive.go",
+        "internal/workspace/reactivate.go",
+        "internal/workspace/reclone.go"
+      ],
+      "depends_on": [
+        4,
+        5,
+        6
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Add the archive, reactivate, reclone and delete commands to the CLI",
+      "criteria": [
+        "REQ-8"
+      ],
+      "steps": [
+        "Add the command behaviours to internal/cli/workspace_test.go against an httptest server and confirm they fail",
+        "Add `parley workspace archive <slug>`: POST to the archive route with a request timeout of 3 minutes; print the workspace",
+        "Add `parley workspace reactivate <slug>` with --wait, --timeout and --poll-interval: POST to the reactivate route with the default request timeout; print the workspace",
+        "Add `parley workspace reclone <slug>` with --confirm, --wait, --timeout and --poll-interval: POST to the reclone route with a request timeout of 3 minutes; print the workspace",
+        "Add `parley workspace delete <slug>` with --confirm: send DELETE and print the confirmation document with status deleted and the slug",
+        "Make reclone and delete without --confirm, or with it set to false, end with a usage error and exit code 2 before any request is sent",
+        "With --wait on reactivate and reclone, use the CLI's shared waiting helper of package 09 as `workspace create` does: poll GET on the workspace, terminal states ready (exit 0) and failed (exit 1 with wait_failed)",
+        "Add the three end-to-end tests of this package to test/e2e/workspace_retire_test.go: archive and reactivate, delete with a fork and re-registration of the slug, reclone with a refused branch"
+      ],
+      "touches": [
+        "internal/cli/workspace.go",
+        "internal/cli/workspace_test.go",
+        "test/e2e/workspace_retire_test.go"
+      ],
+      "depends_on": [
+        7
+      ]
+    }
+  ]
+}

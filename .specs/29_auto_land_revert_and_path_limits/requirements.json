@@ -1,0 +1,721 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "29",
+  "spec_name": "auto_land_revert_and_path_limits",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Start an automatic land when a change becomes landable",
+      "rationale": "An agent sets auto_land and walks away; the hub lands the change as soon as policy is satisfied, with the permissions of the user who asked (LAND-FR-060).",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "an open change with auto_land true becomes landable (landing.status ready and mergeable clean) and the user who set the flag may land it",
+          "action": "start one land attempt for that change alone with trigger auto_land, without stack, without override and with session_id null",
+          "contract": "a land attempt exists with trigger \"auto_land\", changes [<number>], override null, session_id null and requested_by {actor_type: the credential type the flag was set with, actor_id and username of the user who set it}; the parley.change.land or parley.change.land_fail event of the attempt has actor_type \"system\" and actor_id null",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a workspace whose policy requires the check test, with a real repository created by git init in t.TempDir()",
+              "an open change with auto_land true and the check not yet reported"
+            ],
+            "pseudocode": "in internal/land/autoland_test.go, a table over the setter {workspace owner with an API key, org member who authored the change with land.by_author true and a PAT, admin token}: report the check passed so that the re-evaluation writes one parley.change.ready; wait for the attempt; run the lander's pass over the event log twice; assert lands(change) has exactly one attempt with trigger == 'auto_land', changes == [n], override == nil, session_id == nil, requested_by matching the setter; assert change.state == 'landed'; assert the parley.change.land event has actor_type == 'system' and metadata.trigger == 'auto_land'"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "unwanted",
+          "condition": "a change with auto_land true becomes landable and the user who set the flag may not land it at that moment (the user is deleted, the user is blocked, the user lost write access and is not the author, or the user is the author without write access and land.by_author is false)",
+          "action": "create no land attempt, clear the flag and emit one parley.change.land_fail event on the change",
+          "contract": "the change stays open with auto_land false; no land attempt is recorded; exactly one parley.change.land_fail event with actor_type \"system\" and metadata {land_id: null, status: \"blocked\", reason: \"not_permitted\"}; the target branch is unchanged",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/land/autoland_test.go, a table over the four causes: set the flag while permitted, apply the cause, make the change landable; assert lands(change) is empty; assert change.auto_land == false and change.state == 'open'; assert one land_fail event with reason 'not_permitted', status 'blocked', land_id nil, actor_type 'system'; assert head(target) is unchanged"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "unwanted",
+          "condition": "the `parley.change.ready` event of a change is handled and by then the change is not open, its auto_land is false, it is no longer landable, or a land attempt for it is running",
+          "action": "start no land attempt and leave the flag as it is",
+          "contract": "no new land attempt is recorded, auto_land keeps its value and no event is emitted by the automatic lander",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/land/autoland_test.go, a table over {abandoned change, flag false, landing.status pending, mergeable conflict, an attempt already running} with a stub land component that counts starts: deliver the announcement; assert starts == 0; assert the flag is unchanged; assert no event was written"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "event_driven",
+          "condition": "auto_land is set to true on a change that is already landable",
+          "action": "start an automatic land attempt for it as for a change that has just become landable",
+          "contract": "one land attempt with trigger \"auto_land\" exists for the change without any further change to its policy status or mergeability",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/land/autoland_test.go: open a change that is ready and clean with auto_land false; PATCH it with {auto_land: true}; wait; assert one attempt with trigger 'auto_land' and change.state == 'landed'"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "event_driven",
+          "condition": "parleyd starts and a change is landable with auto_land true and no running land attempt",
+          "action": "start an automatic land attempt for that change",
+          "contract": "after start-up one land attempt with trigger \"auto_land\" exists for each such change and none for any other change",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/land/autoland_test.go: with the automatic lander not running, make change A landable with the flag on and change B landable with the flag off; start the lander on the same store; wait; assert A has one attempt with trigger 'auto_land'; assert B has none"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Keep, retry or clear auto_land by the outcome of the attempt",
+      "rationale": "A conflict or a policy block waits for the author; a transient failure is retried without anyone watching, and not forever (LAND-FR-061).",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "an automatic land attempt ends conflict or blocked",
+          "action": "leave auto_land on, schedule no retry, and start a new attempt the next time the change becomes landable",
+          "contract": "auto_land stays true; no further land attempt is recorded while the change is not landable, however much time passes; one new attempt with trigger \"auto_land\" is recorded after the change becomes landable again",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a fake clock",
+              "a change with auto_land true whose automatic attempt ends conflict because another change landed first on the same lines"
+            ],
+            "pseudocode": "in internal/land/autoland_test.go: assert change.auto_land == true and len(lands) == 1; advance the clock 1 hour; assert len(lands) == 1; push a version that resolves the conflict so the change becomes landable; wait; assert len(lands) == 2 and change.state == 'landed'. Second case with a stub land component that ends 'blocked': same assertions up to the advance"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "event_driven",
+          "condition": "an automatic land attempt ends failed and fewer than 10 retries have been made since the last attempt that did not end failed",
+          "action": "start a new automatic land attempt after a delay that is 2 seconds for the first retry and doubles for each further retry up to 300 seconds",
+          "contract": "the delays before retries 1 to 10 are 2, 4, 8, 16, 32, 64, 128, 256, 300 and 300 seconds; each retry is a new land attempt with trigger \"auto_land\"; auto_land stays true",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a fake clock",
+              "a stub land component whose attempts end failed with error contention"
+            ],
+            "pseudocode": "in internal/land/autoland_test.go: start the first attempt; for each expected delay d in [2,4,8,16,32,64,128,256,300,300] seconds: advance the clock by d minus 1 ms and assert no new start; advance 1 ms and assert exactly one new start; assert the flag is still true while the tenth retry runs; when the tenth retry ends failed assert 11 starts in all, the flag is false, and advancing the clock 1 hour brings no further start"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "unwanted",
+          "condition": "the tenth retry of an automatic land also ends failed",
+          "action": "clear auto_land and start no further attempt",
+          "contract": "11 land attempts with trigger \"auto_land\" and status failed are recorded for the change; auto_land is false; no retry is pending; the change stays open",
+          "check": {
+            "same_as": "REQ-2.2"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "unwanted",
+          "condition": "a retry comes due and the change is not open, its auto_land is false or it is not landable",
+          "action": "drop the retry and set the retry count to zero",
+          "contract": "no land attempt is started at the due time; auto_land keeps its value; a later failed series for the change starts again with a 2-second delay",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a fake clock",
+              "a stub land component"
+            ],
+            "pseudocode": "in internal/land/autoland_test.go, a table over {change abandoned, flag set to false by PATCH, mergeable turned conflict} applied after the third failed attempt: advance past the due time; assert no new start; make the change landable again with the flag on and let the attempt fail; assert the next retry starts after 2 seconds"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "event_driven",
+          "condition": "an automatic land attempt ends with a status other than failed",
+          "action": "set the retry count of the change to zero",
+          "contract": "the first retry after the next failed attempt is delayed 2 seconds, whatever the count was before",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/land/autoland_test.go with a fake clock and a stub land component: let attempts end failed, failed, conflict; make the change landable again and let the attempt end failed; assert the next start comes 2 seconds later, not 8"
+          }
+        },
+        {
+          "id": "REQ-2.6",
+          "pattern": "event_driven",
+          "condition": "parleyd starts while a retry of an automatic land is pending",
+          "action": "make that retry at its due time, or at once when the due time has passed, with the stored retry count",
+          "contract": "exactly one new land attempt with trigger \"auto_land\" is started for the change, and the delay after it, should it fail, continues the stored sequence",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/land/autoland_test.go with a fake clock and a real store: let two attempts fail so a retry is pending 4 seconds out; stop the lander; advance 10 seconds; start a new lander on the same store with a stub land component that fails; assert one start at once; assert the following retry is due 8 seconds later"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Land a stack automatically from the bottom up",
+      "rationale": "A change cannot land before the change it depends on, so automatic landing waits for the one below (LAND-FR-062).",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "state_driven",
+          "condition": "the depends_on of a change with auto_land true names a change that is not landed",
+          "action": "start no automatic land attempt for the change and leave its flag on",
+          "contract": "no land attempt is recorded for the upper change, its auto_land stays true and no parley.change.land_fail event is emitted for it",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a stack of two changes; the upper has auto_land true and is ready and clean; the lower has auto_land false"
+            ],
+            "pseudocode": "in internal/land/autoland_test.go: deliver the landable announcement of the upper change; assert lands(upper) is empty; assert upper.auto_land == true; assert no land_fail event for upper"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "event_driven",
+          "condition": "the change below has landed and the dependant with auto_land true, restacked by the hub, becomes landable",
+          "action": "start an automatic land attempt for the dependant",
+          "contract": "the dependant ends landed by an attempt with trigger \"auto_land\" created after the lower change's attempt finished; the target branch holds the lower change's commits below the dependant's",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a stack of two changes, both with auto_land true, both waiting for the check test"
+            ],
+            "pseudocode": "in internal/land/autoland_test.go: report the check passed on the upper change first, then on the lower; wait until both are landed; assert each change has its own attempt with len(changes) == 1; assert lowerAttempt.finished_at <= upperAttempt.created_at; assert git log of the target lists the lower change's commit before the upper's"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "ubiquitous",
+          "action": "for any land attempt with trigger auto_land, land exactly one change and never a stack",
+          "check": {
+            "same_as": "REQ-3.2"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Revert a landed change with one call",
+      "rationale": "When something breaks after landing, a developer needs the undo as an ordinary change, without a clone (LAND-FR-070, LAND-FR-071).",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "a caller who may revert sends POST /api/v1/workspaces/:slug/changes/:number/revert with an empty body for a landed change",
+          "action": "build on the head of the original's target branch one commit per landed commit of the original, newest landed commit first, each undoing that commit, create the branch revert/<number> at the last of them and open a change from that branch to the original's target branch",
+          "contract": "HTTP 201 with the new change object: reverts == <number>, source {workspace_slug: <slug>, branch: \"revert/<number>\"}, target_branch equal to the original's, state \"open\", author the caller, version 1 of kind \"revert\", title `Revert \"<original title>\"` cut to 200 characters, intent `Reverts change <slug>#<number>: <original title>.`; each reverting commit has the subject `Revert \"<subject>\"`, the body `This reverts commit <40-character id>.` and the hub's landing identity as author and committer; the tree of the branch head equals the tree the target had before the original landed when nothing else landed since",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a workspace with a real repository; a change with two commits landed with strategy rebase",
+              "a second case landed with strategy squash"
+            ],
+            "pseudocode": "in internal/land/revert_test.go: before = tree(target before landing); r = POST revert {}; assert r.status == 201; c = r.json; assert c.reverts == n, c.source.branch == 'revert/' + n, c.target_branch == orig.target_branch, c.state == 'open', c.title == 'Revert \"' + orig.title + '\"', c.intent names orig; assert versions(c)[0].kind == 'revert'; assert git log revert/n has 2 commits (1 for squash) on top of the target head, undoing the newest landed commit first, with the revert subject, body and the configured committer; assert tree(revert/n) == before. A row with a 200-character original title asserts len(c.title) == 200"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "event_driven",
+          "condition": "the revert request carries title, intent, draft, auto_land or session_id",
+          "action": "open the reverting change with the given title and intent, as a draft when draft is true, with auto_land set by the caller when auto_land is true, and linked to the given session",
+          "contract": "HTTP 201; the change has the given title and intent; with draft true its state is \"draft\" and no parley.change.open event is written; with auto_land true its auto_land is true and the caller is the user who set it; session_id is the given id",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/land/revert_test.go, a table over bodies {title+intent, draft true, auto_land true, session_id of a session of the caller}: assert 201 and the corresponding fields; for draft assert no parley.change.open event; for auto_land in a workspace with the default policy assert the reverting change is landed by an attempt with trigger 'auto_land'"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "event_driven",
+          "condition": "the branch revert/<number> already exists in the target workspace when a revert is accepted",
+          "action": "create the branch under the first free name among revert/<number>-2, revert/<number>-3 and so on",
+          "contract": "HTTP 201 with source.branch \"revert/<number>-2\" when only revert/<number> exists and \"revert/<number>-3\" when revert/<number>-2 exists too; the existing branches are not moved",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/land/revert_test.go: create branch revert/7 by hand; revert change 7; assert source.branch == 'revert/7-2' and head(revert/7) unchanged; abandon that change, keep its branch, revert again; assert source.branch == 'revert/7-3'"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "event_driven",
+          "condition": "a revert has opened its change",
+          "action": "record the events of the revert and show the reverting change on the original",
+          "contract": "the original change reads reverted_by == <new number>; one parley.change.revert event on the original with the caller as actor and metadata {reverted_by: <new number>}; one parley.change.version event with kind \"revert\" on the new change and, unless it is a draft, one parley.change.open; one parley.git.push event for refs/heads/revert/<number> with created true and via \"api\"",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/land/revert_test.go: revert change n; assert GET change n has reverted_by == m; read the event log after the call; assert the four events with those fields, resource_id n for the revert event and m for the version and open events"
+          }
+        },
+        {
+          "id": "REQ-4.5",
+          "pattern": "unwanted",
+          "condition": "a revert request is malformed or cannot apply: a body member of the wrong type, a title that is not 1 to 200 characters or has a line break, an intent over 16,000 characters, a session_id that fails the session-linking rule, an archived target workspace, a change that is not landed, a change that a draft, open or landed change already reverts, a target branch that no longer exists, or nothing to undo (the original landed with noop true or every reverting commit would be empty)",
+          "action": "refuse the request with the first failing case in that order and create nothing",
+          "contract": "HTTP 400 invalid_request; 400 unknown_session; 409 workspace_archived; 409 change_not_landed; 409 already_reverted with details.reverted_by the number of the reverting change; 400 target_not_found; 400 nothing_to_land, in that order of cases; in every case no branch, no change, no version and no event is created",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/land/revert_test.go, a table with one row per case (for change_not_landed: draft, open and abandoned originals; for already_reverted: a draft, an open and a landed reverter): r = POST revert; assert r.status and r.json.error.error_type; for already_reverted assert details.reverted_by; assert refs, the change count and the event log are unchanged. One more row combines an invalid title with an unlanded change and asserts invalid_request"
+          }
+        },
+        {
+          "id": "REQ-4.6",
+          "pattern": "unwanted",
+          "condition": "a landed commit of the original change can no longer be undone on the current head of the target branch",
+          "action": "refuse the revert with a conflict report and create nothing",
+          "contract": "HTTP 409 with error_type revert_conflict and details.conflict a conflict report whose target_sha is the target head, whose commit_sha is the landed commit that could not be undone and whose files list is not empty; no branch, no change and no event is created",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "change 1 landed; change 2, landed later, rewrote the same lines"
+            ],
+            "pseudocode": "in internal/land/revert_test.go: r = POST revert of change 1; assert r.status == 409 and error_type == 'revert_conflict'; rep = r.json.error.details.conflict; assert rep.target_sha == head(target), rep.commit_sha == landed commit of change 1, rep.files[0].path == the rewritten file and kind == 'content'; assert no ref named revert/1 and no new change"
+          }
+        },
+        {
+          "id": "REQ-4.7",
+          "pattern": "ubiquitous",
+          "action": "for any change, report as reverted_by the highest-numbered change that reverts it and is draft, open or landed, and null when there is none",
+          "contract": "reverted_by on the change object; an abandoned reverting change does not count, so a new revert of the original is accepted",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/land/revert_test.go: revert change n giving m; assert n.reverted_by == m; abandon m; assert n.reverted_by == nil; revert n again giving k with 201; assert n.reverted_by == k"
+          }
+        },
+        {
+          "id": "REQ-4.8",
+          "pattern": "event_driven",
+          "condition": "a landed reverting change is itself reverted and that second reverting change lands",
+          "action": "accept the revert and restore the content the original change landed",
+          "contract": "HTTP 201 for the revert of the reverting change; after its change lands, the tree of the target branch equals the tree it had directly after the original change landed",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/land/revert_test.go: land A; after = tree(target); revert A and land the result B; revert B (assert 201, reverts == B) and land the result C; assert tree(target) == after"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Decide who may revert",
+      "rationale": "Reverting follows the rule for landing, and a fork token must not undo work on its parent (LAND-FR-072, LAND-FR-003).",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "unwanted",
+          "condition": "the caller of the revert route may not revert: a PAT without changes:write, a caller with read access who is neither a writer of the target workspace nor the original's author, the original's author without write access while land.by_author is false, a token bound to a fork of the workspace, a caller without read access, or an unknown change number",
+          "action": "refuse the request and create nothing",
+          "contract": "HTTP 403 insufficient_scope; 403 forbidden; 403 forbidden; 403 token_bound; 404 not_found; 404 change_not_found, in that order of cases; no branch, change or event is created",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/land/revert_test.go, a table with one row per case against a landed change: r = POST revert; assert r.status and error_type; assert refs and the change count are unchanged"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "event_driven",
+          "condition": "the revert route is called with changes:write by a caller with write access to the target workspace, by the admin token, or by the original change's author without write access while land.by_author is true",
+          "action": "accept the revert",
+          "contract": "HTTP 201 with the reverting change, whose author is the caller",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/land/revert_test.go, a table over {owner API key, member of the org with write access through a PAT with changes:write, admin token, org member who authored the change from a fork and uses an API key}: assert 201"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Revert from the shell",
+      "rationale": "The same one call must be scriptable.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "a user runs parley change revert <slug> <number> with any of --title, --intent, --draft, --auto-land and --session <id>",
+          "action": "send POST /api/v1/workspaces/:slug/changes/:number/revert with a JSON body holding exactly the members the given flags name and print the answer",
+          "contract": "request body {} with no flag, and title, intent, draft: true, auto_land: true, session_id for the respective flags; the new change as JSON on stdout; nothing on stderr; exit status 0",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/change_test.go against an httptest server that records the request and answers 201 with a change: a table over flag sets {none, --title t --intent i, --draft, --auto-land, --session s, all}: code = cli.Run(args); assert method == POST, path == '/api/v1/workspaces/demo/changes/7/revert', the decoded body equals the expected map; assert stdout is the change JSON, stderr is empty, code == 0"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "unwanted",
+          "condition": "the hub answers the revert request with an error",
+          "action": "print the error envelope and end unsuccessfully",
+          "contract": "the hub's error envelope on stderr, nothing on stdout, exit status 1",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/change_test.go, a table over hub answers {409 revert_conflict with details.conflict, 409 already_reverted, 403 path_not_allowed}: assert stderr decodes to the envelope with the same error_type and details; assert stdout is empty; assert code == 1"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "unwanted",
+          "condition": "parley change revert is run with a missing argument, an extra argument or a number that is not a positive integer",
+          "action": "report a usage error without sending a request",
+          "contract": "an envelope with error_type usage_error on stderr, nothing on stdout, exit status 2, and no HTTP request reaches the hub",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/change_test.go, a table over args {['demo'], ['demo','7','x'], ['demo','0'], ['demo','abc']}: assert code == 2, stderr error_type == 'usage_error', the httptest server saw 0 requests"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "Hold a path-scoped token to its paths when a version is created",
+      "rationale": "A token limited to some paths must not adopt or produce a version that touches others, by any way a version comes into being (LAND-FR-080).",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "ubiquitous",
+          "action": "for any credential with paths and any version, allow the version only when every path that differs between the version's base and its head, a rename counting with both its old and its new path, matches at least one glob of the credential, and name the first path in byte order that matches none",
+          "contract": "the check answers allowed, or refused with one path; the files are read from the repository, so a file beyond the 2,000 paths stored on the change is still found",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a repository created by git init in t.TempDir()"
+            ],
+            "pseudocode": "in internal/land/pathlimit_test.go, a table over (globs, version): {['docs/**'], only docs/a.md changed -> allowed}; {['docs/**'], docs/a.md and src/b.go and src/a.go changed -> refused 'src/a.go'}; {['docs/**'], docs/a.md renamed to src/a.md -> refused 'src/a.md'}; {['src/*.go'], src/x/y.go added -> refused}; {['docs/**','src/**'], files in both -> allowed}; {['docs/**'], a deleted file lib/z -> refused 'lib/z'}; {['docs/**'], 2,001 files under docs plus zz/last -> refused 'zz/last'}"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "ubiquitous",
+          "action": "for any credential without paths, and for any version the hub creates on its own (a restack with actor system, a sync version), perform no path check",
+          "contract": "the operation proceeds as it would with no path limits in the system, whatever files the version has",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/land/pathlimit_test.go: (a) an unrestricted PAT restacks and lands a change touching src/a.go: assert success; (b) a change opened with a token limited to docs/** depends on a change that then lands, and the hub's restack rebases it over commits touching src/: assert the restack version is recorded with created_by system"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "unwanted",
+          "condition": "a credential with paths makes an update that adds no new commit (a git push or an API ref move onto existing commits) which moves the source branch of a draft or open change, or opens a change, and a file of the resulting version matches none of its globs",
+          "action": "have the push rules refuse the update through the version-files lookup this package supplies",
+          "contract": "over the API HTTP 403 with error_type path_not_allowed and the offending path in error.path; over git the ref is refused with the message `path <path> is outside this token's allowed paths`; the branch does not move and no version is recorded",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "commit X touching src/a.go exists in the repository on a branch pushed with an unrestricted credential",
+              "a change whose source branch feature was created with a token limited to docs/**"
+            ],
+            "pseudocode": "in internal/land/pathlimit_test.go: with the docs token, move refs/heads/feature to X through the API ref route; assert 403, error_type == 'path_not_allowed', error.path == 'src/a.go'; assert head(feature) and the version count are unchanged. Repeat with git push of X to feature over a real hub in test/e2e/path_limits_test.go and assert the remote rejection message names src/a.go"
+          }
+        },
+        {
+          "id": "REQ-7.4",
+          "pattern": "event_driven",
+          "condition": "the version-files lookup is asked about an update of a branch that is not the source of a draft or open change and that opens no change",
+          "action": "answer that no version results, so that the update passes rule 5",
+          "contract": "the lookup returns no files and the flag that no version results; the same update on the source branch of a draft or open change returns the files between the change's base and the new head",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/land/pathlimit_test.go, a table over branches {no change, source of an abandoned change, source of a landed change -> no version}; {source of a draft change, source of an open change -> files of merge-base(target, newHead)..newHead}; {no change but the opens-change flag set -> files against the target branch package 22's open defaults to}; the lookup is called with the arguments the engine of package 18 passes: slug, branch, new head and the opens-change flag"
+          }
+        },
+        {
+          "id": "REQ-7.5",
+          "pattern": "unwanted",
+          "condition": "a caller with a path-scoped token sends POST /api/v1/workspaces/:slug/changes/:number/restack, with or without resolutions, and a file of the version the restack would record matches none of the token's globs",
+          "action": "refuse the restack before the source branch moves",
+          "contract": "HTTP 403 with error_type path_not_allowed and the offending path in error.path; the source branch keeps its head and no version is recorded; the same restack with a token whose globs cover every file succeeds",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "an open change touching docs/a.md and src/b.go, created with an unrestricted credential, whose target has moved"
+            ],
+            "pseudocode": "in internal/land/pathlimit_test.go, a table over {token ['docs/**'] without resolutions, token ['docs/**'] with resolutions for docs/a.md -> 403 path_not_allowed, error.path == 'src/b.go', head(source) unchanged, version count unchanged}; {token ['docs/**','src/**'] -> success with a new version of kind restack}"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "Hold a path-scoped token to its paths at landing, revert and auto_land",
+      "rationale": "Landing and reverting are writes to the target, so a path limit applies to them too, separately from policy (LAND-FR-081, LAND-FR-082).",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "unwanted",
+          "condition": "a path-scoped token calls the land route and a file of the current version of the change, or with stack true of any change the attempt would land, matches none of its globs",
+          "action": "refuse the call before the preconditions of landing are examined and record no land attempt",
+          "contract": "HTTP 403 with error_type path_not_allowed and the offending path in error.path; no land attempt is recorded; the target branch is unchanged; no event is emitted",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/land/pathlimit_test.go, a table with a token limited to docs/**: {change touching src/main.go}; {stack true where the lower change touches src/main.go and the upper only docs/a.md}; {a change touching src/main.go that also has another attempt running}: r = POST land; assert 403, error_type == 'path_not_allowed', error.path == 'src/main.go'; assert lands list length unchanged and head(target) unchanged"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "unwanted",
+          "condition": "a path-scoped token calls the revert route and a file of the landed version of the original change matches none of its globs",
+          "action": "refuse the revert and create nothing",
+          "contract": "HTTP 403 with error_type path_not_allowed and the offending path in error.path; no branch, change or event is created",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/land/revert_test.go: with a token limited to docs/**, revert a landed change touching src/main.go; assert 403 path_not_allowed with error.path == 'src/main.go' and no ref revert/n; with a landed change touching only docs/a.md assert 201"
+          }
+        },
+        {
+          "id": "REQ-8.3",
+          "pattern": "unwanted",
+          "condition": "a path-scoped token asks for auto_land true through POST /api/v1/workspaces/:slug/changes, PATCH /api/v1/workspaces/:slug/changes/:number or the revert route, and a file of the change matches none of its globs",
+          "action": "refuse the request and leave the flag and the change as they were",
+          "contract": "HTTP 403 with error_type path_not_allowed and the offending path in error.path; on PATCH no member of the request is applied and auto_land keeps its value; on open and revert no change is created",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/land/pathlimit_test.go with a token limited to docs/** and a change touching src/main.go opened by another credential: PATCH {auto_land: true, title: 'x'}; assert 403 path_not_allowed, error.path == 'src/main.go', change.auto_land == false and the title unchanged. The revert row is covered in internal/land/revert_test.go with body {auto_land: true}"
+          }
+        },
+        {
+          "id": "REQ-8.4",
+          "pattern": "event_driven",
+          "condition": "a path-scoped token sets auto_land to false on a change with files outside its globs, or sets it to true on a change whose files all match its globs",
+          "action": "accept the edit and, when the flag is set to true, store the token's globs and credential type with the flag",
+          "contract": "HTTP 200 with the change object carrying the requested auto_land value",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/land/pathlimit_test.go: token limited to docs/**; PATCH {auto_land: false} on a change touching src/main.go -> 200, auto_land false; PATCH {auto_land: true} on a change touching only docs/a.md -> 200, auto_land true"
+          }
+        },
+        {
+          "id": "REQ-8.5",
+          "pattern": "unwanted",
+          "condition": "an automatic land is about to start for a flag that was set with a path-scoped token and a file of the change's current version matches none of the globs stored with the flag",
+          "action": "create no land attempt, clear the flag and emit one parley.change.land_fail event on the change",
+          "contract": "auto_land is false; no land attempt is recorded; one parley.change.land_fail event with actor_type \"system\" and metadata {land_id: null, status: \"blocked\", reason: \"not_permitted\"}; the result is the same when the token has been revoked since",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/land/autoland_test.go: a token limited to docs/** opens a change touching docs/a.md with auto_land true while the check test is pending; an unrestricted credential pushes a version adding src/b.go; the check passes; assert lands is empty, auto_land == false, one land_fail event with reason 'not_permitted'. Second row: no extra version, the token is revoked before the check passes; assert the change is landed by an attempt with trigger 'auto_land'"
+          }
+        },
+        {
+          "id": "REQ-8.6",
+          "pattern": "ubiquitous",
+          "action": "for any land call made with a path-scoped token whose globs match every file of the change, give the answer the same call would get from a token of the same user without paths",
+          "contract": "HTTP 409 policy_blocked with the land attempt in details when policy is not ready; HTTP 200 with a landed attempt when policy is ready",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/land/pathlimit_test.go: policy requires the check test for docs/**; a token limited to docs/** lands a change touching docs/a.md: assert 409 policy_blocked with details holding the attempt and its requirements; report the check passed; land again: assert 200 and status 'landed'"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-9",
+      "title": "Let only the workspace owner land past unmet approvals and checks",
+      "rationale": "An override is the one way past policy; it must be out of reach of any agent token and leave a record (LAND-FR-002).",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-9.1",
+          "pattern": "event_driven",
+          "condition": "the workspace's owner with an API key or an unbound PAT, or the admin token, calls the land route with override {reason} while land.allow_override is true and at least one change of the attempt has landing.status pending",
+          "action": "let every pending change pass the policy gate, land, and record the override",
+          "contract": "HTTP 200 with a landed attempt whose override is {reason: <the given text>}; each parley.change.land event of the attempt carries metadata.override {reason: <the given text>}",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a policy requiring one approval and the check test; none given"
+            ],
+            "pseudocode": "in internal/land/override_test.go, a table over callers {owner API key, owner unbound PAT with changes:write, admin token} and shapes {single change, stack true with two pending changes}: r = POST land {override: {reason: 'hotfix'}}; assert 200, status 'landed', attempt.override.reason == 'hotfix'; assert every land event has metadata.override.reason == 'hotfix'"
+          }
+        },
+        {
+          "id": "REQ-9.2",
+          "pattern": "unwanted",
+          "condition": "an accepted override is given and a change of the attempt has landing.status blocked, by a block requirement or by a structural reason",
+          "action": "end the attempt blocked without moving the target",
+          "contract": "HTTP 409 with error_type policy_blocked and the land attempt in details, with status \"blocked\", blocked naming the change and override null; the target branch is unchanged",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/land/override_test.go: policy rule {paths: ['deploy/secrets/**'], require: {block: true}}; the owner lands a change touching deploy/secrets/k with override; assert 409 policy_blocked, details.status == 'blocked', details.override == nil, head(target) unchanged. Second row: a draft change with override -> not landed"
+          }
+        },
+        {
+          "id": "REQ-9.3",
+          "pattern": "unwanted",
+          "condition": "a land call carries a well-formed override and the credential is a PAT bound to the workspace or to one of its forks, or the caller is neither the workspace's owner nor the admin token, or the workspace setting land.allow_override is false",
+          "action": "refuse the call before a land attempt is created, whatever the policy status of the change",
+          "contract": "HTTP 403 with error_type override_not_allowed; no land attempt is recorded; the target branch is unchanged",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/land/override_test.go, a table over {the owner's PAT bound to the workspace, a fork-bound PAT of the owner landing a change from that fork, a member of the org with write access using an API key, the change's author landing by land.by_author, the owner's API key with land.allow_override false, the admin token with land.allow_override false} crossed with policy {pending, ready}: r = POST land {override: {reason: 'x'}}; assert 403 and error_type == 'override_not_allowed'; assert lands is empty and head(target) unchanged; a malformed override ({reason: ''}) from the same callers is answered 400 invalid_request by the land route of package 25 before this refusal"
+          }
+        },
+        {
+          "id": "REQ-9.4",
+          "pattern": "event_driven",
+          "condition": "an accepted override is given and every change of the attempt has landing.status ready",
+          "action": "land as without an override and record none",
+          "contract": "HTTP 200 with a landed attempt whose override is null; the parley.change.land event carries metadata.override null",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/land/override_test.go: default policy; the owner lands with override {reason: 'x'}; assert 200, attempt.override == nil, event metadata.override == nil"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "A change with auto_land lands by itself once its required check passes",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "opens a change with auto_land true in a workspace whose policy requires the check test"
+        },
+        {
+          "actor": "parleyd",
+          "action": "evaluates the change as pending and starts nothing"
+        },
+        {
+          "actor": "developer",
+          "action": "reports the check test as passed on the change's version"
+        },
+        {
+          "actor": "parleyd",
+          "action": "re-evaluates the change as ready, writes one parley.change.ready through the landable announcement, reads that event and starts a land attempt with trigger auto_land as the user who set the flag"
+        },
+        {
+          "actor": "parleyd",
+          "action": "lands the change and writes parley.change.land with actor system"
+        },
+        {
+          "actor": "agent",
+          "action": "reads the change and sees state landed"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parleyd HTTP server",
+          "change component",
+          "policy evaluation",
+          "land component",
+          "automatic lander",
+          "git repository on disk",
+          "store",
+          "event log"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with a workspace cloned from a test origin",
+          "a policy with default {approvals: 0, checks: [\"test\"]}"
+        ],
+        "end_state": [
+          "the change is landed and the target branch contains its commit",
+          "the only land attempt of the change has trigger auto_land and status landed",
+          "the event log holds parley.change.land for the change with actor_type system"
+        ],
+        "pseudocode": "in test/e2e/autoland_revert_test.go: commit a file through the API on a branch; POST changes {auto_land: true}; assert landing.status == 'pending'; PUT checks/test {status: 'passed'}; poll GET change until state == 'landed' (10 s limit); assert GET lands has one attempt with trigger 'auto_land'; assert the event log entry"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "A developer reverts a landed change from the shell and lands the revert",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "runs parley change revert demo 7"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends POST /api/v1/workspaces/demo/changes/7/revert"
+        },
+        {
+          "actor": "parleyd",
+          "action": "builds the reverting commits on the target head, creates the branch revert/7 and opens a change with reverts 7"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers 201 and writes parley.change.revert on change 7"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints the new change and exits 0"
+        },
+        {
+          "actor": "developer",
+          "action": "lands the reverting change and reads the target branch with the content it had before change 7"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parley CLI",
+          "parleyd HTTP server",
+          "revert operation",
+          "change component",
+          "land component",
+          "git repository on disk",
+          "event log"
+        ],
+        "setup": [
+          "a hub started in-process with a workspace in which a change that edits one file has landed"
+        ],
+        "end_state": [
+          "the CLI exited 0 and printed a change with reverts equal to the landed change's number",
+          "the branch revert/<number> exists in the workspace",
+          "after the reverting change lands, the file on the target branch has its content from before the original change",
+          "the original change shows reverted_by and the event log holds parley.change.revert"
+        ],
+        "pseudocode": "in test/e2e/autoland_revert_test.go: before = file content on main; land a change editing the file; code = cli.Run(['change','revert',slug,n]); assert code == 0 and stdout JSON has reverts == n; git ls-remote shows refs/heads/revert/n; cli.Run(['change','land',slug,m]); assert the file read through the API equals before; assert GET change n has reverted_by == m"
+      }
+    },
+    {
+      "id": "PATH-3",
+      "title": "A path-scoped token lands inside its paths and is refused outside them",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "asks to land a change that touches src/main.go with a token limited to docs/**"
+        },
+        {
+          "actor": "parleyd",
+          "action": "compares the files of the change's version with the token's globs and answers 403 path_not_allowed naming src/main.go, recording no attempt"
+        },
+        {
+          "actor": "agent",
+          "action": "asks to land a change that touches only docs/a.md with the same token"
+        },
+        {
+          "actor": "parleyd",
+          "action": "passes the path check, evaluates policy and lands the change"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parleyd HTTP server",
+          "authentication with a real path-scoped PAT",
+          "path-limit check",
+          "land component",
+          "git repository on disk"
+        ],
+        "setup": [
+          "a hub started in-process; the workspace owner minted a PAT with changes:write and paths [\"docs/**\"]",
+          "two open changes made with the owner's API key: one touching src/main.go, one touching docs/a.md"
+        ],
+        "end_state": [
+          "the first land answered 403 path_not_allowed with path src/main.go and that change has no land attempt",
+          "the second change is landed"
+        ],
+        "pseudocode": "in test/e2e/path_limits_test.go: r1 = POST land of the src change with the PAT; assert 403, error_type 'path_not_allowed', error.path == 'src/main.go', GET lands empty; r2 = POST land of the docs change; assert 200 and status 'landed'"
+      }
+    }
+  ]
+}

@@ -1,0 +1,1326 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "55",
+  "spec_name": "acceptance_suite",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Changes and stacks",
+      "rationale": "The change is the unit of work of the product (criteria 1 and 2 of section 16): if a push does not become a numbered, versioned, stackable change, nothing built on changes can be trusted.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "a git client pushes a new branch of a workspace with the push option parley.change and then pushes that branch four more times, one of them a forced push of rewritten history",
+          "action": "open one change for the branch at the first push and record one new version of that same change at each later push",
+          "contract": "GET /api/v1/workspaces/demo/changes/<number> answers 200 with the same number after every push; GET …/changes/<number>/versions lists versions 1 to 5, each with kind push and a distinct head_sha equal to the commit that push sent",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "a clone of demo made with stock git and alice's PAT"
+            ],
+            "pseudocode": "in test/acceptance/changes_test.go, TestChange_FivePushesGiveFiveVersions: out = git push -o parley.change origin feat; n = change number read from GET …/changes?state=open (one item, source branch feat); heads = [head]; repeat 3 times {commit; git push origin feat; heads += head}; git commit --amend; git push --force origin feat; heads += head; for each push assert get(…/changes/n).status == 200 and .number == n; v = get(…/changes/n/versions).items; assert [x.version for x in v] == [1,2,3,4,5]; assert [x.head_sha for x in v] == heads; assert all x.kind == 'push'; assert count(get(…/changes).items) == 1"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "ubiquitous",
+          "action": "for any version of a change, serve that version's head to a git fetch of refs/parley/changes/<number>/<version>, also after a forced push replaced it on the source branch",
+          "contract": "git fetch origin refs/parley/changes/<number>/<v> exits 0 for v = 1 to 5 and FETCH_HEAD equals the head_sha of version v",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "a change with five versions made by five pushes, the last one forced"
+            ],
+            "pseudocode": "in test/acceptance/changes_test.go, TestChange_EveryVersionHeadIsFetchable: in a fresh clone, for v in 1..5: code = git fetch origin refs/parley/changes/<n>/<v>; assert code == 0; assert git rev-parse FETCH_HEAD == versions[v].head_sha; assert git cat-file -t FETCH_HEAD == 'commit'"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "event_driven",
+          "condition": "a push moves a change's source branch to the previous version's commits rebased, with no other edit, onto a newer head of the target branch",
+          "action": "record the new version as patch-equivalent to its predecessor and report an empty interdiff between the two",
+          "contract": "the new version has patch_equivalent_to equal to the previous version number; GET …/changes/<number>/diff?version=<new>&against=<previous> answers 200 with no changed file",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "an open change at version 1; main has since moved by a landed change that touches another file"
+            ],
+            "pseudocode": "in test/acceptance/changes_test.go, TestChange_PureRebaseHasEmptyInterdiff: git fetch; git rebase origin/main; git push --force origin feat; v2 = get(…/changes/n/versions/latest); assert v2.version == 2 and v2.patch_equivalent_to == 1; d = get(…/changes/n/diff?version=2&against=1); assert d.status == 200 and d.files == []; then amend a file's content, force push; v3 = latest; assert v3.patch_equivalent_to == null; assert get(…/diff?version=3&against=2).files names that file"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "event_driven",
+          "condition": "a client asks for the change of a commit that a land put on a protected branch",
+          "action": "answer with the change, the version that was landed and the session named on the work",
+          "contract": "GET …/changes/by-commit/<sha> answers 200 with the landed change's number; GET …/scm/commits/<sha> answers 200 with a change member naming that number and the landed version, and session_id equal to the session given on the push",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "a session S opened with parley session start demo; a change pushed with -o parley.session=S and landed"
+            ],
+            "pseudocode": "in test/acceptance/changes_test.go, TestChange_LandedCommitResolvesToChangeVersionAndSession: sha = landed_sha of the change's land attempt (get(…/changes/n/lands).items[0]), which is the head of main after the land; c = get(…/changes/by-commit/sha); assert c.status == 200 and c.number == n; k = get(…/scm/commits/sha); assert k.change.number == n and k.change.version == 1; assert k.session_id == S; assert cli(alice, 'change','find','demo',sha).json.number == n"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "event_driven",
+          "condition": "the workspace owner fast-forwards the protected default branch by a git push with an API key, and a client then asks for the pushed commit",
+          "action": "report that the commit belongs to no change and record the push as a direct push",
+          "contract": "GET …/scm/commits/<sha> answers 200 with change null; GET /api/v1/events/log?workspace=demo&types=parley.git.push holds one event whose metadata has ref refs/heads/main, after equal to the sha and direct true; GET …/changes lists no change for it",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main"
+            ],
+            "pseudocode": "in test/acceptance/changes_test.go, TestChange_DirectOwnerPushResolvesToNoChange: in a clone with alice's API key: commit on main; code = git push origin main; assert code == 0; sha = HEAD; assert get(…/scm/commits/sha).change == null; ev = get(/events/log?workspace=demo&types=parley.git.push).items; e = the one with metadata.after == sha; assert e.metadata.ref == 'refs/heads/main' and e.metadata.direct == true; assert get(…/changes?state=open).items == []"
+          }
+        },
+        {
+          "id": "REQ-1.6",
+          "pattern": "event_driven",
+          "condition": "the bottom change of a stack of three, opened by pushing three branches each built on the one before, gets a new version",
+          "action": "rebase each change above it onto the new head below it and record a version of kind restack on each, without any request from a client",
+          "contract": "within 30 seconds of the push, changes 2 and 3 of the stack each have a latest version with kind restack and created_by.actor_type system; the new head of each has the new head of the change below it as an ancestor; depends_on of each is unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "branches a, b (on a) and c (on b) pushed in one git push with -o parley.change, giving changes A, B, C with B.depends_on == A and C.depends_on == B"
+            ],
+            "pseudocode": "in test/acceptance/stacks_test.go, TestStack_NewVersionBelowRestacksDependants: assert get(…/changes/A/stack).changes numbers == [A,B,C]; amend a's commit (edit a file only a touches); git push --force origin a; poll up to 30 s until get(…/changes/C/versions/latest).kind == 'restack'; vb = latest of B; vc = latest of C; assert vb.kind == 'restack' and vb.created_by.actor_type == 'system'; git fetch; assert git merge-base --is-ancestor <A.head_sha> <vb.head_sha> and --is-ancestor <vb.head_sha> <vc.head_sha>; assert B.depends_on == A and C.depends_on == B; the test sent no request between the push and the polls other than reads"
+          }
+        },
+        {
+          "id": "REQ-1.7",
+          "pattern": "event_driven",
+          "condition": "the bottom change of a stack lands",
+          "action": "rebase the next change of the stack onto the target branch and clear its depends_on",
+          "contract": "within 30 seconds of the land, the next change has depends_on null, a latest version of kind restack whose base_sha is the target's head, and needs_restack false; the change above it still depends on it",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "a stack of three changes A, B, C as above, all ready"
+            ],
+            "pseudocode": "in test/acceptance/stacks_test.go, TestStack_LandingBottomRebasesNextOntoTarget: r = post(…/changes/A/land); assert r.status == 200 and r.json.status == 'landed'; main = get(…/scm/refs/heads/main).sha; poll up to 30 s until get(…/changes/B).depends_on == null; b = get(…/changes/B); assert b.needs_restack == false; v = get(…/changes/B/versions/latest); assert v.kind == 'restack' and v.base_sha == main; assert get(…/changes/C).depends_on == B"
+          }
+        },
+        {
+          "id": "REQ-1.8",
+          "pattern": "unwanted",
+          "condition": "the restack of a dependent change onto a new version of the change below it conflicts",
+          "action": "leave the dependant's source branch and versions as they were and mark the dependant as needing a restack, with a conflict report",
+          "contract": "the dependant has needs_restack true, restack_reason conflict and mergeable conflict; GET …/changes/<number>/conflict answers 200 with a conflict report whose files name the conflicted path; the dependant's source branch head and its latest version number equal their values before the push below",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "changes A and B with B.depends_on == A, where B edits line 1 of shared.txt that A created"
+            ],
+            "pseudocode": "in test/acceptance/stacks_test.go, TestStack_ConflictingRestackMovesNothing: before = (get(…/scm/refs/heads/b).sha, get(…/changes/B).version); amend a so line 1 of shared.txt differs; git push --force origin a; poll up to 30 s until get(…/changes/B).needs_restack; b = get(…/changes/B); assert b.restack_reason == 'conflict' and b.mergeable == 'conflict'; rep = get(…/changes/B/conflict); assert rep.mergeable == 'conflict' and 'shared.txt' in [f.path for f in rep.conflict.files]; assert (get(…/scm/refs/heads/b).sha, b.version) == before"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Task forks",
+      "rationale": "An agent's first act is to fork (criterion 3): the fork must exist at once whatever the repository's size, must confine its token, and must go away by itself.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "an agent sends POST /api/v1/workspaces/<parent>/forks with a token object",
+          "action": "answer in that one call with the fork, its git remote and a token value, with the fork usable by stock git as soon as the answer arrives",
+          "contract": "HTTP 201 with workspace.kind fork and workspace.status ready, a remote URL and token.token; a git clone of remote with that token, made with no wait after the answer, exits 0 and its HEAD equals the parent's default branch head; a push of a new branch with that token exits 0",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "alice's unbound PAT with workspaces:write and tokens:manage"
+            ],
+            "pseudocode": "in test/acceptance/forks_test.go, TestFork_OneCallGivesForkRemoteAndToken: r = post(…/workspaces/demo/forks, {token:{permissions:['git:read','git:write','changes:read','changes:write']}}); assert r.status == 201; assert r.workspace.kind == 'fork' and r.workspace.status == 'ready'; assert r.remote != '' and r.token.token starts with 'parley_pat_'; assert r.token.workspace == r.workspace.slug; code = git clone <remote with token>; assert code == 0 and HEAD == get(…/demo/scm/refs/heads/main).sha; commit on new branch t; assert git push origin t == 0; assert cli(pat,'fork','list','demo').json.items has the slug"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "optional",
+          "condition": "the suite runs with PARLEY_ACCEPTANCE_LARGE_REPO=1 and the parent's repository holds at least 1 GiB of history",
+          "action": "create a fork that is usable at once, in a time that does not grow with the size of the parent's repository",
+          "contract": "for a parent of at least 1 GiB and for a parent of 1 MiB, each of 20 fork creations is answered 201 in under 1 second, and the median for the large parent is at most 200 ms above the median for the small one; a git ls-remote of the large parent's fork with its token exits 0 immediately after the answer",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness; alice; workspace small from a 1 MiB origin and workspace big from an origin the harness fills with incompressible blobs until its pack is at least 1 GiB, both ready"
+            ],
+            "pseudocode": "in test/acceptance/forks_test.go, TestLargeRepo_ForkCreationDoesNotGrowWithSize: harness.Require(t, LargeRepo); for ws in {small, big}: times[ws] = 20 x duration of post(…/workspaces/ws/forks, {token:{…}}) asserting 201 each; assert max(times[ws]) < 1 s; assert median(times.big) - median(times.small) <= 200 ms; r = last big fork; assert git ls-remote <r.remote with token> == 0 and lists refs/heads/main"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "unwanted",
+          "condition": "a request made with a fork's token names another workspace, or a route of the fork's parent other than the fork's own changes and the awareness and policy reads",
+          "action": "refuse the request without revealing whether the other workspace exists",
+          "contract": "HTTP 404 with error_type not_found for a workspace outside the fork, the same answer as for a slug that does not exist; HTTP 403 with error_type token_bound for another route of the parent; a git fetch of the parent with the token fails with the repository not found; nothing is written",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "a second workspace other owned by alice; a fork F of demo created with a token that holds git, changes, scm, workspaces and audit scopes"
+            ],
+            "pseudocode": "in test/acceptance/forks_test.go, TestFork_TokenIsRefusedOutsideTheFork: a table over requests with F's token: {GET …/workspaces/other -> 404 not_found, GET …/workspaces/no-such -> 404 not_found, GET …/workspaces/other/scm/refs -> 404, GET …/workspaces/demo/scm/refs -> 403 token_bound, POST …/workspaces/demo/scm/commits -> 403 token_bound, PUT …/workspaces/demo/policy -> 403 token_bound, POST …/workspaces/demo/forks -> 403 token_bound}: assert status and error.error_type; assert body(other) == body(no-such) apart from the request id; assert git ls-remote <demo remote with F's token> != 0 and git ls-remote <other remote> != 0; assert demo's refs and policy revision are unchanged"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "event_driven",
+          "condition": "a request made with a fork's token reads or lands a change of the parent whose source is that fork, or reads the parent's activity or policy",
+          "action": "serve the request as it would for the token's user",
+          "contract": "HTTP 200 for GET of the fork's own change on the parent, for GET …/<parent>/activity?paths=… and for GET …/<parent>/policy; HTTP 404 for a change of the parent whose source is another fork",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "forks F and G of demo, each with a token and one open change on demo (numbers f and g)"
+            ],
+            "pseudocode": "in test/acceptance/forks_test.go, TestFork_TokenReachesOwnChangeAndParentReads: with F's token: assert get(…/workspaces/demo/changes/f).status == 200; assert get(…/workspaces/demo/activity?paths=**).status == 200; assert get(…/workspaces/demo/policy).status == 200; assert get(…/workspaces/demo/changes/g).status == 404; assert post(…/workspaces/demo/changes/f/land).status == 200"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "unwanted",
+          "condition": "a git client pushes to a tracking branch of a fork",
+          "action": "refuse the push and leave the branch at the parent's head",
+          "contract": "git push exits non-zero and its stderr holds 'tracks the parent workspace and is read-only in this fork'; git ls-remote of the fork still shows the branch at the parent's head",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "a fork F of demo with a token; a clone of F"
+            ],
+            "pseudocode": "in test/acceptance/forks_test.go, TestFork_PushToTrackingBranchIsRefused: commit on main in the clone; code, err = git push origin main; assert code != 0; assert 'tracks the parent workspace and is read-only in this fork' in err; assert git ls-remote origin refs/heads/main == get(…/workspaces/demo/scm/refs/heads/main).sha"
+          }
+        },
+        {
+          "id": "REQ-2.6",
+          "pattern": "event_driven",
+          "condition": "a fork is created with no ttl",
+          "action": "set the fork to expire 7 days after its creation",
+          "contract": "the fork's expires_at is exactly created_at plus 168 hours",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main"
+            ],
+            "pseudocode": "in test/acceptance/forks_test.go, TestFork_DefaultLifetimeIsSevenDays: r = post(…/workspaces/demo/forks, {}); w = r.workspace; assert parse(w.expires_at) - parse(w.created_at) == 168 h; assert cli(alice,'workspace','get',w.slug).json.expires_at == w.expires_at"
+          }
+        },
+        {
+          "id": "REQ-2.7",
+          "pattern": "optional",
+          "condition": "the suite runs with PARLEY_ACCEPTANCE_LONG=1 and a fork's expires_at has passed",
+          "action": "remove the fork and revoke its token",
+          "contract": "within 7 minutes of creating a fork with ttl 5m: GET of the fork with its owner's API key answers 404 not_found; a request with the fork's token answers 401 unauthenticated; the event log holds parley.fork.expire for the fork with metadata.reason ttl; the fork answers 200 until 4 minutes after its creation",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main"
+            ],
+            "pseudocode": "in test/acceptance/forks_test.go, TestLong_ForkDisappearsAtItsTTL: harness.Require(t, Long); r = post(…/workspaces/demo/forks, {ttl:'5m', token:{…}}); at +4 min assert get(…/workspaces/<fork>).status == 200; poll every 10 s until +7 min for get(…/workspaces/<fork>).status == 404; assert reached; assert get(/user, bearer fork token).status == 401; e = get(/events/log?workspace=demo&types=parley.fork.expire).items; assert one e with resource for the fork and metadata.reason == 'ttl'; assert the fork is absent from get(…/workspaces/demo/forks).items"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Source control API and git compatibility",
+      "rationale": "An agent without a checkout and a developer with stock git must reach the same repository and get the same result (criteria 4 and 14).",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "a client with no clone reads a file, a tree, the history of a path, a diff between two commits and the blame of a file through the source control API",
+          "action": "answer each read with the content of the repository",
+          "contract": "HTTP 200 for each; the file bytes, the tree entries, the commit ids of the path's history, the changed paths of the diff and the commit id of each blamed line equal what stock git reports for a clone of the same workspace",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "the origin was seeded with three commits that touch src/a.txt and docs/b.md; a reference clone made with stock git"
+            ],
+            "pseudocode": "in test/acceptance/scm_test.go, TestSCM_ReadsMatchTheRepository: assert get(…/scm/file?path=src/a.txt&ref=main, raw).body == bytes of src/a.txt in the clone; assert names(get(…/scm/tree?ref=main&path=src).items) == git ls-tree --name-only main src/; assert [c.sha for c in get(…/scm/commits?path=src/a.txt).items] == git log --format=%H -- src/a.txt; assert paths(get(…/scm/diff?base=<c1>&head=<c3>).files) == git diff --name-only c1 c3; for each line of get(…/scm/blame?path=src/a.txt).lines assert its sha == git blame -l; the same five reads through parley scm cat|ls|log|diff|blame exit 0 with the same data"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "event_driven",
+          "condition": "a client sends POST …/scm/commits with operations that create, update and delete several files on a branch that does not exist, naming a base_ref",
+          "action": "create one commit holding all the operations and create the branch at it",
+          "contract": "HTTP 201 with the new commit's sha; GET …/scm/refs/heads/<branch> answers that sha; the commit has one parent, the head of base_ref, and its diff against the parent lists exactly the operated paths",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main"
+            ],
+            "pseudocode": "in test/acceptance/scm_test.go, TestSCM_CommitOfSeveralFiles: r = post(…/scm/commits, {branch:'api-work', base_ref:'main', message:'m', operations:[create x/1.txt, create x/2.txt, update src/a.txt, delete docs/b.md]}); assert r.status == 201; assert get(…/scm/refs/heads/api-work).sha == r.sha; k = get(…/scm/commits/r.sha); assert k.parents == [main head]; assert sorted(paths(get(…/scm/diff?base=main&head=api-work).files)) == ['docs/b.md','src/a.txt','x/1.txt','x/2.txt']"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "unwanted",
+          "condition": "a commit creation names an expected_head_sha that is no longer the branch's head",
+          "action": "refuse the commit and report the branch's current head",
+          "contract": "HTTP 409 with error_type ref_moved and error.details.current_sha equal to the branch's head; the branch has not moved and no commit was added",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "branch api-work created through the API at commit c1, then moved to c2 by a second API commit"
+            ],
+            "pseudocode": "in test/acceptance/scm_test.go, TestSCM_StaleExpectedHeadIsRefMoved: r = post(…/scm/commits, {branch:'api-work', expected_head_sha:c1, message:'late', operations:[create y.txt]}); assert r.status == 409 and r.error.error_type == 'ref_moved' and r.error.details.current_sha == c2; assert get(…/scm/refs/heads/api-work).sha == c2; code = cli(alice,'scm','commit','demo', … '--expected-head', c1).code; assert code == 1 and stderr error_type == 'ref_moved'"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "event_driven",
+          "condition": "a client with no clone creates a commit on a new branch, opens a change for it and lands the change, all through the REST API",
+          "action": "land the change on the target branch",
+          "contract": "POST …/changes answers 201; POST …/changes/<number>/land answers 200 with status landed; GET …/scm/file for each committed path on the target branch answers the committed content",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main"
+            ],
+            "pseudocode": "in test/acceptance/scm_test.go, TestSCM_OpenAndLandAChangeWithoutAClone: post(…/scm/commits, {branch:'w', base_ref:'main', operations:[create n/1.txt 'one', create n/2.txt 'two']}); c = post(…/changes, {source:{branch:'w'}, title:'t'}); assert c.status == 201; l = post(…/changes/c.number/land); assert l.status == 200 and l.json.status == 'landed'; assert get(…/scm/file?path=n/1.txt&ref=main, raw).body == 'one' and same for n/2.txt 'two'; the test ran no git command against the hub"
+          }
+        },
+        {
+          "id": "REQ-3.5",
+          "pattern": "ubiquitous",
+          "action": "for any sequence of file operations committed and landed through the source control API, leave the target branch with the same tree as the equivalent git commits pushed and landed",
+          "contract": "the tree id of the target branch head after the API journey equals the tree id of the head of a local repository in which the same file operations were committed with stock git on the same base; a fresh git clone of the workspace passes git fsck",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "the API journey of the previous scenario has run on demo; a local clone of the origin at the same base commit"
+            ],
+            "pseudocode": "in test/acceptance/scm_test.go, TestSCM_ResultEqualsEquivalentGitOperations: in the local clone: write n/1.txt 'one' and n/2.txt 'two'; git add; git commit; want = git rev-parse HEAD^{tree}; fresh = git clone <demo remote>; assert git -C fresh rev-parse origin/main^{tree} == want; assert git -C fresh fsck --strict == 0; assert git -C fresh log --format=%P -1 origin/main has one parent"
+          }
+        },
+        {
+          "id": "REQ-3.6",
+          "pattern": "event_driven",
+          "condition": "stock git clones a workspace in full, with --depth 1 and with --filter=blob:none, then fetches and pushes, authenticating with a PAT in the remote URL and through parley credential-helper",
+          "action": "serve every one of those operations",
+          "contract": "each git command exits 0; the full clone holds every commit of the default branch; the shallow clone holds exactly one commit; the partial clone holds no blob until a checkout asks for it; a commit pushed from each clone is at the head of its branch on the hub",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "alice's PAT with git:read and git:write; git run with an empty HOME, GIT_CONFIG_NOSYSTEM=1 and GIT_TERMINAL_PROMPT=0"
+            ],
+            "pseudocode": "in test/acceptance/git_compat_test.go, TestGit_CloneFetchPushWithPATAndCredentialHelper: a table over auth {PAT in the URL, credential.helper set to '<parley binary> credential-helper' with PARLEY_ENDPOINT_URL and PARLEY_API_KEY in the environment} x clone {full, --depth 1, --filter=blob:none}: code = git clone …; assert code == 0; full: assert git rev-list --count HEAD == number of seeded commits; shallow: assert count == 1; partial: assert git rev-list --objects --missing=print HEAD lists missing blobs before checkout of a second branch; then another clone pushes a commit to side; assert git fetch origin == 0 and origin/side == that commit; commit on a branch named for the row; assert git push origin <branch> == 0 and get(…/scm/refs/heads/<branch>).sha == HEAD"
+          }
+        },
+        {
+          "id": "REQ-3.7",
+          "pattern": "unwanted",
+          "condition": "a caller without read access to a workspace asks for it, over the REST API or over git",
+          "action": "answer exactly as for a workspace that does not exist",
+          "contract": "over the API, HTTP 404 with error_type not_found and a body equal to the one for an unknown slug; over git, the same status and the same headers and body as for an unknown repository path, so git clone prints the same message for both; nothing in either answer differs but the request id",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "user mallory, signed in, with no organization in common with alice and no access to demo"
+            ],
+            "pseudocode": "in test/acceptance/git_compat_test.go, TestGit_UnreadableWorkspaceLooksNonexistent: with mallory's API key, a table over API paths {…/workspaces/X, …/workspaces/X/changes, …/workspaces/X/scm/refs, …/workspaces/X/activity?paths=a} for X in {demo, no-such}: a = get(path with demo); b = get(path with no-such); assert a.status == 404 and b.status == 404; assert a.error.error_type == b.error.error_type == 'not_found'; assert a.error.message == b.error.message; over git: ra = GET /git/<org>/demo.git/info/refs?service=git-upload-pack with mallory's PAT as Basic password; rb = same for no-such.git; assert ra.status == rb.status and ra.body == rb.body and ra.header['WWW-Authenticate'] == rb.header['WWW-Authenticate']; assert stderr of git clone demo with repository names replaced == stderr of git clone no-such"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Landing and conflicts",
+      "rationale": "Landing without a queue is the product's central claim (criteria 5 and 6): concurrent lands must all succeed when they do not collide, exactly one must win when they do, and a crash must never leave a half-landed change.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "twenty clients each send one land request at the same moment for twenty ready changes that add twenty different files to one target branch",
+          "action": "land all twenty on a linear history without any caller having to retry",
+          "contract": "each of the twenty first requests is answered HTTP 200 with status landed; the target's history from its previous head has exactly twenty new commits, none with two parents; each change's file is added by exactly one of them; every change has state landed",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "twenty open, ready changes c1..c20 on demo, change i adding only file f/<i>.txt from its own branch"
+            ],
+            "pseudocode": "in test/acceptance/landing_test.go, TestLand_TwentyDisjointChangesLandConcurrently: base = head of main; release twenty goroutines at once, each doing exactly one post(…/changes/<ci>/land?wait=60) and recording the answer; assert every answer.status == 200 and json.status == 'landed'; assert no goroutine sent a second request; fresh clone; assert git rev-list --count base..origin/main == 20; assert git rev-list --min-parents=2 base..origin/main is empty; for i in 1..20 assert git log --format=%H base..origin/main -- f/<i>.txt has exactly one commit; assert all get(…/changes/<ci>).state == 'landed'"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "unwanted",
+          "condition": "two changes that edit the same lines of one file are landed at the same moment",
+          "action": "land exactly one of them and end the other's attempt as a conflict, with a report naming the file and the change that landed",
+          "contract": "one request is answered HTTP 200 with status landed; the other HTTP 409 with error_type land_conflict and error.details holding the land attempt with status conflict and a conflict report whose files name the path and whose landed_changes name the winner's number; the target's file holds the winner's lines only, with no conflict marker; the loser stays open",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "open changes p and q on demo that each replace line 3 of src/a.txt with different text"
+            ],
+            "pseudocode": "in test/acceptance/landing_test.go, TestLand_SameLinesExactlyOneLands: rp, rq = the two land posts released together; win, lose = sort by status; assert win.status == 200 and win.json.status == 'landed'; assert lose.status == 409 and lose.error.error_type == 'land_conflict'; att = lose.error.details; assert att.status == 'conflict'; assert 'src/a.txt' in [f.path for f in att.conflict.files]; assert winner number in [c.number for c in att.conflict.landed_changes]; body = get(…/scm/file?path=src/a.txt&ref=main, raw).body; assert winner's line in body and loser's line not in body and '<<<<<<<' not in body; assert get(…/changes/<loser>).state == 'open'; assert get(…/lands?status=conflict).items has the attempt"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "ubiquitous",
+          "action": "for any change whose land was in flight when the hub process was killed, be after the next start in one of two states only: landed with its commit on the target and its parley.change.land event, or not landed with neither",
+          "contract": "after a SIGKILL during concurrent lands and a restart on the same data directory: GET /readyz answers 200; for every change, either state is landed, the target's history holds its file and the event log holds exactly one parley.change.land for it, or state is open, the target does not hold its file and the event log holds no parley.change.land for it; no land attempt has status running; a land of a change left open then answers 200",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "ten open, ready changes on demo, each adding one distinct file"
+            ],
+            "pseudocode": "in test/acceptance/landing_test.go, TestLand_KilledHubLeavesNoHalfLandedChange: repeat for kill delays {0 ms, 20 ms, 60 ms, 150 ms} each on a fresh set of ten changes: start ten concurrent land posts; after the delay hub.Kill() (SIGKILL); hub.Start() on the same directories; wait for /readyz 200; landEvents = get(/events/log?workspace=demo&types=parley.change.land) by resource_id; files = git ls-tree of a fresh clone's origin/main; for each change c: s = get(…/changes/c).state; if s == 'landed': assert file(c) in files and count(landEvents[c]) == 1 else: assert s == 'open' and file(c) not in files and c not in landEvents; assert get(…/lands?status=running).items == []; for one open change assert post(…/land).status == 200"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "event_driven",
+          "condition": "the author of a change whose land ended in a conflict fetches the conflicted file, submits a resolved content for it without a clone, and lands again",
+          "action": "serve the file with conflict markers, record the resolution as a new version and land the change",
+          "contract": "GET …/changes/<number>/conflict/file?path=<path> answers 200 text/plain with the markers <<<<<<<, ======= and >>>>>>>; the restack with the resolution answers 200 and the change has a new version and mergeable clean; the land answers 200 with status landed and the target's file equals the submitted content",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "the losing change of the same-lines race, open, with its conflict report"
+            ],
+            "pseudocode": "in test/acceptance/conflict_test.go, TestConflict_ResolveWithoutACloneThenLand: f = get(…/changes/n/conflict/file?path=src/a.txt); assert f.status == 200 and content type text/plain; assert '<<<<<<<' in f.body and '=======' in f.body and '>>>>>>>' in f.body; write resolved content R to a local file; code = cli(agent, 'change','resolve','demo',n,'--file','src/a.txt=<local file>').code; assert code == 0; c = get(…/changes/n); assert c.version == previous + 1 and c.needs_restack == false; poll until c.mergeable == 'clean'; l = cli(agent,'change','land','demo',n); assert l.code == 0 and l.json.status == 'landed'; assert get(…/scm/file?path=src/a.txt&ref=main, raw).body == R; the scenario ran no git command"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Policy, approvals and path-scoped tokens",
+      "rationale": "What may land is decided by path (criteria 7 and 8): a rule that can be passed by the wrong approval, by an override or by a token outside its paths is not a rule.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "a change that touches only files matched by a rule requiring nothing is landed with no approval and no check",
+          "action": "land it",
+          "contract": "the change's landing.status is ready as soon as it is open; POST …/land answers 200 with status landed; GET …/approvals lists nothing",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "demo's policy set with parley policy set to rules docs (docs/**, approvals 0, no checks), code (src/**, checks [test]), billing (billing/**, approvals 1, approvers [owner]) and secrets (deploy/secrets/**, block true)",
+              "an open change that adds docs/guide.md"
+            ],
+            "pseudocode": "in test/acceptance/policy_test.go, TestPolicy_DocsOnlyChangeLandsWithoutApproval: c = get(…/changes/n); assert c.landing.status == 'ready'; assert get(…/changes/n/approvals).items == []; l = post(…/changes/n/land); assert l.status == 200 and l.json.status == 'landed'"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "state_driven",
+          "condition": "a change touches a path whose rule requires a check and that check has not been reported passed for its version",
+          "action": "report the change's landing status as pending and refuse to land it",
+          "contract": "landing.status is pending with the check listed as pending in its requirement; POST …/land answers 409 with error_type policy_blocked; after PUT …/checks/test with status failed it is still pending; after status passed it is ready and the land answers 200",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "demo's policy set with parley policy set to rules docs (docs/**, approvals 0, no checks), code (src/**, checks [test]), billing (billing/**, approvals 1, approvers [owner]) and secrets (deploy/secrets/**, block true)",
+              "an open change that edits src/a.txt; user ci with write access and a PAT holding checks:write"
+            ],
+            "pseudocode": "in test/acceptance/policy_test.go, TestPolicy_CheckRequiredIsPendingUntilPassed: assert get(…/changes/n).landing.status == 'pending'; r = post(…/changes/n/land); assert r.status == 409 and r.error.error_type == 'policy_blocked'; assert head of main unchanged; put(…/changes/n/checks/test, {status:'failed'}, ci); assert landing.status == 'pending'; cli(ci,'change','check','demo',n,'test','--status','passed'); assert get(…/changes/n).landing.status == 'ready'; assert post(…/changes/n/land).status == 200"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "event_driven",
+          "condition": "an approval is recorded on a change that needs one approval, first with the credential that pushed the change and then with another credential of an allowed approver",
+          "action": "not count the approval given with the pushing credential and count the one given with the other credential",
+          "contract": "after the first approval the approval's counts_for is empty, the requirement shows approvals.counted 0 and landing.status is pending; after the second, counted is 1 and landing.status is ready",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "demo's policy set with parley policy set to rules docs (docs/**, approvals 0, no checks), code (src/**, checks [test]), billing (billing/**, approvals 1, approvers [owner]) and secrets (deploy/secrets/**, block true)",
+              "alice's PAT P with git:write, changes:write and changes:approve; an open change that edits billing/rates.txt, pushed with P"
+            ],
+            "pseudocode": "in test/acceptance/policy_test.go, TestPolicy_ApprovalByPushingCredentialDoesNotCount: a1 = post(…/changes/n/approvals, {verdict:'approve'}, bearer P); assert a1.status == 201 and a1.counts_for == []; c = get(…/changes/n); req = requirement of rule billing; assert req.approvals.counted == 0 and c.landing.status == 'pending'; a2 = cli(alice API key, 'change','approve','demo',n); assert a2.code == 0 and a2.json.counts_for == ['billing']; c = get(…/changes/n); assert req.approvals.counted == 1 and c.landing.status == 'ready'"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "unwanted",
+          "condition": "a change touches a path of a rule with block true and its land is requested, with or without an override by the workspace owner",
+          "action": "refuse the land",
+          "contract": "landing.status is blocked; POST …/land with and without override {reason} by the owner's API key and by the admin token answers 409 with error_type policy_blocked and the land attempt with status blocked in error.details; the target branch has not moved",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "demo's policy set with parley policy set to rules docs (docs/**, approvals 0, no checks), code (src/**, checks [test]), billing (billing/**, approvals 1, approvers [owner]) and secrets (deploy/secrets/**, block true)",
+              "an open change that adds deploy/secrets/key.txt"
+            ],
+            "pseudocode": "in test/acceptance/policy_test.go, TestPolicy_BlockedPathCannotLandEvenWithOverride: before = head of main; assert get(…/changes/n).landing.status == 'blocked'; a table over {(alice API key, no override), (alice API key, override:{reason:'urgent'}), (admin token, override:{reason:'urgent'})}: r = post(…/changes/n/land, body); assert r.status == 409 and r.error.error_type == 'policy_blocked' and r.error.details.status == 'blocked'; assert head of main == before; control: on a change needing check test, post(…/land, {override:{reason:'x'}}, alice API key).status == 200, which shows the override itself is accepted"
+          }
+        },
+        {
+          "id": "REQ-5.5",
+          "pattern": "event_driven",
+          "condition": "a change with a counted approval gets a new version that is a pure rebase of the approved one, and later a version whose content differs",
+          "action": "keep counting the approval on the pure rebase and stop counting it on the version with other content",
+          "contract": "after the pure rebase the requirement shows approvals.counted 1 and landing.status ready; after the content change it shows counted 0 and landing.status pending",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "demo's policy set with parley policy set to rules docs (docs/**, approvals 0, no checks), code (src/**, checks [test]), billing (billing/**, approvals 1, approvers [owner]) and secrets (deploy/secrets/**, block true)",
+              "an open change on billing/rates.txt with one counted approval by alice's API key; main has moved by another landed change"
+            ],
+            "pseudocode": "in test/acceptance/policy_test.go, TestPolicy_ApprovalSurvivesPureRebaseNotContentChange: git rebase origin/main; git push --force (with the agent's token); c = get(…/changes/n); assert latest version patch_equivalent_to == previous; assert billing requirement approvals.counted == 1 and c.landing.status == 'ready'; edit billing/rates.txt; commit; push; c = get(…/changes/n); assert approvals.counted == 0 and c.landing.status == 'pending'"
+          }
+        },
+        {
+          "id": "REQ-5.6",
+          "pattern": "event_driven",
+          "condition": "a client sends POST …/policy/evaluate with a set of paths for which no change exists yet",
+          "action": "answer the requirements and the landing status a change touching those paths has when it is opened with no approvals and no checks",
+          "contract": "HTTP 200 with status ready for [docs/guide.md], pending for [src/a.txt], pending for [billing/rates.txt], blocked for [deploy/secrets/key.txt], each with the requirement of the matching rule; a change later opened on each path set has that landing.status and requirements with the same rule names",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "demo's policy set with parley policy set to rules docs (docs/**, approvals 0, no checks), code (src/**, checks [test]), billing (billing/**, approvals 1, approvers [owner]) and secrets (deploy/secrets/**, block true)",
+              "no change exists on demo"
+            ],
+            "pseudocode": "in test/acceptance/policy_test.go, TestPolicy_EvaluatePredictsEachOutcome: a table over (paths, want status, rule) {(['docs/guide.md'],'ready','docs'), (['src/a.txt'],'pending','code'), (['billing/rates.txt'],'pending','billing'), (['deploy/secrets/key.txt'],'blocked','secrets')}: e = post(…/policy/evaluate, {paths}); assert e.status == 200 and e.json.status == want and [r.rule for r in e.requirements] == [rule]; assert cli(alice,'policy','evaluate','demo','--paths',…).json.status == want; assert get(…/changes).items == [] after all four; then open a change touching those paths; c = get(…/changes/n); assert c.landing.status == want and [r.rule for r in c.landing.requirements] == [rule]"
+          }
+        },
+        {
+          "id": "REQ-5.7",
+          "pattern": "event_driven",
+          "condition": "a client holding a token limited to the paths a/** pushes a branch whose commits change only files under a/, and creates a commit of a file under a/ through the source control API",
+          "action": "accept the push and the commit",
+          "contract": "git push exits 0 and the branch is at the pushed commit; POST …/scm/commits answers 201; a change opened for the branch with that token answers 201",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "alice's PAT A with git:write, scm:write and changes:write and paths ['a/**']"
+            ],
+            "pseudocode": "in test/acceptance/path_tokens_test.go, TestPathToken_WritesUnderItsPathsAreAccepted: clone with A; add a/x.txt; commit on branch pa; assert git push -o parley.change origin pa == 0; assert get(…/scm/refs/heads/pa).sha == HEAD; r = post(…/scm/commits, {branch:'pa', expected_head_sha:HEAD, operations:[create a/y.txt]}, bearer A); assert r.status == 201; assert get(…/changes?state=open, A).items has one change with source branch pa at version 2"
+          }
+        },
+        {
+          "id": "REQ-5.8",
+          "pattern": "unwanted",
+          "condition": "a client holding a token limited to the paths a/** pushes commits, or creates a commit through the source control API, that change the file b/x",
+          "action": "refuse the whole write and name the offending path",
+          "contract": "over git, the push exits non-zero with 'path b/x is outside this token's allowed paths' on stderr; over the API, HTTP 403 with error_type path_not_allowed and a message containing b/x; in both cases no ref moves and no version is recorded, also when the same push or commit changes a file under a/ as well",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "alice's PAT A with paths ['a/**'] and an open change on branch pa at version 2"
+            ],
+            "pseudocode": "in test/acceptance/path_tokens_test.go, TestPathToken_WriteOutsideItsPathsIsRefusedNamingThePath: before = (get(…/scm/refs/heads/pa).sha, version of the change); commit that edits a/x.txt and adds b/x; code, err = git push origin pa; assert code != 0 and \"path b/x is outside this token's allowed paths\" in err; r = post(…/scm/commits, {branch:'pa', expected_head_sha:before.sha, operations:[create a/z.txt, create b/x]}, bearer A); assert r.status == 403 and r.error.error_type == 'path_not_allowed' and 'b/x' in r.error.message; r2 = post(…/scm/commits, {branch:'pb', base_ref:'main', operations:[create b/x]}, bearer A); assert r2.status == 403 and r2.error.error_type == 'path_not_allowed'; assert (get(…/scm/refs/heads/pa).sha, version) == before; assert get(…/scm/refs/heads/pb).status == 404"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Protected branches, automatic landing and revert",
+      "rationale": "A protected branch is the product's safety line (criteria 9 and 10): it must move only in the three recorded ways, for the same callers on every surface, and what landed must be undoable in one call.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "a change targeting a protected branch lands, or a sync from origin finds a new commit on that branch at the origin",
+          "action": "move the protected branch to the landed or fetched commit",
+          "contract": "after the land the branch head is the land attempt's landed_sha; after parley workspace sync the branch head equals the origin's head and the sync result for the branch is fast_forward",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "main is protected (the default setting); an open, ready change"
+            ],
+            "pseudocode": "in test/acceptance/protected_test.go, TestProtected_MovesByLandingAndBySync: l = post(…/changes/n/land); assert get(…/scm/refs/heads/main).sha == l.landed_sha; harness.PushToOrigin(l.landed_sha) so the origin has it; add commit o1 on the origin's main on top of it; s = cli(alice,'workspace','sync','demo'); assert s.code == 0 and result for main == 'fast_forward'; assert get(…/scm/refs/heads/main).sha == o1"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "event_driven",
+          "condition": "the workspace owner with an API key, or the admin token, updates a protected branch by a fast-forward git push, by a commit creation through the API on that branch, or by a fast-forward ref move through the API, while protect.owner_push is true",
+          "action": "accept the update and record it as a direct push",
+          "contract": "git push exits 0; POST …/scm/commits answers 201; PATCH …/scm/refs/heads/main answers 200; after each the branch is at the new commit and the event log holds one more parley.git.push for refs/heads/main with metadata.direct true and after equal to that commit",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "organization acme with owner alice and member bob; workspace demo in acme owned by alice, main protected (the default); credentials: alice's API key, alice's PAT bound to demo, alice's unbound PAT with paths ['**'], bob's API key, the admin token"
+            ],
+            "pseudocode": "in test/acceptance/protected_test.go, TestProtected_OwnerAndAdminDirectPushSucceedAndAreRecorded: a table over {(alice API key, git push), (alice API key, POST scm/commits on main with expected_head_sha), (alice API key, PATCH scm/refs/heads/main to a descendant created on a side branch), (admin token, git push)}: do it; assert success status; sha = new head; assert get(…/scm/refs/heads/main).sha == sha; e = events(types=parley.git.push) with metadata.after == sha; assert count(e) == 1 and e.metadata.direct == true and e.metadata.ref == 'refs/heads/main'"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "unwanted",
+          "condition": "a workspace-bound token of the owner, a path-scoped token of the owner or an org member attempts a fast-forward git push, an API commit or an API ref move of a protected branch",
+          "action": "refuse the update and leave the branch where it was",
+          "contract": "over git, the push exits non-zero with 'main is protected; push another branch and open a change' on stderr; over the API, HTTP 403 with error_type protected_branch; the branch head is unchanged and no parley.git.push event is written for it",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "organization acme with owner alice and member bob; workspace demo in acme owned by alice, main protected (the default); credentials: alice's API key, alice's PAT bound to demo, alice's unbound PAT with paths ['**'], bob's API key, the admin token"
+            ],
+            "pseudocode": "in test/acceptance/protected_test.go, TestProtected_BoundTokenPathTokenAndMemberAreRefused: before = head of main; n0 = count(events parley.git.push); a table over credential {alice's bound PAT, alice's path-scoped PAT, bob's API key} x operation {git push fast-forward, POST scm/commits on main, PATCH scm/refs/heads/main}: git: assert code != 0 and 'main is protected; push another branch and open a change' in stderr; API: assert status == 403 and error.error_type == 'protected_branch'; after all nine: assert head of main == before and count(events parley.git.push for refs/heads/main) == n0"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "unwanted",
+          "condition": "any credential, the admin token and the owner's API key included, attempts a forced update or a delete of a protected branch",
+          "action": "refuse it",
+          "contract": "over git, git push --force and git push --delete exit non-zero with 'main is protected and cannot be force-pushed or deleted' on stderr; over the API, a non-fast-forward PATCH and a DELETE of the ref answer 403 with error_type protected_branch; the branch head is unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "organization acme with owner alice and member bob; workspace demo in acme owned by alice, main protected (the default); credentials: alice's API key, alice's PAT bound to demo, alice's unbound PAT with paths ['**'], bob's API key, the admin token"
+            ],
+            "pseudocode": "in test/acceptance/protected_test.go, TestProtected_ForceAndDeleteRefusedForEveryCredential: before = head of main; a table over all five credentials x {git push --force of a commit that is not a descendant, git push --delete main, PATCH scm/refs/heads/main to a non-descendant with force, DELETE scm/refs/heads/main}: git rows: assert code != 0 and 'main is protected and cannot be force-pushed or deleted' in stderr; API rows: assert status == 403 and error.error_type == 'protected_branch'; assert head of main == before and get(…/scm/refs/heads/main).status == 200"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "state_driven",
+          "condition": "the workspace setting protect.owner_push is false",
+          "action": "refuse every direct update of a protected branch for every credential, while landing still moves it",
+          "contract": "a fast-forward git push, an API commit and an API ref move of the protected branch by the owner's API key and by the admin token are refused as for any other caller (non-zero exit with the protected message; 403 protected_branch); a land of a ready change answers 200 and moves the branch",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "organization acme with owner alice and member bob; workspace demo in acme owned by alice, main protected (the default); credentials: alice's API key, alice's PAT bound to demo, alice's unbound PAT with paths ['**'], bob's API key, the admin token",
+              "parley workspace update demo set protect.owner_push to false"
+            ],
+            "pseudocode": "in test/acceptance/protected_test.go, TestProtected_OwnerPushOffRefusesEveryDirectUpdate: assert get(…/workspaces/demo).settings['protect.owner_push'] == false; before = head of main; a table over {alice API key, admin token} x {git push, POST scm/commits on main, PATCH scm/refs/heads/main}: git: assert code != 0 and 'is protected' in stderr; API: assert status == 403 and error.error_type == 'protected_branch'; assert head of main == before; open a change, land it: assert status == 200 and head of main != before"
+          }
+        },
+        {
+          "id": "REQ-6.6",
+          "pattern": "event_driven",
+          "condition": "the check required for a change with auto_land set is reported passed",
+          "action": "land the change by itself, with no land request from a client",
+          "contract": "within 30 seconds of the report the change's state is landed; its one land attempt has trigger auto and status landed; the event log holds parley.change.land for it; the test sent no POST …/land",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "demo's policy requires check test for src/**; an open change editing src/a.txt, opened with auto_land true"
+            ],
+            "pseudocode": "in test/acceptance/autoland_revert_test.go, TestAutoLand_LandsOnceTheRequiredCheckPasses: assert get(…/changes/n).state == 'open' and .auto_land == true; sleep 3 s; assert still open and get(…/changes/n/lands).items == []; put(…/changes/n/checks/test, {status:'passed'}); poll up to 30 s until state == 'landed'; a = get(…/changes/n/lands).items; assert len(a) == 1 and a[0].trigger == 'auto' and a[0].status == 'landed'; assert one parley.change.land event with resource_id n"
+          }
+        },
+        {
+          "id": "REQ-6.7",
+          "pattern": "event_driven",
+          "condition": "a client sends POST …/changes/<number>/revert for a landed change and the reverting change it returns is landed",
+          "action": "open the reverting change in that one call and, when it lands, restore the target's content from before the original landed",
+          "contract": "the revert call answers 201 with a new open change; after its land the tree id of the target's head equals the tree id of the target's head before the original change landed; a second revert of the original answers 409 with error_type already_reverted",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "tree T0 of main recorded; a change that edits src/a.txt and adds n.txt has landed"
+            ],
+            "pseudocode": "in test/acceptance/autoland_revert_test.go, TestRevert_OneCallAndLandRestoresPreviousContent: r = cli(alice,'change','revert','demo',n); assert r.code == 0; m = r.json.number; assert get(…/changes/m).state == 'open'; assert post(…/changes/m/land).status == 200; fresh clone; assert git rev-parse origin/main^{tree} == T0; assert get(…/scm/file?path=n.txt&ref=main).status == 404; r2 = post(…/changes/n/revert); assert r2.status == 409 and r2.error.error_type == 'already_reverted'"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "Awareness and sessions",
+      "rationale": "Agents working side by side need to see each other without being stopped by each other, and a person needs one thread from a session to everything it did (criteria 11 and 13).",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "event_driven",
+          "condition": "a new version makes two open changes touch the same file for the first time",
+          "action": "write one parley.change.overlap event for each of the two changes, naming the other",
+          "contract": "within 30 seconds the event log holds exactly two parley.change.overlap events for the pair: one with resource_id the first change naming the second in its metadata, one the reverse; a further version of either that keeps the overlap adds none",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "open change x that edits src/a.txt; open change y that so far edits only docs/b.md"
+            ],
+            "pseudocode": "in test/acceptance/awareness_test.go, TestAwareness_OverlapIsAnnouncedOncePerChange: push a commit to y's branch that edits src/a.txt; poll up to 30 s until events(types=parley.change.overlap) has 2 items; ex = the one with resource_id x; ey = the one with resource_id y; assert ex names y and ey names x in metadata; assert get(…/changes/x/overlaps).items numbers == [y]; push another commit to y that edits src/a.txt again; wait 5 s; assert events(types=parley.change.overlap) still has 2 items"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "event_driven",
+          "condition": "a client asks for the activity of a path that two open changes touch and that an active claim covers",
+          "action": "return both changes and the claim",
+          "contract": "GET …/activity?paths=src/a.txt answers 200 with changes naming both change numbers and claims holding the claim's id with state active; parley activity prints the same",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "open changes x and y that both edit src/a.txt; a claim created with parley claim create demo --paths src/** --intent 'refactor' --ttl 1h"
+            ],
+            "pseudocode": "in test/acceptance/awareness_test.go, TestAwareness_ActivityReturnsChangesAndLiveClaim: a = get(…/activity?paths=src/a.txt); assert a.status == 200; assert sorted([c.number for c in a.changes]) == sorted([x, y]); assert [c.id for c in a.claims] == [claim.id] and a.claims[0].state == 'active'; out = cli(alice,'activity','demo','--paths','src/a.txt'); assert out.code == 0 and out.json.claims[0].id == claim.id"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "event_driven",
+          "condition": "a claim's expires_at has passed and a client asks for the activity of its paths",
+          "action": "leave the claim out of the answer while still returning the changes",
+          "contract": "for a claim created with ttl 2s: an activity read within 1 second of creation lists it; an activity read 4 seconds after creation answers 200 with no claim and with both changes; GET …/claims/<id> shows state expired",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "open changes x and y that both edit src/a.txt"
+            ],
+            "pseudocode": "in test/acceptance/awareness_test.go, TestAwareness_ExpiredClaimLeavesActivity: c = post(…/claims, {paths:['src/**'], intent:'i', ttl:'2s'}).claim; assert c.id in ids(get(…/activity?paths=src/a.txt).claims); sleep until 4 s after c.created_at; a = get(…/activity?paths=src/a.txt); assert a.claims == []; assert len(a.changes) == 2; assert get(…/claims/c.id).state == 'expired'"
+          }
+        },
+        {
+          "id": "REQ-7.4",
+          "pattern": "ubiquitous",
+          "action": "for any overlap between changes and any claim by another session on the same paths, accept pushes to the affected branches and land the affected changes exactly as without them",
+          "contract": "with two overlapping changes and an active claim by another user covering their files: a git push to each source branch exits 0; an API commit on each branch answers 201; the land of the first change answers 200; the land of the second answers 200 when its edit does not collide textually",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "user bob with write access; open changes x (alice) and y (alice) that edit different lines of src/a.txt, already announced as overlapping; an active claim by bob on src/** with a session of his own"
+            ],
+            "pseudocode": "in test/acceptance/awareness_test.go, TestAwareness_NeverRefusesAPushOrALand: assert len(get(…/changes/x/overlaps).items) == 1 and len(get(…/activity?paths=src/a.txt).claims) == 1; assert git push origin <x branch> == 0 after a new commit; assert post(…/scm/commits on y's branch).status == 201; assert post(…/changes/x/land).status == 200; poll until y is mergeable clean; assert post(…/changes/y/land).status == 200; no answer carried an awareness error_type"
+          }
+        },
+        {
+          "id": "REQ-7.5",
+          "pattern": "event_driven",
+          "condition": "a client reads a session by its id after that session was named on a fork creation, on pushes that opened changes, and on a land",
+          "action": "make the fork, the changes, their versions and their land attempts reachable from the session",
+          "contract": "GET /api/v1/sessions/<id> answers 200 listing the fork's slug and the numbers of the changes; GET …/changes?session_id=<id> returns those changes; every version of them has session_id equal to the id; GET …/changes/<number>/lands returns a land attempt with that session_id",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "S = parley session start demo; a fork F created with session_id S; two branches pushed from F with -o parley.change -o parley.session=S giving changes c1 and c2; c1 landed with parley change land --session S"
+            ],
+            "pseudocode": "in test/acceptance/sessions_test.go, TestSession_ReachesForkChangesVersionsAndLands: s = get(/sessions/S); assert s.status == 200; assert F.slug in s.forks; assert sorted(numbers in s.changes) == [c1, c2]; assert sorted(numbers(get(…/workspaces/demo/changes?session_id=S&state=open&state=landed).items)) == [c1, c2]; for c in (c1, c2): for v in get(…/changes/c/versions).items: assert v.session_id == S; a = get(…/changes/c1/lands).items; assert len(a) == 1 and a[0].session_id == S and a[0].status == 'landed'; assert cli(alice,'session','get',S).json.id == S"
+          }
+        },
+        {
+          "id": "REQ-7.6",
+          "pattern": "event_driven",
+          "condition": "a client reads a commit that a land with a session put on the target branch",
+          "action": "name the session on the commit",
+          "contract": "GET …/scm/commits/<landed sha> answers 200 with session_id equal to the session; GET /api/v1/sessions/<that id> answers 200",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "the landed change c1 of session S from the scenario above"
+            ],
+            "pseudocode": "in test/acceptance/sessions_test.go, TestSession_IsReachableFromALandedCommit: sha = get(…/changes/c1/lands).items[0].landed_sha; k = get(…/scm/commits/sha); assert k.session_id == S; assert get(/sessions/k.session_id).status == 200 and .id == S; assert get(…/changes/by-commit/sha).number == c1"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "Events and webhooks",
+      "rationale": "Everything that reacts to the hub reads its events (criterion 12): a consumer that loses one, sees them out of order or cannot trust a delivery cannot be built on.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "a consumer of GET /api/v1/events that disconnected and missed fifty events reconnects with Last-Event-ID set to the last seq it received",
+          "action": "replay exactly the missed events in ascending seq and then continue with live events on the same connection",
+          "contract": "the first fifty event frames after the reconnect are the fifty missed events, in strictly ascending seq, none repeated and none before the resume position; an event written after the reconnect arrives next on the same connection",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "a stream reader connected to /events?workspace=demo&types=parley.claim.* that has received the event of one claim creation, with seq s0"
+            ],
+            "pseudocode": "in test/acceptance/events_test.go, TestEvents_ResumeDeliversExactlyTheMissedFiftyThenLive: reader.Close(); ids = 50 x post(…/claims).claim.id; reader2 = stream(/events?workspace=demo&types=parley.claim.*, header Last-Event-ID: s0); got = reader2.Next(50, timeout 10 s); assert [e.resource_id for e in got] == ids; assert seqs strictly ascending and all > s0; live = post(…/claims).claim.id; e = reader2.Next(1, timeout 5 s); assert e.resource_id == live and e.seq > got[49].seq; the same with parley events tail --after s0 prints 51 lines in that order"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "optional",
+          "condition": "the suite runs with PARLEY_ACCEPTANCE_LONG=1 and a consumer resumes from a position whose following events have left the event log",
+          "action": "refuse the position and report the oldest seq still held",
+          "contract": "HTTP 410 with error_type cursor_expired and error.oldest_seq greater than the position, on GET /events with Last-Event-ID and on GET /events/log?after=; a resume from oldest_seq - 1 answers 200",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started with [events] retention = \"1h\"; alice; workspace demo"
+            ],
+            "pseudocode": "in test/acceptance/events_test.go, TestLong_CursorOlderThanRetentionIsExpired: harness.Require(t, Long); s0 = seq of an early event; create 5 claims; sleep 65 min; create 1 claim; hub.Stop(); hub.Start() (retention runs at start); r = get(/events/log?after=s0); assert r.status == 410 and r.error.error_type == 'cursor_expired' and r.error.oldest_seq > s0; r2 = get(/events, header Last-Event-ID: s0); assert r2.status == 410 and r2.error.error_type == 'cursor_expired'; assert get(/events/log?after=<r.error.oldest_seq - 1>).status == 200"
+          }
+        },
+        {
+          "id": "REQ-8.3",
+          "pattern": "ubiquitous",
+          "action": "for any push, fork creation, change version, land and conflict caused by an operation that names a session, carry that session's id on the event it writes",
+          "contract": "the events parley.git.push, parley.workspace.fork, parley.change.version, parley.change.land and parley.change.conflict caused in the scenario each have session_id equal to the session named on the operation; GET /events/log?session_id=<id> returns all five types",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "S = parley session start demo"
+            ],
+            "pseudocode": "in test/acceptance/events_test.go, TestEvents_CarryTheSessionOfTheOperation: fork F with session_id S; push branch w1 from F with -o parley.change -o parley.session=S; push a second change w2 that edits the same lines as w1, same options; land w1 with session_id S; poll until w2 is mergeable conflict; ev = get(/events/log?session_id=S).items; for t in ['parley.workspace.fork','parley.git.push','parley.change.version','parley.change.land','parley.change.conflict']: assert some e in ev with e.type == t; assert all e.session_id == S"
+          }
+        },
+        {
+          "id": "REQ-8.4",
+          "pattern": "ubiquitous",
+          "action": "for any state change it acknowledged or stored before the hub process was killed under load, hold that change's event after the restart, with seq values that never go backwards",
+          "contract": "after a SIGKILL while eight writers create claims and a restart on the same data directory: every claim that GET …/claims?state=active returns has exactly one parley.claim.create event and every such event names a claim that exists; every claim whose creation was answered 201 exists; seq values in the log are strictly ascending and the first seq written after the restart is greater than every seq seen before the kill",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "a stream reader on /events?workspace=demo recording every seq"
+            ],
+            "pseudocode": "in test/acceptance/events_test.go, TestEvents_NoneMissingAfterKillUnderLoad: start 8 goroutines posting claims in a loop and recording each id answered 201; after 2 s hub.Kill(); maxSeen = reader.MaxSeq(); hub.Start(); claims = all pages of get(…/claims?state=active); ev = all pages of get(/events/log?workspace=demo&types=parley.claim.create); assert set(e.resource_id for e in ev) == set(c.id for c in claims); assert no resource_id twice; assert acknowledged ids subset of claim ids; assert seqs of the whole log strictly ascending; n = post(…/claims); e = event of n; assert e.seq > maxSeen and e.seq > max(seq in ev)"
+          }
+        },
+        {
+          "id": "REQ-8.5",
+          "pattern": "event_driven",
+          "condition": "events are written for a workspace that has an event webhook subscription whose receiver answers 200",
+          "action": "send each event to the subscription's URL as one signed POST, in seq order",
+          "contract": "the receiver gets one POST per event; the Parley-Seq values arrive in strictly ascending order and equal the seqs of GET /events/log for the workspace over the same span; for every request, 'sha256=' + hex(HMAC-SHA256(secret, Parley-Timestamp + '.' + body)) equals Parley-Signature, with the secret returned once at creation; Parley-Event equals the body's type",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "the hub's configuration has [webhooks] allow_insecure = true; the harness's webhook receiver listens on http://127.0.0.1:<port> and records every request with its headers and exact body"
+            ],
+            "pseudocode": "in test/acceptance/webhooks_test.go, TestWebhook_DeliversSignedPostsInSeqOrder: w = cli(alice,'webhook','create','demo','--url',receiver.URL).json; secret = w.secret; assert secret != ''; assert 'secret' not in get(…/webhooks/w.id); create 10 claims; reqs = receiver.Wait(10, 20 s); log = get(/events/log?workspace=demo&after=<seq before>).items; assert [int(r.header['Parley-Seq']) for r in reqs] == [e.seq for e in log]; for r in reqs: assert r.method == 'POST'; assert r.header['Parley-Signature'] == 'sha256=' + hmac_sha256_hex(secret, r.header['Parley-Timestamp'] + '.' + r.body); assert json(r.body).type == r.header['Parley-Event']"
+          }
+        },
+        {
+          "id": "REQ-8.6",
+          "pattern": "state_driven",
+          "condition": "the receiver of a subscription answers 500",
+          "action": "retry the same delivery with backoff and send no later event, then deliver every held event in order once the receiver answers 2xx",
+          "contract": "while failing, every request the receiver gets carries the same Parley-Delivery and Parley-Seq; the second attempt arrives at least 10 seconds after the first; no request with a higher Parley-Seq arrives; after the receiver switches to 200, the held events arrive in ascending Parley-Seq with none missing, each with a verifying signature",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "the hub's configuration has [webhooks] allow_insecure = true; the harness's webhook receiver listens on http://127.0.0.1:<port> and records every request with its headers and exact body",
+              "a subscription with the receiver answering 200, already past its first delivery"
+            ],
+            "pseudocode": "in test/acceptance/webhooks_test.go, TestWebhook_FailingReceiverHoldsOrderAndLosesNothing: receiver.Answer(500); create 5 claims (events e1..e5); a = receiver.Wait(2, 40 s); assert a[0].header['Parley-Delivery'] == a[1].header['Parley-Delivery']; assert a[0].header['Parley-Seq'] == a[1].header['Parley-Seq'] == e1.seq; assert a[1].received_at - a[0].received_at >= 10 s; assert every request so far has Parley-Seq == e1.seq; receiver.Answer(200); rest = receiver.WaitUntilSeq(e5.seq, 60 s); ok = the requests answered 200; assert [Parley-Seq of ok] == [e1.seq..e5.seq]; assert ok[0].header['Parley-Delivery'] == a[0].header['Parley-Delivery']; assert every signature verifies; assert get(…/webhooks/w.id).state == 'active'"
+          }
+        },
+        {
+          "id": "REQ-8.7",
+          "pattern": "unwanted",
+          "condition": "a subscription is created or updated with a URL whose host is, or resolves to, a private address",
+          "action": "refuse it and create or change nothing",
+          "contract": "HTTP 400 with error_type webhook_destination_refused for https://10.0.0.5/hook, https://192.168.1.1/hook, https://169.254.169.254/latest and https://[fd00::1]/hook; GET …/webhooks lists no subscription for them; the CLI exits 1",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "[webhooks] allow_private is false (the default) and allow_insecure is true"
+            ],
+            "pseudocode": "in test/acceptance/webhooks_test.go, TestWebhook_PrivateDestinationIsRefused: a table over urls {'https://10.0.0.5/hook','https://192.168.1.1/hook','https://169.254.169.254/latest','https://[fd00::1]/hook'}: r = post(…/webhooks, {url}); assert r.status == 400 and r.error.error_type == 'webhook_destination_refused'; assert get(…/webhooks).items == []; c = cli(alice,'webhook','create','demo','--url','https://10.0.0.5/hook'); assert c.code == 1 and json(c.stderr).error.error_type == 'webhook_destination_refused'; then on a subscription to the receiver: patch(…/webhooks/id, {url:'https://10.0.0.5/hook'}).status == 400 and its url is unchanged"
+          }
+        },
+        {
+          "id": "REQ-8.8",
+          "pattern": "event_driven",
+          "condition": "the owner pings a subscription, or asks for a past delivery to be sent again",
+          "action": "send the ping, or the event of that delivery, to the receiver as a signed POST",
+          "contract": "the ping answers 200 with a delivery record of status succeeded and the receiver gets one POST with Parley-Event parley.webhook.ping and a verifying signature; the redelivery answers 200 and the receiver gets one POST with the Parley-Delivery and the body of the original and a verifying signature",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "the hub's configuration has [webhooks] allow_insecure = true; the harness's webhook receiver listens on http://127.0.0.1:<port> and records every request with its headers and exact body",
+              "a subscription with three deliveries succeeded"
+            ],
+            "pseudocode": "in test/acceptance/webhooks_test.go, TestWebhook_PingAndRedeliveryArriveSigned: p = cli(alice,'webhook','ping','demo',w.id); assert p.code == 0 and p.json.status == 'succeeded'; r = receiver.Last(); assert r.header['Parley-Event'] == 'parley.webhook.ping' and verify(r); d = get(…/webhooks/w.id/deliveries).items; orig = the receiver's request for d[1]; x = post(…/webhooks/w.id/deliveries/<d[1].id>/redeliver); assert x.status == 200; r2 = receiver.Last(); assert r2.header['Parley-Delivery'] == d[1].id and r2.body == orig.body and verify(r2)"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-9",
+      "title": "Conventions, operations and carried features",
+      "rationale": "A client is written once against the conventions, and an operator runs and backs up one process (criteria 16 and 17); the carried features must be reachable end to end in the same hub (criterion 15).",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-9.1",
+          "pattern": "ubiquitous",
+          "action": "for any route under /api/v1, answer a request that fails with the error envelope, and a request with a method the path does not have with 405",
+          "contract": "for every row of the suite's route table (the route table generated from the PRD's route index, docs/prd/appendix_a_routes.md): a request with no credential is answered 401 with Content-Type application/json; charset=utf-8 and a body {error: {code, message, error_type}} where code equals the status and error_type is unauthenticated (of the two public routes, POST /auth/callback with a malformed body is answered 400 invalid_request in the same shape and GET /auth/providers has no failing request of this kind); a request with a credential and a method no route has for that path is answered 405 with error_type method_not_allowed in the same shape; an unknown path is 404 not_found in the same shape",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "the route table in the suite: method, path with placeholders, and whether the route is public; placeholders are filled with identifiers that exist on the hub"
+            ],
+            "pseudocode": "in test/acceptance/conventions_test.go, TestConventions_EveryErrorIsTheEnvelopeAndWrongMethodIs405: assert the (method, path) pairs of routes equal the routes parsed from docs/prd/appendix_a_routes.md; for each row under /api/v1: r = do(row.method, row.path, no Authorization); if row is POST /auth/callback: assertEnvelope(do(POST, row.path, body '{'), 400, 'invalid_request') else if not row.public: assertEnvelope(r, 401, 'unauthenticated'); m = a method in {GET, POST, PUT, PATCH, DELETE} that no row has for row.path; if m exists: assertEnvelope(do(m, row.path, admin token), 405, 'method_not_allowed'); assertEnvelope(get('/api/v1/no/such/path', admin token), 404, 'not_found'); assertEnvelope checks status, Content-Type == 'application/json; charset=utf-8', error.code == status, error.error_type == want and error.message is a non-empty string"
+          }
+        },
+        {
+          "id": "REQ-9.2",
+          "pattern": "ubiquitous",
+          "action": "for any list route, page the result the same way",
+          "contract": "for every list route of the suite's route table, with three items present: the answer is {items: array, next_cursor}; with limit=1, following next_cursor three times returns each of the three items exactly once and the last page has next_cursor null; limit=0 and limit=201 answer 400 invalid_request; a cursor taken from another list route answers 400 invalid_request; an empty list answers items [] and next_cursor null",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "for each list route marked in the route table, a seeding function in the suite that creates three items of that kind through the API"
+            ],
+            "pseudocode": "in test/acceptance/conventions_test.go, TestConventions_EveryListPagesTheSameWay: for each list row: empty = get(path on a fresh parent); assert empty.items == [] and empty.next_cursor == null; seed 3; all = get(path).items; assert len(all) >= 3; seen = []; cur = ''; loop: p = get(path + '?limit=1' + cursor); assert len(p.items) == 1; seen += id(p.items[0]); cur = p.next_cursor; until cur == null; assert seen == [id(x) for x in all]; assert no duplicate in seen; for bad in ['0','201']: r = get(path + '?limit=' + bad); assert r.status == 400 and r.error.error_type == 'invalid_request'; r = get(path + '?cursor=' + a cursor of a different list route); assert r.status == 400 and r.error.error_type == 'invalid_request'"
+          }
+        },
+        {
+          "id": "REQ-9.3",
+          "pattern": "ubiquitous",
+          "action": "for any POST route that creates a resource, honour an Idempotency-Key",
+          "contract": "for every creating POST of the suite's route table except POST /auth/callback: a second request with the same key, caller and body answers 200 with the first answer's body, without any member that is shown once (a token or secret value), and the resource exists once; the same key with a different body answers 409 conflict; an empty key and a key of 256 characters answer 400 invalid_request",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "for each creating POST marked in the route table, a body builder in the suite and a function that counts the resources of that kind"
+            ],
+            "pseudocode": "in test/acceptance/conventions_test.go, TestConventions_EveryCreatingPostHonoursIdempotencyKey: for each creating row: n0 = count(); r1 = post(path, body, Idempotency-Key: k); assert r1.status == 201; r2 = post(path, body, Idempotency-Key: k); assert r2.status == 200; assert r2.json == r1.json minus the row's show-once members; assert count() == n0 + 1; r3 = post(path, other body, Idempotency-Key: k); assert r3.status == 409 and r3.error.error_type == 'conflict'; for bad in ['', 256 x 'k']: r = post(path, body, Idempotency-Key: bad); assert r.status == 400 and r.error.error_type == 'invalid_request'; assert count() == n0 + 1"
+          }
+        },
+        {
+          "id": "REQ-9.4",
+          "pattern": "ubiquitous",
+          "action": "run from one binary, one configuration file and one data directory",
+          "contract": "a parleyd binary copied alone into an empty directory, started with XDG_CONFIG_HOME naming a directory that holds only config.toml, XDG_DATA_HOME naming an empty directory, an empty HOME and a PATH that holds only git, writes its listening line, answers GET /readyz with 200 and serves a workspace creation, a clone, a push and a land; afterwards the binary's directory and HOME hold no new file, the configuration directory holds config.toml and admin_token only, and all other state is under the data directory; no other process was started besides git children that have exited",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the harness's build of parleyd and parley; the fake identity provider and a test origin"
+            ],
+            "pseudocode": "in test/acceptance/harness_test.go, TestHarness_HubRunsFromOneBinaryConfigAndDataDir: hub = harness.Start(t) with an empty working directory W and empty home H; assert hub.ListeningAddr != ''; assert get(/readyz).status == 200; alice = hub.User('alice'); demo = hub.Workspace(alice, 'demo'); run the fork-push-land journey once; hub.Stop(); assert exit status 0; assert ls(W) == ['parleyd'] and ls(H) == []; assert sorted(ls(configDir)) == ['admin_token','config.toml']; assert ls(dataDir) is non-empty; assert no child process of the hub's pid remains"
+          }
+        },
+        {
+          "id": "REQ-9.5",
+          "pattern": "event_driven",
+          "condition": "an operator runs parleyd backup <empty directory> while the hub is serving writes, and then starts a hub on the snapshot",
+          "action": "write a consistent snapshot and start cleanly on it",
+          "contract": "parleyd backup exits 0 while eight writers keep getting 2xx answers; a second parleyd started with the snapshot as its data directory writes its listening line and answers GET /readyz with 200; on it, every workspace listed is ready, every change returned by GET …/changes has its version refs fetchable by git, git fsck of a clone passes, a land of an open change answers 200, and its event log's seq values are strictly ascending; parleyd backup into a non-empty directory exits 1",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness from the built parleyd binary; user alice signed in through the fake identity provider; workspace demo registered from a seeded test origin, owned by alice, default branch main",
+              "five open changes and three landed changes on demo; eight goroutines creating API commits and claims in a loop"
+            ],
+            "pseudocode": "in test/acceptance/operations_test.go, TestOperations_BackupWhileRunningRestoresToACleanStart: code = exec(parleydBin, 'backup', snap) with the hub's environment; assert code == 0; assert the writers saw no status >= 500 during the backup; stop the writers; hub2 = harness.StartOn(snap, same config on another port); assert get(hub2, /readyz).status == 200; ws = get(hub2, /workspaces).items; assert all status == 'ready'; for c in get(hub2, …/changes?state=open).items: assert git fetch <hub2 remote> refs/parley/changes/<c.number>/<c.version> == 0; clone hub2's demo; assert git fsck == 0; assert post(hub2, …/changes/<one open>/land).status == 200; assert seqs of get(hub2, /events/log) strictly ascending; assert exec(parleydBin, 'backup', snap).code == 1"
+          }
+        },
+        {
+          "id": "REQ-9.6",
+          "pattern": "optional",
+          "condition": "the suite runs with PARLEY_ACCEPTANCE_REFERENCE_HOST=1 on a host with 8 cores, 32 GB of memory and local SSD storage",
+          "action": "meet the latency and throughput targets a single client can observe",
+          "contract": "over 100 samples each: fork creation p95 under 1 s; read of one file and of one tree through the API p95 under 100 ms; commit creation of 100 files through the API p95 under 500 ms; land of a change of 20 commits with no contention p95 under 2 s; at least 60 non-conflicting changes landed on one target branch within one minute; an event received by a live subscriber of GET /events within 1 s of the 2xx answer of the request that caused it",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness with default limits; alice; workspace demo from an origin with 1,000 commits and 5,000 files"
+            ],
+            "pseudocode": "in test/acceptance/performance_test.go, TestPerformance_SingleClientTargetsOfTheReferenceHost: harness.Require(t, ReferenceHost); a table over (operation, samples, bound) {(post forks, 100, p95 < 1 s), (get scm/file, 100, p95 < 100 ms), (get scm/tree, 100, p95 < 100 ms), (post scm/commits with 100 create operations, 100, p95 < 500 ms), (post land of a 20-commit change, 100, p95 < 2 s)}: d = durations; assert percentile(d, 95) < bound; throughput: prepare 80 disjoint ready changes; land them from 8 clients for 60 s; assert landed >= 60; events: 100 x {t0 = time of the 201 of post claims; t1 = arrival at the stream reader}; assert max(t1 - t0) < 1 s"
+          }
+        },
+        {
+          "id": "REQ-9.7",
+          "pattern": "event_driven",
+          "condition": "a developer takes one journey through each carried feature with the parley CLI: a workspace's life, a carry-patch rebuild, a secret and a variable, a forge read, and a session with its audit trail",
+          "action": "complete each journey",
+          "contract": "every command of the five journeys exits 0, and: the workspace is ready after create --wait, fast_forward after a sync, archived, ready again, and 404 after delete; the carry-patch workspace's integration branch equals upstream's head plus the patch's commit; parley secrets list names the secret and no output of any command holds its value, while parley vars resolve prints the variable's value with its origin; parley issue list prints the two issues the fake forge holds; parley audit query returns the session's events and GET /metrics exposes parley_agent_sessions_active for the workspace",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started by the harness with PARLEY_SECRETS_KEY set; alice; a test origin and a second test origin used as upstream; the harness's fake forge holding two issues"
+            ],
+            "pseudocode": "in test/acceptance/carried_test.go, TestCarried_OneJourneyPerFeature: five subtests. workspace: cli('workspace','create','--name','w','--git-url',origin,'--wait') -> status ready; push a commit to the origin; cli('workspace','sync','w') -> main fast_forward; cli('workspace','archive','w') -> status archived; cli('workspace','reactivate','w') -> ready; cli('workspace','delete','w') -> 0; cli('workspace','get','w') -> exit 1, not_found. carry-patch: create with workspace mode carry_patch and --upstream-url; cli('patch','add',cp,'--branch','fix-1'); cli('rebuild','submit',cp,'--wait') -> succeeded; clone; assert git rev-parse deploy~1 == upstream head and the patch's file is in deploy. secrets: cli('secrets','create','API_TOKEN=s3cr3t-value','--workspace','demo'); out = cli('secrets','list','--workspace','demo'); assert 'API_TOKEN' in out and 's3cr3t-value' not in any stdout or stderr so far; cli('vars','create','REGION=eu','--workspace','demo'); v = cli('vars','resolve','demo'); assert entry REGION has value 'eu'. forge: cli('workspace','update','demo', setting forge_api_url = fake forge URL); i = cli('issue','list','demo'); assert [x.number for x in i.json.items] == fake forge's issue numbers. sessions: S = cli('session','start','demo','--model','m'); cli('session','usage',S,'--model','m','--input','10','--output','5'); create a claim with --session S; a = cli('audit','query','--session',S); assert parley.claim.create in types(a.json.items); assert 'parley_agent_sessions_active' in get(/metrics).body; cli('session','complete',S) -> status completed"
+          }
+        },
+        {
+          "id": "REQ-9.8",
+          "pattern": "optional",
+          "condition": "the environment variable that enables a gated scenario is not set (PARLEY_ACCEPTANCE_OPENSHELL_GATEWAY_URL for sandbox scenarios, PARLEY_ACCEPTANCE_LONG for scenarios that wait more than two minutes, PARLEY_ACCEPTANCE_LARGE_REPO for the 1 GiB repository, PARLEY_ACCEPTANCE_REFERENCE_HOST for the performance scenario)",
+          "system": "acceptance suite",
+          "action": "report the scenario as skipped with a reason that names the variable, without starting a hub for it, and neither pass nor fail it",
+          "contract": "go test -v of the gated scenarios with the four variables unset exits 0; every test named TestSandbox_*, TestLong_*, TestLargeRepo_* and TestPerformance_* is reported as SKIP with a line holding its variable's name; none is reported as PASS or FAIL; with PARLEY_ACCEPTANCE_OPENSHELL_GATEWAY_URL set to an address where nothing listens, the sandbox scenarios FAIL with the hub's start error instead of being skipped",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the Go toolchain; the suite's own package"
+            ],
+            "pseudocode": "in test/acceptance/harness_test.go, TestHarness_GatedScenariosSkipWithAStatedReason: out, code = exec('go','test','./test/acceptance/','-run','^Test(Sandbox|Long|LargeRepo|Performance)_','-v','-count=1') with the four variables removed from the environment and a variable that stops this test from recursing; assert code == 0; for each '--- ' result line: assert it starts with '--- SKIP'; assert at least one result line per prefix; for each prefix assert some output line holds its variable's name; assert '--- PASS' and '--- FAIL' not in out; then with PARLEY_ACCEPTANCE_OPENSHELL_GATEWAY_URL=http://127.0.0.1:1 and -run '^TestSandbox_ForkWithSandbox': assert code != 0 and '--- FAIL' in out"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-10",
+      "title": "Sandboxes",
+      "rationale": "An agent runs inside a sandbox the hub controls (criterion 18): the sandbox must arrive with the fork, must never hold a credential the operator did not expose, must be confined on the network, bounded in number, and must survive the hub.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-10.1",
+          "pattern": "optional",
+          "condition": "the hub is connected to an OpenShell gateway and an agent creates a fork with a sandbox object in one call",
+          "action": "return the fork and the sandbox, check the fork out in the sandbox by the time it is ready, and open a change in the parent for a git push run inside the sandbox",
+          "contract": "HTTP 201 with workspace and sandbox members; the sandbox reaches state ready within 120 seconds; an exec of git rev-parse HEAD in its working directory prints the fork's default branch head; an exec that commits a file and runs git push -o parley.change origin HEAD:refs/heads/work exits 0; GET …/<parent>/changes lists one open change whose source workspace is the fork",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "PARLEY_ACCEPTANCE_OPENSHELL_GATEWAY_URL, PARLEY_ACCEPTANCE_OPENSHELL_TOKEN_FILE and PARLEY_ACCEPTANCE_SANDBOX_IMAGE are set; the hub is started with [sandbox] pointing at that gateway and the profiles the scenario names, all using that image; alice owns workspace demo",
+              "profile default"
+            ],
+            "pseudocode": "in test/acceptance/sandbox_test.go, TestSandbox_ForkWithSandboxChecksOutAndPushOpensAChange: harness.Require(t, Gateway); r = post(…/workspaces/demo/forks, {sandbox:{profile:'default'}}); assert r.status == 201 and r.workspace.kind == 'fork' and r.sandbox.id != ''; cli(alice,'sandbox','get',fork,id,'--wait') until state ready (timeout 120 s); e = cli(alice,'sandbox','exec',fork,id,'--','git','rev-parse','HEAD'); assert e.code == 0 and e.stdout == head of the fork's main; e2 = exec('sh','-c','echo hi > s.txt && git add s.txt && git commit -m s && git push -o parley.change origin HEAD:refs/heads/work'); assert e2.exit_code == 0; c = get(…/workspaces/demo/changes?state=open).items; assert len(c) == 1 and c[0].source.workspace_slug == fork"
+          }
+        },
+        {
+          "id": "REQ-10.2",
+          "pattern": "optional",
+          "condition": "the hub is connected to an OpenShell gateway and a command in a sandbox reads its environment, under a profile that attaches a credential and exposes no secret, or in a fork owned by an org member with read-only access under a profile that exposes a secret of the parent",
+          "action": "show the command placeholders only: never the value of the hub credential, of an attached credential, or of any secret",
+          "contract": "the output of env in the sandbox holds PARLEY_API_KEY with a value that is not a credential the hub accepts (GET /api/v1/user with it answers 401) and does not hold the attached credential's secret value; with expose_secrets empty no stored secret value occurs anywhere in the output; in the read-only member's fork the parent's exposed secret's value does not occur in the output",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "PARLEY_ACCEPTANCE_OPENSHELL_GATEWAY_URL, PARLEY_ACCEPTANCE_OPENSHELL_TOKEN_FILE and PARLEY_ACCEPTANCE_SANDBOX_IMAGE are set; the hub is started with [sandbox] pointing at that gateway and the profiles the scenario names, all using that image; alice owns workspace demo",
+              "workspace secrets MODEL_KEY=mk-real-value and DEPLOY_KEY=dk-real-value on demo; profile cred attaches MODEL_KEY as a credential and has expose_secrets []; profile exposing has expose_secrets ['DEPLOY_KEY'] not required; bob is a read-only member of demo's organization"
+            ],
+            "pseudocode": "in test/acceptance/sandbox_test.go, TestSandbox_WorkloadSeesPlaceholdersOnly: harness.Require(t, Gateway); s1 = sandbox on alice's fork with profile cred; env = exec(s1, 'env').stdout; k = value of PARLEY_API_KEY in env; assert k != '' and get(/user, bearer k).status == 401; assert 'mk-real-value' not in env and 'dk-real-value' not in env; s2 = sandbox on bob's fork (created by bob) with profile exposing; env2 = exec(s2, 'env').stdout; assert 'dk-real-value' not in env2; assert 'DEPLOY_KEY' not in text(get(s2)), so the sandbox object names no exposed secret"
+          }
+        },
+        {
+          "id": "REQ-10.3",
+          "pattern": "optional",
+          "condition": "the hub is connected to an OpenShell gateway and a sandbox is created under a profile that lists a secret in expose_secrets",
+          "action": "place the secret's real value in the sandbox's environment, name the secret wherever the sandbox is described, and never show the value outside the sandbox",
+          "contract": "an exec of printenv DEPLOY_KEY prints the secret's value; GET /api/v1/sandbox-profiles, the sandbox object and the parley.sandbox.create event each name DEPLOY_KEY; none of those three, serialized, contains the value; after a command in the sandbox printed the value to its main process's output, GET …/logs contains [redacted] and not the value",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "PARLEY_ACCEPTANCE_OPENSHELL_GATEWAY_URL, PARLEY_ACCEPTANCE_OPENSHELL_TOKEN_FILE and PARLEY_ACCEPTANCE_SANDBOX_IMAGE are set; the hub is started with [sandbox] pointing at that gateway and the profiles the scenario names, all using that image; alice owns workspace demo",
+              "workspace secret DEPLOY_KEY=dk-real-value on demo; profile exposing has expose_secrets ['DEPLOY_KEY']; the sandbox's main command prints $DEPLOY_KEY once and then sleeps"
+            ],
+            "pseudocode": "in test/acceptance/sandbox_test.go, TestSandbox_ExposedSecretIsReadableInsideAndNamedNotShownOutside: harness.Require(t, Gateway); s = sandbox on alice's fork with profile exposing; assert exec(s,'printenv','DEPLOY_KEY').stdout == 'dk-real-value\\n'; p = get(/sandbox-profiles); o = get(s); ev = events(types=parley.sandbox.create) for s; for doc in (p, o, ev): assert 'DEPLOY_KEY' in text(doc) and 'dk-real-value' not in text(doc); logs = cli(alice,'sandbox','logs',fork,s.id).stdout; assert '[redacted]' in logs and 'dk-real-value' not in logs"
+          }
+        },
+        {
+          "id": "REQ-10.4",
+          "pattern": "unwanted",
+          "condition": "the hub is connected to an OpenShell gateway and a sandbox is created under a profile that requires an exposed secret that is not stored, or a proposal is approved with a workspace-bound token, or an exec is requested with a token that lacks a scope of the sandbox's hub credential",
+          "action": "refuse the request",
+          "contract": "the creation answers 422 with error_type credential_missing naming the secret and creates neither the sandbox nor, in a fork-create call, the fork; the approval answers 403 with error_type token_bound and the proposal stays pending; the exec answers 403 with error_type insufficient_scope and runs nothing",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "PARLEY_ACCEPTANCE_OPENSHELL_GATEWAY_URL, PARLEY_ACCEPTANCE_OPENSHELL_TOKEN_FILE and PARLEY_ACCEPTANCE_SANDBOX_IMAGE are set; the hub is started with [sandbox] pointing at that gateway and the profiles the scenario names, all using that image; alice owns workspace demo",
+              "profile needs requires exposed secret ABSENT_KEY, which is not stored; a ready sandbox s on fork F whose hub credential holds git:write and changes:write; a pending proposal p on s; F's bound token; alice's PAT with sandboxes scopes but without changes:write"
+            ],
+            "pseudocode": "in test/acceptance/sandbox_test.go, TestSandbox_RefusalsCredentialMissingTokenBoundInsufficientScope: harness.Require(t, Gateway); n0 = count(get(…/workspaces/demo/forks).items); r = post(…/workspaces/demo/forks, {sandbox:{profile:'needs'}}); assert r.status == 422 and r.error.error_type == 'credential_missing' and 'ABSENT_KEY' in r.error.message; assert count(forks) == n0; a = post(…/sandboxes/s/proposals/p/approve, {}, bearer F's token); assert a.status == 403 and a.error.error_type == 'token_bound'; assert proposal p still pending; x = post(…/sandboxes/s/exec, {command:['touch','/tmp/ran']}, bearer the PAT without changes:write); assert x.status == 403 and x.error.error_type == 'insufficient_scope'; assert exec(s,'test','-e','/tmp/ran', alice API key).exit_code != 0"
+          }
+        },
+        {
+          "id": "REQ-10.5",
+          "pattern": "optional",
+          "condition": "the hub is connected to an OpenShell gateway and a command in a sandbox requests a host that no rule allows, and a person then approves the proposal for that host",
+          "action": "block the first request and report it, and let the same request through after the approval",
+          "contract": "the first request fails inside the sandbox; the event log holds parley.sandbox.deny for the sandbox with metadata.host equal to the host; GET …/proposals lists a pending proposal for the host; after POST …/approve with the owner's API key answers 200, the same command exits 0",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "PARLEY_ACCEPTANCE_OPENSHELL_GATEWAY_URL, PARLEY_ACCEPTANCE_OPENSHELL_TOKEN_FILE and PARLEY_ACCEPTANCE_SANDBOX_IMAGE are set; the hub is started with [sandbox] pointing at that gateway and the profiles the scenario names, all using that image; alice owns workspace demo",
+              "profile default allows no egress except the hub; the harness serves a page on a host name the gateway can reach, called the target host; a ready sandbox s on alice's fork"
+            ],
+            "pseudocode": "in test/acceptance/sandbox_test.go, TestSandbox_DeniedHostIsReportedAndOpensAfterApproval: harness.Require(t, Gateway); e = exec(s,'curl','-fsS','--max-time','10',target); assert e.exit_code != 0; poll 20 s for events(types=parley.sandbox.deny) with metadata.host == target host; assert found; p = the pending proposal for target host from cli(alice,'sandbox','proposals',fork,s.id); a = cli(alice,'sandbox','approve',fork,s.id,p.id); assert a.code == 0; poll up to 30 s: e2 = exec(s,'curl','-fsS','--max-time','10',target); assert e2.exit_code == 0"
+          }
+        },
+        {
+          "id": "REQ-10.6",
+          "pattern": "optional",
+          "condition": "the hub is connected to an OpenShell gateway and a proposal is approved with scope workspace",
+          "action": "save the rule on the workspace and apply it to every sandbox created afterwards on the workspace or its forks, and to none that was already running, until the rule is deleted",
+          "contract": "GET …/<workspace>/sandbox-rules lists the rule with the host; a sandbox created afterwards on the workspace and one created on another fork reach the host with no proposal appearing; a sandbox that was running before the approval, other than the proposing one, still fails to reach it; after DELETE of the rule a newly created sandbox fails to reach the host and parley.sandbox.deny is written for it",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "PARLEY_ACCEPTANCE_OPENSHELL_GATEWAY_URL, PARLEY_ACCEPTANCE_OPENSHELL_TOKEN_FILE and PARLEY_ACCEPTANCE_SANDBOX_IMAGE are set; the hub is started with [sandbox] pointing at that gateway and the profiles the scenario names, all using that image; alice owns workspace demo",
+              "ready sandboxes s1 on fork F1 and s0 on fork F0, both created before the approval; s1 has a pending proposal for the target host"
+            ],
+            "pseudocode": "in test/acceptance/sandbox_test.go, TestSandbox_WorkspaceRuleAppliesToNewSandboxesOnly: harness.Require(t, Gateway); post(…/sandboxes/s1/proposals/p/approve, {scope:'workspace'}); rules = cli(alice,'sandbox','rules','demo').json.items; assert one rule with the target host; s2 = new sandbox on demo; s3 = new sandbox on a new fork F2; for s in (s2, s3): assert curl(s, target).exit_code == 0 and get(…/sandboxes/s/proposals).items == []; assert curl(s0, target).exit_code != 0; cli(alice,'sandbox','rule-delete','demo',rule.id); s4 = new sandbox on demo; assert curl(s4, target).exit_code != 0; assert a parley.sandbox.deny event for s4"
+          }
+        },
+        {
+          "id": "REQ-10.7",
+          "pattern": "unwanted",
+          "condition": "the hub is connected to an OpenShell gateway and a sandbox is requested while the number of running sandboxes has reached the limit of the workspace family, of the hub, of the organization or of the user",
+          "action": "refuse the creation and name the limit that was hit",
+          "contract": "HTTP 429 with error_type sandbox_capacity and a message naming max_per_workspace, max_sandboxes, max_per_org or max_per_user, whichever is the one hit; no sandbox is created; after a running sandbox is deleted the same request answers 201",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "PARLEY_ACCEPTANCE_OPENSHELL_GATEWAY_URL, PARLEY_ACCEPTANCE_OPENSHELL_TOKEN_FILE and PARLEY_ACCEPTANCE_SANDBOX_IMAGE are set; the hub is started with [sandbox] pointing at that gateway and the profiles the scenario names, all using that image; alice owns workspace demo",
+              "four hubs, each started with one of [sandbox] max_per_workspace, max_sandboxes, max_per_org, max_per_user set to 1 and the other three at their defaults; for max_sandboxes, max_per_org and max_per_user the second request is made on a second workspace so that the workspace limit is not the one hit (for max_per_user, a workspace in another organization)"
+            ],
+            "pseudocode": "in test/acceptance/sandbox_test.go, TestSandbox_CapacityRefusalNamesTheLimitHit: harness.Require(t, Gateway); a table over limit {max_per_workspace, max_sandboxes, max_per_org, max_per_user}: first = create sandbox, wait ready; r = create the second as the setup says; assert r.status == 429 and r.error.error_type == 'sandbox_capacity' and limit in r.error.message; for the other three names assert name not in r.error.message; assert count(get(/sandboxes).items) == 1; cli(alice,'sandbox','delete',ws,first.id); poll until gone; assert create again .status == 201"
+          }
+        },
+        {
+          "id": "REQ-10.8",
+          "pattern": "optional",
+          "condition": "the hub is connected to an OpenShell gateway and a sandbox with committed and uncommitted work is stopped on request, stopped for being idle, or expires, or the hub itself is stopped and started while a sandbox runs",
+          "action": "leave a checkpoint from which a new sandbox gets the work back, and leave a running sandbox and its main process untouched by the hub's restart",
+          "contract": "after each of the three endings, git ls-remote of the fork lists a ref under refs/parley/sandboxes/<id>/; a sandbox created with restore_from naming the ended sandbox has the committed file in its history and the uncommitted file in its working directory with the same content; after the hub is stopped and started, the sandbox that was running is shown ready again within 60 seconds and a counter file its main process appends to every second has more lines than before the stop, with no gap longer than 5 seconds",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "PARLEY_ACCEPTANCE_OPENSHELL_GATEWAY_URL, PARLEY_ACCEPTANCE_OPENSHELL_TOKEN_FILE and PARLEY_ACCEPTANCE_SANDBOX_IMAGE are set; the hub is started with [sandbox] pointing at that gateway and the profiles the scenario names, all using that image; alice owns workspace demo",
+              "profile quick has idle timeout 1m and ttl 3m; profile default; each sandbox gets a committed file c.txt and an uncommitted file u.txt through exec"
+            ],
+            "pseudocode": "in test/acceptance/sandbox_test.go, TestSandbox_CheckpointsRestoreAndHubRestart: harness.Require(t, Gateway); a table over ending {cli sandbox stop, idle for 1m under profile quick, expiry after 3m under profile quick with an exec every 20 s}: s = sandbox; make c.txt (commit) and u.txt (no commit); end it; poll until state is stopped or expired; refs = git ls-remote <fork remote> 'refs/parley/sandboxes/<s.id>/*'; assert len(refs) >= 1; n = create sandbox {restore_from: s.id}; wait ready; assert exec(n,'git','log','--oneline','--','c.txt').stdout != ''; assert exec(n,'cat','u.txt').stdout == content of u.txt. restart: r = sandbox with main command 'while true; do date +%s >> /tmp/ticks; sleep 1; done'; before = lines(exec(r,'cat','/tmp/ticks')); hub.Stop(); sleep 5 s; hub.Start(); poll up to 60 s until get(r).state == 'ready'; ticks = exec(r,'cat','/tmp/ticks').stdout lines; assert len(ticks) > len(before) and max gap between consecutive ticks <= 5"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "An agent forks, pushes and lands",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "runs parley workspace create --name demo --git-url <origin> --wait"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends POST /api/v1/workspaces and polls GET /api/v1/workspaces/demo until its status is ready"
+        },
+        {
+          "actor": "parleyd",
+          "action": "clones the origin into the workspace's repository and reports the workspace ready"
+        },
+        {
+          "actor": "agent",
+          "action": "sends POST /api/v1/workspaces/demo/forks with a token object"
+        },
+        {
+          "actor": "parleyd",
+          "action": "creates the fork without copying history, mints the fork-bound token and answers 201 with the fork, its remote and the token"
+        },
+        {
+          "actor": "git client",
+          "action": "clones the fork's remote with the token, commits a file on a new branch and pushes it with -o parley.change"
+        },
+        {
+          "actor": "parleyd",
+          "action": "accepts the push, opens a change on the parent with version 1 and prints its number on the push's remote lines"
+        },
+        {
+          "actor": "agent",
+          "action": "runs parley change land demo <number> with the fork's token"
+        },
+        {
+          "actor": "parleyd",
+          "action": "rebases the change onto the target, moves the default branch by compare-and-swap, marks the change landed and writes parley.change.land"
+        },
+        {
+          "actor": "git client",
+          "action": "clones the parent and finds the agent's file on the default branch"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the built parleyd binary as its own process with its real stores and repositories on disk",
+          "the built parley binary",
+          "stock git over smart HTTP",
+          "the test origin of internal/gitrepo/gitrepotest served over TLS",
+          "the fake identity provider reached through POST /auth/callback"
+        ],
+        "setup": [
+          "the harness has built both binaries and started a hub on a temporary configuration directory and data directory",
+          "alice is signed in through the fake identity provider and holds an API key and a PAT with workspaces:write and tokens:manage",
+          "the origin holds three commits on main"
+        ],
+        "end_state": [
+          "GET /api/v1/workspaces/demo/changes/<number> shows state landed and its one land attempt has status landed",
+          "a fresh git clone of demo has the agent's file at the head of main, and main's history is linear",
+          "GET /api/v1/events/log?workspace=demo holds parley.workspace.fork, parley.git.push, parley.change.open and parley.change.land in ascending seq",
+          "the fork's token still answers 404 on a second workspace"
+        ],
+        "pseudocode": "in test/acceptance/journey_test.go, TestJourney_AgentForksPushesAndLands: hub = harness.Start(t); alice = hub.User('alice'); origin = hub.Origin(3 commits); assert cli(alice,'workspace','create','--name','demo','--git-url',origin.URL,'--wait').json.status == 'ready'; f = post(…/workspaces/demo/forks, {token:{permissions:[git:read, git:write, changes:read, changes:write]}}); git clone f.remote with f.token.token; write agent.txt; commit on branch task; out = git push -o parley.change origin task; n = the one open change of demo; l = cli(f.token.token,'change','land','demo',n); assert l.code == 0 and l.json.status == 'landed'; fresh = git clone demo; assert agent.txt in fresh at origin/main; assert types of get(/events/log?workspace=demo) contain the four types in ascending seq"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "Two agents race to land and the loser resolves without a clone",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "two agents, each on its own fork, push a change that replaces the same line of the same file"
+        },
+        {
+          "actor": "parleyd",
+          "action": "opens both changes and reports each mergeable clean against the target"
+        },
+        {
+          "actor": "agent",
+          "action": "both send POST /api/v1/workspaces/demo/changes/<number>/land at the same moment"
+        },
+        {
+          "actor": "parleyd",
+          "action": "lands one change by compare-and-swap; rebasing the other onto the moved target conflicts, so it ends that attempt as conflict and answers 409 land_conflict with the conflict report"
+        },
+        {
+          "actor": "agent",
+          "action": "the losing agent reads GET …/changes/<number>/conflict/file?path=<file> and runs parley change resolve with the resolved content"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends POST …/changes/<number>/restack with the resolution"
+        },
+        {
+          "actor": "parleyd",
+          "action": "rebuilds the change's commits on the target with the resolved file, moves the source branch and records a new version"
+        },
+        {
+          "actor": "agent",
+          "action": "the losing agent sends the land request again"
+        },
+        {
+          "actor": "parleyd",
+          "action": "lands the change and writes parley.change.land"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the built parleyd binary as its own process",
+          "the built parley binary",
+          "stock git over smart HTTP",
+          "the hub's real git rebase and compare-and-swap of refs",
+          "the event log"
+        ],
+        "setup": [
+          "a hub with workspace demo whose src/a.txt has five lines",
+          "two forks of demo, each with a bound token"
+        ],
+        "end_state": [
+          "both changes have state landed",
+          "src/a.txt on main holds the resolved content the losing agent submitted and no conflict marker",
+          "GET …/lands lists three attempts: landed, conflict, landed",
+          "the event log holds parley.change.land_fail for the loser's first attempt and parley.change.land for both changes"
+        ],
+        "pseudocode": "in test/acceptance/journey_test.go, TestJourney_TwoAgentsRaceAndTheLoserResolves: open p (fork 1) and q (fork 2) editing line 3 of src/a.txt; rp, rq = concurrent post(…/land) with each fork's token; assert sorted([rp.status, rq.status]) == [200, 409]; loser = the 409 one; assert loser.error.error_type == 'land_conflict'; body = get(…/changes/<loser>/conflict/file?path=src/a.txt).body; assert '<<<<<<<' in body; cli(loser token,'change','resolve','demo',loser,'--file','src/a.txt=<resolved>'); assert cli(loser token,'change','land','demo',loser).json.status == 'landed'; assert get(…/scm/file?path=src/a.txt&ref=main, raw).body == resolved; assert [a.status for a in get(…/lands).items oldest first] == ['landed','conflict','landed']"
+      }
+    },
+    {
+      "id": "PATH-3",
+      "title": "A consumer resumes the event stream",
+      "steps": [
+        {
+          "actor": "review agent",
+          "action": "opens GET /api/v1/events?workspace=demo with a PAT holding audit:read and reads events as they are written"
+        },
+        {
+          "actor": "parleyd",
+          "action": "sends a heartbeat and then each visible event of the workspace as an SSE frame whose id is the event's seq"
+        },
+        {
+          "actor": "review agent",
+          "action": "disconnects, remembering the last seq it received"
+        },
+        {
+          "actor": "agent",
+          "action": "pushes, opens a change and lands it while the consumer is away"
+        },
+        {
+          "actor": "parleyd",
+          "action": "writes each event to the event log with the next seq, in the same transaction as the state change it reports"
+        },
+        {
+          "actor": "review agent",
+          "action": "reconnects with Last-Event-ID set to the remembered seq"
+        },
+        {
+          "actor": "parleyd",
+          "action": "replays every event after that seq in ascending order, then continues with live events on the same connection"
+        },
+        {
+          "actor": "review agent",
+          "action": "reports a check on the change it learned of from the replayed parley.change.open event"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the built parleyd binary as its own process",
+          "the event log in the hub's store",
+          "the SSE stream of GET /api/v1/events over a real TCP connection",
+          "stock git over smart HTTP",
+          "the built parley binary for parley events tail"
+        ],
+        "setup": [
+          "a hub with workspace demo",
+          "user ci with write access to demo and a PAT holding audit:read, changes:read and checks:write"
+        ],
+        "end_state": [
+          "the events received after the reconnect equal GET /api/v1/events/log?workspace=demo&after=<remembered seq>, in the same order, followed by one live event",
+          "no seq was received twice and none at or below the remembered seq",
+          "GET …/changes/<number>/checks lists the check the review agent reported"
+        ],
+        "pseudocode": "in test/acceptance/journey_test.go, TestJourney_ConsumerResumesTheEventStream: r = stream(/events?workspace=demo, ci PAT); create a claim; s0 = r.Next(1).seq; r.Close(); push a branch with -o parley.change; land it; open a second change n2; want = get(/events/log?workspace=demo&after=s0).items; r2 = stream(/events?workspace=demo, Last-Event-ID: s0); got = r2.Next(len(want)); assert [e.seq for e in got] == [e.seq for e in want]; create a claim; assert r2.Next(1).seq > got[-1].seq; n = number from the parley.change.open event of n2 in got; put(…/changes/n/checks/test, {status:'passed'}, ci PAT); assert get(…/changes/n/checks).items[0].name == 'test'"
+      }
+    }
+  ]
+}

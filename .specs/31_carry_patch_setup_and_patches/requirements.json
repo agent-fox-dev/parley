@@ -1,0 +1,822 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "31",
+  "spec_name": "carry_patch_setup_and_patches",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Upstream credentials",
+      "rationale": "Upstream is often private, and a rotated secret must take effect without a restart.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "ubiquitous",
+          "action": "resolve the upstream credential of a carry-patch workspace from the workspace's secrets on every use, without caching, taking the first that applies of: a non-empty UPSTREAM_GIT_PAT (user name x-token-auth, the token as password); UPSTREAM_GIT_USERNAME with UPSTREAM_GIT_PASSWORD when both are non-empty; the origin credential of the workspace; no credential",
+          "contract": "the resolver returns a user name and a password, or 'no credential'; a secret changed between two calls changes the result of the second call",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose secrets are held by a fake of the secret reader that package 10's origin credential resolver uses"
+            ],
+            "pseudocode": "in internal/carrypatch/credential_test.go, TestResolveUpstreamCredential_Order, a table over the workspace secrets: {UPSTREAM_GIT_PAT=t, UPSTREAM_GIT_USERNAME=u, UPSTREAM_GIT_PASSWORD=p, GIT_PAT=o} -> (x-token-auth, t); {UPSTREAM_GIT_PAT='', UPSTREAM_GIT_USERNAME=u, UPSTREAM_GIT_PASSWORD=p} -> (u, p); {UPSTREAM_GIT_USERNAME=u only, GIT_PAT=o} -> (x-token-auth, o); {UPSTREAM_GIT_USERNAME=u, UPSTREAM_GIT_PASSWORD=''; GIT_USERNAME=a, GIT_PASSWORD=b} -> (a, b); {UPSTREAM_GIT_USERNAME=u only} -> no credential; {} -> no credential. Then: resolve with UPSTREAM_GIT_PAT=t1, write UPSTREAM_GIT_PAT=t2 through the secret component, resolve again and assert the password is t2"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "unwanted",
+          "condition": "the workspace's secrets cannot be read",
+          "action": "return an error from the credential resolution and never report 'no credential'",
+          "contract": "the resolver returns a non-nil error; a fetch that asked for the credential starts no git process",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/carrypatch/credential_test.go, TestResolveUpstreamCredential_ReadErrorIsAnError: the secret reader returns an error for every name; assert ResolveUpstreamCredential returns an error and no credential value; in internal/carrypatch/upstream_test.go, TestFetchUpstream_NoAnonymousFallback: with the same reader and a counting git runner call FetchUpstream; assert it returns an error and the runner started 0 processes"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Upstream fetch and upstream base",
+      "rationale": "Every rebuild, preview and merge detection starts from the upstream base, so the hub must hold upstream's branches and know which one is the base.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "the hub fetches upstream for a carry-patch workspace",
+          "action": "bring every branch of upstream_url into refs/remotes/upstream/* of the workspace's copy, remove the upstream refs that upstream no longer has, fetch no tag, and record upstream's default branch in the copy's configuration under parley.upstreamDefaultBranch, handing the resolved upstream credential to git through the process environment only",
+          "contract": "after the fetch, refs/remotes/upstream/<branch> equals upstream's head for every branch of upstream and exists for no other name; no tag of upstream exists in the copy; the copy's stored remote configuration and the git arguments contain no credential",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a workspace record with workspace_mode carry_patch and upstream_url the test upstream's URL, and a bare copy at RepoPath"
+            ],
+            "pseudocode": "in internal/carrypatch/upstream_test.go, TestFetchUpstream_BringsBranchesWithoutTags: upstream = gitrepotest.NewOrigin(t) with branches main (default) and release, tag v9 and Basic authentication; the workspace secret UPSTREAM_GIT_PAT holds the password; err = FetchUpstream(ctx, ws); assert err == nil; assert ref(copy, 'refs/remotes/upstream/main') == upstream.Head('main') and the same for release; assert 'refs/tags/v9' does not resolve in the copy; assert config(copy, 'parley.upstreamDefaultBranch') == 'main'; assert the token appears in no file under the copy and in no recorded git argument; delete release on upstream, advance main, fetch again; assert upstream/release is gone and upstream/main == the new head"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "ubiquitous",
+          "action": "for any carry-patch workspace, report as the upstream base the head of the upstream's default branch as of the last upstream fetch, else the head of the upstream branch with the same name as the workspace's default_branch, else report that there is no upstream base",
+          "contract": "UpstreamBase returns a full 40-character commit id, or the error ErrNoUpstreamBase; it starts no fetch",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a bare copy made with git init in t.TempDir() whose refs/remotes/upstream/* are written directly by the test"
+            ],
+            "pseudocode": "in internal/carrypatch/upstream_test.go, TestUpstreamBase_Rule, a table over the copy's state with the workspace's default_branch 'main': {recorded default 'trunk', upstream/trunk at A, upstream/main at B} -> A; {no recorded default, upstream/main at B} -> B; {recorded default 'gone' with no such ref, upstream/main at B} -> B; {no recorded default, only upstream/dev} -> ErrNoUpstreamBase; {no upstream ref at all} -> ErrNoUpstreamBase; assert each returned id has 40 hexadecimal characters and that the git runner saw no fetch"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "unwanted",
+          "condition": "an upstream fetch fails because upstream cannot be reached, refuses the credential or the credential cannot be resolved",
+          "action": "return an error whose text contains no credential and has URL user information replaced by ***@, and leave refs/remotes/upstream/* and the recorded default branch as they were",
+          "contract": "FetchUpstream returns a non-nil error; the error text contains neither the token nor the password; every ref of the copy is unchanged",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/carrypatch/upstream_test.go, TestFetchUpstream_FailureChangesNothing, a table over {the upstream URL names no repository, the upstream answers 401 to the credential, the secret reader fails}: before = all refs of the copy and its parley.upstreamDefaultBranch after one good fetch; err = FetchUpstream(ctx, ws); assert err != nil; assert the secret value is not a substring of err.Error(); assert all refs and the recorded default branch == before"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "unwanted",
+          "condition": "an upstream fetch has not finished after 10 minutes",
+          "action": "stop the git process and its children and return the deadline error",
+          "contract": "FetchUpstream returns the deadline error; no git child process is left running; every ref of the copy is unchanged",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/carrypatch/upstream_test.go, TestFetchUpstream_StopsAtDeadline: the upstream is an httptest server that accepts the request and never answers; call FetchUpstream with the deadline option set to 200 ms; assert it returns the deadline error within 2 s, no git child process of the test is left and the refs are unchanged; assert the default deadline constant FetchUpstream uses is 10 minutes"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Set-up after a fresh clone",
+      "rationale": "A carry-patch workspace is usable only once the hub holds upstream, an integration branch and remembered resolutions; none of them may keep the workspace from becoming ready.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "a fresh clone of a workspace in carry_patch mode has completed and the workspace is not yet ready",
+          "action": "fetch upstream with the upstream credential, turn on remembered resolutions in the workspace's copy and set the integration branch to the upstream base, as the post-clone step registered for the mode carry_patch",
+          "contract": "when the workspace's status first reads ready: refs/remotes/upstream/<branch> exists for every branch of upstream, the copy's configuration value rerere.enabled is true, refs/heads/<integration_branch> equals the upstream base, clone_error and upstream_head_sha are null, and the step emitted no event",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the real store, the workspace clone work of package 10 and the real git command; two repositories served by gitrepotest.NewOrigin"
+            ],
+            "pseudocode": "in internal/carrypatch/setup_test.go, TestSetup_RunsAfterFreshCloneBeforeReady: register the step with the post-clone registry of internal/workspace; origin = gitrepotest.NewOrigin(t) with main; upstream = gitrepotest.NewOrigin(t) with main at U and release; create the workspace with integration_branch 'integration' and run its clone work; the step records the status it observes; assert it observed 'cloning'; assert the record is ready with clone_error null and upstream_head_sha null; assert ref(copy, 'refs/heads/integration') == U; assert config(copy, 'rerere.enabled') == 'true'; assert upstream/main and upstream/release exist; assert the event log holds no event other than parley.workspace.create. Create a standard workspace on the same origin; assert its copy has no refs/remotes/upstream ref and no integration branch"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "event_driven",
+          "condition": "the set-up runs for a workspace whose record holds no integration_branch",
+          "action": "write deploy into the record as integration_branch and use deploy as the integration branch",
+          "contract": "the workspace record shows integration_branch \"deploy\"; refs/heads/deploy exists in the copy; IntegrationBranch returns \"deploy\" for a record that still holds null",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/carrypatch/setup_test.go, TestSetup_DefaultsIntegrationBranchToDeploy: create a carry_patch workspace without integration_branch; assert IntegrationBranch(record) == 'deploy' while the stored value is null; run the clone work; assert the stored integration_branch == 'deploy' and ref(copy, 'refs/heads/deploy') == upstream.Head('main'); with a stored value 'integration' assert IntegrationBranch returns 'integration' and the set-up leaves the stored value alone"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "unwanted",
+          "condition": "the upstream fetch of the set-up fails, or no upstream base resolves after it",
+          "action": "set the integration branch to the head of origin's default branch, turn on remembered resolutions, return the failure to the clone work for logging, and leave the workspace free to become ready",
+          "contract": "the workspace reaches status ready with clone_error null; refs/heads/<integration_branch> equals the workspace's head_sha; rerere.enabled is true; one log line reports the failed step and contains no credential",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/carrypatch/setup_test.go, TestSetup_UpstreamFailureStillReady, a table over {the upstream URL names no repository, the upstream refuses the credential held in UPSTREAM_GIT_PAT, the upstream has only a branch 'dev' while the workspace's default branch is main and upstream reports no default branch}: run the clone work; assert the record is ready and clone_error is null; assert ref(copy, 'refs/heads/deploy') == record.head_sha == origin.Head('main'); assert config(copy, 'rerere.enabled') == 'true'; assert the captured log has one entry naming the set-up and the workspace slug and that the secret value is not in it"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "event_driven",
+          "condition": "the fresh clone brought a branch with the integration branch's name from origin",
+          "action": "replace that branch with the hub's integration branch at the upstream base",
+          "contract": "refs/heads/<integration_branch> equals the upstream base and differs from origin's head of the branch of that name; refs/remotes/origin/<integration_branch>, where the clone recorded it, is unchanged",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/carrypatch/setup_test.go, TestSetup_IntegrationBranchDoesNotFollowOrigin: origin has main and a branch deploy at commit X; upstream has main at U, U != X; run the clone work of a carry_patch workspace; assert the record is ready; assert ref(copy, 'refs/heads/deploy') == U"
+          }
+        },
+        {
+          "id": "REQ-3.5",
+          "pattern": "event_driven",
+          "condition": "the set-up is run again on a workspace that is ready",
+          "action": "fetch upstream, turn remembered resolutions on when they are off, create the integration branch at the upstream base (or, without one, at the head of origin's default branch) only when the branch does not exist, and never move an existing integration branch",
+          "contract": "EnsureSetup returns nil when every step succeeded; an integration branch that existed before the call has the same commit id after it; a missing one exists after it",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/carrypatch/setup_test.go, TestEnsureSetup_RepeatsOnlyWhatIsMissing: after a set-up in which the upstream was unreachable (deploy at origin's head H, no upstream refs), make upstream reachable with main at U and call EnsureSetup(ctx, ws); assert nil; assert upstream/main == U; assert ref(copy, 'refs/heads/deploy') == H; then delete refs/heads/deploy and unset rerere.enabled in the copy and call EnsureSetup again; assert ref(copy, 'refs/heads/deploy') == U and rerere.enabled == 'true'; call it a third time and assert no ref changed"
+          }
+        },
+        {
+          "id": "REQ-3.6",
+          "pattern": "unwanted",
+          "condition": "one step of the set-up fails",
+          "action": "attempt every remaining step and return one error that names each failed step, without terminating the process",
+          "contract": "the set-up returns a non-nil error naming the failed step; the steps after the failed one have taken effect",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "fakes for the workspace store, the upstream fetcher and the copy's ref and configuration writes"
+            ],
+            "pseudocode": "in internal/carrypatch/setup_test.go, TestSetup_ContinuesAfterAFailedStep, a table over the injected failure {the store write of integration_branch, the upstream fetch, the configuration write of rerere.enabled, the write of the integration branch}: run the set-up with fakes for the store, the fetcher and the copy; assert the returned error text names that step; assert each of the other three steps was called once"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Access and preconditions of carry-patch routes",
+      "rationale": "Patch routes mean nothing on a standard workspace or a fork, and a write needs a repository that is there.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "unwanted",
+          "condition": "a request that passed authentication, scope, access and request validation names a workspace whose workspace_mode is not carry_patch, a task fork of a carry-patch workspace included",
+          "action": "refuse the request before it looks at the workspace's status",
+          "contract": "HTTP 400 with error_type workspace_mode_mismatch; an invalid body on the same workspace is HTTP 400 with error_type invalid_request instead; a standard workspace in status failed answers workspace_mode_mismatch, not workspace_not_ready, on a write route",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "workspace records written directly to a temporary store; the guard under test with the real access component"
+            ],
+            "pseudocode": "in internal/carrypatch/guard_test.go, TestGuard_ModeMismatch: mount one read route and one write route built with the guard on the server pipeline of internal/server; a table over {standard workspace ready, standard workspace failed, a task fork whose parent is carry_patch} x {read, write}: assert 400 and error_type 'workspace_mode_mismatch'; POST the write route on the standard workspace with a body that fails the route's validation: assert 400 and error_type 'invalid_request'"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "unwanted",
+          "condition": "a write route is called on a carry-patch workspace whose status is not ready or on which a reclone, archive or delete is running",
+          "action": "refuse the request and change nothing",
+          "contract": "HTTP 409 with error_type workspace_busy for status pending or cloning or a running reclone, archive or delete; workspace_not_ready for failed; workspace_archived for archived",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/carrypatch/guard_test.go, TestGuard_WriteNeedsReady, a table over the carry_patch workspace's state {pending, cloning, ready with the maintenance marker reclone, failed, archived} -> {workspace_busy, workspace_busy, workspace_busy, workspace_not_ready, workspace_archived}: call the write route as the owner; assert 409 and the error_type; assert the write handler behind the guard was not called; with status ready and no marker assert the handler was called"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "state_driven",
+          "condition": "a carry-patch workspace is pending, cloning, failed, archived or under a reclone, archive or delete",
+          "action": "answer the read routes of the patch list from stored state",
+          "contract": "HTTP 200 from GET /workspaces/:slug/patches and GET /workspaces/:slug/patches/:id for a caller with read access",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/carrypatch/read_test.go, TestRead_WorksInEveryWorkspaceState, a table over {pending, cloning, failed, archived, ready with the maintenance marker delete} with one stored patch and no copy on disk: assert GET .../patches answers 200 with one item and GET .../patches/<id> answers 200 without the member replaced_sha"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "unwanted",
+          "condition": "the caller of a patch route lacks the scope or the access level the route needs",
+          "action": "refuse the request before validating its body",
+          "contract": "HTTP 403 with error_type insufficient_scope for a PAT without patches:read on a GET route or without patches:write on POST /workspaces/:slug/patches, whether or not the workspace exists; HTTP 404 with error_type not_found for a caller with no access to the workspace; HTTP 403 with error_type forbidden for a caller with read access only on the POST route",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the patch routes registered on the real server pipeline with the real identity and access components; an owner, an organization member with read access and an outsider"
+            ],
+            "pseudocode": "in internal/carrypatch/add_test.go, TestPatchRoutes_ScopeAndAccess, a table: {PAT with patches:read only, POST} -> 403 insufficient_scope; {PAT with workspaces:read only, GET list} -> 403 insufficient_scope; {the same PAT, GET list on an unknown slug} -> 403 insufficient_scope; {a user who is no member of the owning organization, GET list} -> 404 not_found; {an organization member with read access, POST with an invalid body} -> 403 forbidden; {the same member, GET list} -> 200; {the owner, POST valid} -> 201"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Branch resolution",
+      "rationale": "A patch is a branch; registering one must find the branch where the team keeps it, on the hub or on origin.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "a patch is added without skip_branch_check and refs/heads/<branch> exists in the hub's copy",
+          "action": "accept the branch as it is and report the resolution local",
+          "contract": "the resolution is local; no ref of the copy changes; origin is not contacted",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a carry_patch workspace in status ready with a bare copy made by git init in t.TempDir(), served from a store on a temporary file, and a user with an API key who owns it",
+              "an origin served by gitrepotest.NewOrigin with a request counter; the setting patch_branch_source written into the workspace's stored settings where the case says so"
+            ],
+            "pseudocode": "in internal/carrypatch/resolve_test.go, TestResolveBranch_Table, a table that runs ResolveBranch(ctx, ws, branch, skip) against a real copy and a counting origin: {heads/p1 at A, also remotes/origin/p1 at B} -> local, heads/p1 still A, 0 origin requests; {no heads/p2, remotes/origin/p2 at B} -> origin_tracking, heads/p2 == B, 0 origin requests; {setting patch_branch_source origin, no heads/p3, no remotes/origin/p3, origin has p3 at C} -> origin_fetch, heads/p3 == C and remotes/origin/p3 == C; {skip true, branch p4 nowhere} -> skipped, no ref p4, 0 origin requests"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "event_driven",
+          "condition": "a patch is added without skip_branch_check, the branch is not in the hub's copy and refs/remotes/origin/<branch> exists",
+          "action": "create refs/heads/<branch> at the commit of refs/remotes/origin/<branch> and report the resolution origin_tracking",
+          "contract": "the resolution is origin_tracking; refs/heads/<branch> equals the origin-tracking commit; origin is not contacted",
+          "check": {
+            "same_as": "REQ-5.1"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "optional",
+          "condition": "the workspace setting patch_branch_source is origin and a branch being resolved is neither in the hub's copy nor among the origin-tracking refs",
+          "action": "fetch that one branch from origin with the workspace's origin credential under a limit of 2 minutes, record it as refs/remotes/origin/<branch>, create refs/heads/<branch> at its tip and report the resolution origin_fetch",
+          "contract": "the resolution is origin_fetch; refs/heads/<branch> and refs/remotes/origin/<branch> equal origin's tip of the branch; no other origin-tracking ref changes",
+          "check": {
+            "same_as": "REQ-5.1"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "unwanted",
+          "condition": "a branch being resolved is found by none of the lookups that apply",
+          "action": "refuse the add and create no ref",
+          "contract": "HTTP 404 with error_type branch_not_found; no ref named after the branch exists in the copy; with patch_branch_source hub origin is not contacted",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a carry_patch workspace in status ready with a bare copy made by git init in t.TempDir(), served from a store on a temporary file, and a user with an API key who owns it"
+            ],
+            "pseudocode": "in internal/carrypatch/resolve_test.go, TestResolveBranch_NotFound, a table over {patch_branch_source hub, branch nowhere, origin has it}, {patch_branch_source origin, origin has no such branch}: err = ResolveBranch(...); assert err is the error the server's error helper renders as 404 with error_type 'branch_not_found'; assert neither refs/heads/<branch> nor refs/remotes/origin/<branch> exists; assert the origin saw 0 requests in the first case"
+          }
+        },
+        {
+          "id": "REQ-5.5",
+          "pattern": "unwanted",
+          "condition": "the origin fetch of a branch resolution fails because origin cannot be reached, refuses the credential, the origin credential cannot be read or 2 minutes pass",
+          "action": "refuse the add, stop the git process and create no ref",
+          "contract": "HTTP 502 with error_type origin_fetch_failed; the message contains no credential and no URL user information; no ref named after the branch exists in the copy",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a carry_patch workspace in status ready with a bare copy made by git init in t.TempDir(), served from a store on a temporary file, and a user with an API key who owns it"
+            ],
+            "pseudocode": "in internal/carrypatch/resolve_test.go, TestResolveBranch_OriginFetchFailed, a table with patch_branch_source origin over {origin stopped, origin answers 401 to GIT_PAT, the secret reader fails, origin never answers with the deadline option set to 200 ms}: err = ResolveBranch(...); assert err renders as 502 with error_type 'origin_fetch_failed'; assert the GIT_PAT value is not in the message; assert no ref for the branch exists and no git child process is left; assert the default deadline of the single-branch fetch is 2 minutes"
+          }
+        },
+        {
+          "id": "REQ-5.6",
+          "pattern": "event_driven",
+          "condition": "a patch is added with skip_branch_check true",
+          "action": "look nothing up, contact no remote and report the resolution skipped",
+          "contract": "the resolution is skipped; no ref is created; origin is not contacted",
+          "check": {
+            "same_as": "REQ-5.1"
+          }
+        },
+        {
+          "id": "REQ-5.7",
+          "pattern": "unwanted",
+          "condition": "refs/heads/<branch> appears in the hub's copy between the lookup and the creation of the branch by resolution",
+          "action": "keep the branch as it now is and continue the add",
+          "contract": "the resolution succeeds; refs/heads/<branch> holds the commit the other writer set",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a carry_patch workspace in status ready with a bare copy made by git init in t.TempDir(), served from a store on a temporary file, and a user with an API key who owns it"
+            ],
+            "pseudocode": "in internal/carrypatch/resolve_test.go, TestResolveBranch_LosesCreateRace: remotes/origin/p1 at B; a hook in the ref writer creates heads/p1 at A after the lookup and before the create-if-absent write; assert ResolveBranch returns no error and ref(copy, 'refs/heads/p1') == A"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Add one patch",
+      "rationale": "Registering a branch as a patch is the first act of carrying it; its position decides the order rebuilds apply it in.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "a caller with write access submits POST /workspaces/:slug/patches with one valid patch object for a branch that is not registered",
+          "action": "create the patch with status active at the end of the list, or at the given position, and write the event parley.patch.create in the same store transaction",
+          "contract": "HTTP 201 with the patch object: id a UUID, workspace_slug, branch_name, position, status active, conflict_files [], upstream_pr_url and description as given (null when absent, null or empty), added_at and updated_at equal, deleted_at, origin_sync_state, origin_sha and origin_synced_at null; one event parley.patch.create with resource_type patch, resource_id the patch id, the caller as actor and metadata branch_name, position and branch_resolution",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a carry_patch workspace in status ready with a bare copy made by git init in t.TempDir(), served from a store on a temporary file, and a user with an API key who owns it",
+              "the patch routes on the real server pipeline with the real event component; branches p1, p2, p3 and p4 exist in the copy unless a case says otherwise"
+            ],
+            "pseudocode": "in internal/carrypatch/add_test.go, TestAdd_SingleCreatesActivePatch: r = POST {branch_name: 'p1', description: 'first', upstream_pr_url: ''}; assert 201; assert the body has exactly the 14 members of the patch object; assert position == 1, status == 'active', conflict_files == [], description == 'first', upstream_pr_url == null, added_at == updated_at == the test clock in whole seconds, the four nullable members are null; assert the event log holds one parley.patch.create with resource_id == body.id, actor the caller and metadata {branch_name: 'p1', position: 1, branch_resolution: 'local'}; POST {branch_name: 'p2'}; assert position == 2; replay the first request with the same Idempotency-Key it carried: assert 200 with the first body and still 2 patches"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "unwanted",
+          "condition": "the body of POST /workspaces/:slug/patches is neither an object nor an array, or a single patch object has no branch_name, a branch_name that is not a valid git branch name or equals the integration branch, a position that is not an integer of at least 1, or a member of the wrong JSON type",
+          "action": "refuse the request before any lookup, store nothing and create no ref",
+          "contract": "HTTP 400 with error_type invalid_request; the patch list, the refs of the copy and the event log are unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a carry_patch workspace in status ready with a bare copy made by git init in t.TempDir(), served from a store on a temporary file, and a user with an API key who owns it",
+              "the patch routes on the real server pipeline with the real event component; branches p1, p2, p3 and p4 exist in the copy unless a case says otherwise"
+            ],
+            "pseudocode": "in internal/carrypatch/add_test.go, TestAdd_RejectsInvalidBody, a table over the bodies {'x' (a JSON string), 7, {}, {branch_name: ''}, {branch_name: 'a..b'}, {branch_name: '-x'}, {branch_name: 'deploy'} on a workspace whose stored integration_branch is null, {branch_name: 'integration'} on one whose integration_branch is 'integration', {branch_name: 'p1', position: 0}, {position: -1}, {position: 1.5}, {position: '2'}, {branch_name: 'p1', skip_branch_check: 'yes'}, {branch_name: 'p1', description: 5}, {branch_name: 5}}: assert 400 and error_type 'invalid_request'; assert count(patches) == 0, the refs are unchanged and no event exists; assert {branch_name: 'p1', unknown_member: 1} is accepted with 201"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "event_driven",
+          "condition": "a single add carries a position and the workspace has N non-deleted patches",
+          "action": "append the patch at N+1 when the position is greater than N+1, and otherwise give it that position and move the patches at and after it down by one, in one store transaction",
+          "contract": "the response shows the patch's final position; afterwards the non-deleted patches hold the positions 1..N+1 without gaps and the patches that were below the insertion point keep their order",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a carry_patch workspace in status ready with a bare copy made by git init in t.TempDir(), served from a store on a temporary file, and a user with an API key who owns it",
+              "the patch routes on the real server pipeline with the real event component; branches p1, p2, p3 and p4 exist in the copy unless a case says otherwise"
+            ],
+            "pseudocode": "in internal/carrypatch/add_test.go, TestAdd_Position, a table starting from the list [p1, p2, p3]: {p4 at 1} -> [p4, p1, p2, p3], response position 1; {p4 at 2} -> [p1, p4, p2, p3]; {p4 at 3} -> [p1, p2, p4, p3]; {p4 at 4} -> [p1, p2, p3, p4]; {p4 at 5} -> [p1, p2, p3, p4], response position 4; {p4 at 900} -> the same; {p4 without position} -> the same; on an empty list {p1 at 3} -> [p1], response position 1; after each case assert the stored positions are 1..N+1 and that the event's metadata position equals the response position"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "unwanted",
+          "condition": "the branch of a single add is the branch of a non-deleted patch of the workspace and if_not_exists is not true",
+          "action": "refuse the add before branch resolution and change nothing",
+          "contract": "HTTP 409 with error_type patch_exists; the patch list, the refs of the copy and the event log are unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a carry_patch workspace in status ready with a bare copy made by git init in t.TempDir(), served from a store on a temporary file, and a user with an API key who owns it",
+              "the patch routes on the real server pipeline with the real event component; branches p1, p2, p3 and p4 exist in the copy unless a case says otherwise"
+            ],
+            "pseudocode": "in internal/carrypatch/add_test.go, TestAdd_ExistingBranchIsRefused: p1 is registered and then its branch is deleted from the copy while refs/remotes/origin/p1 exists; r = POST {branch_name: 'p1'}; assert 409 and error_type 'patch_exists'; assert refs/heads/p1 was not created, count(patches) == 1 and the event count is unchanged; the same with {branch_name: 'p1', if_not_exists: false} and with a registered patch in status disabled"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "event_driven",
+          "condition": "a single add carries if_not_exists true and its branch is the branch of a non-deleted patch",
+          "action": "answer with the existing patch and change nothing",
+          "contract": "HTTP 200 with the existing patch, its id, position, description and updated_at unchanged; no event is emitted and no ref changes",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a carry_patch workspace in status ready with a bare copy made by git init in t.TempDir(), served from a store on a temporary file, and a user with an API key who owns it",
+              "the patch routes on the real server pipeline with the real event component; branches p1, p2, p3 and p4 exist in the copy unless a case says otherwise"
+            ],
+            "pseudocode": "in internal/carrypatch/add_test.go, TestAdd_IfNotExistsReturnsExisting: p1 is registered with description 'first' at position 1; r = POST {branch_name: 'p1', if_not_exists: true, description: 'other', position: 5}; assert 200 and the body equals the stored patch (description 'first', position 1, the same id and updated_at); assert count(patches) and the event count are unchanged; POST {branch_name: 'p2', if_not_exists: true}; assert 201 and a new patch at position 2"
+          }
+        },
+        {
+          "id": "REQ-6.6",
+          "pattern": "event_driven",
+          "condition": "the branch of an add is the branch of a soft-deleted patch and of no non-deleted patch",
+          "action": "remove the soft-deleted patch for good in the transaction that creates the new patch, then delete refs/parley/replaced/<branch>",
+          "contract": "HTTP 201 with a patch whose id differs from the removed one; GET of the old id answers 404; refs/parley/replaced/<branch> no longer exists; the list with include_deleted=true shows the branch once",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a carry_patch workspace in status ready with a bare copy made by git init in t.TempDir(), served from a store on a temporary file, and a user with an API key who owns it",
+              "the patch routes on the real server pipeline with the real event component; branches p1, p2, p3 and p4 exist in the copy unless a case says otherwise"
+            ],
+            "pseudocode": "in internal/carrypatch/add_test.go, TestAdd_ReplacesSoftDeletedPatch: write a patch row for p1 with status deleted, position null and deleted_at set, and the ref refs/parley/replaced/p1; r = POST {branch_name: 'p1'}; assert 201, r.id != old id, position 1, status active; assert GET .../patches/<old id> is 404; assert refs/parley/replaced/p1 does not resolve; assert GET .../patches?include_deleted=true has one item; repeat with a ref writer that fails the deletion of the backup ref: assert 201 and one log entry naming the ref"
+          }
+        },
+        {
+          "id": "REQ-6.7",
+          "pattern": "ubiquitous",
+          "action": "for any set of adds running at the same time on one workspace, complete each one without a failure caused by the others, create at most one non-deleted patch per branch, and leave the non-deleted patches at the positions 1..N without gaps",
+          "contract": "of several concurrent adds of the same branch exactly one answers 201 and the others answer 409 with error_type patch_exists; concurrent adds of different branches all answer 201 with distinct positions",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a carry_patch workspace in status ready with a bare copy made by git init in t.TempDir(), served from a store on a temporary file, and a user with an API key who owns it",
+              "the patch routes on the real server pipeline with the real event component; branches p1, p2, p3 and p4 exist in the copy unless a case says otherwise"
+            ],
+            "pseudocode": "in internal/carrypatch/add_test.go, TestAdd_Concurrent: start 8 goroutines that each POST {branch_name: 'p1'}; assert exactly one 201 and seven 409 with error_type 'patch_exists'; start 8 goroutines that POST b1..b8 (all with skip_branch_check true), four of them with position 1; assert eight 201; assert the stored positions are exactly 1..9 and that no response is 500"
+          }
+        },
+        {
+          "id": "REQ-6.8",
+          "pattern": "unwanted",
+          "condition": "branch resolution refuses the branch of a single add",
+          "action": "pass the refusal to the caller and store neither a patch nor an event",
+          "contract": "HTTP 404 with error_type branch_not_found when the branch is found nowhere; HTTP 502 with error_type origin_fetch_failed when the origin fetch failed; the patch list and the event log are unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a carry_patch workspace in status ready with a bare copy made by git init in t.TempDir(), served from a store on a temporary file, and a user with an API key who owns it",
+              "the patch routes on the real server pipeline with the real event component; branches p1, p2, p3 and p4 exist in the copy unless a case says otherwise"
+            ],
+            "pseudocode": "in internal/carrypatch/add_test.go, TestAdd_ResolutionRefusals: POST {branch_name: 'nowhere'}; assert 404, error_type 'branch_not_found', count(patches) == 0, no event; set patch_branch_source origin and stop the origin; POST {branch_name: 'nowhere'}; assert 502 and error_type 'origin_fetch_failed'; POST {branch_name: 'nowhere', skip_branch_check: true}; assert 201 and the event's branch_resolution == 'skipped'; with refs/remotes/origin/o1 present and no heads/o1 POST {branch_name: 'o1'}; assert 201, branch_resolution 'origin_tracking' and heads/o1 exists"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "Add a batch of patches",
+      "rationale": "A team that moves an existing patch series to the hub registers it in one step, and half a series is worse than none.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "event_driven",
+          "condition": "a caller with write access submits POST /workspaces/:slug/patches with an array of valid patch objects for branches that are not registered",
+          "action": "create every patch in one store transaction, each with status active and with one parley.patch.create event",
+          "contract": "HTTP 201 with {\"items\": [patch, ...]} in request order, each patch with its final position; one parley.patch.create per patch whose metadata position equals that final position",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a carry_patch workspace in status ready with a bare copy made by git init in t.TempDir(), served from a store on a temporary file, and a user with an API key who owns it",
+              "the patch routes on the real server pipeline with the real event component; branches p1, p2, p3 and p4 exist in the copy unless a case says otherwise"
+            ],
+            "pseudocode": "in internal/carrypatch/batch_test.go, TestBatch_CreatesAllInRequestOrder: r = POST [{branch_name: 'p1'}, {branch_name: 'p2', description: 'two'}, {branch_name: 'p3', skip_branch_check: true}]; assert 201; assert the body has the one member items; assert the branch names of items are [p1, p2, p3] with positions [1, 2, 3] and status active; assert three parley.patch.create events with matching resource ids, positions and branch_resolution [local, local, skipped]; POST [{branch_name: 'p4'}] (one element): assert 201 with items of length 1 and position 4"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "event_driven",
+          "condition": "a batch holds elements with a position and elements without one",
+          "action": "place the elements that carry a position first, in array order, each into the list as it then stands by the rule of a single add, and then append the others in array order",
+          "contract": "the response lists the patches in request order with their final positions; the non-deleted patches hold 1..N without gaps",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a carry_patch workspace in status ready with a bare copy made by git init in t.TempDir(), served from a store on a temporary file, and a user with an API key who owns it",
+              "the patch routes on the real server pipeline with the real event component; branches p1, p2, p3 and p4 exist in the copy unless a case says otherwise"
+            ],
+            "pseudocode": "in internal/carrypatch/batch_test.go, TestBatch_Positions, a table of {list before, batch} -> list after: {[], [a, b@1, c]} -> [b, a, c] with response positions [2, 1, 3]; {[x, y], [a@1, b@1]} -> [b, a, x, y] with response positions [2, 1]; {[x, y], [a, b@2, c@9]} -> [x, b, y, c, a] with response positions [5, 2, 4]; {[x], [a@3, b@3]} -> [x, a, b] with response positions [2, 3]; after each case assert the stored positions are 1..N and each event's metadata position equals the response position"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "unwanted",
+          "condition": "a batch is an empty array, or holds an element that is not an object or fails the validation of a single patch object, an element with if_not_exists true, or a branch named by two elements",
+          "action": "refuse the whole request before any lookup, with a message that starts with patch[<i>]: for the zero-based index of the offending element, the later one of two that name the same branch",
+          "contract": "HTTP 400 with error_type invalid_request; for every case but the empty array the message starts with patch[<i>]: ; the patch list, the refs of the copy and the event log are unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a carry_patch workspace in status ready with a bare copy made by git init in t.TempDir(), served from a store on a temporary file, and a user with an API key who owns it",
+              "the patch routes on the real server pipeline with the real event component; branches p1, p2, p3 and p4 exist in the copy unless a case says otherwise"
+            ],
+            "pseudocode": "in internal/carrypatch/batch_test.go, TestBatch_RejectsInvalid, a table of body -> message prefix: [] -> (400, no prefix asserted); [{branch_name: 'p1'}, 5] -> 'patch[1]: '; [{branch_name: 'p1'}, {}] -> 'patch[1]: '; [{branch_name: 'a..b'}] -> 'patch[0]: '; [{branch_name: 'p1'}, {branch_name: 'p2', position: 0}] -> 'patch[1]: '; [{branch_name: 'p1', if_not_exists: true}] -> 'patch[0]: '; [{branch_name: 'p1'}, {branch_name: 'p2'}, {branch_name: 'p1'}] -> 'patch[2]: '; [{branch_name: 'deploy'}] -> 'patch[0]: '; assert 400 and error_type 'invalid_request' for each, count(patches) == 0 and no event; assert [{branch_name: 'p1', if_not_exists: false}] is accepted with 201"
+          }
+        },
+        {
+          "id": "REQ-7.4",
+          "pattern": "unwanted",
+          "condition": "an element of a validated batch names a registered branch, is refused by branch resolution, or the store fails while the batch is written",
+          "action": "create no patch of the batch and emit no event, while leaving in place every branch that resolution created before the failure",
+          "contract": "HTTP 409 with error_type patch_exists, HTTP 404 with error_type branch_not_found, HTTP 502 with error_type origin_fetch_failed or HTTP 500 with error_type internal, by cause; the patch list and the event log are as before the request; a branch that resolution created for an earlier element still exists",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a carry_patch workspace in status ready with a bare copy made by git init in t.TempDir(), served from a store on a temporary file, and a user with an API key who owns it",
+              "the patch routes on the real server pipeline with the real event component; branches p1, p2, p3 and p4 exist in the copy unless a case says otherwise"
+            ],
+            "pseudocode": "in internal/carrypatch/batch_test.go, TestBatch_AllOrNothing, a table with p9 already registered and refs/remotes/origin/o1 present without heads/o1: {[{o1}, {p9}]} -> 409 patch_exists and heads/o1 not created (the registered check runs before resolution); {[{o1}, {nowhere}]} -> 404 branch_not_found and heads/o1 exists; {patch_branch_source origin, origin stopped, [{p1}, {nowhere}]} -> 502 origin_fetch_failed; {[{p1}, {p2}] with a store fault on the second insert} -> 500 internal; after each case assert the stored patches are exactly [p9] at position 1 and the event count is unchanged"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "Read patches",
+      "rationale": "Agents and developers decide what to rebuild and what to fix from the list and from one patch.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "a caller with read access requests GET /workspaces/:slug/patches",
+          "action": "return the non-deleted patches of the workspace in position order, paged by limit and cursor",
+          "contract": "HTTP 200 with {\"items\": [patch, ...], \"next_cursor\": string or null}; every item carries every member of the patch object; following next_cursor returns each patch once",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a carry_patch workspace with the non-deleted patches p1, p2, p3 at positions 1 to 3 and two soft-deleted patches d1 (deleted_at 10:00:00) and d2 (deleted_at 11:00:00) written directly through the patch store; a caller with read access and the scope patches:read"
+            ],
+            "pseudocode": "in internal/carrypatch/read_test.go, TestList_PositionOrderAndPaging: r = GET .../patches; assert 200, branch names [p1, p2, p3], next_cursor null and 14 members per item; r = GET .../patches?limit=2; assert [p1, p2] and a non-null next_cursor; GET with that cursor; assert [p3] and next_cursor null; on a carry_patch workspace without patches assert items == [] and next_cursor null; assert limit=0 and limit=201 answer 400 invalid_request"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "optional",
+          "condition": "the query of the list carries include_deleted=true",
+          "action": "append the deleted patches after the non-deleted ones, newest deleted_at first and by id where deleted_at is equal",
+          "contract": "HTTP 200; the deleted items follow the last non-deleted item, each with status deleted, position null and deleted_at set; paging crosses the boundary without repeating or skipping an item",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a carry_patch workspace with the non-deleted patches p1, p2, p3 at positions 1 to 3 and two soft-deleted patches d1 (deleted_at 10:00:00) and d2 (deleted_at 11:00:00) written directly through the patch store; a caller with read access and the scope patches:read"
+            ],
+            "pseudocode": "in internal/carrypatch/read_test.go, TestList_IncludeDeleted: r = GET .../patches?include_deleted=true; assert branch names [p1, p2, p3, d2, d1], and for d2 and d1 status 'deleted', position null and deleted_at set; page with limit=2 and assert the three pages are [p1, p2], [p3, d2], [d1]; GET with include_deleted=false and assert [p1, p2, p3]; add a third deleted patch with the same deleted_at as d2 and assert the two are ordered by id"
+          }
+        },
+        {
+          "id": "REQ-8.3",
+          "pattern": "event_driven",
+          "condition": "a caller with read access requests GET /workspaces/:slug/patches/:id with the id of a patch of the workspace",
+          "action": "return that patch whether or not it is deleted",
+          "contract": "HTTP 200 with the patch object, every member present",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a carry_patch workspace with the non-deleted patches p1, p2, p3 at positions 1 to 3 and two soft-deleted patches d1 (deleted_at 10:00:00) and d2 (deleted_at 11:00:00) written directly through the patch store; a caller with read access and the scope patches:read",
+              "a bare copy at the workspace's RepoPath"
+            ],
+            "pseudocode": "in internal/carrypatch/read_test.go, TestGet_ReturnsAnyPatch: assert GET .../patches/<id of p2> is 200 with branch_name 'p2', position 2 and no member replaced_sha; assert GET .../patches/<id of d1> is 200 with status 'deleted' and position null; create refs/parley/replaced/p2 at commit R in the copy and assert the body now has replaced_sha == R (40 characters); create refs/parley/replaced/d1 and assert the deleted patch shows its replaced_sha too"
+          }
+        },
+        {
+          "id": "REQ-8.4",
+          "pattern": "optional",
+          "condition": "refs/parley/replaced/<branch> exists in the workspace's copy for the branch of the patch that is read",
+          "action": "add the member replaced_sha with the full commit id of that ref to the answer of GET /workspaces/:slug/patches/:id",
+          "contract": "the body carries replaced_sha as a 40-character commit id; without the ref, or without a copy on disk, the member is absent",
+          "check": {
+            "same_as": "REQ-8.3"
+          }
+        },
+        {
+          "id": "REQ-8.5",
+          "pattern": "unwanted",
+          "condition": "the id of GET /workspaces/:slug/patches/:id is unknown, belongs to a patch of another workspace or is not a UUID",
+          "action": "refuse the request",
+          "contract": "HTTP 404 with error_type not_found and the message patch not found",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a carry_patch workspace with the non-deleted patches p1, p2, p3 at positions 1 to 3 and two soft-deleted patches d1 (deleted_at 10:00:00) and d2 (deleted_at 11:00:00) written directly through the patch store; a caller with read access and the scope patches:read"
+            ],
+            "pseudocode": "in internal/carrypatch/read_test.go, TestGet_UnknownIdIsNotFound, a table over {a random UUID, the id of a patch of a second carry_patch workspace of the same owner, 'abc', an id of 300 characters}: assert 404, error_type 'not_found' and message 'patch not found'"
+          }
+        },
+        {
+          "id": "REQ-8.6",
+          "pattern": "unwanted",
+          "condition": "the query of the list carries include_deleted with a value other than true or false",
+          "action": "refuse the request",
+          "contract": "HTTP 400 with error_type invalid_request",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a carry_patch workspace with the non-deleted patches p1, p2, p3 at positions 1 to 3 and two soft-deleted patches d1 (deleted_at 10:00:00) and d2 (deleted_at 11:00:00) written directly through the patch store; a caller with read access and the scope patches:read"
+            ],
+            "pseudocode": "in internal/carrypatch/read_test.go, TestList_RejectsBadIncludeDeleted, a table over {include_deleted=1, include_deleted=yes, include_deleted=TRUE, include_deleted=}: assert 400 and error_type 'invalid_request'"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-9",
+      "title": "The parley patch commands",
+      "rationale": "Developers and scripts register and inspect patches from the shell.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-9.1",
+          "pattern": "event_driven",
+          "condition": "a user runs parley patch add <workspace-slug> --branch <name> with any of --position, --upstream-pr, --description, --skip-branch-check and --if-not-exists",
+          "action": "send POST /workspaces/:slug/patches with one object that holds a member only for each flag that was given, and print the hub's response",
+          "contract": "one request with the body members branch_name, position, upstream_pr_url, description, skip_branch_check and if_not_exists for the flags given and no other member; the response body on stdout as one JSON document; exit code 0 for a 201 and for a 200",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the command run against a net/http/httptest server that records requests and answers from a script, with the endpoint URL and API key given by flags"
+            ],
+            "pseudocode": "in internal/cli/patch_test.go, TestPatchAdd_SendsOnlyGivenFlags: run ['patch', 'add', 'ws', '--branch', 'p1']; assert one POST to /api/v1/workspaces/ws/patches with the body exactly {branch_name: 'p1'}; assert stdout parses as the scripted 201 body and exit == 0; run with --position 2 --upstream-pr https://example.com/pull/7 --description '' --skip-branch-check --if-not-exists; assert the body is {branch_name, position: 2, upstream_pr_url, description: '', skip_branch_check: true, if_not_exists: true}; script a 200 and assert exit 0; script 409 patch_exists and assert stdout is empty, stderr is the envelope as received and exit == 1; run with the slug 'a/b' and assert the raw path is /api/v1/workspaces/a%2Fb/patches"
+          }
+        },
+        {
+          "id": "REQ-9.2",
+          "pattern": "event_driven",
+          "condition": "a user runs parley patch list <workspace-slug>, with or without --include-deleted",
+          "action": "send GET /workspaces/:slug/patches, with the query include_deleted=true only when the flag is given, and print the hub's response",
+          "contract": "one GET request; the response body on stdout; exit code 0",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the command run against a net/http/httptest server that records requests and answers from a script, with the endpoint URL and API key given by flags"
+            ],
+            "pseudocode": "in internal/cli/patch_test.go, TestPatchList_QueriesIncludeDeleted: run ['patch', 'list', 'ws']; assert one GET /api/v1/workspaces/ws/patches with an empty query, stdout the scripted body, exit 0; run with --include-deleted and assert the query is include_deleted=true; script 400 workspace_mode_mismatch and assert the envelope on stderr and exit 1"
+          }
+        },
+        {
+          "id": "REQ-9.3",
+          "pattern": "event_driven",
+          "condition": "a user runs parley patch show <workspace-slug> <patch-id>",
+          "action": "send GET /workspaces/:slug/patches/:id with both arguments percent-encoded as one path segment each, and print the hub's response",
+          "contract": "one GET request; the response body on stdout; exit code 0; exit code 1 with the hub's envelope on stderr for a 404",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the command run against a net/http/httptest server that records requests and answers from a script, with the endpoint URL and API key given by flags"
+            ],
+            "pseudocode": "in internal/cli/patch_test.go, TestPatchShow_GetsOnePatch: run ['patch', 'show', 'ws', '5c0e0000-0000-4000-8000-000000000001']; assert one GET /api/v1/workspaces/ws/patches/5c0e0000-0000-4000-8000-000000000001, stdout the scripted body with replaced_sha kept, exit 0; script 404 not_found and assert stdout empty, the envelope on stderr and exit 1"
+          }
+        },
+        {
+          "id": "REQ-9.4",
+          "pattern": "unwanted",
+          "condition": "a parley patch command is run without --branch on add, with a number of arguments other than the command takes, or with a --position that is not an integer",
+          "action": "fail before any request is sent",
+          "contract": "exit code 2; the error envelope with error_type usage_error and code 0 on stderr; nothing on stdout; the hub receives no request",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the command run against a net/http/httptest server that records requests and answers from a script, with the endpoint URL and API key given by flags"
+            ],
+            "pseudocode": "in internal/cli/patch_test.go, TestPatch_UsageErrors, a table over {['patch', 'add', 'ws'], ['patch', 'add', '--branch', 'p1'], ['patch', 'add', 'ws', 'extra', '--branch', 'p1'], ['patch', 'add', 'ws', '--branch', 'p1', '--position', 'two'], ['patch', 'list'], ['patch', 'list', 'a', 'b'], ['patch', 'show', 'ws'], ['patch', 'show', 'ws', 'id', 'extra']}: assert exit == 2, stdout empty, stderr an envelope with error_type 'usage_error', and 0 requests recorded; assert ['patch'] alone prints help and exits 0"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "A developer creates a carry-patch workspace and the hub sets it up",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "sends POST /api/v1/workspaces with workspace_mode carry_patch, a git_url and an upstream_url, without integration_branch"
+        },
+        {
+          "actor": "parleyd",
+          "action": "records the workspace in status pending and answers 201"
+        },
+        {
+          "actor": "parleyd",
+          "action": "clones origin into the workspace's bare copy"
+        },
+        {
+          "actor": "origin",
+          "action": "serves its branches, among them one named deploy"
+        },
+        {
+          "actor": "parleyd",
+          "action": "runs the carry-patch set-up as the post-clone step: writes deploy as integration_branch, fetches upstream into refs/remotes/upstream/*, turns on remembered resolutions and sets refs/heads/deploy to the upstream base"
+        },
+        {
+          "actor": "parleyd",
+          "action": "sets the workspace's status to ready"
+        },
+        {
+          "actor": "developer",
+          "action": "requests GET /api/v1/workspaces/:slug/patches and receives an empty list"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the run function of cmd/parleyd with the clone workers and the carry-patch post-clone step registered",
+          "internal/server on a real TCP listener",
+          "internal/workspace and internal/carrypatch with the real store, access, secret and event components",
+          "internal/gitrepo running the real git command",
+          "an origin and an upstream, each served over TLS by gitrepotest.NewOrigin"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with a temporary data directory and repository root",
+          "a user with an API key",
+          "an origin with the branches main and deploy (deploy at a commit of its own)",
+          "an upstream with the branch main at commit U, which no origin branch points to, and the tag v9"
+        ],
+        "end_state": [
+          "the workspace record is ready with clone_error null and integration_branch deploy",
+          "refs/heads/deploy in the bare copy equals U and refs/remotes/upstream/main equals U",
+          "the copy has no tag v9 and its configuration has rerere.enabled true",
+          "GET /api/v1/workspaces/:slug/patches answers 200 with items [] and the same route on a standard workspace answers 400 workspace_mode_mismatch"
+        ],
+        "pseudocode": "in test/e2e/carry_patch_setup_test.go, TestCarryPatch_CreateAndSetUp: hub = startHub(t); r = post('/workspaces', {slug: 'variant', git_url: origin.URL, workspace_mode: 'carry_patch', upstream_url: upstream.URL}); assert r.status == 201; eventually(10s) hub.Workspaces.Get('variant').status == 'ready'; ws = hub.Workspaces.Get('variant'); assert ws.integration_branch == 'deploy' and ws.clone_error == null; copy = RepoPath(ws); assert git(copy, 'rev-parse', 'refs/heads/deploy') == upstream.Head('main') == git(copy, 'rev-parse', 'refs/remotes/upstream/main'); assert git(copy, 'tag') == ''; assert git(copy, 'config', 'rerere.enabled') == 'true'; r = get('/workspaces/variant/patches'); assert r.status == 200 and r.json.items == []; create a standard workspace 'plain' and assert get('/workspaces/plain/patches') is 400 with error_type 'workspace_mode_mismatch'"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "A developer and an agent register patches and read the list",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "runs parley patch add variant --branch fix-dial --description 'dial timeout'"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends POST /api/v1/workspaces/variant/patches with one object"
+        },
+        {
+          "actor": "parleyd",
+          "action": "finds fix-dial among the origin-tracking refs, creates refs/heads/fix-dial, stores the patch at position 1 with the event parley.patch.create and answers 201"
+        },
+        {
+          "actor": "agent",
+          "action": "sends POST /api/v1/workspaces/variant/patches with an array of two objects, the second with position 1, using a PAT with patches:write"
+        },
+        {
+          "actor": "parleyd",
+          "action": "resolves both branches, stores both patches in one transaction with one event each and answers 201 with the items in request order"
+        },
+        {
+          "actor": "developer",
+          "action": "runs parley patch list variant and then parley patch show variant <patch-id>"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends the two GET requests and prints each response"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers the list in position order and the single patch"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the run function of cmd/parleyd",
+          "internal/server on a real TCP listener",
+          "internal/carrypatch with the real store, access and event components",
+          "internal/gitrepo running the real git command",
+          "internal/cli with its real HTTP client",
+          "an origin served over TLS by gitrepotest.NewOrigin"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with a ready carry_patch workspace variant whose origin has the branches main, fix-dial, add-metrics and vendor-tls and whose upstream has main",
+          "refs/heads/fix-dial deleted from the hub's copy after the clone, so that only refs/remotes/origin/fix-dial holds it",
+          "the developer's API key and an agent's PAT with the scopes patches:read and patches:write, both with write access to variant"
+        ],
+        "end_state": [
+          "parley patch add exited 0 and printed a patch with branch_name fix-dial, position 1 and status active",
+          "refs/heads/fix-dial exists again in the hub's copy at origin's commit",
+          "the batch answered 201 with items [add-metrics at position 3, vendor-tls at position 1]",
+          "parley patch list printed the items vendor-tls, fix-dial, add-metrics at positions 1, 2, 3",
+          "parley patch show printed the patch whose id was given",
+          "the event log holds three parley.patch.create events for the workspace, the first with branch_resolution origin_tracking"
+        ],
+        "pseudocode": "in test/e2e/carry_patch_patches_test.go, TestCarryPatch_RegisterAndReadPatches: out, code = runCLI('patch', 'add', 'variant', '--branch', 'fix-dial', '--description', 'dial timeout'); assert code == 0 and out.position == 1 and out.status == 'active'; assert git(copy, 'rev-parse', 'refs/heads/fix-dial') == origin.Head('fix-dial'); r = post('/workspaces/variant/patches', [{branch_name: 'add-metrics'}, {branch_name: 'vendor-tls', position: 1}], agentPAT); assert r.status == 201 and positions(r.json.items) == [3, 1]; out, code = runCLI('patch', 'list', 'variant'); assert code == 0 and names(out.items) == ['vendor-tls', 'fix-dial', 'add-metrics']; out, code = runCLI('patch', 'show', 'variant', out.items[1].id); assert code == 0 and out.branch_name == 'fix-dial'; events = the parley.patch.create events of the workspace read from the hub's event log in sequence order; assert len(events) == 3 and events[0].metadata.branch_resolution == 'origin_tracking'"
+      }
+    }
+  ],
+  "external_apis": [
+    {
+      "package": "github.com/spf13/cobra",
+      "version": "v1",
+      "verified": false,
+      "symbols": [
+        {
+          "name": "Command",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "type Command struct { Use string; Short string; Args PositionalArgs; RunE func(cmd *Command, args []string) error; ... }"
+        },
+        {
+          "name": "ExactArgs",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func ExactArgs(n int) PositionalArgs"
+        },
+        {
+          "name": "Command.Flags",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) Flags() *pflag.FlagSet"
+        }
+      ]
+    }
+  ]
+}

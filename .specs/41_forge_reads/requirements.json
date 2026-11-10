@@ -1,0 +1,916 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "41",
+  "spec_name": "forge_reads",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Forge resolution for a remote target",
+      "rationale": "A caller that holds no forge token depends on the hub knowing which forge a workspace uses, where its API is and which stored credential to send.",
+      "system": "forge component",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "ubiquitous",
+          "action": "for any remote URL in the forms https://, http://, ssh://, git:// and user@host:owner/name, derive host, owner and name: the host in lower case without a leading www. and without a port, userinfo ignored, one trailing .git removed, name the last path segment and owner every segment before it joined by /",
+          "contract": "repository {host: string, owner: string, name: string}",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/resolve_test.go, a table over remote URLs and the expected {host, owner, name}: 'https://github.com/acme/widgets.git' -> {github.com, acme, widgets}; 'http://GitHub.com/acme/widgets' -> {github.com, acme, widgets}; 'https://www.github.com:8443/acme/widgets.git' -> {github.com, acme, widgets}; 'https://user:pw@gitlab.example.com/group/subgroup/proj.git' -> {gitlab.example.com, group/subgroup, proj}; 'ssh://git@github.com:22/acme/widgets.git' -> {github.com, acme, widgets}; 'git://github.com/acme/widgets' -> {github.com, acme, widgets}; 'git@github.com:acme/widgets.git' -> {github.com, acme, widgets}; 'git@gitlab.com:group/subgroup/proj' -> {gitlab.com, group/subgroup, proj}; for each: repo, ok = ParseRemote(url); assert ok; assert repo == expected"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "ubiquitous",
+          "action": "for any remote target, decide the forge kind in this order, comparing in lower case: the API URL setting, when set and containing exactly one of the words github and gitlab, names that forge; otherwise the remote's host, when containing exactly one of the two words, names that forge; otherwise the kind is unknown",
+          "contract": "kind: one of github, gitlab, unknown",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/resolve_test.go, a table over {setting, host} -> kind: {'', github.com} -> github; {'', gitlab.example.com} -> gitlab; {'https://code.example.com/gitlab', github.com} -> gitlab (the setting wins); {'https://GitHub.example.com', code.example.com} -> github; {'https://api.example.com', gitlab.com} -> gitlab (a setting naming neither falls through to the host); {'https://gitlab.example.com/github-mirror', github.com} -> github (a setting naming both falls through); {'', code.example.com} -> unknown; {'https://api.example.com', github-gitlab.example.com} -> unknown; assert Kind(setting, host) == expected"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "ubiquitous",
+          "action": "for any remote target whose forge kind is known, use as API URL the setting with one trailing / removed when the setting is set, and otherwise https://api.github.com for the host github.com, https://<host>/api/v3 for another GitHub host and https://<host>/api/v4 for a GitLab host, appending /api/v4 to a GitLab API URL that does not end in it",
+          "contract": "an absolute https URL without a trailing /",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/resolve_test.go, a table over {kind, setting, host} -> API URL: {github, '', github.com} -> 'https://api.github.com'; {github, '', github.example.com} -> 'https://github.example.com/api/v3'; {gitlab, '', gitlab.com} -> 'https://gitlab.com/api/v4'; {github, 'https://ghe.example.com/api/v3/', any} -> 'https://ghe.example.com/api/v3'; {gitlab, 'https://gitlab.example.com', any} -> 'https://gitlab.example.com/api/v4'; {gitlab, 'https://gitlab.example.com/api/v4/', any} -> 'https://gitlab.example.com/api/v4'; {gitlab, 'https://code.example.com/gitlab', any} -> 'https://code.example.com/gitlab/api/v4'; assert APIURL(kind, setting, host) == expected"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "unwanted",
+          "condition": "a route that calls the forge finds that the API URL setting of the selected target is set and is not an absolute https URL with a host and without userinfo, query and fragment",
+          "action": "reject the request before any forge request is sent, and before the repository and the forge kind are looked at",
+          "contract": "HTTP 422 with error_type forge_api_url_invalid; no request reaches the forge",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the setting is written straight into the workspace's stored settings, past the validation of the settings route"
+            ],
+            "pseudocode": "in internal/forge/route_test.go, with a fake forge from internal/forge/forgetest, a table over the stored setting {'http://ghe.example.com', 'ghe.example.com/api', 'https://', 'https://u:p@ghe.example.com', 'https://ghe.example.com/api?x=1', 'https://ghe.example.com/api#f'} and over a workspace whose git_url also names no repository: r = GET /api/v1/workspaces/w/forge/repository; assert r.status == 422; assert r.json.error.error_type == 'forge_api_url_invalid'; assert fake.requests == 0; the same table with the value stored as upstream_forge_api_url on a carry-patch workspace and ?target=upstream gives the same answer, while the request without target on that workspace is not refused for it"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "unwanted",
+          "condition": "a route that calls the forge finds that the remote URL of the selected target names no repository, or that the forge kind is unknown",
+          "action": "reject the request before any forge request is sent, naming in the message the setting to set when the kind is unknown",
+          "contract": "HTTP 422 with error_type forge_unknown; for an unknown kind the message contains forge_api_url (origin) or upstream_forge_api_url (upstream); no request reaches the forge",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/route_test.go, a table over workspaces: {git_url 'https://github.com/widgets' (one path segment)} -> forge_unknown; {git_url 'https://code.example.com/acme/widgets', no setting} -> forge_unknown and message contains 'forge_api_url'; {carry-patch, upstream_url 'https://code.example.com/up/proj', ?target=upstream} -> forge_unknown and message contains 'upstream_forge_api_url'; for each: r = GET .../forge/repository; assert r.status == 422; assert r.json.error.error_type == 'forge_unknown'; assert fake.requests == 0"
+          }
+        },
+        {
+          "id": "REQ-1.6",
+          "pattern": "event_driven",
+          "condition": "a forge route resolves the credential for the target origin",
+          "action": "read the workspace's secrets anew and derive the credential kind: pat with the value of GIT_PAT as token when GIT_PAT is set and not empty; otherwise basic with the value of GIT_PASSWORD as token when GIT_USERNAME and GIT_PASSWORD are both set and not empty; otherwise none",
+          "contract": "credential {kind: pat | basic | none, token: string}; a secret changed between two requests is seen by the second",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/resolve_test.go, with a secret reader over a map, a table: {GIT_PAT: 't1'} -> {pat, 't1'}; {GIT_PAT: 't1', GIT_USERNAME: 'u', GIT_PASSWORD: 'p'} -> {pat, 't1'}; {GIT_USERNAME: 'u', GIT_PASSWORD: 'p'} -> {basic, 'p'}; {GIT_USERNAME: 'u'} -> {none, ''}; {GIT_PAT: '', GIT_USERNAME: 'u', GIT_PASSWORD: 'p'} -> {basic, 'p'}; {GIT_PAT: ''} -> {none, ''}; {} -> {none, ''}; assert Credential(ws, origin) == expected; then change the map from {GIT_PAT: 't1'} to {GIT_PAT: 't2'} between two calls on the same component and assert the second call returns 't2'"
+          }
+        },
+        {
+          "id": "REQ-1.7",
+          "pattern": "event_driven",
+          "condition": "a forge route resolves the credential for the target upstream",
+          "action": "use UPSTREAM_GIT_PAT when it is set and not empty, otherwise the password of UPSTREAM_GIT_USERNAME with UPSTREAM_GIT_PASSWORD when both are set and not empty, otherwise the credential the origin resolution gives",
+          "contract": "credential {kind: pat | basic | none, token: string}",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/resolve_test.go beside the origin table, a table for target upstream: {UPSTREAM_GIT_PAT: 'u1', GIT_PAT: 'o1'} -> {pat, 'u1'}; {UPSTREAM_GIT_USERNAME: 'u', UPSTREAM_GIT_PASSWORD: 'up', GIT_PAT: 'o1'} -> {basic, 'up'}; {UPSTREAM_GIT_USERNAME: 'u', GIT_PAT: 'o1'} -> {pat, 'o1'}; {UPSTREAM_GIT_PAT: '', GIT_PAT: 'o1'} -> {pat, 'o1'}; {GIT_USERNAME: 'u', GIT_PASSWORD: 'p'} -> {basic, 'p'}; {} -> {none, ''}; assert Credential(ws, upstream) == expected"
+          }
+        },
+        {
+          "id": "REQ-1.8",
+          "pattern": "unwanted",
+          "condition": "the workspace's secrets cannot be read while a credential is resolved",
+          "action": "fail the request without sending anything to the forge and without falling back to an anonymous request",
+          "contract": "HTTP 500 with error_type internal; no request reaches the forge",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/route_test.go, with a secret reader that returns an error: r = GET /api/v1/workspaces/w/issues; assert r.status == 500; assert r.json.error.error_type == 'internal'; assert fake.requests == 0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Access, target and order of checks on read routes",
+      "rationale": "Every forge route must refuse in one order, so that a refusal never leaks a workspace and never costs a forge call.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "a caller whose credential passes the forge read scope check (the admin token, an API key, or a PAT holding forge:read or forge:write) and who has read access to the workspace as owner, admin or org member calls a read route of this package",
+          "action": "serve the read",
+          "contract": "HTTP 200",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready workspace w owned by a user, in an organization with one other member",
+              "a fake GitHub forge from internal/forge/forgetest holding issue 1 and pull request 1"
+            ],
+            "pseudocode": "in internal/forge/route_test.go, a table over callers {admin token; owner's API key; owner's PAT with forge:read; owner's PAT with only forge:write; org member's PAT with forge:read} and over the routes {/forge, /forge/repository, /issues, /issues/1, /issues/1/comments, /pulls/1, /pulls/1/state, /pulls/1/files, /pulls/1/checks, /pulls/1/reviews}: r = GET /api/v1/workspaces/w + route; assert r.status == 200"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "unwanted",
+          "condition": "a PAT that holds neither forge:read nor forge:write calls a read route of this package",
+          "action": "refuse the request with the same answer whether or not the slug names a workspace",
+          "contract": "HTTP 403 with error_type insufficient_scope; no request reaches the forge",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/route_test.go, with a PAT holding only workspaces:read, a table over the slug {an existing workspace of the caller, 'no-such-slug'} and the ten read routes: r = GET; assert r.status == 403; assert r.json.error.error_type == 'insufficient_scope'; assert the two bodies for one route are equal; assert fake.requests == 0"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "unwanted",
+          "condition": "a caller with no access to the workspace calls a read route of this package",
+          "action": "answer exactly as for a slug that names no workspace",
+          "contract": "HTTP 404 with error_type not_found and the same body as for an unknown slug; no request reaches the forge",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/route_test.go, with a user who is neither owner nor org member: a = GET /api/v1/workspaces/w/issues; b = GET /api/v1/workspaces/no-such-slug/issues; assert a.status == 404 and b.status == 404; assert a.json.error.error_type == 'not_found'; assert a.body == b.body; assert fake.requests == 0"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "unwanted",
+          "condition": "a read route that takes target receives the query parameter target more than once, or with a value other than origin and upstream",
+          "action": "reject the request",
+          "contract": "HTTP 400 with error_type invalid_request; no request reaches the forge",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/route_test.go, a table over the query {'target=fork', 'target=', 'target=Origin', 'target=origin&target=origin', 'target=origin&target=upstream'} on GET /api/v1/workspaces/w/issues: assert r.status == 400; assert r.json.error.error_type == 'invalid_request'; assert fake.requests == 0; and for {'', 'target=origin'}: assert r.status == 200"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "unwanted",
+          "condition": "a read route receives target=upstream for a workspace that is not a carry-patch workspace with an upstream_url",
+          "action": "reject the request",
+          "contract": "HTTP 400 with error_type workspace_mode_mismatch; no request reaches the forge",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/route_test.go, a table over workspaces {workspace_mode standard; carry_patch with no upstream_url}: r = GET /api/v1/workspaces/w/issues?target=upstream; assert r.status == 400; assert r.json.error.error_type == 'workspace_mode_mismatch'; assert fake.requests == 0; and for a carry_patch workspace with upstream_url on the fake forge: assert r.status == 200 and the fake saw the request under the upstream repository's path"
+          }
+        },
+        {
+          "id": "REQ-2.6",
+          "pattern": "unwanted",
+          "condition": "a :number path parameter is not made of digits only, has a sign or a leading zero, is zero, or is greater than 2,147,483,647",
+          "action": "reject the request with the message number must be a positive decimal integer",
+          "contract": "HTTP 400 with error_type invalid_request and message 'number must be a positive decimal integer'; no request reaches the forge",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/route_test.go, a table over the :number segment {'0', '01', '+1', '-1', '1.0', '1e3', 'abc', '%20', '2147483648', '99999999999999999999'} and the routes {/issues/:number, /issues/:number/comments, /pulls/:number, /pulls/:number/state, /pulls/:number/files, /pulls/:number/checks, /pulls/:number/reviews}: assert r.status == 400; assert r.json.error.error_type == 'invalid_request'; assert r.json.error.message == 'number must be a positive decimal integer'; assert fake.requests == 0; and ParseNumber('1') == 1 and ParseNumber('2147483647') == 2147483647 without error"
+          }
+        },
+        {
+          "id": "REQ-2.7",
+          "pattern": "ubiquitous",
+          "action": "for any read request that passed the access check, run the checks in the order target, then path and query parameters, then forge configuration, answer with the first failure, and send nothing to the forge for a request refused by any of them",
+          "contract": "the status and error_type of the earliest failing check; no request reaches the forge",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/route_test.go, a table of requests that fail two checks at once and the expected winner: {?target=bad on /issues/abc} -> 400 invalid_request whose message is not the number message; {?target=upstream on a standard workspace, /issues/abc} -> 400 workspace_mode_mismatch; {/issues/abc on a workspace whose forge kind is unknown} -> 400 invalid_request with the number message; {/issues?state=bogus on a workspace whose forge kind is unknown} -> 400 invalid_request; {/issues?limit=0 on a workspace with an invalid forge_api_url} -> 400 invalid_request; {/issues/1 on a workspace with an invalid forge_api_url and a git_url naming no repository} -> 422 forge_api_url_invalid; for each: assert status and error_type; assert fake.requests == 0"
+          }
+        },
+        {
+          "id": "REQ-2.8",
+          "pattern": "state_driven",
+          "condition": "the workspace is pending, failed, archived or in an exclusive maintenance operation",
+          "action": "answer its read routes as it does for a ready workspace",
+          "contract": "HTTP 200 with the same body as for a ready workspace; never workspace_archived, workspace_not_ready or workspace_busy",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/route_test.go, a table over the workspace state {status pending, status failed, archived, held by an exclusive maintenance operation}: r = GET /api/v1/workspaces/w/issues/1; assert r.status == 200; assert r.json.issue.number == 1"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Task forks act on the parent's forge",
+      "rationale": "An agent working in a fork must reach the parent's issues without knowing the parent's forge, and must not gain access through the fork that it lacks on the parent.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "a read route of this package is called with the slug of a task fork by a caller who has read access on the fork's parent",
+          "action": "resolve the parent's remote URL, settings and credential for the given target, target=upstream included, and call the forge for the parent's repository",
+          "contract": "HTTP 200 with the object read from the parent's forge repository",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a parent workspace p with git_url https://github.com/acme/widgets.git, forge_api_url pointing at the fake forge and the secret GIT_PAT 'parent-token'",
+              "a task fork f of p, stored as a workspace record of kind fork with parent p, with no secrets and no settings of its own"
+            ],
+            "pseudocode": "in internal/forge/route_test.go: r = GET /api/v1/workspaces/f/issues/1; assert r.status == 200; assert fake.last.path names acme/widgets; assert fake.last.header('Authorization') == 'Bearer parent-token'; then with the parent a carry-patch workspace whose upstream_url is on the fake: r = GET /api/v1/workspaces/f/issues/1?target=upstream; assert r.status == 200 and fake.last.path names the upstream repository"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "unwanted",
+          "condition": "a read route is called with a task fork's slug by a caller who passes the access check on the fork and has no read access on the fork's parent",
+          "action": "refuse the request before the target check",
+          "contract": "HTTP 403 with error_type forbidden; no request reaches the forge",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/route_test.go, with an access decider stubbed to grant read on the fork f and none on its parent p: r = GET /api/v1/workspaces/f/issues?target=bad; assert r.status == 403; assert r.json.error.error_type == 'forbidden'; assert fake.requests == 0"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "event_driven",
+          "condition": "a read route is called with a task fork's slug using a token bound to that fork whose user has read access on the parent",
+          "action": "decide access on the parent by the level of the user behind the token, without applying the token's binding to the parent's slug, and serve the read",
+          "contract": "HTTP 200",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/route_test.go, with a caller identity that is a PAT of the parent's owner bound to the fork f and holding forge:read: r = GET /api/v1/workspaces/f/pulls/1/state; assert r.status == 200; assert the access decider was asked for the user's level on p with need read"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "event_driven",
+          "condition": "GET /workspaces/:slug/forge is called with the slug of a task fork",
+          "action": "answer the diagnostic document of the fork's parent, with the parent's slug in webhook.url",
+          "contract": "HTTP 200 with a body equal to that of the same route on the parent",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/status_test.go, with fork f of parent p and server.external_url 'https://hub.example.com': a = GET /api/v1/workspaces/f/forge; b = GET /api/v1/workspaces/p/forge; assert a.status == 200; assert a.json == b.json; assert a.json.webhook.url == 'https://hub.example.com/hooks/forge/p'"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Outbound call rules",
+      "rationale": "The hub calls a third party with a stored credential; each call must be bounded in time and size, must not follow the forge elsewhere and must not hammer a forge that asked it to wait.",
+      "system": "forge client",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "ubiquitous",
+          "action": "for any request it sends to a forge, set the header User-Agent to parleyd/ followed by the hub's build version, and, when the credential kind is pat or basic, send the credential's token as Authorization: Bearer",
+          "contract": "request headers User-Agent: parleyd/<version> and Authorization: Bearer <token>",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/client_test.go, a table over the credential {pat 't1', basic with password 'p1'} and the kind {github, gitlab}: client.Do(GET, fake.URL + '/x'); assert fake.last.header('User-Agent') == 'parleyd/' + buildinfo.Version; assert fake.last.header('Authorization') == 'Bearer ' + token"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "state_driven",
+          "condition": "the credential kind for the target is none",
+          "system": "parleyd",
+          "action": "send its requests without an Authorization header and without any other authentication, whatever the process environment holds, and use the API URL it resolved from the workspace",
+          "contract": "the forge receives the request with no Authorization header; the read is answered from the forge's anonymous response",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/client_test.go: t.Setenv for GITHUB_TOKEN, GH_TOKEN and GITLAB_TOKEN = 'envtoken' and GITHUB_API_URL and GITLAB_API_URL = 'https://elsewhere.invalid'; build the client and resolve a workspace with no secrets whose forge_api_url points at the fake; r = GET /api/v1/workspaces/w/issues/1; assert r.status == 200; assert fake.requests > 0; for every recorded request: assert no Authorization header and no PRIVATE-TOKEN header; assert 'envtoken' appears in no header and no URL"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "optional",
+          "condition": "HTTPS_PROXY, HTTP_PROXY or NO_PROXY is set in the hub's environment when the hub starts",
+          "action": "send forge requests through the proxy the variable names, and directly for a host NO_PROXY lists",
+          "contract": "the request for a proxied host arrives at the proxy; a host in NO_PROXY is contacted directly",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/client_test.go: proxy = an httptest server that records requests and answers 200 '{}'; t.Setenv('HTTP_PROXY', proxy.URL); build the client after the variable is set; client.Do(GET, 'http://forge.test/x'); assert proxy.requests == 1 and proxy.last.url == 'http://forge.test/x'; then t.Setenv('NO_PROXY', 'forge.test'), build a new client, client.Do(GET, 'http://forge.test/x') and assert proxy.requests is still 1"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "event_driven",
+          "condition": "a forge answers a request with a redirect whose target has the same scheme, host and port as the request",
+          "action": "follow the redirect, up to 10 redirects for one request, and use the final answer",
+          "contract": "the response of the last request in the chain",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/client_test.go, a table over the number of same-origin redirects the fake answers before 200 {1, 10}: resp, err = client.Do(GET, fake.URL + '/start'); assert err == nil; assert resp.status == 200; assert fake.requests == redirects + 1; assert every request carried the Authorization header"
+          }
+        },
+        {
+          "id": "REQ-4.5",
+          "pattern": "unwanted",
+          "condition": "a forge answers with a redirect to another scheme, host or port, or with an eleventh redirect for one request",
+          "system": "parleyd",
+          "action": "stop without sending a request to the redirect's target and fail the call",
+          "contract": "HTTP 502 with error_type forge_error; the other host receives no request and no credential",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/client_test.go, a table: {the fake redirects to a second httptest server on another port; the fake (https) redirects to an http URL on its own host; the fake redirects to itself 11 times}: r = GET /api/v1/workspaces/w/issues/1; assert r.status == 502; assert r.json.error.error_type == 'forge_error'; for the first two rows assert other.requests == 0; for the third assert fake.requests == 11"
+          }
+        },
+        {
+          "id": "REQ-4.6",
+          "pattern": "unwanted",
+          "condition": "a forge has not answered a request completely within 30 seconds of the request being sent",
+          "system": "parleyd",
+          "action": "abandon the forge request at the deadline and fail the call",
+          "contract": "HTTP 504 with error_type forge_timeout",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/client_test.go, with a client built with a deadline of 50 ms in place of the production 30 s and a fake that holds the answer until the test ends: start = now; r = GET /api/v1/workspaces/w/issues/1; assert r.status == 504; assert r.json.error.error_type == 'forge_timeout'; assert now - start < 2 s; and assert the client built by the hub's composition has a deadline of exactly 30 s"
+          }
+        },
+        {
+          "id": "REQ-4.7",
+          "pattern": "event_driven",
+          "condition": "a forge answers a request as rate limited (status 429, or status 403 with X-RateLimit-Remaining: 0 or a Retry-After header) and states a wait (Retry-After in seconds, else X-RateLimit-Reset or RateLimit-Reset minus the current time) that is at most the time left of that request's 30-second deadline",
+          "action": "wait for the stated time, send the request once more with a new 30-second deadline, and answer with the result of that second request",
+          "contract": "the response of the second request; exactly two requests reach the forge",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/client_test.go, with a fake clock whose sleep is recorded and returns at once, a table of first answers: {429 with Retry-After: 2; 403 with X-RateLimit-Remaining: 0 and X-RateLimit-Reset: now+3; 429 with RateLimit-Reset: now+1; 429 with Retry-After: 30 when the request was sent 0 s ago; 429 with Retry-After: 0}, the fake answering 200 to the second request: resp, err = client.Do(GET, url); assert err == nil; assert resp.status == 200; assert fake.requests == 2; assert the recorded sleep equals the stated wait"
+          }
+        },
+        {
+          "id": "REQ-4.8",
+          "pattern": "unwanted",
+          "condition": "a forge answers a request as rate limited and states no wait, or states a wait longer than the time left of the request's deadline, or answers the one retry as rate limited too",
+          "system": "parleyd",
+          "action": "fail the call without a further request, carrying the wait of the last rate-limited answer, rounded up to whole seconds, in a Retry-After header when the forge stated one",
+          "contract": "HTTP 429 with error_type forge_rate_limited; header Retry-After: <whole seconds> when the forge stated a wait, absent otherwise; at most two requests reach the forge",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/client_test.go, with the fake clock, a table: {429 with Retry-After: 31 -> 1 forge request, Retry-After '31'; 429 with no wait header -> 1 forge request, no Retry-After header; 403 with X-RateLimit-Remaining: 0 and no reset -> 1 forge request, no Retry-After; 429 with Retry-After: 1 then 429 with Retry-After: 5 -> 2 forge requests, Retry-After '5'; 429 with Retry-After: 20 when the clock says the request has already used 15 s -> 1 forge request, Retry-After '20'}: r = GET /api/v1/workspaces/w/issues/1; assert r.status == 429; assert r.json.error.error_type == 'forge_rate_limited'; assert fake.requests and r.header('Retry-After') as in the row"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "The diagnostic route GET /workspaces/:slug/forge",
+      "rationale": "When a forge read fails, the first question is how the hub thinks it reaches the forge; the answer must be available without a forge call and without showing a credential.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "a caller with the forge read scope and read access calls GET /workspaces/:slug/forge",
+          "action": "answer a document with the members forge, api_url, repository {host, owner, name}, credential, upstream and webhook {configured, url, last_delivery_at}, computed from the workspace's record, settings and secrets without contacting the forge, ignoring a target query parameter",
+          "contract": "HTTP 200 with {forge: github | gitlab | unknown, api_url: string | null, repository: {host, owner, name} | null, credential: pat | basic | none, upstream: object | null, webhook: {configured: boolean, url: string | null, last_delivery_at: timestamp | null}}",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a standard workspace widgets with git_url https://github.com/acme/widgets.git, no forge_api_url and the secret GIT_PAT 't1'"
+            ],
+            "pseudocode": "in internal/forge/status_test.go, a table over {no query, '?target=upstream'}: r = GET /api/v1/workspaces/widgets/forge; assert r.status == 200; assert r.json.forge == 'github'; assert r.json.api_url == 'https://api.github.com'; assert r.json.repository == {host: 'github.com', owner: 'acme', name: 'widgets'}; assert r.json.credential == 'pat'; assert r.json.upstream == null; assert keys(r.json.webhook) == {configured, url, last_delivery_at}; assert r.body does not contain 't1'; assert no outbound request was made (the client's transport records none)"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "state_driven",
+          "condition": "the workspace's remote URL names no repository, or its forge kind is unknown",
+          "action": "report forge unknown and api_url null in the diagnostic document, with repository null when the URL names none and the derived repository when only the kind is unknown, and still answer 200",
+          "contract": "HTTP 200 with forge: unknown, api_url: null, and repository null or the derived repository",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/status_test.go, a table over git_url: 'https://github.com/widgets' -> {forge: unknown, api_url: null, repository: null}; 'https://code.example.com/acme/widgets.git' -> {forge: unknown, api_url: null, repository: {code.example.com, acme, widgets}}; assert r.status == 200 and the three members as in the row; assert r.json.credential == 'none'"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "state_driven",
+          "condition": "the workspace is a carry-patch workspace with an upstream_url",
+          "action": "set the member upstream of the diagnostic document to an object with the members forge, api_url, repository and credential, resolved for the target upstream",
+          "contract": "upstream: {forge, api_url, repository, credential}; null for every other workspace",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/status_test.go: carry-patch workspace with upstream_url 'https://gitlab.com/group/sub/proj.git' and the secret UPSTREAM_GIT_PAT; r = GET .../forge; assert r.json.upstream == {forge: 'gitlab', api_url: 'https://gitlab.com/api/v4', repository: {host: 'gitlab.com', owner: 'group/sub', name: 'proj'}, credential: 'pat'}; and a table over {standard workspace; carry-patch workspace without upstream_url}: assert r.json.upstream == null"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "ubiquitous",
+          "action": "for any diagnostic document, set webhook.configured to whether the workspace secret FORGE_WEBHOOK_SECRET is present and not empty, webhook.url to server.external_url without a trailing / followed by /hooks/forge/<slug> or to null when external_url is empty, and webhook.last_delivery_at to the time the delivery provider registered through SetLastDeliveryProvider reports for the workspace or to null when it reports none or no provider is registered",
+          "contract": "webhook: {configured: boolean, url: string | null, last_delivery_at: RFC 3339 UTC timestamp with whole seconds | null}",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/status_test.go, a table over {secret, external_url, provider}: {absent, '', none} -> {configured: false, url: null, last_delivery_at: null}; {stored as '', '', none} -> {configured: false, url: null, last_delivery_at: null}; {present, 'https://hub.example.com', a provider reporting none} -> {true, 'https://hub.example.com/hooks/forge/widgets', null}; {present, 'https://hub.example.com/', none} -> {true, 'https://hub.example.com/hooks/forge/widgets', null}; {present, 'https://hub.example.com', a provider registered with SetLastDeliveryProvider returning 2026-10-21T09:12:03.7Z} -> {true, 'https://hub.example.com/hooks/forge/widgets', '2026-10-21T09:12:03Z'}; assert r.json.webhook == expected; assert the response body does not contain the secret's value; with a provider that returns an error assert status 500 and error_type internal"
+          }
+        },
+        {
+          "id": "REQ-5.5",
+          "pattern": "unwanted",
+          "condition": "GET /workspaces/:slug/forge finds that forge_api_url, or upstream_forge_api_url of a carry-patch workspace with an upstream_url, is set and is not an absolute https URL with a host and without userinfo, query and fragment",
+          "action": "reject the request",
+          "contract": "HTTP 422 with error_type forge_api_url_invalid",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the setting is written straight into the stored settings, past the validation of the settings route"
+            ],
+            "pseudocode": "in internal/forge/status_test.go, a table over {forge_api_url 'http://x.example.com' on a standard workspace; upstream_forge_api_url 'https://u:p@x.example.com' on a carry-patch workspace with an upstream_url}: r = GET .../forge; assert r.status == 422; assert r.json.error.error_type == 'forge_api_url_invalid'"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Forge failures as hub errors",
+      "rationale": "A caller cannot see the forge; it needs one documented error per kind of failure, and a message that can be shown without leaking the credential that was used.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "unwanted",
+          "condition": "a forge answers a request of a read route with a status of 400 or above that is not a rate limit",
+          "action": "fail the read with the status and error_type of the forge's status: 404 as 404 forge_not_found, 401 as 502 forge_unauthenticated, 403 that is not a rate limit as 502 forge_forbidden, any other 4xx as 422 forge_rejected, and 5xx as 502 forge_error",
+          "contract": "the error envelope with HTTP 404 forge_not_found, 502 forge_unauthenticated, 502 forge_forbidden, 422 forge_rejected or 502 forge_error, by the forge's status",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/errors_test.go, a table over the status the fake forge answers for the issue {404 -> 404 forge_not_found; 401 -> 502 forge_unauthenticated; 403 without rate-limit headers -> 502 forge_forbidden; 400 -> 422 forge_rejected; 410 -> 422 forge_rejected; 422 -> 422 forge_rejected; 500 -> 502 forge_error; 503 -> 502 forge_error}, for a GitHub and a GitLab fake: r = GET /api/v1/workspaces/w/issues/1/comments; assert r.status and r.json.error.error_type as in the row; assert r.json.error.code == r.status"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "unwanted",
+          "condition": "the connection to the forge cannot be established because the name does not resolve, the TCP connection fails or the TLS handshake fails",
+          "action": "fail the read",
+          "contract": "HTTP 502 with error_type forge_unreachable",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/errors_test.go, a table over an API URL {on a port nothing listens on; with a host name that does not resolve ('forge.invalid'); on a plain-TCP listener that answers bytes that are not a TLS handshake}: r = GET /api/v1/workspaces/w/forge/repository; assert r.status == 502; assert r.json.error.error_type == 'forge_unreachable'; assert r.json.error.message does not start with 'the forge answered'"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "unwanted",
+          "condition": "a forge answers a request with a success status and a body that is longer than 8,388,608 bytes or is not the JSON the read expects",
+          "action": "fail the read, reading no more than 8,388,608 bytes of the body",
+          "contract": "HTTP 502 with error_type forge_error; a body of exactly 8,388,608 bytes is read",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/errors_test.go, a table over the body the fake answers with status 200 {8,388,609 bytes of valid JSON padding; the text '<html>'; a JSON array where an object is expected}: r = GET /api/v1/workspaces/w/forge/repository; assert r.status == 502; assert r.json.error.error_type == 'forge_error'; and with a body of exactly 8,388,608 bytes that is a valid repository object padded with white space: assert r.status == 200"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "ubiquitous",
+          "action": "for any failed forge call, build the error message as 'the forge answered <status>: <the forge's message>' when the forge answered, taking the forge's message from the member message of the response body, else from the member error, a non-string value in its JSON form, and as a description without that prefix when the forge gave no answer",
+          "contract": "error.message: 'the forge answered <status>: <message>' or a description of the missing answer",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/errors_test.go, a table: {404, body {\"message\":\"Not Found\"}} -> 'the forge answered 404: Not Found'; {404, body {\"message\":\"404 Project Not Found\"}} -> 'the forge answered 404: 404 Project Not Found'; {400, body {\"error\":\"state does not have a valid value\"}} -> 'the forge answered 400: state does not have a valid value'; {400, body {\"message\":{\"title\":[\"is too long\"]}}} -> 'the forge answered 400: {\"title\":[\"is too long\"]}'; {500, body 'oops'} -> message starts with 'the forge answered 500'; {deadline passed} and {connection refused} -> a non-empty message that does not contain 'the forge answered'; assert MapError(failure).message as in the row"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "ubiquitous",
+          "action": "for any error message of a forge route, before it leaves the hub, replace every occurrence of the workspace's forge token by [redacted], remove the userinfo from every URL in it and cut it to at most 1,024 bytes",
+          "contract": "error.message and comments_error.message: at most 1,024 bytes, without the token and without URL userinfo",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/errors_test.go, with the secret GIT_PAT 's3cr3t-token-value' and a fake that answers 422 with a table of messages {'bad credentials for s3cr3t-token-value'; 'see https://user:s3cr3t-token-value@forge.example.com/x'; a message of 5,000 letters}: r = GET /api/v1/workspaces/w/issues/1; assert r.status == 422; assert 's3cr3t-token-value' not in r.body; row 1: assert '[redacted]' in r.json.error.message; row 2: assert 'https://forge.example.com/x' in r.json.error.message and 'user:' not in it; row 3: assert byte length of r.json.error.message <= 1024; the same three messages returned for the comments of an issue thread: assert the same properties of r.json.comments_error.message"
+          }
+        },
+        {
+          "id": "REQ-6.6",
+          "pattern": "ubiquitous",
+          "action": "for any forge request, successful or failed, write no log line that contains the forge credential that was sent",
+          "contract": "no log line contains the token",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/errors_test.go, with the hub's logger writing to a buffer at debug level and the secret GIT_PAT 's3cr3t-token-value': run one successful read, one read the fake answers with 401 and a body that echoes the Authorization header, one read against a closed port; assert 's3cr3t-token-value' not in buffer; assert the buffer is not empty"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "Repository and issue list reads, and list paging",
+      "rationale": "Triage starts from the list of open issues; it has to look the same on both forges and page the same way as every other list of the hub.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "event_driven",
+          "condition": "a caller calls GET /workspaces/:slug/forge/repository",
+          "action": "read the repository from the forge and answer it with full_name, default_branch, private, archived, permissions {pull, push, admin} and allow_merge_commit, allow_squash_merge and allow_rebase_merge, the last three null when the forge does not report them",
+          "contract": "HTTP 200 with {full_name: string, default_branch: string, private: boolean, archived: boolean, permissions: {pull, push, admin: boolean}, allow_merge_commit, allow_squash_merge, allow_rebase_merge: boolean | null}",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/github_test.go and internal/forge/gitlab_test.go, a table of forge payloads and expected answers: GitHub {full_name acme/widgets, default_branch main, private true, archived false, permissions {pull true, push true, admin false}, allow_merge_commit true, allow_squash_merge false, allow_rebase_merge true} -> the same values; GitHub payload without permissions and without allow_* -> permissions {true, false, false} and three nulls; GitLab {path_with_namespace group/sub/proj, default_branch main, visibility internal, archived true, permissions.project_access.access_level 30, group_access null, merge_method ff, squash_option never} -> {full_name group/sub/proj, private true, archived true, permissions {true, true, false}, allow_merge_commit false, allow_squash_merge false, allow_rebase_merge true}; GitLab public project with group access 40 and no merge_method and no squash_option -> private false, permissions {true, true, true}, three nulls; r = GET /api/v1/workspaces/w/forge/repository; assert r.status == 200; assert r.json == expected; assert the GitLab fake was asked for /projects/group%2Fsub%2Fproj"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "event_driven",
+          "condition": "a caller calls GET /workspaces/:slug/issues with each of state, sort, direction, labels and assignee given at most once and within its set",
+          "action": "ask the forge for the issues that match state (default open), labels (every name) and assignee, ordered by sort (default created) and direction (default desc), and answer a list of issues with timestamps in RFC 3339 UTC with whole seconds, an absent timestamp as null and an absent body as an empty string",
+          "contract": "HTTP 200 with {items: [issue], next_cursor: string | null}; issue is {number: integer, title: string, body: string, state: open | closed, url: string, author: {login: string}, labels: [string], created_at, updated_at, closed_at: timestamp | null, is_pr: boolean}",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the fake forge holds issues 7 (open, labels bug and ui, assignee kim) and 8 (closed)"
+            ],
+            "pseudocode": "in internal/forge/issues_test.go, for a GitHub and a GitLab fake: r = GET /api/v1/workspaces/w/issues; assert the forge was asked with GitHub state=open, sort=created, direction=desc and GitLab state=opened, order_by=created_at, sort=desc; r = GET ...?state=all&sort=updated&direction=asc&labels=bug,ui&assignee=kim; assert GitHub query state=all, sort=updated, direction=asc, labels=bug,ui, assignee=kim and GitLab query has no state, order_by=updated_at, sort=asc, labels=bug,ui, assignee_username=kim; assert r.status == 200; assert keys(r.json) == {items, next_cursor}; assert r.json.items[0] == {number: 7, title: 'Crash', body: '', state: 'open', url: the forge's web URL, author: {login: 'kim'}, labels: ['bug', 'ui'], created_at: '2026-10-01T08:00:00Z', updated_at: '2026-10-02T09:30:00Z', closed_at: null, is_pr: false} for a forge issue created at 2026-10-01T10:00:00.123+02:00 with a null body; assert GitLab state 'opened' reads 'open' and number is the iid"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "ubiquitous",
+          "action": "for any issue list page, leave out every entry the forge marks as a pull request",
+          "contract": "items holds no pull request; a page may hold fewer items than limit",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/issues_test.go, with a GitHub fake whose issue page holds issue 7, an entry 9 carrying a pull_request member and issue 10: r = GET /api/v1/workspaces/w/issues?limit=3; assert numbers(r.json.items) == [7, 10]; assert every item has is_pr == false"
+          }
+        },
+        {
+          "id": "REQ-7.4",
+          "pattern": "unwanted",
+          "condition": "the issue list receives one of state, sort, direction, labels and assignee more than once, a state outside open, closed and all, a sort outside created and updated, a direction outside asc and desc, a labels value with an empty name, or an empty assignee",
+          "action": "reject the request",
+          "contract": "HTTP 400 with error_type invalid_request; no request reaches the forge",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/issues_test.go, a table over the query {'state=merged', 'state=open&state=closed', 'sort=comments', 'sort=created&sort=created', 'direction=up', 'direction=asc&direction=desc', 'labels=a&labels=b', 'labels=a,,b', 'labels=', 'assignee=a&assignee=b', 'assignee='}: r = GET /api/v1/workspaces/w/issues? + query; assert r.status == 400; assert r.json.error.error_type == 'invalid_request'; assert fake.requests == 0"
+          }
+        },
+        {
+          "id": "REQ-7.5",
+          "pattern": "event_driven",
+          "condition": "a caller calls a list route of this package with a limit from 1 to 200 or none, and with no cursor or the next_cursor of the previous page of the same route and parameters",
+          "action": "ask the forge for one page of limit entries (default 50), answer next_cursor as a string when the forge names a next page and as null when it names none, and on a request that carries that cursor answer the forge's next page with the cursor's page size",
+          "contract": "HTTP 200 with {items: array (never null), next_cursor: string | null}",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/page_test.go, with a GitHub and a GitLab fake holding 5 entries per collection and announcing the next page in the Link header (rel=\"next\"), a table over the list routes {/issues, /issues/1/comments, /pulls/1/files, /pulls/1/checks, /pulls/1/reviews}: p1 = GET route?limit=2; assert len(p1.json.items) == 2 and p1.json.next_cursor is a string; assert the forge was asked with per_page=2 and page=1; p2 = GET route?cursor=p1.next_cursor (no limit); assert the forge was asked with per_page=2 and page=2; p3 = GET route?limit=2&cursor=p2.next_cursor; assert len(p3.json.items) == 1 and p3.json.next_cursor == null; assert the ids of p1, p2 and p3 together are the 5 entries without repeat; and with no limit: assert the forge was asked with per_page=50; and for an empty collection: assert r.json.items == [] (an array, not null) and next_cursor == null"
+          }
+        },
+        {
+          "id": "REQ-7.6",
+          "pattern": "unwanted",
+          "condition": "a list route of this package receives a limit that is not an integer from 1 to 200, a cursor that cannot be decoded, a cursor issued for another route, another path parameter or other query parameters, or a limit that differs from the page size of the cursor given with it",
+          "action": "reject the request",
+          "contract": "HTTP 400 with error_type invalid_request",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/page_test.go, with c = the next_cursor of GET /api/v1/workspaces/w/issues?limit=2&state=open, a table of requests: {/issues?limit=0}; {/issues?limit=201}; {/issues?limit=x}; {/issues?cursor=not-a-cursor}; {/issues/1/comments?cursor=c} (another route); {/issues?state=closed&cursor=c} (another filter); {/issues?target=upstream&cursor=c on a carry-patch workspace} (another target); {/issues?limit=3&state=open&cursor=c} (another page size); a cursor of /issues/1/comments used on /issues/2/comments (another number); assert r.status == 400; assert r.json.error.error_type == 'invalid_request'"
+          }
+        },
+        {
+          "id": "REQ-7.7",
+          "pattern": "ubiquitous",
+          "action": "for any read request of this package that reaches the call step, ask the forge anew and answer from that response, keeping no forge response for a later request",
+          "contract": "two equal read requests cause two sets of forge requests; the second answer shows the forge's current state",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/issues_test.go: a = GET /api/v1/workspaces/w/issues/7; change issue 7's title on the fake; b = GET /api/v1/workspaces/w/issues/7; assert b.json.issue.title is the new title; assert the fake served the issue twice"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "Issue thread and comments",
+      "rationale": "An agent that picks up an issue needs the issue and its discussion in one call, and must still get the issue when only the comments fail.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "a caller calls GET /workspaces/:slug/issues/:number for an issue the forge holds",
+          "action": "read the issue and the first page of at most 100 of its comments from the forge and answer the issue thread with the comments oldest first and comments_error null",
+          "contract": "HTTP 200 with {issue: issue, comments: [comment], comments_next_cursor: string | null, comments_error: null}",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/issues_test.go, for a GitHub and a GitLab fake holding issue 7 with 3 comments: r = GET /api/v1/workspaces/w/issues/7; assert r.status == 200; assert keys(r.json) == {issue, comments, comments_next_cursor, comments_error}; assert r.json.issue.number == 7; assert the comments were requested with per_page=100; assert [c.created_at for c in r.json.comments] is ascending; assert keys(r.json.comments[0]) == {id, body, author, created_at, updated_at, url}; assert r.json.comments_next_cursor == null; assert r.json.comments_error == null"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "event_driven",
+          "condition": "the forge names a next page after the first 100 comments of an issue thread",
+          "action": "set comments_next_cursor to a cursor that, given to GET /workspaces/:slug/issues/:number/comments for the same number and target with no limit, answers the comments that follow the thread's page",
+          "contract": "comments_next_cursor: string, accepted by the comments route of the same issue and target",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/issues_test.go, with a fake holding issue 7 with 130 comments: t = GET /api/v1/workspaces/w/issues/7; assert len(t.json.comments) == 100; assert t.json.comments_next_cursor is a string; n = GET /api/v1/workspaces/w/issues/7/comments?cursor=t.json.comments_next_cursor; assert n.status == 200; assert len(n.json.items) == 30; assert n.json.items[0].id is the id of the 101st comment; assert n.json.next_cursor == null"
+          }
+        },
+        {
+          "id": "REQ-8.3",
+          "pattern": "unwanted",
+          "condition": "the forge answered the issue of an issue thread and the read of its comments failed",
+          "action": "answer the issue with an empty comments list and the failure in comments_error, mapped and scrubbed as an error of the comments read would be",
+          "contract": "HTTP 200 with comments: [], comments_next_cursor: null and comments_error: {error_type: string, message: string}",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/issues_test.go, a table over what the fake answers for the comments of issue 7 {500 -> forge_error; 403 without rate-limit headers -> forge_forbidden; 429 without a wait -> forge_rate_limited; no answer before the client's deadline -> forge_timeout}: r = GET /api/v1/workspaces/w/issues/7; assert r.status == 200; assert r.json.issue.number == 7; assert r.json.comments == []; assert r.json.comments_next_cursor == null; assert r.json.comments_error.error_type as in the row; assert r.json.comments_error.message != ''; assert keys(r.json.comments_error) == {error_type, message}"
+          }
+        },
+        {
+          "id": "REQ-8.4",
+          "pattern": "event_driven",
+          "condition": "GET /workspaces/:slug/issues/:number is called on a GitHub repository with the number of a pull request",
+          "action": "answer the issue thread of that number with is_pr true",
+          "contract": "HTTP 200 with issue.is_pr: true; is_pr is false for every other issue and for every GitLab issue",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/github_test.go, with a GitHub fake whose issue 9 carries a pull_request member: r = GET /api/v1/workspaces/w/issues/9; assert r.status == 200; assert r.json.issue.is_pr == true; and for issue 7 without the member: assert is_pr == false; in internal/forge/gitlab_test.go: for a GitLab issue, assert is_pr == false and the fake was asked for /projects/<path>/issues/7 only, never for a merge request"
+          }
+        },
+        {
+          "id": "REQ-8.5",
+          "pattern": "event_driven",
+          "condition": "a caller calls GET /workspaces/:slug/issues/:number/comments",
+          "action": "answer a list of the issue's comments, oldest first, each with id, body, author {login}, created_at, updated_at and url, leaving out GitLab notes the forge marks as system notes",
+          "contract": "HTTP 200 with {items: [{id: integer, body: string, author: {login: string}, created_at: timestamp, updated_at: timestamp | null, url: string}], next_cursor: string | null}",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/gitlab_test.go, with a GitLab fake whose issue 7 has the notes [{id 1, system false, body 'first'}, {id 2, system true, body 'added label'}, {id 3, system false, body 'second'}] and web host forge.example.com: r = GET /api/v1/workspaces/w/issues/7/comments; assert r.status == 200; assert [c.id for c in r.json.items] == [1, 3]; assert the fake was asked with sort=asc and order_by=created_at; assert r.json.items[0].author.login is the note author's username; assert r.json.items[0].url ends with '/group/sub/proj/-/issues/7#note_1'; in internal/forge/github_test.go: assert items carry the forge's id, body, user.login as author.login and html_url as url, in the forge's order"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-9",
+      "title": "Pull request reads",
+      "rationale": "Teams that review on the forge need the state, the changed files, the checks and the reviews of a pull request without giving every agent a forge token.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-9.1",
+          "pattern": "event_driven",
+          "condition": "a caller calls GET /workspaces/:slug/pulls/:number for a pull request the forge holds",
+          "action": "read the pull request (on GitLab the merge request with that iid) from the forge and answer it, with state merged and merged true when the forge reports it merged, and state open for GitLab's opened and locked",
+          "contract": "HTTP 200 with {number: integer, title: string, body: string, state: open | closed | merged, url: string, draft: boolean, merged: boolean, head_sha: string, head_branch: string, base_branch: string, author: {login: string}, created_at, updated_at, closed_at, merged_at: timestamp | null}",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/pulls_test.go, a table of forge payloads: GitHub {number 12, state open, draft true, head {sha, ref feature}, base {ref main}, user.login kim} -> {state: 'open', draft: true, merged: false, head_sha, head_branch: 'feature', base_branch: 'main', merged_at: null}; GitHub {state closed, merged true, merged_at set} -> {state: 'merged', merged: true}; GitHub {state closed, merged false} -> {state: 'closed', merged: false}; GitLab {iid 12, state opened, draft true, sha, source_branch feature, target_branch main, author.username kim, description null} -> {number: 12, state: 'open', draft: true, body: '', head_sha: sha}; GitLab {state merged, merged_at set} -> {state: 'merged', merged: true}; GitLab {state locked} -> {state: 'open'}; r = GET /api/v1/workspaces/w/pulls/12; assert r.status == 200; assert the 16 members of the pull request type are all present; assert the row's members; assert head_sha is the full 40-character id"
+          }
+        },
+        {
+          "id": "REQ-9.2",
+          "pattern": "event_driven",
+          "condition": "a caller calls GET /workspaces/:slug/pulls/:number/state",
+          "action": "answer the pull request state: number, state, merged and head_sha, with the values the pull request read gives",
+          "contract": "HTTP 200 with {number: integer, state: open | closed | merged, merged: boolean, head_sha: string}",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/pulls_test.go, over the same table of forge payloads as the pull request read: r = GET /api/v1/workspaces/w/pulls/12/state; assert r.status == 200; assert keys(r.json) == {number, state, merged, head_sha}; assert each equals the member of GET /pulls/12"
+          }
+        },
+        {
+          "id": "REQ-9.3",
+          "pattern": "event_driven",
+          "condition": "a caller calls GET /workspaces/:slug/pulls/:number/files",
+          "action": "answer a list of the files the pull request changes, each with filename, status (added, modified, deleted or renamed), additions and deletions",
+          "contract": "HTTP 200 with {items: [{filename: string, status: added | modified | deleted | renamed, additions: integer, deletions: integer}], next_cursor: string | null}",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/pulls_test.go, a table: GitHub files with status {added, modified, removed, renamed, copied, changed, unchanged} -> {added, modified, deleted, renamed, added, modified, modified} with the forge's additions and deletions; GitLab diffs {new_file true} -> added, {deleted_file true} -> deleted, {renamed_file true, new_path b.go} -> renamed with filename b.go, {none true} -> modified, and a diff text '@@ -1,2 +1,3 @@\\n ctx\\n-old\\n+new\\n+more\\n--- dashes' -> additions 2, deletions 2, and a missing diff text -> 0 and 0; r = GET /api/v1/workspaces/w/pulls/12/files; assert r.status == 200; assert r.json.items as in the row"
+          }
+        },
+        {
+          "id": "REQ-9.4",
+          "pattern": "event_driven",
+          "condition": "a caller calls GET /workspaces/:slug/pulls/:number/checks",
+          "action": "answer a list of the check runs of the pull request's head (on GitLab the jobs of the merge request's latest pipeline), each with name, status, conclusion (null while not completed), summary and url, and an empty list when the head has none, reading every page of one listing from the head the first page was read from",
+          "contract": "HTTP 200 with {items: [{name: string, status: queued | in_progress | completed, conclusion: success | failure | cancelled | skipped | neutral | null, summary: string, url: string}], next_cursor: string | null}",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/pulls_test.go, a table: GitHub check runs {status queued} -> {queued, null}; {status in_progress} -> {in_progress, null}; {status pending} -> {queued, null}; {completed, success, output.summary 'ok'} -> {completed, success, summary 'ok'}; {completed, timed_out} -> failure; {completed, stale} -> cancelled; {completed, neutral, no output} -> {neutral, summary ''}; assert the fake was asked for /commits/<head_sha of pull 12>/check-runs; GitLab jobs {created} -> {queued, null}; {manual} -> {queued, null}; {running} -> {in_progress, null}; {success} -> {completed, success}; {failed} -> {completed, failure}; {failed, allow_failure true} -> {completed, neutral}; {canceled} -> {completed, cancelled}; {skipped} -> {completed, skipped}; assert the jobs are those of the first pipeline the merge request's pipeline list names; a pull request without check runs and a merge request without pipelines: assert r.json == {items: [], next_cursor: null}; paging: p1 = GET ...checks?limit=1; move the pull request's head on the fake; p2 = GET ...checks?cursor=p1.next_cursor; assert p2's forge request names the head (commit id, or pipeline id on GitLab) of p1"
+          }
+        },
+        {
+          "id": "REQ-9.5",
+          "pattern": "event_driven",
+          "condition": "a caller calls GET /workspaces/:slug/pulls/:number/reviews",
+          "action": "answer a list of the pull request's reviews, each with author {login}, state (approved, changes_requested, commented or dismissed), body and submitted_at, oldest first; on GitLab the approvals as approved with submitted_at null, in the forge's order, followed by the non-system notes as commented, oldest first, with no page longer than limit",
+          "contract": "HTTP 200 with {items: [{author: {login: string}, state: approved | changes_requested | commented | dismissed, body: string, submitted_at: timestamp | null}], next_cursor: string | null}",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/pulls_test.go: GitHub reviews [APPROVED by kim at t1, PENDING by lee, CHANGES_REQUESTED by ana at t2, COMMENTED at t3, DISMISSED at t4]: r = GET /api/v1/workspaces/w/pulls/12/reviews; assert [x.state for x in r.json.items] == ['approved', 'changes_requested', 'commented', 'dismissed']; assert submitted_at ascending; GitLab merge request with approved_by [kim, lee] and notes [n1 system false at t1, n2 system true, n3 system false at t2]: r = GET ...reviews; assert r.json.items == [{author kim, approved, body '', submitted_at null}, {author lee, approved, '', null}, {n1's author, commented, n1's body, t1}, {n3's author, commented, n3's body, t2}]; with limit=3 and 5 non-system notes: p1 = GET ...reviews?limit=3; assert len(p1.json.items) == 3 (2 approvals and 1 note) and the notes were requested with per_page=1; follow next_cursor to the end; assert no page is longer than 3 and all pages together are the 2 approvals then the 5 notes in order, none repeated"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-10",
+      "title": "CLI read commands",
+      "rationale": "Agents and developers reach the forge reads from the shell with the same commands whatever forge the workspace uses.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-10.1",
+          "pattern": "event_driven",
+          "condition": "a user runs one of parley forge status, parley forge repository, parley issue list, parley issue get, parley issue comments, parley pr get, parley pr state, parley pr files, parley pr checks and parley pr reviews with a workspace slug and, where the command takes one, a number that passes the number rule",
+          "action": "send one GET to the command's route (forge status to /workspaces/:slug/forge; forge repository to /forge/repository; issue list to /issues; issue get to /issues/:number; issue comments to /issues/:number/comments; pr get to /pulls/:number; pr state to /pulls/:number/state; pr files to /pulls/:number/files; pr checks to /pulls/:number/checks; pr reviews to /pulls/:number/reviews), with the slug and the number each percent-encoded as one path segment, and print the hub's answer",
+          "contract": "one GET request; the hub's JSON on stdout; exit code 0",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/forge_test.go, internal/cli/issue_test.go and internal/cli/pr_test.go, against an httptest hub that records method and raw path and answers 200 with a JSON document, a table over the ten commands with slug 'widgets' and number '7': out = run(command); assert hub.last.method == 'GET'; assert hub.last.rawPath == '/api/v1/workspaces/widgets' + route; assert hub.last.rawQuery == ''; assert out.exit == 0; assert json(out.stdout) == the hub's document; and with the slug 'a/b': assert hub.last.rawPath starts with '/api/v1/workspaces/a%2Fb/'; and with a wrong number of arguments: assert out.exit == 2 and hub.requests == 0"
+          }
+        },
+        {
+          "id": "REQ-10.2",
+          "pattern": "optional",
+          "condition": "a flag is given: --target on every command of this package except forge status, --limit and --cursor on issue list, issue comments, pr files, pr checks and pr reviews, and --state, --label (repeatable) and --assignee on issue list",
+          "action": "send the flag's value as the query parameter of the same name, sending no parameter for a flag that was not given and all values of --label as one labels parameter joined by commas",
+          "contract": "the query string holds exactly the parameters of the flags given",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/issue_test.go and internal/cli/pr_test.go, a table: {issue list widgets --state closed --label bug --label ui --assignee kim --limit 10 --cursor c1 --target upstream} -> query {state=closed, labels=bug,ui, assignee=kim, limit=10, cursor=c1, target=upstream}; {issue list widgets} -> empty query; {issue get widgets 7 --target upstream} -> {target=upstream}; {issue comments widgets 7 --limit 5 --cursor c} -> {limit=5, cursor=c}; {forge repository widgets --target origin} -> {target=origin}; {pr files|checks|reviews widgets 7 --limit 5 --cursor c --target upstream} -> {limit=5, cursor=c, target=upstream}; {pr get|state widgets 7 --target upstream} -> {target=upstream}; assert parsed(hub.last.rawQuery) == expected; and {forge status widgets --target origin}, {pr get widgets 7 --limit 5}, {issue list widgets --sort updated}: assert out.exit == 2 and hub.requests == 0 (the command has no such flag)"
+          }
+        },
+        {
+          "id": "REQ-10.3",
+          "pattern": "unwanted",
+          "condition": "the <number> argument of a command of this package is not a positive decimal integer of digits only, without sign and leading zero, of at most 2,147,483,647",
+          "action": "fail as a usage error without sending a request",
+          "contract": "exit code 2; the error envelope with error_type usage_error on stderr; nothing on stdout; no request sent",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/issue_test.go and internal/cli/pr_test.go, a table over the number argument {'0', '01', '+1', '-1', '1.5', 'abc', '', '2147483648'} and the commands {issue get, issue comments, pr get, pr state, pr files, pr checks, pr reviews}: out = run(command, 'widgets', number); assert out.exit == 2; assert json(out.stderr).error.error_type == 'usage_error'; assert out.stdout == ''; assert hub.requests == 0; and for '2147483647': assert out.exit == 0"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "An agent triages a workspace's issues from the CLI",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "runs parley issue list widgets --label bug with a token that holds forge:read"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends GET /api/v1/workspaces/widgets/issues?labels=bug"
+        },
+        {
+          "actor": "parleyd",
+          "action": "checks the scope and the read access, resolves the forge kind, the API URL and the stored GIT_PAT of the workspace and asks the forge for the open issues labelled bug with that token"
+        },
+        {
+          "actor": "forge",
+          "action": "answers one page that holds two issues and one pull request"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers 200 with the two issues and next_cursor null"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints the list on stdout and exits 0"
+        },
+        {
+          "actor": "agent",
+          "action": "runs parley issue get widgets 7"
+        },
+        {
+          "actor": "parleyd",
+          "action": "reads issue 7 and its comments from the forge and answers the issue thread"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints the thread and exits 0"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parley CLI command tree",
+          "parleyd HTTP server with its middleware",
+          "scope check and access component",
+          "workspace store, settings and secrets on SQLite",
+          "forge component with its outbound HTTP client",
+          "a fake GitHub API served over TLS by net/http/httptest"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 whose forge client trusts the fake forge's certificate",
+          "a workspace widgets created through POST /api/v1/workspaces with git_pat 'tok-1' against a test origin of internal/gitrepo/gitrepotest whose path ends in /acme/widgets.git",
+          "forge_api_url set through PATCH /api/v1/workspaces/widgets to the fake forge's URL followed by /github",
+          "the fake holds for acme/widgets the issues 7 and 8 labelled bug, a pull request 9 labelled bug, and two comments on issue 7",
+          "a PAT of the owner that holds only forge:read"
+        ],
+        "end_state": [
+          "parley issue list widgets --label bug printed exactly the issues 7 and 8 and exited 0",
+          "parley issue get widgets 7 printed issue 7 with two comments and comments_error null",
+          "every request the fake received carried Authorization: Bearer tok-1 and a User-Agent that starts with parleyd/",
+          "the string tok-1 is in no CLI output"
+        ],
+        "pseudocode": "in test/e2e/forge_read_test.go: fake = forgetest.NewGitHub(t); hub = startHub(t, trusting fake); create widgets with git_pat 'tok-1'; PATCH settings {forge_api_url: fake.URL + '/github'}; pat = mint PAT [forge:read]; out = runCLI(pat, 'issue', 'list', 'widgets', '--label', 'bug'); assert out.exit == 0; assert numbers(json(out.stdout).items) == [7, 8] in the fake's order; th = runCLI(pat, 'issue', 'get', 'widgets', '7'); assert th.exit == 0; assert len(json(th.stdout).comments) == 2; assert json(th.stdout).comments_error == null; for q in fake.requests: assert q.header('Authorization') == 'Bearer tok-1' and q.header('User-Agent') starts with 'parleyd/'; assert 'tok-1' not in out.stdout + out.stderr + th.stdout + th.stderr"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "An agent working in a task fork reads the parent's forge",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "sends GET /api/v1/workspaces/<fork>/pulls/12/state with a token that holds forge:read"
+        },
+        {
+          "actor": "parleyd",
+          "action": "finds that the slug names a task fork, confirms the caller's read access on the fork's parent, resolves the parent's forge and credential and asks the forge for pull request 12"
+        },
+        {
+          "actor": "forge",
+          "action": "answers the pull request"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers 200 with number, state, merged and head_sha"
+        },
+        {
+          "actor": "agent",
+          "action": "sends GET /api/v1/workspaces/<fork>/pulls/999/state"
+        },
+        {
+          "actor": "forge",
+          "action": "answers 404 with a message"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers 404 with error_type forge_not_found and the scrubbed message 'the forge answered 404: …'"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parleyd HTTP server with its middleware",
+          "scope check and access component",
+          "workspace store, settings and secrets on SQLite",
+          "forge component with its outbound HTTP client",
+          "a fake GitLab API served over TLS by net/http/httptest"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 whose forge client trusts the fake forge's certificate",
+          "a parent workspace created through POST /api/v1/workspaces with git_pat 'tok-2', with forge_api_url set through PATCH to the fake forge's URL followed by /gitlab",
+          "a task fork of the parent, written as a workspace record of kind fork with that parent through the workspace store (fork creation is package 15)",
+          "the fake holds merge request 12 (state merged) for the parent's repository path and answers 404 with message '404 Not Found' for merge request 999",
+          "a PAT of the parent's owner that holds only forge:read"
+        ],
+        "end_state": [
+          "the first answer is 200 with number 12, state merged, merged true and a 40-character head_sha",
+          "the fake was asked under <fake>/gitlab/api/v4/projects/<encoded parent path>/merge_requests/12 with Authorization: Bearer tok-2",
+          "the second answer is 404 with error_type forge_not_found and message 'the forge answered 404: 404 Not Found'",
+          "neither answer contains tok-2"
+        ],
+        "pseudocode": "in test/e2e/forge_read_test.go: fake = forgetest.NewGitLab(t); hub = startHub(t, trusting fake); create parent with git_pat 'tok-2'; PATCH settings {forge_api_url: fake.URL + '/gitlab'}; insert fork record f with parent; pat = mint PAT [forge:read]; a = GET /api/v1/workspaces/f/pulls/12/state; assert a.status == 200; assert a.json == {number: 12, state: 'merged', merged: true, head_sha: fake's sha}; assert fake.last.path == '/gitlab/api/v4/projects/' + urlencode(parent path) + '/merge_requests/12'; assert fake.last.header('Authorization') == 'Bearer tok-2'; b = GET /api/v1/workspaces/f/pulls/999/state; assert b.status == 404; assert b.json.error.error_type == 'forge_not_found'; assert b.json.error.message == 'the forge answered 404: 404 Not Found'; assert 'tok-2' not in a.body + b.body"
+      }
+    }
+  ],
+  "external_apis": [
+    {
+      "package": "github.com/spf13/cobra",
+      "version": "v1",
+      "verified": false,
+      "symbols": [
+        {
+          "name": "Command",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "type Command struct { Use string; Short string; Args PositionalArgs; RunE func(cmd *Command, args []string) error }"
+        },
+        {
+          "name": "Command.AddCommand",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) AddCommand(cmds ...*Command)"
+        },
+        {
+          "name": "Command.Flags",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) Flags() *pflag.FlagSet"
+        }
+      ]
+    },
+    {
+      "package": "golang.org/x/net",
+      "version": "v0",
+      "verified": false,
+      "symbols": [
+        {
+          "name": "FromEnvironment",
+          "import_path": "golang.org/x/net/http/httpproxy",
+          "signature": "func FromEnvironment() *Config"
+        },
+        {
+          "name": "Config.ProxyFunc",
+          "import_path": "golang.org/x/net/http/httpproxy",
+          "signature": "func (cfg *Config) ProxyFunc() func(reqURL *url.URL) (*url.URL, error)"
+        }
+      ]
+    }
+  ]
+}

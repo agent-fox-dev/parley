@@ -1,0 +1,323 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "53",
+  "spec_name": "event_webhooks",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/webhook/... ./internal/cli/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "52",
+      "reason": "reads the event log in-process after a sequence number with ReadAfter under VisibleToOwnerOf, is woken through OnCommit, uses the types filter and the event record's JSON form, and emits the five parley.webhook.* events with Emit"
+    },
+    {
+      "spec": "39",
+      "reason": "encrypts and decrypts the signing secret with the secrets key, takes the secrets_unavailable condition from it and registers a converter with its re-encryption task"
+    },
+    {
+      "spec": "09",
+      "reason": "builds the nine parley webhook commands on the CLI's HTTP client, output, exit codes and command declaration"
+    },
+    {
+      "spec": "51",
+      "reason": "reports its two metrics to the recorder and registry of internal/metrics and registers its delivery store as the DeliveryPruner of the webhook_deliveries retention step"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Create subscriptions with a signing secret shown once",
+      "criteria": [
+        "REQ-2.1",
+        "REQ-2.2",
+        "REQ-2.3",
+        "REQ-2.6",
+        "REQ-8.5"
+      ],
+      "steps": [
+        "Add the create and configuration behaviours to internal/webhook/subscription_test.go and internal/webhook/config_test.go and confirm they fail",
+        "Register the four [webhooks] keys with the key registry of internal/config: max_per_workspace (integer, default 20, at least 0), timeout (duration, default 10s, 1s to 60s), allow_private and allow_insecure (bool, default false); a value outside the rule is a load error naming the key",
+        "Register the schema steps of the transactional store for subscriptions (all fields of the subscription, the encrypted signing secret, the position in the event log) and for delivery records (the eleven listed members plus the subscription id and the time of the first attempt)",
+        "Add the route guard every webhook route uses, in this order: refuse a workspace-bound token through the binding guard's declaration for routes that refuse bound tokens, need the scope workspaces:write (writing routes) or either workspaces scope (reading routes), need level owner through the access component, answer 400 not_supported_on_fork when the workspace record's kind is fork, then check that :id and :delivery_id are UUIDs and look the subscription up within the addressed workspace (404 webhook_not_found)",
+        "Validate the create body field by field (url shape and length, types through the event component's filter syntax with at most 20 non-empty entries, include_forks, description length), each violation 400 invalid_request naming the field; ignore unknown members; accept http only when allow_insecure is true and the host is a literal loopback address or localhost",
+        "After validation refuse an archived workspace with 409 workspace_archived, then a workspace that already holds max_per_workspace subscriptions in any state with 429 webhook_limit_reached, then a missing encryption key with 503 secrets_unavailable",
+        "Generate the secret from 32 random bytes as whsec_ plus 64 lower-case hexadecimal characters, seal it with SealValue of package 39 (internal/secret) under the binding string `webhook:<subscription id>` and store only the sealed bytes; a missing key is what Available of that package reports",
+        "In one transaction insert the subscription, emit parley.webhook.create through the event component (metadata webhook_id, host, types, include_forks; resource_type event_webhook) and set the subscription's position to that event's seq",
+        "Answer 201 with the subscription plus secret, and declare secret as the member the idempotency helper of internal/server omits on a replay"
+      ],
+      "touches": [
+        "internal/webhook/config.go",
+        "internal/webhook/config_test.go",
+        "internal/webhook/schema.go",
+        "internal/webhook/subscription.go",
+        "internal/webhook/subscription_test.go",
+        "internal/webhook/guard.go",
+        "internal/webhook/routes.go"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Read, change, delete and rotate subscriptions",
+      "criteria": [
+        "REQ-4.1",
+        "REQ-4.2",
+        "REQ-4.4",
+        "REQ-4.7",
+        "REQ-2.4",
+        "REQ-2.5"
+      ],
+      "steps": [
+        "Add the list, get, update-validation, delete, archived and missing-key behaviours to internal/webhook/routes_test.go and internal/webhook/subscription_test.go and confirm they fail",
+        "Add GET …/webhooks behind the guard: the list envelope of internal/server in (created_at, id) ascending order with an optional state filter; a state outside active, failing and disabled is 400 invalid_request",
+        "Add GET …/webhooks/:id: the subscription plus pending, counted through the event component's in-process read as the events after the position that an owner of the workspace may see, that pass include_forks and that match types; 0 for a disabled subscription",
+        "Add PATCH …/webhooks/:id for url, types, include_forks and description: refuse an empty body, an unknown member and a bad value with 400 invalid_request, then an archived workspace with 409; change only the fields given, set updated_at, and emit parley.webhook.update with the names of the fields given and the state, in the same transaction; accept the member active as a bool and record it in fields (its state change is added by the task that owns the states)",
+        "Add DELETE …/webhooks/:id: remove the subscription, its delivery records and its ciphertext and emit parley.webhook.delete with webhook_id and host in one transaction; answer 204 in every workspace status",
+        "Add POST …/webhooks/:id/rotate-secret: refuse an archived workspace with 409 and a missing key with 503; otherwise replace the ciphertext with that of a new secret, emit parley.webhook.update with fields ['secret'], and answer 200 with the subscription plus secret",
+        "Keep the secret out of every object these routes return: one function builds the subscription object, and only create and rotate add secret"
+      ],
+      "touches": [
+        "internal/webhook/routes.go",
+        "internal/webhook/routes_test.go",
+        "internal/webhook/subscription.go",
+        "internal/webhook/subscription_test.go"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Refuse unsafe destinations when a URL is set",
+      "criteria": [
+        "REQ-3.1",
+        "REQ-3.2",
+        "REQ-3.3"
+      ],
+      "steps": [
+        "Add the destination tables to internal/webhook/destination_test.go and confirm they fail",
+        "Add one function that judges an IP address: refused when it is in 127.0.0.0/8, 169.254.0.0/16, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4 or is 0.0.0.0, or in ::1, fe80::/10, fc00::/7, ff00::/8 or is ::; an IPv4-mapped IPv6 address is judged by its IPv4 address",
+        "Make the function take the subscription's scheme and the two settings: allow_private lifts every refusal; allow_insecure lifts the refusal of a loopback address for an http url only",
+        "At create and at a PATCH that gives url, after the shape rules passed, resolve the host through a resolver the component is constructed with and answer 400 webhook_destination_refused when the host is a refused literal address or any resolved address is refused; accept a name that does not resolve",
+        "Leave the stored url unchanged and write no event on a refusal"
+      ],
+      "touches": [
+        "internal/webhook/destination.go",
+        "internal/webhook/destination_test.go",
+        "internal/webhook/subscription.go"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Send one signed attempt and judge its outcome",
+      "criteria": [
+        "REQ-5.1",
+        "REQ-5.2",
+        "REQ-5.3",
+        "REQ-5.4",
+        "REQ-3.4"
+      ],
+      "steps": [
+        "Add the request, signature, outcome and connection-check behaviours to internal/webhook/sender_test.go and confirm they fail",
+        "Add the sender, constructed with the timeout, the clock, the hub version from internal/buildinfo, a resolver, a dialer and the TLS trust roots (the system roots in production); it has no setting that turns certificate verification off",
+        "Build the request: POST to the url with the body bytes handed in, Content-Type application/json, Parley-Event, Parley-Delivery, Parley-Seq, Parley-Timestamp (Unix seconds of the clock at sending), User-Agent parley-webhook/<version>, and no other header that the caller or the hub's credentials could add",
+        "Compute Parley-Signature as sha256= plus the lower-case hexadecimal HMAC-SHA256 of timestamp, a dot and the body, keyed with the secret string as shown to the owner; take the secret as a parameter of each attempt so that a rotated secret is used from the next attempt",
+        "Check the address the dialer is about to connect to with the destination function of the previous task, at connection time and before the connection is opened; a refusal ends the attempt with error destination_refused",
+        "Do not follow redirects; bound the attempt from connect to the response status by the timeout and by the caller's context; close the response without storing or returning its body",
+        "Map the outcome: 2xx is success with response_code; 3xx is failure with response_code and error redirect; any other status is failure with response_code and no error; a timeout, a connection or resolution failure and a TLS failure are failures with response_code null and error timeout, connection_failed or tls_error; return the duration in milliseconds"
+      ],
+      "touches": [
+        "internal/webhook/sender.go",
+        "internal/webhook/sender_test.go",
+        "internal/webhook/destination.go"
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Deliver each subscription's events from the event log",
+      "criteria": [
+        "REQ-6.1",
+        "REQ-6.3",
+        "REQ-6.4",
+        "REQ-6.5",
+        "REQ-6.6"
+      ],
+      "steps": [
+        "Add the first-delivery, selection, start-point, independence and vanished-event behaviours to internal/webhook/loop_test.go and confirm they fail",
+        "Add one delivery loop per active or failing subscription, started when a subscription is created and stopped when it is deleted; loops of different subscriptions never wait for each other and each has at most one attempt in flight",
+        "Wake a loop on the event component's in-process notification of a committed event, registered through OnCommit of package 52, and on the loop's own timer",
+        "Read the next events after the stored position through ReadAfter of the event component and decide each with VisibleToOwnerOf for the subscription's workspace; keep an event when its workspace is the subscription's workspace, or a task fork of it and include_forks is true, and its type matches types; never keep an event without a workspace",
+        "Move the position past events that are not kept without recording a delivery, in the store",
+        "For a kept event insert a pending delivery record with a new id before the first attempt, encode the body with the event component's JSON form of the record, open the secret with OpenValue of package 39 and call the sender",
+        "On success, in one transaction: mark the delivery succeeded with attempts, response_code, duration and last_attempt_at, move the position past the event, set last_status succeeded and last_delivery_at, clear failing_since",
+        "When the read reports that the position is older than the log's oldest event, move the position to just before the oldest event and report one failed to the metrics recorder; when the event of a pending delivery is gone, mark the delivery failed, report one failed and move on; change neither state nor failing_since",
+        "Report through the Recorder of internal/metrics (package 51): one Add on parley_webhook_deliveries_total per attempt with the label result set to ok, retry or failed; the component takes the recorder at construction, tests pass a recording one, and each successful attempt reports ok"
+      ],
+      "touches": [
+        "internal/webhook/loop.go",
+        "internal/webhook/loop_test.go",
+        "internal/webhook/delivery.go",
+        "internal/webhook/metrics.go"
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Retry failed attempts in order with growing waits",
+      "criteria": [
+        "REQ-7.1",
+        "REQ-6.2",
+        "REQ-4.3",
+        "REQ-4.8"
+      ],
+      "steps": [
+        "Add the retry-schedule and ordering behaviours to internal/webhook/state_test.go and internal/webhook/loop_test.go, and the update-while-pending and rotation-while-retrying behaviours to internal/webhook/subscription_test.go, and confirm they fail",
+        "On a failed attempt of the loop made less than 24 hours after the delivery's first attempt, in one transaction: keep the delivery pending, add one to attempts, store response_code, error, duration and last_attempt_at, set last_status failed and last_delivery_at, and set failing_since to the attempt's time when it is null",
+        "Schedule next_attempt_at as the attempt's time plus 10 seconds doubled for each earlier failure of the delivery and capped at 1 hour, and never later than the first attempt plus 24 hours; report retry to the recorder",
+        "Make the loop sleep on the controlled clock until next_attempt_at and send nothing else for the subscription meanwhile, so that no later event overtakes the pending one",
+        "Read url, types, include_forks and the secret from the store at the start of every attempt and every read of the log, so that a PATCH or a rotation applies from the next attempt, the pending delivery keeps its id, and a changed filter applies to every event not yet examined"
+      ],
+      "touches": [
+        "internal/webhook/loop.go",
+        "internal/webhook/loop_test.go",
+        "internal/webhook/state.go",
+        "internal/webhook/state_test.go",
+        "internal/webhook/subscription_test.go"
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Give events up, mark subscriptions failing and disable them",
+      "criteria": [
+        "REQ-7.2",
+        "REQ-7.3",
+        "REQ-7.4",
+        "REQ-7.5",
+        "REQ-4.5",
+        "REQ-4.6"
+      ],
+      "steps": [
+        "Add the give-up, recovery, 72-hour and switch behaviours to internal/webhook/state_test.go and confirm they fail",
+        "On a failed attempt made 24 hours or more after the delivery's first attempt, in one transaction: mark the delivery failed with next_attempt_at null, move the position past the event, and when the state is not yet failing set it and emit parley.webhook.failing with actor system and metadata webhook_id, host, seq, failing_since, response_code and error; report failed to the recorder and go on with the next event at once",
+        "On a successful attempt return a failing subscription to active together with clearing failing_since, without an event",
+        "Add background work that checks at least once a minute, on the controlled clock, for active or failing subscriptions whose failing_since is 72 hours or more in the past; for each, in one transaction, set disabled, mark the pending delivery failed with next_attempt_at null and emit parley.webhook.disabled with actor system and metadata webhook_id, host and failing_since; stop its loop",
+        "Complete PATCH active: true sets active and clears failing_since; a subscription that was disabled gets the seq of this request's parley.webhook.update event as its position and its loop is started; one that was failing keeps position and pending delivery",
+        "Complete PATCH active: false sets disabled, marks the pending delivery failed with next_attempt_at null, leaves failing_since as it is and stops the loop; either value on a subscription already in that state changes nothing else and still answers 200 with the update event",
+        "Start no loop and record no delivery for a disabled subscription"
+      ],
+      "touches": [
+        "internal/webhook/state.go",
+        "internal/webhook/state_test.go",
+        "internal/webhook/loop.go",
+        "internal/webhook/subscription.go"
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Survive restarts, stop without waiting and go with a deleted workspace",
+      "criteria": [
+        "REQ-8.1",
+        "REQ-8.2",
+        "REQ-8.3"
+      ],
+      "steps": [
+        "Add the restart, shutdown and removal behaviours to internal/webhook/lifecycle_test.go and confirm they fail",
+        "Add a start function that loads every active and failing subscription and starts its loop from the stored position; a stored pending delivery is continued under its id and attempts count, at once when its next_attempt_at is null or past (an attempt that was in flight) and at next_attempt_at otherwise",
+        "Run the loops and the 72-hour check under one context; when it is cancelled, cancel the attempts in flight, record nothing for them and return without waiting for a receiver",
+        "Add the workspace remover in the shape of a Remover of owned data of the Teardown set of internal/workspace (package 14; it takes the transaction and one slug and returns an error): given the removal transaction and a slug, delete the workspace's subscriptions, delivery records and ciphertexts in that transaction and emit no event; stop the loops of the removed subscriptions once the transaction has committed and not when it is rolled back"
+      ],
+      "touches": [
+        "internal/webhook/lifecycle.go",
+        "internal/webhook/lifecycle_test.go",
+        "internal/webhook/loop.go"
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Send pings, list deliveries, redeliver and prune the delivery log",
+      "criteria": [
+        "REQ-9",
+        "REQ-5.5"
+      ],
+      "steps": [
+        "Add the ping behaviours to internal/webhook/ping_test.go, the list, redelivery and pruning behaviours to internal/webhook/deliveries_test.go and the undecryptable-secret behaviour to internal/webhook/sender_test.go, and confirm they fail",
+        "Add POST …/webhooks/:id/ping behind the guard, in any subscription state and workspace status: build a body in the event record's JSON form with type parley.webhook.ping, seq 0, a new id, the time, the workspace, the caller's actor_type and actor_id, resource_type event_webhook, resource_id the subscription id, action ping, session_id null and metadata {}; make one attempt through the sender; store a delivery record with attempts 1 and the outcome; answer 200 with the record whether it succeeded or failed; write no event and change nothing on the subscription",
+        "Add GET …/webhooks/:id/deliveries: the list envelope in (created_at, id) descending order with an optional status filter, each item holding exactly the eleven members; a status outside pending, succeeded and failed is 400 invalid_request",
+        "Add POST …/deliveries/:delivery_id/redeliver: 400 for an id that is not a UUID, 404 delivery_not_found for an id that is not one of the subscription's deliveries, 400 invalid_request for a ping, 409 delivery_pending for a pending delivery, 410 event_expired when ReadAfter of the event component no longer returns the event of that seq",
+        "Otherwise make one attempt with the event's body, the same delivery id and the subscription's current url and secret; set the record's status to the outcome, add one to attempts, set response_code, error, duration and last_attempt_at, keep next_attempt_at null; answer 200 with the record; change nothing on the subscription",
+        "Report ok or failed to the recorder for each ping and redelivery",
+        "When the signing secret cannot be decrypted: answer ping and redeliver with 503 secrets_unavailable without touching a delivery record; in the loop make no attempt, leave delivery and position as they are and try again within one minute",
+        "Add PruneDeliveries(ctx, before) on the delivery store, in the shape of the DeliveryPruner interface of internal/audit (package 51): delete the records that are not pending and whose last_attempt_at is before the given time, and return the number deleted; the retention step webhook_deliveries passes now minus 7 days"
+      ],
+      "touches": [
+        "internal/webhook/ping.go",
+        "internal/webhook/ping_test.go",
+        "internal/webhook/deliveries.go",
+        "internal/webhook/deliveries_test.go",
+        "internal/webhook/sender_test.go",
+        "internal/webhook/loop.go",
+        "internal/webhook/routes.go"
+      ],
+      "depends_on": [
+        7
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Connect the webhook component to the hub and report its metrics",
+      "criteria": [
+        "REQ-1",
+        "REQ-2.7",
+        "REQ-8.4",
+        "REQ-8.6",
+        "REQ-8.7"
+      ],
+      "steps": [
+        "Add the access tables over all nine routes to internal/webhook/routes_test.go, the secrecy behaviour to internal/webhook/subscription_test.go, the archived-workspace behaviour to internal/webhook/lifecycle_test.go the metrics behaviour to internal/webhook/metrics_test.go and the converter behaviour to internal/webhook/reencrypt_test.go, and confirm that what is not yet built fails",
+        "Give the component one constructor that takes the store, the event component, the secret component, the access component, the configuration, the clock, the logger, the resolver, dialer and trust roots, and the metrics recorder; and one function that registers the nine routes on the router of internal/server, each behind the guard of the first task",
+        "Add the queue-depth function QueueDepth: the sum, over all active and failing subscriptions, of the events after the position that the subscription may receive and that match its types",
+        "Add the converter for the re-encryption task of package 39: re-seal with SealValue under the current key every signing secret for which NeedsReseal of package 39 is true, opening it with OpenValue, leave a ciphertext that opens under neither key unchanged, change no other member of a subscription, write no event, and return the numbers converted and remaining; return an error only when the store fails",
+        "Make every attempt report exactly one result (loop, ping and redelivery), and make no code path log or return the secret: hand the secret to the scrubber of the hub so that a log line that would hold it is scrubbed",
+        "In internal/hub/webhook.go, construct the component at start, register its routes, register the start function as a start hook and the loops with the 72-hour check as background work, pass the registry of internal/metrics as the recorder and register QueueDepth with its RegisterSource for parley_webhook_queue_depth, register the delivery store with RegisterDeliveryPruner of internal/audit, register the converter with the converter registry of internal/secret, and register the workspace remover as a Remover of owned data in the Teardown set of internal/workspace (package 14), unconditionally",
+        "Check that an archived workspace changes nothing for delivery and for the list, get, deliveries, ping, redeliver and delete routes"
+      ],
+      "touches": [
+        "internal/webhook/webhook.go",
+        "internal/webhook/metrics.go",
+        "internal/webhook/metrics_test.go",
+        "internal/webhook/routes.go",
+        "internal/webhook/routes_test.go",
+        "internal/webhook/subscription_test.go",
+        "internal/webhook/lifecycle_test.go",
+        "internal/hub/webhook.go",
+        "internal/webhook/reencrypt.go",
+        "internal/webhook/reencrypt_test.go"
+      ],
+      "depends_on": [
+        8,
+        9
+      ]
+    },
+    {
+      "id": 11,
+      "title": "Add the parley webhook commands",
+      "criteria": [
+        "REQ-10"
+      ],
+      "steps": [
+        "Add the command behaviours to internal/cli/webhook_test.go against an httptest hub that records method, path, query and body, and confirm they fail",
+        "Add the webhook command group in internal/cli/webhook.go, each command declared through the command helper of package 09 with its method and path and built on its HTTP client, output and exit codes; do not write a second client",
+        "create <workspace-slug>: --url (required), --types (a comma list sent as an array), --no-forks (include_forks false), --description; send a member only for a flag that was given",
+        "list (--state, --limit, --cursor), get, deliveries (--status, --limit, --cursor): send a query parameter only for a flag that was given and print the body",
+        "update: --url, --types, --forks or --no-forks, --description, --enable or --disable; no flag at all, or both flags of a pair, is a usage error before any request",
+        "delete: on 204 print the document with status deleted and id the webhook id",
+        "create and rotate-secret: print the response including secret on stdout and a note on stderr that the secret is shown only once, without repeating the secret there",
+        "ping and redeliver: print the delivery record; when its status is failed report an envelope with code 0 and error_type delivery_failed on stderr and exit with status 1",
+        "Add test/e2e/webhook_test.go with the two end-to-end flows of the PRD: start the hub in-process on a loopback port the system picks with allow_insecure true and a controlled clock, insert the workspace record through internal/access, run an httptest receiver that verifies signatures, and drive everything through the CLI command tree"
+      ],
+      "touches": [
+        "internal/cli/webhook.go",
+        "internal/cli/webhook_test.go",
+        "test/e2e/webhook_test.go"
+      ]
+    }
+  ]
+}

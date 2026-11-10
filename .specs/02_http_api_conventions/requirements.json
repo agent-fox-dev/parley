@@ -1,0 +1,823 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "02",
+  "spec_name": "http_api_conventions",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Surfaces and route matching",
+      "rationale": "Every later package registers its routes in one place, and a client gets the same answer for a path or method the hub does not have, whoever it is.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "a request arrives whose method and path match a route registered under the fixed mount `/api/v1`",
+          "action": "run that route's handler and give it the value of every `:param` path parameter of the route's pattern",
+          "contract": "the handler's status and body are the response; a route registered as `GET /things/:id` and requested as `GET /api/v1/things/42` sees `id` = `42`",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a server with the test routes `GET /things` and `GET /things/:id` registered and a passing authenticator installed"
+            ],
+            "pseudocode": "in internal/server/route_test.go: r = do(GET, '/api/v1/things/42'); assert r.status == 200; assert the handler saw param('id') == '42'; r = do(GET, '/api/v1/things'); assert r.status == 200 and the list handler ran"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "unwanted",
+          "condition": "a request's path matches no registered route",
+          "action": "answer `not_found` without calling the authenticator or running a handler, and without redirecting a path that differs from a route only by a trailing slash",
+          "contract": "HTTP 404 with the error envelope, `error_type` `not_found` and `code` 404; the authenticator call count is unchanged; the answer is the same with no credential and with an unknown credential",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a server with the test route `GET /things` registered and a counting authenticator"
+            ],
+            "pseudocode": "in internal/server/route_test.go, a table over the paths {'/api/v1/nope', '/nope', '/api/v1/things/', '/api/v2/things', '/api/v1'} each sent twice, once with no Authorization header and once with 'Bearer bogus': assert r.status == 404 (never 301 or 308); assert r.json.error.error_type == 'not_found' and r.json.error.code == 404; assert authenticator.calls == 0 and no handler ran"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "unwanted",
+          "condition": "a request's path matches a registered route under another method only",
+          "action": "answer `method_not_allowed` with an `Allow` header listing every method registered for that path, without calling the authenticator or running a handler",
+          "contract": "HTTP 405 with the error envelope, `error_type` `method_not_allowed` and `code` 405; header `Allow` holds exactly the registered methods of the path, separated by `, `; the authenticator call count is unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a server with the test routes `GET /things` and `POST /things` registered and a counting authenticator"
+            ],
+            "pseudocode": "in internal/server/route_test.go: r = do(DELETE, '/api/v1/things') with no credential; assert r.status == 405; assert r.json.error.error_type == 'method_not_allowed'; assert the set split(r.header('Allow'), ', ') == {'GET', 'POST'}; assert authenticator.calls == 0 and no handler ran"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Error envelope and error_type catalogue",
+      "rationale": "A client branches on the status and `error_type` alone, so both must have one shape and one catalogue on every route.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "ubiquitous",
+          "action": "for any error raised on the REST API, answer with the JSON body `{\"error\":{\"code\":…,\"message\":…,\"error_type\":…}}` in which `code` equals the HTTP status and `error_type` and `message` are non-empty strings, with content type `application/json; charset=utf-8`",
+          "contract": "the response body has the single top-level member `error`; `error.code` is a number equal to the response status; header `Content-Type` is `application/json; charset=utf-8`",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/server/errors_test.go: write the error {type 'conflict', message 'workspace is busy'} to a response recorder; assert status == 409; assert header Content-Type == 'application/json; charset=utf-8'; assert keys(body) == ['error']; assert body.error.code == 409, body.error.message == 'workspace is busy', body.error.error_type == 'conflict'"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "ubiquitous",
+          "action": "for any error of a catalogued type, answer with the status the catalogue gives: `invalid_request` 400, `unauthenticated` 401, `forbidden` 403, `not_found` 404, `method_not_allowed` 405, `conflict` 409, `gone` 410, `payload_too_large` 413, `unsupported_media_type` 415, `rate_limited` 429, `internal` 500, `upstream_error` 502, `unavailable` 503, `insufficient_scope` 403, `token_bound` 403, `path_not_allowed` 403, `workspace_archived` 409",
+          "contract": "for each of the 17 types, the response status and `error.code` are the listed number and `error.error_type` is the type's name",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/server/errors_test.go, a table over the 17 (type, status) pairs of the criterion: write an error of the type built by its catalogue constructor; assert the recorder's status == status; assert body.error.code == status; assert body.error.error_type == type"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "event_driven",
+          "condition": "a handler or check raises an error that names a specific `error_type` outside the catalogue together with a status",
+          "action": "answer with that status and that `error_type` in the envelope",
+          "contract": "raising (`workspace_busy`, 409) answers HTTP 409 with `error_type` `workspace_busy`; raising (`unknown_session`, 400) answers HTTP 400 with `error_type` `unknown_session`",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/server/errors_test.go, a table over {('workspace_busy', 409), ('unknown_session', 400), ('cursor_expired', 410)}: a test handler returns the error; assert r.status == status, r.json.error.code == status, r.json.error.error_type == name"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "event_driven",
+          "condition": "an error is raised with extra members, either a named member or a `details` object",
+          "action": "write those members inside `error` beside `code`, `message` and `error_type`",
+          "contract": "an error with the named member `oldest_seq` = 17 answers `{\"error\":{\"code\":410,\"message\":…,\"error_type\":\"cursor_expired\",\"oldest_seq\":17}}`; an error with `details` answers the same object under `error.details`",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/server/errors_test.go: write ('cursor_expired', 410) with member oldest_seq = 17; assert body.error.oldest_seq == 17 and the three standard members are present; write ('ref_moved', 409) with details {current_sha: 'abc'}; assert body.error.details.current_sha == 'abc'; assert an extra member cannot replace code, message or error_type"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "unwanted",
+          "condition": "a handler or an installed check returns an error that is not an API error, or panics",
+          "action": "answer `internal` with the fixed message `internal error`, write the cause to the server log with the request id, and keep serving later requests",
+          "contract": "HTTP 500 with the error envelope, `error_type` `internal`, `code` 500 and `message` `internal error`; the text of the cause appears nowhere in the response; one log line holds the cause and the response's `X-Request-ID`; the next request to the same server is answered",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a server whose logger writes to a buffer, with a test route whose handler fails as the case says"
+            ],
+            "pseudocode": "in internal/server/pipeline_test.go, a table over {handler returns errors.New('db password hunter2'), handler panics with 'boom hunter2', the scope check returns a plain error}: assert r.status == 500; assert r.json.error.error_type == 'internal' and r.json.error.message == 'internal error'; assert 'hunter2' not in r.body; assert the log buffer has a line containing 'hunter2' and r.header('X-Request-ID'); assert a following request to a healthy route returns 200"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Order of checks",
+      "rationale": "The order decides which answer a caller gets when several things are wrong, and a fixed order is what keeps an answer from leaking whether a workspace exists.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "ubiquitous",
+          "action": "for any request to a route that is not public, run the checks in the order route match, authentication, rate limit, body size and content type, the route's feature check, binding guard, scope check, access check, handler, and answer with the failure of the first check that fails without running any later check or the handler",
+          "contract": "when the check at position N fails, the response is that check's status and `error_type`, every check before N ran exactly once and no check after N ran",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a server with a limit of 1000 requests per minute and a test route `POST /things` that declares a feature check, with recording stubs installed as authenticator, feature check, binding guard, scope check and access check, each able to fail with its own distinct error"
+            ],
+            "pseudocode": "in internal/server/pipeline_test.go, a table with one case per failing position {authentication -> 401 unauthenticated, rate limit (the credential's window already used up) -> 429 rate_limited, body (2 MiB body) -> 413 payload_too_large, feature check -> 503 unavailable, binding guard -> 403 token_bound, scope -> 403 insufficient_scope, access -> 404 not_found, handler -> 400 invalid_request} plus the case where nothing fails: send POST '/api/v1/things'; assert r.status and r.json.error.error_type are the failing position's; assert the recorded call order is exactly the prefix [authentication, feature check, binding guard, scope, access, handler] up to and including the failing position; in the all-pass case assert the full order and status 201"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "optional",
+          "condition": "a route is registered as public",
+          "action": "skip authentication, the binding guard, the scope check and the access check, and still apply the rate limit, counted per client address, and the body size and content type checks before the handler",
+          "contract": "a request with no credential reaches the handler; the installed authenticator, binding guard, scope check and access check are not called; an over-limit body is still HTTP 413 and an over-limit client address is still HTTP 429",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a server with a public test route `POST /open`, recording stubs in all four positions and a limit of 2 requests per minute"
+            ],
+            "pseudocode": "in internal/server/pipeline_test.go: r = do(POST, '/api/v1/open', no credential, '{}'); assert r.status == 200 and no stub was called; r = do(POST, '/api/v1/open', body of limit+1 bytes); assert r.status == 413; a third request from the same address returns 429"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "unwanted",
+          "condition": "a request matches a route that is not public and no authenticator is installed",
+          "action": "refuse the request without running the handler",
+          "contract": "HTTP 401 with the error envelope, `error_type` `unauthenticated` and `code` 401; the handler call count is 0",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a server with the test route `GET /things` and nothing installed in any position"
+            ],
+            "pseudocode": "in internal/server/pipeline_test.go: for the headers {none, 'Authorization: Bearer anything'}: r = do(GET, '/api/v1/things'); assert r.status == 401; assert r.json.error.error_type == 'unauthenticated'; assert handler.calls == 0"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "event_driven",
+          "condition": "the authenticator accepts a request and reports its caller: the credential's id and either a user id or the admin token",
+          "action": "give that caller, unchanged, to every later check and to the handler of the same request",
+          "contract": "the binding guard, the scope check, the access check and the handler each read the credential id and the user id (or the admin marker) the authenticator reported for this request, and never those of another request",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/server/pipeline_test.go: an authenticator that maps 'Bearer a' to caller {credential 'k1', user 'u1'} and 'Bearer root' to {credential 'admin', admin}; send both requests in parallel 50 times; assert every stub and the handler saw exactly the caller of its own request"
+          }
+        },
+        {
+          "id": "REQ-3.5",
+          "pattern": "optional",
+          "condition": "no binding guard, no scope check or no access check is installed, or the route declares no feature check",
+          "action": "treat that position as passed and continue with the next check",
+          "contract": "with only an authenticator installed, an authenticated request to a non-public route reaches the handler and gets the handler's response",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/server/pipeline_test.go: a server with only a passing authenticator and the test route `GET /things`; r = do(GET, '/api/v1/things'); assert r.status == 200 and the handler ran once"
+          }
+        },
+        {
+          "id": "REQ-3.6",
+          "pattern": "ubiquitous",
+          "action": "for any two requests in flight at the same time, on the same route or on different routes, serve both, without refusing either one or making it wait because the other is running",
+          "contract": "while one request's handler is blocked, a second request to the same route completes with its handler's status; the first completes with its own status when released",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/server/pipeline_test.go: a test route whose handler blocks on a channel for the request with ?hold=1; start that request in a goroutine and wait until its handler is entered; r2 = do(GET, same route without hold) with a 2-second deadline; assert r2.status == 200 before the first is released; release; assert the first returns 200"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Request bodies",
+      "rationale": "A handler should only ever see a body of bounded size that is a JSON object; everything else is refused the same way on every route.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "unwanted",
+          "condition": "a request's body is larger than the body limit (default 1048576 bytes), whether or not the request declares its length, and whatever its content type",
+          "action": "refuse the request before the binding guard, the scope check, the access check and the handler run",
+          "contract": "HTTP 413 with the error envelope, `error_type` `payload_too_large` and `code` 413; the handler call count is 0; a body of exactly the limit is not refused by this check",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a server with the default body limit, a passing authenticator and the test route `POST /things` that echoes the length it read"
+            ],
+            "pseudocode": "in internal/server/body_test.go, a table over {1048576 bytes with Content-Length -> handler runs, 1048577 bytes with Content-Length -> 413, 1048577 bytes chunked without Content-Length -> 413, 1048577 bytes with Content-Type text/plain -> 413 (not 415)}: assert status; for 413 assert r.json.error.error_type == 'payload_too_large' and handler.calls == 0; for the accepted case assert the handler read 1048576 bytes"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "optional",
+          "condition": "a route states a body limit of its own",
+          "action": "apply the route's limit to that route in place of the server's body limit",
+          "contract": "on a route with a limit of 4 MiB a 2 MiB body reaches the handler and a body of 4 MiB plus one byte is HTTP 413 `payload_too_large`; other routes keep the server's limit",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/server/body_test.go: register `POST /big` with limit 4194304 and `POST /things` without; assert POST /big with 2097152 bytes -> handler runs; POST /big with 4194305 bytes -> 413; POST /things with 2097152 bytes -> 413"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "unwanted",
+          "condition": "a `POST`, `PUT` or `PATCH` request has a body within the limit and its `Content-Type` is missing or names a media type other than `application/json`",
+          "action": "refuse the request before the binding guard, the scope check, the access check and the handler run",
+          "contract": "HTTP 415 with the error envelope, `error_type` `unsupported_media_type` and `code` 415; the handler call count is 0; `application/json` in any letter case and with parameters such as `charset=utf-8` is accepted",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a server with a passing authenticator and test routes for POST, PUT and PATCH on `/things`"
+            ],
+            "pseudocode": "in internal/server/body_test.go, a table over method in {POST, PUT, PATCH} and Content-Type in {'text/plain' -> 415, absent -> 415, 'application/x-www-form-urlencoded' -> 415, 'application/json' -> pass, 'application/json; charset=utf-8' -> pass, 'Application/JSON' -> pass} with body '{}': assert status; for 415 assert r.json.error.error_type == 'unsupported_media_type' and handler.calls == 0"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "event_driven",
+          "condition": "a `POST`, `PUT` or `PATCH` request arrives without a body",
+          "action": "pass the content type check whatever the `Content-Type` header says and run the later checks",
+          "contract": "a bodiless `POST` with `Content-Type: text/plain`, and one with no `Content-Type`, reach the handler",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/server/body_test.go: for Content-Type in {absent, 'text/plain'}: r = do(POST, '/api/v1/things/42/block', no body); assert the handler ran and r.status is the handler's 200"
+          }
+        },
+        {
+          "id": "REQ-4.5",
+          "pattern": "optional",
+          "condition": "a route states a request content type other than JSON",
+          "action": "accept a body of that content type on that route",
+          "contract": "on a route that states `text/plain`, a `PUT` with `Content-Type: text/plain` reaches the handler with the raw bytes, and the server's body limit or the route's own still applies",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/server/body_test.go: register `PUT /raw` accepting 'text/plain'; r = do(PUT, '/api/v1/raw', 'hello', Content-Type text/plain); assert the handler read 'hello'; a body of limit+1 bytes on the same route -> 413"
+          }
+        },
+        {
+          "id": "REQ-4.6",
+          "pattern": "unwanted",
+          "condition": "a handler decodes a request body as a JSON object and the body is empty, is not valid JSON, is a JSON value other than an object, or has bytes other than white space after the object",
+          "action": "refuse the request and leave the handler's target value unused",
+          "contract": "HTTP 400 with the error envelope, `error_type` `invalid_request` and `code` 400",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a test route `POST /things` whose handler decodes the body into a struct with the member `name` through the JSON body helper and answers 201"
+            ],
+            "pseudocode": "in internal/server/body_test.go, a table over the bodies {'', '{', 'nope', '[1,2]', '\"text\"', '42', 'null', '{\"name\":\"a\"} trailing', '{\"name\":\"a\"}{\"name\":\"b\"}'} sent as application/json: assert r.status == 400 and r.json.error.error_type == 'invalid_request'"
+          }
+        },
+        {
+          "id": "REQ-4.7",
+          "pattern": "event_driven",
+          "condition": "a handler decodes a request body that is a JSON object with members the handler does not know",
+          "action": "decode the known members and ignore the unknown ones",
+          "contract": "the body `{\"name\":\"a\",\"surprise\":true}` decodes to `name` = `a` and the request proceeds",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/server/body_test.go beside the table above: r = do(POST, '/api/v1/things', '{\"name\":\"a\",\"surprise\":true}  \\n'); assert r.status == 201 and the handler saw name == 'a'"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "List paging",
+      "rationale": "One list shape and one cursor rule let a client page through any collection with the same loop.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "a list handler answers a page through the list helper",
+          "action": "write `{\"items\":[…],\"next_cursor\":…}` where `items` is a JSON array, `[]` when the page is empty and never null, and `next_cursor` is a string when more items follow and null on the last page",
+          "contract": "HTTP 200 with content type `application/json; charset=utf-8`; an empty collection answers exactly the members `items` = `[]` and `next_cursor` = null",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a test route `GET /things` that pages an in-memory ordered collection through the list helper"
+            ],
+            "pseudocode": "in internal/server/list_test.go: with 0 items: assert raw body has '\"items\":[]' and '\"next_cursor\":null'; with a nil slice passed to the helper: the same; with 3 items and limit=2: assert len(items) == 2 and next_cursor is a non-empty string; following it: len(items) == 1 and next_cursor == null"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "event_driven",
+          "condition": "a list request carries no `limit` parameter",
+          "action": "use a limit of 50",
+          "contract": "a collection of 51 items answers 50 items and a non-null `next_cursor`",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/server/list_test.go: with 51 items: r = do(GET, '/api/v1/things'); assert len(r.json.items) == 50 and r.json.next_cursor != null"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "unwanted",
+          "condition": "a list request's `limit` is not an integer, or is outside 1–200 on a route that states no other bounds",
+          "action": "refuse the request without reading the collection",
+          "contract": "HTTP 400 with the error envelope, `error_type` `invalid_request` and `code` 400; the limits 1 and 200 are accepted",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/server/list_test.go, a table over limit in {'0', '-1', '201', '1000', 'abc', '1.5', ''} -> 400 invalid_request with the collection's read count unchanged, and {'1', '200'} -> 200 with at most that many items"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "optional",
+          "condition": "a route states its own default and bounds for `limit`",
+          "action": "apply the route's default and bounds to that route in place of 50 and 1–200",
+          "contract": "on a route with bounds 1–1000 and default 100, `limit=1000` is accepted, `limit=1001` is HTTP 400 `invalid_request`, and no `limit` answers up to 100 items",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/server/list_test.go: register `GET /wide` with bounds 1..1000 and default 100 over 1200 items; assert limit=1000 -> 1000 items; limit=1001 -> 400; no limit -> 100 items"
+          }
+        },
+        {
+          "id": "REQ-5.5",
+          "pattern": "unwanted",
+          "condition": "a list request's `cursor` is malformed, or was issued for another query: another route, another value of a path parameter, or other query parameters apart from `cursor` and `limit`",
+          "action": "refuse the request without reading the collection",
+          "contract": "HTTP 400 with the error envelope, `error_type` `invalid_request` and `code` 400; a cursor reused with a different `limit` on the same query is accepted",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "test routes `GET /things`, `GET /owners/:owner/things` and `GET /others`, each paging through the list helper, and a cursor c taken from page one of `GET /things?state=open`"
+            ],
+            "pseudocode": "in internal/server/list_test.go, a table: cursor in {'%%%', 'AAAA', 'e30', c with its last character removed} on /things?state=open -> 400; c on /others -> 400; c on /things?state=closed -> 400; c on /things (no state) -> 400; a cursor from /owners/a/things used on /owners/b/things -> 400; c on /things?state=open&limit=7 -> 200 continuing after page one; each 400 has error_type 'invalid_request'"
+          }
+        },
+        {
+          "id": "REQ-5.6",
+          "pattern": "ubiquitous",
+          "action": "for any ordered collection and any limit within the bounds, return every item that existed throughout exactly once and in the collection's order when a client follows `next_cursor` from the first page until it is null, with a null `next_cursor` on the final page also when the item count is an exact multiple of the limit",
+          "contract": "the concatenation of the pages' `items` equals the collection; the number of pages is ceil(n / limit), or 1 when n is 0",
+          "check": {
+            "kind": "property",
+            "pseudocode": "in internal/server/list_test.go: for n in 0..120 and limit in {1, 2, 7, 50, 60, 200} (the exact multiples n = k*limit among them): walk GET /api/v1/things?limit=L following next_cursor; assert the concatenated ids == the collection's ids in order; assert page count == max(1, ceil(n/L)); assert only the last page has next_cursor == null; and with one item inserted before the current position between two pages, assert no item that existed throughout is repeated or skipped"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Idempotency keys",
+      "rationale": "An agent that loses the answer to a create must be able to send it again without creating a second resource.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "a `POST` to a create route carries an `Idempotency-Key` of 1–255 characters that has no record for this caller and route, and the handler answers with a 2xx status",
+          "action": "return the handler's response unchanged and record its body under the key, the caller and the route (method and request path) for 24 hours, without the members the route declares as shown once",
+          "contract": "the first response has the handler's status (for example 201) and full body, show-once members included; the stored record holds no show-once member",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a server with a clock the test controls, a passing authenticator and the create test route `POST /things` whose handler counts its calls and answers 201 `{\"id\":…,\"token\":\"secret-1\"}`, declaring `token` as shown once"
+            ],
+            "pseudocode": "in internal/server/idempotency_test.go: r = do(POST, '/api/v1/things', key 'k1', '{\"name\":\"a\"}'); assert r.status == 201; assert r.json.token == 'secret-1'; assert the record store holds one record for (k1, caller, 'POST /api/v1/things') whose body has no 'token' member and nowhere contains 'secret-1'"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "event_driven",
+          "condition": "a `POST` to a create route carries a key that has a record for the same caller and route, the request body is byte-for-byte the recorded request's, and the record is younger than 24 hours",
+          "action": "answer with the recorded body without running the handler",
+          "contract": "HTTP 200 with the original body's members (the original's status 201 or 202 is not repeated); the handler call count is unchanged; nothing is created",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/server/idempotency_test.go, after the first request of the test above: advance the clock 23h59m; r2 = do(POST, same key, same body); assert r2.status == 200; assert r2.json.id == r.json.id; assert handler.calls == 1"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "event_driven",
+          "condition": "a replay is answered for a route that declares show-once members, at the top level or nested (`token`, `token.token`)",
+          "action": "omit each declared member from the replayed body and keep every other member",
+          "contract": "the replay of `{\"id\":\"1\",\"token\":\"secret-1\"}` is `{\"id\":\"1\"}`; the replay of `{\"workspace\":{…},\"token\":{\"token_id\":\"t\",\"token\":\"secret-2\"}}` with `token.token` declared keeps `token.token_id` and has no `token.token`",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/server/idempotency_test.go, a table over {route declaring 'token' with a flat body, route declaring 'token.token' with a nested body, route declaring a member the body does not have}: replay; assert the declared member is absent, every other member equals the original's, and the secret string is not in the raw replay body"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "unwanted",
+          "condition": "a `POST` to a create route carries a key that has a record for the same caller and route and the request body differs from the recorded request's",
+          "action": "refuse the request without running the handler and keep the record as it was",
+          "contract": "HTTP 409 with the error envelope, `error_type` `conflict` and `code` 409; the handler call count is unchanged; a later replay with the original body still answers 200",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/server/idempotency_test.go: after a recorded create with body '{\"name\":\"a\"}': r = do(POST, same key, '{\"name\":\"b\"}'); assert r.status == 409 and r.json.error.error_type == 'conflict'; assert handler.calls == 1; then the original body again -> 200"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "unwanted",
+          "condition": "a `POST` to a create route carries an `Idempotency-Key` header that is empty or longer than 255 characters",
+          "action": "refuse the request without running the handler and without recording anything",
+          "contract": "HTTP 400 with the error envelope, `error_type` `invalid_request` and `code` 400; keys of 1 and of 255 characters are accepted; a request with no `Idempotency-Key` header runs the handler without recording",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/server/idempotency_test.go, a table over the header {'' -> 400, 256 x 'a' -> 400, 'a' -> 201, 255 x 'a' -> 201, absent -> 201 with no record written}: assert status; for 400 assert error_type 'invalid_request', handler.calls unchanged and the record store unchanged"
+          }
+        },
+        {
+          "id": "REQ-6.6",
+          "pattern": "event_driven",
+          "condition": "a `POST` to a create route carries a key and the request ends with a status that is not 2xx, from the handler or from a check",
+          "action": "record nothing, so that a later request with the same key runs the handler again",
+          "contract": "after a first request answered 400 or 500, a second request with the same key and a body the handler accepts answers the handler's 201 and is then recorded",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/server/idempotency_test.go, a table over a handler that first answers {400 invalid_request, 500 through a plain error, 409 conflict} and then 201: send twice with key 'k'; assert first status is the failure, second is 201, handler.calls == 2; a third request -> 200 replay"
+          }
+        },
+        {
+          "id": "REQ-6.7",
+          "pattern": "event_driven",
+          "condition": "several requests with the same key, caller, route and body are in flight at the same time",
+          "action": "let exactly one of them create and answer every other one as a replay of it, or, when the one that ran failed, let exactly one of the others run next",
+          "contract": "of N concurrent requests the handler succeeds exactly once; one response is the handler's 201 and N-1 are 200 with the same resource id",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the pipeline and the in-memory record store, with a handler that sleeps 20 ms before answering 201 with a fresh id"
+            ],
+            "pseudocode": "in internal/server/idempotency_test.go, run with the race detector: start 20 goroutines posting key 'k' and the same body; assert handler.calls == 1; assert exactly one 201 and nineteen 200; assert all 20 bodies carry the same id; repeat with a handler whose first call answers 500: assert exactly one 500, handler.calls == 2 and the rest agree on one id"
+          }
+        },
+        {
+          "id": "REQ-6.8",
+          "pattern": "event_driven",
+          "condition": "a `POST` carries a key that is recorded only for another caller, for another route, or in a record 24 hours old or older, or the route is not a create route",
+          "action": "treat the request as new: run the handler, and record the response only on a create route",
+          "contract": "the handler runs and the response is the handler's own status and body, never a replay or a 409; on a route that is not a create route the header has no effect however often it is repeated",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/server/idempotency_test.go, after caller u1 recorded key 'k' on POST /api/v1/things, a table: {caller u2 same key and route, caller u1 with a different body on POST /api/v1/others, caller u1 on POST /api/v1/owners/b/things after recording on /owners/a/things, the admin-token caller same key, caller u1 same key after the clock advanced exactly 24h} -> 201 with handler called; {POST /api/v1/things/42/block (not a create route) sent twice with key 'k' and with an empty key} -> the handler's 200 both times with handler.calls == 2"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "Timestamps and durations",
+      "rationale": "One timestamp format and one duration grammar spare every client and every configuration key a parser of its own.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "ubiquitous",
+          "action": "for any instant, format it as RFC 3339 in UTC with whole seconds and the suffix `Z`, truncating any fraction of a second",
+          "contract": "the instant 2026-01-02T05:04:05.999+02:00 is written `2026-01-02T03:04:05Z`; the output always matches `^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$`",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/server/timefmt/timefmt_test.go, a table over the instants {2026-01-02T03:04:05Z, 2026-01-02T05:04:05.999999999+02:00, 2025-12-31T23:59:59.5-01:00, the Unix epoch}: assert Format(t) equals the expected UTC string and matches the pattern; assert a struct with a timestamp member marshals that member to the same string"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "event_driven",
+          "condition": "a duration is given as a non-negative whole number followed by one of the unit suffixes `s`, `m`, `h` or `d`",
+          "action": "parse it to that many seconds, minutes, hours or 24-hour days",
+          "contract": "`30s` is 30 seconds, `15m` is 900 seconds, `24h` is 86400 seconds, `30d` is 2592000 seconds and `0s` is zero",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/server/timefmt/timefmt_test.go, a table over {'30s' -> 30s, '15m' -> 15m, '24h' -> 24h, '30d' -> 720h, '0s' -> 0, '1d' -> 24h, '365d' -> 8760h}: d, err = ParseDuration(s); assert err == nil and d == want"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "unwanted",
+          "condition": "a duration is given in any other form: empty, without a unit, with an unknown unit, negative, fractional, compound, with spaces, or too large to represent",
+          "action": "return an error that names the value and no duration",
+          "contract": "the parse function returns a non-nil error whose text contains the rejected value, and a zero duration; it does not panic",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/server/timefmt/timefmt_test.go, a table over {'', '30', 's', '30x', '30w', '-5m', '1.5h', '1h30m', ' 30s', '30 s', '30S', '99999999999999999999d'}: d, err = ParseDuration(s); assert err != nil; assert d == 0; for a non-empty s assert s in err.Error()"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "Request id, response headers and access log",
+      "rationale": "A request must be traceable from the client to the log, and no response may be sniffed, framed or cached by accident.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "a request carries an `X-Request-ID` header that is a UUID in the 36-character hyphenated hexadecimal form, in either letter case",
+          "action": "reuse it as the request id and return it as received in the response's `X-Request-ID`",
+          "contract": "response header `X-Request-ID` equals the request's value character for character",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/server/headers_test.go, a table over {'3f2a1bc4-0000-4000-8000-0123456789ab', '3F2A1BC4-0000-1000-8000-0123456789AB'}: r = do(GET, '/api/v1/things', X-Request-ID: v); assert r.header('X-Request-ID') == v; assert the handler's request id equals v"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "event_driven",
+          "condition": "a request carries no `X-Request-ID` header, or one that is not a UUID in that form",
+          "action": "generate a new random UUID as the request id and return it in the response's `X-Request-ID`",
+          "contract": "response header `X-Request-ID` matches `^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`, differs from the received value and differs between two requests",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/server/headers_test.go, a table over the incoming value {absent, '', 'abc', '{3f2a1bc4-0000-4000-8000-0123456789ab}', '3f2a1bc400004000800001234567 89ab', a 300-character string, '3f2a1bc4-0000-4000-8000-0123456789zz'}: assert r.header('X-Request-ID') matches the version 4 pattern and != the incoming value; assert two requests get two different ids"
+          }
+        },
+        {
+          "id": "REQ-8.3",
+          "pattern": "ubiquitous",
+          "action": "for any response the server sends, on the REST API or on any other surface, set `X-Request-ID`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and `Referrer-Policy: no-referrer`",
+          "contract": "all four headers are present with those values on success answers, on 404, 405, 401, 413, 429 and 500 answers, and on `/healthz`, `/readyz` and `/version`",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the server of package 01 with this package's middleware, a test route that succeeds and one that panics"
+            ],
+            "pseudocode": "in internal/server/headers_test.go, a table over the requests {GET /api/v1/things -> 200, GET /api/v1/nope -> 404, DELETE /api/v1/things -> 405, GET /api/v1/things without credential -> 401, POST with an over-limit body -> 413, a request over the rate limit -> 429, GET /api/v1/panic -> 500, GET /healthz, GET /readyz, GET /version, GET /nope}: assert header X-Content-Type-Options == 'nosniff', X-Frame-Options == 'DENY', Referrer-Policy == 'no-referrer' and X-Request-ID non-empty"
+          }
+        },
+        {
+          "id": "REQ-8.4",
+          "pattern": "ubiquitous",
+          "action": "for any response under `/api/v1`, error answers included, set `Cache-Control: no-store` unless the route states its own value, and set `Cache-Control: no-cache` on `/healthz` and `/readyz` and `Cache-Control: public, max-age=300` on `/version`",
+          "contract": "header `Cache-Control` is `no-store` on API successes and API errors; a route registered with the value `public, max-age=300` answers exactly that value; `/healthz` and `/readyz` answer `no-cache`; `/version` answers `public, max-age=300`",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/server/headers_test.go, a table over {GET /api/v1/things -> 'no-store', GET /api/v1/nope (404) -> 'no-store', GET /api/v1/things without credential (401) -> 'no-store', a test route registered with 'public, max-age=300' -> 'public, max-age=300', a test route whose stated value is 'no-cache' -> 'no-cache', GET /healthz -> 'no-cache', GET /readyz -> 'no-cache', GET /version -> 'public, max-age=300'}: assert r.header('Cache-Control') == want and the header appears once"
+          }
+        },
+        {
+          "id": "REQ-8.5",
+          "pattern": "event_driven",
+          "condition": "the server finishes answering a request",
+          "action": "write one access-log line as a JSON object with the members `method`, `path` (the path of the request's URL without the query string), `status`, `duration_ms` and `request_id`, except that a request to `/healthz` or `/readyz` produces a line, at debug level, only while health-probe logging is on",
+          "contract": "exactly one line per request; `path` equals the request's URL path and holds no `?` and nothing that followed one, so no query parameter's name or value is in the line; `request_id` equals the response's `X-Request-ID`; `status` equals the response status; `duration_ms` is a non-negative number; with health-probe logging off (the default) `/healthz` and `/readyz` produce no line",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a server whose logger writes JSON lines to a buffer at debug level"
+            ],
+            "pseudocode": "in internal/server/headers_test.go: r = do(GET, '/api/v1/nope'); parse the single new log line; assert line.method == 'GET', line.path == '/api/v1/nope', line.status == 404, line.duration_ms >= 0, line.request_id == r.header('X-Request-ID'); r2 = do(GET, '/api/v1/nope?token=s3cr3t&x=1'); parse the single new log line; assert line.path == '/api/v1/nope'; assert the raw line contains neither '?' nor 's3cr3t'; with health-probe logging off: GET /healthz and GET /readyz add no line; with it on: each adds one line with level debug"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-9",
+      "title": "Rate limit",
+      "rationale": "One runaway script or agent must not starve the other callers of a hub built for a team.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-9.1",
+          "pattern": "unwanted",
+          "condition": "an authenticated request arrives after its credential has already had the configured number of requests (default 600) counted in the credential's current 60-second window",
+          "action": "refuse the request before the body checks, the later checks and the handler run",
+          "contract": "HTTP 429 with the error envelope, `error_type` `rate_limited` and `code` 429; header `Retry-After` is a whole number of seconds from 1 to 60, the time to the end of the window rounded up; the handler call count is unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a server with a clock the test controls, a limit of 3 requests per minute, an authenticator that maps each bearer value to a credential id, and the test route `GET /things`"
+            ],
+            "pseudocode": "in internal/server/ratelimit_test.go: three GETs with 'Bearer a' -> 200; advance the clock 20.4s; the fourth -> 429; assert r.json.error.error_type == 'rate_limited'; assert r.header('Retry-After') == '40'; assert handler.calls == 3; with the default options assert request 600 is 200 and request 601 is 429"
+          }
+        },
+        {
+          "id": "REQ-9.2",
+          "pattern": "ubiquitous",
+          "action": "for any two different credentials, count their requests separately, also when both come from the same client address",
+          "contract": "after credential A is over its limit, a request with credential B from the same address is answered by its handler",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/server/ratelimit_test.go: with a limit of 3: four GETs with 'Bearer a' (the fourth 429); then GET with 'Bearer b' from the same remote address -> 200; a fourth 'Bearer b' -> 429"
+          }
+        },
+        {
+          "id": "REQ-9.3",
+          "pattern": "event_driven",
+          "condition": "a request has no valid credential, because its route is public or because authentication refused it",
+          "action": "count it against the client address of its connection, answer a request refused by authentication with the authenticator's answer, and refuse a public-route request from an address that is over the limit",
+          "contract": "a public-route request from an over-limit address is HTTP 429 `rate_limited` with `Retry-After`; a request refused by authentication is the authenticator's 401 and raises the address's count by one; another client address is unaffected; forwarding headers such as `X-Forwarded-For` do not change the address",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a server with a limit of 3, a public test route `GET /open`, a protected test route `GET /things` and an authenticator that refuses 'Bearer bad' with 401"
+            ],
+            "pseudocode": "in internal/server/ratelimit_test.go: from address 10.0.0.1: three GET /things with 'Bearer bad' -> each 401; then GET /open -> 429 with Retry-After; a fourth 'Bearer bad' request -> still 401; from address 10.0.0.2: GET /open -> 200; from 10.0.0.1 with 'X-Forwarded-For: 10.9.9.9': GET /open -> still 429"
+          }
+        },
+        {
+          "id": "REQ-9.4",
+          "pattern": "optional",
+          "condition": "the requests-per-minute limit is configured as 0",
+          "action": "apply no rate limit to any request",
+          "contract": "no request is answered 429, however many arrive in a minute",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/server/ratelimit_test.go: with limit 0: send 2000 GETs with one credential and 2000 to a public route from one address without advancing the clock; assert none is 429"
+          }
+        },
+        {
+          "id": "REQ-9.5",
+          "pattern": "ubiquitous",
+          "action": "for any request to `/healthz`, `/readyz`, `/version` or `/metrics`, and any request answered 404 or 405 at route matching, neither count the request against any limit nor refuse it for the rate limit",
+          "contract": "an address that is over the limit still gets the endpoint's own answer from `/healthz`, `/readyz` and `/version`; any number of requests to them, and any number of requests to unknown paths or with wrong methods, leaves the count of the address and of the credential unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the server of package 01 with this package's middleware, a limit of 3 and a public test route `GET /open`"
+            ],
+            "pseudocode": "in internal/server/ratelimit_test.go: from one address send 50 requests to each of /healthz, /readyz, /version, /metrics, GET /api/v1/nope (expect 404 every time) and DELETE /api/v1/open (expect 405 every time); assert none is 429; then three GET /api/v1/open -> 200 (the probes were not counted) and a fourth -> 429; then GET /healthz -> 200 again"
+          }
+        },
+        {
+          "id": "REQ-9.6",
+          "pattern": "event_driven",
+          "condition": "60 seconds have passed since the first counted request of a key's window",
+          "action": "start a new window for that key at its next request and admit the configured number of requests again",
+          "contract": "a key refused at second 59 of its window is served at second 60; a restarted server starts with no counts",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/server/ratelimit_test.go: with a limit of 3 and the test clock: exhaust the limit at t=0; at t=59s -> 429 with Retry-After '1'; at t=60s -> 200, and two more -> 200, the next -> 429; build a second server value over the same options: its first request with the same credential -> 200"
+          }
+        },
+        {
+          "id": "REQ-9.7",
+          "pattern": "event_driven",
+          "condition": "a request is admitted by the rate limit and then refused by a later check or by its handler, or is itself refused with 429",
+          "action": "count it against its key exactly as a request that succeeds",
+          "contract": "with a limit of 3, three requests answered 403 or 400 use up the window and the fourth request with the same credential is HTTP 429; requests answered 429 do not extend the window",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/server/ratelimit_test.go, a table over a route answered by {the scope check with 403 insufficient_scope, the handler with 400 invalid_request, the body check with 413}: three requests get that answer, the fourth -> 429; then ten more 429s at t=30s; at t=60s the next request is admitted"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "A developer asks a running hub for a path it does not have",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "sends GET /api/v1/no-such-thing with no credential and no X-Request-ID"
+        },
+        {
+          "actor": "parleyd",
+          "action": "generates a request id, finds no route for the path and skips authentication, the rate limit and every later check"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers 404 with the error envelope (error_type not_found, code 404), X-Request-ID, the three security headers and Cache-Control: no-store"
+        },
+        {
+          "actor": "parleyd",
+          "action": "writes one access-log line carrying the same request id and status 404"
+        },
+        {
+          "actor": "developer",
+          "action": "sends GET /healthz and receives 200 with the security headers and Cache-Control: no-cache"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the HTTP server of package 01 on a loopback listener",
+          "route matching",
+          "the error envelope writer",
+          "the request id and header middleware",
+          "the access log"
+        ],
+        "setup": [
+          "the server is built by the constructor of package 01 with default options and its logger writing to a buffer, and served by net/http/httptest on a real TCP listener; nothing is installed in any check position"
+        ],
+        "end_state": [
+          "the 404 response body is the error envelope with error_type not_found and code 404",
+          "the access log holds one line whose request_id equals the response's X-Request-ID and whose status is 404",
+          "/healthz answers 200 with Cache-Control no-cache and the three security headers"
+        ],
+        "pseudocode": "in internal/server/conventions_smoke_test.go: srv = httptest.NewServer(handler of the real server); r = http.Get(srv.URL + '/api/v1/no-such-thing'); assert r.status == 404; assert r.json.error == {code: 404, error_type: 'not_found', message: non-empty}; assert r.header('Cache-Control') == 'no-store'; assert the one log line for the path has request_id == r.header('X-Request-ID'); h = http.Get(srv.URL + '/healthz'); assert h.status == 200 and h.header('X-Frame-Options') == 'DENY' and h.header('Cache-Control') == 'no-cache'"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "An agent retries a create with an idempotency key and pages through the result",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "sends POST /api/v1/things with a credential, an Idempotency-Key and a JSON body"
+        },
+        {
+          "actor": "parleyd",
+          "action": "matches the route, authenticates, counts the request, checks the body, runs the guard, scope and access positions in order, runs the handler once and records the 201 answer under the key"
+        },
+        {
+          "actor": "agent",
+          "action": "loses the answer and sends the same request again with the same key"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers 200 with the recorded body, without the show-once member and without running the handler"
+        },
+        {
+          "actor": "agent",
+          "action": "sends the key again with a different body and receives 409 conflict"
+        },
+        {
+          "actor": "agent",
+          "action": "lists GET /api/v1/things?limit=2 and follows next_cursor until it is null"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers each page as items and next_cursor, with the created item present exactly once across the pages"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the HTTP server of package 01 on a loopback listener",
+          "the check pipeline",
+          "the body checks and JSON body helper",
+          "the in-memory idempotency record store",
+          "the list helper"
+        ],
+        "setup": [
+          "the real server on a loopback listener with test routes registered through the public registration call: the create route POST /things (show-once member token) and the list route GET /things over an in-memory ordered collection holding four items",
+          "a test authenticator that accepts one bearer value, installed in the authentication position"
+        ],
+        "end_state": [
+          "the collection holds five items: the create ran once although it was sent twice",
+          "the second answer is 200 and has no token member; the third is 409 with error_type conflict",
+          "the pages of limit 2 hold 2, 2 and 1 items, the last with next_cursor null, and together list each of the five ids once"
+        ],
+        "pseudocode": "in internal/server/conventions_smoke_test.go: a = post('/api/v1/things', key 'k', body); assert a.status == 201 and a.json.token != ''; b = post(same); assert b.status == 200, b.json.id == a.json.id, 'token' not in b.json; c = post(key 'k', other body); assert c.status == 409; ids = []; cur = ''; loop: p = get('/api/v1/things?limit=2' + cursor(cur)); ids += p.json.items.ids; cur = p.json.next_cursor; until cur == null; assert len(ids) == 5 and unique(ids) and a.json.id in ids"
+      }
+    },
+    {
+      "id": "PATH-3",
+      "title": "A developer's script runs into the rate limit and recovers",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "sends requests with one credential faster than the configured limit per minute"
+        },
+        {
+          "actor": "parleyd",
+          "action": "authenticates each request, counts it against the credential and serves the ones within the limit"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers the first request past the limit with 429 rate_limited and a Retry-After header in whole seconds"
+        },
+        {
+          "actor": "operator",
+          "action": "probes GET /healthz meanwhile and receives 200"
+        },
+        {
+          "actor": "developer",
+          "action": "waits for the time Retry-After names and sends the request again"
+        },
+        {
+          "actor": "parleyd",
+          "action": "starts a new window for the credential and serves the request"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the HTTP server of package 01 on a loopback listener",
+          "the check pipeline",
+          "the rate limiter",
+          "the error envelope writer"
+        ],
+        "setup": [
+          "the real server on a loopback listener with the requests-per-minute option set to 5, a clock the test advances, a test authenticator and the test route GET /things"
+        ],
+        "end_state": [
+          "requests one to five were answered 200 and the sixth 429 with error_type rate_limited and Retry-After between 1 and 60",
+          "/healthz answered 200 while the credential was over its limit",
+          "after the clock advanced by the Retry-After value, the same credential was answered 200"
+        ],
+        "pseudocode": "in internal/server/conventions_smoke_test.go: for i in 1..5: assert get('/api/v1/things', cred).status == 200; r = get('/api/v1/things', cred); assert r.status == 429 and r.json.error.error_type == 'rate_limited'; n = int(r.header('Retry-After')); assert 1 <= n <= 60; assert get('/healthz').status == 200; clock.advance(n seconds); assert get('/api/v1/things', cred).status == 200"
+      }
+    }
+  ]
+}

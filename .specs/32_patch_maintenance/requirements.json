@@ -1,0 +1,903 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "32",
+  "spec_name": "patch_maintenance",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Access and preconditions on the patch maintenance routes",
+      "rationale": "Every route here changes the patch list or a branch, so each one must refuse a caller without write access and a workspace that cannot take the write, before it reads or changes anything.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "unwanted",
+          "condition": "a request to PATCH or DELETE /api/v1/workspaces/:slug/patches/:id, POST /api/v1/workspaces/:slug/patches/:id/restore, POST /api/v1/workspaces/:slug/patches/:id/reset-to-origin or POST /api/v1/workspaces/:slug/patches/reorder comes from a PAT without the scope patches:write, from a caller with read access but not write access, or from a caller with no access to the workspace",
+          "action": "refuse the request without changing a patch, moving a ref, contacting origin or emitting an event",
+          "contract": "HTTP 403 with error_type insufficient_scope for the PAT, whether or not the workspace exists; HTTP 403 with error_type forbidden for the caller with read access only; HTTP 404 with error_type not_found, identical to the answer for an unknown slug, for the caller with no access",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a patch fixture: a carry-patch workspace 'carry' in status ready in a real store in t.TempDir(), with patches A (branch patch/a), B (patch/b) and C (patch/c) at positions 1, 2, 3, all active, and the real event log of internal/event on the same store",
+              "the routes mounted on the real router of internal/server behind the carry-patch route guard of package 31, with a clock the test controls",
+              "a recording fetcher in place of the origin fetch"
+            ],
+            "pseudocode": "in internal/carrypatch/maintain_guard_test.go, TestMaintenanceRoutes_RefuseCallersWithoutWriteAccess, a table over the five routes {PATCH /patches/:id, DELETE /patches/:id, POST /patches/:id/restore, POST /patches/reorder, POST /patches/:id/reset-to-origin} times the callers {PAT with only patches:read -> 403 insufficient_scope, PAT with only patches:read on an unknown slug -> 403 insufficient_scope, caller with read access only -> 403 forbidden, user outside the organization -> 404 not_found, owner on an unknown slug -> 404 not_found}: r = send(route, caller, a valid body); assert r.status and r.json.error.error_type; assert list(patches) unchanged; assert events(parley.patch.*) empty; assert fetcher.calls == 0"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "unwanted",
+          "condition": "a caller with write access sends a request with a valid body to one of the five patch maintenance routes of a workspace whose workspace_mode is standard, a task fork of a carry-patch workspace included",
+          "action": "refuse the request without changing a patch, moving a ref or emitting an event",
+          "contract": "HTTP 400 with error_type workspace_mode_mismatch",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a patch fixture: a carry-patch workspace 'carry' in status ready in a real store in t.TempDir(), with patches A (branch patch/a), B (patch/b) and C (patch/c) at positions 1, 2, 3, all active, and the real event log of internal/event on the same store",
+              "the routes mounted on the real router of internal/server behind the carry-patch route guard of package 31, with a clock the test controls",
+              "a standard workspace 'plain' in status ready and a task fork of 'carry', both readable and writable by the owner"
+            ],
+            "pseudocode": "in internal/carrypatch/maintain_guard_test.go, TestMaintenanceRoutes_RefuseStandardWorkspaces, a table over the five routes times the workspaces {standard workspace 'plain', task fork of 'carry'}: r = send(route, owner, a valid body, with any UUID as the patch id); assert r.status == 400; assert r.json.error.error_type == 'workspace_mode_mismatch'; then for PATCH on 'plain' with body {status: 'bogus'}: assert error_type == 'invalid_request' (shape validation runs first)"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "unwanted",
+          "condition": "a caller with write access sends a request with a valid body to one of the five patch maintenance routes of a carry-patch workspace whose status is pending, cloning, failed or archived, or on which a reclone, an archive or a delete is running",
+          "action": "refuse the request without changing a patch, moving a ref, contacting origin or emitting an event",
+          "contract": "HTTP 409 with error_type workspace_busy for pending, cloning or a running reclone, archive or delete; workspace_not_ready for failed; workspace_archived for archived",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a patch fixture: a carry-patch workspace 'carry' in status ready in a real store in t.TempDir(), with patches A (branch patch/a), B (patch/b) and C (patch/c) at positions 1, 2, 3, all active, and the real event log of internal/event on the same store",
+              "the routes mounted on the real router of internal/server behind the carry-patch route guard of package 31, with a clock the test controls"
+            ],
+            "pseudocode": "in internal/carrypatch/maintain_guard_test.go, TestMaintenanceRoutes_RefuseByWorkspaceStatus, a table over the five routes times {pending -> workspace_busy, cloning -> workspace_busy, ready with a reclone running -> workspace_busy, ready with an archive running -> workspace_busy, ready with a delete running -> workspace_busy, failed -> workspace_not_ready, archived -> workspace_archived}: set the workspace record to the state; r = send(route, owner, a valid body); assert r.status == 409; assert r.json.error.error_type == want; assert list(patches) unchanged; assert events(parley.patch.*) empty"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "unwanted",
+          "condition": "a caller with write access to a ready carry-patch workspace sends PATCH or DELETE /api/v1/workspaces/:slug/patches/:id, POST /api/v1/workspaces/:slug/patches/:id/restore or POST /api/v1/workspaces/:slug/patches/:id/reset-to-origin with an id that names no patch of that workspace: an unknown UUID, the id of another workspace's patch, or a value that is not a UUID",
+          "action": "refuse the request without changing any patch or emitting an event",
+          "contract": "HTTP 404 with error_type not_found and message 'patch not found'",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a patch fixture: a carry-patch workspace 'carry' in status ready in a real store in t.TempDir(), with patches A (branch patch/a), B (patch/b) and C (patch/c) at positions 1, 2, 3, all active, and the real event log of internal/event on the same store",
+              "the routes mounted on the real router of internal/server behind the carry-patch route guard of package 31, with a clock the test controls",
+              "a second carry-patch workspace 'other' of the same owner with one patch"
+            ],
+            "pseudocode": "in internal/carrypatch/maintain_guard_test.go, TestMaintenanceRoutes_UnknownPatchIsNotFound, a table over the four routes that name a patch times the ids {a random UUID, the id of a patch of workspace 'other', 'not-a-uuid'}: r = send(route, owner, a valid body); assert r.status == 404; assert r.json.error.error_type == 'not_found'; assert r.json.error.message == 'patch not found'; assert list(patches of 'carry') and list(patches of 'other') unchanged"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Patch update",
+      "rationale": "A developer disables, re-enables, marks, describes and moves a patch without re-registering it, and a partial body must never wipe a field it does not name.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "a caller with write access sends PATCH /api/v1/workspaces/:slug/patches/:id for a non-deleted patch with a JSON object carrying description, upstream_pr_url or both",
+          "action": "set description and upstream_pr_url from the members that are present and not null, clear a field to null when its member is the empty string, leave every field whose member is absent or null as it was, ignore branch_name and unknown members, set updated_at to now when a field changed, and answer with the patch as it now stands",
+          "contract": "HTTP 200 with the patch object, every field present (null when unset)",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a patch fixture: a carry-patch workspace 'carry' in status ready in a real store in t.TempDir(), with patches A (branch patch/a), B (patch/b) and C (patch/c) at positions 1, 2, 3, all active, and the real event log of internal/event on the same store",
+              "the routes mounted on the real router of internal/server behind the carry-patch route guard of package 31, with a clock the test controls"
+            ],
+            "pseudocode": "in internal/carrypatch/patch_update_test.go, TestUpdatePatch_TextFields, a table over bodies applied in order to patch A {{description: 'net fix'} -> description 'net fix', upstream_pr_url null; {upstream_pr_url: 'https://example.test/pull/7'} -> description still 'net fix'; {description: null} -> description still 'net fix'; {description: ''} -> description null, upstream_pr_url kept; {upstream_pr_url: ''} -> upstream_pr_url null; {branch_name: 'x', colour: 'red', description: 'd'} -> branch_name still 'patch/a', description 'd'}: advance the clock; r = PATCH /patches/A; assert r.status == 200; assert r.json has every patch field; assert the fields named; assert r.json.updated_at == clock.now; assert GET /patches/A == r.json"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "event_driven",
+          "condition": "a caller with write access sends PATCH /api/v1/workspaces/:slug/patches/:id for a non-deleted patch with an empty object, or with members that are all absent, null, ignored or equal to the stored values",
+          "action": "change nothing, leave updated_at as it was, emit no event and answer with the patch",
+          "contract": "HTTP 200 with the unchanged patch object; no parley.patch.update event",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a patch fixture: a carry-patch workspace 'carry' in status ready in a real store in t.TempDir(), with patches A (branch patch/a), B (patch/b) and C (patch/c) at positions 1, 2, 3, all active, and the real event log of internal/event on the same store",
+              "the routes mounted on the real router of internal/server behind the carry-patch route guard of package 31, with a clock the test controls"
+            ],
+            "pseudocode": "in internal/carrypatch/patch_update_test.go, TestUpdatePatch_NoChange, a table over bodies on patch B (position 2, active, description 'd') {{}, {status: null, position: null}, {status: 'active'}, {position: 2}, {description: 'd'}, {branch_name: 'other'}}: before = GET /patches/B; advance the clock; r = PATCH /patches/B; assert r.status == 200; assert r.json == before; assert events(parley.patch.update) empty"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "event_driven",
+          "condition": "a caller with write access sends PATCH /api/v1/workspaces/:slug/patches/:id for a non-deleted patch with status set to active, disabled, merged_upstream or conflict and different from the stored status",
+          "action": "set the status, clear conflict_files to [] when the new status is not conflict, leave conflict_files as it was when the new status is conflict, and answer with the patch",
+          "contract": "HTTP 200 with the patch object; status is the requested value; conflict_files is [] unless status is conflict",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a patch fixture: a carry-patch workspace 'carry' in status ready in a real store in t.TempDir(), with patches A (branch patch/a), B (patch/b) and C (patch/c) at positions 1, 2, 3, all active, and the real event log of internal/event on the same store",
+              "the routes mounted on the real router of internal/server behind the carry-patch route guard of package 31, with a clock the test controls"
+            ],
+            "pseudocode": "in internal/carrypatch/patch_update_test.go, TestUpdatePatch_Status, a table over {active -> disabled, disabled -> active, active -> merged_upstream, merged_upstream -> active, active -> conflict (conflict_files stays []), conflict with conflict_files ['a.go'] -> active (conflict_files []), conflict with ['a.go'] -> disabled ([]), conflict with ['a.go'] -> merged_upstream ([])}: put the patch in the from state in the store; r = PATCH /patches/A {status: to}; assert r.status == 200; assert r.json.status == to; assert r.json.conflict_files == want; assert r.json.position unchanged"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "event_driven",
+          "condition": "a caller with write access sends PATCH /api/v1/workspaces/:slug/patches/:id for a non-deleted patch with position set to an integer between 1 and the number N of non-deleted patches and different from the patch's position",
+          "action": "take the patch out of the order, insert it at the requested position and renumber the non-deleted patches 1..N in one transaction, and answer with the patch",
+          "contract": "HTTP 200 with the patch object at the requested position; the list route returns the non-deleted patches at positions 1..N without a gap or a duplicate, the other patches in their previous relative order",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a patch fixture: a carry-patch workspace 'carry' in status ready in a real store in t.TempDir(), with patches A (branch patch/a), B (patch/b) and C (patch/c) at positions 1, 2, 3, all active, and the real event log of internal/event on the same store",
+              "the routes mounted on the real router of internal/server behind the carry-patch route guard of package 31, with a clock the test controls",
+              "a fourth active patch D at position 4 and a soft-deleted patch X"
+            ],
+            "pseudocode": "in internal/carrypatch/patch_update_test.go, TestUpdatePatch_Position, a table over a list A,B,C,D plus one deleted patch X {move A to 3 -> B,C,A,D; move D to 1 -> D,A,B,C; move B to 4 -> A,C,D,B; move C to 2 -> A,C,B,D}: r = PATCH /patches/:id {position: p}; assert r.status == 200; assert r.json.position == p; assert [x.branch for x in GET /patches] == want; assert positions == [1,2,3,4]; assert X.position == null; then with a store whose commit fails: assert r.status == 500 and the order is the one before"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "unwanted",
+          "condition": "the body of PATCH /api/v1/workspaces/:slug/patches/:id is not a JSON object, carries a member of the wrong JSON type, carries a status other than active, disabled, merged_upstream or conflict (deleted included), or carries a position that is not an integer between 1 and the number of non-deleted patches",
+          "action": "reject the request and change no patch",
+          "contract": "HTTP 400 with error_type invalid_request; no field of any patch changes, including the fields the same body named validly; no event",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a patch fixture: a carry-patch workspace 'carry' in status ready in a real store in t.TempDir(), with patches A (branch patch/a), B (patch/b) and C (patch/c) at positions 1, 2, 3, all active, and the real event log of internal/event on the same store",
+              "the routes mounted on the real router of internal/server behind the carry-patch route guard of package 31, with a clock the test controls"
+            ],
+            "pseudocode": "in internal/carrypatch/patch_update_test.go, TestUpdatePatch_RejectsInvalidBody, a table over bodies on patch A in a list of 3 {{status: 'deleted'}, {status: 'paused'}, {status: ''}, {status: 5}, {position: 0}, {position: -1}, {position: 4}, {position: 1.5}, {position: '2'}, {description: 7}, {upstream_pr_url: []}, raw '[1]', raw '{bad', {status: 'disabled', position: 9}}: before = list(patches); r = PATCH /patches/A; assert r.status == 400; assert r.json.error.error_type == 'invalid_request'; assert list(patches) == before; assert events(parley.patch.update) empty"
+          }
+        },
+        {
+          "id": "REQ-2.6",
+          "pattern": "unwanted",
+          "condition": "a caller with write access sends PATCH /api/v1/workspaces/:slug/patches/:id with a body of valid shape, the empty object included, for a patch whose status is deleted",
+          "action": "reject the request and leave the patch deleted and unchanged",
+          "contract": "HTTP 409 with error_type patch_deleted; the patch keeps status deleted, position null and its deleted_at",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a patch fixture: a carry-patch workspace 'carry' in status ready in a real store in t.TempDir(), with patches A (branch patch/a), B (patch/b) and C (patch/c) at positions 1, 2, 3, all active, and the real event log of internal/event on the same store",
+              "the routes mounted on the real router of internal/server behind the carry-patch route guard of package 31, with a clock the test controls",
+              "a soft-deleted patch X"
+            ],
+            "pseudocode": "in internal/carrypatch/patch_update_test.go, TestUpdatePatch_RefusesDeletedPatch, a table over bodies on the soft-deleted patch X {{}, {description: 'd'}, {status: 'active'}, {position: 1}, {position: 99}}: before = GET /patches/X; r = PATCH /patches/X; assert r.status == 409; assert r.json.error.error_type == 'patch_deleted'; assert GET /patches/X == before; then {status: 'deleted'} on X: assert 400 invalid_request"
+          }
+        },
+        {
+          "id": "REQ-2.7",
+          "pattern": "event_driven",
+          "condition": "a PATCH /api/v1/workspaces/:slug/patches/:id changed at least one of status, position, description and upstream_pr_url",
+          "action": "write exactly one parley.patch.update event in the transaction of the change, and queue no rebuild",
+          "contract": "one event of type parley.patch.update with resource_type patch, resource_id the patch id, the caller as actor and metadata {branch_name: string, changed: list of the changed field names} plus, when the status changed, {from: old status, to: new status, reason: 'api'}; no rebuild job is queued",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a patch fixture: a carry-patch workspace 'carry' in status ready in a real store in t.TempDir(), with patches A (branch patch/a), B (patch/b) and C (patch/c) at positions 1, 2, 3, all active, and the real event log of internal/event on the same store",
+              "the routes mounted on the real router of internal/server behind the carry-patch route guard of package 31, with a clock the test controls",
+              "a recording rebuild enqueuer"
+            ],
+            "pseudocode": "in internal/carrypatch/patch_update_test.go, TestUpdatePatch_EmitsOneEvent, a table over {{description: 'd'} -> changed ['description']; {status: 'disabled'} -> changed ['status'], from 'active', to 'disabled', reason 'api'; {position: 3} -> changed ['position'], no from/to/reason; {status: 'disabled', position: 2, upstream_pr_url: 'u', description: 'same as stored'} -> changed ['status','position','upstream_pr_url']}: PATCH /patches/A as user U; e = events(parley.patch.update); assert len(e) == 1; assert e[0].resource_type == 'patch'; assert e[0].resource_id == A.id; assert e[0].actor == U; assert e[0].metadata.branch_name == 'patch/a'; assert sorted(e[0].metadata.changed) == sorted(want); assert from/to/reason as named; assert enqueuer.calls == 0; then with an event log that fails the write: assert r.status == 500 and GET /patches/A is unchanged"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Soft delete of a patch",
+      "rationale": "Removing a patch must take it out of the next rebuild at once, yet a removal made by mistake has to stay reversible, so neither the row nor the branch nor the backup ref may go.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "a caller with write access sends DELETE /api/v1/workspaces/:slug/patches/:id for a non-deleted patch",
+          "action": "set the patch's status to deleted, deleted_at to now, position to null and conflict_files to [], renumber the remaining non-deleted patches 1..N-1 in their existing order, all in one transaction, and leave the patch branch and refs/parley/replaced/<branch> untouched",
+          "contract": "HTTP 204 with an empty body; the get route returns the patch with status deleted, position null and deleted_at set; the list route returns the other patches at positions 1..N-1",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a patch fixture: a carry-patch workspace 'carry' in status ready in a real store in t.TempDir(), with patches A (branch patch/a), B (patch/b) and C (patch/c) at positions 1, 2, 3, all active, and the real event log of internal/event on the same store",
+              "the routes mounted on the real router of internal/server behind the carry-patch route guard of package 31, with a clock the test controls",
+              "a hub bare repository made with git in t.TempDir() holding the three patch branches and a ref refs/parley/replaced/patch/a"
+            ],
+            "pseudocode": "in internal/carrypatch/patch_remove_test.go, TestDeletePatch_SoftDeletes, a table over the patch deleted from A,B,C {A -> B,C; B -> A,C; C -> A,B} with B in status conflict and conflict_files ['a.go']: r = DELETE /patches/:id; assert r.status == 204; assert r.body == ''; g = GET /patches/:id; assert g.status == 200; assert g.json.status == 'deleted'; assert g.json.position == null; assert g.json.deleted_at == clock.now; assert g.json.conflict_files == []; assert [x.branch for x in GET /patches] == want with positions [1,2]; assert GET /patches?include_deleted=true lists the deleted patch last; assert git rev-parse refs/heads/<branch> and refs/parley/replaced/<branch> in the hub repository are unchanged"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "event_driven",
+          "condition": "a DELETE /api/v1/workspaces/:slug/patches/:id soft-deleted a patch",
+          "action": "write exactly one parley.patch.delete event in the transaction of the delete, and queue no rebuild",
+          "contract": "one event of type parley.patch.delete with resource_type patch, resource_id the patch id, the caller as actor and metadata {branch_name: string, reason: 'api'}; no rebuild job is queued",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a patch fixture: a carry-patch workspace 'carry' in status ready in a real store in t.TempDir(), with patches A (branch patch/a), B (patch/b) and C (patch/c) at positions 1, 2, 3, all active, and the real event log of internal/event on the same store",
+              "the routes mounted on the real router of internal/server behind the carry-patch route guard of package 31, with a clock the test controls",
+              "a recording rebuild enqueuer"
+            ],
+            "pseudocode": "in internal/carrypatch/patch_remove_test.go, TestDeletePatch_EmitsOneEvent: DELETE /patches/B as user U; e = events(parley.patch.delete); assert len(e) == 1; assert e[0].resource_type == 'patch'; assert e[0].resource_id == B.id; assert e[0].actor == U; assert e[0].metadata == {branch_name: 'patch/b', reason: 'api'}; assert events(parley.patch.update) empty; assert enqueuer.calls == 0; then with an event log that fails the write: r = DELETE /patches/A; assert r.status == 500; assert GET /patches/A .status == 'active' and positions are unchanged"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "event_driven",
+          "condition": "a caller with write access sends DELETE /api/v1/workspaces/:slug/patches/:id for a patch whose status is already deleted",
+          "action": "change nothing and emit no event",
+          "contract": "HTTP 204 with an empty body; deleted_at keeps its earlier value; no parley.patch.delete event",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a patch fixture: a carry-patch workspace 'carry' in status ready in a real store in t.TempDir(), with patches A (branch patch/a), B (patch/b) and C (patch/c) at positions 1, 2, 3, all active, and the real event log of internal/event on the same store",
+              "the routes mounted on the real router of internal/server behind the carry-patch route guard of package 31, with a clock the test controls"
+            ],
+            "pseudocode": "in internal/carrypatch/patch_remove_test.go, TestDeletePatch_TwiceIsANoOp: DELETE /patches/B; before = GET /patches/B; n = len(events(parley.patch.delete)); advance the clock by one hour; r = DELETE /patches/B; assert r.status == 204; assert GET /patches/B == before; assert len(events(parley.patch.delete)) == n; assert positions of A and C are still [1,2]"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Restore of a deleted patch",
+      "rationale": "A patch removed by a caller, or by a rebuild that judged it merged upstream, must come back with one call while its row still exists.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "a caller with write access sends POST /api/v1/workspaces/:slug/patches/:id/restore for a patch whose status is deleted, whether a caller deleted it or a rebuild removed it as merged upstream, and no non-deleted patch of the workspace has the same branch_name",
+          "action": "set the patch's status to active, its position to N+1 where N is the number of non-deleted patches before the call, deleted_at to null and conflict_files to [], in one transaction, and answer with the patch",
+          "contract": "HTTP 200 with the patch object: status active, position the last of the list, deleted_at null, conflict_files []",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a patch fixture: a carry-patch workspace 'carry' in status ready in a real store in t.TempDir(), with patches A (branch patch/a), B (patch/b) and C (patch/c) at positions 1, 2, 3, all active, and the real event log of internal/event on the same store",
+              "the routes mounted on the real router of internal/server behind the carry-patch route guard of package 31, with a clock the test controls"
+            ],
+            "pseudocode": "in internal/carrypatch/patch_remove_test.go, TestRestorePatch_AppendsAsActive, a table over how patch A became deleted {DELETE route by a caller, store row written as a rebuild writes it for a patch merged upstream (status deleted, deleted_at set, position null)}: r = POST /patches/A/restore with no body; assert r.status == 200; assert r.json.status == 'active'; assert r.json.position == 3; assert r.json.deleted_at == null; assert r.json.conflict_files == []; assert r.json.updated_at == clock.now; assert [x.branch for x in GET /patches] == ['patch/b','patch/c','patch/a']; repeat on a workspace whose only patch is the deleted one: assert position == 1"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "event_driven",
+          "condition": "a POST /api/v1/workspaces/:slug/patches/:id/restore restored a patch",
+          "action": "write exactly one parley.patch.restore event in the transaction of the restore",
+          "contract": "one event of type parley.patch.restore with resource_type patch, resource_id the patch id, the caller as actor and metadata {branch_name: string, position: integer, the position the patch took}",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a patch fixture: a carry-patch workspace 'carry' in status ready in a real store in t.TempDir(), with patches A (branch patch/a), B (patch/b) and C (patch/c) at positions 1, 2, 3, all active, and the real event log of internal/event on the same store",
+              "the routes mounted on the real router of internal/server behind the carry-patch route guard of package 31, with a clock the test controls"
+            ],
+            "pseudocode": "in internal/carrypatch/patch_remove_test.go, TestRestorePatch_EmitsOneEvent: DELETE /patches/A; POST /patches/A/restore as user U; e = events(parley.patch.restore); assert len(e) == 1; assert e[0].resource_type == 'patch'; assert e[0].resource_id == A.id; assert e[0].actor == U; assert e[0].metadata == {branch_name: 'patch/a', position: 3}; then with an event log that fails the write: DELETE /patches/B; r = POST /patches/B/restore; assert r.status == 500; assert GET /patches/B .status == 'deleted'"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "unwanted",
+          "condition": "a caller with write access sends POST /api/v1/workspaces/:slug/patches/:id/restore for a patch whose status is active, disabled, conflict or merged_upstream",
+          "action": "reject the request and change no patch",
+          "contract": "HTTP 409 with error_type patch_not_deleted; the patch keeps its status and position",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a patch fixture: a carry-patch workspace 'carry' in status ready in a real store in t.TempDir(), with patches A (branch patch/a), B (patch/b) and C (patch/c) at positions 1, 2, 3, all active, and the real event log of internal/event on the same store",
+              "the routes mounted on the real router of internal/server behind the carry-patch route guard of package 31, with a clock the test controls"
+            ],
+            "pseudocode": "in internal/carrypatch/patch_remove_test.go, TestRestorePatch_RefusesNonDeleted, a table over the status of patch B {active, disabled, conflict, merged_upstream}: before = list(patches); r = POST /patches/B/restore; assert r.status == 409; assert r.json.error.error_type == 'patch_not_deleted'; assert list(patches) == before; assert events(parley.patch.restore) empty"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "unwanted",
+          "condition": "a caller with write access sends POST /api/v1/workspaces/:slug/patches/:id/restore for a deleted patch while another non-deleted patch of the workspace has the same branch_name",
+          "action": "reject the request and leave the patch deleted",
+          "contract": "HTTP 409 with error_type patch_exists; the patch keeps status deleted, position null and its deleted_at",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a patch fixture: a carry-patch workspace 'carry' in status ready in a real store in t.TempDir(), with patches A (branch patch/a), B (patch/b) and C (patch/c) at positions 1, 2, 3, all active, and the real event log of internal/event on the same store",
+              "the routes mounted on the real router of internal/server behind the carry-patch route guard of package 31, with a clock the test controls"
+            ],
+            "pseudocode": "in internal/carrypatch/patch_remove_test.go, TestRestorePatch_RefusesWhenBranchIsRegisteredAgain: write into the store a deleted patch X with branch_name 'patch/a' beside the active patch A; before = list(patches, include_deleted); r = POST /patches/X/restore; assert r.status == 409; assert r.json.error.error_type == 'patch_exists'; assert list(patches, include_deleted) == before; assert events(parley.patch.restore) empty"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Patch reorder and the gap-free order",
+      "rationale": "Rebuilds apply patches in position order, so the order has to be settable in one step and can never be left with a gap, a duplicate or a patch missing from it.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "a caller with write access sends POST /api/v1/workspaces/:slug/patches/reorder with patch_ids naming every non-deleted patch of the workspace exactly once",
+          "action": "renumber the patches 1..N in the order of patch_ids in one transaction, set updated_at on each patch whose position changed, and answer with all non-deleted patches in the new order",
+          "contract": "HTTP 200 with {items: list of patch objects in the order of patch_ids at positions 1..N, next_cursor: null}",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a patch fixture: a carry-patch workspace 'carry' in status ready in a real store in t.TempDir(), with patches A (branch patch/a), B (patch/b) and C (patch/c) at positions 1, 2, 3, all active, and the real event log of internal/event on the same store",
+              "the routes mounted on the real router of internal/server behind the carry-patch route guard of package 31, with a clock the test controls",
+              "a soft-deleted patch X"
+            ],
+            "pseudocode": "in internal/carrypatch/patch_reorder_test.go, TestReorderPatches, a table over orders of A,B,C with a soft-deleted X present {[C,A,B], [B,A,C], [A,B,C] (the current order), [C,B,A]}: r = POST /patches/reorder {patch_ids}; assert r.status == 200; assert [x.id for x in r.json.items] == patch_ids; assert [x.position for x in r.json.items] == [1,2,3]; assert r.json.next_cursor == null; assert GET /patches .items == r.json.items; assert X.position == null; assert updated_at changed exactly on the patches whose position changed; then on a carry-patch workspace with no non-deleted patch: POST {patch_ids: []} -> 200, items [], no event; then with a store whose commit fails: assert 500 and the order is the one before"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "event_driven",
+          "condition": "a POST /api/v1/workspaces/:slug/patches/reorder succeeded on a workspace with at least one non-deleted patch, also when the requested order equals the current one",
+          "action": "write exactly one parley.patch.reorder event in the transaction of the reorder",
+          "contract": "one event of type parley.patch.reorder with resource_type patch, resource_id the id of the first patch of the new order, the caller as actor and metadata {patch_ids: the ids in the new order}; no parley.patch.update event and no rebuild job",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a patch fixture: a carry-patch workspace 'carry' in status ready in a real store in t.TempDir(), with patches A (branch patch/a), B (patch/b) and C (patch/c) at positions 1, 2, 3, all active, and the real event log of internal/event on the same store",
+              "the routes mounted on the real router of internal/server behind the carry-patch route guard of package 31, with a clock the test controls",
+              "a recording rebuild enqueuer"
+            ],
+            "pseudocode": "in internal/carrypatch/patch_reorder_test.go, TestReorderPatches_EmitsOneEvent, a table over {[C,A,B], [A,B,C] (the current order)}: POST /patches/reorder as user U; e = events(parley.patch.reorder); assert len(e) == 1; assert e[0].resource_type == 'patch'; assert e[0].resource_id == patch_ids[0]; assert e[0].actor == U; assert e[0].metadata.patch_ids == patch_ids; assert events(parley.patch.update) empty; assert enqueuer.calls == 0"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "unwanted",
+          "condition": "the body of POST /api/v1/workspaces/:slug/patches/reorder has no patch_ids array of strings, or patch_ids holds an id twice, an id that names no patch of the workspace, the id of a deleted patch, or fewer ids than the workspace has non-deleted patches",
+          "action": "reject the request with a message that names the offending id, or for an incomplete list the number of ids given and the number of non-deleted patches, and change no position",
+          "contract": "HTTP 400 with error_type invalid_request; error.message contains the offending id (duplicate, unknown or deleted) or both counts (missing patch); every patch keeps its position; no event",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a patch fixture: a carry-patch workspace 'carry' in status ready in a real store in t.TempDir(), with patches A (branch patch/a), B (patch/b) and C (patch/c) at positions 1, 2, 3, all active, and the real event log of internal/event on the same store",
+              "the routes mounted on the real router of internal/server behind the carry-patch route guard of package 31, with a clock the test controls",
+              "a soft-deleted patch X"
+            ],
+            "pseudocode": "in internal/carrypatch/patch_reorder_test.go, TestReorderPatches_RejectsIncompleteOrWrongLists, a table over bodies for the list A,B,C with a soft-deleted X {{patch_ids: [A,B,B]} -> message contains B.id; {patch_ids: [A,B,C,A]} -> contains A.id; {patch_ids: [A,B,<random uuid>]} -> contains that uuid; {patch_ids: [A,B,C,X]} -> contains X.id; {patch_ids: [A,B]} -> contains '2' and '3'; {patch_ids: []} -> contains '0' and '3'; {} ; {patch_ids: 'A'}; {patch_ids: [1,2,3]}; raw '{bad'}: before = list(patches); r = POST /patches/reorder; assert r.status == 400; assert r.json.error.error_type == 'invalid_request'; assert the message contains what the row names; assert list(patches) == before; assert events(parley.patch.reorder) empty"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "ubiquitous",
+          "action": "for any sequence of patch updates with a position, soft deletes, restores and reorders on one workspace, keep the non-deleted patches at the positions 1..N without a gap or a duplicate and every deleted patch at position null",
+          "check": {
+            "kind": "property",
+            "setup": [
+              "a patch fixture: a carry-patch workspace 'carry' in status ready in a real store in t.TempDir(), with patches A (branch patch/a), B (patch/b) and C (patch/c) at positions 1, 2, 3, all active, and the real event log of internal/event on the same store",
+              "the routes mounted on the real router of internal/server behind the carry-patch route guard of package 31, with a clock the test controls"
+            ],
+            "pseudocode": "in internal/carrypatch/patch_order_test.go, TestPatchOrder_StaysGapFree: over 200 seeded random sequences of 30 operations drawn from {update position to a random value in 0..N+1, delete a random patch (deleted ones included), restore a random patch, reorder with a random permutation, reorder with a random wrong list} on a workspace that starts with 6 patches: after every operation, whether it answered 2xx or 4xx, assert sorted(position of non-deleted patches) == [1..N]; assert every deleted patch has position null and deleted_at set; assert every non-deleted patch has deleted_at null; assert the set of patch ids is unchanged"
+          }
+        },
+        {
+          "id": "REQ-5.5",
+          "pattern": "event_driven",
+          "condition": "two or more requests that change positions (an update with a position, a delete, a restore or a reorder) arrive for one workspace at the same time and each is valid against the list as it stands when its turn comes",
+          "action": "apply the requests one after the other so that each one succeeds, and fail none of them because the other was running",
+          "contract": "each request answers its success status (200 or 204); none answers 409 or 5xx because of the other; afterwards the non-deleted patches hold positions 1..N",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a patch fixture: a carry-patch workspace 'carry' in status ready in a real store in t.TempDir(), with patches A (branch patch/a), B (patch/b) and C (patch/c) at positions 1, 2, 3, all active, and the real event log of internal/event on the same store",
+              "the routes mounted on the real router of internal/server behind the carry-patch route guard of package 31, with a clock the test controls"
+            ],
+            "pseudocode": "in internal/carrypatch/patch_order_test.go, TestPatchOrder_ConcurrentWritesSerialize: on a list of 8 patches start 16 goroutines at once, each sending one of {PATCH position, POST reorder with a fixed permutation, DELETE then restore of its own patch}; assert every response status is 200 or 204; assert sorted(position of non-deleted patches) == [1..N]; assert the number of parley.patch.* events equals the number of requests that changed something; run with -race"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Reset of a patch branch to origin",
+      "rationale": "When the hub's copy of a patch branch has gone wrong, the developer needs one call that makes it equal to origin's again without losing the tip the hub held.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "a caller with write access sends POST /api/v1/workspaces/:slug/patches/:id/reset-to-origin for a patch in status active, conflict or disabled whose branch exists on origin",
+          "action": "fetch that one branch from origin into refs/remotes/origin/<branch> with the workspace's origin credential resolved at the time of the call, bring refs/heads/<branch> in the hub to origin's tip, and answer with the patch plus the outcome",
+          "contract": "HTTP 200 with the patch object plus {action: 'none' | 'created' | 'fast_forwarded' | 'replaced', rebuild_triggered: boolean}, plus rebuild_job_id: string only when a job was queued, plus replaced_sha: 40 hex only when refs/parley/replaced/<branch> exists after the call",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a reset fixture: an origin bare repository served by internal/gitrepo/gitrepotest and a hub bare repository cloned from it, both made with git in t.TempDir(); a carry-patch workspace 'carry' in status ready in a real store with patch A (branch patch/a, active) registered; the real event log of internal/event; a stub origin credential resolver; a recording rebuild enqueuer",
+              "the routes mounted on the real router of internal/server behind the carry-patch route guard of package 31, with a clock the test controls"
+            ],
+            "pseudocode": "in internal/carrypatch/patch_reset_test.go, TestResetToOrigin_AnswersPatchWithOutcome, a table over the patch status {active, conflict, disabled} with origin one commit ahead on patch/a and another origin branch 'other' also ahead: r = POST /patches/A/reset-to-origin with no body; assert r.status == 200; assert r.json.id == A.id and every patch field is present; assert r.json.action == 'fast_forwarded'; assert type(r.json.rebuild_triggered) == bool; assert 'replaced_sha' not in r.json; assert hub rev-parse refs/heads/patch/a == origin tip; assert hub refs/remotes/origin/patch/a == origin tip; assert hub refs/remotes/origin/other is unchanged (one branch fetched); assert resolver.calls == 1; assert r.json.status is the status before"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "ubiquitous",
+          "action": "for any reset to origin, choose the outcome as the first that applies: the hub has no such branch, so create it at origin's tip (created); the tips are equal, so write nothing (none); the hub's tip is an ancestor of origin's, so move the branch forward (fast_forwarded); otherwise save the hub's tip to refs/parley/replaced/<branch>, overwriting an earlier backup, and move the branch to origin's tip (replaced)",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a reset fixture: an origin bare repository served by internal/gitrepo/gitrepotest and a hub bare repository cloned from it, both made with git in t.TempDir(); a carry-patch workspace 'carry' in status ready in a real store with patch A (branch patch/a, active) registered; the real event log of internal/event; a stub origin credential resolver; a recording rebuild enqueuer",
+              "the routes mounted on the real router of internal/server behind the carry-patch route guard of package 31, with a clock the test controls"
+            ],
+            "pseudocode": "in internal/carrypatch/patch_reset_test.go, TestResetToOrigin_Actions, a table over the hub and origin state of patch/a, each row run under the settings {patch_branch_source: hub | origin} times {patch_divergence_policy: replace | report} {hub has no branch -> created, no backup ref; tips equal -> none, no ref written (reflog/ref values identical), no backup ref; origin ahead by 2 commits -> fast_forwarded, no backup ref; both sides have a commit the other lacks -> replaced, backup == old hub tip; hub ahead of origin by 1 commit -> replaced, backup == old hub tip; diverged with an earlier backup ref pointing at commit K -> replaced, backup == old hub tip (not K), response replaced_sha == old hub tip; tips equal with an earlier backup ref at K -> none, response replaced_sha == K}: r = POST /patches/A/reset-to-origin; assert r.status == 200; assert r.json.action == want; assert hub refs/heads/patch/a == origin tip; assert hub refs/parley/replaced/patch/a as named; assert ('replaced_sha' in r.json) == backup ref exists; assert the old hub tip is still an object in the hub repository"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "event_driven",
+          "condition": "a reset to origin runs on a workspace whose patch_branch_source is hub or origin and whose patch_divergence_policy is replace or report",
+          "action": "choose the action and move the refs from the hub's tip and origin's tip alone, without consulting patch_branch_source or patch_divergence_policy",
+          "contract": "the same action, refs and response as for any other value of the two settings",
+          "check": {
+            "same_as": "REQ-6.2"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "event_driven",
+          "condition": "a reset to origin succeeded, whatever its action",
+          "action": "set the patch's origin_sync_state to in_sync, origin_sha to origin's tip and origin_synced_at to now when patch_branch_source is origin, and leave those three fields as they were when it is hub",
+          "contract": "with patch_branch_source origin the patch object carries origin_sync_state 'in_sync', origin_sha equal to the new tip of the branch and origin_synced_at equal to the time of the call; with hub the three fields are unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a reset fixture: an origin bare repository served by internal/gitrepo/gitrepotest and a hub bare repository cloned from it, both made with git in t.TempDir(); a carry-patch workspace 'carry' in status ready in a real store with patch A (branch patch/a, active) registered; the real event log of internal/event; a stub origin credential resolver; a recording rebuild enqueuer",
+              "the routes mounted on the real router of internal/server behind the carry-patch route guard of package 31, with a clock the test controls"
+            ],
+            "pseudocode": "in internal/carrypatch/patch_reset_test.go, TestResetToOrigin_RecordsOriginState, a table over {source origin, patch stored as diverged with an old origin_sha, tips diverged -> in_sync, origin_sha == origin tip, origin_synced_at == clock.now; source origin, stored missing_on_origin with origin_sha null, action created -> in_sync; source origin, action none -> in_sync, origin_synced_at == clock.now; source hub, all three null, action fast_forwarded -> all three still null}: r = POST /patches/A/reset-to-origin; assert the three fields in r.json and in GET /patches/A"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "event_driven",
+          "condition": "a reset to origin succeeded, whatever its action",
+          "action": "write one parley.patch.reset event, and when the action is replaced also one parley.patch.replace event, in the transaction that records the outcome",
+          "contract": "one event of type parley.patch.reset with resource_type patch, resource_id the patch id, the caller as actor and metadata {branch_name, action, local_sha: the hub's tip before the call or null when created, origin_sha, replaced_sha: the tip this call saved or null}; when action is replaced, also one event of type parley.patch.replace with metadata {branch_name, replaced_sha, origin_sha, trigger: 'reset_to_origin'}",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a reset fixture: an origin bare repository served by internal/gitrepo/gitrepotest and a hub bare repository cloned from it, both made with git in t.TempDir(); a carry-patch workspace 'carry' in status ready in a real store with patch A (branch patch/a, active) registered; the real event log of internal/event; a stub origin credential resolver; a recording rebuild enqueuer",
+              "the routes mounted on the real router of internal/server behind the carry-patch route guard of package 31, with a clock the test controls"
+            ],
+            "pseudocode": "in internal/carrypatch/patch_reset_test.go, TestResetToOrigin_EmitsEvents, a table over the action {none, created, fast_forwarded, replaced} as user U: POST /patches/A/reset-to-origin; e = events(parley.patch.reset); assert len(e) == 1; assert e[0].resource_type == 'patch' and e[0].resource_id == A.id and e[0].actor == U; assert e[0].metadata.branch_name == 'patch/a'; assert e[0].metadata.action == action; assert e[0].metadata.local_sha == hub tip before (null for created); assert e[0].metadata.origin_sha == origin tip; assert e[0].metadata.replaced_sha == (old hub tip if action == 'replaced' else null); p = events(parley.patch.replace); assert len(p) == (1 if action == 'replaced' else 0); for replaced assert p[0].metadata == {branch_name: 'patch/a', replaced_sha: old hub tip, origin_sha: origin tip, trigger: 'reset_to_origin'}"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "Refusals of a reset to origin",
+      "rationale": "A reset discards a branch tip, so when it cannot finish the caller must learn exactly why, and the patch must be as it was.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "unwanted",
+          "condition": "a caller with write access sends POST /api/v1/workspaces/:slug/patches/:id/reset-to-origin for a patch whose status is merged_upstream or deleted",
+          "action": "reject the request without contacting origin",
+          "contract": "HTTP 409 with error_type patch_status_invalid; origin is not fetched; no ref and no patch field changes",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a reset fixture: an origin bare repository served by internal/gitrepo/gitrepotest and a hub bare repository cloned from it, both made with git in t.TempDir(); a carry-patch workspace 'carry' in status ready in a real store with patch A (branch patch/a, active) registered; the real event log of internal/event; a stub origin credential resolver; a recording rebuild enqueuer",
+              "the routes mounted on the real router of internal/server behind the carry-patch route guard of package 31, with a clock the test controls",
+              "a recording fetcher in place of the origin fetch"
+            ],
+            "pseudocode": "in internal/carrypatch/patch_reset_test.go, TestResetToOrigin_RefusesByPatchStatus, a table over the status of patch A {merged_upstream, deleted}: r = POST /patches/A/reset-to-origin; assert r.status == 409; assert r.json.error.error_type == 'patch_status_invalid'; assert fetcher.calls == 0; assert hub refs/heads/patch/a unchanged; assert events(parley.patch.reset) empty"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "unwanted",
+          "condition": "a reset to origin fetches the patch branch and origin has no branch of that name",
+          "action": "reject the request and leave the hub's branch, the backup ref and the patch record as they were",
+          "contract": "HTTP 409 with error_type missing_on_origin; refs/heads/<branch> in the hub, refs/parley/replaced/<branch> and every field of the patch are unchanged; no event; no rebuild job",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a reset fixture: an origin bare repository served by internal/gitrepo/gitrepotest and a hub bare repository cloned from it, both made with git in t.TempDir(); a carry-patch workspace 'carry' in status ready in a real store with patch A (branch patch/a, active) registered; the real event log of internal/event; a stub origin credential resolver; a recording rebuild enqueuer",
+              "the routes mounted on the real router of internal/server behind the carry-patch route guard of package 31, with a clock the test controls"
+            ],
+            "pseudocode": "in internal/carrypatch/patch_reset_test.go, TestResetToOrigin_MissingOnOrigin: delete patch/a on origin; set patch_branch_source origin with the patch stored as in_sync; before = GET /patches/A; tip = hub rev-parse refs/heads/patch/a; r = POST /patches/A/reset-to-origin; assert r.status == 409; assert r.json.error.error_type == 'missing_on_origin'; assert hub refs/heads/patch/a == tip; assert refs/parley/replaced/patch/a does not exist; assert GET /patches/A == before; assert events(parley.patch.*) empty; assert enqueuer.calls == 0"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "unwanted",
+          "condition": "the single-branch fetch of a reset to origin fails for a reason other than a missing branch: origin cannot be reached, origin refuses the credential, the origin credential cannot be resolved, or the fetch runs longer than 2 minutes",
+          "action": "reject the request, stop the git subprocess when the limit passed, and leave the hub's branch, the backup ref and the patch record as they were",
+          "contract": "HTTP 502 with error_type origin_fetch_failed; error.message holds no credential (URL user information reads '***@'); no ref and no patch field changes; no event; no rebuild job",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a reset fixture: an origin bare repository served by internal/gitrepo/gitrepotest and a hub bare repository cloned from it, both made with git in t.TempDir(); a carry-patch workspace 'carry' in status ready in a real store with patch A (branch patch/a, active) registered; the real event log of internal/event; a stub origin credential resolver; a recording rebuild enqueuer",
+              "the routes mounted on the real router of internal/server behind the carry-patch route guard of package 31, with a clock the test controls"
+            ],
+            "pseudocode": "in internal/carrypatch/patch_reset_test.go, TestResetToOrigin_FetchFailures, a table over {origin server stopped; origin requires a token and the resolver returns the wrong one, with git_url 'https://user:s3cret@host/repo.git'; the credential resolver returns an error; a fetcher that blocks until its context ends, with the clock advanced past 2 minutes}: tip = hub rev-parse refs/heads/patch/a; r = POST /patches/A/reset-to-origin; assert r.status == 502; assert r.json.error.error_type == 'origin_fetch_failed'; assert 's3cret' not in r.body and the token is not in r.body; assert hub refs/heads/patch/a == tip; assert events(parley.patch.*) empty; for the blocking row assert the fetcher's context was cancelled"
+          }
+        },
+        {
+          "id": "REQ-7.4",
+          "pattern": "unwanted",
+          "condition": "refs/heads/<branch> in the hub changes, appears or disappears between the moment a reset to origin compared the tips and its compare-and-swap of the branch",
+          "action": "reject the request, leave the branch at the value the other writer gave it, keep a backup ref already written, and leave the patch record unchanged",
+          "contract": "HTTP 409 with error_type ref_moved and error.details.current_sha: the branch's current 40-hex commit; the branch is not moved by this call; a backup ref this call wrote stays; no patch field changes; no event; no rebuild job; a repeated request is evaluated afresh",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a reset fixture: an origin bare repository served by internal/gitrepo/gitrepotest and a hub bare repository cloned from it, both made with git in t.TempDir(); a carry-patch workspace 'carry' in status ready in a real store with patch A (branch patch/a, active) registered; the real event log of internal/event; a stub origin credential resolver; a recording rebuild enqueuer",
+              "the routes mounted on the real router of internal/server behind the carry-patch route guard of package 31, with a clock the test controls"
+            ],
+            "pseudocode": "in internal/carrypatch/patch_reset_test.go, TestResetToOrigin_LostRaceIsRefMoved, a table over {tips diverged, origin ahead, hub has no branch}: install a hook that runs after the hub's tip was read and before the compare-and-swap and moves (or creates) refs/heads/patch/a at commit W with git update-ref; before = GET /patches/A; r = POST /patches/A/reset-to-origin; assert r.status == 409; assert r.json.error.error_type == 'ref_moved'; assert r.json.error.details.current_sha == W; assert hub refs/heads/patch/a == W; for the diverged row assert refs/parley/replaced/patch/a == the tip the hub compared; assert GET /patches/A == before; assert events(parley.patch.*) empty; assert enqueuer.calls == 0; then remove the hook and repeat the request: assert 200"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "Rebuild after a reset to origin",
+      "rationale": "A patch branch that moved makes the integration branch stale, so the reset queues the rebuild itself when the workspace is set to rebuild automatically.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "a reset to origin moved the branch (action created, fast_forwarded or replaced), the patch's status is active or conflict, and the workspace setting auto_rebuild_after_sync is true",
+          "action": "queue one rebuild for the workspace through the rebuild enqueue with the caller as the submitter, and report the job in the answer",
+          "contract": "the HTTP 200 answer carries rebuild_triggered: true and rebuild_job_id: the id of the queued job; the enqueue received the workspace and the caller's identity as submitted_by",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a reset fixture: an origin bare repository served by internal/gitrepo/gitrepotest and a hub bare repository cloned from it, both made with git in t.TempDir(); a carry-patch workspace 'carry' in status ready in a real store with patch A (branch patch/a, active) registered; the real event log of internal/event; a stub origin credential resolver; a recording rebuild enqueuer",
+              "the routes mounted on the real router of internal/server behind the carry-patch route guard of package 31, with a clock the test controls"
+            ],
+            "pseudocode": "in internal/carrypatch/patch_reset_test.go, TestResetToOrigin_QueuesRebuild, a table over the action {created, fast_forwarded, replaced} times the patch status {active, conflict}, with auto_rebuild_after_sync true and the enqueuer returning job id J: r = POST /patches/A/reset-to-origin as user U; assert r.status == 200; assert r.json.rebuild_triggered == true; assert r.json.rebuild_job_id == J; assert enqueuer.calls == [{workspace: 'carry', submitted_by: U}]; assert the enqueuer was called after the branch moved (hub refs/heads/patch/a == origin tip at call time)"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "event_driven",
+          "condition": "a reset to origin succeeded with action none, or on a patch whose status is disabled, or on a workspace whose setting auto_rebuild_after_sync is false",
+          "action": "queue no rebuild and report that none was triggered",
+          "contract": "the HTTP 200 answer carries rebuild_triggered: false and no member rebuild_job_id; the enqueue is not called",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a reset fixture: an origin bare repository served by internal/gitrepo/gitrepotest and a hub bare repository cloned from it, both made with git in t.TempDir(); a carry-patch workspace 'carry' in status ready in a real store with patch A (branch patch/a, active) registered; the real event log of internal/event; a stub origin credential resolver; a recording rebuild enqueuer",
+              "the routes mounted on the real router of internal/server behind the carry-patch route guard of package 31, with a clock the test controls"
+            ],
+            "pseudocode": "in internal/carrypatch/patch_reset_test.go, TestResetToOrigin_DoesNotQueueRebuild, a table over {action none, active, setting true; action fast_forwarded, disabled, setting true; action replaced, disabled, setting true; action fast_forwarded, active, setting false; action replaced, conflict, setting false}: r = POST /patches/A/reset-to-origin; assert r.status == 200; assert r.json.rebuild_triggered == false; assert 'rebuild_job_id' not in r.json; assert enqueuer.calls == []"
+          }
+        },
+        {
+          "id": "REQ-8.3",
+          "pattern": "unwanted",
+          "condition": "a reset to origin that moved the branch asks for a rebuild while the workspace already has a rebuild job that is queued, running or failed (waiting to retry)",
+          "action": "skip the trigger and keep the reset",
+          "contract": "HTTP 200 with the action taken, rebuild_triggered: false and no member rebuild_job_id; the branch stays at origin's tip and parley.patch.reset is emitted",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a reset fixture: an origin bare repository served by internal/gitrepo/gitrepotest and a hub bare repository cloned from it, both made with git in t.TempDir(); a carry-patch workspace 'carry' in status ready in a real store with patch A (branch patch/a, active) registered; the real event log of internal/event; a stub origin credential resolver; a recording rebuild enqueuer",
+              "the routes mounted on the real router of internal/server behind the carry-patch route guard of package 31, with a clock the test controls"
+            ],
+            "pseudocode": "in internal/carrypatch/patch_reset_test.go, TestResetToOrigin_SkipsDuplicateRebuild: the enqueuer reports a duplicate (nothing queued, the existing job's id, no error); origin ahead; r = POST /patches/A/reset-to-origin; assert r.status == 200; assert r.json.action == 'fast_forwarded'; assert r.json.rebuild_triggered == false; assert 'rebuild_job_id' not in r.json; assert hub refs/heads/patch/a == origin tip; assert len(events(parley.patch.reset)) == 1"
+          }
+        },
+        {
+          "id": "REQ-8.4",
+          "pattern": "unwanted",
+          "condition": "the rebuild enqueue called by a reset to origin fails for a reason other than an existing job",
+          "action": "keep the reset, log the failure and report that no rebuild was triggered",
+          "contract": "HTTP 200 with the action taken, rebuild_triggered: false and no member rebuild_job_id; the branch stays at origin's tip; one error log record",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a reset fixture: an origin bare repository served by internal/gitrepo/gitrepotest and a hub bare repository cloned from it, both made with git in t.TempDir(); a carry-patch workspace 'carry' in status ready in a real store with patch A (branch patch/a, active) registered; the real event log of internal/event; a stub origin credential resolver; a recording rebuild enqueuer",
+              "the routes mounted on the real router of internal/server behind the carry-patch route guard of package 31, with a clock the test controls",
+              "a log handler that records entries"
+            ],
+            "pseudocode": "in internal/carrypatch/patch_reset_test.go, TestResetToOrigin_EnqueueErrorKeepsReset: the enqueuer returns an error; origin ahead; r = POST /patches/A/reset-to-origin; assert r.status == 200; assert r.json.rebuild_triggered == false; assert 'rebuild_job_id' not in r.json; assert hub refs/heads/patch/a == origin tip; assert len(events(parley.patch.reset)) == 1; assert the log has one error record naming the workspace"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-9",
+      "title": "CLI commands that update, remove, restore and reorder patches",
+      "rationale": "Developers and agents script the patch list from the shell, so each maintenance route has a command that sends exactly what was asked and prints what the hub answered.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-9.1",
+          "pattern": "event_driven",
+          "condition": "a user runs parley patch update <workspace-slug> <patch-id> with at least one of --status, --position <int>, --description and --upstream-pr",
+          "action": "send PATCH /api/v1/workspaces/<slug>/patches/<patch-id> with a JSON object holding exactly the members whose flags were given (status, position as an integer, description, upstream_pr_url for --upstream-pr), an empty string included, and print the hub's response",
+          "contract": "one PATCH request whose body has one member per given flag and no other; stdout is the hub's response as one JSON document; exit status 0; a hub error is printed on stderr as received with exit status 1",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server standing in for the hub that records every request and answers from a table",
+              "the parley command tree of internal/cli run in-process with --endpoint-url and --api-key pointing at that server and PARLEY_CONFIG_DIR set to an empty t.TempDir()"
+            ],
+            "pseudocode": "in internal/cli/patch_test.go, TestPatchUpdate_SendsOnlyGivenFlags, a table over argument lists {--status disabled -> {status:'disabled'}; --position 2 -> {position:2}; --description '' -> {description:''}; --upstream-pr https://example.test/pull/7 -> {upstream_pr_url:'https://example.test/pull/7'}; --status active --position 1 --description d --upstream-pr '' -> all four members; --status bogus -> {status:'bogus'} (not validated by the CLI)}: run parley patch update carry <id> args; assert the one recorded request is PATCH /api/v1/workspaces/carry/patches/<id> with exactly that JSON body; assert stdout == the stub's patch document indented by 2 spaces; assert exit == 0; then with the stub answering 409 patch_deleted: assert stdout == '', stderr holds the envelope as received, exit == 1"
+          }
+        },
+        {
+          "id": "REQ-9.2",
+          "pattern": "unwanted",
+          "condition": "a user runs parley patch update with none of the four flags, with a --position that is not an integer, or with other than two arguments",
+          "action": "send no request and report a usage error",
+          "contract": "no HTTP request; nothing on stdout; the envelope {error: {code: 0, error_type: 'usage_error', message}} on stderr; exit status 2",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server standing in for the hub that records every request and answers from a table",
+              "the parley command tree of internal/cli run in-process with --endpoint-url and --api-key pointing at that server and PARLEY_CONFIG_DIR set to an empty t.TempDir()"
+            ],
+            "pseudocode": "in internal/cli/patch_test.go, TestPatchUpdate_UsageErrors, a table over argument lists {carry <id> (no flag); carry <id> --position two; carry (no patch id); carry <id> extra --status active}: run parley patch update args; assert len(recorded requests) == 0; assert stdout == ''; assert stderr JSON .error.error_type == 'usage_error' and .error.code == 0; assert exit == 2"
+          }
+        },
+        {
+          "id": "REQ-9.3",
+          "pattern": "event_driven",
+          "condition": "a user runs parley patch remove <workspace-slug> <patch-id>",
+          "action": "send DELETE /api/v1/workspaces/<slug>/patches/<patch-id> and, on the 204 answer, print a confirmation document",
+          "contract": "stdout is {\"status\":\"removed\",\"patch_id\":\"<patch-id>\"} as one JSON document; exit status 0; a hub error is printed on stderr as received with exit status 1 and nothing on stdout",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server standing in for the hub that records every request and answers from a table",
+              "the parley command tree of internal/cli run in-process with --endpoint-url and --api-key pointing at that server and PARLEY_CONFIG_DIR set to an empty t.TempDir()"
+            ],
+            "pseudocode": "in internal/cli/patch_test.go, TestPatchRemove_PrintsConfirmation: the stub answers 204; run parley patch remove carry <id>; assert the one recorded request is DELETE /api/v1/workspaces/carry/patches/<id> with no body; assert json(stdout) == {status: 'removed', patch_id: <id>}; assert exit == 0; then the stub answers 404 not_found: assert stdout == '', stderr holds the envelope as received, exit == 1"
+          }
+        },
+        {
+          "id": "REQ-9.4",
+          "pattern": "event_driven",
+          "condition": "a user runs parley patch restore <workspace-slug> <patch-id>",
+          "action": "send POST /api/v1/workspaces/<slug>/patches/<patch-id>/restore with no body and print the hub's response",
+          "contract": "stdout is the restored patch as the hub answered it; exit status 0; a hub error is printed on stderr as received with exit status 1",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server standing in for the hub that records every request and answers from a table",
+              "the parley command tree of internal/cli run in-process with --endpoint-url and --api-key pointing at that server and PARLEY_CONFIG_DIR set to an empty t.TempDir()"
+            ],
+            "pseudocode": "in internal/cli/patch_test.go, TestPatchRestore_PrintsPatch: run parley patch restore carry <id>; assert the one recorded request is POST /api/v1/workspaces/carry/patches/<id>/restore with an empty body; assert stdout == the stub's patch document; assert exit == 0; then the stub answers 409 patch_not_deleted: assert stderr holds the envelope as received and exit == 1; then a slug argument 'a/b': assert the request path holds a%2Fb as one segment"
+          }
+        },
+        {
+          "id": "REQ-9.5",
+          "pattern": "event_driven",
+          "condition": "a user runs parley patch reorder <workspace-slug> <patch-id>... with at least one patch id",
+          "action": "send POST /api/v1/workspaces/<slug>/patches/reorder with {patch_ids: the patch ids in argument order} and print the hub's response",
+          "contract": "one POST request whose body is {patch_ids: [the arguments after the slug, in order]}; stdout is the hub's response; exit status 0; with no patch id: no request, usage_error on stderr and exit status 2",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server standing in for the hub that records every request and answers from a table",
+              "the parley command tree of internal/cli run in-process with --endpoint-url and --api-key pointing at that server and PARLEY_CONFIG_DIR set to an empty t.TempDir()"
+            ],
+            "pseudocode": "in internal/cli/patch_test.go, TestPatchReorder_SendsIdsInOrder: run parley patch reorder carry C A B; assert the one recorded request is POST /api/v1/workspaces/carry/patches/reorder with body {patch_ids: ['C','A','B']}; assert stdout == the stub's {items, next_cursor} document; assert exit == 0; then parley patch reorder carry (no id): assert no request, stderr error_type 'usage_error', exit == 2; then the stub answers 400 invalid_request: assert stderr holds the envelope as received and exit == 1"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-10",
+      "title": "CLI command that resets a patch to origin and waits for the rebuild",
+      "rationale": "A script that resets a patch usually wants to know whether the integration branch rebuilt, so the command can follow the job the reset queued and report both in one document.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-10.1",
+          "pattern": "event_driven",
+          "condition": "a user runs parley patch reset-to-origin <workspace-slug> <patch-id> without --wait",
+          "action": "send POST /api/v1/workspaces/<slug>/patches/<patch-id>/reset-to-origin with no body, print the hub's response and send no further request",
+          "contract": "stdout is the hub's response as one JSON document; exit status 0; a hub error is printed on stderr as received with exit status 1",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server standing in for the hub that records every request and answers from a table",
+              "the parley command tree of internal/cli run in-process with --endpoint-url and --api-key pointing at that server and PARLEY_CONFIG_DIR set to an empty t.TempDir()"
+            ],
+            "pseudocode": "in internal/cli/patch_test.go, TestPatchResetToOrigin_PrintsResponse: the stub answers 200 with a patch plus {action: 'replaced', replaced_sha, rebuild_triggered: true, rebuild_job_id: 'J'}; run parley patch reset-to-origin carry <id>; assert recorded requests == [POST /api/v1/workspaces/carry/patches/<id>/reset-to-origin]; assert stdout == the stub's document; assert 'rebuild' not in json(stdout); assert exit == 0; then the stub answers 409 ref_moved: assert stdout == '', stderr holds the envelope as received, exit == 1; then --timeout 0 without --wait: assert no request, usage_error, exit == 2"
+          }
+        },
+        {
+          "id": "REQ-10.2",
+          "pattern": "event_driven",
+          "condition": "a user runs parley patch reset-to-origin <workspace-slug> <patch-id> --wait and the hub's response names a rebuild_job_id",
+          "action": "poll GET /api/v1/workspaces/<slug>/rebuilds/<rebuild_job_id> through the shared wait until the job's status is completed, dead_letter or cancelled, treating queued, running and failed as not terminal, and print one document: the reset response with one more member, rebuild, holding the final job record",
+          "contract": "stdout is one JSON document: every member of the reset response plus rebuild: the final job record; exit status 0 when the job's status is completed",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server standing in for the hub that records every request and answers from a table",
+              "the parley command tree of internal/cli run in-process with --endpoint-url and --api-key pointing at that server and PARLEY_CONFIG_DIR set to an empty t.TempDir()"
+            ],
+            "pseudocode": "in internal/cli/patch_test.go, TestPatchResetToOrigin_WaitsForRebuild: the stub answers the reset with rebuild_job_id 'J' and the job route with the sequence queued, running, failed, queued, running, completed; run parley patch reset-to-origin carry <id> --wait --poll-interval 10ms --timeout 5s; assert the job route was requested 6 times at /api/v1/workspaces/carry/rebuilds/J; d = json(stdout); assert d minus 'rebuild' == the reset response; assert d.rebuild == the final job record with status 'completed'; assert stdout holds exactly one JSON document; assert stderr has waiting: lines and no error; assert exit == 0"
+          }
+        },
+        {
+          "id": "REQ-10.3",
+          "pattern": "unwanted",
+          "condition": "the rebuild a parley patch reset-to-origin --wait follows ends in dead_letter or cancelled, or does not reach a terminal status before --timeout, or a poll is answered with a hub error",
+          "action": "end the wait as unsuccessful",
+          "contract": "for dead_letter or cancelled: stdout is the reset response plus rebuild: the final job record, stderr carries error_type wait_failed, exit status 1; on timeout: nothing on stdout, error_type wait_timeout on stderr, exit status 1, and no request that cancels the job; on a hub error during polling: nothing on stdout, that envelope on stderr, exit status 1",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server standing in for the hub that records every request and answers from a table",
+              "the parley command tree of internal/cli run in-process with --endpoint-url and --api-key pointing at that server and PARLEY_CONFIG_DIR set to an empty t.TempDir()"
+            ],
+            "pseudocode": "in internal/cli/patch_test.go, TestPatchResetToOrigin_WaitFailures, a table over the job route's answers {running then dead_letter -> stdout is the reset response plus rebuild with status dead_letter, stderr error_type wait_failed, exit 1; cancelled -> the same with cancelled, exit 1; failed forever with --timeout 100ms -> stdout == '', stderr error_type wait_timeout, exit 1; 404 not_found on the second poll -> stdout == '', stderr holds the envelope as received, exit 1}: run parley patch reset-to-origin carry <id> --wait --poll-interval 10ms; assert as the row names; for the timeout row assert no DELETE or cancel request was sent"
+          }
+        },
+        {
+          "id": "REQ-10.4",
+          "pattern": "event_driven",
+          "condition": "a user runs parley patch reset-to-origin <workspace-slug> <patch-id> --wait and the hub's response has no rebuild_job_id",
+          "action": "print the hub's response as it is, without a rebuild member, and send no request to the rebuild job route",
+          "contract": "stdout is the hub's response unchanged; exactly one HTTP request was sent; exit status 0",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server standing in for the hub that records every request and answers from a table",
+              "the parley command tree of internal/cli run in-process with --endpoint-url and --api-key pointing at that server and PARLEY_CONFIG_DIR set to an empty t.TempDir()"
+            ],
+            "pseudocode": "in internal/cli/patch_test.go, TestPatchResetToOrigin_WaitWithoutJob, a table over reset responses {action 'none', rebuild_triggered false; action 'fast_forwarded', rebuild_triggered false (duplicate skipped)}: run parley patch reset-to-origin carry <id> --wait; assert recorded requests == [the one POST]; assert stdout == the stub's document; assert 'rebuild' not in json(stdout); assert exit == 0"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "A developer maintains the patch list from the shell",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "runs parley patch update carry <B> --status disabled on a carry-patch workspace with the patches A, B, C at positions 1, 2, 3"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends PATCH /api/v1/workspaces/carry/patches/<B> with {status: 'disabled'} and the developer's API key"
+        },
+        {
+          "actor": "parleyd",
+          "action": "authenticates the caller, finds write access and a ready carry-patch workspace, sets B to disabled, writes parley.patch.update in the same transaction and answers 200 with the patch"
+        },
+        {
+          "actor": "developer",
+          "action": "runs parley patch reorder carry <C> <A> <B>"
+        },
+        {
+          "actor": "parleyd",
+          "action": "checks that the three ids are every non-deleted patch exactly once, renumbers them 1, 2, 3 in that order, writes one parley.patch.reorder and answers 200 with the items in the new order"
+        },
+        {
+          "actor": "developer",
+          "action": "runs parley patch remove carry <C>"
+        },
+        {
+          "actor": "parleyd",
+          "action": "soft-deletes C, renumbers A and B to 1 and 2, writes parley.patch.delete and answers 204"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints {\"status\":\"removed\",\"patch_id\":\"<C>\"} and exits 0"
+        },
+        {
+          "actor": "developer",
+          "action": "runs parley patch restore carry <C>"
+        },
+        {
+          "actor": "parleyd",
+          "action": "makes C active at position 3 with deleted_at null, writes parley.patch.restore and answers 200 with the patch"
+        },
+        {
+          "actor": "developer",
+          "action": "runs parley patch list carry and reads A at 1, B at 2 and disabled, C at 3 and active"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the parley CLI command tree of internal/cli with its real HTTP client",
+          "a hub started in-process on 127.0.0.1:0 with its real router, authentication and access middleware",
+          "the patch routes of internal/carrypatch, those of package 31 included",
+          "the SQLite store of internal/store",
+          "the event log of internal/event"
+        ],
+        "setup": [
+          "a hub started in-process as the end-to-end tests of package 01 start it, against a data directory in t.TempDir()",
+          "an origin and an upstream repository served by internal/gitrepo/gitrepotest, origin holding the branches patch/a, patch/b and patch/c",
+          "the carry-patch workspace 'carry' created through POST /api/v1/workspaces and waited for until ready, and the three patches registered through parley patch add as package 31 specifies"
+        ],
+        "end_state": [
+          "parley patch list carry prints three patches at positions 1, 2, 3: patch/a active, patch/b disabled, patch/c active with deleted_at null",
+          "parley patch list carry --include-deleted prints no deleted patch",
+          "GET /api/v1/events/log, filtered to the workspace, holds in this order one parley.patch.update (to: disabled), one parley.patch.reorder, one parley.patch.delete and one parley.patch.restore, each with the developer as actor",
+          "every command exited 0 and printed exactly one JSON document on stdout"
+        ],
+        "pseudocode": "in test/e2e/patch_maintenance_test.go, TestPatchMaintenance_FromTheShell: ids = add three patches; run(parley patch update carry B --status disabled) -> exit 0, .status == 'disabled'; run(parley patch reorder carry C A B) -> [x.id for x in .items] == [C,A,B]; run(parley patch remove carry C) -> {status:'removed', patch_id:C}; run(parley patch restore carry C) -> .position == 3, .status == 'active'; l = run(parley patch list carry); assert [(x.branch_name, x.position, x.status) for x in l.items] == [('patch/a',1,'active'),('patch/b',2,'disabled'),('patch/c',3,'active')]; assert the four event types in order in the event log"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "A developer forces a diverged patch branch back to origin's tip",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "runs parley patch reset-to-origin carry <A> after the hub's patch/a and origin's patch/a each gained a commit the other lacks"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends POST /api/v1/workspaces/carry/patches/<A>/reset-to-origin with the developer's API key"
+        },
+        {
+          "actor": "parleyd",
+          "action": "authenticates the caller, finds write access, a ready carry-patch workspace and an active patch, resolves the origin credential and fetches the branch patch/a from origin"
+        },
+        {
+          "actor": "origin",
+          "action": "serves its tip of patch/a to the fetch"
+        },
+        {
+          "actor": "parleyd",
+          "action": "finds the tips diverged, saves its own tip to refs/parley/replaced/patch/a and moves refs/heads/patch/a to origin's tip by compare-and-swap"
+        },
+        {
+          "actor": "parleyd",
+          "action": "writes parley.patch.reset and parley.patch.replace, asks for a rebuild when auto_rebuild_after_sync is true, and answers 200 with the patch, action replaced and replaced_sha"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints the answer on stdout and exits 0"
+        },
+        {
+          "actor": "developer",
+          "action": "runs parley patch show carry <A> and reads replaced_sha, the tip the hub discarded"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the parley CLI command tree of internal/cli with its real HTTP client",
+          "a hub started in-process on 127.0.0.1:0 with its real router, authentication and access middleware",
+          "the reset operation of internal/carrypatch",
+          "internal/gitrepo running the git binary",
+          "the SQLite store of internal/store",
+          "the event log of internal/event",
+          "an origin git repository served to the hub by internal/gitrepo/gitrepotest"
+        ],
+        "setup": [
+          "a hub started in-process as the end-to-end tests of package 01 start it, against a data directory in t.TempDir()",
+          "the carry-patch workspace 'carry' created and ready, with patch/a registered as patch A, as in the first end-to-end test of this file",
+          "one commit added to patch/a in the hub's bare repository <[workspace].path>/carry.git with git, and a different commit pushed to patch/a on origin, so that the tips diverge; H is the hub's tip and O origin's"
+        ],
+        "end_state": [
+          "the command exited 0 and its document has action 'replaced', replaced_sha == H and a boolean rebuild_triggered",
+          "git rev-parse refs/heads/patch/a in the hub's bare repository prints O",
+          "git rev-parse refs/parley/replaced/patch/a in the hub's bare repository prints H",
+          "parley patch show carry <A> prints replaced_sha == H",
+          "the event log holds one parley.patch.reset with action replaced and one parley.patch.replace with trigger reset_to_origin for the patch",
+          "a second parley patch reset-to-origin carry <A> exits 0 with action 'none'"
+        ],
+        "pseudocode": "in test/e2e/patch_maintenance_test.go, TestPatchMaintenance_ResetToOrigin: H, O = diverge(patch/a); d = run(parley patch reset-to-origin carry A); assert d.action == 'replaced' and d.replaced_sha == H and type(d.rebuild_triggered) == bool; assert git(hub, 'rev-parse', 'refs/heads/patch/a') == O; assert git(hub, 'rev-parse', 'refs/parley/replaced/patch/a') == H; assert run(parley patch show carry A).replaced_sha == H; assert events of types parley.patch.reset and parley.patch.replace; assert run(parley patch reset-to-origin carry A).action == 'none'"
+      }
+    }
+  ]
+}

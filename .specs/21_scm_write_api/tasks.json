@@ -1,0 +1,243 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "21",
+  "spec_name": "scm_write_api",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/scm/... ./internal/gitrepo/... ./internal/cli/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "09",
+      "reason": "builds its CLI commands on the client, output and exit-code helpers of the CLI foundation"
+    },
+    {
+      "spec": "18",
+      "reason": "the push rule engine (Evaluate) and the ref writer (Apply with via api) in internal/gitserver/pushrule that every API write goes through: the owner exemption, the compare-and-swap of refs, the ref-updated stages and the parley.git.push emission"
+    },
+    {
+      "spec": "20",
+      "reason": "the internal/scm route group, revision resolution, the ref and commit objects, the [scm] configuration section, internal/gitrepo with the trial rebase, and the scm command group of the CLI"
+    },
+    {
+      "spec": "52",
+      "reason": "emits its hub events through the event log component"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Gate every write route by scope, access and workspace status",
+      "criteria": [
+        "REQ-1.1",
+        "REQ-1.2",
+        "REQ-1.3"
+      ],
+      "steps": [
+        "Add the gate's behaviours to internal/scm/write_test.go as table-driven tests around a probe handler, with a stub access component and a stub workspace lookup, and confirm they fail",
+        "Add the write gate in internal/scm/write.go as a wrapper for a route handler: it declares the PAT scope git:write and the workspace need write through the check positions of internal/server, so the conventions' order holds (scope before access, access before validation)",
+        "After access passes, load the workspace and refuse by status: archived answers 409 workspace_archived; a fork whose parent is archived answers 409 parent_archived; pending, cloning or a running reclone, archive or delete (on the workspace or, for a fork, on its parent) answers 409 workspace_busy; failed answers 409 workspace_not_ready",
+        "Hand the wrapped handler the caller, the credential and the loaded workspace so that no write handler looks them up a second time",
+        "Use the error constructors of internal/server for every refusal; add parent_archived, workspace_busy and workspace_not_ready through the constructor for specific types only where the workspace package does not already export them"
+      ],
+      "touches": [
+        "internal/scm/write.go",
+        "internal/scm/write_test.go"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Create, move and delete branches and tags by compare-and-swap",
+      "criteria": [
+        "REQ-7"
+      ],
+      "steps": [
+        "Add the ref behaviours to internal/scm/refs_write_test.go against a bare repository made with git init in t.TempDir(), a recording event sink, a recording ref-updated stage and a fake change linker, and confirm they fail",
+        "Declare the interface ChangeLinker in internal/scm/linker.go with a registration function RegisterChangeLinker and three operations: find the draft or open change whose source is a branch (with its current version); check an opening before a branch moves; open a change after a branch moved. The default reports no change for any branch and refuses a check; package 22 registers the real one. Recording a version is not an operation of the linker: package 22 does it in the ref-updated stage it registers with the ref writer of package 18",
+        "Add the shared ref update step in internal/scm/refupdate.go, used by every write route: take the full ref name, the before commit (none for a create), the after commit (none for a delete), the version kind of the route (commit, ref, rebase or none) and the session; call Evaluate of internal/gitserver/pushrule with the caller facts (level, credential kind and id, user, binding, paths) and, on acceptance, Apply of the same package with via api and the version kind, then its event step; Apply makes the compare-and-swap, sets head_sha, runs the ref-updated stages in its commit step, reports fork activity and emits parley.git.push with created, deleted, forced and direct, and its event step calls the post-push listeners of package 18 with the slug, the accepted updates, via api and the session, so this package writes no ref and no push event and notifies no listener itself; return the engine's direct flag and the version the ref writer reports for the update",
+        "Map the ref writer's outcome ref_moved to 409 ref_moved with details.current_sha read after the failure; pass an error a ref-updated stage returned through with its status and error_type, and answer 500 internal for one that carries none",
+        "Report every write request that reaches a write route's handler exactly once to the request recorder of package 20 (the recorder interface of internal/scm that feeds parley_scm_requests_total{op,result}; declare no second recorder): op is commit for POST …/scm/commits, ref_create for POST …/scm/refs, ref_move for PATCH …/scm/refs/*name, ref_delete for DELETE …/scm/refs/*name and rebase for POST …/scm/rebase; result is ok for a status below 400 and error otherwise, as package 20 defines them, except ref_moved for a 409 ref_moved and refused for a 403 of a push rule; a request the write gate refused is not reported",
+        "Register POST /workspaces/:slug/scm/refs behind the write gate: a bare name is a branch; accept only refs/heads/ and refs/tags/ names that git check-ref-format accepts (add this ref-name check to internal/gitrepo; package 19 reuses it), pass refs/parley/ names on to the rule engine, and refuse every other namespace and HEAD with 400 invalid_request; require exactly one of sha (a full 40-character id) and ref (a revision in the four forms of §6.3, resolved with the resolver of package 20); the target must resolve to a commit, else 404 ref_not_found; an existing ref answers 409 ref_exists; answer 201 with the ref object of package 20",
+        "Register PATCH /workspaces/:slug/scm/refs/*name: resolve the name as a full ref name or a branch name; require sha and expected_sha as full ids; a sha that is no commit answers 404 ref_not_found; a sha equal to the current commit answers 200 without an update or an event; otherwise run the shared update step with version kind ref, so that the stage of package 22 records the version when the branch is the source of a draft or open change",
+        "Register DELETE /workspaces/:slug/scm/refs/*name with the optional query parameter expected_sha: a branch that the linker reports as the source of a draft or open change answers 409 ref_in_use; otherwise run the shared update step with the current commit (or expected_sha) as before and version kind none and answer 204 with no body",
+        "Leave the deleted ref's commits in the repository: no object is pruned by a delete"
+      ],
+      "touches": [
+        "internal/scm/linker.go",
+        "internal/scm/refupdate.go",
+        "internal/scm/refs_write.go",
+        "internal/scm/refs_write_test.go",
+        "internal/gitrepo"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Apply file operations to a tree without a working copy",
+      "criteria": [
+        "REQ-3.1",
+        "REQ-3.2",
+        "REQ-3.3"
+      ],
+      "steps": [
+        "Add the operation behaviours to internal/gitrepo/treewrite_test.go as tables over a repository made with git init in t.TempDir() that also holds an executable file, a nested directory and a submodule entry, and confirm they fail",
+        "Add the operation applier in internal/gitrepo/treewrite.go: given a parent commit and an ordered list of operations it returns the id of the resulting tree, or an error value carrying the zero-based index of the first operation that cannot apply",
+        "Work in a temporary index file private to the call (never the repository's own index, never a working tree): load the parent's tree, then apply each operation to the index as the previous one left it",
+        "put: write the bytes as a blob and set the entry with the given mode (100644 when none); a mode of 120000 stores the content as the link target",
+        "delete: remove the entry; move: re-add the entry's blob id and mode under the new path and remove the old one; chmod: keep the blob id and set the mode",
+        "Report as not applicable, with the operation's index: delete, move or chmod of a path that is not a file in the index; move onto an existing file or directory; put where an ancestor of the path is a file; put onto a directory; any operation on or under an entry of mode 160000",
+        "Write the tree from the index and remove the temporary index file on every exit, success or failure",
+        "Add commit creation from a tree beside it: parents, message, author name and e-mail, committer identity and both times are parameters; nothing is read from the environment or the user's git configuration"
+      ],
+      "touches": [
+        "internal/gitrepo/treewrite.go",
+        "internal/gitrepo/treewrite_test.go"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Create a commit from file operations and move one branch",
+      "criteria": [
+        "REQ-2",
+        "REQ-3.4",
+        "REQ-3.5",
+        "REQ-3.6",
+        "REQ-3.7"
+      ],
+      "steps": [
+        "Add the commit behaviours to internal/scm/commit_test.go and the configuration behaviour to internal/config/config_test.go and confirm they fail",
+        "Add the key max_commit_size to the [scm] section of internal/config: a size, default 32MB; register POST /workspaces/:slug/scm/commits behind the write gate with that value as the route's own body limit in place of [server].max_body_size",
+        "Validate the body before touching the repository and answer 400 invalid_request for: a missing or invalid branch name, a missing or empty message, an author without name or email, more than 1,000 operations, and any malformed operation (unknown op, a path that is empty, starts with /, or has a ., .. or .git segment, both or neither of content and content_base64, invalid base64, a put mode outside 100644, 100755 and 120000, a chmod mode outside 100644 and 100755, a missing field)",
+        "Resolve the parent: for an existing branch the parent is its head, base_ref is ignored, and an expected_head_sha that is absent or different answers 409 ref_moved with details.current_sha; for a missing branch base_ref is required (400 invalid_request) and must resolve to a commit (404 ref_not_found) through the revision resolver of package 20",
+        "Apply the operations with the applier of internal/gitrepo; an operation that cannot apply answers 400 invalid_operation with details.index",
+        "Refuse a tree equal to the parent's tree with 400 empty_commit unless allow_empty is true; operations may be empty or absent",
+        "Create the commit: the request's author or else the caller's name and e-mail (the hub's identity for the admin token), the hub's identity as committer, the current time for both",
+        "Move or create the branch through the shared ref update step with the parent as before (none for a new branch) and version kind commit; a lost compare-and-swap answers 409 ref_moved and the unreferenced commit is left for git's garbage collection",
+        "Answer 201 with commit (the commit object of package 20, with stats), branch (the ref object), and change and change_error both null; the task that adds the commit's consequences fills them"
+      ],
+      "touches": [
+        "internal/scm/commit.go",
+        "internal/scm/commit_test.go",
+        "internal/config",
+        "internal/config/config_test.go"
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Rebase a branch on the server",
+      "criteria": [
+        "REQ-8",
+        "REQ-1.4"
+      ],
+      "steps": [
+        "Add the rebase behaviours to internal/scm/rebase_test.go and the five-route gate table to internal/scm/write_routes_test.go and confirm they fail",
+        "Register POST /workspaces/:slug/scm/rebase behind the write gate; require branch (an existing branch, by bare or full name) and onto (a revision in the four forms of §6.3, resolved with the resolver of package 20); an optional expected_head_sha must be a full id and must equal the head, else 409 ref_moved with details.current_sha",
+        "Answer 200 with status up_to_date, equal old and new head, and no update when onto is an ancestor of the head or equal to it, asked with IsAncestor of internal/gitrepo (package 12, not declared again here)",
+        "Refuse with 400 merge_commits_unsupported when any commit of the branch that is not in onto has more than one parent",
+        "Replay the commits oldest first onto the onto commit with the rebase of internal/gitrepo that package 20's comparison uses for its trial, extended to keep the result: each new commit keeps its author and message and takes the hub as committer; a commit that changes nothing on its new base is skipped; when nothing is left the result is the onto commit",
+        "On the first commit that does not apply, stop, remove every temporary file of the replay and answer 409 rebase_conflict with details holding the ConflictReport of internal/gitrepo that package 20 declares (no second report type): target_sha, head_sha, base_sha (the merge base), commit_sha and one files entry per conflicted path with its kind and its base, ours and theirs entries; landed_by and landed_changes are empty arrays and change is null",
+        "Move the branch through the shared ref update step with the head read at the start as before and version kind rebase, so a branch that moved meanwhile answers 409 ref_moved",
+        "Put the version the ref writer reports for the update in the answer's change as {workspace_slug, number, version}; on up_to_date make no ref update and report the change the linker's lookup finds for the branch with its current version",
+        "Answer 200 with status rebased, branch (the ref object), old_head_sha, new_head_sha, onto_sha and change"
+      ],
+      "touches": [
+        "internal/scm/rebase.go",
+        "internal/scm/rebase_test.go",
+        "internal/scm/write_routes_test.go",
+        "internal/gitrepo/rebase.go",
+        "internal/gitrepo/rebase_test.go"
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Answer push-rule refusals with one error type per rule",
+      "criteria": [
+        "REQ-5"
+      ],
+      "steps": [
+        "Add the refusal behaviours to internal/scm/rules_test.go (a fake rule engine: recording, refusing by script, failing) and internal/scm/rules_integration_test.go (the real engine of package 18, a path-scoped PAT, a task fork) and confirm they fail",
+        "Make sure each write route makes exactly one Evaluate call of package 18 per request, through the shared ref update step, after the after commit exists in the repository and before the compare-and-swap",
+        "Map the refusing rule to the answer in the shared step: 403 with the engine's message unchanged and error_type hub_owned_ref (rule 1), protected_branch (rule 2), default_branch (rule 2a), tracking_branch (rule 3), integration_branch or patch_branch (rule 4, by which kind of branch the engine names) and path_not_allowed (rule 5)",
+        "For path_not_allowed add the offending path as the named member path of the error; for tracking_branch add details.base_ref with the fork's fork_point.ref",
+        "Map an engine failure that is not a refusal to 500 internal with a fixed message, never to acceptance",
+        "On any refusal or failure return before the compare-and-swap, the event emission, the change linker and the idempotency record, so that a retry with the same Idempotency-Key is evaluated again"
+      ],
+      "touches": [
+        "internal/scm/refupdate.go",
+        "internal/scm/rules_test.go",
+        "internal/scm/rules_integration_test.go"
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Let the owner push directly to a protected branch through the API",
+      "criteria": [
+        "REQ-6"
+      ],
+      "steps": [
+        "Add the direct-push behaviours to internal/scm/direct_push_test.go with the real rule engine of package 18, a workspace with default protection, and the callers owner API key, admin token, the owner's unbound PAT, the owner's workspace-bound PAT and the owner's path-scoped PAT, and confirm they fail",
+        "In commit creation, before the parent is resolved, refuse a request that carries a change object and names a branch the protected-branch test of package 18 matches with 400 invalid_request",
+        "Pass the engine's direct flag from the shared ref update step to the route: when the update was a direct push, the commit, ref move and rebase routes make no call to the change linker (no change, no auto_change opening) and answer change null; the stage of package 22 records no version for an update flagged direct",
+        "Confirm through the tests that a commit, a fast-forward PATCH and a rebase that leaves the branch a fast-forward of its old head are accepted for the exempt callers with direct true on the event, and that the workspace's head_sha follows a moved default branch as it does after a git push",
+        "Confirm that a create, a backwards or sideways move, a delete and a rebase that is not a fast-forward of a protected branch answer 403 protected_branch with the rule's two messages for every caller, the admin token included, and that protect.owner_push false removes the exemption"
+      ],
+      "touches": [
+        "internal/scm/commit.go",
+        "internal/scm/refs_write.go",
+        "internal/scm/rebase.go",
+        "internal/scm/refupdate.go",
+        "internal/scm/direct_push_test.go"
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Give an API commit the consequences of a push",
+      "criteria": [
+        "REQ-4"
+      ],
+      "steps": [
+        "Add the consequence behaviours to internal/scm/commit_events_test.go and internal/scm/session_test.go with a recording event sink, a recording ref-updated stage, a fake change linker, a fake session linker and the real idempotency helper of internal/server, and confirm they fail",
+        "After a commit's branch has moved, emit parley.scm.commit after parley.git.push, with metadata branch (the short name), sha, parent_sha and files: the paths the commit changed against its parent, both paths of a move, sorted, cut to 100",
+        "Declare the interface SessionLinker in internal/scm/session.go (caller, session id, workspace -> accepted, refused, or internal error) with a registration call, the same name and check packages 19 and 22 declare in their own Go packages; package 49 owns the check and hands it to all three. The interface is check-only here: the session link is recorded by package 22 with the change version, never by this package. On the commit and rebase routes check a given session_id after body validation and before the parent is resolved; a refusal, or no registered linker, answers 400 unknown_session",
+        "Carry an accepted session_id onto the emitted events, the commit object's session_id, the ref writer (which hands it to the ref-updated stages) and every linker call",
+        "Leave the post-push listeners to package 18: its ref writer calls them from the event step with via api and the session id this package passed; add no listener registry and no listener call to internal/scm, and compose what this package is handed in internal/hub/scm.go",
+        "When the ref writer reports a version for the moved branch (the source of a draft or open change), answer change {workspace_slug, number, version} from it",
+        "With a change object in the request (on an unprotected branch): ask the linker to check the opening after the push rules accepted and before the compare-and-swap, and pass its error through unchanged (403 insufficient_scope, the 400 and 409 of the opening checks); with no linker registered answer 400 invalid_request; after the branch moved, open the change and answer it with version 1",
+        "Without a change object, in a fork whose auto_change is true, when the branch is the fork's own and has no draft or open change: ask the linker to open a change in the parent with the fork's base branch as target; on failure keep the commit and answer change null with change_error {error_type, message}",
+        "Wrap the three POST routes (commits, refs, rebase) in the idempotency helper of internal/server so that a replay answers 200 with the recorded body, a different body under the same key answers 409 conflict, and refused requests are not recorded"
+      ],
+      "touches": [
+        "internal/scm/commit.go",
+        "internal/scm/session.go",
+        "internal/scm/linker.go",
+        "internal/scm/rebase.go",
+        "internal/scm/refs_write.go",
+        "internal/scm/commit_events_test.go",
+        "internal/scm/session_test.go"
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Add parley scm commit and parley scm rebase",
+      "criteria": [
+        "REQ-9"
+      ],
+      "steps": [
+        "Add the command behaviours to internal/cli/scm_write_test.go, running the root command in-process against a net/http/httptest server that records requests, and confirm they fail",
+        "Add scm commit <slug> to the scm command group in internal/cli/scm.go with the flags --branch and --message (required), --base, --expected-head, --put, --delete, --move (each repeatable), --session, --change-target, --title, --intent and --draft",
+        "Collect --put, --delete and --move into one operation list in command-line order; split --put <repo-path>=<local-file> and --move <from>=<to> at the first =; a value without = or with an empty side, and a local file that cannot be read, are usage errors raised before any request",
+        "Read each --put file and send its bytes as content_base64 with no mode",
+        "Without --expected-head, read GET …/scm/refs/<branch> through the shared client (the branch percent-encoded as one segment): use its sha as expected_head_sha; on 404 ref_not_found send none; on any other error print it and exit 1",
+        "Build the body: branch, message, operations, base_ref from --base, session_id from --session, and a change object holding only the members whose flags were given when at least one of --change-target, --title, --intent, --draft is present; send one POST …/scm/commits and print the answer through the shared output of internal/cli",
+        "Add scm rebase <slug> <branch> with --onto (required) and --expected-head; send one POST …/scm/rebase and print the answer",
+        "Send each write request once: an error answer is printed as received, details included, and the command exits 1 without a retry"
+      ],
+      "touches": [
+        "internal/cli/scm.go",
+        "internal/cli/scm_write_test.go",
+        "test/e2e/scm_write_test.go"
+      ]
+    }
+  ]
+}

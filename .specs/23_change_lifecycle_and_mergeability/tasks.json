@@ -1,0 +1,297 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "23",
+  "spec_name": "change_lifecycle_and_mergeability",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/change/... ./internal/cli/... ./internal/config/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "09",
+      "reason": "builds its CLI commands on the client, output and exit-code helpers of the CLI foundation"
+    },
+    {
+      "spec": "12",
+      "reason": "registers with its branch-move observer to learn of target branches a sync moved"
+    },
+    {
+      "spec": "18",
+      "reason": "registers a ref-updated stage with its ref writer to learn of moved and deleted target branches"
+    },
+    {
+      "spec": "22",
+      "reason": "edits, abandons and restores the change record package 22 defines, and uses its version recording, version observers, StackLinker and ForkActivity interfaces, target validation, landing re-evaluation and read route"
+    },
+    {
+      "spec": "52",
+      "reason": "emits its hub events through the event log component"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Register the three write routes behind the caller rule",
+      "criteria": [
+        "REQ-1"
+      ],
+      "steps": [
+        "Add the caller-rule behaviours to internal/change/authz_test.go against a hub started in-process with real authentication, access rule, store and repositories, and confirm they fail",
+        "Register PATCH /api/v1/workspaces/{slug}/changes/{number}, POST …/changes/{number}/abandon and POST …/changes/{number}/restore on the router of internal/server, each declaring the scope changes:write and the workspace need read, so that the shared middleware gives 401, the binding guard answers, 403 insufficient_scope and 404 workspace not found in the platform's order",
+        "After the access step, load the change by workspace and number; answer 404 change_not_found for a :number that is not a positive decimal integer, for a number with no change, and, when the caller's token is bound to a fork and the addressed workspace is that fork's parent, for a change whose source workspace is not that fork (use the same confinement package 22 applies to its read routes)",
+        "Add one function that decides whether a caller may modify a change: true for the admin token, for a caller whose access level on the target workspace allows writes, and for a caller whose user id equals the change's author.actor_id whatever the credential; answer 403 forbidden with the change untouched otherwise",
+        "Add one function that maps the target workspace's status to the refusal of WS-FR-007 (pending, cloning or running maintenance: 409 workspace_busy; failed: 409 workspace_not_ready; archived: 409 workspace_archived) and call it in each handler after body validation and before any state check of the change",
+        "Have each handler run, in this order, the caller rule, the body decoding and validation, the workspace status check and then its operation. In this task the edit operation stores labels only, abandon handles a change without dependants and restore handles a change whose source branch is at its last version's head; tasks 2 and 5 to 8 complete the operations",
+        "Export the modify-permission function so that package 24 uses it for the restack route"
+      ],
+      "touches": [
+        "internal/change/authz.go",
+        "internal/change/authz_test.go",
+        "internal/change/edit.go",
+        "internal/change/lifecycle.go",
+        "internal/hub/change.go"
+      ],
+      "done_when": [
+        "`go test ./internal/change/... -count=1` passes with authentication and the access rule unstubbed"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Edit title, intent, labels and auto_land with PATCH",
+      "criteria": [
+        "REQ-2"
+      ],
+      "steps": [
+        "Add the edit behaviours to internal/change/edit_test.go and confirm they fail: accepted bodies with their boundaries, each invalid body, the intent rule, the auto_land setter, closed changes, labels on a landed change and the empty edit",
+        "Decode the body into optional members so that an absent member is distinguishable from an empty value; ignore unknown members; hand a present depends_on member (a number or null) to SetDependsOn of the StackLinker interface of package 22 inside the PATCH transaction, so that an error it returns (400 invalid_dependency from package 24) leaves every field unchanged, and ignore the member while no stack linker is registered; answer 400 invalid_request for a wrong JSON type",
+        "Validate every present member before changing anything: title 1 to 200 characters without line feed or carriage return; intent at most 16,000 characters; labels deduplicated keeping the first occurrence, then at most 20, each matching ^[a-z0-9][a-z0-9_.:/-]{0,62}$; state one of draft and open; target_branch a string. Count characters as Unicode code points",
+        "Apply the state rules after validation: a body with no editable member answers 200 with the change untouched; an abandoned change answers 409 change_closed; a landed change answers 409 change_closed unless labels is the only editable member",
+        "Compute the resulting title, intent and state from the stored change and the body and answer 400 intent_required when the result is an open change with an empty intent while the target workspace's setting changes.require_intent is true",
+        "When the body has an auto_land member, call the AutoLandGuard of package 22 (registered by package 29) inside the PATCH transaction, after validation and the state rules and before any member is written, with the caller and its credential, the change and the value; answer its refusal unchanged (403 path_not_allowed with the path) and roll back so that no member of the request is applied; with no guard registered store the flag as given",
+        "Write all members in one store transaction and advance updated_at only when at least one stored value differs; write no event for title, intent, labels and auto_land",
+        "Add a stored auto-land setter beside the flag (a schema migration registered with internal/store) by extending SetAutoLand(tx, change, value, caller), the one function of internal/change through which the Open of package 22 and this PATCH store the flag: when the flag goes from false to true store the calling user's id (none for the admin token), the credential type and the token's paths globs or null; clear all three when the flag goes to false; leave them when the value does not change; expose the read accessor AutoLandSetter(tx, change) returning {user_id, credential_type, paths} or absent for package 29, which keeps no setter of its own",
+        "Answer 200 with the change object as GET returns it"
+      ],
+      "touches": [
+        "internal/change/edit.go",
+        "internal/change/edit_test.go",
+        "internal/store/"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Run mergeability checks in a background worker",
+      "criteria": [
+        "REQ-7"
+      ],
+      "steps": [
+        "Add the mergeability behaviours to internal/change/mergeable_test.go on real bare repositories made with git in t.TempDir(), and the configuration behaviours to internal/config/config_test.go, and confirm they fail",
+        "Read [changes].mergeable_debounce in internal/config: a duration, default 5s when the key or the table is absent, 0s allowed; a negative or unparsable value is a load error whose text names changes.mergeable_debounce, which stops parleyd before it listens",
+        "Store on the change, beside mergeable, the pair of commits (head and onto-commit) the value was computed for and the last computed value (a schema migration registered with internal/store)",
+        "Add the worker: a per-change pending set so that any number of triggers for one change leaves one pending entry; a per-change earliest-next-start time of last start plus the debounce; a small fixed pool of goroutines; an injectable clock, trial-rebase function and deadline for tests; a stop that waits for running computations when the server shuts down",
+        "Add the trigger entry points and connect them: register a version observer with package 22 (a version recorded for a draft or open change triggers that change and the draft or open changes that depend on it, whatever recorded the version, a restack of package 24 included); register a ref-updated stage with the ref writer of package 18 (RegisterRefUpdatedStage) that triggers the draft and open changes whose target is a branch a push, an API write or a land moved or deleted, and the branch-move observer of package 12 for a sync; export triggers for retarget, for restore and for package 24 (a needs_restack flag cleared without a new version). Each sets mergeable to unknown in the triggering transaction and adds the change to the pending set after commit",
+        "Compute: read the change's current head, base and onto-commit at computation start (the target branch head, or the head of the depends_on change when that change is draft or open); run the trial rebase of internal/gitrepo (package 20, which returns the one ConflictReport type on a conflict) for base..head onto the onto-commit under a 30 second deadline; write no ref and leave no worktree or temporary ref",
+        "Store the result only when the change is still draft or open and its head and onto-commit are still the ones computed; otherwise discard it and leave the change pending for the newer pair",
+        "When the target branch does not exist: leave unknown, clear nothing else, and run the landing re-evaluation of package 22 so that landing reports blocked with reason target_not_found",
+        "When the trial rebase returns a non-conflict error or passes its deadline: cancel the git process, leave unknown, log the workspace slug and change number, and go on with other changes",
+        "Start the worker from internal/hub/change.go with the configured debounce and stop it on shutdown"
+      ],
+      "touches": [
+        "internal/change/mergeable.go",
+        "internal/change/mergeable_test.go",
+        "internal/config/",
+        "internal/store/",
+        "internal/hub/change.go"
+      ],
+      "depends_on": [
+        1
+      ],
+      "done_when": [
+        "`go test ./internal/change/... ./internal/config/... -count=1 -race` passes"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Announce conflicts and landable changes as events",
+      "criteria": [
+        "REQ-8"
+      ],
+      "steps": [
+        "Add the event behaviours to internal/change/landable_test.go with the real event log and confirm they fail",
+        "Add one exported function that stores a mergeability result for a change with the pair of commits it holds for, in the caller's transaction, and use it for every computation: on conflict after clean or after no value, store the ConflictReport of internal/gitrepo and write parley.change.conflict with actor system and metadata number, ref, version, head_sha, files (the conflicted paths) and needs_restack (the change's current flag); on conflict after conflict, replace the report and write nothing; on clean, clear the report. Package 24 stores the conflict of a failed restack through this same function, so that one place writes mergeable, the report and the event",
+        "Add the announcement step as one exported function, AnnounceLandable in internal/change/landable.go, the only writer of parley.change.ready, which takes the store transaction and the change (workspace and number) and which package 27 calls in every transaction that stores a landing: when the change is open, its landing.status is ready and its mergeable is clean, and the stored announced head differs from head_sha, write parley.change.ready (actor system, metadata number, ref, version, head_sha) and store head_sha as announced; when the change is not landable and its mergeable is clean or conflict, clear the announced head; when mergeable is unknown, do nothing",
+        "Store the announced head on the change (a schema migration registered with internal/store) and add an exported function that clears it, for the retarget of task 6",
+        "Call the announcement step in the transaction that stores each mergeability result, after the conflict handling",
+        "Write every event through internal/event in the same transaction as the value it reports; when the event write or the transaction fails, store nothing, leave mergeable unknown, log, and leave the change to its next trigger",
+        "Give every event resource_type change, resource_id the decimal number, the target workspace and the change's session_id when it has one"
+      ],
+      "touches": [
+        "internal/change/landable.go",
+        "internal/change/landable_test.go",
+        "internal/change/mergeable.go",
+        "internal/store/"
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Move a change between draft and open",
+      "criteria": [
+        "REQ-3"
+      ],
+      "steps": [
+        "Add the state behaviours to internal/change/edit_test.go and confirm they fail",
+        "On state open for a draft, after the intent rule of task 2 passed: set the state, run the landing re-evaluation of package 22 in the same transaction, and write parley.change.open with the caller as actor and metadata number, ref, version, head_sha, title, target_branch, source_workspace, source_branch, depends_on and was_draft true",
+        "On state draft for an open change: set the state and run the landing re-evaluation so that landing is blocked with reason draft; keep versions, labels, auto_land and mergeable; write no event",
+        "Treat a state equal to the current one as no edit: no event, updated_at untouched when nothing else changed",
+        "Run the announcement step of task 4 in the same transaction after either transition, so that a draft marked ready that is already clean is announced after its parley.change.open, and a change moved to draft forgets its announcement"
+      ],
+      "touches": [
+        "internal/change/edit.go",
+        "internal/change/edit_test.go"
+      ],
+      "depends_on": [
+        2,
+        4
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Retarget a change with PATCH",
+      "criteria": [
+        "REQ-4"
+      ],
+      "steps": [
+        "Add the retarget behaviours to internal/change/edit_test.go on a repository with diverged branches and confirm they fail",
+        "Treat a target_branch equal to the current one as no edit",
+        "Validate a differing target with the target validator package 22 uses at open, so that the answers are the same: 400 target_not_found, 400 invalid_request for the change's own source branch, 403 integration_branch",
+        "Refuse with 409 conflict when the change has a depends_on or at least one draft or open dependant; the closed-change rule of task 2 already covers landed and abandoned changes",
+        "In one transaction: set target_branch; set base_sha to the merge base of head_sha and the new target head; recompute stats and paths against it with the functions package 22 uses for a version; leave the version records untouched; run the landing re-evaluation (which reports nothing_to_land or merge_commits as structural reasons instead of refusing); set mergeable to unknown; clear the announced head; write parley.change.version with the caller as actor and metadata number, ref, version, head_sha, kind retarget, base_sha, patch_equivalent_to null and draft",
+        "After commit, trigger the mergeability check of task 3",
+        "Allow the retarget when the current target branch no longer exists"
+      ],
+      "touches": [
+        "internal/change/edit.go",
+        "internal/change/edit_test.go"
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Abandon a change and settle its dependants",
+      "criteria": [
+        "REQ-5"
+      ],
+      "steps": [
+        "Add the abandon behaviours to internal/change/lifecycle_test.go, with stacks linked through the change store, and confirm they fail",
+        "Decode the optional body: no body and {} are the same; reason must be a JSON string and dependants one of reparent and abandon, else 400 invalid_request",
+        "Refuse an abandoned or landed change with 409 change_closed",
+        "Add the abandon operation as an exported function taking the change, the reason and the actor, built on the move to state abandoned that package 22 provides (the setter its SourceDeleted and ForkDeleted also use, which reports fork activity), so that package 14 (reclone) and the reconciliation of task 9 use the same code: set state abandoned through that setter, remove the change from the mergeability pending set, clear its announced head, write parley.change.abandon with metadata number, ref, version, head_sha and reason; touch no branch and no version ref",
+        "With draft or open dependants and no dependants member: 409 has_dependants, nothing written",
+        "With dependants abandon: collect every draft or open change above in the stack by following dependants transitively and abandon all of them with the same reason and actor in the one transaction",
+        "With dependants reparent: in the same transaction set each direct dependant's depends_on to the abandoned change's depends_on through the setter of package 22; declare the interface Restacker in internal/change/lifecycle.go (one operation: request the restack of one change with a trigger name, inside a store transaction) with a registration function for package 24, which implements it and owns everything the restack does; call it once per direct dependant with trigger abandon inside the abandon's transaction and roll back on its error, or, when none is registered, set each direct dependant's mergeable to unknown and trigger its check after commit",
+        "Answer 200 with the abandoned change as GET returns it"
+      ],
+      "touches": [
+        "internal/change/lifecycle.go",
+        "internal/change/lifecycle_test.go"
+      ],
+      "depends_on": [
+        1,
+        4
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Restore an abandoned change",
+      "criteria": [
+        "REQ-6"
+      ],
+      "steps": [
+        "Add the restore behaviours to internal/change/lifecycle_test.go on real repositories and confirm they fail",
+        "Run the refusals in this fixed order and stop at the first: not abandoned (409 change_not_abandoned); source workspace has no record (409 source_workspace_gone); another draft or open change has the same source workspace and branch (409 change_exists, the message naming that change's ref, as package 22 answers at open); source branch missing and the last version's head commit missing from the source repository (409 conflict); empty intent while changes.require_intent is true (400 intent_required)",
+        "When the source branch is missing and the commit exists, create the branch at the last version's head with a create-only compare-and-swap of internal/gitrepo; if the branch appeared in the meantime, read its head and go on as for an existing branch",
+        "In one transaction: set state open; run the landing re-evaluation; set mergeable to unknown; write parley.change.restore with the caller as actor and metadata number, ref, version and head_sha; write no parley.change.open; report the source fork to the fork activity recorder of package 22 (ForkActivity) when the source workspace is a fork. Rely on the store's uniqueness of one draft or open change per source so that of two concurrent restores one answers 409 change_exists",
+        "When the source branch points at a commit other than the last version's head, record that commit through the version recording of package 22 with kind ref, the caller as created_by and the caller's credential as creating credential, in the same transaction, after the state change",
+        "After commit, trigger the mergeability check of task 3",
+        "Answer 200 with the change object as GET returns it"
+      ],
+      "touches": [
+        "internal/change/lifecycle.go",
+        "internal/change/lifecycle_test.go"
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Reconcile changes with their source branches at start",
+      "criteria": [
+        "REQ-9"
+      ],
+      "steps": [
+        "Add the reconciliation behaviours to internal/change/reconcile_test.go, stopping and starting the hub on the same directories, and confirm they fail",
+        "Add a reconcile function that lists every draft or open change and, for each, reads the head of its source branch in the source workspace's repository",
+        "Head equal to the current version's head: do nothing, write nothing",
+        "Head differs: record it through the version recording of package 22 with kind ref, created_by actor_type system and no creating credential, which also resets mergeable and writes parley.change.version",
+        "Branch missing while the source workspace exists: call the abandon operation of task 7 with reason source_deleted and actor system",
+        "On an error for one change (repository unreadable, version not recorded): log the workspace slug and change number and continue with the next change; the function returns no error for such failures",
+        "After the pass, add every draft or open change whose mergeable is unknown to the mergeability pending set",
+        "Register the function in internal/hub/change.go as a start hook of package 03, so that it runs after the store and the repositories are open and before the listener accepts connections"
+      ],
+      "touches": [
+        "internal/change/reconcile.go",
+        "internal/change/reconcile_test.go",
+        "internal/hub/change.go"
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Add the edit, ready, draft, abandon and restore commands",
+      "criteria": [
+        "REQ-10.1",
+        "REQ-10.2",
+        "REQ-10.4",
+        "REQ-10.5"
+      ],
+      "steps": [
+        "Add the command behaviours to internal/cli/change_test.go against an httptest server that records requests, running the root command in-process, and confirm they fail",
+        "Add `edit`, `ready`, `draft`, `abandon` and `restore` under the `change` command group in internal/cli/change.go, each taking exactly the two arguments <slug> and <number>, using the HTTP client, output and exit-code helpers of the CLI foundation",
+        "edit: flags --title, --intent, --label and --remove-label (repeatable), --auto-land, --no-auto-land, --target; put a member into the PATCH body only when its flag was given on the command line, so that an empty --title is sent as an empty string",
+        "edit --intent: text as given; @path reads that file; - reads stdin to its end; reuse the helper of `parley change open` when package 22 has one",
+        "edit with label flags: GET the change first; start from its labels, remove the --remove-label values, append the --label values that are not present, and send the result as labels; when the GET fails print its error and send no PATCH",
+        "ready and draft: send PATCH with exactly {\"state\":\"open\"} and {\"state\":\"draft\"}",
+        "abandon: flags --reason and --dependants; send POST …/abandon with a JSON object holding only the members whose flags were given. restore: send POST …/restore without a body",
+        "Report as usage errors, before any request: edit without an edit flag, --auto-land together with --no-auto-land, a --dependants value other than reparent and abandon, a wrong number of arguments"
+      ],
+      "touches": [
+        "internal/cli/change.go",
+        "internal/cli/change_test.go"
+      ],
+      "depends_on": [
+        8
+      ]
+    },
+    {
+      "id": 11,
+      "title": "Add the wait command",
+      "criteria": [
+        "REQ-10.3",
+        "REQ-10.6",
+        "REQ-10.7",
+        "REQ-10.8"
+      ],
+      "steps": [
+        "Add the wait and usage-error behaviours to internal/cli/change_test.go with short poll intervals and confirm they fail",
+        "Add `parley change wait <slug> <number>` with --for (landed, ready, mergeable; default landed), --timeout (default 5m) and --poll-interval (default 5s); an unknown --for value and a non-positive duration are usage errors that send no request",
+        "Poll GET …/changes/<number> at once and then every poll interval under one overall deadline, using the shared waiting helper of the CLI foundation where it fits a condition that is not a terminal state",
+        "Decide each poll with one function from (--for, state, landing.status, mergeable): success for state landed under every --for; success for landed on state landed, for ready on landing.status ready with mergeable clean, for mergeable on mergeable clean; failure on state abandoned under every --for, on landing.status blocked or mergeable conflict for ready, on mergeable conflict for mergeable; otherwise keep waiting",
+        "On success print the last change on stdout and exit 0; on failure print the last change on stdout, the wait_failed envelope on stderr and exit 1; on timeout print nothing on stdout, the wait_timeout envelope on stderr and exit 1; on a hub error print the hub's envelope and exit 1",
+        "Write progress (one line per poll with state, landing.status and mergeable) to stderr only"
+      ],
+      "touches": [
+        "internal/cli/change.go",
+        "internal/cli/change_test.go",
+        "test/e2e/change_lifecycle_test.go"
+      ]
+    }
+  ]
+}

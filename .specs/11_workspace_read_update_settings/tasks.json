@@ -1,0 +1,219 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "11",
+  "spec_name": "workspace_read_update_settings",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/workspace/... ./internal/cli/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "09",
+      "reason": "builds its CLI commands on the client, output and exit-code helpers of the CLI foundation"
+    },
+    {
+      "spec": "10",
+      "reason": "uses the workspace record, its store and POST /workspaces, and through it the access rule, the event log, the HTTP conventions and the CLI foundation"
+    },
+    {
+      "spec": "52",
+      "reason": "emits its hub events through the event log component"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Render the workspace response object and serve GET /workspaces/:slug",
+      "criteria": [
+        "REQ-1",
+        "REQ-2"
+      ],
+      "steps": [
+        "Add the behaviours of the response object to internal/workspace/response_test.go and of the single read to internal/workspace/read_test.go, as table-driven tests over httptest, and confirm they fail",
+        "Complete RenderWorkspace of package 10 (internal/workspace/response.go), the one encoder that turns a workspace record and the caller's access level into the response object, so that it emits every stored field, each nullable one emitted as null when it has no value, timestamps in RFC 3339 UTC with whole seconds",
+        "Compute org_slug from the workspace's organization and access from the level the access component of package 07 reports for the caller; never derive access from token scopes",
+        "Compute hub_url from server.external_url with one trailing slash removed, the organization slug and the workspace slug; emit null when external_url is empty",
+        "Emit settings from EffectiveSettings of package 10's settings registry, which returns {} until the next task registers the keys",
+        "Register GET /api/v1/workspaces/{slug} on the router of package 02, declared with the scope workspaces:read (which a PAT holding workspaces:write also satisfies) and the access need read, so that the scope check and the access rule run before the handler in the order of PLAT-FR-013",
+        "Answer 200 with the rendered object for every status and for both kinds; let the access component produce the 404 for an unreadable or unknown slug so that the two bodies are identical",
+        "Confirm with a test that the create route of package 10 answers with the same 30 members, because it renders through the same RenderWorkspace; add no second encoder"
+      ],
+      "touches": [
+        "internal/workspace/response.go",
+        "internal/workspace/response_test.go",
+        "internal/workspace/read.go",
+        "internal/workspace/read_test.go"
+      ],
+      "done_when": [
+        "`go test ./internal/workspace/... -count=1` passes",
+        "GET of an unreadable workspace and of an unknown slug return byte-identical bodies in the test"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Compute the effective settings document",
+      "criteria": [
+        "REQ-4"
+      ],
+      "steps": [
+        "Add the behaviours of effective values to internal/workspace/settings_test.go, the glob table to internal/workspace/branchglob_test.go and the fork case to internal/workspace/read_test.go and confirm they fail",
+        "Define the settings table once, in the order of the PRD: 21 keys, each with its type (bool, enum with its listed strings, URL string, list of branch globs) and its default; every later rule reads this one table. Add RegisterSettingKeys(registry), which registers each key of the table with RegisterSetting on the SettingsRegistry that package 10 declared; the hub's composition in internal/hub calls it once on the registry the workspace service is built with, and the tests of this package call it on theirs",
+        "Keep in the store only the keys a caller set explicitly, as one JSON document per workspace, in the stored settings document of the workspace record that package 10 created; add no column",
+        "Complete EffectiveSettings(stored, default_branch) of package 10 through the default functions of the registered keys: every key of the table with the stored value when present, else the default; protected_branches defaults to a list holding default_branch, or to the empty list while default_branch is null, and a stored list (the empty one included) is returned as it is",
+        "For a fork, compute settings from the parent's stored settings and the parent's default_branch at read time, so that a later change of the parent shows in the fork",
+        "Add the one branch-glob matcher of the repository to internal/workspace/branchglob.go: MatchBranchGlob(glob, branch) matches the glob against the whole branch name, case-sensitive, where * is any run of characters except /, ** is any run including /, and every other character, ? included, is itself; MatchAnyBranchGlob(globs, branch) reports whether one of a list matches, and an empty list matches nothing; ValidateBranchGlob(glob) accepts 1 to 255 code points that pass ValidateBranchName of package 10 with the character * permitted. Packages 13, 18 and 27 call these functions and write no matcher of their own"
+      ],
+      "touches": [
+        "internal/workspace/settings.go",
+        "internal/workspace/settings_test.go",
+        "internal/workspace/response.go",
+        "internal/workspace/read_test.go",
+        "internal/workspace/branchglob.go",
+        "internal/workspace/branchglob_test.go",
+        "internal/hub/workspace.go"
+      ],
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Validate and apply a settings value on create and update",
+      "criteria": [
+        "REQ-5",
+        "REQ-6"
+      ],
+      "steps": [
+        "Add the validation tables to internal/workspace/settings_test.go and the merge, reset and all-or-nothing behaviours to internal/workspace/update_test.go and confirm they fail",
+        "Use ApplySettings(current stored settings, raw JSON value) of package 10, which returns the new stored settings or an invalid-request error (null clears every stored key; anything that is not an object is an error; a key with value null is removed from the stored set; keys not given are kept), and give every key of the table its Validate function by the rules of this task",
+        "Validate bool keys (a JSON boolean only) and enum keys (one of the listed strings, exact case)",
+        "Validate URL keys: a JSON string that after trimming surrounding whitespace is empty or parses as an absolute https URL with a non-empty host and no userinfo, query or fragment; store the trimmed string; never repeat a URL's userinfo in an error message",
+        "Validate protected_branches: a JSON array of at most 50 distinct strings, each 1 to 255 code points, each passing ValidateBranchGlob of the previous task",
+        "Complete ApplySettings with the choice of the reported key: an unknown key first (message containing unknown setting \"<key>\", the first in byte order when several), otherwise the first invalid key in table order; decode the object without relying on member order",
+        "Return the new stored settings only when every key is valid, so that the caller writes all of them or none",
+        "Add the smallest PATCH /api/v1/workspaces/{slug} handler that accepts a body with settings alone, declared with the scope workspaces:write and the access need write, applies it with Apply inside one store transaction and answers 200 with the rendered workspace; the next task completes the handler",
+        "Change nothing in the create handler of package 10: it already applies its settings member with ApplySettings starting from the empty stored set, so the rules registered here reach POST /api/v1/workspaces through the registry; prove it with the create test of this task, where an invalid value answers 400 invalid_request before anything is stored"
+      ],
+      "touches": [
+        "internal/workspace/settings.go",
+        "internal/workspace/settings_test.go",
+        "internal/workspace/update.go",
+        "internal/workspace/update_test.go"
+      ],
+      "depends_on": [
+        2
+      ]
+    },
+    {
+      "id": 4,
+      "title": "List the workspaces a caller can read",
+      "criteria": [
+        "REQ-3"
+      ],
+      "steps": [
+        "Add the list behaviours to internal/workspace/read_test.go (readable set per caller, default filters, parent filter, order and paging, bad boolean parameters) and confirm they fail",
+        "Register GET /api/v1/workspaces with the scope workspaces:read; it names no workspace, so it has no per-workspace access need",
+        "Take the caller's readable set from the access component of package 07 and query only inside it, so that a narrowing of that set (a bound token, package 08) narrows the list without a change here",
+        "Parse include_archived and include_forks: absent or false excludes, true includes, any other value is 400 invalid_request",
+        "Apply the filters: status archived only with include_archived=true; kind fork only with include_forks=true or a parent parameter; with parent, only records whose parent_slug equals it, and an empty page when that slug is unknown, unreadable or a fork",
+        "Order by created_at descending then slug ascending in the query itself, and page with the limit and cursor helpers of package 02, encoding the pair (created_at, slug) of the last item in the cursor",
+        "Render each item with the response object, with the access level the caller has on that item; return items as an empty array when nothing matches"
+      ],
+      "touches": [
+        "internal/workspace/read.go",
+        "internal/workspace/read_test.go"
+      ],
+      "depends_on": [
+        2
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Update display name and description under the update rules",
+      "criteria": [
+        "REQ-7"
+      ],
+      "steps": [
+        "Add the update behaviours to internal/workspace/update_test.go (given fields only, resets, body shape, refused fields, length limits, archived, access and scope, the fork case) and confirm they fail",
+        "Complete the PATCH handler around one table of fields per kind: mutable for a repository workspace are display_name, description, org_id, settings; for a fork display_name and description; immutable for both are slug, kind, git_url, default_branch, owner_id, workspace_mode, upstream_url, integration_branch, parent_slug, fork_point. Keep the table in one place, with the fork-only names ttl, purpose and auto_change in it, and export two registrations for packages 15 and 16, so that they change no rule written here: RegisterForkField(name, handler), where the handler validates the JSON value of one fork-only field and stores it inside the update's transaction, and RegisterForkUpdateGuard(guard), a function the handler calls for every update of a fork after the body is valid and before anything is written, whose API error is answered unchanged. A fork-only field with no handler registered is 400 invalid_request on a fork",
+        "Check the body in this order and stop at the first failure: not a JSON object; an immutable field present (whatever its value); a field that does not apply to the kind (ttl, purpose or auto_change on a repository workspace: invalid_request; org_id or settings on a fork: not_supported_on_fork); no mutable field present; then the values",
+        "Distinguish a member that is absent from one that is null: decode the body so that presence is known for every field",
+        "Validate display_name (null, or a string of at most 128 code points) and description (null, or a string of at most 1024 code points); null or an empty display_name stores the slug, null description stores the empty string",
+        "After validation, refuse a workspace in status archived with 409 workspace_archived; every other status is updated",
+        "Write the given fields and updated_at in one store transaction and answer 200 with the rendered workspace; a refusal writes nothing, updated_at included",
+        "Confirm through the tests that the scope check and the access rule answer before the handler: a member gets 403 forbidden also on an archived workspace, a PAT without workspaces:write gets 403 insufficient_scope, a caller without read access gets the 404 of an unknown slug"
+      ],
+      "touches": [
+        "internal/workspace/update.go",
+        "internal/workspace/update_test.go"
+      ],
+      "depends_on": [
+        3
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Move a workspace and its forks to another organization",
+      "criteria": [
+        "REQ-8"
+      ],
+      "steps": [
+        "Add the organization-move behaviours to internal/workspace/update_test.go and confirm they fail",
+        "Resolve org_id in the body: null means the personal organization of the workspace's owner; a string is looked up as an organization id and then as a slug through internal/identity; anything else, or a string that names no organization, is 400 invalid_request",
+        "After body validation and before the archived check, require that the workspace's owner (not the caller) is a member of the target organization, else 403 forbidden",
+        "In the update's transaction set org_id on the workspace and on every record whose parent_slug is the workspace; a failure of any of these writes rolls all of them back and answers 500",
+        "Confirm that the response and later reads show the new org_id, org_slug and hub_url for the workspace and its forks, and that the access rule now grants read to the new organization's members and no longer to the old one's"
+      ],
+      "touches": [
+        "internal/workspace/update.go",
+        "internal/workspace/update_test.go"
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Emit parley.workspace.update with the update",
+      "criteria": [
+        "REQ-9"
+      ],
+      "steps": [
+        "Add the event behaviours to internal/workspace/update_test.go against the real event log of internal/event and confirm they fail",
+        "Inside the update's store transaction write one event through the event component of package 52: type parley.workspace.update, workspace and resource_id the slug, resource_type workspace, the caller as actor",
+        "Set metadata.fields to the mutable field names that were present in the body, in the fixed order display_name, description, org_id, settings, ttl, purpose, auto_change (the last three appear only when their handlers of packages 16 and 15 are registered and the body of a fork update carried them); put no value of any field into the metadata",
+        "For a fork add metadata.parent_slug",
+        "Emit the event for every successful update, also when no stored value changed; emit nothing on any refusal; when the event write fails, roll the update back and answer 500 internal"
+      ],
+      "touches": [
+        "internal/workspace/update.go",
+        "internal/workspace/update_test.go"
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Add parley workspace list, get and update",
+      "criteria": [
+        "REQ-10"
+      ],
+      "steps": [
+        "Add the command behaviours to internal/cli/workspace_test.go against an httptest hub that records method, raw path, query and body, and confirm they fail",
+        "Add list, get and update under the workspace command group of internal/cli/workspace.go, using the HTTP client, output and exit-code helpers of package 09",
+        "list: flags --include-archived, --include-forks, --parent, --limit, --cursor; send a query parameter only for a flag that was given; print the page",
+        "get: exactly one argument; percent-encode the slug as one path segment; print the workspace",
+        "update: exactly one argument; flags --display-name, --description, --org, --clear-display-name, --clear-description, --clear-org and a repeatable --setting; build the body from the flags that were given (a value flag given with an empty string sends the empty string), a clear flag sending null and winning over its value flag; with none of the flags given, fail as a usage error before any request",
+        "Parse every --setting with ParseSettingFlags, the one parser that package 10 added to internal/cli/workspace.go for parley workspace create (split at the first =; no = or an empty key is a usage error; an empty value is null; for protected_branches a non-empty value is split at commas into a list; otherwise true and false become booleans; anything else stays a string; the last occurrence of a key wins); write no second parser",
+        "Add to the end-to-end test a run of parley workspace create --wait of package 10 against the real hub, which polls GET /api/v1/workspaces/<slug> of this package until the workspace is ready and exits 0: package 10 could test that wait only against a scripted server",
+        "Add test/e2e/workspace_read_update_test.go with the two end-to-end flows of the PRD, starting the hub in-process on a loopback port the system picks and running the CLI command tree against it"
+      ],
+      "touches": [
+        "internal/cli/workspace.go",
+        "internal/cli/workspace_test.go",
+        "test/e2e/workspace_read_update_test.go"
+      ],
+      "depends_on": [
+        4,
+        7
+      ]
+    }
+  ]
+}

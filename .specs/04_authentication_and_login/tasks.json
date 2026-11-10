@@ -1,0 +1,266 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "04",
+  "spec_name": "authentication_and_login",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/identity/... ./internal/cli/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "02",
+      "reason": "uses the request pipeline's authentication position, public routes, the error envelope and the list helper"
+    },
+    {
+      "spec": "03",
+      "reason": "uses the loaded configuration ([[oauth.providers]], external_url), the store with transactions and migration, and the stored admin-token hash and admin_email"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Authenticate the admin token, API keys and PATs on every non-public route",
+      "criteria": [
+        "REQ-1.1",
+        "REQ-1.2",
+        "REQ-1.3",
+        "REQ-1.5",
+        "REQ-1.6"
+      ],
+      "steps": [
+        "Add the task's behaviours to internal/identity/authenticate_test.go and internal/identity/credential_test.go, with a test hub helper in internal/identity/testhub_test.go that builds the request pipeline of internal/server over a store in t.TempDir() and registers the test routes whoami and me, and confirm they fail; packages 05 and 06 extend this helper and do not write a second one",
+        "Create the identity tables through the schema migration of internal/store: users (id, username unique, email unique, full_name, role, status, provider and provider_id unique as a pair, created_at, updated_at), orgs (id, name unique, slug unique, url, owner_id nullable, status, created_at, updated_at), memberships (org_id and user_id unique as a pair, created_at), API keys (key_id, user_id, secret hash, expires_days, expires_at nullable, revoked_at nullable, created_at) and PATs (token_id, user_id, secret hash, name, permissions, paths nullable, workspace nullable, expires_at nullable, revoked_at nullable, created_at)",
+        "Generate credentials from crypto/rand in the three wire formats: an API key as parley_<8>_<32> over [0-9A-Za-z], a PAT as parley_pat_<8>_<32> over [a-z0-9]; store the lowercase hexadecimal SHA-256 of the secret part and never the secret; return the full value once to the caller",
+        "Add the store functions later packages and the tests use: create a user, issue an API key for a user with a lifetime in days, store a PAT for a user with name, permissions, paths, workspace and expiry inside a transaction it is given, generating the id again when it exists (the store-level write that package 06's minting operation wraps; no other production code calls it), and look a key or PAT up by its id",
+        "Recognise a credential by exact format (admin: parley_admin_ plus 64 characters of [0-9a-f]); read it from the Authorization header with the scheme Bearer matched without regard to case, one or more spaces between scheme and credential, surrounding white space ignored",
+        "Answer 401 unauthenticated with the message \"authentication required\" for a missing header, another scheme, an empty credential or an unknown format, and 401 with \"invalid credentials\" for an unknown id or a secret that does not match; compare hashes with crypto/subtle.ConstantTimeCompare, and run the comparison against a fixed dummy hash when the id is unknown so both cases take the same path",
+        "Verify an admin-format token through the verification function of internal/identity/admin.go that package 03 created; answer \"invalid credentials\" when it does not match or the hub is not bootstrapped",
+        "Report the caller to the pipeline: type (admin, api_key, pat), credential id (admin, key_id or token_id), the user with role and status or none, and a PAT's permissions, paths and workspace; expose the same credential check as a function that takes the credential string, so the git server of package 17 can call it with a Basic password",
+        "Add the route declaration \"needs a user\" as a named mark of package 02's route registration, read by the authenticator right after it accepted the credential, which answers the admin token 403 forbidden with the message \"this route needs a user\"",
+        "Install the authenticator in the authentication position of package 02's pipeline and register this package's schema step on the composition of package 03, in internal/hub/identity.go, so every non-public route under /api/v1 is authenticated"
+      ],
+      "touches": [
+        "internal/identity/schema.go",
+        "internal/identity/credential.go",
+        "internal/identity/credential_test.go",
+        "internal/identity/store.go",
+        "internal/identity/authenticate.go",
+        "internal/identity/authenticate_test.go",
+        "internal/identity/testhub_test.go",
+        "internal/hub/identity.go"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Refuse revoked and expired credentials and the credentials of blocked users",
+      "criteria": [
+        "REQ-2"
+      ],
+      "steps": [
+        "Add the task's behaviours to internal/identity/authenticate_test.go and confirm they fail; add the admin-token flow to test/e2e/auth_test.go",
+        "Give the authenticator its clock as a parameter, the system clock in production",
+        "After the secret matched, and only then, check in this order: revoked_at set is 401 \"credential revoked\"; the current time at or after expires_at is 401 \"credential expired\" (null never expires); a user whose status is blocked is 403 forbidden \"user is blocked\"",
+        "Keep a wrong secret answered \"invalid credentials\" with the same body whatever the state of the credential or its user",
+        "Read the credential and its user's status from the store on every request, so that a revocation, a block and an unblock take effect on the next request and blocking changes no credential record"
+      ],
+      "touches": [
+        "internal/identity/authenticate.go",
+        "internal/identity/authenticate_test.go",
+        "test/e2e/auth_test.go"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "List the configured identity providers",
+      "criteria": [
+        "REQ-3"
+      ],
+      "steps": [
+        "Add the task's behaviours to internal/identity/providers_test.go and confirm they fail",
+        "Describe the two supported providers, github and google, with their default authorize, token and user URLs and their scopes (user:email; openid email profile), and resolve each configured [[oauth.providers]] entry against them, taking authorize_url, token_url and userinfo_url from the entry when set",
+        "Build authorize_url as the authorize endpoint with the query parameters client_id and scope, plus response_type=code for google",
+        "Register the public route GET /auth/providers: answer the configured providers ordered by name through the list helper of internal/server, each as {name, authorize_url}, with Cache-Control: public, max-age=300; an empty configuration answers an empty items array",
+        "Never copy client_secret into the answer",
+        "Register the route on the hub's composition in internal/hub/identity.go, from the loaded configuration"
+      ],
+      "touches": [
+        "internal/identity/provider.go",
+        "internal/identity/providers_test.go",
+        "internal/identity/routes.go",
+        "internal/hub/identity.go"
+      ],
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Exchange an OAuth code and read the user's identity from the provider",
+      "criteria": [
+        "REQ-4"
+      ],
+      "steps": [
+        "Add the task's behaviours to internal/identity/oauth_test.go, against a fake provider built on httptest that records its requests, and confirm they fail",
+        "Add the provider client with one operation that takes a provider name, a code and a redirect_uri and returns an identity {provider, provider_id, username, full_name, email} or an error of the kind rejected or upstream; the HTTP client and the timeout (15 seconds by default) are parameters",
+        "Exchange the code with one form-encoded POST to the token URL carrying client_id, client_secret, code, redirect_uri and grant_type=authorization_code and the header Accept: application/json",
+        "Treat a JSON answer with an error member and a status below 500 as rejected, and every other answer without an access token (network error, status of 500 or above, a body that is not a JSON object, no access_token) as upstream",
+        "Read the GitHub identity from the user URL with Authorization: Bearer: id as a decimal string, login, name, email; when email is null or empty read the user URL with /emails appended and take the entry with primary and verified both true",
+        "Read the Google identity from the user URL: sub, name as username and full name, email only when email_verified is true",
+        "Trim the username; when it is empty use <provider>-<provider_id>",
+        "Return upstream when the user URL or the e-mail list does not answer 200 with the expected JSON, or when the id or the verified e-mail is missing",
+        "Bound each call by the timeout and close the connection when it passes; build error texts from fixed words only, never from the code, the client secret, the access token or the provider's body"
+      ],
+      "touches": [
+        "internal/identity/oauth.go",
+        "internal/identity/oauth_test.go"
+      ],
+      "depends_on": [
+        3
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Create the user, the personal org and an API key at a first login",
+      "criteria": [
+        "REQ-5"
+      ],
+      "steps": [
+        "Add the task's behaviours to internal/identity/login_test.go and internal/identity/slug_test.go and confirm they fail; the handler takes the provider client as an interface so the tests can set the identity it returns, and its clock as a parameter",
+        "Register the public route POST /auth/callback, not a create route (so Idempotency-Key is ignored): decode the body {provider, code, redirect_uri, expires}, read the identity through the provider client, and run the sign-in",
+        "Sign-in, in one store transaction: look the user up by provider and provider_id; when none exists create the user with status active, the username and e-mail of the identity and the provider's display name as full_name",
+        "When the username is another user's, try <name>-2 to <name>-10 in order; when none is free fail with a conflict",
+        "Set the role to admin when the e-mail equals the stored bootstrap admin_email ignoring letter case and no user with role admin exists in any status; otherwise user",
+        "Derive the personal org's slug from the final username: lowercase, replace characters outside [a-z0-9_-] with -, collapse runs of -, trim leading and trailing - and _; fewer than 2 characters left gives u-<first 8 characters of the user id>; a leading digit gets the prefix u-; a taken slug tries <slug>-1 to <slug>-10 in order",
+        "Create the org with name equal to the username, owner_id the user and status active, and the membership of the user, in the same transaction; export this creation as one function that takes an open transaction, the user's fields and the role and returns a conflict error when the username, the e-mail or the provider identity is taken, an org has the username as its name, or no slug is free; the sign-in picks the username suffix and the role before calling it, and package 05 calls it from POST /users with role user",
+        "Issue an API key for the user with the requested lifetime (expires_at is the login time plus expires x 24 hours, null for 0, 90 days when absent) and answer 200 {user, api_key: {key, key_id, expires_at}} with timestamps written through internal/server/timefmt of package 02",
+        "Answer 409 conflict and roll the whole transaction back when the e-mail belongs to another user, an org already has the username as its name, or no free username or slug is found"
+      ],
+      "touches": [
+        "internal/identity/login.go",
+        "internal/identity/login_test.go",
+        "internal/identity/slug.go",
+        "internal/identity/slug_test.go",
+        "internal/identity/routes.go",
+        "internal/identity/store.go",
+        "internal/hub/identity.go"
+      ],
+      "depends_on": [
+        1,
+        4
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Refresh an existing user at login and replace the user's API keys",
+      "criteria": [
+        "REQ-6"
+      ],
+      "steps": [
+        "Add the task's behaviours to internal/identity/login_test.go and confirm they fail",
+        "When the identity matches a user by provider and provider_id and the user is blocked, answer 403 forbidden with the message \"user is blocked\" and change nothing",
+        "Otherwise refresh email and username from the identity and set updated_at; keep id, role, full_name, created_at and the personal org untouched",
+        "When the new username belongs to another user, keep the old username and go on; when the new e-mail belongs to another user, answer 409 conflict and roll back",
+        "In the same transaction, for a new and for an existing user alike, set revoked_at on every API key of the user that is neither revoked nor expired, then issue the new key; leave already revoked keys, the user's PATs and other users' keys untouched"
+      ],
+      "touches": [
+        "internal/identity/login.go",
+        "internal/identity/login_test.go",
+        "internal/identity/store.go"
+      ],
+      "depends_on": [
+        2,
+        5
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Validate the login callback and report provider failures",
+      "criteria": [
+        "REQ-7",
+        "REQ-1.4"
+      ],
+      "steps": [
+        "Add the task's behaviours to internal/identity/login_test.go and internal/identity/providers_test.go, running the real provider client against the fake provider, and confirm they fail",
+        "Validate the body before any call to the provider: provider, code and redirect_uri are required strings, code is non-empty, provider names a configured provider, expires is absent, null or one of the integers 0, 30, 60 and 90; a violation is 400 invalid_request",
+        "Validate redirect_uri: parse it as an absolute URL; allow scheme http with host localhost or 127.0.0.1 and any port and path; allow a URL whose scheme, host and port (with the scheme's default port filled in) equal those of [server].external_url when that is set; refuse everything else, including URLs with user information, with 400 invalid_request",
+        "Map the provider client's errors: rejected is 401 unauthenticated; upstream, including a timeout and an identity without id or verified e-mail, is 502 upstream_error; both with fixed messages that contain no code, secret, token or provider body",
+        "Make sure every refusal leaves the store unchanged: no user, org, membership or key created and no key revoked",
+        "Wire the production provider client, with its 15-second timeout and the configured providers and external_url, into the callback route registered in internal/hub/identity.go",
+        "Confirm both public routes answer the same with no Authorization header and with one that would fail authentication"
+      ],
+      "touches": [
+        "internal/identity/routes.go",
+        "internal/identity/login.go",
+        "internal/identity/login_test.go",
+        "internal/identity/providers_test.go",
+        "internal/identity/redirect.go",
+        "internal/hub/identity.go"
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Store a credential with parley login --api-key and save the client configuration file",
+      "criteria": [
+        "REQ-8",
+        "REQ-9"
+      ],
+      "steps": [
+        "Add the task's behaviours to internal/cli/login_test.go and internal/cli/config_test.go, against a stub hub built on httptest, and confirm they fail",
+        "Use github.com/BurntSushi/toml, which package 03 added to go.mod; add no second TOML module",
+        "Create internal/cli/config.go, the file package 09 later extends into the one read and save of every command, and locate the config file: $PARLEY_CONFIG_DIR/config.toml when the variable is set and non-empty, otherwise .parley/config.toml under the user's home directory",
+        "Read the file into a map; a missing file is an empty map; a file that is not valid TOML fails parley login before any request with exit status 2 and a client_error envelope",
+        "Save: set endpoint_url (without trailing slashes), api_key and user_id in the map, keep every other key, create the directory with mode 0700 when missing, write a temporary file with mode 0600 in the same directory and rename it over config.toml; on failure remove the temporary file and report client_error with a message that says the credential was accepted and not saved",
+        "Add the command parley login to the root command with the flags --provider (default github), --expires (default 90) and --api-key; resolve the hub URL from --endpoint-url, PARLEY_ENDPOINT_URL and the file key endpoint_url, in that order; with none, fail with exit status 2 and a client_error that names all three",
+        "Key flow, chosen by the flag --api-key alone: take the credential from the flag, or from stdin when the value is -, trimmed; an empty credential is a usage_error; send GET <hub>/api/v1/user with Authorization: Bearer and a 30-second timeout",
+        "On 200 save the file, print the User on stdout as one JSON document indented by 2 spaces with a trailing newline, and print \"Logged in as <username>\" on stderr; exit 0",
+        "On a hub error print the envelope on stderr exactly as received and exit 1; on a connection failure or an answer that is not a JSON object print an envelope with code 0 and error_type client_error and exit 2; in both cases print nothing on stdout and save nothing",
+        "Give the login command the error type it needs for this (exit status plus envelope) in internal/cli/login.go; package 09 replaces it with its shared error types and exit-code mapping and moves login onto its client"
+      ],
+      "touches": [
+        "go.mod",
+        "go.sum",
+        "internal/cli/config.go",
+        "internal/cli/config_test.go",
+        "internal/cli/login.go",
+        "internal/cli/login_test.go",
+        "internal/cli/root.go"
+      ],
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Sign in through the browser with parley login",
+      "criteria": [
+        "REQ-10"
+      ],
+      "steps": [
+        "Add the task's behaviours to internal/cli/login_test.go, with a browser opener and a wait the test supplies, and confirm they fail; add the first-login and second-login flows to test/e2e/login_test.go with a fake GitHub",
+        "Validate --expires (0, 30, 60 or 90) before any request; another value is a usage_error with exit status 2",
+        "Fetch GET <hub>/api/v1/auth/providers without a credential and pick the item whose name equals --provider; a hub error is printed as received with exit status 1; an unreachable hub, an unreadable answer or a provider that is not listed is a client_error with exit status 2, the last naming the providers the hub lists",
+        "Listen on 127.0.0.1 port 0; build the URL to open by adding redirect_uri=http://127.0.0.1:<port>/callback and a state of 32 hexadecimal characters from crypto/rand to the provider's authorize_url as query parameters, keeping the parameters it has",
+        "Open the URL with the opener (open on macOS, xdg-open on Linux, rundll32 url.dll,FileProtocolHandler on Windows; a parameter of the command's constructor); when it fails print the URL on stderr and keep waiting",
+        "Serve GET /callback once: a code together with the state that was sent answers 200 with a short HTML success page; another state, an error parameter or a missing code answers 400 with a short HTML failure page and fails the login with client_error, exit status 2; compare the state in constant time",
+        "Wait at most 120 seconds (a parameter of the constructor) for the redirect; on expiry fail with client_error, exit status 2; close the listener on every way out",
+        "Send POST <hub>/api/v1/auth/callback with {provider, code, redirect_uri, expires} and no Authorization header; a hub error is printed as received with exit status 1",
+        "On 200 save endpoint_url, api_key.key and user.id through the config file code, print the user object alone on stdout, indented by 2 spaces, and \"Logged in as <username>\" on stderr; never print the key"
+      ],
+      "touches": [
+        "internal/cli/login.go",
+        "internal/cli/login_test.go",
+        "internal/cli/browser.go",
+        "test/e2e/login_test.go"
+      ],
+      "depends_on": [
+        7,
+        8
+      ],
+      "done_when": [
+        "`go test ./test/e2e/... -run Login -count=1` passes against an in-process hub and a fake GitHub"
+      ]
+    }
+  ]
+}

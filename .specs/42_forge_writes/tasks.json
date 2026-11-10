@@ -1,0 +1,256 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "42",
+  "spec_name": "forge_writes",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/forge/... ./internal/cli/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "41",
+      "reason": "provides forge detection and configuration, the forge client, the result types, the error mapping and the `issue` and `pr` command groups the write routes and commands build on"
+    },
+    {
+      "spec": "09",
+      "reason": "provides the command helper, HTTP client, output and exit codes the nine write commands use"
+    },
+    {
+      "spec": "52",
+      "reason": "provides the event component every write event is recorded through"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Run the shared checks on write routes and create issues",
+      "criteria": [
+        "REQ-1",
+        "REQ-3.1"
+      ],
+      "steps": [
+        "Read what package 41 left in internal/forge: the resolution of workspace, target and forge configuration (repository, forge kind, API URL, credential kind, and the parent for a task fork), the forge client, the issue type with its GitHub and GitLab mappings, and the failure mapping. Use those parts under the names they have; do not write a second resolver, client or mapping",
+        "Extend the fake forge of package 41, internal/forge/forgetest, for this package's tests instead of writing a second one: add the write endpoints of GitHub and of GitLab for one repository, keep issues, labels, comments and pull requests in memory, record every request (method, escaped path, headers, body) and let a test make it fail, stall or hold a request",
+        "Add the behaviours of this task to internal/forge/write_test.go and internal/forge/issue_write_test.go and confirm they fail. Write the tables that run over every write route against a list of write routes in the test file, to which each later task adds its routes",
+        "Add one frame every write handler runs through, in internal/forge/write.go, built on the route helper of package 41 (internal/forge/route.go) with the scope `forge:write` and the need write, and on the hook that helper leaves for the archived and credential checks: the route needs the scope `forge:write` and write access (403 insufficient_scope, 403 forbidden, 404 not_found as the platform's check order gives them), then in this order: target; path parameters and the body rules that do not depend on the forge kind; archived workspace (409 workspace_archived) or, through a fork, archived parent (409 parent_archived); forge configuration (422 forge_api_url_invalid, 422 forge_unknown); the checks that depend on the forge kind; credential kind `none` (422 forge_credential_missing); the call",
+        "Give each route two validation hooks in the frame, one that runs before the archived check and one that runs after the forge kind is known, so that later tasks place their rules at the right step",
+        "For a fork's slug, act on the parent: require write access on the parent (403 forbidden without it), use the parent's repository, credential and settings, including target=upstream. A fork-bound token of a user with that access is accepted",
+        "Send the stored credential as package 41's client does for kind `pat` and `basic`; for target=upstream use the upstream repository, API URL and credential, falling back to the origin credential",
+        "Refuse before the call without sending anything to the forge and without recording an event; the frame, not each handler, guarantees it",
+        "Add POST /api/v1/workspaces/{slug}/issues: `title` required, `body`, `labels`, `assignees` optional; create the issue with the set fields (GitHub: POST /repos/<owner>/<name>/issues with title, body, labels, assignees; GitLab: POST /projects/<owner%2Fname>/issues with title, description and labels as one comma-separated string); answer 201 with the issue through package 41's issue mapping",
+        "Mount the route where the hub composes its routes (internal/hub), next to package 41's forge routes"
+      ],
+      "touches": [
+        "internal/forge/write.go",
+        "internal/forge/write_test.go",
+        "internal/forge/issue_write.go",
+        "internal/forge/issue_write_test.go",
+        "internal/forge/forgetest/",
+        "internal/hub/"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Validate write bodies and measure text before sending",
+      "criteria": [
+        "REQ-2"
+      ],
+      "steps": [
+        "Add the body and limit behaviours to internal/forge/write_test.go as tables keyed by route and confirm they fail for the create-issue route; later tasks add the rows of their routes",
+        "Add body decoding helpers to internal/forge/write.go: a JSON object is required unless the route says otherwise; malformed JSON, a non-object, or a missing body where one is required is 400 invalid_request; unknown members are ignored; a member that is `null` counts as absent",
+        "Add field rules that every write route uses: a required string is present and not blank (blank is empty or Unicode white space only); a string, boolean or list member of the wrong JSON type is refused; a list of names has at most 100 entries, each a non-blank string. Each violation is 400 invalid_request with a message that contains the field's name",
+        "Add the text limit as a check of the step that depends on the forge kind: count Unicode code points, not bytes; more than 65,536 on GitHub or 1,000,000 on GitLab is 413 payload_too_large with a message that contains the field's name, the text's length and the limit; exactly the limit passes",
+        "Apply the rules to the create-issue route: `title` required; `body` a string and measured; `labels` and `assignees` lists of names",
+        "Keep the order of the frame: decoding and field rules run before the archived check, the text limit after forge configuration and before the credential check, so that an oversized text on a workspace with an unknown forge answers 422 forge_unknown"
+      ],
+      "touches": [
+        "internal/forge/write.go",
+        "internal/forge/write_test.go",
+        "internal/forge/issue_write.go"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Record one event per write that reached the forge",
+      "criteria": [
+        "REQ-9",
+        "REQ-8.1",
+        "REQ-8.2"
+      ],
+      "steps": [
+        "Add the event, failure and disconnect behaviours to internal/forge/write_test.go as tables keyed by route and confirm they fail for the create-issue route; later tasks add the rows of their routes. Use an event recorder in place of the event log that notes whether the response had been written when it was called",
+        "Give the frame an event step: when a write handed at least one request to the forge client (also one whose connection failed or whose deadline passed), record exactly one event through the event component of package 52 (EmitNow, the form without a caller's transaction) before the response is written; when it handed none, record nothing",
+        "Fill the event from the route: its type, `resource_type`, `resource_id` (a string; `none` for a failed create of an issue or a pull request), `action`, the caller as actor, the written workspace as `workspace`, and metadata `target`, `ok`, `error_type` when `ok` is false, `number` and `url` when known, plus the route's extra members",
+        "For a call through a fork's slug set `workspace` to the parent and metadata `fork` to the fork's slug; write no `fork` member otherwise",
+        "Never put a title, a body, a comment text, a label description, a credential or the forge's error message into an event; a failed write contributes its `error_type` only",
+        "Answer a failed forge call with the status, `error_type`, message and `Retry-After` of package 41's failure mapping and scrubbing; do not map failures a second time",
+        "Run the forge calls and the event step on a context that is not cancelled when the caller disconnects, keeping the 30-second deadline of each forge request, so that a write runs to its end and records its event",
+        "When the event cannot be recorded, answer 500 internal instead of the write's own answer and do not undo what the forge did",
+        "Wire the create-issue route to the event step: `parley.forge.issue.create`, resource `issue`, the new number, action `create`, `url` the issue's web URL"
+      ],
+      "touches": [
+        "internal/forge/write.go",
+        "internal/forge/write_test.go",
+        "internal/forge/issue_write.go",
+        "internal/hub/"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Update issues",
+      "criteria": [
+        "REQ-3.2",
+        "REQ-3.3",
+        "REQ-3.4",
+        "REQ-3.5"
+      ],
+      "steps": [
+        "Add the update behaviours to internal/forge/issue_write_test.go, add the route to the tables of internal/forge/write_test.go, and confirm they fail",
+        "Add PATCH /api/v1/workspaces/{slug}/issues/{number} on the frame, with package 41's number rule for `{number}`",
+        "Decode `title` (not blank when set), `body` (the empty string is a value and clears the body), `state` (`open` or `closed`), `labels` and `assignees` (an empty list is a value and clears the set); refuse a body that sets none of the five with 400 invalid_request, before the archived check",
+        "Send only the set fields. GitHub: PATCH /repos/<owner>/<name>/issues/<n> with title, body, state, labels, assignees. GitLab: PUT /projects/<owner%2Fname>/issues/<n> with title, description, state_event (`close` for `closed`, `reopen` for `open`) and labels as one comma-separated string, the empty string for an empty list",
+        "On GitLab never send assignees, on create or on update; when `assignees` is the only set field of an update refuse with 400 invalid_request at the step that depends on the forge kind",
+        "Answer 200 with the issue as the forge returns it, through package 41's issue mapping",
+        "Record `parley.forge.issue.update` with resource `issue`, the number, action `update`, and `fields`: the names of the fields sent to the forge, sorted, which on GitLab never include `assignees`"
+      ],
+      "touches": [
+        "internal/forge/issue_write.go",
+        "internal/forge/issue_write_test.go",
+        "internal/forge/write_test.go",
+        "internal/forge/forgetest/",
+        "internal/hub/"
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Close issues and post comments",
+      "criteria": [
+        "REQ-4",
+        "REQ-5"
+      ],
+      "steps": [
+        "Add the close and comment behaviours to internal/forge/issue_write_test.go and internal/forge/pull_write_test.go, add the three routes to the tables of internal/forge/write_test.go, and confirm they fail",
+        "Add POST /api/v1/workspaces/{slug}/issues/{number}/comments and POST /api/v1/workspaces/{slug}/pulls/{number}/comments on the frame: `body` required, not blank, measured against the text limit, sent exactly as given",
+        "Post an issue comment with GitHub POST /repos/<owner>/<name>/issues/<n>/comments or GitLab POST /projects/<owner%2Fname>/issues/<n>/notes; post a pull-request comment with the same GitHub call on the pull request's number or GitLab POST /projects/<owner%2Fname>/merge_requests/<n>/notes",
+        "Answer 201 with exactly `{\"url\": <web URL of the comment>}`, taking the URL from package 41's comment mapping so that a written comment has the URL its read gives",
+        "Record `parley.forge.comment.create` (resource `comment`, the issue number, action `create`) or `parley.forge.pull_request.comment` (resource `pull_request`, the number, action `comment`), each with `url` the comment's web URL",
+        "Add POST /api/v1/workspaces/{slug}/issues/{number}/close on the frame: the body may be absent, empty, `{}` or `{\"comment\": string}`; a `comment` that is not a string is 400 invalid_request; a non-blank comment is measured against the text limit",
+        "With a non-blank comment post it first; when that fails answer its failure and send no close; when it succeeds close the issue (GitHub PATCH issues/<n> with state `closed`; GitLab PUT issues/<n> with state_event `close`). Without one send the close alone. Closing a closed issue is a success",
+        "Answer 200 with the issue the close returned",
+        "Record one `parley.forge.issue.close` per request that reached the forge (resource `issue`, the number, action `close`), with `comment_url` whenever the comment was posted, also when the close then failed, and `url` the issue's web URL on success"
+      ],
+      "touches": [
+        "internal/forge/issue_write.go",
+        "internal/forge/issue_write_test.go",
+        "internal/forge/pull_write.go",
+        "internal/forge/pull_write_test.go",
+        "internal/forge/write_test.go",
+        "internal/forge/forgetest/",
+        "internal/hub/"
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Add, remove and ensure labels",
+      "criteria": [
+        "REQ-6"
+      ],
+      "steps": [
+        "Add the label behaviours to internal/forge/label_write_test.go, add the three routes to the tables of internal/forge/write_test.go, and confirm they fail",
+        "Add POST /api/v1/workspaces/{slug}/issues/{number}/labels on the frame: the body is a bare JSON array of 1 to 100 non-blank strings, anything else is 400 invalid_request. Add the names without replacing the issue's labels (GitHub POST issues/<n>/labels with `labels`; GitLab PUT issues/<n> with `add_labels`, comma-separated). Answer 204 with no body; record `parley.forge.label.add` (resource `label`, the issue number, action `add`, metadata `labels`)",
+        "Add DELETE /api/v1/workspaces/{slug}/issues/{number}/labels/{name} on the frame: the name is the last path segment decoded once by the router; a blank name is 400 invalid_request",
+        "Remove on GitHub with DELETE issues/<n>/labels/<name as one percent-encoded segment>; when the forge answers 404 read the issue: it exists -> 204, it does not -> 404 forge_not_found; any other failure of either call is mapped as usual. Remove on GitLab with PUT issues/<n> and `remove_labels`; its 404 is 404 forge_not_found",
+        "Answer 204 whether or not the issue carried the label; record `parley.forge.label.remove` (resource `label`, the issue number, action `remove`, metadata `label`), with `ok` false and `error_type` forge_not_found when the issue does not exist",
+        "Add POST /api/v1/workspaces/{slug}/labels on the frame: `name` required; `color` optional, six hex digits in either case with or without a leading `#`, default `ededed`; `description` optional string",
+        "Add the label type {name, color, description} to internal/forge/types.go with its GitHub and GitLab mappings (package 41 has none). Look the label up by name (GET labels/<name as one percent-encoded segment> under the repository or project). Found -> answer 200 with it, unchanged, and send nothing else. A 404 -> create it (colour in lower case, without `#` to GitHub, with `#` to GitLab) and answer 201 with the created label. Any other lookup failure is the answer",
+        "When the create is refused because the label now exists (GitHub 422, GitLab 409), look it up once more and answer 200 with it; when that lookup does not find it, answer the create's mapped refusal",
+        "Record `parley.forge.label.create` in every case that reached the forge: resource `label`, the label name, action `create`, metadata `label` and `created` (true only when this call created it); no `number` and no `url`"
+      ],
+      "touches": [
+        "internal/forge/label_write.go",
+        "internal/forge/label_write_test.go",
+        "internal/forge/write_test.go",
+        "internal/forge/forgetest/",
+        "internal/hub/",
+        "internal/forge/types.go"
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Open pull requests",
+      "criteria": [
+        "REQ-7"
+      ],
+      "steps": [
+        "Add the pull-request behaviours to internal/forge/pull_write_test.go, add the route to the tables of internal/forge/write_test.go, and confirm they fail",
+        "Add POST /api/v1/workspaces/{slug}/pulls on the frame: `title`, `head` and `base` required and not blank; `body` optional and measured against the text limit; `draft` an optional boolean, false when not set",
+        "On GitHub send POST /repos/<owner>/<name>/pulls with title, head exactly as given (so `owner:branch` passes through), base, draft, and body when set",
+        "On GitLab send POST /projects/<owner%2Fname>/merge_requests with source_branch = head as given, target_branch = base, title, and description when set; when `draft` is true and the title does not already begin with `Draft: `, prefix it",
+        "Answer 201 with the pull request through package 41's pull-request mapping; on GitLab the number is the merge request's project-level iid",
+        "Let the forge decide whether the branches exist and whether a pull request already exists: its refusal is answered through package 41's mapping (422 forge_rejected), with no lookup before the create",
+        "Record `parley.forge.pull_request.create`: resource `pull_request`, the new number or `none` on failure, action `create`, metadata `head`, `base`, `draft` as requested, and `number` and `url` on success"
+      ],
+      "touches": [
+        "internal/forge/pull_write.go",
+        "internal/forge/pull_write_test.go",
+        "internal/forge/write_test.go",
+        "internal/forge/forgetest/",
+        "internal/hub/"
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Make the creating routes safe to retry",
+      "criteria": [
+        "REQ-8.3",
+        "REQ-8.4"
+      ],
+      "steps": [
+        "Add the replay behaviours to internal/forge/write_test.go with the real idempotency helper of internal/server and confirm they fail",
+        "Mount the five creating routes (POST issues, POST issues/{number}/comments, POST pulls/{number}/comments, POST labels, POST pulls) through the create-route helper of package 02, so that a replay with the same key, caller, route and body answers 200 with the first answer before the write frame runs",
+        "Confirm that a replay hands nothing to the forge client and records no event, that the same key with another body is 409 conflict, and that a failed first request is not recorded, so its retry reaches the forge again and records its own event",
+        "Leave the close route and the add-labels route outside the helper: an `Idempotency-Key` header on them is ignored and every request is carried out",
+        "None of the five answers carries a secret shown once, so no member is declared for removal from the stored answer"
+      ],
+      "touches": [
+        "internal/forge/write.go",
+        "internal/forge/write_test.go",
+        "internal/hub/"
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Add the write commands to the CLI",
+      "criteria": [
+        "REQ-10"
+      ],
+      "steps": [
+        "Add the command behaviours to internal/cli/issue_test.go, internal/cli/pr_test.go and the new internal/cli/label_test.go, against a stub hub, and confirm they fail",
+        "Declare every command through the command helper of package 09 with its method and path, and use its client, output and usage errors; reuse the `--target` flag and the `<number>` check of package 41's read commands",
+        "Add a text-input helper in internal/cli/textinput.go: `--body <text>` gives the text, `--body-file <path>` reads it from the file, `-` reads standard input; the text is passed on byte for byte; both flags together, or a file that cannot be read, is a usage error; a command says whether one of the two is required",
+        "Add to the `issue` group: `create <workspace-slug>` (`--title` required, text input, repeatable `--label` and `--assignee`), `update <workspace-slug> <number>` (`--title`, text input, `--state`, repeatable `--label` and `--assignee`; at least one of them), `close <workspace-slug> <number>` (`--comment`), `comment <workspace-slug> <number>` (text input required)",
+        "Build each body from the flags that were given only: a flag that was not given adds no member; `--body \"\"` on update sends `body` as the empty string; `issue close` sends no body without `--comment`",
+        "Add `issue label <workspace-slug> <number> <label>...` (one or more labels, sent as a bare JSON array, prints `{status: labeled, number, labels}`) and `issue unlabel <workspace-slug> <number> <label>` (the label as one percent-encoded path segment, prints `{status: unlabeled, number, label}`); `number` is printed as a JSON number",
+        "Add the `label` group with `create <workspace-slug> <name>` (`--color`, `--description`) in the new internal/cli/label.go and register the group on the root command; exit 0 for a 200 and for a 201",
+        "Add to the `pr` group: `create <workspace-slug>` (`--title`, `--head`, `--base` required, text input, `--draft` sent only when given) and `comment <workspace-slug> <number>` (text input required)",
+        "Raise every usage error before any request: a bad `<number>`, a missing required flag, both text flags, an unreadable body file, `issue update` without a field flag, a wrong argument count. Send no `Idempotency-Key` header"
+      ],
+      "touches": [
+        "internal/cli/issue.go",
+        "internal/cli/issue_test.go",
+        "internal/cli/label.go",
+        "internal/cli/label_test.go",
+        "internal/cli/pr.go",
+        "internal/cli/pr_test.go",
+        "internal/cli/textinput.go",
+        "internal/cli/root.go",
+        "test/e2e/forge_write_test.go"
+      ],
+      "done_when": [
+        "`parley help --json` lists `issue create`, `issue update`, `issue close`, `issue comment`, `issue label`, `issue unlabel`, `label create`, `pr create` and `pr comment`, each with its method and path"
+      ]
+    }
+  ]
+}

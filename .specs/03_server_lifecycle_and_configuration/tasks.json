@@ -1,0 +1,307 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "03",
+  "spec_name": "server_lifecycle_and_configuration",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./cmd/parleyd/... ./internal/config/... ./internal/store/... ./internal/scrub/... ./internal/identity/... ./internal/maintenance/... ./internal/hub/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "01",
+      "reason": "extends the parleyd run function, the HTTP server with its readiness probes and options, and the shutdown that package 01 delivers"
+    },
+    {
+      "spec": "02",
+      "reason": "fills the server options package 02 defines (body limit, requests per minute, health-probe logging), lets later packages install checks in its pipeline positions, and implements its idempotency record store interface over the transactional store"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Load and strictly validate the configuration file",
+      "criteria": [
+        "REQ-1",
+        "REQ-3.1"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/config/config_test.go as table-driven tests and confirm they fail",
+        "Add github.com/BurntSushi/toml v1.6.0 to go.mod and confirm the signatures recorded in the package's external API against the module",
+        "Create internal/config with a key registry: a key has a section, a name, a type (string, int, bool), a default and an optional validation rule; registering a section.key twice is remembered and fails the next load with an error naming it",
+        "Register the keys this package owns with their defaults and rules: server.bind, server.port, server.external_url, server.max_body_size, database.path, workspace.path, workspace.workers, logging.level, logging.log_health_probes and limits.requests_per_minute; treat [[oauth.providers]] as the one repeatable table, with name, client_id, client_secret, authorize_url, token_url and userinfo_url",
+        "Load takes an environment lookup and a working directory, never the process environment: choose $XDG_CONFIG_HOME/config.toml when the variable is set and non-empty and config.toml in the working directory otherwise; a missing file means all defaults; a file that exists and cannot be read is an error naming its path",
+        "Decode the file into a generic map and walk it against the registry: an unregistered section, an unregistered key, a top-level key, a value of the wrong type and a value its rule refuses each fail the load with an error naming section.key; invalid TOML fails with the line of the syntax error; never return a partly filled configuration",
+        "Parse max_body_size as a positive integer followed by KB, MB or GB in any letter case with powers of 1024 and expose it in bytes; lower-case logging.level; accept external_url empty or as an absolute http or https URL",
+        "Validate the OAuth providers: name is github or google and unique, client_id and client_secret are non-empty, the three URLs default to the provider's public endpoints recorded in the PRD's design decisions and must be absolute http or https URLs when given",
+        "Resolve database.path and workspace.path to absolute paths by the rules of the PRD (defaults under ./data or $XDG_DATA_HOME, a bare file name under $XDG_DATA_HOME when set, other relative paths against the working directory) and expose the data directory and the analytical store's path analytics.db beside the database file",
+        "Expose the loaded configuration with typed accessors for this package's keys, a lookup by section and name for registered keys of other packages, the path that was looked for and the config dir"
+      ],
+      "touches": [
+        "go.mod",
+        "go.sum",
+        "internal/config/config.go",
+        "internal/config/registry.go",
+        "internal/config/config_test.go"
+      ],
+      "done_when": [
+        "`go test ./internal/config/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Replace environment references in configuration values",
+      "criteria": [
+        "REQ-2",
+        "REQ-10"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/config/env_test.go and, for the whole-section registration, to internal/config/section_test.go as table-driven tests and confirm they fail",
+        "After the file is decoded and before values are validated, walk every string value, including those inside [[oauth.providers]] tables and of keys other packages registered, and replace ${NAME} by the variable NAME from the environment lookup and $$ by one $; leave a $ followed by neither { nor $ as it is",
+        "A reference to a variable the lookup does not have fails the load with an error naming the variable and the section.key; a variable set to the empty string yields the empty string",
+        "A ${ without a closing } and a name that does not match [A-Za-z_][A-Za-z0-9_]* fail the load as an invalid value of that key",
+        "Never expand table names, key names, integers or booleans, and never expand before parsing, so that a variable's content cannot change the file's structure",
+        "Validate the replaced value exactly as a literal one, and keep the variable's value out of every error text: errors name the key and the variable, not the content",
+        "Add the whole-section registration RegisterSection(name, validator) to internal/config/registry.go beside the per-key registration: the loader does not check the keys of a registered section; when the file holds the section it hands the section's parsed content (keys, tables and arrays of tables, as a generic map), after the environment references in its string values at any depth are replaced, to the validator once, and the validator's single error fails the load with its message unchanged; without the section the validator is not called",
+        "Expose a registered section on the loaded configuration by name: whether the file held it, and the content the validator was given; registering a section twice, or a section that has registered keys, or a key in a registered section, is remembered and fails the next load with an error naming the section; package 44 registers [sandbox] this way"
+      ],
+      "touches": [
+        "internal/config/env.go",
+        "internal/config/env_test.go",
+        "internal/config/config.go",
+        "internal/config/registry.go",
+        "internal/config/section_test.go"
+      ],
+      "done_when": [
+        "`go test ./internal/config/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Scrub credentials from text",
+      "criteria": [
+        "REQ-8.1",
+        "REQ-8.2",
+        "REQ-8.3",
+        "REQ-8.4",
+        "REQ-8.5",
+        "REQ-8.6"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/scrub/scrub_test.go, the property over generated inputs among them, and confirm they fail",
+        "Create internal/scrub as a leaf package that imports nothing of the project: a scrubber type that is safe for concurrent use, with a method to register a secret value for the life of the process and a Scrub method that takes the text and further values for this call only",
+        "Ignore an empty value and a value that is a substring of the marker [redacted]; replace every occurrence of every other value by the marker, longer values first",
+        "Replace the hub's own credential formats by shape, registered or not: parley_admin_ with 64 lowercase hex characters, parley_pat_ with 8 then 32 characters of [a-z0-9] joined by _, and parley_ with 8 then 32 characters of [0-9A-Za-z] joined by _; keep words that only begin like one",
+        "Remove user information from URLs of any scheme: everything between :// and the last @ before the next /, whitespace or end of text, with that @; keep an @ in a URL path and in plain text",
+        "Look at the result again: if it still holds a non-ignored value, a hub credential or a URL with user information, return the marker alone",
+        "Cut the result to the longest prefix of at most 1024 bytes that ends on a UTF-8 character boundary, after the replacements and never before them",
+        "Keep the order fixed (values, hub credentials, user information, second look, cut) so that scrubbing a scrubbed text changes nothing"
+      ],
+      "touches": [
+        "internal/scrub/scrub.go",
+        "internal/scrub/scrub_test.go"
+      ],
+      "done_when": [
+        "`go test ./internal/scrub/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Open, migrate and transact on the two embedded stores",
+      "criteria": [
+        "REQ-3.2",
+        "REQ-3.3",
+        "REQ-3.4",
+        "REQ-3.5",
+        "REQ-3.6",
+        "REQ-3.7"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/store/store_test.go and confirm they fail",
+        "Add modernc.org/sqlite v1.60.1 to go.mod and confirm that it registers the driver name sqlite and accepts the _pragma and _txlock parameters recorded in the package's external API",
+        "Create internal/store: Open takes the database path, the workspace root and the registered schema steps; it creates the data directory and the workspace root with missing parents and mode 0700, leaving the mode of an existing directory alone, and fails with an error naming the path when one cannot be created",
+        "Open the transactional store at the database path and the analytical store at analytics.db beside it, both in write-ahead-log mode with foreign keys on and a busy timeout long enough that concurrent writers wait for each other instead of failing; a file that is not a database fails the open with an error naming it and is left byte for byte as it was",
+        "A schema step has a unique name, a target store (transactional or analytical) and a function that receives a transaction; refuse a list with a duplicated name before applying anything",
+        "Record applied step names in a table of the store they target; on every open apply the steps that store has not recorded, in registration order, each in one transaction together with its record; a failing step is rolled back, later steps are not applied, and the open fails with an error naming the step",
+        "Give the store a Tx method for the transactional store: commit when the function returns nil; roll back and return the error when it returns one; on a panic roll back and return an error carrying the panic value; library code never terminates the process",
+        "Give the store Ping (both stores answer a trivial query), Close (idempotent; later calls fail with a closed-store error) and read access to the analytical store for the packages that write telemetry and audit"
+      ],
+      "touches": [
+        "go.mod",
+        "go.sum",
+        "internal/store/store.go",
+        "internal/store/migrate.go",
+        "internal/store/store_test.go"
+      ],
+      "depends_on": [
+        1
+      ],
+      "done_when": [
+        "`go test ./internal/store/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Start the hub in one fixed order with flags, logging and readiness",
+      "criteria": [
+        "REQ-4",
+        "REQ-3.8",
+        "REQ-8.7"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/hub/hub_test.go, internal/hub/logging_test.go and cmd/parleyd/main_test.go and confirm they fail; package 01's rejected-arguments table in cmd/parleyd/main_test.go holds no backup row and stays as it is",
+        "Create internal/hub with a Run function that takes a context, the arguments, an environment lookup, the working directory, stdout and stderr and returns the exit status, and a composition value on which later packages register configuration keys, schema steps, start hooks (a name and a function returning an error), background work, maintenance tasks, routes and the checks of the pipeline positions of package 02 (authenticator, binding guard, scope check, access checks), each package in a file of its own under internal/hub; cmd/parleyd's run function and main become thin callers of it with the process's arguments, environment and working directory",
+        "Parse the arguments with the standard flag package: --admin-email takes a string, --reset-admin-token is a boolean, --help prints usage on stdout and returns 0; an undefined flag, --admin-email without a value, a positional argument other than backup, and backup with no directory or more than one print usage on stderr and return 2; usage names both flags and backup <directory>; none of these loads, opens or creates anything",
+        "Build the logger with log/slog: JSON lines on the given stderr, the levels trace, debug, info, warn and error with trace below debug, lines below the configured level dropped, and the message and every string attribute passed through the scrubber of internal/scrub; install it as the default logger of the process",
+        "Run the stages in this order and stop at the first failure: load the configuration; register every provider's client_secret with the scrubber; open the stores; run the bootstrap stage (a function another task fills; here it does nothing); run the start hooks in registration order, each to completion; start the maintenance loop in the background; bind the listener on [server].bind and [server].port",
+        "On a failure before listening, close what was opened, write exactly one JSON line at level error through the scrubbing logger that names the cause (key, path, step, hook name or listen address), write no listening line, call no later hook and return 1",
+        "Build the HTTP server of internal/server from the configuration: the body limit in bytes, the requests per minute and health-probe logging as the options package 02 defines, and one readiness probe that fails when either store does not answer a query",
+        "Register one schema step for idempotency records (key, caller, route, body hash, response body, written-at) and install a store-backed implementation of package 02's record store interface through its server option, in internal/hub/idempotency.go: find by key, caller and route, write, and delete records 24 hours old or older by the hub's clock, so that a record written before a stop is replayed after the next start",
+        "Once the listener is bound, write the listening line with msg listening, addr (the bound host and port), config (the absolute path that was looked for, also when the file is missing) and data_dir (the absolute directory of the database path), exactly once",
+        "Expose test options on Run for the things tests must control without changing behaviour: the registered hooks, tasks, steps and routes of the composition, and an override of the listen port"
+      ],
+      "touches": [
+        "cmd/parleyd/main.go",
+        "cmd/parleyd/main_test.go",
+        "internal/hub/hub.go",
+        "internal/hub/logging.go",
+        "internal/hub/hub_test.go",
+        "internal/hub/logging_test.go",
+        "internal/server/server.go",
+        "internal/hub/idempotency.go",
+        "internal/hub/idempotency_test.go"
+      ],
+      "depends_on": [
+        2,
+        3,
+        4
+      ],
+      "done_when": [
+        "`go test ./internal/hub/... ./cmd/parleyd/... -count=1` passes",
+        "`go build ./cmd/parleyd` succeeds"
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Hand the operator a first admin token",
+      "criteria": [
+        "REQ-5"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/hub/bootstrap_test.go and internal/identity/admin_test.go and confirm they fail",
+        "Create internal/identity/admin.go: a schema step for the admin settings (the bootstrap e-mail and the admin token hash, one row), a reader that returns both or reports that none is stored, a generator that returns parley_admin_ followed by 64 lowercase hex characters from 32 bytes of the system's random source, the hash function (lowercase hex SHA-256 of the whole token), and a verification function that reports whether a presented token's hash equals the stored one, compared in constant time and false when none is stored, which package 04 authenticates with",
+        "Fill the bootstrap stage of the hub's start, after the stores are open and before any start hook: the hub is bootstrapped when a hash is stored; the token file is admin_token in the config dir",
+        "With --reset-admin-token, in any state: generate a token, replace the stored hash, also store the --admin-email address when no hash was stored before and the flag has a non-empty value, write the file over any existing one, and end the run",
+        "Without it, when not bootstrapped and --admin-email has a non-empty value: store the address and the new token's hash, write the file over any leftover one, and end the run; when not bootstrapped and no address is given, go on with the start",
+        "Without it, when bootstrapped: refuse with a start error naming the token file's absolute path while the file exists, calling no start hook; go on with the start when it does not exist, ignoring --admin-email",
+        "Write the token file with mode 0600 and no trailing newline, inside the transaction that stores the hash and the address, so that a file that cannot be written stores nothing and ends the run with status 1 and one error line naming the file",
+        "After a successful write, log the file's absolute path at warn level with the instruction to save the token and delete the file, bind no listener, call no start hook and return 0; never pass the token to the logger, to stdout or to stderr"
+      ],
+      "touches": [
+        "internal/identity/admin.go",
+        "internal/identity/admin_test.go",
+        "internal/hub/bootstrap.go",
+        "internal/hub/bootstrap_test.go",
+        "internal/hub/hub.go"
+      ],
+      "done_when": [
+        "`go test ./internal/identity/... ./internal/hub/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Run the hourly maintenance loop over registered tasks",
+      "criteria": [
+        "REQ-6"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/maintenance/loop_test.go and internal/hub/hub_test.go and confirm they fail",
+        "Create internal/maintenance: a registry in which a task is a name and a function taking a context and returning an error; an empty name and a name registered before are refused with an error naming it, keeping the first task",
+        "Fix the order of the eight known names: retention, secret_reencryption, claim_cleanup, forge_delivery_pruning, token_binding_sweep, patch_purge, fork_expiry, sandbox_record_cleanup; a pass runs the registered ones of these in that order, then every task under another name in registration order, one at a time",
+        "Run takes a context and the source of ticks: it runs one pass at once and one at each tick; the interval constant is one hour and nothing in configuration changes it; the hub passes a one-hour ticker, tests pass a channel",
+        "Never run two passes at once: a tick that arrives while a pass runs is dropped, without blocking the sender and without starting a pass when the running one ends",
+        "A task that returns an error or panics is logged at error level with the members task and error (the text passed through the scrubber) and the pass goes on with the next task; the loop survives",
+        "When the context is cancelled, the running task sees its context done, no further task and no further pass start, Run returns when the running task has returned, and a task that ended because of the cancellation is not logged as failed",
+        "In the hub, start the loop after the last start hook and before the listener is bound, without waiting for the first pass; a registration error in the composition is a start error with exit status 1; a test option of the hub replaces the one-hour ticker by a shorter one for the end-to-end check of a failing task"
+      ],
+      "touches": [
+        "internal/maintenance/loop.go",
+        "internal/maintenance/loop_test.go",
+        "internal/hub/hub.go",
+        "internal/hub/hub_test.go"
+      ],
+      "depends_on": [
+        5
+      ],
+      "done_when": [
+        "`go test ./internal/maintenance/... ./internal/hub/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Stop the hub within thirty seconds",
+      "criteria": [
+        "REQ-7"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/hub/shutdown_test.go and confirm they fail",
+        "Let later packages register background work on the composition: a name, a function that runs until its context is cancelled, and a grace; a grace above 30 seconds counts as 30 seconds; the hub starts each piece of work after the start hooks",
+        "Offer a shutdown notification (a channel that is closed once) that route handlers of long-lived responses watch, and close it at the moment SIGTERM or SIGINT is handled, before any waiting begins",
+        "On the signal: stop accepting connections, close the notification, cancel the context of the maintenance loop and of every piece of background work, then wait at the same time for in-flight requests (15 seconds, the grace of package 01) and for each piece of background work (its own grace; the maintenance loop 15 seconds)",
+        "Stop waiting for anything whose grace has passed, and for everything 30 seconds after the signal; then close the stores, last, and return 0 whether or not a grace passed",
+        "Ignore further SIGTERM and SIGINT signals during the shutdown: they neither restart a grace nor end the process early",
+        "Keep the request grace, the total limit and the loop's grace as fields with the defaults 15 s, 30 s and 15 s that tests scale down",
+        "Make sure a transaction committed before the signal is on disk after the stores are closed, and that the next start on the same data calls every start hook again"
+      ],
+      "touches": [
+        "internal/hub/shutdown.go",
+        "internal/hub/shutdown_test.go",
+        "internal/hub/hub.go",
+        "cmd/parleyd/main.go",
+        "cmd/parleyd/main_test.go"
+      ],
+      "depends_on": [
+        7
+      ],
+      "done_when": [
+        "`go test ./internal/hub/... ./cmd/parleyd/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Snapshot the data of a running hub with parleyd backup",
+      "criteria": [
+        "REQ-9"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/hub/backup_test.go, internal/store/snapshot_test.go and test/e2e/lifecycle_test.go (the first-boot flow and the backup flow of the package's execution paths) and confirm they fail",
+        "Route parleyd backup <directory> in the hub's Run to the backup command; --admin-email or --reset-admin-token together with backup is a usage error with status 2",
+        "The command loads the configuration exactly as the server does and stops with status 1 and one error line naming the key when it is invalid; it binds no listener and runs no bootstrap, start hook, maintenance task or schema step",
+        "Refuse a target that is a non-empty directory or not a directory with status 1 and one line naming it, writing nothing; create a target that does not exist with mode 0700",
+        "Refuse with status 1 and one line naming the database path when the database file does not exist, without creating it",
+        "Add a snapshot function to internal/store that writes a transactionally consistent copy of one store file to a new file while other connections keep writing, opening the source without changing it; confirm the unverified VACUUM INTO behaviour recorded in the package's external API against the driver before relying on it, and use the engine's online copy otherwise",
+        "Write the transactional store under the database file's own name and the analytical store as analytics.db, stores first",
+        "Then copy the workspace root under its own directory name, keeping relative paths and file content, and within each repository copying refs, packed refs and HEAD before the objects, so that every copied ref points at a copied object",
+        "On any failure after the first write, remove everything the command wrote, leave the hub's data unchanged, and return 1 with one error line naming the path that failed",
+        "On success write one log line with the target directory, nothing on stdout, and return 0"
+      ],
+      "touches": [
+        "internal/hub/backup.go",
+        "internal/hub/backup_test.go",
+        "internal/hub/hub.go",
+        "internal/store/snapshot.go",
+        "internal/store/snapshot_test.go",
+        "test/e2e/lifecycle_test.go"
+      ],
+      "depends_on": [
+        6,
+        8
+      ],
+      "done_when": [
+        "`go test ./internal/hub/... ./internal/store/... ./test/e2e/... -count=1` passes",
+        "`go build ./cmd/parleyd` succeeds"
+      ]
+    }
+  ]
+}

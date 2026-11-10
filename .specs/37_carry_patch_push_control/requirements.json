@@ -1,0 +1,740 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "37",
+  "spec_name": "carry_patch_push_control",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Integration branch and backup refs",
+      "rationale": "The integration branch is trusted only while nobody but the hub can write it, and a backup of a replaced patch tip is worth nothing if a client can overwrite it.",
+      "system": "carry-patch controller",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "unwanted",
+          "condition": "the controller is asked about a create, an update or a delete of refs/heads/<integration_branch> of a carry-patch workspace",
+          "action": "refuse the update for every caller and every combination of the settings patch_branch_source and push_patches_to_origin, without reading the patch list",
+          "contract": "answer refuse {message: 'integration branch <name> is maintained by the hub; push a patch branch and rebuild instead', error_type: 'integration_branch'} with <name> the branch name without refs/heads/; no forward is attached",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace record in mode carry_patch with integration_branch 'deploy'",
+              "a patch store stub that fails the test when it is read"
+            ],
+            "pseudocode": "in internal/carrypatch/pushcontrol_test.go, a table over the update {create, fast-forward update, forced update, delete} of refs/heads/deploy x the caller level {admin, owner, member} x the settings {hub/false, hub/true, origin/false, origin/true}: a = controller.Decide(workspace, caller, update); assert a is refuse; assert a.message == 'integration branch deploy is maintained by the hub; push a patch branch and rebuild instead'; assert a.error_type == 'integration_branch'; assert a.forward == nil. Further rows with integration_branch 'release/int' -> the message names 'release/int'; and with integration_branch null in the record -> refs/heads/deploy is refused with the message naming 'deploy'"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "optional",
+          "condition": "the workspace record holds no integration_branch",
+          "action": "treat refs/heads/deploy as the integration branch",
+          "check": {
+            "same_as": "REQ-1.1"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "event_driven",
+          "condition": "the controller is asked about a ref of a carry-patch workspace that is neither the integration branch nor the branch of a patch whose status is not deleted",
+          "action": "allow the update without a forward, whatever the settings",
+          "contract": "answer allow with no forward for: refs/tags/<integration_branch>, refs/notes/<integration_branch>, the branch of a patch with status deleted, an unregistered branch",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "integration_branch 'deploy'; patches: 'patch/a' active, 'patch/old' deleted",
+              "settings patch_branch_source origin, push_patches_to_origin false"
+            ],
+            "pseudocode": "in internal/carrypatch/pushcontrol_test.go, a table over the ref {refs/tags/deploy, refs/notes/deploy, refs/heads/patch/old, refs/heads/feature/x, refs/heads/deploy-2} x {create, update, delete}: a = controller.Decide(...); assert a is allow; assert a.forward == nil"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "unwanted",
+          "condition": "a git client pushes the integration branch of a carry-patch workspace together with an unregistered branch, with the admin token",
+          "system": "parleyd",
+          "action": "refuse the whole push and move no ref",
+          "contract": "git exits non-zero; its output holds '! [remote rejected]' for the integration branch with 'integration branch deploy is maintained by the hub; push a patch branch and rebuild instead', and 'not updated: another ref in this push was refused' for the other branch; refs/heads/deploy and the other branch are unchanged in the hub's repository; no parley.git.push event is written",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process with the controller registered, the test origin of internal/gitrepo/gitrepotest as origin and as upstream",
+              "carry-patch workspace 'demo', status ready, integration branch deploy",
+              "a local clone with one new commit on deploy and one on a new branch feature/x"
+            ],
+            "pseudocode": "in internal/carrypatch/push_integration_test.go: before = hub rev-parse refs/heads/deploy; out, code = git push origin deploy feature/x with the admin token as Basic password; assert code != 0; assert out contains 'integration branch deploy is maintained by the hub; push a patch branch and rebuild instead'; assert out contains 'not updated: another ref in this push was refused'; assert hub rev-parse refs/heads/deploy == before; assert refs/heads/feature/x does not exist in the hub; assert count(events of type parley.git.push) is unchanged. Then git push origin :deploy -> same message, the branch still exists"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "unwanted",
+          "condition": "a git client pushes a create, an update or a delete of a ref under refs/parley/replaced/ of a carry-patch workspace",
+          "system": "parleyd",
+          "action": "refuse the push by the hub-owned refs rule before the controller is asked, and leave the backup ref as it was",
+          "contract": "git output holds 'refs/parley/ is maintained by the hub and cannot be pushed to' for the ref; the ref's value in the hub's repository is unchanged; the controller was asked 0 times for that ref",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the hub and workspace of the integration-branch test above, with refs/parley/replaced/patch/a set to commit B in the hub's repository by git update-ref",
+              "the registered controller wrapped by a counter"
+            ],
+            "pseudocode": "in internal/carrypatch/push_integration_test.go, a table over {git push origin HEAD:refs/parley/replaced/patch/a (update), git push origin HEAD:refs/parley/replaced/new (create), git push origin :refs/parley/replaced/patch/a (delete)} with the owner's API key: assert exit != 0; assert out contains 'refs/parley/ is maintained by the hub and cannot be pushed to'; assert hub rev-parse refs/parley/replaced/patch/a == B; assert refs/parley/replaced/new does not exist; assert controller call count == 0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Patch branches follow the workspace's patch settings",
+      "rationale": "A team chooses whether its patches live on the hub or on origin; a push to the side that is not the authority would be lost at the next sync.",
+      "system": "carry-patch controller",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "the controller is asked about the branch of a non-deleted patch and the setting patch_branch_source is hub",
+          "action": "allow a create, a fast-forward update, a forced update and a delete without a forward, whatever push_patches_to_origin is",
+          "contract": "answer allow with no forward; for a delete the patch stays in the patch list with its status and position",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "patches 'patch/a' active, 'patch/b' conflict, 'patch/c' disabled, 'patch/d' merged_upstream"
+            ],
+            "pseudocode": "in internal/carrypatch/pushcontrol_test.go, a table over the patch {patch/a, patch/b, patch/c, patch/d} x the update {create, fast-forward, forced, delete} x push_patches_to_origin {false, true} with patch_branch_source hub: a = controller.Decide(...); assert a is allow and a.forward == nil; after the delete rows assert the patch store still lists the patch with the same status and position (the controller wrote nothing)"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "unwanted",
+          "condition": "the controller is asked about a create, an update or a delete of the branch of a non-deleted patch while patch_branch_source is origin and push_patches_to_origin is false",
+          "action": "refuse the update and name the workspace's origin URL without user information",
+          "contract": "answer refuse {message: 'branch is synced from origin; push to <git_url> instead', error_type: 'patch_branch'}; <git_url> carries no user name and no password; a git_url of the form git@host:path is shown as stored",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/carrypatch/pushcontrol_test.go, a table over git_url -> shown URL {'https://example.test/acme/demo.git' -> same; 'https://bot:s3cret@example.test/acme/demo.git' -> 'https://example.test/acme/demo.git'; 'git@example.test:acme/demo.git' -> same} x the update {create, fast-forward, forced, delete} of refs/heads/patch/a x the caller level {admin, owner, member}: a = controller.Decide(...); assert a is refuse; assert a.message == 'branch is synced from origin; push to ' + shown + ' instead'; assert a.error_type == 'patch_branch'; assert a.message does not contain 's3cret' nor 'bot'"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "ubiquitous",
+          "action": "for any decision, read patch_branch_source and push_patches_to_origin from the workspace's settings at the time of that decision, taking hub for a missing patch_branch_source and false for a missing push_patches_to_origin",
+          "contract": "two decisions about the same update, with the setting changed between them and no restart, differ as the table of settings says; a workspace whose settings hold neither key is decided as hub/false",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/carrypatch/pushcontrol_test.go with an in-memory settings reader: settings = {}; assert Decide(update of patch/a) is allow without forward; settings.patch_branch_source = 'origin'; assert Decide(same update) is refuse with error_type 'patch_branch' and the 'push to' message; settings.push_patches_to_origin = true; assert Decide(same update) is allow with a forward; settings.patch_branch_source = 'hub'; assert Decide(same update) is allow without forward; assert the settings reader was called once per Decide"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "unwanted",
+          "condition": "the workspace record, the workspace's settings or the patch list cannot be read while a decision is made",
+          "action": "report a failure to the rule engine and never answer allow",
+          "contract": "Decide returns an error and no answer; through the engine of package 18 the ref update is refused with message 'internal error; try again' and error_type 'internal', which a git client sees on that ref and a source control API caller as HTTP 500 with error_type internal",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the real rule engine of internal/gitserver/pushrule with the controller registered",
+              "a carry_patch workspace and an update of refs/heads/feature/x that every other rule allows"
+            ],
+            "pseudocode": "in internal/carrypatch/pushcontrol_test.go, a table of injected faults {settings reader returns an error; patch store returns an error; workspace record lookup returns an error}: _, err = controller.Decide(...); assert err != nil; then v = engine.Evaluate(request with that update); assert v.Decisions[0].allowed == false; assert message == 'internal error; try again'; assert error_type == 'internal'. One more row: the patch store fails and the ref is refs/heads/deploy -> refused with error_type 'integration_branch' (decided before the patch list is read)"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "unwanted",
+          "condition": "a caller without the owner exemption pushes an update of a patch branch that the setting protected_branches matches",
+          "system": "parleyd",
+          "action": "refuse the update by the protected-branch rule before the controller is asked",
+          "contract": "git output holds '<branch> is protected; push another branch and open a change (git push -o parley.change)' for a fast-forward and '<branch> is protected and cannot be force-pushed or deleted' for a forced update or a delete; the controller was asked 0 times; the branch is unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the hub of the integration-branch test; workspace 'demo' with patch 'patch/a', protected_branches ['main', 'patch/*'], patch_branch_source hub",
+              "an org member with write access and a PAT carrying git:write",
+              "the registered controller wrapped by a counter"
+            ],
+            "pseudocode": "in internal/carrypatch/push_integration_test.go: table {member fast-forwards patch/a -> 'patch/a is protected; push another branch and open a change (git push -o parley.change)'; member force-pushes patch/a -> 'patch/a is protected and cannot be force-pushed or deleted'; owner with an API key deletes patch/a -> the same forced-or-delete message}: assert git exit != 0 and out contains the message; assert hub rev-parse refs/heads/patch/a is unchanged; assert controller call count == 0 after all rows"
+          }
+        },
+        {
+          "id": "REQ-2.6",
+          "pattern": "event_driven",
+          "condition": "the workspace's owner fast-forwards a protected patch branch with an API key while protect.owner_push is true",
+          "system": "parleyd",
+          "action": "apply the patch settings to the update after it has passed the protected-branch rule",
+          "contract": "patch_branch_source hub: the push is accepted and its parley.git.push event has direct true; patch_branch_source origin with push_patches_to_origin false: git output holds 'branch is synced from origin; push to <git_url> instead' and the branch is unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the hub and workspace of the protected-branch test above"
+            ],
+            "pseudocode": "in internal/carrypatch/push_integration_test.go: owner commits on patch/a and runs git push origin patch/a with the API key; assert exit 0; assert hub rev-parse refs/heads/patch/a == local HEAD; assert the last parley.git.push event has metadata.direct == true. Then set patch_branch_source to 'origin' in the workspace's settings; owner commits again and pushes; assert exit != 0; assert out contains 'branch is synced from origin; push to ' + origin URL + ' instead'; assert the hub's branch still equals the first pushed commit"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Forwarding a patch branch to origin",
+      "rationale": "When origin is the authority and the team still wants to push through the hub, the hub may accept only what origin has accepted first.",
+      "system": "carry-patch controller",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "the controller is asked about a create or a non-delete update of the branch of a non-deleted patch while patch_branch_source is origin and push_patches_to_origin is true",
+          "action": "answer allow after a forward, and contact origin zero times while deciding",
+          "contract": "answer allow with a forward function for that branch and the update's after commit; the origin's request counter is unchanged after Decide",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the test origin of internal/gitrepo/gitrepotest with its request counter",
+              "settings origin/true, patch 'patch/a' active"
+            ],
+            "pseudocode": "in internal/carrypatch/pushcontrol_test.go, a table over the update {create, fast-forward, forced} of refs/heads/patch/a: n = origin.Requests(); a = controller.Decide(...); assert a is allow; assert a.forward != nil; assert origin.Requests() == n"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "unwanted",
+          "condition": "the controller is asked about a delete of the branch of a non-deleted patch while patch_branch_source is origin and push_patches_to_origin is true",
+          "action": "refuse the delete and contact origin zero times",
+          "contract": "answer refuse {message: 'branch is synced from origin; delete it on origin instead', error_type: 'patch_branch'}; no forward is attached",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/carrypatch/pushcontrol_test.go beside the forward table: a = controller.Decide(delete of refs/heads/patch/a) with settings origin/true; assert a is refuse; assert a.message == 'branch is synced from origin; delete it on origin instead'; assert a.error_type == 'patch_branch'; assert a.forward == nil; assert origin.Requests() is unchanged"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "event_driven",
+          "condition": "a forward is run and origin accepts the push",
+          "action": "push the update's after commit to refs/heads/<branch> on origin as a non-forced push with the workspace's origin credential resolved at that moment, report success and record that commit as the origin head of the branch",
+          "contract": "the forward returns success; origin's refs/heads/<branch> equals the after commit; the recorded origin head of the branch equals the after commit; no other ref of origin changed; the hub's own ref is not written by the forward",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the push-accepting test origin with Basic authentication, holding main and patch/a",
+              "a hub repository with a commit C on top of origin's patch/a that is not yet the hub's refs/heads/patch/a (an object only)",
+              "the workspace's origin credential stored as secret GIT_PAT"
+            ],
+            "pseudocode": "in internal/carrypatch/forward_test.go: refsBefore = origin for-each-ref; hubBefore = hub rev-parse refs/heads/patch/a; msg, ok = forward(ctx, 'demo', 'patch/a', C); assert ok; assert origin rev-parse refs/heads/patch/a == C; assert originHeads.Get('demo', 'patch/a') == C; assert every other ref of origin equals refsBefore; assert hub rev-parse refs/heads/patch/a == hubBefore. Second case: rotate the secret GIT_PAT and the origin's accepted password between two forwards without rebuilding the component -> the second forward succeeds. Third case: the branch does not exist on origin -> the forward creates it"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "unwanted",
+          "condition": "a forward is run and origin refuses the push or cannot be reached",
+          "action": "fail the forward with a scrubbed message that names the reason, and leave the recorded origin head as it was",
+          "contract": "the forward returns failure with 'origin rejected push: <reason>'; <reason> is origin's own message for the ref when a rule or hook of origin refused it, 'non-fast-forward' when origin's branch is not an ancestor of the commit, 'authentication failed', 'permission denied', 'repository not found', 'origin unreachable', or 'push failed' for any other failure; the message holds neither the credential's value nor URL user information and is at most 1024 bytes; origin's branch and the recorded origin head are unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the push-accepting test origin with its switches: refuse every update from a hook with a given text, answer a fixed HTTP status, stop listening",
+              "origin credential 'tok-12345'"
+            ],
+            "pseudocode": "in internal/carrypatch/forward_test.go, a table of (origin condition -> want message): (hook refuses with 'branch is frozen' -> 'origin rejected push: branch is frozen'); (hook refuses with a text that contains 'tok-12345' -> the message contains '[redacted]' and not 'tok-12345'); (hook refuses with a 3000-character text -> len(message) <= 1024); (origin's patch/a has a commit the pushed commit does not contain -> 'origin rejected push: non-fast-forward'); (HTTP 401 -> 'origin rejected push: authentication failed'); (HTTP 403 -> 'origin rejected push: permission denied'); (HTTP 404 -> 'origin rejected push: repository not found'); (listener closed -> 'origin rejected push: origin unreachable'); (HTTP 500 -> 'origin rejected push: push failed'); in every row: assert ok == false; assert origin's patch/a is unchanged where origin is reachable; assert originHeads.Get('demo', 'patch/a') is unchanged; assert the message contains no '@'"
+          }
+        },
+        {
+          "id": "REQ-3.5",
+          "pattern": "unwanted",
+          "condition": "a forward is run and the workspace's origin credential cannot be read",
+          "action": "fail the forward without contacting origin and without an anonymous attempt",
+          "contract": "the forward returns failure with 'failed to resolve origin credentials'; the origin's request counter is unchanged",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/carrypatch/forward_test.go: with a credential resolver stub that returns an error: n = origin.Requests(); msg, ok = forward(ctx, 'demo', 'patch/a', C); assert ok == false; assert msg == 'failed to resolve origin credentials'; assert origin.Requests() == n"
+          }
+        },
+        {
+          "id": "REQ-3.6",
+          "pattern": "unwanted",
+          "condition": "a forward has not finished when its limit of 120 seconds passes or when its caller cancels it",
+          "action": "end the git push process and fail the forward",
+          "contract": "the forward returns failure with 'origin rejected push: timed out'; no git process started by the forward is still running; the recorded origin head is unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the test origin switched to stall every push",
+              "the forward component built with a limit of 200 ms in place of 120 s"
+            ],
+            "pseudocode": "in internal/carrypatch/forward_test.go, two rows {the limit passes; the caller's context is cancelled after 100 ms with the limit at 120 s}: start = now; msg, ok = forward(ctx, 'demo', 'patch/a', C); assert ok == false; assert msg == 'origin rejected push: timed out'; assert now - start < 5 s; assert the child git process has exited; assert originHeads.Get('demo', 'patch/a') is unchanged. And assert the hub's component is built with a limit of 120 s by reading the limit from the component the hub composition returns"
+          }
+        },
+        {
+          "id": "REQ-3.7",
+          "pattern": "unwanted",
+          "condition": "a git client pushes two patch branches of a workspace with patch_branch_source origin and push_patches_to_origin true, and origin accepts the first and refuses the second",
+          "system": "parleyd",
+          "action": "refuse the whole push, move no ref of the hub and leave the first branch on origin as forwarded",
+          "contract": "git exits non-zero; its output holds 'origin rejected push: <reason>' for the second branch and 'not updated: another ref in this push was refused' for the first; both branches are unchanged in the hub's repository; origin's first branch equals the pushed commit; no parley.git.push event is written",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the in-process hub with the controller registered and the push-accepting test origin, whose hook refuses updates of refs/heads/patch/b with 'frozen'",
+              "workspace 'demo' with patches patch/a and patch/b, settings origin/true",
+              "a local clone with one new commit on each of the two branches"
+            ],
+            "pseudocode": "in internal/carrypatch/push_integration_test.go: a0, b0 = hub heads of patch/a and patch/b; out, code = git push origin patch/a patch/b; assert code != 0; assert out contains 'origin rejected push: frozen'; assert out contains 'not updated: another ref in this push was refused'; assert hub heads == (a0, b0); assert origin rev-parse refs/heads/patch/a == local patch/a; assert count(parley.git.push events) is unchanged"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Landing on a patch branch",
+      "rationale": "A team that reviews patch work lands it as changes; a landing must not be a way around the rule that decides where patch branches live.",
+      "system": "carry-patch landing guard",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "the guard is asked before the target of a land attempt moves, and the target is not the branch of a non-deleted patch, or the target workspace is not in mode carry_patch, or patch_branch_source is hub",
+          "action": "let the attempt pass without contacting origin",
+          "contract": "the guard answers allow; the origin's request counter is unchanged",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/carrypatch/landguard_test.go, a table {standard workspace, target main; carry_patch workspace, target main; carry_patch, target the branch of a deleted patch, settings origin/false; carry_patch, target patch/a, settings hub/false; carry_patch, target patch/a, settings hub/true}: n = origin.Requests(); g = guard.BeforeTargetMoves(slug, branch, newHead); assert g is allow; assert origin.Requests() == n"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "unwanted",
+          "condition": "the guard is asked about a target that is the branch of a non-deleted patch while patch_branch_source is origin and push_patches_to_origin is false",
+          "action": "end the attempt as blocked with the reason of the push refusal, so that the target does not move",
+          "contract": "the guard answers refuse with the reason 'branch is synced from origin; push to <git_url> instead', <git_url> without user information; origin is not contacted; through package 25 the land attempt's status is 'blocked' and the patch branch keeps its head",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/carrypatch/landguard_test.go: with git_url 'https://bot:s3cret@example.test/acme/demo.git' and settings origin/false: g = guard.BeforeTargetMoves('demo', 'patch/a', newHead); assert g is refuse; assert g.reason == 'branch is synced from origin; push to https://example.test/acme/demo.git instead'; assert origin.Requests() is unchanged"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "event_driven",
+          "condition": "the guard is asked about a target that is the branch of a non-deleted patch while patch_branch_source is origin and push_patches_to_origin is true",
+          "action": "forward the new head to origin as a non-forced push under the 120 second limit before the target moves, and let the attempt pass when origin accepts",
+          "contract": "the guard answers allow only after origin's refs/heads/<branch> equals the new head; the recorded origin head of the branch equals the new head; the guard itself does not write the hub's ref",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the push-accepting test origin holding patch/a",
+              "a hub repository with a commit N on top of patch/a, as a land would have built it",
+              "settings origin/true"
+            ],
+            "pseudocode": "in internal/carrypatch/landguard_test.go: hubBefore = hub rev-parse refs/heads/patch/a; g = guard.BeforeTargetMoves('demo', 'patch/a', N); assert g is allow; assert origin rev-parse refs/heads/patch/a == N; assert originHeads.Get('demo', 'patch/a') == N; assert hub rev-parse refs/heads/patch/a == hubBefore"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "unwanted",
+          "condition": "the forward of a land attempt's new head fails because origin refuses it, origin cannot be reached, the origin credential cannot be read or the 120 second limit passes",
+          "action": "end the attempt as failed with the error origin_rejected, so that the target does not move",
+          "contract": "the guard answers origin rejected, with the forward's scrubbed message; through package 25 the land attempt's status is 'failed' with error 'origin_rejected' and the patch branch keeps its head",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the test origin and repository of the passing guard test"
+            ],
+            "pseudocode": "in internal/carrypatch/landguard_test.go, a table over the origin condition {hook refuses with 'frozen'; origin's patch/a moved to a commit N does not contain; listener closed; credential resolver returns an error; origin stalls with the limit set to 200 ms}: g = guard.BeforeTargetMoves('demo', 'patch/a', N); assert g is origin rejected; assert g.message is the forward's message for that row ('origin rejected push: frozen', '... non-fast-forward', '... origin unreachable', 'failed to resolve origin credentials', '... timed out')"
+          }
+        },
+        {
+          "id": "REQ-4.5",
+          "pattern": "unwanted",
+          "condition": "the guard cannot decide because the workspace record, the settings or the patch list cannot be read",
+          "action": "return an error to the land engine of package 25 and never an allow, so that the target does not move",
+          "contract": "the guard returns an error and none of the answers allow, refuse or origin rejected; origin is not contacted",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/carrypatch/landguard_test.go, a table of injected faults {settings reader fails; patch store fails; workspace record lookup fails}: g = guard.BeforeTargetMoves('demo', 'patch/a', N); assert the guard returned an error and no answer; assert origin.Requests() is unchanged"
+          }
+        },
+        {
+          "id": "REQ-4.6",
+          "pattern": "event_driven",
+          "condition": "a land attempt has moved a target that is the branch of a non-deleted patch",
+          "action": "run the rebuild trigger and then the mirror for that branch from the after-landing hook, with the source land and the session id of the landing",
+          "contract": "with auto_rebuild_after_push true the rebuild queue receives one request {workspace, submitted_by: 'system:land', session_id: the landing's}; with patch_branch_source hub and push_patches_to_origin true origin's branch equals the landed head; the land attempt is answered as landed before the hook has finished",
+          "check": {
+            "same_as": "PATH-3"
+          }
+        },
+        {
+          "id": "REQ-4.7",
+          "pattern": "ubiquitous",
+          "system": "parleyd",
+          "action": "register the guard as a target guard and the trigger as an after-landing hook of internal/land when the hub is composed",
+          "contract": "in a composed hub a land onto a patch branch of a workspace with patch_branch_source origin and push_patches_to_origin false ends with HTTP 409 and a land attempt whose status is 'blocked', and the patch branch keeps its head",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the in-process hub with every component of the composition, the test origin as origin and upstream",
+              "workspace 'demo' with patch patch/a and settings origin/false; an open change from branch fix/tls targeting patch/a, opened through POST /workspaces/demo/changes"
+            ],
+            "pseudocode": "in internal/carrypatch/push_integration_test.go: before = hub rev-parse refs/heads/patch/a; r = POST /workspaces/demo/changes/1/land; assert r.status == 409; assert the attempt in the answer has status 'blocked'; assert the answer's text contains 'branch is synced from origin; push to '; assert hub rev-parse refs/heads/patch/a == before; assert the rebuild list of 'demo' is empty"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Rebuild trigger after an update of a patch branch",
+      "rationale": "The integration branch is stale the moment a patch branch moves; queuing the rebuild is the hub's job, not the pusher's.",
+      "system": "carry-patch trigger",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "an accepted request updated at least one ref that is not a delete and is the branch of a non-deleted patch, and auto_rebuild_after_push is true or missing from the settings",
+          "action": "queue one rebuild for the request through the rebuild enqueue, with the source and the session id of the request",
+          "contract": "the enqueue is called exactly once per request, however many patch branches the request updated, with {workspace slug, submitted_by: 'system:push' for a git push and for a source control API write, 'system:land' for a landing, session_id: the request's or null}",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a recording rebuild queuer",
+              "workspace 'demo' in mode carry_patch with patches patch/a and patch/b active, patch/old deleted"
+            ],
+            "pseudocode": "in internal/carrypatch/trigger_test.go, a table of (updates, source, session, auto_rebuild_after_push -> want enqueue calls): ([update patch/a], push, null, true -> 1 call {demo, 'system:push', null}); ([update patch/a, update patch/b, create feature/x], push, 'sess-1', true -> 1 call with session 'sess-1'); ([create patch/b], push, null, key missing -> 1 call); ([update patch/a], land, 'sess-2', true -> 1 call {demo, 'system:land', 'sess-2'}); trigger.AfterUpdates('demo', updates, source, session); assert the recorded calls equal the wanted ones"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "state_driven",
+          "condition": "auto_rebuild_after_push is false, or the accepted updates hold no non-delete update of the branch of a non-deleted patch, or the workspace is not in mode carry_patch",
+          "action": "queue no rebuild",
+          "contract": "the enqueue is called 0 times for: auto_rebuild_after_push false; a delete of a patch branch; an update of the branch of a deleted patch; an update of an unregistered branch or a tag; any update on a standard workspace or a task fork",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the recording queuer and patches of the trigger table above"
+            ],
+            "pseudocode": "in internal/carrypatch/trigger_test.go, a table: (auto_rebuild_after_push false, [update patch/a]); (true, [delete patch/a]); (true, [update patch/old]); (true, [create feature/x, create refs/tags/v1]); (true, [update patch/a] on a workspace in mode standard); (true, [update patch/a] on a task fork of 'demo'); (true, []): trigger.AfterUpdates(...); assert queuer.calls == 0 in every row; and on the standard-workspace rows assert the patch store was not read"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "unwanted",
+          "condition": "the rebuild enqueue reports that a rebuild of the workspace is already queued, running or waiting to retry",
+          "action": "skip the trigger silently and go on to the mirror",
+          "contract": "no second job is created, no event is written by the trigger, nothing is logged above debug level, and the mirror of the same request still runs",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a queuer stub that answers duplicate",
+              "settings hub/true and a recording mirror pusher"
+            ],
+            "pseudocode": "in internal/carrypatch/trigger_test.go: trigger.AfterUpdates('demo', [update patch/a], push, null); assert queuer.calls == 1; assert the event writer stub was called 0 times; assert the captured log holds no record at level warn or error; assert the mirror pusher was called once for patch/a"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "unwanted",
+          "condition": "the trigger fails because the settings or the patch list cannot be read, the enqueue returns an error, or a step panics",
+          "action": "log the failure and return, leaving the refs and the client's answer as they are",
+          "contract": "AfterUpdates returns without a panic; one log record at level error names the workspace; the refs the request wrote keep their after values; when only the enqueue failed, the mirror still runs",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/carrypatch/trigger_test.go, a table of faults {settings reader fails; patch store fails; queuer returns an error; queuer panics}: assert AfterUpdates does not panic; assert the captured log holds one error record containing 'demo'; for the two queuer rows with settings hub/true assert the mirror pusher was called once; for the reader rows assert the queuer and the mirror pusher were called 0 times"
+          }
+        },
+        {
+          "id": "REQ-5.5",
+          "pattern": "event_driven",
+          "condition": "a git push that updated a patch branch has been accepted",
+          "system": "parleyd",
+          "action": "run the trigger only after the git client has its complete answer",
+          "contract": "the push's HTTP response is complete and git has exited 0 while the trigger is still blocked in the enqueue; after the enqueue is released one rebuild request with submitted_by 'system:push' exists",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the in-process hub with the trigger registered as a post-push listener and a rebuild queuer that blocks on a channel",
+              "workspace 'demo' with patch patch/a, settings hub/false"
+            ],
+            "pseudocode": "in internal/carrypatch/push_integration_test.go: run git push origin patch/a; assert exit 0 while the queuer is still blocked; assert hub rev-parse refs/heads/patch/a == local HEAD; release the queuer; assert eventually queuer.calls == [{demo, 'system:push', null}]. Then push with -o parley.session=<id of an open session> and assert the next call carries that session id"
+          }
+        },
+        {
+          "id": "REQ-5.6",
+          "pattern": "event_driven",
+          "condition": "the post-push listeners of package 18 are called for an accepted write through the source control API (a commit, a ref create, a ref move or a server-side rebase) that updated a patch branch",
+          "system": "parleyd",
+          "action": "run the trigger for that write as for a git push",
+          "contract": "the listener queues one rebuild request with submitted_by 'system:push' and the session id of the write, exactly as for a git push; a call whose updates hold no patch branch queues nothing; the listener returns nothing to the write route",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a recording rebuild queuer",
+              "workspace 'demo' in mode carry_patch with patch patch/a active, settings hub/false"
+            ],
+            "pseudocode": "in internal/carrypatch/trigger_test.go, a table over the call package 18 makes to a post-push listener after an accepted source control API write {via api, [update patch/a], session 'sess-3' -> 1 call {demo, 'system:push', 'sess-3'}; via api, [create patch/a], no session -> 1 call {demo, 'system:push', null}; via api, [update feature/x] -> 0 calls}: call the listener this package registers with the slug, the accepted updates, via and session id; assert the recorded enqueue calls equal the wanted ones and that the listener returned no value the caller could act on"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Mirror of patch branches to origin",
+      "rationale": "When the hub is the authority, origin is a copy the team still wants current, and a copy that fell behind must be visible.",
+      "system": "carry-patch trigger",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "the rebuild trigger step of an accepted request has finished, patch_branch_source is hub and push_patches_to_origin is true",
+          "action": "push each updated branch of a non-deleted patch that was not deleted to origin, in the order of the updates, with the head the branch has at that moment, force-with-lease against the recorded origin head of the branch or against its absence when none is recorded, each under a limit of 120 seconds, and record the pushed commit as the origin head",
+          "contract": "after the mirror origin's refs/heads/<branch> equals the hub's head of each such branch, also when the update was a forced update; the recorded origin head equals it; no event is written for a successful mirror",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the push-accepting test origin holding main, patch/a at commit A0 and no patch/b",
+              "a hub repository with patch/a rewritten to A1 (not a descendant of A0) and patch/b created at B1; recorded origin heads: patch/a = A0, none for patch/b",
+              "settings hub/true; a recording rebuild queuer; the real event log"
+            ],
+            "pseudocode": "in internal/carrypatch/mirror_test.go: trigger.AfterUpdates('demo', [forced update of patch/a, create of patch/b], push, null); assert origin rev-parse refs/heads/patch/a == A1; assert origin rev-parse refs/heads/patch/b == B1; assert originHeads.Get('demo', 'patch/a') == A1 and Get('demo', 'patch/b') == B1; assert count(events of type parley.patch.mirror_failed) == 0; assert the queuer was called before the first push reached origin. Second case: move the hub's patch/a to A2 after building the updates list with after == A1 -> origin's patch/a == A2"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "ubiquitous",
+          "action": "for any accepted request, run the mirror whether auto_rebuild_after_push is true or false",
+          "contract": "with auto_rebuild_after_push false, patch_branch_source hub and push_patches_to_origin true: the enqueue is called 0 times and origin's branch equals the hub's head",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the origin and repository of the mirror test above; settings hub/true with auto_rebuild_after_push false"
+            ],
+            "pseudocode": "in internal/carrypatch/mirror_test.go: trigger.AfterUpdates('demo', [forced update of patch/a], push, null); assert queuer.calls == 0; assert origin rev-parse refs/heads/patch/a == A1"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "unwanted",
+          "condition": "the mirror of one branch fails because origin refuses the push, the lease is stale, origin cannot be reached, the origin credential cannot be read or the 120 second limit passes",
+          "action": "write one parley.patch.mirror_failed event for that branch and go on with the next branch",
+          "contract": "one event per failed branch: {type: 'parley.patch.mirror_failed', resource_type: 'patch', resource_id: the patch id, workspace: the slug, actor: 'system', metadata: {branch_name, error}}; error is the scrubbed reason: origin's own message, 'non-fast-forward', 'authentication failed', 'permission denied', 'repository not found', 'origin unreachable', 'push failed', 'origin moved' for a stale lease, 'timed out', or 'failed to resolve origin credentials'; the branches after it are still pushed; the hub's branch and the recorded origin head of the failed branch are unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the origin and repository of the mirror test above, with the real event log",
+              "origin credential 'tok-12345'"
+            ],
+            "pseudocode": "in internal/carrypatch/mirror_test.go, a table of (condition on patch/a -> want error): (origin's patch/a moved to a commit other than the recorded A0 -> 'origin moved'); (hook refuses refs/heads/patch/a with 'frozen tok-12345' -> 'frozen [redacted]'); (credential resolver fails -> 'failed to resolve origin credentials'); (origin stalls pushes of patch/a, limit 200 ms -> 'timed out'); in every row: trigger.AfterUpdates('demo', [update patch/a, create patch/b], push, null); evs = events of type parley.patch.mirror_failed; assert len(evs) == 1; assert evs[0].resource_type == 'patch' and evs[0].resource_id == id of patch/a and evs[0].actor_type == 'system' and evs[0].metadata.branch_name == 'patch/a' and evs[0].metadata.error == want; assert originHeads.Get('demo', 'patch/a') == A0; assert hub rev-parse refs/heads/patch/a == A1; and except in the credential row assert origin rev-parse refs/heads/patch/b == B1. One row with origin's listener closed -> two events, one per branch, each with error 'origin unreachable'"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "state_driven",
+          "condition": "patch_branch_source is origin, or push_patches_to_origin is false or missing from the settings",
+          "action": "mirror nothing",
+          "contract": "the origin's request counter is unchanged after the trigger and no parley.patch.mirror_failed event is written",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/carrypatch/mirror_test.go, a table over the settings {hub/false, hub/key missing, origin/false, origin/true}: n = origin.Requests(); trigger.AfterUpdates('demo', [update patch/a], push, null); assert origin.Requests() == n; assert the event writer was called 0 times"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "ubiquitous",
+          "action": "for any accepted request, push to origin only the updated branches of non-deleted patches that were not deleted: never the integration branch, never a deleted patch branch, never the branch of a deleted patch and never another ref of the request",
+          "contract": "after a request that updated patch/a, deleted patch/b, created feature/x and created refs/tags/v1 on a workspace with settings hub/true, origin differs from before in refs/heads/patch/a alone",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the push-accepting test origin holding main, deploy, patch/a, patch/b, patch/old; settings hub/true; patches patch/a and patch/b active, patch/old deleted"
+            ],
+            "pseudocode": "in internal/carrypatch/mirror_test.go: refsBefore = origin for-each-ref; trigger.AfterUpdates('demo', [update patch/a, delete patch/b, update patch/old, create feature/x, create refs/tags/v1], push, null); refsAfter = origin for-each-ref; assert the only difference between refsAfter and refsBefore is refs/heads/patch/a == the hub's head of patch/a"
+          }
+        },
+        {
+          "id": "REQ-6.6",
+          "pattern": "ubiquitous",
+          "action": "for any workspace, run the triggers of two accepted requests one after the other, never at the same time",
+          "contract": "two requests that updated the same patch branch in quick succession leave origin's branch at the hub's final head and write no parley.patch.mirror_failed event",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the origin and repository of the mirror test above, settings hub/true"
+            ],
+            "pseudocode": "in internal/carrypatch/mirror_test.go, repeated 20 times: move the hub's patch/a to X1 and call trigger.AfterUpdates on goroutine 1; move it to X2 and call it on goroutine 2; wait for both; assert origin rev-parse refs/heads/patch/a == X2; assert count(parley.patch.mirror_failed) == 0; and with a pusher wrapper that counts concurrent pushes per workspace assert the maximum is 1"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "An agent pushes a patch branch, the hub rebuilds and mirrors, and the integration branch stays the hub's",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "commits on patch/tls in a clone of carry-patch workspace 'demo' and runs git push origin patch/tls with a PAT that has git:write"
+        },
+        {
+          "actor": "git client",
+          "action": "sends the update of refs/heads/patch/tls and its pack to POST /git/acme/demo.git/git-receive-pack"
+        },
+        {
+          "actor": "parleyd",
+          "action": "evaluates the push rules, asks the carry-patch controller, which allows the update of a hub-owned patch branch, moves the ref and answers 'ok refs/heads/patch/tls'"
+        },
+        {
+          "actor": "parleyd",
+          "action": "after the answer queues one rebuild with submitted_by system:push and pushes patch/tls to origin with force-with-lease"
+        },
+        {
+          "actor": "origin",
+          "action": "accepts the update of refs/heads/patch/tls"
+        },
+        {
+          "actor": "agent",
+          "action": "runs git push origin HEAD:deploy"
+        },
+        {
+          "actor": "parleyd",
+          "action": "refuses the update of the integration branch with 'integration branch deploy is maintained by the hub; push a patch branch and rebuild instead' and moves no ref"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "a stock git client",
+          "the git routes, push processor, rule engine and ref writer of internal/gitserver",
+          "the carry-patch controller, trigger and mirror of internal/carrypatch",
+          "the patch list of internal/carrypatch",
+          "the rebuild enqueue of package 33",
+          "internal/gitrepo with the git command",
+          "the push-accepting test origin of internal/gitrepo/gitrepotest",
+          "the event log and the SQLite store"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with a data directory in t.TempDir()",
+          "workspace 'demo' in organization 'acme', created with workspace_mode carry_patch against the test origin (also used as upstream), status ready, integration branch deploy",
+          "patch patch/tls registered through POST /workspaces/demo/patches; settings patch_branch_source hub, push_patches_to_origin true, auto_rebuild_after_push true",
+          "a user who owns the workspace, with a PAT carrying git:write and rebuilds:read; a local clone"
+        ],
+        "end_state": [
+          "refs/heads/patch/tls in the hub's repository equals the pushed commit",
+          "origin's refs/heads/patch/tls equals the pushed commit",
+          "GET /workspaces/demo/rebuilds lists exactly one job, with submitted_by 'system:push'",
+          "refs/heads/deploy in the hub's repository has the value it had before the second push, and origin has no new deploy commit",
+          "no parley.patch.mirror_failed event exists for 'demo'"
+        ],
+        "pseudocode": "in internal/carrypatch/push_integration_test.go: start the hub; create the workspace and the patch; clone; commit on patch/tls; assert git push origin patch/tls exits 0; assert hub rev-parse refs/heads/patch/tls == local HEAD; assert eventually origin rev-parse refs/heads/patch/tls == local HEAD; jobs = GET /workspaces/demo/rebuilds; assert len(jobs) == 1 and jobs[0].submitted_by == 'system:push'; d = hub rev-parse refs/heads/deploy; out, code = git push origin HEAD:deploy; assert code != 0 and out contains 'integration branch deploy is maintained by the hub'; assert hub rev-parse refs/heads/deploy == d; assert no parley.patch.mirror_failed event"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "A developer is pointed to origin, turns forwarding on and pushes through the hub",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "commits on patch/tls in a clone of workspace 'demo', whose setting patch_branch_source is origin, and runs git push origin patch/tls with an API key"
+        },
+        {
+          "actor": "parleyd",
+          "action": "asks the controller, refuses the update with 'branch is synced from origin; push to <git_url> instead' and moves no ref"
+        },
+        {
+          "actor": "git client",
+          "action": "prints the remote rejection and exits non-zero"
+        },
+        {
+          "actor": "developer",
+          "action": "sets the workspace setting push_patches_to_origin to true and pushes again"
+        },
+        {
+          "actor": "parleyd",
+          "action": "allows the update after a forward and, once every rule has passed, pushes the commit to origin without force"
+        },
+        {
+          "actor": "origin",
+          "action": "accepts the fast-forward of refs/heads/patch/tls"
+        },
+        {
+          "actor": "parleyd",
+          "action": "moves refs/heads/patch/tls by compare-and-swap, writes the parley.git.push event and answers 'ok refs/heads/patch/tls'"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "a stock git client",
+          "the git routes, push processor, rule engine and ref writer of internal/gitserver",
+          "the carry-patch controller and forward of internal/carrypatch",
+          "the workspace settings store",
+          "internal/gitrepo with the git command",
+          "the push-accepting test origin of internal/gitrepo/gitrepotest with Basic authentication",
+          "the event log and the SQLite store"
+        ],
+        "setup": [
+          "the in-process hub and carry-patch workspace 'demo' of the first path, with the origin credential stored as workspace secret GIT_PAT",
+          "settings patch_branch_source origin, push_patches_to_origin false, auto_rebuild_after_push false",
+          "the workspace's owner with an API key; a local clone"
+        ],
+        "end_state": [
+          "after the first push refs/heads/patch/tls is unchanged in the hub and on origin, and git printed the pointer to the origin URL without the credential",
+          "after the second push origin's refs/heads/patch/tls and the hub's refs/heads/patch/tls both equal the pushed commit",
+          "exactly one parley.git.push event exists for refs/heads/patch/tls",
+          "the rebuild list of 'demo' is empty"
+        ],
+        "pseudocode": "in internal/carrypatch/push_integration_test.go: h0 = hub rev-parse refs/heads/patch/tls; out, code = git push origin patch/tls; assert code != 0; assert out contains 'branch is synced from origin; push to ' + origin URL without userinfo + ' instead'; assert out does not contain the GIT_PAT value; assert hub and origin heads of patch/tls == h0; write push_patches_to_origin = true through the workspace settings store; assert git push origin patch/tls exits 0; assert origin rev-parse refs/heads/patch/tls == local HEAD == hub rev-parse refs/heads/patch/tls; assert count(parley.git.push events for refs/heads/patch/tls) == 1; assert GET /workspaces/demo/rebuilds is empty"
+      }
+    },
+    {
+      "id": "PATH-3",
+      "title": "An agent lands a change on a patch branch and the hub queues a rebuild",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "pushes branch fix/tls, which adds one commit on top of patch/tls, and opens a change that targets patch/tls with POST /workspaces/demo/changes"
+        },
+        {
+          "actor": "agent",
+          "action": "lands the change with POST /workspaces/demo/changes/1/land, naming its session"
+        },
+        {
+          "actor": "parleyd",
+          "action": "asks the carry-patch landing guard before the target moves; the guard passes because the hub is the authority for patch branches"
+        },
+        {
+          "actor": "parleyd",
+          "action": "moves refs/heads/patch/tls to the landed commit and answers 200 with the land attempt in status landed"
+        },
+        {
+          "actor": "parleyd",
+          "action": "runs the after-landing hook: queues one rebuild with submitted_by system:land and the landing's session id, then pushes patch/tls to origin"
+        },
+        {
+          "actor": "origin",
+          "action": "accepts the update of refs/heads/patch/tls"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the change and land routes of internal/change and internal/land",
+          "the carry-patch landing guard, trigger and mirror of internal/carrypatch",
+          "the rebuild enqueue of package 33",
+          "the git routes and rule engine of internal/gitserver",
+          "internal/gitrepo with the git command",
+          "the push-accepting test origin of internal/gitrepo/gitrepotest",
+          "the event log and the SQLite store"
+        ],
+        "setup": [
+          "the in-process hub and carry-patch workspace 'demo' of the first path with patch patch/tls",
+          "settings patch_branch_source hub, push_patches_to_origin true, auto_rebuild_after_push true",
+          "the rebuild list of 'demo' is empty before the land: the push of fix/tls updates no patch branch",
+          "an agent session 's1' and a PAT of the workspace's owner with git:write, changes:write and rebuilds:read"
+        ],
+        "end_state": [
+          "the land attempt has status 'landed'",
+          "refs/heads/patch/tls in the hub's repository equals the attempt's landed_sha",
+          "GET /workspaces/demo/rebuilds lists exactly one job, with submitted_by 'system:land'",
+          "the parley.rebuild.enqueue event of that job carries session_id 's1'",
+          "origin's refs/heads/patch/tls equals the landed_sha"
+        ],
+        "pseudocode": "in internal/carrypatch/push_integration_test.go: git push origin fix/tls; assert GET /workspaces/demo/rebuilds is empty; POST /workspaces/demo/changes {source_branch: 'fix/tls', target_branch: 'patch/tls', title: 'Fix TLS patch'}; r = POST /workspaces/demo/changes/1/land with the session s1; assert r.status == 200 and r.json.status == 'landed'; assert hub rev-parse refs/heads/patch/tls == r.json.landed_sha; assert eventually jobs = GET /workspaces/demo/rebuilds has len 1 and jobs[0].submitted_by == 'system:land'; assert the parley.rebuild.enqueue event has session_id == 's1'; assert eventually origin rev-parse refs/heads/patch/tls == r.json.landed_sha"
+      }
+    }
+  ]
+}

@@ -1,0 +1,881 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "39",
+  "spec_name": "secrets",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Encryption keys from the operator",
+      "rationale": "The operator supplies and rotates the key, so a copy of the hub's storage discloses no secret and the hub never holds a key of its own making.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "parleyd starts",
+          "action": "take the current key from the environment variable PARLEY_SECRETS_KEY, or when that is unset or empty from the file that [secrets].key_file names, and the previous key from PARLEY_SECRETS_KEY_PREVIOUS, each as standard padded base64 of exactly 32 bytes with surrounding white space ignored",
+          "contract": "the loaded current and previous keys equal the configured bytes; with both sources of the current key set, the environment variable's key is used and the file is not read",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/secret/keys_test.go, a table over {environment only; key_file only; both set with different keys -> environment wins and an unreadable key_file is not an error; key_file content with a trailing newline; PARLEY_SECRETS_KEY set to the empty string and key_file set -> file used; previous key set; nothing set -> no current key and no previous key; previous set without current -> previous loaded, no current}: keys = LoadKeys(env, config); assert keys.Current and keys.Previous equal the expected bytes or are absent"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "unwanted",
+          "condition": "a configured key is not standard base64 of exactly 32 bytes, or PARLEY_SECRETS_KEY is unset and the file named by [secrets].key_file cannot be read",
+          "action": "stop the start before listening",
+          "contract": "the process exits with status 1 without opening the listener, and writes one error log line that names the variable (PARLEY_SECRETS_KEY or PARLEY_SECRETS_KEY_PREVIOUS) or the file path and does not contain the configured value",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/secret/keys_test.go a table over {31 bytes, 33 bytes, not base64, URL-safe base64 alphabet, malformed previous key, key_file missing, key_file holding 16 bytes} asserts LoadKeys returns an error naming the source and not containing the value; in internal/secret/secret_integration_test.go one case starts the hub's run function with PARLEY_SECRETS_KEY='not-a-key': assert exit status == 1; assert stderr has one error line containing 'PARLEY_SECRETS_KEY' and not 'not-a-key'; assert no listener was opened"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "event_driven",
+          "condition": "parleyd starts and the keys are loaded",
+          "action": "write one info log line reporting whether a current key is configured, whether a previous key is present, and the number of stored secrets whose key id matches neither configured key",
+          "contract": "one log line with the message `secret encryption` and the members key_configured (boolean), previous_key_present (boolean) and undecryptable_secrets (integer)",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a store with the secret table and rows sealed under known keys"
+            ],
+            "pseudocode": "in internal/secret/report_test.go, a table over stores {empty; 2 secrets under the current key; 2 under the current key and 1 under the previous key with the previous key configured -> 0; the same without the previous key -> 1; 3 secrets and no key configured -> 3}: run the start report against a real store with a captured logger; assert exactly one line with message 'secret encryption' and the expected three members"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "event_driven",
+          "condition": "parleyd starts with no current key",
+          "action": "write a warning log line saying that secrets cannot be stored, and go on starting",
+          "contract": "one warn log line with the message `secrets cannot be stored: no encryption key configured`; the hub listens and GET /readyz answers ready",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/secret/secret_integration_test.go: start the hub in-process with no key variable and no key_file; assert the log holds the warning line once; assert GET /readyz is ready"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "ubiquitous",
+          "action": "for any start with a configured key, keep the key out of the store and out of every log line",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/secret/secret_integration_test.go: start the hub in-process with a current and a previous key; store one secret through the secret component, let the first maintenance pass end, stop; assert neither the base64 form nor the raw 32 bytes of either key occur in the captured log or in the bytes of the database files in the data directory"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Encryption at rest",
+      "rationale": "A secret that lies readable in storage is disclosed by every backup; one that silently reads as absent makes the hub act without a credential.",
+      "system": "secret store",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "ubiquitous",
+          "action": "for any secret value it stores, keep only the AES-256-GCM sealing of the value under the current key with a fresh random 12-byte nonce, bound to the entry's scope, scope id and lowercase key as additional authenticated data, together with the key id of the sealing key (the first 8 bytes of the key's SHA-256 in lowercase hex)",
+          "check": {
+            "kind": "property",
+            "pseudocode": "in internal/secret/cipher_test.go, over random values of length 0 to 262144 bytes and random (scope, scope_id, key): sealed = Seal(keys, binding, value); assert Open(keys, binding, sealed) == value; assert sealed.KeyID == KeyID(keys.Current); for len(value) >= 16 assert the sealed bytes do not contain value; assert two sealings of the same value under the same binding differ"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "event_driven",
+          "condition": "a value sealed under the previous key is read while that key is configured as the previous key",
+          "action": "open it with the previous key and return the plaintext",
+          "contract": "the read returns the original value and no error",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/secret/cipher_test.go: sealed = Seal(keysWithCurrent(A), b, 'v'); assert Open(keys{Current: B, Previous: A}, b, sealed) == 'v'; assert Open(keys{Previous: A}, b, sealed) == 'v'"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "unwanted",
+          "condition": "a stored value's key id matches neither configured key, or the value fails authentication",
+          "action": "fail the read with an unreadable-secret error and never report the secret as absent",
+          "contract": "the read returns an error that matches ErrUnreadable, whose message is `secret \"<key>\" cannot be decrypted` with the stored key, and that contains no byte sequence of the value; found is not reported false",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a real store with one secret `TOKEN` sealed under key A"
+            ],
+            "pseudocode": "in internal/secret/store_test.go, a table over {no key configured; a different current key and no previous; one ciphertext byte flipped; the sealed bytes of key A copied into the row of key B; the row moved to another scope_id}: value, found, err = store.Get(ctx, scope, id, 'TOKEN'); assert errors.Is(err, ErrUnreadable); assert err.Error() == 'secret \"TOKEN\" cannot be decrypted'; assert value == ''"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Access to each secret scope",
+      "rationale": "A user's, an org's and a workspace's secrets have different owners, and a stranger must not learn from the answer whether an org or a workspace exists.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "a caller authenticated with an API key or a PAT calls a route under /api/v1/user/secrets",
+          "action": "act on the user secret scope whose id is the caller's user id",
+          "contract": "a secret one user created is absent from every other user's list, and each user can create the same key",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the real router, store, identity and event components; two users with API keys"
+            ],
+            "pseudocode": "in internal/secret/handlers_test.go: as user A post {entries:[{key:'K',value:'a'}]} to /user/secrets -> 201; as user B GET /user/secrets -> items == []; as user B post the same key -> 201; as user A GET -> exactly one item 'K'"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "unwanted",
+          "condition": "the admin token calls a route under /api/v1/user/secrets",
+          "action": "refuse the request and change nothing",
+          "contract": "HTTP 403 with error_type `forbidden` and the message `user-scoped endpoints require a user credential`",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/secret/handlers_test.go, a table over every user-scope secret route in the route table of the test file (GET and POST /user/secrets, PATCH and DELETE /user/secrets/K): r = do(adminToken, route, validBody); assert r.status == 403; assert r.json.error.error_type == 'forbidden'; assert r.json.error.message == 'user-scoped endpoints require a user credential'"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "event_driven",
+          "condition": "a member of an active organization, or the admin token, calls a route under /api/v1/orgs/:slug/secrets, naming the organization by its slug or its UUID",
+          "action": "act on the org secret scope whose id is the organization's id",
+          "contract": "a secret one member created is listed for another member of the same org and for the admin token, under the slug and under the UUID, and is absent from the lists of other orgs",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "an org `acme` with members M1 and M2"
+            ],
+            "pseudocode": "in internal/secret/handlers_test.go: member M1 posts key 'K' to /orgs/acme/secrets -> 201; member M2 GET /orgs/acme/secrets -> one item 'K'; admin GET /orgs/<acme uuid>/secrets -> one item 'K'; M1 GET /orgs/<M1 personal org>/secrets -> items == []"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "unwanted",
+          "condition": "the organization named in the path does not exist, or the caller is a user who is not a member of it, or the organization is blocked and the caller is not the admin token",
+          "action": "refuse the request and change nothing",
+          "contract": "HTTP 404 with error_type `not_found`; the response body is byte-for-byte the same in the three cases",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/secret/handlers_test.go, a table over every org-scope secret route x {unknown slug; existing org, caller not a member; blocked org, caller a member}: r = do(userKey, route, validBody); assert r.status == 404; assert r.json.error.error_type == 'not_found'; assert the three bodies of one route are equal; assert the admin token gets 200 on GET for the blocked org"
+          }
+        },
+        {
+          "id": "REQ-3.5",
+          "pattern": "event_driven",
+          "condition": "a caller whose level on the workspace is owner or admin calls a route under /api/v1/workspaces/:slug/secrets",
+          "action": "act on the workspace secret scope whose id is that slug and on no other workspace's secrets",
+          "contract": "the list of a task fork holds none of its parent's secrets and the parent's list none of the fork's; the owner of the parent can use the fork's secret routes; the admin token can use both",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "workspace records written through internal/access: `acme` owned by user O in org `acme`, and a task fork `acme-fork` of it created by org member M"
+            ],
+            "pseudocode": "in internal/secret/handlers_test.go: owner posts 'P' to /workspaces/acme/secrets and 'F' to /workspaces/acme-fork/secrets; assert GET on acme lists only 'P' and GET on acme-fork lists only 'F', for the owner and for the admin token"
+          }
+        },
+        {
+          "id": "REQ-3.6",
+          "pattern": "unwanted",
+          "condition": "a caller whose level on the workspace is member calls any of its secret routes, the list included",
+          "action": "refuse the request and change nothing",
+          "contract": "HTTP 403 with error_type `forbidden` and the message `org members have read-only access to this workspace`",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/secret/handlers_test.go, a table over every workspace-scope secret route x {org member M on `acme`; M, creator of the fork `acme-fork`, on the parent `acme`}: r = do(M, route, validBody); assert r.status == 403; assert r.json.error.error_type == 'forbidden'; assert r.json.error.message == 'org members have read-only access to this workspace'; assert the store's rows for `acme` are unchanged"
+          }
+        },
+        {
+          "id": "REQ-3.7",
+          "pattern": "unwanted",
+          "condition": "a caller whose level on the workspace is none calls one of its secret routes, or the slug names no workspace",
+          "action": "refuse the request and change nothing",
+          "contract": "HTTP 404 with error_type `not_found` and the message `workspace not found`; the body is byte-for-byte the same for an existing workspace and an unknown slug",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/secret/handlers_test.go, a table over every workspace-scope secret route: a = do(outsider, route on `acme`); b = do(outsider, route on `no-such`); assert a.status == 404 and b.status == 404; assert a.body == b.body; assert a.json.error.message == 'workspace not found'"
+          }
+        },
+        {
+          "id": "REQ-3.8",
+          "pattern": "unwanted",
+          "condition": "a PAT calls a list route without `secrets:read` or `secrets:write`, or a create, update or delete route without `secrets:write`",
+          "action": "refuse the request before deciding access to the scope",
+          "contract": "HTTP 403 with error_type `insufficient_scope`, the same for an existing and for an unknown organization or workspace",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/secret/handlers_test.go, a table over {PAT with `vars:read` on GET in each scope -> 403; PAT with `secrets:read` on POST, PATCH and DELETE in each scope -> 403; PAT with `secrets:read` on GET -> 200; PAT with `secrets:write` on GET -> 200; PAT with `secrets:read` on POST /workspaces/no-such/secrets -> 403 and not 404; PAT with `secrets:read` on POST /orgs/no-such/secrets -> 403}: assert status and, for 403, error_type == 'insufficient_scope'"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Secret creation",
+      "rationale": "A developer stores a credential once and several at a time; a half-applied create would leave them guessing which ones the hub holds.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "a caller with access to the scope posts {\"entries\":[{\"key\",\"value\"}, ...]} to a secrets collection route with valid entries",
+          "action": "store every entry with the key casing as given, an absent value as the empty string, and one shared creation time, and answer with the entries in request order",
+          "contract": "HTTP 201 with body {\"items\":[{key, created_at, updated_at}, ...]} in request order, where created_at == updated_at and every item carries the same created_at as an RFC 3339 UTC timestamp with whole seconds, and no item has any other member",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a current key is configured; the clock is fixed"
+            ],
+            "pseudocode": "in internal/secret/handlers_test.go, a table over bodies {one entry; three entries `b`,`A`,`c` -> items in that order; entry without `value` -> stored value ''; value ''; key `_`; key of 255 characters; value of exactly 262144 bytes; mixed-case key `Git_Pat` returned as given}: r = post(route, body); assert r.status == 201; assert keys(r.json.items) == request keys; assert each item has exactly the members key, created_at, updated_at with created_at == updated_at == the clock's time; assert store.Get returns each value"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "unwanted",
+          "condition": "the create body has no `entries` array or an empty one, or an entry's key is missing, empty, longer than 255 characters, starts with a digit or holds a character other than an ASCII letter, a digit or `_`, or an entry's value is present and not a JSON string or is longer than 262144 bytes, or two keys of the request are equal ignoring ASCII case",
+          "action": "reject the whole request and store nothing",
+          "contract": "HTTP 400 with error_type `invalid_request`; where the fault is in an entry the message contains that entry's key; the scope's secrets and the event log are unchanged",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/secret/handlers_test.go, a table over bodies {`{}`; entries: []; entries: 'x'; entry without key; key ''; key of 256 characters; key `1A`; key `A-B`; key `A B`; key with a non-ASCII letter; value 5; value null; value of 262145 bytes; keys `Token` and `TOKEN`; a valid entry followed by an invalid one}: r = post(route, body); assert r.status == 400; assert r.json.error.error_type == 'invalid_request'; where a key is at fault assert it occurs in the message; assert count(scope) is unchanged"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "unwanted",
+          "condition": "a create request passes validation and no current encryption key is configured",
+          "action": "reject the request and store nothing",
+          "contract": "HTTP 503 with error_type `secrets_unavailable`; the scope's secrets are unchanged; an invalid body without a key is still answered 400",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the component built with no current key, also in the variant with only a previous key"
+            ],
+            "pseudocode": "in internal/secret/handlers_test.go: with no key configured, r = post(route, validBody); assert r.status == 503; assert r.json.error.error_type == 'secrets_unavailable'; assert count(scope) == 0; r2 = post(route, {entries: []}); assert r2.status == 400"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "unwanted",
+          "condition": "the number of secrets in the scope plus the number of entries in the request exceeds 100",
+          "action": "reject the whole request and store nothing, also when a key of the request already exists",
+          "contract": "HTTP 429 with error_type `secret_limit_reached` and the message `maximum of 100 entries per scope exceeded`; the scope's secrets are unchanged",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/secret/handlers_test.go, a table over {100 stored + 1 new -> 429; 99 stored + 2 new -> 429; 0 stored + 101 new -> 429; 100 stored + 1 entry whose key already exists -> 429; 99 stored + 1 new -> 201; 0 stored + 100 new -> 201}: assert status; for 429 assert error_type == 'secret_limit_reached' and message == 'maximum of 100 entries per scope exceeded' and count(scope) unchanged; assert a full user scope does not limit an org scope"
+          }
+        },
+        {
+          "id": "REQ-4.5",
+          "pattern": "unwanted",
+          "condition": "a key of the request equals, ignoring ASCII case, a key already stored in the scope, and the limit is not exceeded",
+          "action": "reject the whole request and store none of its entries",
+          "contract": "HTTP 409 with error_type `conflict` and the message `key \"<k>\" already exists`, where <k> is the first conflicting key in request order as the request spelled it; the entries of the request that did not conflict are not stored",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/secret/handlers_test.go: with `Token` and `Other` stored, a table over request keys {[`NEW`,`TOKEN`] -> message 'key \"TOKEN\" already exists'; [`token`] -> 'key \"token\" already exists'; [`other`,`TOKEN`] -> 'key \"other\" already exists'}: r = post(route, body); assert r.status == 409; assert r.json.error.error_type == 'conflict'; assert the message; assert `NEW` is not stored and `Token` keeps its value and timestamps"
+          }
+        },
+        {
+          "id": "REQ-4.6",
+          "pattern": "ubiquitous",
+          "action": "for any set of create requests that arrive at the same time for one scope, store each key at most once and never hold more than 100 secrets in the scope",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/secret/store_test.go against a real store: start 8 goroutines that each create key `K` in one scope; assert exactly one succeeds and seven fail with the conflict error; then with 99 stored start 8 goroutines that each create a distinct key; assert exactly one succeeds, seven fail with the limit error, and count(scope) == 100"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Secret listing",
+      "rationale": "The owner needs to see which secrets exist and when they changed, and must never get a value back.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "a caller with access to the scope sends GET to a secrets collection route",
+          "action": "answer with the scope's own secrets ordered by key ascending, comparing keys with A to Z lowered, paged by `limit` and `cursor`",
+          "contract": "HTTP 200 with body {\"items\":[{key, created_at, updated_at}, ...],\"next_cursor\": string or null}; items is [] for an empty scope; following next_cursor returns every secret exactly once in order and ends with next_cursor null",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/secret/handlers_test.go: store keys `b`, `A`, `c`, `_x`, `B2`, `a1`; r = get(route); assert keys(r.json.items) == ['_x','A','a1','b','B2','c']; assert r.json.next_cursor == null; with limit=4 assert page 1 has 4 items and a cursor, page 2 has the remaining 2 and next_cursor null, and the concatenation equals the full order; on an empty scope assert the raw body has \"items\":[]; assert limit=0 and limit=201 answer 400 invalid_request; assert every item has exactly the members key, created_at, updated_at and the raw body contains none of the stored values"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "ubiquitous",
+          "action": "for any list response, give each item exactly the members key, created_at and updated_at, without the value and without the owner",
+          "check": {
+            "same_as": "REQ-5.1"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "state_driven",
+          "condition": "no encryption key is configured, or a stored secret cannot be decrypted with the configured keys",
+          "action": "still list every secret of the scope",
+          "contract": "HTTP 200 with every stored entry, the undecryptable ones included",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/secret/handlers_test.go: store two secrets under key A; rebuild the component over the same store with {no key} and then with {a different key B}; in both assert get(route).status == 200 and both keys are listed"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Secret update and deletion",
+      "rationale": "A rotated credential must replace the old one in place, and a secret nobody can decrypt any more must still be replaceable and removable.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "a caller with access to the scope sends PATCH with {\"value\": string} to a secret whose key matches the path's key ignoring ASCII case",
+          "action": "replace the value, sealed under the current key, keep the stored key casing and created_at, and set updated_at to the current time",
+          "contract": "HTTP 200 with body {key, created_at, updated_at}, where key has the stored casing, created_at is unchanged and updated_at is the time of the update; the internal read returns the new value",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/secret/handlers_test.go, a table over {PATCH /…/secrets/git_pat on stored `Git_Pat` with value 'new'; value ''; value of exactly 262144 bytes}: advance the clock by 90 seconds; r = patch(route, body); assert r.status == 200; assert r.json.key == 'Git_Pat'; assert r.json.created_at == the create time; assert r.json.updated_at == the clock's time; assert store.Get(...) == the new value; assert r.json has no other member"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "unwanted",
+          "condition": "the update body has no `value`, or its value is null, not a JSON string or longer than 262144 bytes",
+          "action": "reject the request and leave the secret as it was",
+          "contract": "HTTP 400 with error_type `invalid_request`; the stored value and updated_at are unchanged",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/secret/handlers_test.go, a table over bodies {`{}`; value null; value 7; value of 262145 bytes}: r = patch(route, body); assert r.status == 400; assert r.json.error.error_type == 'invalid_request'; assert store.Get returns the old value and updated_at is unchanged"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "unwanted",
+          "condition": "a PATCH passes validation and no current encryption key is configured",
+          "action": "reject the request and leave the secret as it was",
+          "contract": "HTTP 503 with error_type `secrets_unavailable`, for a stored key and for a key that is not stored alike; the stored row is unchanged",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/secret/handlers_test.go: with a secret stored under key A and the component rebuilt with no current key: assert patch(existing, {value:'x'}).status == 503 with error_type 'secrets_unavailable'; assert patch(unknown key, {value:'x'}).status == 503; assert the row's sealed bytes are unchanged"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "unwanted",
+          "condition": "a PATCH or DELETE names a key that matches no secret of the scope ignoring ASCII case, the key being legal or not",
+          "action": "refuse the request and change nothing",
+          "contract": "HTTP 404 with error_type `not_found` and the message `key \"<k>\" not found`, where <k> is the key from the path",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/secret/handlers_test.go, a table over {PATCH, DELETE} x keys {`MISSING`; `not-a-key`; a key stored only in another scope; a key stored in the parent of the fork addressed}: assert r.status == 404; assert r.json.error.error_type == 'not_found'; assert r.json.error.message == 'key \"' + k + '\" not found'"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "event_driven",
+          "condition": "a caller with access to the scope sends DELETE to a secret whose key matches the path's key ignoring ASCII case",
+          "action": "remove the secret, whether or not an encryption key is configured and whether or not the value can be decrypted",
+          "contract": "HTTP 204 with an empty body; the key is gone from the list and can be created again with 201",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/secret/handlers_test.go, a table over {key configured; no key configured; value sealed under a key that is no longer configured}: r = delete(route with the key in another casing); assert r.status == 204 and len(r.body) == 0; assert the key is absent from GET; in the first case assert a POST of the same key answers 201"
+          }
+        },
+        {
+          "id": "REQ-6.6",
+          "pattern": "event_driven",
+          "condition": "a PATCH names a secret whose stored value cannot be decrypted while a current key is configured",
+          "action": "overwrite it with the new value sealed under the current key",
+          "contract": "HTTP 200; the internal read of the secret afterwards returns the new value without an error",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/secret/handlers_test.go: store `K` under key A; rebuild the component with current key B only; assert store.Get returns ErrUnreadable; r = patch('/…/secrets/K', {value:'again'}); assert r.status == 200; assert store.Get(...) == 'again'"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "Write-only values and events",
+      "rationale": "The owner sees every change to their secrets in the audit record, and no surface of the hub may give a value back.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "event_driven",
+          "condition": "a create request succeeds",
+          "action": "write one event per created entry in the transaction that stores the entries",
+          "contract": "per entry one event with type `parley.secret.create`, resource_type `secret`, action `create`, resource_id the stored key, metadata exactly {\"scope\", \"scope_id\", \"key\"} with scope `user`, `org` or `workspace` and scope_id the user id, org id or workspace slug, workspace the slug for the workspace scope and null otherwise, and the caller as actor",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/secret/handlers_test.go, a table over the three scopes: post two entries; read the events back through internal/event; assert exactly two new events of type 'parley.secret.create' in request order with resource_type 'secret', action 'create', resource_id == key, metadata == {scope, scope_id, key}; assert event.workspace == slug for the workspace scope and null for user and org; assert the actor is the calling user, or the admin token on an org route"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "event_driven",
+          "condition": "an update or a delete request succeeds",
+          "action": "write one event in the transaction of the change, naming the secret by its stored key",
+          "contract": "one event with type `parley.secret.update` and action `update`, or type `parley.secret.delete` and action `delete`, with resource_type `secret`, resource_id and metadata.key the stored key casing whatever casing the path used, and the scope, scope_id and workspace as for create",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/secret/handlers_test.go: with `Git_Pat` stored in a workspace scope: patch('/…/secrets/GIT_PAT'); assert one new event 'parley.secret.update' with resource_id 'Git_Pat' and metadata.key 'Git_Pat'; delete('/…/secrets/git_pat'); assert one new event 'parley.secret.delete' with the same resource_id, scope 'workspace', scope_id and workspace the slug"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "unwanted",
+          "condition": "a secret request is answered with an error status",
+          "action": "write no secret event",
+          "contract": "the number of events in the event log is the same after the request as before it",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/secret/handlers_test.go, a table over failing requests {create 400; create 409 with one non-conflicting entry; create 429; create 503; update 400; update 404; delete 404; member 403; outsider 404; PAT 403}: n = count(events); do(request); assert count(events) == n"
+          }
+        },
+        {
+          "id": "REQ-7.4",
+          "pattern": "ubiquitous",
+          "action": "for any secret value a caller submits, keep the value out of every response body, every event, every log line and every error message, and out of the store in readable form",
+          "contract": "a byte search for the value finds nothing in any response body, any event, any log line at any level, any error text and the database files; the only way to obtain the value is the internal read of REQ-8.1",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/secret/secret_integration_test.go: with the sentinel value 'S3ntinel-7f3a9c41-value' and the hub's log captured at trace level: create it, replay the create with the same Idempotency-Key, list, create it again (409), update it to a second sentinel, read both through store.Get, rebuild with another key and read (unreadable error), delete; assert neither sentinel occurs in any response body, in any event read back through internal/event, in the captured log, in any returned error's text, or in the bytes of the database files"
+          }
+        },
+        {
+          "id": "REQ-7.5",
+          "pattern": "unwanted",
+          "condition": "the event of a create, update or delete cannot be written",
+          "action": "roll the change back",
+          "contract": "HTTP 500 with error_type `internal`; the scope's secrets are as they were before the request",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/secret/handlers_test.go: build the handlers with an event writer stub that returns an error; assert post, patch and delete each answer 500 with error_type 'internal'; assert the store rows are unchanged after each"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "The secret component for hub code",
+      "rationale": "Workspace creation, the forge client, webhook verification and sandboxes use secrets; they need one place that reads, stores and removes them under the same rules as the routes.",
+      "system": "secret store",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "hub code reads a secret by secret scope, scope id and name",
+          "action": "return the decrypted value of the entry of exactly that scope whose key equals the name ignoring ASCII case, reading the store on every call",
+          "contract": "Get returns (value, true, nil) for a stored secret, the empty value stored as (\"\", true, nil), and (\"\", false, nil) when the scope has no such key; a secret of another scope, of the parent workspace or of the owner's user scope is never returned; a value updated through the route is returned by the next call",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/secret/store_test.go against a real store: Put `Git_Pat`='a' in workspace `acme`; assert Get(workspace, 'acme', 'GIT_PAT') == ('a', true, nil); assert Get(workspace, 'acme-fork', 'GIT_PAT') == ('', false, nil); assert Get(user, ownerID, 'GIT_PAT') == ('', false, nil); store '' and assert ('', true, nil); update the value to 'b' through the store's update operation and assert the next Get returns 'b'"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "event_driven",
+          "condition": "hub code stores a named secret inside a store transaction it owns",
+          "action": "create the entry, or overwrite the value of the entry whose key matches ignoring ASCII case, sealed under the current key, as part of that transaction and without writing an event",
+          "contract": "after the caller commits, Get returns the value; after the caller rolls back, the scope is as before; a new entry has created_at == updated_at and an overwritten one keeps its key casing and created_at; no `parley.secret.*` event is written",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/secret/store_test.go: tx = store.Begin(); Put(tx, workspace, 'w', 'GIT_PAT', 'p'); tx.Rollback(); assert Get(...) not found; repeat with Commit; assert Get == 'p'; Put(tx2, workspace, 'w', 'git_pat', 'q') and commit; assert one row with key 'GIT_PAT', the first created_at and value 'q'; assert count(events of type parley.secret.*) == 0"
+          }
+        },
+        {
+          "id": "REQ-8.3",
+          "pattern": "unwanted",
+          "condition": "hub code stores a secret while no current key is configured, or with a key or value outside the limits of REQ-4.2, or as the 101st entry of the scope",
+          "action": "return a typed error and write nothing in the transaction",
+          "contract": "Put returns an error matching ErrUnavailable, ErrInvalid or ErrLimitReached respectively; Available() reports false exactly when no current key is configured; the HTTP error the component exports for ErrUnavailable is 503 with error_type `secrets_unavailable`",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/secret/store_test.go, a table over {no current key -> ErrUnavailable; key `1A` -> ErrInvalid; value of 262145 bytes -> ErrInvalid; 100 stored and a new key -> ErrLimitReached; 100 stored and an existing key -> nil}: err = Put(tx, …); assert errors.Is(err, want); assert the transaction wrote no row on error; assert Available() == false with no key and true with one; assert the exported envelope for ErrUnavailable has code 503 and error_type 'secrets_unavailable'"
+          }
+        },
+        {
+          "id": "REQ-8.4",
+          "pattern": "event_driven",
+          "condition": "hub code removes a secret scope inside a store transaction it owns, as the deletion of a workspace or the expiry of a task fork does",
+          "action": "delete every secret of that scope and of no other as part of that transaction, without writing an event",
+          "contract": "after commit the scope has no secret and a secret created later under the same scope id has a fresh created_at and none of the old entries; after rollback every secret is still there; secrets of other scopes, the fork's parent included, are untouched",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/secret/store_test.go: store 3 secrets in workspace `acme`, 2 in `acme-fork`, 1 in the owner's user scope; tx = Begin(); RemoveScope(tx, workspace, 'acme-fork'); Rollback -> counts 3, 2, 1; again with Commit -> counts 3, 0, 1; assert the workspace remover exported for the registry of internal/workspace does the same for a slug; assert no event was written"
+          }
+        },
+        {
+          "id": "REQ-8.5",
+          "pattern": "event_driven",
+          "condition": "an admin deletes a user or an organization through DELETE /api/v1/users/:id or DELETE /api/v1/orgs/:id",
+          "action": "delete the secrets of that user's or that organization's scope in the transaction of the deletion",
+          "contract": "the delete answers 204 and the store holds no secret with that scope id; when the deletion is refused or rolled back the secrets remain",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/secret/secret_integration_test.go with the real identity routes: store 2 secrets in user U's scope and 2 in org `acme`; admin DELETE /users/<U> -> 204; assert count(user, U) == 0 and count(org, acme) == 2; admin DELETE /orgs/acme -> 204; assert count(org, acme id) == 0; assert DELETE of the only active admin user answers 409 and that user's secrets remain"
+          }
+        },
+        {
+          "id": "REQ-8.6",
+          "pattern": "event_driven",
+          "condition": "the internal read returns a non-empty decrypted value",
+          "action": "register the value with the hub's scrubber",
+          "contract": "a log line written afterwards through the hub's logger that contains the value shows `[redacted]` in its place",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/secret/store_test.go with the real internal/scrub scrubber: store 'tok-4be1c0ffee-2d9a'; Get it; assert scrub('fetch failed for tok-4be1c0ffee-2d9a') == 'fetch failed for [redacted]'"
+          }
+        },
+        {
+          "id": "REQ-8.7",
+          "pattern": "event_driven",
+          "condition": "hub code seals or opens a value that is not a named secret, with a binding string of its own",
+          "action": "seal it under the current key and open it under the current or the previous key by the same rules as stored secrets, and report whether a sealed value is under the current key",
+          "contract": "SealValue returns the sealed bytes or ErrUnavailable without a current key; OpenValue returns the plaintext, or an error matching ErrUnreadable when neither key fits or the binding differs; NeedsReseal is true exactly when the sealed value's key id is not the current key's",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/secret/cipher_test.go: s = SealValue(keys{Current: A}, 'webhook:17', 'whsec'); assert OpenValue(keys{Current: A}, 'webhook:17', s) == 'whsec'; assert errors.Is(OpenValue(keys{Current: A}, 'webhook:18', s), ErrUnreadable); assert NeedsReseal(keys{Current: B, Previous: A}, s) == true and NeedsReseal(keys{Current: A}, s) == false; assert errors.Is(SealValue(keys{}, …), ErrUnavailable)"
+          }
+        },
+        {
+          "id": "REQ-8.8",
+          "pattern": "event_driven",
+          "condition": "hub code deletes a named secret inside a store transaction it owns",
+          "action": "remove the entry of exactly that scope whose key equals the name ignoring ASCII case, without reading its value and without writing an event, and report whether an entry existed",
+          "contract": "Delete returns (true, nil) when an entry was removed and (false, nil) when the scope has no such key; it works without a current key and on an entry that cannot be decrypted; after the caller rolls back the entry is still there; no `parley.secret.*` event is written",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a real store in t.TempDir() holding the workspace secret Forge_Webhook_Secret and one other secret"
+            ],
+            "pseudocode": "in internal/secret/store_test.go: tx = store.Begin(); existed, err = c.Delete(tx, workspace, 'acme', 'FORGE_WEBHOOK_SECRET'); tx.Commit(); assert existed and err == nil; assert Get(workspace, 'acme', 'FORGE_WEBHOOK_SECRET') == ('', false, nil) and the other secret is still read; existed, err = c.Delete(tx2, workspace, 'acme', 'FORGE_WEBHOOK_SECRET'); assert !existed and err == nil; repeat the first delete with a component that has no current key and with a row whose key id matches no key: assert existed; repeat with tx.Rollback() and assert the secret is still read; assert the event log has no parley.secret.* event"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-9",
+      "title": "Re-encryption after a key rotation",
+      "rationale": "The operator can drop the old key only when nothing is encrypted with it any more, and needs the hub to say when that is.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-9.1",
+          "pattern": "event_driven",
+          "condition": "a maintenance pass runs the task `secret_reencryption` while a current and a previous key are configured",
+          "action": "seal again under the current key every secret whose key id is the previous key's, leaving key, created_at and updated_at as they are and writing no event",
+          "contract": "afterwards every converted secret is read with only the current key configured; its key, created_at and updated_at are byte-for-byte unchanged; the event log has no new event",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/secret/reencrypt_test.go against a real store: store 5 secrets under key A across the three scopes and 2 under key B; run the task with keys{Current: B, Previous: A} and the clock advanced by 2 hours; assert all 7 rows carry B's key id; assert Get with keys{Current: B} returns each original value; assert every created_at and updated_at is unchanged; assert count(events) is unchanged"
+          }
+        },
+        {
+          "id": "REQ-9.2",
+          "pattern": "event_driven",
+          "condition": "the task `secret_reencryption` ends",
+          "action": "write one info log line with the number of values it converted and the number of stored values that are still not under the current key, the counts of every registered converter included",
+          "contract": "one log line with the message `secret re-encryption` and the integer members converted and remaining",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/secret/reencrypt_test.go, a table over {5 under previous, previous configured -> converted 5, remaining 0; 5 under a third key C -> converted 0, remaining 5; nothing stored -> 0, 0; 2 under previous plus a registered converter that returns (3, 1) -> converted 5, remaining 1}: run the task with a captured logger; assert exactly one line with message 'secret re-encryption' and the expected members"
+          }
+        },
+        {
+          "id": "REQ-9.3",
+          "pattern": "state_driven",
+          "condition": "no previous key or no current key is configured",
+          "action": "leave every stored value as it is when the task runs, and report converted 0",
+          "contract": "the task returns no error; every row's sealed bytes are unchanged; the log line carries converted 0 and remaining equal to the number of values not under the current key (every value when no current key is configured)",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/secret/reencrypt_test.go, a table over keys {Current only; Previous only; neither}: snapshot the rows; run the task; assert err == nil; assert the rows are byte-identical; assert the log line's converted == 0 and remaining as expected"
+          }
+        },
+        {
+          "id": "REQ-9.4",
+          "pattern": "unwanted",
+          "condition": "a value marked with the previous key's id fails to open under the previous key",
+          "action": "leave that value unchanged, go on with the remaining values and count it as remaining",
+          "contract": "the task returns no error; the failing row is byte-identical; every other value under the previous key is converted; the log line's remaining is at least 1 and no log line contains a value",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/secret/reencrypt_test.go: store 3 secrets under key A and flip one byte of one sealed value; run the task with keys{Current: B, Previous: A}; assert err == nil; assert 2 rows carry B's key id and the tampered row is unchanged; assert the log line has converted 2 and remaining 1"
+          }
+        },
+        {
+          "id": "REQ-9.5",
+          "pattern": "unwanted",
+          "condition": "a secret is updated or deleted by a request between the task reading it and the task writing it",
+          "action": "keep the request's result and discard the task's re-sealed value for that secret",
+          "contract": "after the pass an updated secret reads as the value the request stored, with the request's updated_at, and a deleted secret stays deleted",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/secret/reencrypt_test.go: with a hook between the task's read and its write, update one secret to 'newer' and delete another; let the task finish; assert Get of the first == 'newer' and its updated_at is the update's time; assert the second is not found"
+          }
+        },
+        {
+          "id": "REQ-9.6",
+          "pattern": "unwanted",
+          "condition": "the store fails while the task reads or writes",
+          "action": "stop the task and return the error to the maintenance loop",
+          "contract": "the task function returns a non-nil error, which the maintenance loop logs with the task name `secret_reencryption`; values converted before the failure stay converted and every value is still readable with the two keys",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/secret/reencrypt_test.go: run the task over a store wrapper that fails the third write; assert err != nil; assert the first two values carry the current key id and all values open with keys{Current: B, Previous: A}"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-10",
+      "title": "The parley secrets commands",
+      "rationale": "A developer or a script stores a credential from the shell without writing HTTP calls, and can pipe a value in so it never appears in the argument list.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-10.1",
+          "pattern": "event_driven",
+          "condition": "a user runs `parley secrets create` with one or more KEY=VALUE arguments and any combination of the flags --user, --org <slug> and --workspace <slug>",
+          "action": "send one POST /<scope>/secrets per scope given, in the order user, org, workspace, the user scope alone when no flag is given, each with every entry of the arguments, splitting arguments at commas and each entry at its first `=`",
+          "contract": "stdout holds one document {\"results\":[{\"scope\":\"user\"|\"org\"|\"workspace\",\"items\":[…]}, …]} in the order user, org, workspace with each route's items; exit status 0 when every scope succeeded",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/cli/secrets_test.go against an httptest server that records requests, a table over {`create A=1` -> one POST /user/secrets with entries [{A,1}]; `create A=1,B=x=y C=` -> entries [{A,'1'},{B,'x=y'},{C,''}]; `create A=1 --workspace w --org o --user` -> three POSTs in the order /user/secrets, /orgs/o/secrets, /workspaces/w/secrets with equal bodies; `create A=1 --org o` -> only /orgs/o/secrets}: assert the recorded requests; assert stdout parses to {results:[{scope, items}]} in order; assert exit == 0"
+          }
+        },
+        {
+          "id": "REQ-10.2",
+          "pattern": "unwanted",
+          "condition": "the hub answers an error for one or more of the scopes of `parley secrets create`",
+          "action": "still send the requests of the other scopes, print the results of the scopes that succeeded, and print each failed scope's error envelope once on stderr",
+          "contract": "exit status 1; stdout holds {\"results\":[…]} with exactly the scopes that succeeded ({\"results\":[]} when none did); stderr holds one error envelope per failed scope, as the hub sent it",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/cli/secrets_test.go: the test server answers 409 on /orgs/o/secrets and 201 elsewhere; run `create A=1 --user --org o --workspace w`; assert three requests were sent; assert stdout results have scopes ['user','workspace']; assert stderr holds exactly one envelope with error_type 'conflict'; assert exit == 1; with every route answering 503 assert stdout == {results: []}, three envelopes on stderr and exit == 1"
+          }
+        },
+        {
+          "id": "REQ-10.3",
+          "pattern": "event_driven",
+          "condition": "a user runs `parley secrets create <KEY> --from-stdin` or `parley secrets update <KEY> --from-stdin`",
+          "action": "read the value from standard input, drop one trailing line ending (a line feed, or a carriage return and line feed) and send it as the value of that key",
+          "contract": "the request body carries the bytes of standard input without one trailing line ending; commas, `=` and inner line breaks in the value are kept",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/cli/secrets_test.go, a table over stdin {'abc\\n' -> 'abc'; 'abc\\r\\n' -> 'abc'; 'abc\\n\\n' -> 'abc\\n'; 'a,b=c' -> 'a,b=c'; '' -> ''; 'line1\\nline2' -> unchanged} x {create, update}: run the command with that stdin; assert the recorded body's value"
+          }
+        },
+        {
+          "id": "REQ-10.4",
+          "pattern": "event_driven",
+          "condition": "a user runs `parley secrets list` with at most one scope flag",
+          "action": "request GET /<scope>/secrets with limit=200 and every following page, and print the items of all pages as one document",
+          "contract": "stdout holds {\"items\":[{key, created_at, updated_at}, …]} with the items of every page in the hub's order and no next_cursor; exit status 0",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/cli/secrets_test.go: the test server serves three pages of two items for /workspaces/w/secrets; run `list --workspace w`; assert three GETs with the cursors the server returned; assert stdout == {items: the six items in order}; run `list` with no flag and assert GET /user/secrets; assert exit == 0"
+          }
+        },
+        {
+          "id": "REQ-10.5",
+          "pattern": "event_driven",
+          "condition": "a user runs `parley secrets update <KEY=VALUE>` or `parley secrets delete <KEY>` with at most one scope flag",
+          "action": "send PATCH /<scope>/secrets/<KEY> with {\"value\"} or DELETE /<scope>/secrets/<KEY>",
+          "contract": "update prints the entry the hub returned; delete prints {\"deleted\":\"<KEY>\"} with the key as typed; exit status 0; a hub error is printed as received on stderr with exit status 1 and nothing on stdout",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/cli/secrets_test.go: `update A=x=y --org o` -> PATCH /orgs/o/secrets/A with body {value:'x=y'}, stdout the returned entry; `delete A --workspace w` -> DELETE /workspaces/w/secrets/A, stdout {deleted:'A'}; with the server answering 404 assert stdout is empty, stderr holds the envelope with error_type 'not_found' and exit == 1"
+          }
+        },
+        {
+          "id": "REQ-10.6",
+          "pattern": "unwanted",
+          "condition": "the arguments are malformed: no argument; an argument or entry without `=` when --from-stdin is absent; an entry with nothing before `=`; --from-stdin with more than one argument or with `=` or a comma in it; more than one entry for `update`; more or fewer than one argument for `delete`; more than one scope flag on `list`, `update` or `delete`; --org or --workspace with an empty value",
+          "action": "fail before sending any request",
+          "contract": "exit status 2; stderr holds one error envelope with code 0 and error_type `usage_error`; stdout is empty; the hub receives no request",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/cli/secrets_test.go, a table over {`create`; `create A`; `create =v`; `create A=1,B`; `create A B --from-stdin`; `create A=1 --from-stdin`; `update A=1,B=2`; `update A`; `delete`; `delete A B`; `list --user --org o`; `update A=1 --org o --workspace w`; `delete A --user --workspace w`; `list --org ''`}: run; assert exit == 2; assert stderr parses to an envelope with error_type 'usage_error'; assert stdout == ''; assert the test server recorded zero requests"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "A developer stores, rotates and removes a workspace secret from the shell",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "runs `parley secrets create GIT_PAT=<value> --workspace acme` for a workspace they own"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "posts the entry to /api/v1/workspaces/acme/secrets with the developer's API key"
+        },
+        {
+          "actor": "parleyd",
+          "action": "decides the developer's level is owner, seals the value under the current key, stores it and writes `parley.secret.create` in the same transaction, and answers 201 without the value"
+        },
+        {
+          "actor": "developer",
+          "action": "runs `parley secrets list --workspace acme` and sees the key and its timestamps"
+        },
+        {
+          "actor": "developer",
+          "action": "pipes a new value into `parley secrets update GIT_PAT --from-stdin --workspace acme`"
+        },
+        {
+          "actor": "parleyd",
+          "action": "replaces the value, writes `parley.secret.update`, and returns the new value to hub code that reads the secret next"
+        },
+        {
+          "actor": "developer",
+          "action": "runs `parley secrets delete GIT_PAT --workspace acme`"
+        },
+        {
+          "actor": "parleyd",
+          "action": "removes the secret, writes `parley.secret.delete` and answers 204"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parley CLI root command and HTTP client",
+          "HTTP router with the check order",
+          "authentication and identity",
+          "workspace access component",
+          "secret handlers and store",
+          "AES-256-GCM cipher with a real key",
+          "event component",
+          "SQLite store on disk"
+        ],
+        "setup": [
+          "a hub built in-process on a temporary data directory with PARLEY_SECRETS_KEY set",
+          "a user with an API key, and a workspace record `acme` owned by that user written through internal/access"
+        ],
+        "end_state": [
+          "`create` exits 0 and its document holds scope `workspace` with the item `GIT_PAT`",
+          "`list` prints one item with exactly key, created_at and updated_at",
+          "the internal read returns the first value after create and the piped value after update",
+          "after delete the list is empty and the internal read reports not found",
+          "the event log holds one create, one update and one delete event for `GIT_PAT` with workspace `acme`",
+          "neither value occurs in any command output, in the captured log or in the database file"
+        ],
+        "pseudocode": "in internal/secret/secret_integration_test.go: run the four commands through the CLI root command against the in-process hub; between them call store.Get(workspace, 'acme', 'GIT_PAT'); read the events through internal/event; grep the outputs, the log and the database file for both values"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "An operator rotates the encryption key",
+      "steps": [
+        {
+          "actor": "operator",
+          "action": "restarts parleyd with a new PARLEY_SECRETS_KEY and the old key as PARLEY_SECRETS_KEY_PREVIOUS"
+        },
+        {
+          "actor": "parleyd",
+          "action": "loads both keys and logs the start report with a previous key present and zero undecryptable secrets"
+        },
+        {
+          "actor": "parleyd",
+          "action": "runs the maintenance pass, re-encrypts every secret still under the previous key and logs the numbers converted and remaining"
+        },
+        {
+          "actor": "operator",
+          "action": "reads zero remaining in the log and restarts parleyd without PARLEY_SECRETS_KEY_PREVIOUS"
+        },
+        {
+          "actor": "parleyd",
+          "action": "logs zero undecryptable secrets and reads every secret with the new key alone"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the hub's run function and configuration loader",
+          "key loading",
+          "the maintenance loop and its task registry",
+          "secret store and cipher",
+          "SQLite store on disk",
+          "the hub's logger"
+        ],
+        "setup": [
+          "a data directory in which a hub run with key A stored three secrets across the user, org and workspace scopes"
+        ],
+        "end_state": [
+          "the second start logs key_configured true, previous_key_present true and undecryptable_secrets 0",
+          "the first maintenance pass logs converted 3 and remaining 0",
+          "the third start, with key B only, logs undecryptable_secrets 0",
+          "the internal read returns the three original values and every updated_at equals its value before the rotation",
+          "a fourth start with key A only logs undecryptable_secrets 3 and still lists the three keys"
+        ],
+        "pseudocode": "in internal/secret/secret_integration_test.go: start the hub in-process four times on one data directory with the environments {A}, {B, previous A}, {B}, {A}; wait for the first maintenance pass of the second start; assert the log lines and the store reads"
+      }
+    },
+    {
+      "id": "PATH-3",
+      "title": "An org shares a secret while a workspace's secrets stay with its owner",
+      "steps": [
+        {
+          "actor": "org member",
+          "action": "posts a secret to /api/v1/orgs/acme/secrets"
+        },
+        {
+          "actor": "parleyd",
+          "action": "finds the caller among the org's members, stores the secret in the org's scope and writes the event with scope `org` and a null workspace"
+        },
+        {
+          "actor": "org member",
+          "action": "lists the secrets of a workspace of the org that a developer owns"
+        },
+        {
+          "actor": "parleyd",
+          "action": "decides the caller's level is member and answers 403 forbidden"
+        },
+        {
+          "actor": "developer",
+          "action": "who owns the workspace lists its secrets and gets 200, without the org's secret in it"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers a user outside the org 404 for the org's secrets and for the workspace's secrets"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "HTTP router with the check order",
+          "authentication and identity with real memberships",
+          "workspace access component",
+          "secret handlers and store",
+          "event component",
+          "SQLite store"
+        ],
+        "setup": [
+          "an org `acme` with two members, a workspace `acme` of that org owned by a third user, and a user outside the org"
+        ],
+        "end_state": [
+          "the second member's GET /orgs/acme/secrets lists the key the first member stored",
+          "the member's GET /workspaces/acme/secrets is 403 forbidden",
+          "the owner's list of the workspace is 200 and empty",
+          "the outsider gets 404 not_found on both collections",
+          "exactly one secret event exists, with scope `org`"
+        ],
+        "pseudocode": "in internal/secret/secret_integration_test.go over HTTP against the in-process hub: the five requests in order with four API keys; assert statuses and error types; assert the event log"
+      }
+    }
+  ]
+}

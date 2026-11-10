@@ -1,0 +1,881 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "09",
+  "spec_name": "cli_foundation",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Settings from flag, environment and configuration file",
+      "rationale": "A person at a terminal logs in once and an agent gets its settings in its environment; both must reach the same hub with the same command line (PLAT-FR-090).",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "a command whose auth is user or admin runs",
+          "action": "take the hub URL from the first non-empty value of the flag --endpoint-url, the variable PARLEY_ENDPOINT_URL and the file key endpoint_url, and the credential from the first non-empty value of the flag --api-key, the variable PARLEY_API_KEY and the file key api_key",
+          "contract": "the command's request arrives at the chosen hub URL and carries the header Authorization: Bearer <the chosen credential>; an empty flag value or an empty variable is passed over for the next source",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "three httptest servers A, B and C each answer GET /api/v1/things/x with 200 {} and record their requests",
+              "a probe command 'probe get <name>' declared by the test through the declaration helper of internal/cli/command.go with method GET, path /things/:name and auth user",
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir(); PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset unless the case sets them"
+            ],
+            "pseudocode": "in internal/cli/config_test.go, a table over (flag url, env url, file url, flag key, env key, file key) -> (expected hub, expected key): {(A,B,C,k1,k2,k3)->(A,k1); (absent,B,C,absent,k2,k3)->(B,k2); (absent,unset,C,absent,unset,k3)->(C,k3); ('',B,C,'',k2,k3)->(B,k2); (absent,'',C,absent,'',k3)->(C,k3); (A,unset,C,absent,unset,k3)->(A,k3)}: code = run(['probe','get','x'] + flags); assert code == 0; assert only the expected hub recorded a request; assert its Authorization header == 'Bearer ' + expected key"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "unwanted",
+          "condition": "a command whose auth is user or admin runs and the hub URL, the credential or both have no non-empty value in flag, variable and configuration file",
+          "action": "fail before any request with a client error whose message names, for each missing setting, its flag, its variable and the path of the configuration file",
+          "contract": "exit status 2; stdout is empty; stderr is one JSON document {error: {code: 0, message, error_type: \"client_error\"}}; when the hub URL is missing the message contains --endpoint-url, PARLEY_ENDPOINT_URL and the configuration file's path; when the credential is missing it contains --api-key, PARLEY_API_KEY and the configuration file's path; no request is sent",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server stands in for the hub and records every request's method, raw path and headers",
+              "a probe command 'probe get <name>' declared by the test through the declaration helper of internal/cli/command.go with method GET, path /things/:name and auth user",
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir(); PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset unless the case sets them"
+            ],
+            "pseudocode": "in internal/cli/config_test.go, a table over what is missing {hub URL only, credential only, both; each with the file absent and with a file that holds only user_id}: code = run(['probe','get','x'] + flags); assert code == 2; assert stdout == ''; e = json(stderr).error; assert e.code == 0 and e.error_type == 'client_error'; assert e.message contains the flag, the variable and the path <config dir>/config.toml of each missing setting and not the flag of a setting that was given; assert hub requests == 0"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "unwanted",
+          "condition": "the hub URL a command resolved is not an absolute URL with scheme http or https and a host",
+          "action": "fail before any request with a client error whose message names the value",
+          "contract": "exit status 2; stdout is empty; stderr is one JSON document with error.code 0 and error.error_type \"client_error\", and error.message contains the rejected value; no request is sent",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a probe command 'probe get <name>' declared by the test through the declaration helper of internal/cli/command.go with method GET, path /things/:name and auth user",
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir(); PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset unless the case sets them"
+            ],
+            "pseudocode": "in internal/cli/config_test.go, a table over hub URLs {'localhost:8080', 'ftp://host', 'http://', '/api', 'host'} given by --endpoint-url with --api-key k: code = run(['probe','get','x', ...]); assert code == 2; assert stdout == ''; assert json(stderr).error.error_type == 'client_error'; assert json(stderr).error.message contains the value"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "state_driven",
+          "condition": "flags and environment variables give every setting the command needs",
+          "action": "run the command without reading the configuration file",
+          "contract": "the command sends its request and exits 0 although the configuration file holds text that is not valid TOML",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server stands in for the hub and records every request's method, raw path and headers",
+              "a probe command 'probe get <name>' declared by the test through the declaration helper of internal/cli/command.go with method GET, path /things/:name and auth user",
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir(); PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset unless the case sets them"
+            ],
+            "pseudocode": "in internal/cli/config_test.go: write 'not = [toml' to <config dir>/config.toml; a table over {both settings by flag, both by variable, URL by flag and key by variable}: code = run(['probe','get','x'] + flags); assert code == 0; assert hub requests == 1; assert stderr == ''"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "event_driven",
+          "condition": "a developer runs parley version, neither --endpoint-url nor PARLEY_ENDPOINT_URL gives a non-empty value, and the configuration file holds endpoint_url",
+          "action": "send GET <endpoint_url without trailing slash>/version without an Authorization header and print the client's build and the hub's build",
+          "contract": "exit status 0; stdout is one JSON document {cli: {version, commit}, server: {version, commit, build_time, go_version}} whose server member holds what the hub answered; the hub records one request to /version with no Authorization header, although the file also holds api_key",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "two httptest servers answer GET /version with different version values and record their requests",
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir(); PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset unless the case sets them"
+            ],
+            "pseudocode": "in internal/cli/version_test.go beside the existing table of hub URL sources: write endpoint_url = <hub> and api_key = 'k' to <config dir>/config.toml; code = cli.Run(ctx, ['version'], stdout, stderr); assert code == 0; assert json(stdout).server == the body the hub answered; assert recorded path == '/version' and no Authorization header; and with --endpoint-url <other hub> the other hub is called, not the file's"
+          }
+        },
+        {
+          "id": "REQ-1.6",
+          "pattern": "unwanted",
+          "condition": "a developer runs parley version, neither --endpoint-url nor PARLEY_ENDPOINT_URL gives a non-empty value, and the configuration file exists and cannot be parsed",
+          "action": "write one warning line that names the file to stderr, print the client's build without a server member and exit with success",
+          "contract": "exit status 0; stdout is the JSON document {cli: {version, commit}} with no server member; stderr holds exactly one line, it begins with \"warning: \" and contains the file's path",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir(); PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset unless the case sets them"
+            ],
+            "pseudocode": "in internal/cli/version_test.go: write 'not = [toml' to <config dir>/config.toml; code = cli.Run(ctx, ['version'], stdout, stderr); assert code == 0; assert keys(json(stdout)) == {cli}; lines = nonEmptyLines(stderr); assert len(lines) == 1 and lines[0] starts with 'warning: ' and contains <config dir>/config.toml"
+          }
+        },
+        {
+          "id": "REQ-1.7",
+          "pattern": "ubiquitous",
+          "action": "accept the global flags --endpoint-url <url>, --api-key <credential> and --json on every command, before or after the command's own words, and give --json no effect when neither help nor --help is asked for",
+          "contract": "a command line with a global flag in any position runs as the same command; the same command with and without --json sends the same request and prints the same stdout",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server stands in for the hub and records every request's method, raw path and headers at URL H and answers 200 {\"name\":\"x\"}",
+              "a probe command 'probe get <name>' declared by the test through the declaration helper of internal/cli/command.go with method GET, path /things/:name and auth user",
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir(); PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset unless the case sets them"
+            ],
+            "pseudocode": "in internal/cli/root_test.go, a table over argument orders {['--endpoint-url',H,'--api-key','k','probe','get','x'], ['probe','--api-key','k','get','x','--endpoint-url',H], ['probe','get','x','--endpoint-url='+H,'--api-key=k'], the first with '--json' added}: code = run(args); assert code == 0; assert hub recorded GET /api/v1/things/x with Authorization 'Bearer k'; assert stdout equals the stdout of the first case"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "The client configuration file",
+      "rationale": "The file is what parley login leaves behind; it holds a credential, so where it lives, who creates it and how it is replaced are fixed (docs/prd/03_platform.md §3.3.7).",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "ubiquitous",
+          "action": "locate the configuration file at $PARLEY_CONFIG_DIR/config.toml when PARLEY_CONFIG_DIR is set and non-empty, and otherwise at .parley/config.toml under the user's home directory",
+          "contract": "the path function of internal/cli/config.go returns <PARLEY_CONFIG_DIR>/config.toml or <home>/.parley/config.toml",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/config_test.go, a table over (PARLEY_CONFIG_DIR, HOME) -> path: {('/tmp/a', '/home/u') -> '/tmp/a/config.toml'; (unset, '/home/u') -> '/home/u/.parley/config.toml'; ('', '/home/u') -> '/home/u/.parley/config.toml'}: set both with t.Setenv; assert configPath() == path; and with a file holding endpoint_url and api_key at <HOME>/.parley/config.toml and PARLEY_CONFIG_DIR unset, run(['probe','get','x']) reaches the hub the file names"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "state_driven",
+          "condition": "the configuration file does not exist, or PARLEY_CONFIG_DIR is unset or empty and the home directory cannot be determined",
+          "action": "resolve the settings from flags and environment variables alone and create neither the directory nor the file",
+          "contract": "a command given both settings by variables exits 0; a command missing a setting exits 2 with error_type client_error; after either, the configuration directory does not exist",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server stands in for the hub and records every request's method, raw path and headers",
+              "a probe command 'probe get <name>' declared by the test through the declaration helper of internal/cli/command.go with method GET, path /things/:name and auth user"
+            ],
+            "pseudocode": "in internal/cli/config_test.go, a table over {PARLEY_CONFIG_DIR = <tmp>/missing; PARLEY_CONFIG_DIR unset and HOME = <tmp>/nohome; PARLEY_CONFIG_DIR unset and HOME unset}: with both variables set, code = run(['probe','get','x']); assert code == 0; with PARLEY_API_KEY unset, assert code == 2 and json(stderr).error.error_type == 'client_error'; assert no directory <tmp>/missing and no directory <tmp>/nohome/.parley exists afterwards"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "unwanted",
+          "condition": "a command needs a setting from the configuration file and the file exists and cannot be read, is not valid TOML, or holds endpoint_url, api_key or user_id with a value that is not a string",
+          "action": "fail before any request with a client error that names the file's path",
+          "contract": "exit status 2; stdout is empty; stderr is one JSON document with error.code 0 and error.error_type \"client_error\", and error.message contains the file's path; no request is sent",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server stands in for the hub and records every request's method, raw path and headers",
+              "a probe command 'probe get <name>' declared by the test through the declaration helper of internal/cli/command.go with method GET, path /things/:name and auth user",
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir(); PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset unless the case sets them"
+            ],
+            "pseudocode": "in internal/cli/config_test.go, a table over file states {content 'not = [toml'; content 'endpoint_url = 5'; content 'api_key = [\"a\"]'; valid content with mode 0000 (skipped when the test runs as root); a directory named config.toml}: PARLEY_ENDPOINT_URL = hub, PARLEY_API_KEY unset; code = run(['probe','get','x']); assert code == 2; assert stdout == ''; e = json(stderr).error; assert e.code == 0 and e.error_type == 'client_error' and e.message contains <config dir>/config.toml; assert hub requests == 0"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "event_driven",
+          "condition": "parley login saves settings and the configuration directory or the file does not exist yet",
+          "action": "create the directory with mode 0700 when it is missing and write the file with mode 0600, holding the keys endpoint_url, api_key and user_id with the saved values",
+          "contract": "the save function of internal/cli/config.go returns no error; the directory's permission bits are 0700; the file's permission bits are 0600; the file parses as TOML with exactly the three string keys; a command run afterwards without flags or variables uses the saved hub URL and credential",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server stands in for the hub and records every request's method, raw path and headers",
+              "a probe command 'probe get <name>' declared by the test through the declaration helper of internal/cli/command.go with method GET, path /things/:name and auth user",
+              "the process umask is 022"
+            ],
+            "pseudocode": "in internal/cli/config_test.go: PARLEY_CONFIG_DIR = <tmp>/new/dir (not existing); err = save({endpoint_url: hub, api_key: 'k', user_id: 'u1'}); assert err == nil; assert stat(<tmp>/new/dir).mode.perm == 0700; assert stat(file).mode.perm == 0600; assert toml(file) == {endpoint_url: hub, api_key: 'k', user_id: 'u1'}; code = run(['probe','get','x']); assert code == 0 and hub saw Authorization 'Bearer k'"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "event_driven",
+          "condition": "parley login saves settings and the configuration file already exists",
+          "action": "replace the file atomically with a file of mode 0600 that holds the saved values for endpoint_url, api_key and user_id and every other key of the old file with its value",
+          "contract": "the save function returns no error; the file's permission bits are 0600 whatever they were before; keys the CLI does not know, tables included, read back with their old values; the directory holds config.toml and no other entry; the file was replaced by a rename, so its inode differs from the old file's",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir(); PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset unless the case sets them"
+            ],
+            "pseudocode": "in internal/cli/config_test.go: write a file with mode 0644 holding endpoint_url = 'http://old', api_key = 'old', color = 'blue', retries = 3 and a table [profile] with name = 'x'; inodeBefore = stat(file).inode; err = save({endpoint_url: 'http://new', api_key: 'new', user_id: 'u2'}); assert err == nil; got = toml(file); assert got.endpoint_url == 'http://new' and got.api_key == 'new' and got.user_id == 'u2'; assert got.color == 'blue' and got.retries == 3 and got.profile.name == 'x'; assert stat(file).mode.perm == 0600; assert stat(file).inode != inodeBefore; assert readdir(dir) == ['config.toml']"
+          }
+        },
+        {
+          "id": "REQ-2.6",
+          "pattern": "unwanted",
+          "condition": "a save of the configuration file cannot write the new file, cannot replace the old one, or finds an existing file it cannot parse",
+          "action": "return an error that names the file's path, leave the previous file byte for byte as it was and remove any temporary file it created",
+          "contract": "the save function returns a client error whose message contains the file's path (a command that surfaces it exits 2 with error_type client_error); the previous file's bytes and mode are unchanged; the directory holds no entry other than the ones it held before",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir(); PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset unless the case sets them"
+            ],
+            "pseudocode": "in internal/cli/config_test.go, a table over {the directory has mode 0500 and holds a valid file (skipped as root); config.toml is a non-empty directory; the existing file holds 'not = [toml'; PARLEY_CONFIG_DIR unset and HOME unset}: before = (bytes, mode, readdir); err = save(settings); assert err != nil and err is a client error; where a path exists assert message contains it; assert (bytes, mode, readdir) == before"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "One HTTP client for every command",
+      "rationale": "Every command reaches the hub the same way, so a script that works for one command works for all (PLAT-FR-091).",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "a command sends a request for a path of the REST API",
+          "action": "send it with the command's method to <hub URL without its trailing slashes>/api/v1<path> with the header Authorization: Bearer <credential>, with a JSON body and Content-Type: application/json when the command has a body, and with no body and no Content-Type header when it has none",
+          "contract": "the hub receives the method, the path /api/v1<path> (after any path the hub URL itself carries), the query string the command set, the Authorization header and, for a body, bytes that parse as the JSON document the command passed",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server stands in for the hub and records every request's method, raw path and headers at URL H, on any path"
+            ],
+            "pseudocode": "in internal/cli/client_test.go, a table over (hub URL, method, path, query, body) {(H, GET, '/things/x', none, none); (H + '/', GET, '/things/x', 'limit=5', none); (H + '//', DELETE, '/things/x', none, none); (H + '/prefix', GET, '/things/x', none, none); (H, POST, '/things', none, {name: 'x', n: 1}); (H, PATCH, '/things/x', none, {})}: send through the client; assert recorded method, path == pathOf(hub URL) + '/api/v1' + path, query, Authorization == 'Bearer k'; with a body assert Content-Type == 'application/json' and json(recorded body) == body; without one assert no Content-Type header and content length 0"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "ubiquitous",
+          "action": "for any path segment that comes from a command-line argument or flag value, percent-encode it as one segment, so that a / inside it is sent as %2F",
+          "contract": "the raw request path the hub receives has exactly the segments the route's pattern has; the segment holds no /, ?, # or space; percent-decoding it gives the argument back unchanged",
+          "check": {
+            "kind": "property",
+            "setup": [
+              "an httptest server stands in for the hub and records every request's method, raw path and headers",
+              "a probe command 'probe get <name>' declared by the test through the declaration helper of internal/cli/command.go with method GET, path /things/:name and auth user",
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir(); PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset unless the case sets them"
+            ],
+            "pseudocode": "in internal/cli/client_test.go: the domain is strings of 1 to 64 characters drawn from letters, digits, '/', '?', '#', '%', ' ', '+', '.', '..', '&', '=' and non-ASCII letters, plus the fixed cases {'a/b', 'feature/x y', '100%', '..', 'a?b#c', 'ü/ö'}: for each s, run(['probe','get', s]); raw = recorded raw path; assert raw starts with '/api/v1/things/'; seg = raw after that prefix; assert seg contains none of '/', '?', '#', ' '; assert url.PathUnescape(seg) == s; assert the recorded query is empty"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "unwanted",
+          "condition": "no complete response arrives within the request timeout, which is 30 seconds unless the command states another",
+          "action": "abandon the request and fail with a client error",
+          "contract": "exit status 2; stdout is empty; stderr is one JSON document with error.code 0 and error.error_type \"client_error\"; the command returns no later than 1 second after the timeout; the hub recorded exactly one request",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a probe command 'probe get <name>' declared by the test through the declaration helper of internal/cli/command.go with method GET, path /things/:name and auth user",
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir(); PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset unless the case sets them",
+              "the default timeout is held in a field tests can shorten"
+            ],
+            "pseudocode": "in internal/cli/client_test.go: assert the client's default request timeout == 30 s; a table over {the default shortened by the test to 100 ms against a hub that sleeps 2 s before answering; a probe command that states a timeout of 300 ms against a hub that sleeps 200 ms (succeeds, code 0); the same command against a hub that sleeps 2 s; a hub that sends headers and half a body and then stalls}: start = now; code = run(...); for the failing cases assert code == 2, stdout == '', json(stderr).error.error_type == 'client_error', now - start < timeout + 1 s, hub requests == 1"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "unwanted",
+          "condition": "the connection to the hub cannot be made: the connection is refused, the host name does not resolve, or the TLS handshake fails",
+          "action": "fail with a client error whose message names the hub URL",
+          "contract": "exit status 2; stdout is empty; stderr is one JSON document with error.code 0 and error.error_type \"client_error\", and error.message contains the hub URL's host",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a probe command 'probe get <name>' declared by the test through the declaration helper of internal/cli/command.go with method GET, path /things/:name and auth user",
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir(); PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset unless the case sets them"
+            ],
+            "pseudocode": "in internal/cli/client_test.go, a table over hubs {'http://127.0.0.1:<a port that was closed>', 'http://no-such-host.invalid', an httptest TLS server whose certificate the client does not trust}: code = run(['probe','get','x','--endpoint-url',hub,'--api-key','k']); assert code == 2; assert stdout == ''; e = json(stderr).error; assert e.code == 0 and e.error_type == 'client_error' and e.message contains host(hub)"
+          }
+        },
+        {
+          "id": "REQ-3.5",
+          "pattern": "unwanted",
+          "condition": "the hub's response cannot be decoded: a 2xx status with a non-empty body that is not JSON, or a status of 400 or above whose body is not a JSON object with an error member that holds error_type",
+          "action": "fail with a client error whose message names the HTTP status",
+          "contract": "exit status 2; stdout is empty; stderr is one JSON document with error.code 0 and error.error_type \"client_error\", and error.message contains the status number",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server stands in for the hub and records every request's method, raw path and headers",
+              "a probe command 'probe get <name>' declared by the test through the declaration helper of internal/cli/command.go with method GET, path /things/:name and auth user",
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir(); PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset unless the case sets them"
+            ],
+            "pseudocode": "in internal/cli/client_test.go, a table over answers {200 '<html>'; 200 '{\"a\":'; 502 '<html>Bad Gateway</html>'; 404 'not found'; 500 '{}'; 500 '{\"error\":\"boom\"}'; 403 '{\"error\":{\"message\":\"x\"}}'}: code = run(['probe','get','x']); assert code == 2; assert stdout == ''; e = json(stderr).error; assert e.code == 0 and e.error_type == 'client_error' and e.message contains str(status)"
+          }
+        },
+        {
+          "id": "REQ-3.6",
+          "pattern": "ubiquitous",
+          "action": "for any command, send each of its requests exactly once and never repeat a request because of its outcome, a 429 answer included",
+          "contract": "after a command that failed with HTTP 429, 500, 502 or 503, a timeout or a broken connection, the hub has recorded exactly one request; for 429 with the error envelope, stderr holds that envelope with error_type \"rate_limited\" and the exit status is 1",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server stands in for the hub and records every request's method, raw path and headers",
+              "a probe command 'probe get <name>' declared by the test through the declaration helper of internal/cli/command.go with method GET, path /things/:name and auth user",
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir(); PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset unless the case sets them"
+            ],
+            "pseudocode": "in internal/cli/client_test.go, a table over answers {429 envelope rate_limited with Retry-After: 1; 500 envelope internal; 502 envelope upstream_error; 503 envelope unavailable; a connection the hub closes without answering}: code = run(['probe','get','x']); wait 1.5 s in the 429 case; assert hub requests == 1; for 429 assert code == 1 and json(stderr).error.error_type == 'rate_limited'"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Result on stdout, everything else on stderr",
+      "rationale": "A caller pipes stdout into a JSON parser and reads the error type from stderr; neither may ever hold anything else (PLAT-FR-092).",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "the hub answers a command's request with a 2xx status and a JSON body",
+          "action": "print the body on stdout as one JSON document indented by 2 spaces and followed by one newline, keeping the order of members and the text of numbers as received",
+          "contract": "exit status 0; stdout equals the body re-indented with 2 spaces plus \"\\n\" and parses as one JSON document equal to the body; stderr is empty",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server stands in for the hub and records every request's method, raw path and headers",
+              "a probe command 'probe get <name>' declared by the test through the declaration helper of internal/cli/command.go with method GET, path /things/:name and auth user",
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir(); PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset unless the case sets them"
+            ],
+            "pseudocode": "in internal/cli/output_test.go, a table over (status, body) {(200, '{\"b\":1,\"a\":{\"z\":[1,2],\"y\":null}}'); (201, '{\"id\":\"x\",\"n\":1.50,\"big\":12345678901234567890}'); (200, '{\"items\":[],\"next_cursor\":null}'); (200, '[]'); (202, a body already indented with tabs)}: code = run(['probe','get','x']); assert code == 0; assert stdout == indent(compact(body), '  ') + '\\n'; assert member order and number text in stdout equal the body's; assert stderr == ''"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "event_driven",
+          "condition": "the hub answers a command's request with a 2xx status and no body, as a route that answers 204 does",
+          "action": "print {} on stdout, or the confirmation document where the command states one, in the same form as any result",
+          "contract": "exit status 0; stdout is \"{}\\n\" for a command without a confirmation document, and the confirmation document indented by 2 spaces plus a newline for a command with one (for example {\"status\": \"deleted\", \"slug\": \"<slug>\"} built from the command's argument); stderr is empty",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server stands in for the hub and records every request's method, raw path and headers",
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir(); PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset unless the case sets them",
+              "two probe commands declared by the test with method DELETE, one of them with a confirmation document"
+            ],
+            "pseudocode": "in internal/cli/output_test.go, a table over (command, status) {(probe delete without confirmation, 204); (probe delete without confirmation, 200 with empty body); (probe remove declaring the confirmation {status: 'deleted', slug: <arg>}, 204)}: code = run([..., 'demo']); assert code == 0; assert stdout == '{}\\n' for the first two; assert stdout == '{\\n  \"status\": \"deleted\",\\n  \"slug\": \"demo\"\\n}\\n' for the third; assert stderr == ''"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "unwanted",
+          "condition": "the hub answers a command's request with a status of 400 or above and the error envelope",
+          "action": "print the envelope on stderr as received, with error_type and every extra member, print nothing on stdout and end with the exit status for a hub error",
+          "contract": "exit status 1; stdout is empty; stderr is one JSON document indented by 2 spaces and followed by a newline that equals the hub's body member for member: error.code is the HTTP status, error.error_type and error.message are the hub's, and members such as error.details or error.oldest_seq are present with their values",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server stands in for the hub and records every request's method, raw path and headers",
+              "a probe command 'probe get <name>' declared by the test through the declaration helper of internal/cli/command.go with method GET, path /things/:name and auth user",
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir(); PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset unless the case sets them"
+            ],
+            "pseudocode": "in internal/cli/output_test.go, a table over hub answers {404 {error:{code:404,message:'workspace not found',error_type:'not_found'}}; 401 unauthenticated; 403 insufficient_scope; 409 {error:{code:409,message:'m',error_type:'ref_moved',details:{current_sha:'<40 hex>'}}}; 410 {error:{code:410,message:'m',error_type:'cursor_expired',oldest_seq:42}}; 503 unavailable}: code = run(['probe','get','x']); assert code == 1; assert stdout == ''; assert json(stderr) == json(body); assert stderr == indent(compact(body), '  ') + '\\n'"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "ubiquitous",
+          "action": "for any error it raises itself, print on stderr the error envelope with code 0, a message and one of the types usage_error, client_error, wait_failed, wait_timeout and condition_not_met",
+          "contract": "stderr ends with one JSON document indented by 2 spaces and followed by a newline, {\"error\": {\"code\": 0, \"message\": <non-empty string>, \"error_type\": <the type>}}, with exactly those three members inside error",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/errors_test.go, a table over the five CLI error kinds built with the constructors of internal/cli/errors.go and one error of no named kind: write it with the error printer to a buffer; doc = json(buffer); assert keys(doc) == {error}; assert keys(doc.error) == {code, message, error_type}; assert doc.error.code == 0; assert doc.error.message != ''; assert doc.error.error_type == the kind's type ('client_error' for the error of no named kind); assert buffer == indent(doc, '  ') + '\\n'"
+          }
+        },
+        {
+          "id": "REQ-4.5",
+          "pattern": "optional",
+          "condition": "a command declares that its result carries a secret that is shown once (a token or key value)",
+          "action": "print the result on stdout unchanged and warn on stderr that the value will not be shown again",
+          "contract": "exit status 0; stdout is the hub's document with the secret member as received; stderr holds the line \"warning: this value is shown once and will not be shown again\"; when the hub answers an error no such line is written",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server stands in for the hub and records every request's method, raw path and headers",
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir(); PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset unless the case sets them"
+            ],
+            "pseudocode": "in internal/cli/output_test.go: a probe command declared with the show-once mark; hub answers 201 {\"id\":\"t1\",\"token\":\"parley_pat_abc\"}; code = run(...); assert code == 0; assert json(stdout).token == 'parley_pat_abc'; assert stderr == 'warning: this value is shown once and will not be shown again\\n'; then the hub answers 403 with an envelope: assert stderr holds the envelope and does not contain 'shown once'"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Exit codes and usage errors",
+      "rationale": "A script branches on the exit status alone, so each status has one meaning on every command (PLAT-FR-093).",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "ubiquitous",
+          "action": "for any command, end with exit status 0 on success, 1 when the hub answered an error or a wait failed or timed out, 2 for a usage error or a client error, and 3 when a requested condition was not met, and with no other status",
+          "contract": "cli.Run returns, and the parley process exits with, 0 for no error, 1 for a hub error, wait_failed and wait_timeout, 2 for usage_error, client_error and an error of no named kind, 3 for condition_not_met",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/errors_test.go, a table over outcomes {nil -> 0; hub error with status 404 -> 1; hub error with status 500 -> 1; wait_failed -> 1; wait_timeout -> 1; usage_error -> 2; client_error -> 2; errors.New('other') -> 2; condition_not_met -> 3}: assert exitCode(err) == want; and in internal/cli/root_test.go a probe command whose run step returns each outcome: assert cli run == want; and in test/e2e/build_test.go the built parley binary run with an unknown command exits 2"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "unwanted",
+          "condition": "the command line names an unknown command at the top level or under a group, carries a flag the command does not define, has fewer or more arguments than the command declares, or gives a flag a value that does not parse as the flag's type",
+          "action": "fail with a usage error before resolving settings and before any request",
+          "contract": "exit status 2; stdout is empty; stderr is exactly one JSON document {error: {code: 0, message, error_type: \"usage_error\"}} and no usage text; the message names the unknown command or flag; no request is sent and the configuration file is not read",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server stands in for the hub and records every request's method, raw path and headers",
+              "a probe command 'probe get <name>' declared by the test through the declaration helper of internal/cli/command.go with method GET, path /things/:name and auth user, and 'probe count' with an int flag --limit",
+              "PARLEY_ENDPOINT_URL and PARLEY_API_KEY are set; the configuration file holds invalid TOML"
+            ],
+            "pseudocode": "in internal/cli/root_test.go, a table over argument lists {['nosuch']; ['probe','nosuch']; ['probe','get','x','--bogus']; ['probe','get']; ['probe','get','x','y']; ['probe','count','--limit','abc'] for an int flag; ['version','extra']}: code = run(args); assert code == 2; assert stdout == ''; doc = json(whole stderr); assert doc.error.code == 0 and doc.error.error_type == 'usage_error'; for the unknown command and flag cases assert doc.error.message contains 'nosuch' or 'bogus'; assert hub requests == 0"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "event_driven",
+          "condition": "a command is run with its --fail-on-… flag and, in the result the hub returned, the flag's condition holds",
+          "action": "print the result on stdout as for a success, then report condition_not_met on stderr with the command's message and end with exit status 3",
+          "contract": "exit status 3; stdout is the complete result document indented by 2 spaces; stderr is one JSON document with error.code 0, error.error_type \"condition_not_met\" and the message the command gave",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server stands in for the hub and records every request's method, raw path and headers and answers 200 {\"n\": <n>}",
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir(); PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset unless the case sets them"
+            ],
+            "pseudocode": "in internal/cli/output_test.go: a probe command with the flag --fail-on-odd whose condition is result.n being odd and whose message names n; a table over (flag given, n) -> (code, stderr type) {(yes, 3) -> (3, 'condition_not_met'); (yes, 2) -> (0, none); (no, 3) -> (0, none)}: code = run(...); assert code == want; assert json(stdout) == the hub's body in every case; when 3 assert json(stderr).error.error_type == 'condition_not_met' and message contains '3'; otherwise assert stderr == ''"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "state_driven",
+          "condition": "a command's --fail-on-… flag is not given, or it is given and its condition does not hold",
+          "action": "print the result and end with exit status 0 without writing to stderr",
+          "contract": "exit status 0; stdout is the result document; stderr is empty",
+          "check": {
+            "same_as": "REQ-5.3"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Waiting for a long operation",
+      "rationale": "Clones, rebuilds and landings finish after their request returns; a script needs one way to wait for the end and to tell success from failure and from running out of time (PLAT-FR-094).",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "ubiquitous",
+          "action": "give every command that has --wait the flags --timeout with the default 5m and --poll-interval with the default 5s, each a whole number followed by one of the units s, m, h and d",
+          "contract": "the JSON help of such a command lists the flags wait (type bool, default \"false\"), timeout (default \"5m\") and poll-interval (default \"5s\"); the values 90s, 5m, 2h and 1d are accepted",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server stands in for the hub: POST /api/v1/jobs answers a record {id, state} and GET /api/v1/jobs/j1 answers the states of the case in order, repeating the last, and counts requests",
+              "a probe command 'probe run' declared by the test with --wait through the wait helper of internal/cli/wait.go: it starts with POST /jobs, polls GET /jobs/:id, and names the terminal states done (successful), dead and cancelled (unsuccessful); queued, running and failed (waiting to retry) are not terminal",
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir(); PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset unless the case sets them"
+            ],
+            "pseudocode": "in internal/cli/wait_test.go: doc = json(stdout of run(['help','probe','run','--json'])); assert flag(doc,'timeout').default == '5m' and flag(doc,'poll-interval').default == '5s' and flag(doc,'wait').type == 'bool'; a table over accepted values {'90s','5m','2h','1d'} for both flags without --wait: assert code == 0; assert parseDuration('1d') == 24 h"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "unwanted",
+          "condition": "a command is run with a --timeout or --poll-interval value that is not a positive whole number followed by one of s, m, h and d, with or without --wait",
+          "action": "fail with a usage error before it sends the request that starts the operation",
+          "contract": "exit status 2; stdout is empty; stderr is one JSON document with error.code 0 and error.error_type \"usage_error\" whose message names the flag; the hub receives no request",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server stands in for the hub: POST /api/v1/jobs answers a record {id, state} and GET /api/v1/jobs/j1 answers the states of the case in order, repeating the last, and counts requests",
+              "a probe command 'probe run' declared by the test with --wait through the wait helper of internal/cli/wait.go: it starts with POST /jobs, polls GET /jobs/:id, and names the terminal states done (successful), dead and cancelled (unsuccessful); queued, running and failed (waiting to retry) are not terminal",
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir(); PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset unless the case sets them"
+            ],
+            "pseudocode": "in internal/cli/wait_test.go, a table over (flag, value) for flag in {--timeout, --poll-interval} and value in {'0s', '0', '-5s', '5', '1.5m', '1m30s', 'abc', '', '5 m', '5w'}, each with and without --wait: code = run(['probe','run', flag, value, ...]); assert code == 2; assert stdout == ''; e = json(stderr).error; assert e.error_type == 'usage_error' and e.message contains the flag's name; assert hub requests == 0"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "event_driven",
+          "condition": "a command is run with --wait and its operation reaches a successful terminal state before the timeout",
+          "action": "send the request that starts the operation, then poll the operation's status once per poll interval under one overall deadline, passing over every state that is not terminal, and print the final record alone on stdout, with progress on stderr",
+          "contract": "exit status 0; stdout is exactly one JSON document, the last polled record (or the start request's record when that is already terminal, in which case no poll is sent); stderr holds only lines that begin with \"waiting: \", at least one, one per change of observed state; consecutive polls are at least one poll interval apart",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "an httptest server stands in for the hub: POST /api/v1/jobs answers a record {id, state} and GET /api/v1/jobs/j1 answers the states of the case in order, repeating the last, and counts requests",
+              "a probe command 'probe run' declared by the test with --wait through the wait helper of internal/cli/wait.go: it starts with POST /jobs, polls GET /jobs/:id, and names the terminal states done (successful), dead and cancelled (unsuccessful); queued, running and failed (waiting to retry) are not terminal",
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir(); PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset unless the case sets them",
+              "the poll interval can be set below one second by a test hook, since the flag's smallest value is 1s"
+            ],
+            "pseudocode": "in internal/cli/wait_test.go with --poll-interval shortened through a test hook to 20 ms and --timeout 5s, a table over (start state, polled states) -> polls {(queued, [running, running, done]) -> 3; (queued, [failed, running, failed, done]) -> 4; (done, []) -> 0; (running, [done]) -> 1}: code = run(['probe','run','--wait',...]); assert code == 0; assert stdout parses as exactly one document and its state == 'done' and it equals the last record the hub served; assert GET count == polls; assert every stderr line starts with 'waiting: ' and the number of lines == number of state changes + 1; assert gaps between polls >= 20 ms"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "unwanted",
+          "condition": "a wait ends in a terminal state that the command names as unsuccessful",
+          "action": "print the final record on stdout, report wait_failed on stderr and end with exit status 1",
+          "contract": "exit status 1; stdout is exactly one JSON document, the final record; the last document on stderr is {error: {code: 0, message, error_type: \"wait_failed\"}} and its message names the final state; no poll is sent after the terminal record",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "an httptest server stands in for the hub: POST /api/v1/jobs answers a record {id, state} and GET /api/v1/jobs/j1 answers the states of the case in order, repeating the last, and counts requests",
+              "a probe command 'probe run' declared by the test with --wait through the wait helper of internal/cli/wait.go: it starts with POST /jobs, polls GET /jobs/:id, and names the terminal states done (successful), dead and cancelled (unsuccessful); queued, running and failed (waiting to retry) are not terminal",
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir(); PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset unless the case sets them"
+            ],
+            "pseudocode": "in internal/cli/wait_test.go, a table over (start state, polled states) {(queued, [running, dead]); (queued, [cancelled]); (dead, [])}: code = run(['probe','run','--wait',...]); assert code == 1; assert json(stdout).state == the final state; e = json(last JSON document of stderr).error; assert e.code == 0 and e.error_type == 'wait_failed' and e.message contains the final state; assert GET count == len(polled states)"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "unwanted",
+          "condition": "the --timeout of a wait passes before the operation reaches a terminal state",
+          "action": "stop polling, print nothing on stdout, report wait_timeout on stderr, end with exit status 1 and send no request that cancels or changes the operation",
+          "contract": "exit status 1; stdout is empty; the last document on stderr is {error: {code: 0, message, error_type: \"wait_timeout\"}}; the command returns no later than 1 second after the timeout, also when a poll is in flight at the deadline; after the start request the hub has received only GET requests",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "an httptest server stands in for the hub: POST /api/v1/jobs answers a record {id, state} and GET /api/v1/jobs/j1 answers the states of the case in order, repeating the last, and counts requests",
+              "a probe command 'probe run' declared by the test with --wait through the wait helper of internal/cli/wait.go: it starts with POST /jobs, polls GET /jobs/:id, and names the terminal states done (successful), dead and cancelled (unsuccessful); queued, running and failed (waiting to retry) are not terminal",
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir(); PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset unless the case sets them"
+            ],
+            "pseudocode": "in internal/cli/wait_test.go with --timeout 1s and a poll interval of 50 ms, a table over hubs {every poll answers running; every poll answers failed (waiting to retry); the second poll stalls for 5 s}: start = now; code = run(['probe','run','--wait','--timeout','1s',...]); assert code == 1; assert stdout == ''; assert json(last JSON document of stderr).error.error_type == 'wait_timeout'; assert now - start < 2 s; assert every request after the POST is a GET; wait 200 ms and assert the request count did not grow"
+          }
+        },
+        {
+          "id": "REQ-6.6",
+          "pattern": "unwanted",
+          "condition": "the hub answers a poll of a wait with the error envelope",
+          "action": "end the wait with that error, printed on stderr as received, and print nothing on stdout",
+          "contract": "exit status 1; stdout is empty; the last document on stderr equals the hub's envelope member for member; no poll is sent afterwards",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "an httptest server stands in for the hub: POST /api/v1/jobs answers a record {id, state} and GET /api/v1/jobs/j1 answers the states of the case in order, repeating the last, and counts requests",
+              "a probe command 'probe run' declared by the test with --wait through the wait helper of internal/cli/wait.go: it starts with POST /jobs, polls GET /jobs/:id, and names the terminal states done (successful), dead and cancelled (unsuccessful); queued, running and failed (waiting to retry) are not terminal",
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir(); PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset unless the case sets them"
+            ],
+            "pseudocode": "in internal/cli/wait_test.go, a table over the answer to the second poll {404 not_found envelope; 429 rate_limited envelope; 500 internal envelope}: code = run(['probe','run','--wait',...]); assert code == 1; assert stdout == ''; assert json(last JSON document of stderr) == the envelope; assert GET count == 2"
+          }
+        },
+        {
+          "id": "REQ-6.7",
+          "pattern": "unwanted",
+          "condition": "a poll of a wait fails with a client error: the connection fails, the poll gets no response within the request timeout while the wait's deadline has not passed, or the answer cannot be decoded",
+          "action": "end the wait with a client error and print nothing on stdout",
+          "contract": "exit status 2; stdout is empty; the last document on stderr has error.code 0 and error.error_type \"client_error\"; no poll is sent afterwards",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "an httptest server stands in for the hub: POST /api/v1/jobs answers a record {id, state} and GET /api/v1/jobs/j1 answers the states of the case in order, repeating the last, and counts requests",
+              "a probe command 'probe run' declared by the test with --wait through the wait helper of internal/cli/wait.go: it starts with POST /jobs, polls GET /jobs/:id, and names the terminal states done (successful), dead and cancelled (unsuccessful); queued, running and failed (waiting to retry) are not terminal",
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir(); PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset unless the case sets them"
+            ],
+            "pseudocode": "in internal/cli/wait_test.go, a table over the second poll {the hub's listener is closed before it; the hub answers 200 '<html>'; the hub answers 502 without an envelope}: code = run(['probe','run','--wait',...]); assert code == 2; assert stdout == ''; assert json(last JSON document of stderr).error.error_type == 'client_error'; assert no later GET arrives"
+          }
+        },
+        {
+          "id": "REQ-6.8",
+          "pattern": "state_driven",
+          "condition": "a command that has --wait is run without it",
+          "action": "print the answer of the request that starts the operation and send no poll",
+          "contract": "exit status 0; stdout is the start request's record, whatever its state; stderr is empty; the hub receives the start request and no other",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server stands in for the hub: POST /api/v1/jobs answers a record {id, state} and GET /api/v1/jobs/j1 answers the states of the case in order, repeating the last, and counts requests",
+              "a probe command 'probe run' declared by the test with --wait through the wait helper of internal/cli/wait.go: it starts with POST /jobs, polls GET /jobs/:id, and names the terminal states done (successful), dead and cancelled (unsuccessful); queued, running and failed (waiting to retry) are not terminal",
+              "PARLEY_CONFIG_DIR points at a directory under t.TempDir(); PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset unless the case sets them"
+            ],
+            "pseudocode": "in internal/cli/wait_test.go, a table over start states {queued, done, dead}: code = run(['probe','run']); assert code == 0; assert json(stdout).state == the start state; assert stderr == ''; assert POST count == 1 and GET count == 0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "Help in text and as JSON",
+      "rationale": "A person reads help as text; an agent discovers commands, their routes and their flags from one machine-readable description (PLAT-FR-095, §3.6).",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "event_driven",
+          "condition": "parley is run with no arguments, or with the words of a command group and no subcommand",
+          "action": "print the help of the root or of the group on stdout, listing each of its subcommands with its description, without resolving settings, reading the configuration file or sending a request",
+          "contract": "exit status 0; stdout holds the help text and names every direct subcommand of the root or group; stderr is empty; no request is sent",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the real command tree of internal/cli plus, for the group cases, a probe group 'probe' declared by the test with the commands 'probe get <name>' (GET /things/:name, auth user, flag --limit int default 50) and 'probe admin purge [reason]' (DELETE /things, auth admin, required flag --confirm bool)",
+              "PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset; PARLEY_CONFIG_DIR points at a directory whose config.toml holds invalid TOML; an httptest server counts requests"
+            ],
+            "pseudocode": "in internal/cli/help_test.go, a table over args {[]; ['probe']; ['probe','admin']}: code = run(args); assert code == 0; assert stdout contains the name and description of each direct subcommand ('version' and 'help' for the root, 'get' and 'admin' for probe, 'purge' for probe admin); assert stderr == ''; assert requests == 0"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "event_driven",
+          "condition": "parley help is run with the words of a command, or a command is run with --help",
+          "action": "print that command's help as text on stdout, the same text for both forms, naming its arguments, its own flags with their defaults and the global flags, without resolving settings or sending a request",
+          "contract": "exit status 0; the stdout of parley help <words> equals the stdout of parley <words> --help; it contains the command's description, each argument name and each flag name with its dashes; stderr is empty; no request is sent",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the real command tree of internal/cli plus, for the group cases, a probe group 'probe' declared by the test with the commands 'probe get <name>' (GET /things/:name, auth user, flag --limit int default 50) and 'probe admin purge [reason]' (DELETE /things, auth admin, required flag --confirm bool)",
+              "PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset; PARLEY_CONFIG_DIR points at a directory whose config.toml holds invalid TOML; an httptest server counts requests"
+            ],
+            "pseudocode": "in internal/cli/help_test.go, a table over words {['probe','get']; ['probe','admin','purge']; ['version']; ['probe']; ['help']}: a = run(['help'] + words); b = run(words + ['--help']); assert a.code == 0 and b.code == 0; assert a.stdout == b.stdout; for probe get assert stdout contains 'name', '--limit', '50', '--endpoint-url', '--api-key', '--json'; assert stderr == ''; assert requests == 0"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "event_driven",
+          "condition": "help is asked for a command that is not a group, by parley help <words> --json or parley <words> --help --json",
+          "action": "print one JSON object that describes the command: name, description, method, path, args, flags and auth",
+          "contract": "exit status 0; stdout is one JSON document indented by 2 spaces with exactly the members name (the words after parley joined by single spaces), description (string), method and path (both strings, or both null for a command that calls no single route), args (array of {name, required} in order), flags (array sorted by name of {name without dashes, type, required (bool), default (string), description}, the command's own flags and the three global flags) and auth (\"none\", \"user\" or \"admin\"); stderr is empty",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the real command tree of internal/cli plus, for the group cases, a probe group 'probe' declared by the test with the commands 'probe get <name>' (GET /things/:name, auth user, flag --limit int default 50) and 'probe admin purge [reason]' (DELETE /things, auth admin, required flag --confirm bool)",
+              "PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset; PARLEY_CONFIG_DIR points at a directory whose config.toml holds invalid TOML; an httptest server counts requests"
+            ],
+            "pseudocode": "in internal/cli/help_test.go: d = json(run(['help','probe','get','--json']).stdout); assert keys(d) == {name, description, method, path, args, flags, auth}; assert d.name == 'probe get' and d.method == 'GET' and d.path == '/things/:name' and d.auth == 'user'; assert d.args == [{name: 'name', required: true}]; assert names(d.flags) == ['api-key','endpoint-url','json','limit']; assert flag(d,'limit') == {name: 'limit', type: 'int', required: false, default: '50', description: <its text>}; p = json(run(['probe','admin','purge','--help','--json']).stdout); assert p.name == 'probe admin purge' and p.auth == 'admin' and p.args == [{name: 'reason', required: false}] and flag(p,'confirm').required == true and flag(p,'confirm').type == 'bool'; v = json(run(['help','version','--json']).stdout); assert v.method == 'GET' and v.path == '/version' and v.auth == 'none'; h = json(run(['help','help','--json']).stdout); assert h.method == null and h.path == null and h.auth == 'none'"
+          }
+        },
+        {
+          "id": "REQ-7.4",
+          "pattern": "event_driven",
+          "condition": "help with --json is asked for a command group, or for parley itself by parley help --json or parley --help --json",
+          "action": "print one JSON object whose commands member describes every command under the group or the root that is not itself a group, at any depth, each in the form of a single command's description, sorted by name",
+          "contract": "exit status 0; stdout is one JSON document {commands: [...]} indented by 2 spaces; each element has the members of a single command's description; no element is a group; the names are in ascending order; stderr is empty",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the real command tree of internal/cli plus, for the group cases, a probe group 'probe' declared by the test with the commands 'probe get <name>' (GET /things/:name, auth user, flag --limit int default 50) and 'probe admin purge [reason]' (DELETE /things, auth admin, required flag --confirm bool)",
+              "PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset; PARLEY_CONFIG_DIR points at a directory whose config.toml holds invalid TOML; an httptest server counts requests"
+            ],
+            "pseudocode": "in internal/cli/help_test.go: g = json(run(['help','probe','--json']).stdout); assert keys(g) == {commands}; assert names(g.commands) == ['probe admin purge', 'probe get']; assert g.commands[1] == json(run(['help','probe','get','--json']).stdout); r = json(run(['help','--json']).stdout); assert names(r.commands) is sorted and contains 'help', 'version', 'probe get', 'probe admin purge' and neither 'probe' nor 'probe admin'; assert json(run(['--help','--json']).stdout) == r"
+          }
+        },
+        {
+          "id": "REQ-7.5",
+          "pattern": "unwanted",
+          "condition": "parley help is run with words that name no command",
+          "action": "fail with a usage error that names the words",
+          "contract": "exit status 2; stdout is empty; stderr is one JSON document with error.code 0 and error.error_type \"usage_error\" whose message contains the unknown word, with and without --json",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the real command tree of internal/cli plus, for the group cases, a probe group 'probe' declared by the test with the commands 'probe get <name>' (GET /things/:name, auth user, flag --limit int default 50) and 'probe admin purge [reason]' (DELETE /things, auth admin, required flag --confirm bool)",
+              "PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset; PARLEY_CONFIG_DIR points at a directory whose config.toml holds invalid TOML; an httptest server counts requests"
+            ],
+            "pseudocode": "in internal/cli/help_test.go, a table over args {['help','nosuch']; ['help','probe','nosuch']; ['help','nosuch','--json']}: code = run(args); assert code == 2; assert stdout == ''; e = json(stderr).error; assert e.code == 0 and e.error_type == 'usage_error' and e.message contains 'nosuch'"
+          }
+        },
+        {
+          "id": "REQ-7.6",
+          "pattern": "ubiquitous",
+          "action": "for any command registered on the root that is not a group, describe it in JSON help with a non-empty description, an auth of none, user or admin, and a method and path that are either both strings, the path beginning with /, or both null",
+          "contract": "every element of the commands array of parley help --json satisfies those three conditions, and a command whose auth is none runs without a hub URL and a credential being required",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset; PARLEY_CONFIG_DIR points at an empty directory"
+            ],
+            "pseudocode": "in internal/cli/help_test.go, over the real command tree with no probe command added: r = json(run(['help','--json']).stdout); assert len(r.commands) >= 2; for c in r.commands: assert c.description != ''; assert c.auth in {'none','user','admin'}; assert (c.method == null and c.path == null) or (c.method in {'GET','POST','PUT','PATCH','DELETE'} and c.path starts with '/'); so that a command a later package adds without declaring itself fails this test"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "A developer's command finds the hub through the configuration file",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "has a configuration file with endpoint_url and api_key, as parley login leaves it, and runs parley version with no flag and no variable"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "finds no hub URL in --endpoint-url or PARLEY_ENDPOINT_URL, reads endpoint_url from $PARLEY_CONFIG_DIR/config.toml and sends GET /version to it without a credential"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers 200 with its version, commit, build time and Go version"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints one JSON document with the cli and server builds on stdout, writes nothing to stderr and exits 0"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "internal/cli with its settings resolution, its configuration file reader and its real HTTP client",
+          "the configuration file on disk, written by the save function of internal/cli/config.go",
+          "the hub's HTTP handler of internal/server with the conventions of package 02, on a real TCP listener"
+        ],
+        "setup": [
+          "the hub's handler serves on 127.0.0.1:0",
+          "PARLEY_CONFIG_DIR is a new temporary directory; PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset",
+          "the save function wrote endpoint_url = the hub's URL with a trailing slash, api_key = a well-formed API key the hub does not know, and user_id"
+        ],
+        "end_state": [
+          "parley version exited 0 and its stdout holds a server member equal to the body GET /version returns",
+          "stderr is empty",
+          "the configuration file still has mode 0600 and the same bytes as before the command ran"
+        ],
+        "pseudocode": "in test/e2e/cli_test.go: before = read(file); want = json(get(hub + '/version').body); code = cli.Run(ctx, ['version'], stdout, stderr); assert code == 0; assert json(stdout).server == want; assert stderr == ''; assert read(file) == before and stat(file).mode.perm == 0600"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "The hub refuses a command and its error envelope reaches stderr",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "runs parley login --api-key with a well-formed API key the hub does not know and --endpoint-url with the hub's URL"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends its request to <hub URL>/api/v1/user with Authorization: Bearer <the key> through the shared client, once"
+        },
+        {
+          "actor": "parleyd",
+          "action": "refuses the request with an HTTP status of 400 or above and the error envelope, error_type unauthenticated (or not_found while the route is not registered)"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints the envelope on stderr as received, prints nothing on stdout, saves no configuration file and exits 1"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "internal/cli: the login command of package 04 on the shared HTTP client and error output",
+          "the hub's HTTP handler of internal/server with the conventions of package 02 and the authentication of package 04, on a real TCP listener"
+        ],
+        "setup": [
+          "the hub's handler serves on 127.0.0.1:0 and counts requests by path through a wrapping handler",
+          "PARLEY_CONFIG_DIR is a new temporary directory that does not exist yet; PARLEY_ENDPOINT_URL and PARLEY_API_KEY are unset"
+        ],
+        "end_state": [
+          "the command exited 1 with empty stdout",
+          "stderr parses as one error envelope whose code equals the HTTP status the hub answered and whose error_type is unauthenticated or not_found",
+          "the hub received exactly one request under /api/v1 and it carried Authorization: Bearer <the key>",
+          "the configuration directory was not created"
+        ],
+        "pseudocode": "in test/e2e/cli_test.go: key = 'parley_' + 8 alphanumerics + '_' + 32 alphanumerics; code = cli.Run(ctx, ['login', '--api-key', key, '--endpoint-url', hub], stdout, stderr); assert code == 1; assert stdout == ''; e = json(stderr).error; assert e.code == recorded status and e.code >= 400; assert e.error_type in {'unauthenticated', 'not_found'}; assert recorded requests under /api/v1 == 1 and its Authorization == 'Bearer ' + key; assert not exists(PARLEY_CONFIG_DIR)"
+      }
+    }
+  ],
+  "external_apis": [
+    {
+      "package": "github.com/spf13/cobra",
+      "version": "v1.10.2",
+      "verified": true,
+      "symbols": [
+        {
+          "name": "Command.SetFlagErrorFunc",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) SetFlagErrorFunc(f func(*Command, error) error)"
+        },
+        {
+          "name": "Command.SetHelpFunc",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) SetHelpFunc(f func(*Command, []string))"
+        },
+        {
+          "name": "Command.SetHelpCommand",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) SetHelpCommand(cmd *Command)"
+        },
+        {
+          "name": "Command.Find",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) Find(args []string) (*Command, []string, error)"
+        },
+        {
+          "name": "Command.Commands",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) Commands() []*Command"
+        },
+        {
+          "name": "Command.CommandPath",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) CommandPath() string"
+        },
+        {
+          "name": "Command.Runnable",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) Runnable() bool"
+        },
+        {
+          "name": "Command.Flags",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) Flags() *pflag.FlagSet"
+        },
+        {
+          "name": "Command.InheritedFlags",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) InheritedFlags() *pflag.FlagSet"
+        },
+        {
+          "name": "Command (fields)",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "Args PositionalArgs; Annotations map[string]string; RunE func(cmd *Command, args []string) error; SilenceErrors bool; SilenceUsage bool"
+        },
+        {
+          "name": "ExactArgs",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func ExactArgs(n int) PositionalArgs"
+        },
+        {
+          "name": "RangeArgs",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func RangeArgs(min int, max int) PositionalArgs"
+        },
+        {
+          "name": "NoArgs",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func NoArgs(cmd *Command, args []string) error"
+        }
+      ]
+    },
+    {
+      "package": "github.com/spf13/pflag",
+      "version": "v1.0.10",
+      "verified": true,
+      "symbols": [
+        {
+          "name": "FlagSet.VisitAll",
+          "import_path": "github.com/spf13/pflag",
+          "signature": "func (f *FlagSet) VisitAll(fn func(*Flag))"
+        },
+        {
+          "name": "FlagSet.Changed",
+          "import_path": "github.com/spf13/pflag",
+          "signature": "func (f *FlagSet) Changed(name string) bool"
+        },
+        {
+          "name": "FlagSet.BoolVar",
+          "import_path": "github.com/spf13/pflag",
+          "signature": "func (f *FlagSet) BoolVar(p *bool, name string, value bool, usage string)"
+        }
+      ]
+    },
+    {
+      "package": "github.com/BurntSushi/toml",
+      "version": "v1.6.0",
+      "verified": true,
+      "symbols": [
+        {
+          "name": "Unmarshal",
+          "import_path": "github.com/BurntSushi/toml",
+          "signature": "func Unmarshal(data []byte, v any) error"
+        },
+        {
+          "name": "Marshal",
+          "import_path": "github.com/BurntSushi/toml",
+          "signature": "func Marshal(v any) ([]byte, error)"
+        }
+      ]
+    }
+  ]
+}

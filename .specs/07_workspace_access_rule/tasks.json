@@ -1,0 +1,145 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "07",
+  "spec_name": "workspace_access_rule",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/access/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "05",
+      "reason": "level resolution reads users, organization status and memberships that package 05 stores"
+    },
+    {
+      "spec": "06",
+      "reason": "the access step runs directly after the PAT scope check of package 06, and a PAT caller has its user's level"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Store and read the minimal workspace record",
+      "criteria": [
+        "REQ-1"
+      ],
+      "steps": [
+        "Add the record behaviours to internal/access/record_test.go against a real store opened in t.TempDir() and confirm they fail: round trip across a reopen, duplicate slug, each invalid record, and reads of strings that have no record",
+        "Register a schema step with the store of package 03, on the hub's composition in internal/hub/access.go, that creates the workspaces table with the columns slug (unique), owner_id, org_id, kind, parent_slug (nullable) and status, and no foreign key to users or organizations",
+        "Add the workspace record type with those six fields and the kinds repository and fork and the statuses pending, cloning, ready, failed and archived",
+        "Add the insert: validate the record (non-empty slug, owner and org; known kind and status; a repository has no parent; a fork has a parent that exists, is a repository and has the same org) and return the invalid-record error without writing when it fails; return the duplicate-slug error when the slug exists; do the parent read and the write in one transaction",
+        "Add the read by slug with an exact string match that returns the record and found = true, or found = false with a nil error when no record has that slug",
+        "Add the two list reads the readable set needs: records by owner_id or org_id in a given list, and the forks whose parent_slug is in a given list",
+        "Export the two error values so that callers test them with errors.Is"
+      ],
+      "touches": [
+        "internal/access/record.go",
+        "internal/access/record_test.go",
+        "internal/hub/access.go"
+      ],
+      "done_when": [
+        "`go test ./internal/access/... -count=1` passes with the store on disk, not in memory"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Resolve a caller's level on repository workspaces and task forks",
+      "criteria": [
+        "REQ-2",
+        "REQ-3"
+      ],
+      "steps": [
+        "Add the two level tables (repository workspaces, task forks) to internal/access/level_test.go with a stubbed membership source and confirm they fail",
+        "Define the caller the rule works on: the admin token, or a user id; the credential type and the user's role are not inputs",
+        "Define the narrow membership source the resolver asks: the ids of the active organizations a user is a member of; a blocked or deleted organization is never in the answer. Provide its real implementation over the memberships and org status that package 05 maintains in package 04's tables, and wire it in internal/hub/access.go",
+        "Resolve on a repository: admin for the admin token; owner when the user id equals owner_id, before any membership read; member when org_id is among the user's active organizations; otherwise none. Do not read the status",
+        "Resolve on a fork: admin for the admin token; otherwise resolve the user's level on the parent record first; none on the parent, or a parent with no record, gives none on the fork; otherwise owner when the user is the fork's owner or the parent's owner, else member",
+        "Return a slug with no record as level none together with found = false, and return every read failure as an error with level none"
+      ],
+      "touches": [
+        "internal/access/level.go",
+        "internal/access/level_test.go",
+        "internal/access/membership.go",
+        "internal/hub/access.go"
+      ],
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Decide for a declared need and answer over HTTP without revealing existence",
+      "criteria": [
+        "REQ-4",
+        "REQ-5"
+      ],
+      "steps": [
+        "Add the decision table, the failure table, the missing-caller and unknown-need cases and the byte-equality table to internal/access/middleware_test.go and the surface-independent cases to internal/access/decide_test.go, using httptest probe routes, and confirm they fail",
+        "Define the three needs read, write and owner and a decision with an outcome (granted, not_found, read_only), the level and the workspace record",
+        "Implement the decision: level none or no record gives not_found for every need, with a zero record and level none so that the two cases compare equal; member with need write or owner gives read_only; everything else is granted with the level and the record; a need outside the three is an error",
+        "Implement the HTTP side in internal/access/middleware.go as an access check for the access position of package 02's pipeline (step 7 of the check order, so it runs before the idempotency stage and the handler): a route declares its need with this package's need mark at registration, and a route without the mark is passed untouched; take the caller from the authenticated principal package 04 attaches to the request, take the slug from the route's path parameter slug, decide, and on granted store the decision on the request context and let the pipeline go on",
+        "Answer not_found with HTTP 404, error_type not_found and the message 'workspace not found', and read_only with HTTP 403, error_type forbidden and the message 'org members have read-only access to this workspace', both through the error envelope helper of internal/server",
+        "Answer every error from the decision, a request with no authenticated caller and an unknown need with HTTP 500 and error_type internal, with the generic message of that type and nothing from the underlying error; never call the handler on these paths",
+        "Build the 404 body from constants only, so that it cannot differ between an invisible workspace and a missing one; do not validate the slug's shape before the lookup",
+        "Add the accessor a handler uses to read the decision from the request, and the level's string form admin, owner and member; install the access check beside package 05's admin check in the access position, in internal/hub/access.go"
+      ],
+      "touches": [
+        "internal/access/decide.go",
+        "internal/access/decide_test.go",
+        "internal/access/middleware.go",
+        "internal/access/middleware_test.go",
+        "internal/hub/access.go"
+      ],
+      "depends_on": [
+        2
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Let members through on read-need routes and answer write-access questions",
+      "criteria": [
+        "REQ-6"
+      ],
+      "steps": [
+        "Add the method table for a member on need-read routes to internal/access/middleware_test.go and the write-access table to internal/access/level_test.go and confirm they fail",
+        "Confirm the middleware takes no account of the HTTP method: a member is granted on a need-read route for POST, PATCH, PUT and DELETE as for GET",
+        "Make the granted decision carry all six record fields as read during the decision, so a route's own condition (fork owner, parent slug, kind) reads them without a second lookup",
+        "Add the write-access question for a named user and slug: true exactly when that user's level is owner; false for member, none and a slug with no record; false with the error when a read fails"
+      ],
+      "touches": [
+        "internal/access/middleware.go",
+        "internal/access/middleware_test.go",
+        "internal/access/level.go",
+        "internal/access/level_test.go"
+      ],
+      "depends_on": [
+        3
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Build the readable set for cross-workspace reads",
+      "criteria": [
+        "REQ-7"
+      ],
+      "steps": [
+        "Add the readable-set table, the agreement-with-level sweep and the failure table to internal/access/readable_test.go and confirm they fail",
+        "Define the set: an all flag for the admin token, otherwise entries of slug and level, with a contains question and a level question by slug that also answer for the all form",
+        "For a user, collect the records the user owns and the records whose org_id is among the user's active organizations, then the forks of the owned repositories; include records of every status",
+        "Give each collected record the level the resolver gives it and drop those with level none, so a fork whose owner has no access to its parent is absent; keep one entry per slug, owner over member",
+        "Return an empty set with a nil error for a user with nothing, and an error with an empty set when any read fails",
+        "Add the harness the end-to-end checks use to internal/access/access_integration_test.go: a hub started in-process on a loopback address with a port the system picks, users, an organization and a membership created through internal/identity, workspace records inserted through the record store, and probe routes with need read, write and owner registered behind the real authentication middleware"
+      ],
+      "touches": [
+        "internal/access/readable.go",
+        "internal/access/readable_test.go",
+        "internal/access/access_integration_test.go"
+      ],
+      "depends_on": [
+        2
+      ]
+    }
+  ]
+}

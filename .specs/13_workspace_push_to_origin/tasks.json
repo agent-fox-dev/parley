@@ -1,0 +1,185 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "13",
+  "spec_name": "workspace_push_to_origin",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/workspace/... ./internal/gitrepo/... ./internal/cli/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "09",
+      "reason": "builds its CLI commands on the client, output and exit-code helpers of the CLI foundation"
+    },
+    {
+      "spec": "11",
+      "reason": "reads the effective setting protected_branches, whose key that package registers, and matches it with the one branch-glob matcher of the repository in internal/workspace/branchglob.go"
+    },
+    {
+      "spec": "12",
+      "reason": "keeps the origin head of every branch current as the ref refs/remotes/origin/<name>, which is the lease of a forced push, and provides the sync route the second execution path uses"
+    },
+    {
+      "spec": "52",
+      "reason": "emits its hub events through the event log component"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Serve the push route and push a branch fast-forward",
+      "criteria": [
+        "REQ-1",
+        "REQ-3"
+      ],
+      "steps": [
+        "Add the behaviours of the push request and of the fast-forward push to internal/gitrepo/push_test.go and internal/workspace/push_test.go and confirm they fail",
+        "Extend the test origin of package 10 in internal/gitrepo/gitrepotest, the one test origin of the repository, with a mode (SmartOrigin) that serves a bare repository through `git http-backend` with pushes enabled, over TLS, with optional Basic authentication, a request counter and a way to read a branch head; keep the existing read-only mode working",
+        "Add a push operation to internal/gitrepo that takes the copy, the origin URL, the resolved credential, a commit id, a branch name and a context, and runs one `git push` in machine-readable mode with the single refspec `<commit>:refs/heads/<name>`; it never pushes tags or other branches, never prompts, and hands the credential to `git` the way the clone of package 10 does (not in the URL, the arguments or the copy's configuration)",
+        "Make the operation return a result of pushed or up_to_date from the per-ref status git reports, and a typed non-fast-forward error when git refuses the ref as non-fast-forward or fetch-first",
+        "Register POST /api/v1/workspaces/{slug}/branches/{name}/push on the hub's router with scope `workspaces:write` and the write need of the workspace access rule; take the branch name from the router's once-decoded path value",
+        "Parse the body: none, empty and `{}` mean force false; unknown members are ignored; anything that is not a JSON object, or a `force` that is not a JSON boolean (null included), is 400 invalid_request",
+        "Validate the decoded name with the branch-name rule of package 10 and answer 400 invalid_request when it fails",
+        "Build the handler from its collaborators as parameters (workspace store, credential resolver, push operation, event writer, push deadline) so that tests can replace the push operation with a stub",
+        "Read the head of refs/heads/<name> once, resolve the origin credential from the workspace's secrets for this call, run the push operation and answer 200 with branch, sha, remote `origin`, remote_url and result",
+        "Answer 409 non_fast_forward for the typed error, with a message that names the recorded origin head of the branch, read with OriginHead of internal/gitrepo (the ref refs/remotes/origin/<name> of the hub's copy), when that ref exists, and says to sync or to push with force",
+        "Wire the handler on the composition value of internal/hub (package 03) so that a running parleyd serves the route"
+      ],
+      "touches": [
+        "internal/gitrepo/push.go",
+        "internal/gitrepo/push_test.go",
+        "internal/gitrepo/gitrepotest/",
+        "internal/workspace/push.go",
+        "internal/workspace/push_test.go",
+        "internal/hub/"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Refuse pushes by workspace state and branch kind",
+      "criteria": [
+        "REQ-2"
+      ],
+      "steps": [
+        "Add the refusal behaviours and the order table to internal/workspace/push_test.go and confirm they fail",
+        "After the body and the branch name, ask the state guard of package 10 about the addressed workspace and return its 409 answer",
+        "Refuse a workspace of kind fork with 400 fork_has_no_origin, whatever the state of its parent",
+        "On a carry-patch workspace refuse the branch equal to the record's `integration_branch` with 403 integration_branch; a null `integration_branch` refuses nothing",
+        "Declare the patch-branch lookup as an interface in internal/workspace, PatchBranchLookup (given a workspace slug and a branch, whether the branch is the branch of a registered, non-deleted patch, or an error), with the registration function RegisterPatchBranchLookup; package 31 implements and registers it, and this package registers none. With none registered no branch is a patch branch; when it reports a registered, non-deleted patch refuse with 403 patch_branch; when it returns an error answer 503 unavailable",
+        "Match branch globs only with MatchAnyBranchGlob of internal/workspace/branchglob.go, the one matcher of the repository, which package 11 delivers; add no matcher and no glob test table of the matcher here",
+        "Read the workspace's protected globs as the effective `protected_branches` setting, through EffectiveSettings of the settings registry (the key and its default, the default branch alone, are package 11's); refuse with 403 protected_branch when force is true and a glob matches",
+        "Answer 404 branch_not_found when refs/heads/<name> does not exist in the hub's copy, as the last check before the push",
+        "Keep the order body, branch name, status, fork, integration branch or patch branch, forced protected branch, branch exists; none of these refusals contacts origin"
+      ],
+      "touches": [
+        "internal/workspace/push.go",
+        "internal/workspace/push_test.go"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Force a push only under a lease",
+      "criteria": [
+        "REQ-4"
+      ],
+      "steps": [
+        "Add the forced-push behaviours to internal/gitrepo/push_test.go and internal/workspace/push_test.go and confirm they fail",
+        "Extend the push operation with a lease argument: either a commit id origin's branch must still have, or the statement that origin must not have the branch; with a lease the operation passes git an explicit force-with-lease for that one ref and never a plain force",
+        "Return the result forced when git reports a forced update, pushed for a fast-forward or a new branch, up_to_date when origin's branch already equals the commit, and a typed lease error when git refuses the ref because the lease is stale",
+        "In the handler, when force is true, read the recorded origin head of the branch with OriginHead of internal/gitrepo and pass it as the lease, or pass must-not-exist when none is recorded",
+        "Answer 409 origin_moved for the typed lease error and leave the recorded origin head untouched"
+      ],
+      "touches": [
+        "internal/gitrepo/push.go",
+        "internal/gitrepo/push_test.go",
+        "internal/workspace/push.go",
+        "internal/workspace/push_test.go"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Classify the failures of a push and enforce its deadline",
+      "criteria": [
+        "REQ-5"
+      ],
+      "steps": [
+        "Add the failure table, the timeout and the unreadable-credential behaviours to internal/workspace/push_test.go and internal/gitrepo/push_test.go and confirm they fail",
+        "Extend the test origin with switches: answer a fixed HTTP status to the push, refuse every update from a server-side hook with a given text, stall after accepting the connection, close its listener, and serve a certificate the hub does not trust",
+        "Make the push operation return a typed error for each class: rejected by origin for the ref (with origin's reason), unauthenticated, forbidden, not found, unreachable (name resolution, connection, TLS) and other; read the class from the per-ref status when git reports one and from the transport failure otherwise, for HTTPS origins and for the messages of the SSH transport",
+        "Map the classes to 422 origin_rejected, 502 origin_unauthenticated, 502 origin_forbidden, 502 origin_not_found, 502 origin_unreachable and 502 upstream_error; for origin_unauthenticated say in the message whether the workspace has no credential or origin rejected the stored one",
+        "Run the push under the handler's deadline (2 minutes in production, a parameter in tests); when it passes, end the `git` process and its children, wait for them, and answer 504 origin_timeout",
+        "When the credential resolver returns an error, answer 500 internal without calling the push operation",
+        "Return every failure as an error value; the push operation never ends the process and leaves no temporary file or child process behind on any outcome"
+      ],
+      "touches": [
+        "internal/gitrepo/push.go",
+        "internal/gitrepo/push_test.go",
+        "internal/gitrepo/gitrepotest/",
+        "internal/workspace/push.go",
+        "internal/workspace/push_test.go"
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Record the origin head and the push event, also for a caller that left",
+      "criteria": [
+        "REQ-6"
+      ],
+      "steps": [
+        "Add the record, event and disconnect behaviours to internal/workspace/push_test.go and confirm they fail",
+        "After a result of pushed, forced or up_to_date, set refs/remotes/origin/<name> of the hub's copy to the pushed commit with SetOriginHead of internal/gitrepo, remembering the value it had, then write the `parley.workspace.push` event and, for the default branch, the workspace's `origin_head_sha` in one store transaction",
+        "After a failure of the push itself, write the event alone, with ok false and the answer's error_type, and leave the origin head as it was",
+        "Fill the event: workspace the slug, the caller as actor, resource_type `branch`, resource_id the branch name, metadata branch, sha, force, ok, remote_url and either result or error_type, never both",
+        "Write no event for a request refused before the push or ended by an unreadable credential",
+        "Run the push and the writes after it on a context that is not cancelled when the request's connection closes, bounded by the push deadline, so that a caller that disconnects changes neither the outcome nor the records",
+        "When the transaction after an accepted push fails, put refs/remotes/origin/<name> back to the remembered value (delete it when it did not exist) and answer 500 internal"
+      ],
+      "touches": [
+        "internal/workspace/push.go",
+        "internal/workspace/push_test.go"
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Scrub every message of the push route",
+      "criteria": [
+        "REQ-7"
+      ],
+      "steps": [
+        "Add the scrubbing behaviours to internal/workspace/push_test.go and confirm they fail",
+        "Pass every error message of the route and every text written into the event through the scrubber of internal/scrub, giving it the token or password of the credential resolved for this push as a secret to replace",
+        "Rely on the scrubber's cut so that no message exceeds 1024 characters and none ends inside a multi-byte character",
+        "Compute remote_url once per request as the workspace's git_url with URL userinfo removed (a `git@host:path` origin is given unchanged) and use that value in the answer and in the event"
+      ],
+      "touches": [
+        "internal/workspace/push.go",
+        "internal/workspace/push_test.go"
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Add the `parley workspace push` command",
+      "criteria": [
+        "REQ-8"
+      ],
+      "steps": [
+        "Add the command's behaviours to internal/cli/workspace_test.go and confirm they fail",
+        "Add `push <slug> <branch>` to the workspace command group with the boolean flag `--force`; any other number of arguments is a usage error through the CLI's own error path, with nothing sent",
+        "With `--force`, write one warning line to stderr that origin's branch may be replaced, before the request is sent",
+        "Send POST /workspaces/<slug>/branches/<branch>/push through the CLI's HTTP client, which percent-encodes each argument as one path segment, with the body {\"force\": false} or {\"force\": true} and a request timeout of 3 minutes",
+        "Print the hub's answer through the CLI's output function; a hub error and its exit status are left to the CLI's shared error handling",
+        "Add the end-to-end tests of both execution paths to test/e2e/workspace_push_test.go: the developer's push from the shell and the forced push stopped by the lease and repeated after a sync"
+      ],
+      "touches": [
+        "internal/cli/workspace.go",
+        "internal/cli/workspace_test.go",
+        "test/e2e/workspace_push_test.go"
+      ],
+      "depends_on": [
+        1
+      ]
+    }
+  ]
+}

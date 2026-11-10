@@ -1,0 +1,571 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "07",
+  "spec_name": "workspace_access_rule",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Minimal workspace record",
+      "rationale": "The rule needs a workspace's owner, organization, kind, parent and status before the routes that create workspaces exist.",
+      "system": "workspace record store",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "a workspace record with slug, owner_id, org_id, kind, parent_slug and status is inserted",
+          "action": "persist the record so that every later read by that slug returns the same six values, also after the store is closed and opened again",
+          "contract": "the read returns found = true and a record equal to the inserted one, with no error",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a store opened on an empty directory from t.TempDir(), migrated to the current schema"
+            ],
+            "pseudocode": "in internal/access/record_test.go, a table over {repository record with parent_slug null in each of the five statuses; fork record whose parent is the repository}: insert(rec); got, found, err = get(rec.slug); assert err == nil and found and got == rec; close the store, open it again on the same directory; assert get(rec.slug) == rec"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "unwanted",
+          "condition": "a record is inserted whose slug already has a record",
+          "action": "refuse the insert and leave the stored record unchanged",
+          "contract": "the insert returns the duplicate-slug error; a read by that slug returns the first record",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a migrated store holding the repository record 'acme' owned by user u1"
+            ],
+            "pseudocode": "in internal/access/record_test.go: err = insert({slug:'acme', owner_id:u2, ...}); assert errors.Is(err, the duplicate-slug error); assert get('acme').owner_id == u1"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "unwanted",
+          "condition": "a record is inserted that has an empty slug, owner_id or org_id, a kind other than repository or fork, a status other than pending, cloning, ready, failed or archived, kind repository with a parent_slug, kind fork without a parent_slug, kind fork whose parent has no record or is itself a fork, or kind fork whose org_id differs from its parent's org_id",
+          "action": "refuse the insert and write nothing",
+          "contract": "the insert returns the invalid-record error; a read by the refused slug returns found = false",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a migrated store holding the repository record 'acme' in org o1 and its fork 'acme--f1'"
+            ],
+            "pseudocode": "in internal/access/record_test.go, a table with one row per case named in the condition (empty slug; empty owner_id; empty org_id; kind 'mirror'; status 'deleted'; repository with parent_slug 'acme'; fork with parent_slug null; fork with parent_slug 'nope'; fork with parent_slug 'acme--f1'; fork of 'acme' with org_id o2): err = insert(row); assert errors.Is(err, the invalid-record error); assert the number of stored records is still 2"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "event_driven",
+          "condition": "a record is read by a string that no record has as its slug, including the empty string, a string of 300 characters and a string that differs from an existing slug only in letter case",
+          "action": "report that no such workspace exists as a result and not as a failure",
+          "contract": "the read returns found = false and a nil error",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a migrated store holding the repository record 'acme'"
+            ],
+            "pseudocode": "in internal/access/record_test.go, a table over {'', 'nope', 'ACME', 'acme--x', 300 times 'a'}: _, found, err = get(s); assert err == nil and not found"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Access level on a repository workspace",
+      "rationale": "Every later answer depends on one resolution of who the caller is to the workspace (PLAT-FR-060 step 1, section 3.3.6).",
+      "system": "access component",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "the caller is the admin token and the slug names a repository workspace",
+          "action": "resolve the level admin",
+          "contract": "level = admin",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a store holding repository workspace 'acme' with owner u-owner in org o1, and 'solo' with owner u-owner in org o2",
+              "a membership stub: u-member and u-owner are members of active org o1; u-blocked-org-member is a member of org o3, which is blocked; nobody is a member of o2",
+              "workspace 'held' with owner u-owner in blocked org o3, and 'orphan' with owner u-owner in org o9, which does not exist"
+            ],
+            "pseudocode": "in internal/access/level_test.go, one table of (caller, slug, want level) run through the level resolver: (admin token, 'acme', admin); (admin token, 'held', admin); (u-owner, 'acme', owner); (u-owner, 'solo', owner); (u-owner, 'held', owner); (u-owner, 'orphan', owner); (u-member, 'acme', member); (u-member, 'solo', none); (u-blocked-org-member, 'held', none); (u-ghost, whose membership row names the deleted org o9 and whom the stub therefore reports as a member of no active org, 'orphan', none); (u-stranger, 'acme', none); (u-admin-role with no membership, authenticated by API key, 'acme', none); (u-admin-role authenticated by PAT, 'acme', none); (u-member authenticated by PAT, 'acme', member); then for each status in {pending, cloning, ready, failed, archived} insert a workspace in o1 owned by u-owner and assert admin token -> admin, u-owner -> owner, u-member -> member, u-stranger -> none"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "event_driven",
+          "condition": "the caller is a user whose id equals the workspace's owner_id",
+          "action": "resolve the level owner, whether or not the user is also a member of the workspace's organization and whether that organization is active, blocked or absent",
+          "contract": "level = owner",
+          "check": {
+            "same_as": "REQ-2.1"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "event_driven",
+          "condition": "the caller is a user who is not the workspace's owner and is a member of the workspace's organization, and that organization has status active",
+          "action": "resolve the level member",
+          "contract": "level = member",
+          "check": {
+            "same_as": "REQ-2.1"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "state_driven",
+          "condition": "the workspace's organization is blocked or no longer exists",
+          "action": "resolve the level none for every user who is not the workspace's owner, including users who hold a membership of that organization",
+          "contract": "level = none",
+          "check": {
+            "same_as": "REQ-2.1"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "ubiquitous",
+          "action": "for any user with role admin who is neither the workspace's owner nor a member of its active organization, resolve the level none, with an API key as with a PAT",
+          "contract": "level = none",
+          "check": {
+            "same_as": "REQ-2.1"
+          }
+        },
+        {
+          "id": "REQ-2.6",
+          "pattern": "ubiquitous",
+          "action": "for any caller and any workspace, resolve the same level in each of the statuses pending, cloning, ready, failed and archived, and the same level whether a user authenticated with an API key or a PAT",
+          "check": {
+            "same_as": "REQ-2.1"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Access level on a task fork",
+      "rationale": "A task fork never grants more than its parent, so leaving an organization also closes the forks created in it (PLAT-FR-060 step 1, WS-FR-004).",
+      "system": "access component",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "the caller is a user whose id equals a fork's owner_id and whose level on the fork's parent is member or owner",
+          "action": "resolve the level owner on the fork",
+          "contract": "level = owner",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a store holding repository 'acme' (owner u-owner, org o1, active) and forks 'acme--m' (owner u-member), 'acme--o' (owner u-owner), 'acme--gone' (owner u-left)",
+              "a membership stub: u-member and u-other are members of o1; u-left is a member of nothing",
+              "repository 'held' (owner u-owner, blocked org o3) with fork 'held--m' (owner u-blocked-org-member, a member of o3)",
+              "a fork row 'lost--f' (owner u-member, org o1) whose parent row 'lost' was removed directly in the store after the insert"
+            ],
+            "pseudocode": "in internal/access/level_test.go, one table of (caller, fork slug, want level) run through the level resolver: (u-member, 'acme--m', owner); (u-owner, 'acme--o', owner); (u-owner, 'acme--m', owner); (u-other, 'acme--m', member); (u-member, 'acme--o', member); (u-left, 'acme--gone', none); (u-blocked-org-member, 'held--m', none); (u-owner, 'held--m', owner); (u-stranger, 'acme--m', none); (admin token, 'acme--m', admin); (admin token, 'acme--gone', admin); (u-member, 'lost--f', none); (admin token, 'lost--f', admin); and for every row with a user caller assert that want == none whenever the resolver gives none for that user on the fork's parent"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "event_driven",
+          "condition": "the caller is the user who owns a fork's parent and the fork is owned by another user",
+          "action": "resolve the level owner on the fork",
+          "contract": "level = owner",
+          "check": {
+            "same_as": "REQ-3.1"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "event_driven",
+          "condition": "the caller is a user whose level on a fork's parent is member and who owns neither the fork nor its parent",
+          "action": "resolve the level member on the fork",
+          "contract": "level = member",
+          "check": {
+            "same_as": "REQ-3.1"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "ubiquitous",
+          "action": "for any user whose level on a fork's parent is none, resolve the level none on the fork, including for the user who owns the fork",
+          "contract": "level = none",
+          "check": {
+            "same_as": "REQ-3.1"
+          }
+        },
+        {
+          "id": "REQ-3.5",
+          "pattern": "event_driven",
+          "condition": "the caller is the admin token and the slug names a fork",
+          "action": "resolve the level admin",
+          "contract": "level = admin",
+          "check": {
+            "same_as": "REQ-3.1"
+          }
+        },
+        {
+          "id": "REQ-3.6",
+          "pattern": "unwanted",
+          "condition": "the slug names a fork whose parent has no record and the caller is a user",
+          "action": "resolve the level none",
+          "contract": "level = none, with no error",
+          "check": {
+            "same_as": "REQ-3.1"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Decision for a declared need",
+      "rationale": "Each workspace route states what it needs once, and the caller sees one of three answers (PLAT-FR-060 steps 2 to 4).",
+      "system": "access component",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "a request reaches a workspace route that declares need read, write or owner and the caller's level on the named workspace is admin or owner",
+          "action": "grant access, run the route's handler and make the decision readable by it",
+          "contract": "the handler runs once; the decision it reads holds the level as the string admin or owner and the workspace record of the slug in the path",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a store holding repository 'acme' (owner u-owner, org o1) in status ready and 'old' (owner u-owner, org o1) in status archived",
+              "a membership stub: u-member is a member of active org o1",
+              "an httptest server with three probe routes GET /api/v1/workspaces/:slug/r, /w and /o registered through package 02's route registration with this package's need mark set to read, write and owner, behind the access check installed in the pipeline's access position; the probe handler writes 200 with the decision's level and record slug; a test hook sets the authenticated caller"
+            ],
+            "pseudocode": "in internal/access/middleware_test.go, a table of (caller, slug, route, want status, want error_type, want message, want level): for admin token and u-owner on 'acme' and 'old', every route -> 200 and body level == 'admin' / 'owner' and body slug == the path slug; u-member on /r of 'acme' and 'old' -> 200, level 'member'; u-member on /w and /o of 'acme' and of archived 'old' -> 403, 'forbidden', 'org members have read-only access to this workspace'; u-stranger on every route of 'acme', and each of admin token, u-owner, u-member and u-stranger on every route of 'nope' -> 404, 'not_found', 'workspace not found'; for every refused row assert the probe handler's call counter did not move and the body is the error envelope with code == status and Content-Type 'application/json; charset=utf-8'"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "event_driven",
+          "condition": "a request reaches a workspace route that declares need read and the caller's level is member",
+          "action": "grant access, run the route's handler and make the decision readable by it",
+          "contract": "the handler runs once; the decision it reads holds the level as the string member and the workspace record",
+          "check": {
+            "same_as": "REQ-4.1"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "unwanted",
+          "condition": "a request reaches a workspace route that declares need write or owner and the caller's level is member, in any status of the workspace including archived",
+          "action": "refuse the request without running the route's handler",
+          "contract": "HTTP 403 with error_type forbidden and message 'org members have read-only access to this workspace'; the handler is not called",
+          "check": {
+            "same_as": "REQ-4.1"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "unwanted",
+          "condition": "a request reaches a workspace route with any need and the caller's level is none or the slug names no workspace",
+          "action": "refuse the request without running the route's handler",
+          "contract": "HTTP 404 with error_type not_found and message 'workspace not found'; the handler is not called",
+          "check": {
+            "same_as": "REQ-4.1"
+          }
+        },
+        {
+          "id": "REQ-4.5",
+          "pattern": "unwanted",
+          "condition": "reading the workspace record, the parent's record or the caller's memberships fails while a decision is being made",
+          "action": "refuse the request without running the route's handler and without granting access",
+          "contract": "HTTP 500 with error_type internal; the handler is not called; the response body contains neither the workspace record nor the text of the underlying failure",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the probe routes of the decision table test",
+              "a record reader and a membership stub that can each be told to return an error containing the text 'disk I/O error at /data/parley.db'"
+            ],
+            "pseudocode": "in internal/access/middleware_test.go, a table over {record read fails for the slug; record read fails for the fork's parent; membership read fails} x {admin token where the failing read is on its path, u-owner, u-member, u-stranger} x {read, write, owner}: r = get(route); assert r.status == 500 and r.json.error.error_type == 'internal' and r.json.error.code == 500; assert handler calls == 0; assert body does not contain '/data/parley.db' or 'acme'"
+          }
+        },
+        {
+          "id": "REQ-4.6",
+          "pattern": "unwanted",
+          "condition": "a request reaches the access step with no authenticated caller attached, or the route declared a need other than read, write or owner",
+          "action": "refuse the request without running the route's handler and without granting access",
+          "contract": "HTTP 500 with error_type internal; the handler is not called",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a store holding repository 'acme' owned by u-owner"
+            ],
+            "pseudocode": "in internal/access/middleware_test.go: (a) call the read probe route for 'acme' with no caller set on the request; (b) register a probe route whose need mark holds a value outside the three and call it as u-owner; in both assert status == 500, error_type == 'internal', handler calls == 0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Anti-enumeration",
+      "rationale": "A caller who may not read a workspace must not learn that it exists (PLAT-FR-061).",
+      "system": "access component",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "ubiquitous",
+          "action": "for any caller whose level on an existing workspace is none, answer with the same HTTP status and the same response body, byte for byte, as for a slug that names no workspace, for each need read, write and owner, each workspace status and each kind",
+          "contract": "HTTP 404; the body bytes equal the body bytes of the answer for a slug with no record",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a store holding repository workspaces in org o1 owned by u-owner, one per status (pending, cloning, ready, failed, archived), and a fork of the ready one owned by u-left",
+              "a membership stub in which u-stranger and u-left are members of nothing and u-admin-role has role admin and no membership",
+              "the probe routes with need read, write and owner"
+            ],
+            "pseudocode": "in internal/access/middleware_test.go: baseline = for each need, the (status, body bytes) of u-stranger on slug 'does-not-exist'; then a table over callers {u-stranger, u-left, u-admin-role} x every stored slug x need {read, write, owner} x method {GET on the probe}: r = call; assert r.status == 404 and bytes.Equal(r.body, baseline[need].body); assert the three baseline bodies are equal to each other; also for the strings {'ACME', 'a--b--c', 300 times 'a', '%2e%2e'} as slug assert the same status and body"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "unwanted",
+          "condition": "a caller whose level is none calls a route that declares need write or owner on an existing workspace",
+          "action": "answer as for a slug that names no workspace and never with the member's read-only refusal",
+          "contract": "HTTP 404 with error_type not_found; never HTTP 403",
+          "check": {
+            "same_as": "REQ-5.1"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "event_driven",
+          "condition": "a caller other than an HTTP route, such as the git server, asks for the decision on a slug and a need and the outcome is not-found",
+          "action": "return an outcome that carries no workspace record and no level, and that is equal for an existing workspace the caller cannot read and for a slug with no record",
+          "contract": "the returned decision has outcome not_found, a zero record and level none; the two decisions compare equal",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a store holding repository 'acme' owned by u-owner in org o1; u-stranger is a member of nothing"
+            ],
+            "pseudocode": "in internal/access/decide_test.go: a = decide(u-stranger, 'acme', need) and b = decide(u-stranger, 'nope', need) for each need; assert a.outcome == not_found and a == b and a.record is the zero record and a.level == none; assert decide(u-member, 'acme', write).outcome == read_only and decide(u-owner, 'acme', owner).outcome == granted"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Member contributions",
+      "rationale": "Members may fork, contribute changes, record verdicts and make claims although those routes change state (PLAT-FR-062); the rule must let them through and give the routes the facts their own conditions read.",
+      "system": "access component",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "a caller whose level is member calls a route that declares need read with the method POST, PATCH, PUT or DELETE",
+          "action": "grant access exactly as for GET",
+          "contract": "the handler runs once and reads level member",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a store holding repository 'acme' (owner u-owner, org o1) and its fork 'acme--m' (owner u-member); u-member is a member of active org o1",
+              "probe routes registered for POST, PATCH, PUT and DELETE on /api/v1/workspaces/:slug/contrib with need read; the probe handler echoes the decision"
+            ],
+            "pseudocode": "in internal/access/middleware_test.go, a table over the four methods and the slugs {'acme', 'acme--m'}: r = call as u-member; assert r.status == 200; assert r.json.level == 'member' on 'acme' and 'owner' on 'acme--m'; assert r.json.record == {slug, owner_id, org_id, kind, parent_slug, status} of the stored record"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "event_driven",
+          "condition": "access is granted on a workspace route",
+          "action": "give the handler the caller's level and the workspace record's slug, owner_id, org_id, kind, parent_slug and status as read during the decision",
+          "contract": "the decision read from the request holds the level and all six record fields, equal to the stored record",
+          "check": {
+            "same_as": "REQ-6.1"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "event_driven",
+          "condition": "a component asks whether a named user, who need not be the caller, has write access to a workspace",
+          "action": "answer yes exactly when that user's level on the workspace is owner, and no when it is member or none or the slug names no workspace",
+          "contract": "returns true or false with a nil error; returns an error and false when a read fails",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a store holding repository 'acme' (owner u-owner, org o1) and fork 'acme--m' (owner u-member); u-member is a member of active org o1"
+            ],
+            "pseudocode": "in internal/access/level_test.go, a table of (user, slug, want): (u-owner, 'acme', true); (u-member, 'acme', false); (u-stranger, 'acme', false); (u-member, 'acme--m', true); (u-owner, 'acme--m', true); (u-owner, 'nope', false); then make the record read fail and assert the result is (false, non-nil error)"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "Readable set",
+      "rationale": "The workspace list, events and audit must all show a caller the same workspaces, and never one that would then answer 404 (PLAT-FR-063).",
+      "system": "access component",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "event_driven",
+          "condition": "the readable set is asked for the admin token",
+          "action": "return a set that contains every workspace, with level admin",
+          "contract": "the set reports all = true; a membership question on any existing slug answers yes with level admin",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a store holding: repositories 'mine' (owner u1, org o-u1), 'team' (owner u2, org o1), 'both' (owner u1, org o1), 'held' (owner u2, blocked org o3), 'other' (owner u2, org o2), 'archived-team' (owner u2, org o1, status archived); forks 'mine--x' (owner u3), 'team--a' (owner u1), 'team--b' (owner u3), 'other--z' (owner u1)",
+              "a membership stub: u1 is a member of active o-u1 and o1 and of blocked o3; u3 is a member of o-u1 only; u9 is a member of nothing"
+            ],
+            "pseudocode": "in internal/access/readable_test.go: s = readable(admin token); assert s.all and s.contains(x) with level admin for every stored slug. s = readable(u1); assert s.entries == {mine: owner, mine--x: owner, both: owner, team: member, team--a: owner, team--b: member, archived-team: member} exactly, each slug once; assert 'held', 'other' and 'other--z' are absent. assert readable(u9) is empty with nil error. Then for every user in {u1, u2, u3, u9} and every stored slug assert s.contains(slug) == (level(user, slug) != none) and, when contained, s.level(slug) == level(user, slug)"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "event_driven",
+          "condition": "the readable set is asked for a user",
+          "action": "return the workspaces the user owns, the forks of those workspaces and the workspaces, forks included, of the organizations the user is a member of while those organizations are active, each once and each with the caller's level, in every workspace status",
+          "contract": "a set of (slug, level) entries with level owner or member and no duplicate slug",
+          "check": {
+            "same_as": "REQ-7.1"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "event_driven",
+          "condition": "a workspace is both owned by the user and in an organization the user is a member of",
+          "action": "list it once with level owner",
+          "contract": "one entry for the slug, level owner",
+          "check": {
+            "same_as": "REQ-7.1"
+          }
+        },
+        {
+          "id": "REQ-7.4",
+          "pattern": "ubiquitous",
+          "action": "for any user and any workspace, include the workspace in the user's readable set exactly when the user's resolved level on it is not none, with that level, so that a fork whose owner has level none on its parent and a workspace of a blocked organization that the user does not own are absent",
+          "check": {
+            "same_as": "REQ-7.1"
+          }
+        },
+        {
+          "id": "REQ-7.5",
+          "pattern": "event_driven",
+          "condition": "the readable set is asked for a user who owns no workspace and is a member of no active organization",
+          "action": "return an empty set",
+          "contract": "an empty set with all = false and a nil error",
+          "check": {
+            "same_as": "REQ-7.1"
+          }
+        },
+        {
+          "id": "REQ-7.6",
+          "pattern": "unwanted",
+          "condition": "reading workspace records or memberships fails while the readable set is built",
+          "action": "return the failure and no set",
+          "contract": "a non-nil error and an empty set with all = false; no partial entries",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the store of the readable-set table test, with a record reader and a membership stub that can each be told to fail"
+            ],
+            "pseudocode": "in internal/access/readable_test.go, a table over {membership read fails, record read fails}: s, err = readable(u1); assert err != nil and len(s.entries) == 0 and not s.all"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "An owner, a member and an outsider call a write route of the same workspace",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "calls a route that declares need write on workspace 'acme', which the developer owns, with an API key"
+        },
+        {
+          "actor": "parleyd",
+          "action": "authenticates the caller, reads the workspace record, resolves level owner and runs the handler, which answers 200 with access owner"
+        },
+        {
+          "actor": "org member",
+          "action": "calls the same route with an API key"
+        },
+        {
+          "actor": "parleyd",
+          "action": "resolves level member from the caller's membership in the workspace's active organization and answers 403 forbidden with 'org members have read-only access to this workspace'"
+        },
+        {
+          "actor": "developer",
+          "action": "as a second user who is neither the owner nor in the organization, calls the same route, and then the same route on a slug that names no workspace"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers both requests 404 not_found with 'workspace not found', with identical bodies"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the net/http router and error envelope of internal/server",
+          "the authentication middleware of internal/identity",
+          "the access middleware and level resolver of internal/access",
+          "the users, organizations and memberships of internal/identity",
+          "the SQLite store of internal/store"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 against a store in t.TempDir()",
+          "three users with API keys: the owner, a member of organization o1 and an outsider; workspace record 'acme' owned by the owner in o1",
+          "a probe route POST /api/v1/workspaces/:slug/probe registered by the test with need write behind the real authentication middleware"
+        ],
+        "end_state": [
+          "the owner's call answered 200 and the probe handler ran exactly once",
+          "the member's call answered 403 with error_type forbidden",
+          "the outsider's calls on 'acme' and on 'nope' answered 404 with error_type not_found and byte-identical bodies"
+        ],
+        "pseudocode": "in internal/access/access_integration_test.go: start the hub; create users, org, membership through internal/identity; insert the record; assert post('/api/v1/workspaces/acme/probe', ownerKey).status == 200; m = post(..., memberKey); assert m.status == 403 and m.json.error.error_type == 'forbidden'; a = post('/api/v1/workspaces/acme/probe', outsiderKey); b = post('/api/v1/workspaces/nope/probe', outsiderKey); assert a.status == 404 and b.status == 404 and bytes.Equal(a.body, b.body); assert probe calls == 1"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "A member who leaves the organization loses the fork they created",
+      "steps": [
+        {
+          "actor": "org member",
+          "action": "calls a route that declares need owner on task fork 'acme--m', which the member owns, and receives 200 with access owner"
+        },
+        {
+          "actor": "operator",
+          "action": "removes the member from the workspace's organization"
+        },
+        {
+          "actor": "org member",
+          "action": "calls the same route on the fork and a read route on the parent 'acme'"
+        },
+        {
+          "actor": "parleyd",
+          "action": "resolves level none on the parent, therefore none on the fork, and answers both requests 404 not_found"
+        },
+        {
+          "actor": "parleyd",
+          "action": "builds the former member's readable set without 'acme' and 'acme--m'"
+        },
+        {
+          "actor": "developer",
+          "action": "calls the owner route on the fork as the parent's owner and receives 200 with access owner"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the net/http router and error envelope of internal/server",
+          "the authentication middleware of internal/identity",
+          "the access middleware, level resolver and readable set of internal/access",
+          "the organization membership removal of internal/identity",
+          "the SQLite store of internal/store"
+        ],
+        "setup": [
+          "the hub, users and workspace of the first path, plus fork record 'acme--m' owned by the member with parent 'acme'",
+          "probe routes GET /api/v1/workspaces/:slug/probe-read with need read and GET /api/v1/workspaces/:slug/probe-owner with need owner"
+        ],
+        "end_state": [
+          "before the removal the member's owner-route call on 'acme--m' answered 200 with level owner",
+          "after the removal the member's calls on 'acme--m' and 'acme' answered 404 with error_type not_found",
+          "the former member's readable set is empty",
+          "the parent's owner still gets 200 with level owner on 'acme--m', and the owner's readable set holds 'acme' and 'acme--m' with level owner"
+        ],
+        "pseudocode": "in internal/access/access_integration_test.go: assert get('/api/v1/workspaces/acme--m/probe-owner', memberKey).json.level == 'owner'; remove the membership through internal/identity; assert get('/api/v1/workspaces/acme--m/probe-owner', memberKey).status == 404 and get('/api/v1/workspaces/acme/probe-read', memberKey).status == 404; assert readable(member).entries is empty; assert get('/api/v1/workspaces/acme--m/probe-owner', ownerKey).json.level == 'owner'; assert readable(owner).entries == {acme: owner, acme--m: owner}"
+      }
+    }
+  ]
+}

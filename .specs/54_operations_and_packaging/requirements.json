@@ -1,0 +1,863 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "54",
+  "spec_name": "operations_and_packaging",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Git version check at start",
+      "rationale": "A hub on a host without a usable git fails at the first clone or push; it is cheaper to refuse the start and say why.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "parleyd starts to serve and git on the PATH of its environment answers git --version with a first line git version <major>.<minor> followed by anything, where (major, minor) is at least (2, 38)",
+          "action": "run git --version exactly once as the start hook git-version, before every other registered start hook, accept the version, and write one info log line with msg 'git version checked' and the member git_version holding the text after 'git version ' up to the first space",
+          "contract": "the hub goes on to listen; stderr holds exactly one line with msg 'git version checked', and it precedes the first effect of every other start hook; git_version is for example '2.39.3' for the output 'git version 2.39.3 (Apple Git-146)'",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a temporary directory first on the PATH of the hub's environment lookup, holding an executable script named git that the test writes",
+              "a temporary working directory with a config.toml setting bind 127.0.0.1 and port 0"
+            ],
+            "pseudocode": "in internal/hub/gitcheck_test.go: the script prints 'git version 2.39.3 (Apple Git-146)' and appends a line to a counter file; register a start hook h that appends 'h' to a shared log and records whether the 'git version checked' line is already on stderr; run the hub; wait for the listening line; assert lines(counter file) == 1; assert h saw the line; rec = json(the line); assert rec.level == 'INFO' and rec.git_version == '2.39.3'; and once with the real git of the test host: assert the hub listens"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "ubiquitous",
+          "action": "for any first line of the output of git --version, read the version as the two decimal numbers that follow 'git version ' separated by a dot, ignore everything after the minor number, and accept exactly the versions whose (major, minor) is at least (2, 38)",
+          "contract": "the parsing function returns (major, minor, the version text up to the first space) or an error; the comparison accepts 2.38, 2.38.0, 2.45.1.windows.1, 2.50.0-rc1, 2.100.0 and 3.0, and refuses 2.37.7, 2.9.5 and 1.9",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/gitrepo/version_test.go, a table of (line, want major, want minor, want text, accepted): ('git version 2.38.0', 2, 38, '2.38.0', true), ('git version 2.38', 2, 38, '2.38', true), ('git version 2.39.3 (Apple Git-146)', 2, 39, '2.39.3', true), ('git version 2.45.1.windows.1', 2, 45, '2.45.1.windows.1', true), ('git version 2.50.0-rc1', 2, 50, '2.50.0-rc1', true), ('git version 2.100.0', 2, 100, '2.100.0', true), ('git version 3.0', 3, 0, '3.0', true), ('git version 2.37.7', 2, 37, '2.37.7', false), ('git version 2.9.5', 2, 9, '2.9.5', false), ('git version 1.9', 1, 9, '1.9', false): v, err = gitrepo.ParseVersion(line); assert err == nil; assert v.Major == major and v.Minor == minor and v.Text == text; assert v.AtLeast(2, 38) == accepted; and a table of lines that return an error: '', 'git version', 'git version two', 'git version 2', 'hg version 2.40', 'version 2.40.0'"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "unwanted",
+          "condition": "parleyd starts to serve and no executable named git is on the PATH of its environment",
+          "action": "stop the start in the git-version hook without calling any later start hook and without listening",
+          "contract": "exit status 1; stderr holds exactly one non-empty line, a JSON object at level ERROR whose text contains 'git not found on PATH; parleyd needs git 2.38 or later'; no line with msg 'listening'; a start hook registered by another package is not called",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a temporary working directory with a valid config.toml; the PATH of the hub's environment lookup is set by each table row"
+            ],
+            "pseudocode": "in internal/hub/gitcheck_test.go, a table of (arrangement of the PATH, text the error line must contain): (a PATH of one empty directory, 'git not found on PATH; parleyd needs git 2.38 or later'), (script prints 'git version 2.30.2', 'git 2.30.2 is too old; parleyd needs git 2.38 or later'), (script prints 'git version 2.37.7', 'git 2.37.7 is too old'), (script prints 'gti 2.40', 'cannot read the git version from \"gti 2.40\"'), (script exits 3 without output, 'git --version failed: exit status 3'): register a start hook h that sets a flag; code = hub.Run(ctx, opts); assert code == 1; lines = nonEmptyLines(stderr); assert len(lines) == 1; assert json(lines[0]).level == 'ERROR'; assert contains(lines[0], text); assert not contains(stderr, 'listening'); assert h's flag is unset"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "unwanted",
+          "condition": "parleyd starts to serve and git --version reports a version whose (major, minor) is below (2, 38)",
+          "action": "stop the start in the git-version hook, naming the version that was found",
+          "contract": "exit status 1; one JSON error line whose text contains 'git <found> is too old; parleyd needs git 2.38 or later', where <found> is the version text git printed; no listening line",
+          "check": {
+            "same_as": "REQ-1.3"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "unwanted",
+          "condition": "the first line of the output of git --version does not have the form git version <major>.<minor>, or git --version exits with a status other than 0, or it has not answered after 10 seconds",
+          "action": "return an error from the version check, kill the git process when the time limit passed, and stop the start with that error",
+          "contract": "the check returns an error whose text is 'cannot read the git version from \"<first line cut to 100 bytes>\"', 'git --version failed: exit status <n>' or 'git --version failed: no answer within <limit>'; with a time limit the check returns no later than 2 seconds after the limit and the process it started no longer runs; at start the exit status is 1 with one JSON error line holding that text",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a temporary directory with an executable script named git, and a path lookup that resolves git to it"
+            ],
+            "pseudocode": "in internal/gitrepo/version_test.go, with the script as git: (a) script prints a first line of 300 'x' characters: _, err = gitrepo.CheckVersion(ctx, lookPath, 10*time.Second); assert contains(err.Error(), 'cannot read the git version from \"' + 100 'x' characters + '\"'); (b) script exits 3: assert contains(err.Error(), 'git --version failed: exit status 3'); (c) script writes its process id to a file and sleeps 60 seconds: start = now; _, err = gitrepo.CheckVersion(ctx, lookPath, 200*time.Millisecond); assert contains(err.Error(), 'no answer within 200ms'); assert now - start < 2200 ms; assert the process with the recorded id no longer exists"
+          }
+        },
+        {
+          "id": "REQ-1.6",
+          "pattern": "event_driven",
+          "condition": "parleyd is run as parleyd --help, with a usage error, as parleyd backup <directory>, or as a bootstrap run that writes the admin token and exits (--admin-email on a hub with no admin token hash, or --reset-admin-token)",
+          "action": "complete the run without running git",
+          "contract": "on a PATH that holds no git the run ends as it does on a host with git: exit status 0 for --help, the backup and the bootstrap runs, 2 for the usage error; stderr holds no text 'git not found'",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a temporary working directory with a valid config.toml"
+            ],
+            "pseudocode": "in internal/hub/gitcheck_test.go, a table of (arguments, want exit status) run with a PATH of one empty directory: (['--help'], 0), (['--no-such-flag'], 2), (['--admin-email=a@x'] on a new data directory, 0), (['--reset-admin-token'], 0), (['backup', target] on the data directory the bootstrap row created, 0): code = hub.Run(ctx, opts); assert code == want; assert not contains(stderr, 'git not found')"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "A newer binary opens the previous release's data",
+      "rationale": "An upgrade must be a restart, not a migration project (NFR-003).",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "a person runs go run ./test/upgrade/record <name> with a name that matches ^[a-z0-9][a-z0-9._-]{0,62}$ and no archive of that name exists",
+          "system": "upgrade recorder",
+          "action": "start a hub in a temporary directory with --admin-email, start it again to serve, create the bare repository fixture.git with one commit on main under its workspace root, stop it with a clean shutdown, and write test/upgrade/testdata/<name>.tar.gz holding the data directory and manifest.json",
+          "contract": "exit status 0; stdout is the archive's path and a newline; the archive holds the transactional store, analytics.db, the workspace root with fixture.git, and manifest.json with release == <name>, recorded_at, steps.transactional and steps.analytical (the applied schema steps of each store in order of application), admin_token_sha256 (64 lowercase hex characters, the stored hash) and repositories == [{path: 'fixture.git', refs: {'refs/heads/main': <40 hex>}}]; the temporary directory is removed",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "record.Run takes the output directory as a parameter; the command passes test/upgrade/testdata"
+            ],
+            "pseudocode": "in test/upgrade/record/record_test.go: out = t.TempDir(); code = record.Run(ctx, ['r1'], out, stdout, stderr); assert code == 0; assert stdout == out + '/r1.tar.gz\\n'; unpack the archive into d; m = json(d/manifest.json); assert m.release == 'r1'; assert m.steps.transactional == store.AppliedSteps(open d's transactional store) and likewise analytical; assert len(m.admin_token_sha256) == 64; assert m.repositories[0].path == 'fixture.git'; assert exec('git', '-C', d/<workspace root>/fixture.git, 'rev-parse', 'refs/heads/main') == m.repositories[0].refs['refs/heads/main']"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "unwanted",
+          "condition": "the name given to the recorder does not match ^[a-z0-9][a-z0-9._-]{0,62}$, no name or more than one is given, or test/upgrade/testdata/<name>.tar.gz already exists",
+          "system": "upgrade recorder",
+          "action": "refuse without starting a hub and without writing or changing any file",
+          "contract": "exit status 1; stdout is empty; stderr holds one line that names the cause (the name and the pattern, or the existing archive's path); the output directory's listing and the bytes of an existing archive are unchanged",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in test/upgrade/record/record_test.go, a table of argument lists: [], ['a', 'b'], ['Upper'], ['-x'], ['a/b'], [65 characters 'a'], and ['r1'] with out/r1.tar.gz already holding the bytes 'old': code = record.Run(ctx, args, out, stdout, stderr); assert code == 1; assert stdout == ''; assert len(nonEmptyLines(stderr)) == 1; assert listDir(out) is unchanged; in the last row assert read(out/r1.tar.gz) == 'old' and contains(stderr, 'r1.tar.gz')"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "event_driven",
+          "condition": "parleyd is started with no flags on the unpacked data of a recorded archive under test/upgrade/testdata",
+          "action": "apply every registered schema step that the data does not record, apply no recorded step again, run the start hooks, listen, and keep what the data held",
+          "contract": "the listening line is logged and GET /readyz answers 200; in each store the list of applied steps begins with the manifest's list for that store in the same order and holds every registered step of that store; the stored admin token hash equals the manifest's admin_token_sha256; for each repository of the manifest git fsck exits 0 and each ref resolves to the manifest's commit id; on SIGTERM the exit status is 0",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "test/upgrade/testdata holds at least baseline.tar.gz, recorded by the recorder when this package was implemented"
+            ],
+            "pseudocode": "in test/upgrade/upgrade_test.go, one subtest per archive in testdata (the test fails when there is none): unpack into d; write config.toml with database.path and workspace.path inside d, bind 127.0.0.1, port 0; run the hub; rec = json(listening line); assert get('http://' + rec.addr + '/readyz').status == 200; cancel; assert exit status == 0; for each store: applied = store.AppliedSteps(store); assert applied[0:len(m.steps[store])] == m.steps[store]; assert set(applied) == set(names of the registered steps of that store); assert the admin token hash read through internal/identity == m.admin_token_sha256; for r in m.repositories: assert exec('git', '-C', d/workspaces/r.path, 'fsck').code == 0; for ref, sha in r.refs: assert exec('git', '-C', ..., 'rev-parse', ref) == sha"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "event_driven",
+          "condition": "parleyd is started a second time on data it has already brought to the current schema",
+          "action": "apply no schema step and leave the record of applied steps of both stores as it was",
+          "contract": "the lists of applied steps of both stores are equal before and after the second start; the hub listens and answers GET /readyz with 200",
+          "check": {
+            "same_as": "PATH-2"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "ubiquitous",
+          "system": "upgrade test",
+          "action": "for any list of recorded step names and any list of registered step names, report the pair as compatible exactly when every recorded name is registered and the recorded names appear among the registered ones in the same relative order, and otherwise name the first recorded step that breaks the rule",
+          "contract": "upgrade.Compatible(recorded, registered) returns nil for a compatible pair and otherwise an error whose text contains the step's name and 'not registered' or 'out of order'; the upgrade test calls it for both stores of every archive before it starts the hub and fails with that text",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in test/upgrade/compat_test.go, a table of (recorded, registered, want): ([], [], nil), ([], ['a'], nil), (['a', 'b'], ['a', 'b', 'c'], nil), (['a', 'c'], ['a', 'b', 'c'], nil), (['a', 'b'], ['a'], error containing 'b' and 'not registered'), (['a', 'b'], ['a', 'b2'], 'b' and 'not registered'), (['a', 'b'], ['b', 'a'], 'b' and 'out of order'), (['a'], [], 'a' and 'not registered'): err = upgrade.Compatible(recorded, registered); assert (err == nil) == (want == nil); where want is an error assert contains(err.Error(), each expected text)"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Structured logging rules",
+      "rationale": "Logs are read by machines and kept by third parties: each line must parse, must be attributable to a request, and must never carry a credential (NFR-042).",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "ubiquitous",
+          "action": "for any line it logs, write exactly one line of text that is one JSON object with the members time (an RFC 3339 timestamp in UTC ending in Z), level (one of TRACE, DEBUG, INFO, WARN, ERROR) and msg (a string)",
+          "contract": "a line logged at the trace level has level 'TRACE'; a message or value that contains a line break is written with the break escaped, so the output has exactly one newline per logged line",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/hub/logging_test.go, beside the level-filter test: log = hub.NewLogger(buffer, 'trace', scrubber) with a clock fixed at 2026-03-04T05:06:07+02:00; emit one line at each of the five levels, the last with msg 'two\\nlines' and an attribute 'v' = 'a\\nb'; assert count(buffer, '\\n') == 5; for each line: rec = json(line); assert rec.time ends with 'Z' and parses as RFC 3339 to the instant 2026-03-04T03:06:07Z; assert [rec.level for each line] == ['TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR']; assert json(last line).msg == 'two\\nlines'"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "event_driven",
+          "condition": "code logs a line with the context of a request that the HTTP server is handling",
+          "action": "add the member request_id to the line, equal to the request id of that request",
+          "contract": "the line's request_id equals the X-Request-ID header of the request's response, for a line written by a handler and for a line written by code the handler calls with the request's context; a line logged with a context that belongs to no request, or without a context, has no request_id member",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the request id middleware of package 02 is installed"
+            ],
+            "pseudocode": "in internal/hub/logging_test.go: build the HTTP server of internal/server with the hub's logger and a test route whose handler logs 'in handler' with r.Context() and calls a function that logs 'deeper' with the same context; resp = get(route); id = resp.header['X-Request-ID']; assert json(line 'in handler').request_id == id; assert json(line 'deeper').request_id == id; send a second request and assert its lines carry the second response's id; log.InfoContext(context.Background(), 'background'); log.Info('no context'); assert 'request_id' not in json(line 'background'); assert 'request_id' not in json(line 'no context')"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "event_driven",
+          "condition": "a line is logged with an attribute whose value is an error, a nested group of attributes, a list, a map, a byte slice or a value that is rendered as text",
+          "action": "render the value and pass every string in the rendering through the scrubber before the line is written, rendering an error as its message, and write numbers, booleans and durations unchanged",
+          "contract": "no string anywhere in the line holds a registered secret value, a credential in one of the hub's formats or user information in a URL; each is replaced by [redacted] or the URL without user information, as for a string attribute; attribute keys are unchanged",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/hub/logging_test.go, beside the scrubbing test: s = scrub.New(); s.Add('hunter2'); log = hub.NewLogger(buffer, 'info', s); a table of attribute values: errors.New('auth hunter2 failed'), fmt.Errorf('wrap: %w', errors.New('https://u:hunter2@h/r.git')), slog.Group('g', 'inner', 'hunter2', 'n', 7), ['a', 'hunter2'], {'k': 'hunter2'}, []byte('hunter2'), a value whose String method returns 'tok hunter2', a generated personal access token inside a struct field: log.Info('m', 'v', value, 'count', 3, 'ok', true); assert not contains(line, 'hunter2'); assert not contains(line, the token); assert contains(line, '[redacted]') or (for the URL row) contains(line, 'https://h/r.git'); rec = json(line); assert rec.count == 3 and rec.ok == true; for the first row assert rec.v == 'auth [redacted] failed'"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "ubiquitous",
+          "action": "for any request, write the path member of its access-log line as the path of the request's URL without the query string",
+          "contract": "a request to /version?token=s3cr3t&x=1 gives an access-log line whose path is '/version' and which contains neither 's3cr3t' nor '?'",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/server/headers_test.go, beside the access-log test: a table of request targets ('/version?token=s3cr3t&x=1', '/api/v1/none?a=b', '/version'): send the request through the server with a buffer as log; rec = json(the access-log line); assert rec.path == the target up to but excluding '?'; assert not contains(line, 's3cr3t'); assert not contains(line, '?')"
+          }
+        },
+        {
+          "id": "REQ-3.5",
+          "pattern": "unwanted",
+          "condition": "a write of a log line to stderr returns an error",
+          "action": "drop the line and go on, without failing the request that caused the line and without stopping the process",
+          "contract": "the request is answered with the status and body it has when logging works; later requests are answered; the hub's exit status at a later SIGTERM is 0",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a temporary working directory with a valid config.toml and [logging].level trace"
+            ],
+            "pseudocode": "in internal/hub/logging_test.go: run the hub with a stderr writer that returns an error for every write after the listening line; r1 = get('/version'); assert r1.status == 200 and r1.json.version != ''; r2 = get('/api/v1/no-such-route'); assert r2.status == 404; cancel; assert exit status == 0"
+          }
+        },
+        {
+          "id": "REQ-3.6",
+          "pattern": "ubiquitous",
+          "action": "for any run at level trace in which requests carry secrets in an Authorization Bearer header, an Authorization Basic header, a Cookie header, a JSON body and a query parameter, write a log in which every line is a JSON object with time, level and msg, every access-log line carries the request_id of its response, and none of those secrets appears",
+          "contract": "every non-empty line of stderr parses as a JSON object with the three members; for each response the log holds an access-log line whose request_id equals its X-Request-ID; no line contains any of the five marker secrets, neither as sent nor base64-encoded",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "an in-process hub with [logging].level trace and log_health_probes true, started through the run function with a buffer as stderr"
+            ],
+            "pseudocode": "in test/e2e/logging_test.go: five distinct random markers of 24 characters; send to the running hub: GET /api/v1/user with 'Authorization: Bearer ' + m1; GET /git/acme/app.git/info/refs?service=git-upload-pack with Basic auth user 'x' and password m2; GET /version with 'Cookie: session=' + m3; POST /api/v1/no-such-route with content type application/json and body {'secret': m4}; GET /healthz?token=m5; collect each response's X-Request-ID; stop the hub; for line in nonEmptyLines(stderr): rec = json(line); assert rec.time != '' and rec.level != '' and rec.msg is a string; for each collected id: assert at least one line has the members method, path and status and request_id == id; for m in markers: assert not contains(stderr, m); assert not contains(stderr, base64('x:' + m2))"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Restore of a backup taken under load",
+      "rationale": "A backup is worth what its restore is worth; NFR-007 promises that a hub started on a restored snapshot starts cleanly.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "an operator copies a snapshot written by parleyd backup to a new place (the transactional store to [database].path, analytics.db beside it, the workspace directory to [workspace].path) and starts parleyd there with no flags",
+          "action": "open the copied stores without applying a schema step, run every registered start hook to completion with the restored data open, listen, and accept new work",
+          "contract": "the listening line is logged and GET /readyz answers 200; a start hook registered by the test is called once before the listener is bound and reads the restored rows; the stored admin token hash equals the source hub's; a transaction on the restored transactional store commits, and git push of a new commit to a restored repository exits 0; every file of the snapshot directory that was copied from has the same content hash as before the start",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a bootstrapped source hub with a schema step creating table a with 100 committed rows and one bare repository r.git with two commits, backed up with parleyd backup into a snapshot directory"
+            ],
+            "pseudocode": "in test/e2e/restore_test.go: hash every file of the snapshot; copy the snapshot's parley.db, analytics.db and workspaces into a new directory d2 as its data/parley.db, data/analytics.db and data/workspaces; write d2/config.toml with bind 127.0.0.1 and port 0; register a start hook that records count(a) and whether a TCP dial to the configured address fails; run the hub with working directory d2; rec = json(listening line); assert get('http://' + rec.addr + '/readyz').status == 200; assert the hook ran once and saw count(a) == 100; assert the admin token hash == the source's; assert a transaction inserting one row into a commits with nil error; clone d2/data/workspaces/r.git, commit, assert exec('git', 'push').code == 0; assert store.AppliedSteps is equal before and after for both stores; assert the hashes of the snapshot's files are unchanged"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "ubiquitous",
+          "action": "for any snapshot that parleyd backup writes while writers commit transactions to both stores and git clients push to the repositories, give a snapshot whose copy starts a hub as a snapshot of an idle hub does, whose stores are sound and whose repositories are complete",
+          "contract": "the hub started on the copy logs the listening line and answers GET /readyz with 200; PRAGMA integrity_check answers ok on each restored store; the row count of the load table is a multiple of 10; for each restored repository git fsck exits 0, its ref refs/heads/main resolves to a commit that is the source repository's commit of that ref at the end of the load or an ancestor of it, and every commit pushed before the backup started is an ancestor of the restored ref or equal to it",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a running in-process hub under load: four goroutines each committing transactions of 10 rows to a table of the transactional store, one goroutine committing rows to a table of the analytical store, and two git clients each pushing one new commit after another to one of two bare repositories under the workspace root, from before the backup starts until after it ends"
+            ],
+            "pseudocode": "in test/e2e/restore_test.go, repeated for 3 backups of the same running hub: before = rev-parse refs/heads/main of each source repository; code = run(['backup', target]); assert code == 0; stop the load; final = rev-parse of each source repository; restore target into a new directory and start a hub on it as in the restore test above; assert readyz 200; for db in {parley.db, analytics.db}: assert query('PRAGMA integrity_check') == 'ok'; assert count(load table) % 10 == 0; for each repository r: assert exec('git', '-C', restored r, 'fsck').code == 0; head = rev-parse refs/heads/main in restored r; assert exec('git', '-C', source r, 'merge-base', '--is-ancestor', head, final[r]).code == 0; assert exec('git', '-C', restored r, 'merge-base', '--is-ancestor', before[r], head).code == 0"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "state_driven",
+          "condition": "parleyd backup runs against the data of a hub that is under load",
+          "action": "let every transaction of the running hub commit and every git push to its repositories complete",
+          "contract": "no writer's commit returns an error and no git push exits with a status other than 0 between the start and the end of the backup; the running hub answers GET /readyz with 200 after the backup",
+          "check": {
+            "same_as": "REQ-4.2"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Hub container image",
+      "rationale": "NFR-006 lists a hub container image among the deliverables; it must run the hub the way the hub is meant to run.",
+      "system": "hub image",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "a container is started from the image built from containers/hub/Dockerfile with no arguments and an empty volume at /var/lib/parley",
+          "action": "run parleyd as user id 10001 with the config dir /var/lib/parley/config and the data directory /var/lib/parley/data, listening on port 8080",
+          "contract": "GET /readyz on the published port answers 200 within 60 seconds; GET /version answers a document whose version is the build argument VERSION, whose commit is COMMIT and whose build_time is BUILD_TIME; the container's log holds the line 'git version checked'; the volume holds data/parley.db owned by user id 10001; id -u in the container prints 10001",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "PARLEY_IMAGE_TESTS=1 and a container engine named by PARLEY_CONTAINER_ENGINE (default docker); without PARLEY_IMAGE_TESTS=1 the test is skipped",
+              "the image built once per test run with <engine> build -f containers/hub/Dockerfile --build-arg VERSION=9.9.9-test --build-arg COMMIT=abc1234 --build-arg BUILD_TIME=2026-01-02T03:04:05Z from the repository root"
+            ],
+            "pseudocode": "in test/image/hub_test.go: id = engine('run', '-d', '-p', '127.0.0.1::8080', '-v', vol + ':/var/lib/parley', image); port = engine('port', id, '8080'); poll get(port + '/readyz') until 200, at most 60 s; v = get(port + '/version').json; assert v.version == '9.9.9-test' and v.commit == 'abc1234' and v.build_time == '2026-01-02T03:04:05Z'; assert contains(engine('logs', id), 'git version checked'); assert engine('exec', id, 'id', '-u') == '10001'; assert engine('exec', id, 'stat', '-c', '%u', '/var/lib/parley/data/parley.db') == '10001'"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "event_driven",
+          "condition": "the container engine stops a running hub container",
+          "action": "deliver the stop signal to parleyd, which shuts down and ends the container",
+          "contract": "the container ends within 30 seconds of the stop request with exit code 0; a new container started on the same volume answers GET /readyz with 200",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "PARLEY_IMAGE_TESTS=1 and a container engine named by PARLEY_CONTAINER_ENGINE (default docker); without PARLEY_IMAGE_TESTS=1 the test is skipped",
+              "the image built once per test run with <engine> build -f containers/hub/Dockerfile --build-arg VERSION=9.9.9-test --build-arg COMMIT=abc1234 --build-arg BUILD_TIME=2026-01-02T03:04:05Z from the repository root"
+            ],
+            "pseudocode": "in test/image/hub_test.go, after the test above: start = now; engine('stop', '-t', '40', id); assert now - start < 30 s; assert engine('inspect', '-f', '{{.State.ExitCode}}', id) == '0'; id2 = engine('run', '-d', '-p', '127.0.0.1::8080', '-v', vol + ':/var/lib/parley', image); poll readyz until 200"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "event_driven",
+          "condition": "a container is started from the hub image with arguments, or with parley as its command",
+          "action": "pass the arguments to parleyd unchanged, and provide the parley CLI in /usr/local/bin built with the same build values",
+          "contract": "the arguments backup /var/lib/parley/snapshot on the volume of a running hub exit with code 0 and leave parley.db, analytics.db and workspaces in /var/lib/parley/snapshot; the arguments --help print parleyd's usage and exit with code 0; parley version as the command prints a JSON document whose cli.version is the build argument VERSION and exits with code 0",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "PARLEY_IMAGE_TESTS=1 and a container engine named by PARLEY_CONTAINER_ENGINE (default docker); without PARLEY_IMAGE_TESTS=1 the test is skipped",
+              "the image built once per test run with <engine> build -f containers/hub/Dockerfile --build-arg VERSION=9.9.9-test --build-arg COMMIT=abc1234 --build-arg BUILD_TIME=2026-01-02T03:04:05Z from the repository root"
+            ],
+            "pseudocode": "in test/image/hub_test.go, with the hub container of the first test running: assert engine('run', '--rm', '-v', vol + ':/var/lib/parley', image, 'backup', '/var/lib/parley/snapshot').code == 0; assert sorted(engine('exec', id, 'ls', '/var/lib/parley/snapshot')) == ['analytics.db', 'parley.db', 'workspaces']; out = engine('run', '--rm', image, '--help'); assert out.code == 0 and contains(out.stdout, 'backup'); out = engine('run', '--rm', '--entrypoint', 'parley', image, 'version'); assert out.code == 0 and json(out.stdout).cli.version == '9.9.9-test'"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "unwanted",
+          "condition": "PARLEY_IMAGE_TESTS is 1 and the command named by PARLEY_CONTAINER_ENGINE (docker when unset) is not on the PATH, or PARLEY_IMAGE_TESTS is not 1",
+          "system": "image tests",
+          "action": "fail every image test naming the missing command in the first case, and skip every image test without running any command in the second",
+          "contract": "with PARLEY_IMAGE_TESTS unset the engine lookup reports 'skip' and go test ./test/image/ passes with every test skipped; with PARLEY_IMAGE_TESTS=1 and PARLEY_CONTAINER_ENGINE=no-such-engine the lookup returns an error whose text contains 'no-such-engine'",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in test/image/engine_test.go, a table over an environment lookup: ({}, skip), ({PARLEY_IMAGE_TESTS: '0'}, skip), ({PARLEY_IMAGE_TESTS: '1', PARLEY_CONTAINER_ENGINE: 'no-such-engine'}, error containing 'no-such-engine'), ({PARLEY_IMAGE_TESTS: '1', PARLEY_CONTAINER_ENGINE: 'sh'}, engine 'sh'): eng, skip, err = image.Engine(lookupEnv); assert the row's outcome"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Reference sandbox image",
+      "rationale": "Operators need one image that is known to satisfy the image contract of §13.9, and a way to check their own.",
+      "system": "reference sandbox image",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "ubiquitous",
+          "system": "image tests",
+          "action": "for any image reference given to the contract check, run in a container of that image, as the image's default user and in a writable directory, git init, a commit of one file and git rev-parse HEAD, and report the image as satisfying the image contract exactly when all three succeed",
+          "contract": "the check passes for the reference image and, when PARLEY_SANDBOX_IMAGE is set, is also run against that image; for an image without git it fails with a message that contains the image reference and 'git'",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "PARLEY_IMAGE_TESTS=1 and a container engine named by PARLEY_CONTAINER_ENGINE (default docker); without PARLEY_IMAGE_TESTS=1 the test is skipped",
+              "the image built once per test run with <engine> build -f containers/sandbox/Dockerfile --build-arg VERSION=9.9.9-test from the repository root"
+            ],
+            "pseudocode": "in test/image/sandbox_test.go: contract(image) = engine('run', '--rm', image, 'sh', '-c', 'cd \"$(mktemp -d)\" && git init -q . && echo x > f && git add f && git -c user.name=t -c user.email=t@x commit -q -m m && git rev-parse HEAD'); assert contract(reference image).code == 0 and its last output line is 40 hex characters; for an image built in the test from the reference image's base without git: err = image.CheckContract(engine, thatImage); assert contains(err.Error(), thatImage) and contains(err.Error(), 'git'); when PARLEY_SANDBOX_IMAGE is set: assert image.CheckContract(engine, PARLEY_SANDBOX_IMAGE) == nil"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "ubiquitous",
+          "action": "contain git of version 2.38 or later, a POSIX shell at /bin/sh, the CA certificates of the base image and the parley CLI in /usr/local/bin built with the build values, and contain no parleyd",
+          "contract": "in a container of the image: git --version prints a version of at least 2.38; /bin/sh -c true exits 0; parley version exits 0 and prints a JSON document whose cli.version is the build argument VERSION, also with PARLEY_ENDPOINT_URL set to an address nothing listens on; command -v parleyd exits with a status other than 0; a file of CA certificates exists and is not empty",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "PARLEY_IMAGE_TESTS=1 and a container engine named by PARLEY_CONTAINER_ENGINE (default docker); without PARLEY_IMAGE_TESTS=1 the test is skipped",
+              "the image built once per test run with <engine> build -f containers/sandbox/Dockerfile --build-arg VERSION=9.9.9-test from the repository root"
+            ],
+            "pseudocode": "in test/image/sandbox_test.go: v = engine('run', '--rm', image, 'git', '--version').stdout; assert gitrepo.ParseVersion(v).AtLeast(2, 38); assert engine('run', '--rm', image, '/bin/sh', '-c', 'true').code == 0; out = engine('run', '--rm', '-e', 'PARLEY_ENDPOINT_URL=http://127.0.0.1:9', image, 'parley', 'version'); assert out.code == 0 and json(out.stdout).cli.version == '9.9.9-test'; assert engine('run', '--rm', image, 'sh', '-c', 'command -v parleyd').code != 0; assert engine('run', '--rm', image, 'sh', '-c', 'test -s /etc/ssl/certs/ca-certificates.crt').code == 0"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "event_driven",
+          "condition": "a container is started from the reference sandbox image with a command",
+          "action": "run that command unchanged, as a user that is not root and has a writable home directory",
+          "contract": "the command echo hi prints 'hi' and nothing else on stdout; id -u prints 1000; sh -c 'touch \"$HOME/x\"' exits 0",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "PARLEY_IMAGE_TESTS=1 and a container engine named by PARLEY_CONTAINER_ENGINE (default docker); without PARLEY_IMAGE_TESTS=1 the test is skipped",
+              "the image built once per test run with <engine> build -f containers/sandbox/Dockerfile --build-arg VERSION=9.9.9-test from the repository root"
+            ],
+            "pseudocode": "in test/image/sandbox_test.go: assert engine('run', '--rm', image, 'echo', 'hi').stdout == 'hi\\n'; assert engine('run', '--rm', image, 'id', '-u').stdout == '1000\\n'; assert engine('run', '--rm', image, 'sh', '-c', 'touch \"$HOME/x\"').code == 0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "Kubernetes manifests",
+      "rationale": "NFR-006 lists manifests with one replica and a persistent volume claim; NFR-001 forbids a second replica, also during an update.",
+      "system": "Kubernetes manifests",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "ubiquitous",
+          "action": "define, in deploy/kubernetes, a ConfigMap parley (configmap.yaml), a Secret parley-secrets (secret.example.yaml), a PersistentVolumeClaim parley-data (pvc.yaml), a Deployment parley (deployment.yaml) and a Service parley (service.yaml), each labelled app.kubernetes.io/name: parley, where the Deployment asks for exactly one replica with the strategy Recreate",
+          "contract": "the five files each decode to one object of the named kind and name; the Deployment's spec.replicas is 1 and spec.strategy.type is 'Recreate'; its only container's image is a parley-hub reference and it has no command or args, so the image's entry point runs with no flags",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the files of deploy/kubernetes decoded with gopkg.in/yaml.v3, one document per object"
+            ],
+            "pseudocode": "in deploy/kubernetes/manifests_test.go, a table of (file, kind, name): ('configmap.yaml', 'ConfigMap', 'parley'), ('secret.example.yaml', 'Secret', 'parley-secrets'), ('pvc.yaml', 'PersistentVolumeClaim', 'parley-data'), ('deployment.yaml', 'Deployment', 'parley'), ('service.yaml', 'Service', 'parley'): docs = decodeAll(file); assert len(docs) == 1; assert docs[0].kind == kind and docs[0].metadata.name == name and docs[0].metadata.labels['app.kubernetes.io/name'] == 'parley'; d = deployment; assert d.spec.replicas == 1; assert d.spec.strategy.type == 'Recreate'; assert len(containers) == 1; assert contains(containers[0].image, 'parley-hub'); assert containers[0].command and containers[0].args are absent"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "ubiquitous",
+          "action": "mount the claim parley-data at /var/lib/parley, mount the ConfigMap's key config.toml as the single file /var/lib/parley/config/config.toml, and run the pod as user id 10001 with fsGroup 10001 and runAsNonRoot",
+          "contract": "the claim has the access mode ReadWriteOnce alone, requests 20Gi of storage and names no storage class; the container has a volume mount of the claim's volume at /var/lib/parley and a volume mount of the ConfigMap's volume at /var/lib/parley/config/config.toml with subPath config.toml; the pod's securityContext has runAsUser 10001, runAsNonRoot true and fsGroup 10001",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the files of deploy/kubernetes decoded with gopkg.in/yaml.v3, one document per object"
+            ],
+            "pseudocode": "in deploy/kubernetes/manifests_test.go: pvc = decode('pvc.yaml'); assert pvc.spec.accessModes == ['ReadWriteOnce']; assert pvc.spec.resources.requests.storage == '20Gi'; assert 'storageClassName' not in pvc.spec; pod = deployment.spec.template.spec; data = the volume whose persistentVolumeClaim.claimName == 'parley-data'; cfg = the volume whose configMap.name == 'parley'; mounts = containers[0].volumeMounts; assert {name: data.name, mountPath: '/var/lib/parley'} in mounts; assert {name: cfg.name, mountPath: '/var/lib/parley/config/config.toml', subPath: 'config.toml'} in mounts; assert pod.securityContext.runAsUser == 10001 and pod.securityContext.runAsNonRoot == true and pod.securityContext.fsGroup == 10001"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "ubiquitous",
+          "action": "give the container the keys of the Secret parley-secrets as environment variables, and ship in the ConfigMap a config.toml that the hub's configuration loader accepts when the environment holds the keys of the example Secret",
+          "contract": "the container's envFrom names the secret parley-secrets; every value of the example Secret is 'replace-me'; loading the ConfigMap's config.toml with an environment made of the example Secret's keys returns no error and yields port 8080 and one OAuth provider named github whose client_secret is the value of GITHUB_CLIENT_SECRET; every ${NAME} in the config.toml is a key of the example Secret; loading it with an empty environment fails naming GITHUB_CLIENT_SECRET",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the files of deploy/kubernetes decoded with gopkg.in/yaml.v3, one document per object",
+              "the configuration loader of internal/config with the keys package 03 registers"
+            ],
+            "pseudocode": "in deploy/kubernetes/manifests_test.go: sec = decode('secret.example.yaml').stringData; assert all(v == 'replace-me' for v in sec.values()); assert {secretRef: {name: 'parley-secrets'}} in containers[0].envFrom; write configmap.data['config.toml'] to dir/config.toml; cfg, err = config.Load(lookup over sec, dir); assert err == nil; assert cfg.Server.Port == 8080; assert len(cfg.OAuth.Providers) == 1 and cfg.OAuth.Providers[0].Name == 'github' and cfg.OAuth.Providers[0].ClientSecret == 'replace-me'; for name in every ${NAME} of the file: assert name in sec; _, err = config.Load(empty lookup, dir); assert contains(err.Error(), 'GITHUB_CLIENT_SECRET')"
+          }
+        },
+        {
+          "id": "REQ-7.4",
+          "pattern": "ubiquitous",
+          "action": "probe the container's liveness with GET /healthz and its readiness with GET /readyz on port 8080, expose port 8080 through the Service to the pods the Deployment creates, and give the pod 40 seconds to stop",
+          "contract": "the container declares containerPort 8080; livenessProbe.httpGet is {path: /healthz, port: 8080 or its name}; readinessProbe.httpGet is {path: /readyz, the same port}; the Service is of type ClusterIP with one port 8080 whose targetPort is the container's port; the Service's selector equals the Deployment's selector labels, which are among the pod template's labels; terminationGracePeriodSeconds is 40",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the files of deploy/kubernetes decoded with gopkg.in/yaml.v3, one document per object"
+            ],
+            "pseudocode": "in deploy/kubernetes/manifests_test.go: ct = containers[0]; assert ct.ports holds containerPort 8080; assert ct.livenessProbe.httpGet.path == '/healthz' and ct.readinessProbe.httpGet.path == '/readyz'; assert both probes' port is 8080 or the name of the port 8080; svc = decode('service.yaml'); assert svc.spec.type == 'ClusterIP'; assert len(svc.spec.ports) == 1 and svc.spec.ports[0].port == 8080 and svc.spec.ports[0].targetPort resolves to 8080; assert svc.spec.selector == deployment.spec.selector.matchLabels; assert every selector label is in deployment.spec.template.metadata.labels; assert pod.terminationGracePeriodSeconds == 40"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "Performance harness: run, verdicts and report",
+      "rationale": "§15.4 calls its targets an initial bar to be revisited with measurements; this is what measures them.",
+      "system": "performance harness",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "go test runs TestPerformanceTargets in test/perf and PARLEY_PERF_URL is not set",
+          "action": "skip the test without sending any request, with a message that names PARLEY_PERF_URL",
+          "contract": "go test ./... -count=1 with none of the PARLEY_PERF variables set passes, and TestPerformanceTargets is reported as skipped; the configuration function returns 'skip' with a message containing 'PARLEY_PERF_URL'",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in test/perf/config_test.go, a table over an environment lookup: ({}, skip with message containing 'PARLEY_PERF_URL'), ({URL}, error containing 'PARLEY_PERF_TOKEN'), ({URL, TOKEN}, error containing 'PARLEY_PERF_WORKSPACE'), ({URL, TOKEN, WORKSPACE: 'a, b,c'}, config with Workspaces == ['a', 'b', 'c'], Capacity == false, SandboxProfile == '', ReportPath == os.TempDir() + '/parley-perf-report.json'), ({URL, TOKEN, WORKSPACE: 'a', PARLEY_PERF_CAPACITY: '1', PARLEY_PERF_SANDBOX_PROFILE: 'agent', PARLEY_PERF_REPORT: '/x/r.json'}, config with Capacity == true, SandboxProfile == 'agent', ReportPath == '/x/r.json'): cfg, skip, err = perf.ConfigFromEnv(lookup); assert the row's outcome"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "unwanted",
+          "condition": "PARLEY_PERF_URL is set and PARLEY_PERF_TOKEN or PARLEY_PERF_WORKSPACE is not set, or GET /version of the hub does not answer 200 within 10 seconds, or the report cannot be written to its path",
+          "action": "fail the run with an error that names the missing variable, the hub's URL or the report's path, and run no scenario in the first two cases",
+          "contract": "perf.Run returns a non-nil error and TestPerformanceTargets fails; for the unanswering hub the error contains the URL and no scenario request was sent; for the unwritable path the error contains the path; the token is in no error text",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub built with net/http/httptest that answers GET /version and the scenario routes as each row says"
+            ],
+            "pseudocode": "in test/perf/run_test.go: (a) stub answers GET /version with 503: _, err = perf.Run(ctx, cfg); assert contains(err.Error(), stub.URL); assert the stub saw no request other than GET /version; (b) cfg.ReportPath inside a directory that does not exist: rep, err = perf.Run(ctx, cfg); assert contains(err.Error(), cfg.ReportPath); assert len(rep.Results) == 14; in both: assert not contains(err.Error(), cfg.Token); the missing variables are the rows of the configuration table in test/perf/config_test.go"
+          }
+        },
+        {
+          "id": "REQ-8.3",
+          "pattern": "ubiquitous",
+          "action": "for any list of n samples, n at least 1, compute p95 as the sample at position ceil(0.95 * n) of the list sorted ascending, counting from 1, and report no measurement for an empty list",
+          "contract": "perf.P95 returns (value, true) for a non-empty list and (0, false) for an empty one; it does not change the order of the list it was given",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in test/perf/stats_test.go, a table of (samples, want): ([7], 7), ([1, 2], 2), (the integers 1..20 shuffled, 19), (1..21 shuffled, 20), (1..100 shuffled, 95), (1..50 shuffled, 48), ([5, 5, 5], 5): in = copy(samples); v, ok = perf.P95(samples); assert ok and v == want; assert samples == in; and v, ok = perf.P95([]); assert not ok"
+          }
+        },
+        {
+          "id": "REQ-8.4",
+          "pattern": "ubiquitous",
+          "action": "for any scenario, set its status to met when its measured value satisfies its target under the target's comparison (lt, le or ge), to missed when it has a measurement that does not, to skipped when the variable it needs is not set, and to error when it has no measurement or ended in an error",
+          "contract": "lt is met only below the target value, le at or below it, ge at or above it; a skipped result has measured null, samples 0 and a detail naming the variable (PARLEY_PERF_CAPACITY or PARLEY_PERF_SANDBOX_PROFILE); a scenario that needs both variables and has neither names PARLEY_PERF_CAPACITY",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub built with net/http/httptest that answers GET /version and the scenario routes as each row says"
+            ],
+            "pseudocode": "in test/perf/stats_test.go, a table of (comparison, target, measured, want): ('lt', 1000, 999.9, met), ('lt', 1000, 1000, missed), ('le', 60, 60, met), ('le', 60, 60.1, missed), ('le', 0, 0, met), ('le', 0, 1, missed), ('ge', 60, 60, met), ('ge', 60, 59.9, missed), (any, any, no measurement, error): assert perf.Verdict(target, measured) == want; and in test/perf/run_test.go with Capacity false and SandboxProfile '': rep = run against the stub; for name in {active_forks, open_changes, event_streams}: assert result(name).status == 'skipped' and contains(result(name).detail, 'PARLEY_PERF_CAPACITY'); assert contains(result('sandboxes_running').detail, 'PARLEY_PERF_CAPACITY'); for name in {sandbox_ready, sandbox_exec}: assert contains(result(name).detail, 'PARLEY_PERF_SANDBOX_PROFILE'); for each: assert measured is null and samples == 0"
+          }
+        },
+        {
+          "id": "REQ-8.5",
+          "pattern": "unwanted",
+          "condition": "during a scenario a request that is not the scenario's expected stop is answered with a status of 400 or more or fails in transport, or the scenario runs past its deadline of 10 minutes (60 minutes for a capacity scenario)",
+          "action": "end that scenario with status error, clean up what it created, and run the next scenario",
+          "contract": "the scenario's result has status 'error', measured null, and a detail that holds the method, the path, the status and the error_type of the first failing request, or 'deadline exceeded'; the scenarios after it have results of their own; perf.Run returns a nil error; TestPerformanceTargets does not fail",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub built with net/http/httptest that answers GET /version and the scenario routes as each row says"
+            ],
+            "pseudocode": "in test/perf/run_test.go: (a) the stub answers POST /api/v1/workspaces/w/forks with 500 and the error envelope with error_type 'internal': rep, err = perf.Run(ctx, cfg); assert err == nil; r = result('fork_create'); assert r.status == 'error' and r.measured is null; assert contains(r.detail, 'POST') and contains(r.detail, '/workspaces/w/forks') and contains(r.detail, '500') and contains(r.detail, 'internal'); assert result('file_read').status != '' and len(rep.Results) == 14; (b) the stub never answers the file route and the scenario deadline is set to 100 ms through the configuration: assert result('file_read').status == 'error' and contains(result('file_read').detail, 'deadline exceeded'); assert the run ended within 5 s"
+          }
+        },
+        {
+          "id": "REQ-8.6",
+          "pattern": "event_driven",
+          "condition": "a run has executed its scenarios",
+          "action": "write one JSON report to the report path and log it as a table, holding the hub's URL and the document GET /version returned, a run id of 12 hexadecimal characters, started_at, finished_at, the results of all fourteen scenarios in the fixed order, and the clean-up errors",
+          "contract": "the file parses as JSON with hub.url, hub.version, run_id, started_at, finished_at, results and cleanup_errors; results has exactly 14 entries named fork_create, file_read, commit_create, land, land_throughput, land_concurrency, mergeability, event_latency, active_forks, open_changes, event_streams, sandboxes_running, sandbox_ready, sandbox_exec in that order, each with name, target {comparison, value, unit}, measured (a number or null), samples, status and detail; the file contains the token nowhere; every detail is at most 200 bytes",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub built with net/http/httptest that answers GET /version and the scenario routes as each row says"
+            ],
+            "pseudocode": "in test/perf/run_test.go: the stub answers every scenario route with success except one route that answers 500 with a message of 5000 bytes that contains cfg.Token; rep, err = perf.Run(ctx, cfg); assert err == nil; doc = json(read(cfg.ReportPath)); assert [r.name for r in doc.results] == the fourteen names in order; assert doc.hub.url == stub.URL and doc.hub.version.version == the stub's; assert doc.run_id matches ^[0-9a-f]{12}$; assert parse(doc.started_at) <= parse(doc.finished_at); for r in doc.results: assert r.target.comparison in {'lt', 'le', 'ge'} and r.status in {'met', 'missed', 'skipped', 'error'} and len(r.detail) <= 200; assert not contains(read(cfg.ReportPath), cfg.Token); assert doc.cleanup_errors is a list"
+          }
+        },
+        {
+          "id": "REQ-8.7",
+          "pattern": "ubiquitous",
+          "action": "for any run in which every scenario ends as met, missed, skipped or error and the report is written, pass TestPerformanceTargets",
+          "contract": "a run whose report holds missed and error results returns a nil error from perf.Run; against a real hub that has none of the scenario routes the report holds 14 results, none of them met, and the run passes",
+          "check": {
+            "same_as": "PATH-4"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-9",
+      "title": "Performance scenarios",
+      "rationale": "Each row of the table of §15.4 needs one defined way of being measured, or two runs cannot be compared.",
+      "system": "performance harness",
+      "criteria": [
+        {
+          "id": "REQ-9.1",
+          "pattern": "ubiquitous",
+          "action": "run the scenarios fork_create (50 forks created one after the other), file_read (200 reads, alternately a file and a tree), commit_create (50 commits of 100 files each on a fork) and sandbox_exec (50 execs of the command true in one sandbox), measure the duration of each request from sending it to reading the end of its response, and report the p95 in milliseconds against the targets under 1000, under 100, under 500 and under 200",
+          "contract": "the results carry samples 50, 200, 50 and 50, target {lt, 1000 | 100 | 500 | 200, ms} and measured equal to the p95 of the durations; every request carries Authorization: Bearer <token>; file_read sends 100 requests to …/scm/file and 100 to …/scm/tree; each commit request holds 100 file operations",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub built with net/http/httptest that answers GET /version and the scenario routes as each row says"
+            ],
+            "pseudocode": "in test/perf/scenarios_test.go: the stub delays each fork response by 20 ms and counts requests per route, checking the Authorization header and the number of file operations in each commit body; rep = perf.Run(ctx, cfg with SandboxProfile 'agent'); for (name, samples, value) in {('fork_create', 50, 1000), ('file_read', 200, 100), ('commit_create', 50, 500), ('sandbox_exec', 50, 200)}: r = result(name); assert r.samples == samples; assert r.target == {comparison: 'lt', value: value, unit: 'ms'}; assert r.status == 'met'; assert result('fork_create').measured >= 20; assert stub count of scm/file == 100 and of scm/tree == 100; assert every commit body held 100 operations; assert every request carried the bearer token; and with the fork route delayed by 1100 ms for 5 of the 50 requests: assert result('fork_create').status == 'missed'"
+          }
+        },
+        {
+          "id": "REQ-9.2",
+          "pattern": "ubiquitous",
+          "action": "run the scenario land (20 changes of 20 commits each with disjoint files, landed one at a time, measuring the time from the land request to the success of its land attempt; p95 in milliseconds, target under 2000), the scenario land_throughput (120 one-commit changes with disjoint files landed on one target branch with at most 8 land requests in flight; changes landed times 60 divided by the seconds elapsed, target at least 60) and the scenario land_concurrency (16 land requests for 16 non-conflicting changes sent at the same time; the number of land attempts that did not end in success, target at most 0)",
+          "contract": "land has samples 20 and target {lt, 2000, ms}; land_throughput has samples 120 and target {ge, 60, per_minute}, and the stub never sees more than 8 land requests of it in flight; land_concurrency has samples 16 and target {le, 0, count}, and its measured value is the number of attempts whose final state is not success; a land attempt that fails is counted, not treated as a request error",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub built with net/http/httptest that answers GET /version and the scenario routes as each row says"
+            ],
+            "pseudocode": "in test/perf/scenarios_test.go: the stub answers land requests after 50 ms, tracks the largest number in flight per scenario (told apart by the change numbers it handed out), and lets 2 of the 16 attempts of land_concurrency end as failed: rep = perf.Run(ctx, cfg); l = result('land'); assert l.samples == 20 and l.target == {comparison: 'lt', value: 2000, unit: 'ms'} and l.status == 'met'; t = result('land_throughput'); assert t.samples == 120 and t.target == {comparison: 'ge', value: 60, unit: 'per_minute'}; assert stub.maxInFlight('land_throughput') <= 8; assert t.measured == 120 * 60 / elapsed seconds within 10 percent; c = result('land_concurrency'); assert c.measured == 2 and c.status == 'missed'; assert stub.maxInFlight('land_concurrency') == 16"
+          }
+        },
+        {
+          "id": "REQ-9.3",
+          "pattern": "ubiquitous",
+          "action": "run the scenario mergeability (with 100 open changes, move the target branch by landing one more change and measure the seconds until none of the 100 reports mergeable unknown, target at most 60) and the scenario event_latency (with one subscriber on GET /events, create 50 commits one after the other and measure, for each, the time from the commit's response to the arrival of its event; the largest in milliseconds, target at most 1000)",
+          "contract": "mergeability has samples 100 and target {le, 60, s}; it polls the changes no faster than once per second and ends in error with 'deadline exceeded' when a change still reports unknown at the scenario's deadline; event_latency has samples 50 and target {le, 1000, ms}; an event that arrives before its commit's response counts as 0; an event that has not arrived 10 seconds after its response ends the scenario in error",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub built with net/http/httptest that answers GET /version and the scenario routes as each row says"
+            ],
+            "pseudocode": "in test/perf/scenarios_test.go: the stub reports mergeable 'unknown' for the 100 changes until 2 s after the extra land and 'clean' afterwards, and sends each commit's event on the open GET /events stream 30 ms after the commit's response: rep = perf.Run(ctx, cfg); m = result('mergeability'); assert m.samples == 100 and m.target == {comparison: 'le', value: 60, unit: 's'}; assert 2 <= m.measured < 5 and m.status == 'met'; e = result('event_latency'); assert e.samples == 50 and e.target == {comparison: 'le', value: 1000, unit: 'ms'}; assert 30 <= e.measured < 1000; and with the stub withholding the event of the 10th commit and the event wait set to 200 ms through the configuration: assert result('event_latency').status == 'error'"
+          }
+        },
+        {
+          "id": "REQ-9.4",
+          "pattern": "optional",
+          "condition": "PARLEY_PERF_CAPACITY is 1",
+          "action": "run the capacity scenarios active_forks (forks created over all listed workspaces until 5,000 exist), open_changes (changes opened in the first workspace until 2,000 are open), event_streams (GET /events connections opened until 500 are open) and, with a sandbox profile set, sandboxes_running (sandboxes created until 200 are provisioning or ready), ending each when its count is reached or the hub refuses a creation, and report the count reached against the targets at least 5000, 2000, 500 and 200",
+          "contract": "each result has target {ge, the count, count} and measured equal to the number that existed at once; a refusal by the hub (a status of 400 or more on the creating request) ends the scenario with status met or missed by the count, not error, and a detail that holds the refusal's error_type; active_forks moves to the next listed workspace when one refuses and ends when every listed workspace has refused",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub built with net/http/httptest that answers GET /version and the scenario routes as each row says"
+            ],
+            "pseudocode": "in test/perf/scenarios_test.go: cfg with Capacity true, SandboxProfile 'agent' and workspaces ['w1', 'w2']; the stub accepts 200 forks per workspace and then answers 409 with an error_type of its own, accepts 2,000 changes, accepts 500 event streams, and answers the 21st sandbox creation with 429 and error_type 'sandbox_capacity': rep = perf.Run(ctx, cfg); f = result('active_forks'); assert f.measured == 400 and f.status == 'missed' and f.target == {comparison: 'ge', value: 5000, unit: 'count'}; assert contains(f.detail, the stub's error_type); assert result('open_changes').measured == 2000 and result('open_changes').status == 'met'; assert result('event_streams').measured == 500 and result('event_streams').status == 'met'; s = result('sandboxes_running'); assert s.measured == 20 and s.status == 'missed' and contains(s.detail, 'sandbox_capacity')"
+          }
+        },
+        {
+          "id": "REQ-9.5",
+          "pattern": "optional",
+          "condition": "PARLEY_PERF_SANDBOX_PROFILE names a profile",
+          "action": "run the scenario sandbox_ready: create 5 sandboxes of that profile one after the other, measure for each the time from the create response to the first read that shows state ready, and report the largest in seconds against the target at most 60",
+          "contract": "the result has samples 5 and target {le, 60, s}; every create request names the configured profile; a sandbox that reaches state failed ends the scenario in error with a detail that holds its state_reason",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub built with net/http/httptest that answers GET /version and the scenario routes as each row says"
+            ],
+            "pseudocode": "in test/perf/scenarios_test.go: the stub shows each sandbox as provisioning for 300 ms and then ready, and records the profile of each create request: rep = perf.Run(ctx, cfg with SandboxProfile 'agent'); r = result('sandbox_ready'); assert r.samples == 5 and r.target == {comparison: 'le', value: 60, unit: 's'}; assert 0.3 <= r.measured < 5 and r.status == 'met'; assert every recorded profile == 'agent'; and with the stub showing the third sandbox as failed with state_reason 'image_pull': assert result('sandbox_ready').status == 'error' and contains(result('sandbox_ready').detail, 'image_pull')"
+          }
+        },
+        {
+          "id": "REQ-9.6",
+          "pattern": "ubiquitous",
+          "action": "for any scenario and any verdict, delete the forks and sandboxes the scenario created and close the connections it opened when the scenario ends, create every change against a target branch perf/<run id> of its own, and never move a workspace's default branch",
+          "contract": "after a run the stub holds no fork and no sandbox the harness created and no open event stream, also for a scenario that ended in error; no land request and no commit request named the default branch as its target; a clean-up request that is answered with a status of 400 or more adds an entry with its method, path and status to cleanup_errors and changes no result's status",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub built with net/http/httptest that answers GET /version and the scenario routes as each row says"
+            ],
+            "pseudocode": "in test/perf/scenarios_test.go: the stub records every created fork and sandbox, every delete, every open stream and the target branch of every change; run once with every route succeeding, and once with the commit route answering 500 from its 10th request: after each run assert stub.liveForks() == 0 and stub.liveSandboxes() == 0 and stub.openStreams() == 0; assert every recorded target branch == 'perf/' + rep.run_id; then with the stub answering the first fork delete with 500: rep = run; assert len(rep.cleanup_errors) == 1 and contains(rep.cleanup_errors[0], 'DELETE') and contains(rep.cleanup_errors[0], '500'); assert result('fork_create').status == 'met'"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "An operator starts the hub on a host whose git is too old, then on one that has a usable git",
+      "steps": [
+        {
+          "actor": "operator",
+          "action": "starts parleyd with no flags on a host whose git answers git version 2.30.2"
+        },
+        {
+          "actor": "parleyd",
+          "action": "loads its configuration, opens its data and runs git --version as the first start hook"
+        },
+        {
+          "actor": "parleyd",
+          "action": "writes one error line saying that git 2.30.2 is too old and that 2.38 or later is needed, and exits 1 without listening"
+        },
+        {
+          "actor": "operator",
+          "action": "puts a git of at least 2.38 on the PATH and starts parleyd again"
+        },
+        {
+          "actor": "parleyd",
+          "action": "logs 'git version checked', runs the other start hooks and listens"
+        },
+        {
+          "actor": "operator",
+          "action": "sends GET /readyz and receives 200"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the run function of internal/hub",
+          "internal/gitrepo running a real subprocess",
+          "the real git command of the test host in the second start",
+          "internal/store on real SQLite files",
+          "internal/server on a real TCP listener"
+        ],
+        "setup": [
+          "a temporary working directory with a config.toml setting bind 127.0.0.1 and port 0",
+          "a directory holding a script named git that prints 'git version 2.30.2'"
+        ],
+        "end_state": [
+          "the first run returned 1 and its stderr holds one error line naming 2.30.2 and 2.38 and no listening line",
+          "the second run logged 'git version checked' before the listening line and answers GET /readyz with 200",
+          "the second run returns 0 after its context is cancelled"
+        ],
+        "pseudocode": "in test/e2e/operations_test.go: code = run(ctx, [], env with PATH = scriptDir, dir, out, errb); assert code == 1; assert contains(errb, 'git 2.30.2 is too old') and not contains(errb, 'listening'); go run(ctx2, [], env with the test host's PATH, dir, out, errb2); rec = json(listening line of errb2); assert index(errb2, 'git version checked') < index(errb2, 'listening'); assert get('http://' + rec.addr + '/readyz').status == 200; cancel ctx2; assert exit status == 0"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "An operator upgrades the hub by starting the new binary on the previous release's data",
+      "steps": [
+        {
+          "actor": "operator",
+          "action": "stops the hub of the previous release and starts the new parleyd on the same data directory with no flags"
+        },
+        {
+          "actor": "parleyd",
+          "action": "opens the stores and applies every registered schema step the data does not record, keeping the recorded ones"
+        },
+        {
+          "actor": "parleyd",
+          "action": "checks git, runs its start hooks and listens"
+        },
+        {
+          "actor": "operator",
+          "action": "sends GET /readyz and receives 200, and reads the repositories with stock git"
+        },
+        {
+          "actor": "operator",
+          "action": "restarts parleyd"
+        },
+        {
+          "actor": "parleyd",
+          "action": "applies no schema step, listens and answers GET /readyz with 200"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the run function of internal/hub with every schema step and start hook the binary registers",
+          "internal/store on the real SQLite files of a recorded archive",
+          "the git command on the recorded repository",
+          "internal/server on a real TCP listener"
+        ],
+        "setup": [
+          "the archive test/upgrade/testdata/baseline.tar.gz unpacked into a temporary directory",
+          "a config.toml pointing database.path and workspace.path into it, bind 127.0.0.1, port 0"
+        ],
+        "end_state": [
+          "the first start listened and answered GET /readyz with 200",
+          "after the first start each store's applied steps begin with the manifest's list",
+          "the second start listened, answered GET /readyz with 200, and left both lists of applied steps equal to what they were after the first start",
+          "git rev-parse refs/heads/main in fixture.git gives the manifest's commit id"
+        ],
+        "pseudocode": "in test/upgrade/upgrade_test.go: start the hub on the unpacked data; assert readyz 200; stop it; a1 = store.AppliedSteps of both stores; assert a1 begins with the manifest's lists; start it again; assert readyz 200; stop it; a2 = store.AppliedSteps of both stores; assert a2 == a1; assert exec('git', '-C', d/workspaces/fixture.git, 'rev-parse', 'refs/heads/main') == manifest.repositories[0].refs['refs/heads/main']"
+      }
+    },
+    {
+      "id": "PATH-3",
+      "title": "An operator backs up a hub under load and restores the snapshot to a hub that starts cleanly",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "commits work to the hub and pushes to its repositories, continuously"
+        },
+        {
+          "actor": "operator",
+          "action": "runs parleyd backup <directory> while that work goes on"
+        },
+        {
+          "actor": "parleyd",
+          "action": "as the backup command, writes the snapshot of both stores and the repositories and exits 0, while the serving parleyd completes every commit and push"
+        },
+        {
+          "actor": "operator",
+          "action": "copies the snapshot to a new data directory and starts parleyd there with no flags"
+        },
+        {
+          "actor": "parleyd",
+          "action": "opens the restored stores, applies no schema step, runs its start hooks on the restored data and listens"
+        },
+        {
+          "actor": "operator",
+          "action": "sends GET /readyz and receives 200, and reads every restored repository with stock git"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the run function of internal/hub for the serving hub, the backup subcommand and the restored hub",
+          "internal/store on real SQLite files, written by concurrent writers while the backup reads",
+          "the git command pushing to real bare repositories during the backup",
+          "internal/server on real TCP listeners"
+        ],
+        "setup": [
+          "a running in-process hub with a schema step creating a load table, four writers committing transactions of 10 rows, and two git clients each pushing commits to one bare repository under the workspace root"
+        ],
+        "end_state": [
+          "the backup returned 0 and no writer and no push saw an error",
+          "a hub started on a copy of the snapshot logged the listening line and answers GET /readyz with 200",
+          "PRAGMA integrity_check answers ok on both restored stores and the load table's row count is a multiple of 10",
+          "git fsck succeeds on both restored repositories and each restored head is the source's head or an ancestor of it"
+        ],
+        "pseudocode": "in test/e2e/restore_test.go: start the load; code = run(ctx, ['backup', target], env, dir, out, errb); assert code == 0; stop the load and assert no writer and no push had an error; copy target into d2/data; go run(ctx2, [], env, d2, out, errb2); rec = json(listening line); assert get('http://' + rec.addr + '/readyz').status == 200; stop hub 2; for each store assert query('PRAGMA integrity_check') == 'ok'; assert count(load table) % 10 == 0; for each repository assert exec('git', '-C', restored, 'fsck').code == 0 and exec('git', '-C', source, 'merge-base', '--is-ancestor', restoredHead, sourceHead).code == 0"
+      }
+    },
+    {
+      "id": "PATH-4",
+      "title": "An operator measures the performance targets against a running hub",
+      "steps": [
+        {
+          "actor": "operator",
+          "action": "sets PARLEY_PERF_URL, PARLEY_PERF_TOKEN and PARLEY_PERF_WORKSPACE and runs go test ./test/perf/ -run TestPerformanceTargets"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers GET /version with its build values"
+        },
+        {
+          "actor": "operator",
+          "action": "through the harness, sends the requests of the fourteen scenarios one scenario after the other"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers each request; a route it does not have is answered 404 with the error envelope"
+        },
+        {
+          "actor": "operator",
+          "action": "reads the report: fourteen results, each with its measured value and its verdict, and the test passes whatever the verdicts are"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the harness of test/perf with its real HTTP client",
+          "a real in-process hub started through the run function of internal/hub on a loopback listener",
+          "the report file on disk"
+        ],
+        "setup": [
+          "a running in-process hub with whatever routes the binary has",
+          "a configuration with the hub's URL, the token 'parley_perf_smoke_token', the workspace 'perf-smoke' and a report path in t.TempDir()"
+        ],
+        "end_state": [
+          "perf.Run returned a nil error",
+          "the report file holds hub.version equal to the hub's GET /version document and exactly fourteen results in the fixed order",
+          "every result has one of the four statuses, and a scenario whose route the hub refused has status error with the refusing status in its detail",
+          "the report does not contain the token"
+        ],
+        "pseudocode": "in test/perf/run_test.go: start the hub in-process; cfg = {URL: 'http://' + addr, Token: 'parley_perf_smoke_token', Workspaces: ['perf-smoke'], ReportPath: tmp + '/r.json'}; rep, err = perf.Run(ctx, cfg); assert err == nil; doc = json(read(cfg.ReportPath)); assert doc.hub.version == get(addr + '/version').json; assert len(doc.results) == 14; for r in doc.results: assert r.status in {'met', 'missed', 'skipped', 'error'}; assert not contains(read(cfg.ReportPath), cfg.Token)"
+      }
+    }
+  ],
+  "external_apis": [
+    {
+      "package": "gopkg.in/yaml.v3",
+      "version": "v3.0.1",
+      "verified": true,
+      "symbols": [
+        {
+          "name": "Unmarshal",
+          "import_path": "gopkg.in/yaml.v3",
+          "signature": "func Unmarshal(in []byte, out interface{}) (err error)"
+        },
+        {
+          "name": "NewDecoder",
+          "import_path": "gopkg.in/yaml.v3",
+          "signature": "func NewDecoder(r io.Reader) *Decoder"
+        },
+        {
+          "name": "Decoder.Decode",
+          "import_path": "gopkg.in/yaml.v3",
+          "signature": "func (dec *Decoder) Decode(v interface{}) (err error)"
+        }
+      ]
+    }
+  ]
+}

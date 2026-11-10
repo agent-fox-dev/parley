@@ -1,0 +1,956 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "20",
+  "spec_name": "scm_read_api",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Access and workspace state",
+      "rationale": "A read must be available to everyone who may see the workspace, on every workspace whose repository is intact, and to nobody else.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "a caller with read access to the workspace, whose credential is an API key, the admin token or a PAT holding `git:read` or `git:write`, calls one of the ten read routes under `/api/v1/workspaces/:slug/scm` on a workspace in status `ready` or `archived`, on a task fork, or on a fork whose parent is `archived`",
+          "action": "serve the read from the workspace's repository",
+          "contract": "HTTP 200 with the route's body; the archived workspace and the fork of an archived parent answer the same body they answered before archiving",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 with a store in t.TempDir()",
+              "workspace `demo` owned by the owner in organization o1, a task fork of it, and a second workspace with its own fork that is archived after the fork was made; all repositories hold one commit on `main`"
+            ],
+            "pseudocode": "in internal/scm/access_test.go, a table over workspace {ready, archived, fork of a ready parent, fork of an archived parent} x credential {owner API key, org member API key, PAT with git:read, PAT with only git:write, admin token}: r = get('/api/v1/workspaces/'+slug+'/scm/refs', cred); assert r.status == 200 and r.json.items is an array; for the ready workspace repeat over the paths of all ten read routes with valid query parameters and assert status 200"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "unwanted",
+          "condition": "a read route is called without a valid credential, with a PAT that holds neither `git:read` nor `git:write`, or by a caller who has no read access to the workspace",
+          "action": "refuse the request without running any git command",
+          "contract": "no valid credential: HTTP 401 with `error_type` `unauthenticated`; PAT without the scope: HTTP 403 with `error_type` `insufficient_scope`, for an existing and for a missing workspace alike; no read access: HTTP 404 with `error_type` `not_found`, with a body byte-identical to the one for a slug that does not exist",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 with a store in t.TempDir()",
+              "workspace `demo` and a user `outsider` who is neither its owner nor a member of its organization; the repository's git runner is wrapped by a recorder"
+            ],
+            "pseudocode": "in internal/scm/access_test.go, a table over the ten read routes: assert get(route, no credential).status == 401 and error_type == 'unauthenticated'; p = PAT with scope changes:read only; assert get(route on 'demo', p).status == 403 and error_type == 'insufficient_scope'; assert get(route on 'nope', p).status == 403; a = get(route on 'demo', outsider key); b = get(route on 'nope', outsider key); assert a.status == 404 and a.error_type == 'not_found' and a.body == b.body; assert the git runner recorded no command"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "unwanted",
+          "condition": "a read route is called by a caller with read access while the workspace is `pending`, `cloning` or `failed`, has a reclone, archive or delete running, or is a fork whose parent is in `pending`, `cloning` or an archive or delete call",
+          "action": "refuse the read without touching the repository",
+          "contract": "HTTP 409 with `error_type` `workspace_busy` for `pending`, `cloning`, a running reclone, archive or delete, and a fork whose parent is in one of those states; HTTP 409 with `error_type` `workspace_not_ready` for `failed`",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the scm routes mounted on an httptest server with a workspace record whose state the test sets"
+            ],
+            "pseudocode": "in internal/scm/access_test.go, a table over the state the precondition of package 10 reports {pending, cloning, reclone running, archive running, delete running, fork with parent cloning -> workspace_busy; failed -> workspace_not_ready}: r = get('/api/v1/workspaces/demo/scm/tree', ownerKey); assert r.status == 409 and r.json.error.error_type == want; assert the git runner recorded no command"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "state_driven",
+          "condition": "the workspace is a task fork",
+          "action": "resolve refs and revisions against the fork's own branches together with the tracking branches at the parent's current heads",
+          "contract": "after the parent's `main` moves from c1 to c2, `GET …/scm/refs/main` on the fork answers `sha` c2 with `tracking` true, and `GET …/scm/file?ref=main&path=f.txt` on the fork answers `X-Parley-Resolved-Sha` c2 and the content of c2; a branch created in the fork is listed with `tracking` false and does not appear in the parent's list",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 with a store in t.TempDir()",
+              "workspace `demo` with `main` at c1 holding f.txt, and a second commit c2 that changes f.txt, present in the repository but not yet on `main`"
+            ],
+            "pseudocode": "in internal/scm/fork_test.go: f = a task fork fixture of 'demo' (a bare repository that borrows demo's objects) served with a ref view (the interface RefView of internal/scm) that lists the fork's own branches and the recorded tracking names at the parent's current heads, as the ref view of package 15 does; push branch 'work' to f; move demo's main from c1 to c2 with a compare-and-swap; r = get(f + '/scm/refs/main'); assert r.json.sha == c2 and r.json.tracking == true; assert get(f + '/scm/file?ref=main&path=f.txt').header('X-Parley-Resolved-Sha') == c2; names = names of get(f + '/scm/refs').json.items; assert 'refs/heads/work' in names with tracking false; assert 'refs/heads/work' not in names of get('demo/scm/refs')"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "ubiquitous",
+          "action": "for any request handled by a read route, report exactly one observation to the request recorder, carrying the route's `op` (`refs`, `commits`, `tree`, `file`, `diff`, `compare`, `blame` or `search`) and `result` `ok` when the status is below 400 and `error` otherwise, and emit no hub event",
+          "contract": "one recorder call per request: both refs routes report `refs`, both commits routes report `commits`; a 200, a 206 and a 304 report `ok`; a 400, 404, 409, 413 and 503 answered by the read route report `error`",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the scm routes mounted on an httptest server with a stub request recorder and a fixture repository"
+            ],
+            "pseudocode": "in internal/scm/recorder_test.go, a table over {refs list, ref get -> 'refs'; commits list, commit get -> 'commits'; tree; file; diff; compare; blame; search} x {a 200 request -> 'ok'; a request with unknown ref -> 'error'}: reset the stub recorder; do the request; assert recorder.calls == [(op, result)]; plus one file request with a matching If-None-Match: assert calls == [('file','ok')]"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Revision parameters and consistency",
+      "rationale": "Every read names a commit; a caller must be able to say it in the forms git users know and learn exactly which commit answered.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "a read carries a revision parameter (`ref`, `base`, `head`, or `:sha` of the commit route) written as a branch name, a tag name, a full ref name, a full 40-character commit id or an abbreviated commit id of 4 or more hexadecimal characters that matches one commit",
+          "action": "resolve it to one commit, peeling an annotated tag to its commit, and name that commit in the response as a full 40-character id",
+          "contract": "`resolved_sha` (or `base_sha` and `head_sha`, or `sha` on the commit route) equals the commit's full id; a string starting with `refs/` is taken as a full ref name only",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a fixture repository with commits c1..c3 on `main`, branch `feature/x`, lightweight tag `v1`, annotated tag `v2` and the ref `refs/parley/changes/12/3`, served as workspace `demo`"
+            ],
+            "pseudocode": "in internal/scm/revision_test.go, a table over ref = {'main', 'feature/x', 'v1' (lightweight tag), 'v2' (annotated tag), 'refs/heads/main', 'refs/tags/v2', 'refs/parley/changes/12/3', full id of c2, first 7 characters of c2}: r = get('/scm/tree?ref=' + urlencode(ref)); assert r.status == 200 and r.json.resolved_sha == want and len(want) == 40; d = get('/scm/diff?base=v1&head=feature/x'); assert d.json.base_sha == id(v1) and d.json.head_sha == id(feature/x); c = get('/scm/commits/feature%2Fx'); assert c.json.sha == id(feature/x)"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "event_driven",
+          "condition": "a read route whose `ref` parameter is optional is called without it",
+          "action": "use the head of the workspace's default branch",
+          "contract": "the response's `resolved_sha` equals the current head of the default branch",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a fixture repository whose default branch is `trunk`, with a second branch `main` at another commit"
+            ],
+            "pseudocode": "in internal/scm/revision_test.go, a table over the routes {commits, tree, file?path=f.txt, blame?path=f.txt, search?q=x} on a workspace whose default branch is 'trunk': assert response.resolved_sha (X-Parley-Resolved-Sha for the raw file) == head('trunk')"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "unwanted",
+          "condition": "a revision parameter names nothing in the repository, is the name of both a branch and a tag, is an abbreviated id that matches more than one commit, names an object that is not a commit, or is an expression other than the five accepted forms (for example `main~2`, `HEAD`, `@{1}`, a string starting with `-`)",
+          "action": "refuse the read",
+          "contract": "HTTP 404 with `error_type` `ref_not_found`; no part of the string reaches the `git` command line as an option",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the fixture of the resolution test plus a branch and a tag both named `dup`, and two commits created so that their ids share the first 4 characters"
+            ],
+            "pseudocode": "in internal/scm/revision_test.go, a table over ref = {'nope', 'dup' (branch and tag of that name), a 4-character prefix shared by two commits, the id of a blob, 'main~2', 'HEAD', '@{1}', '--all', 'refs/heads/nope'}: r = get('/scm/tree?ref=' + urlencode(ref)); assert r.status == 404 and r.json.error.error_type == 'ref_not_found'; the same table against /scm/commits/{ref} and /scm/diff?base={ref}&head=main"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "event_driven",
+          "condition": "a read names, by full 40-character id, a commit that is reachable from no ref while its object is still in the repository",
+          "action": "serve the read from that commit",
+          "contract": "HTTP 200 with `resolved_sha` equal to the id",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a fixture repository with a branch `gone` whose head commit is on no other ref"
+            ],
+            "pseudocode": "in internal/scm/revision_test.go: c = head of branch 'gone'; delete refs/heads/gone in the fixture; r = get('/scm/file?ref=' + c + '&path=only-on-gone.txt'); assert r.status == 200 and r.body == the file's bytes; assert get('/scm/commits/' + c).json.sha == c"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "ubiquitous",
+          "action": "for any read request, resolve each revision parameter exactly once and compute the whole response from the resolved commit ids, so that a read that runs while the named ref is moved from an old to a new commit answers for the old or for the new commit",
+          "contract": "every response obtained during concurrent moves of the ref has status 200, a `resolved_sha` equal to one of the two commits and content equal to that commit's content",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a fixture repository in which f.txt differs between commits c1 and c2, c2 a child of c1"
+            ],
+            "pseudocode": "in internal/scm/consistency_test.go: start a goroutine that moves refs/heads/main between c1 and c2 with compare-and-swap until stopped; 200 times: r = get('/scm/file?ref=main&path=f.txt'); assert r.status == 200; s = r.header('X-Parley-Resolved-Sha'); assert s in {c1, c2}; assert r.body == content of f.txt at s; the same loop for /scm/tree?ref=main&recursive=true asserting tree_sha == tree of resolved_sha"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Caching headers, read timeout and limits",
+      "rationale": "Answers addressed by commit id never change, so they should be cacheable forever; every other read should be cheap to revalidate, and no read may run without bound.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "a read on the commits, commit, tree, file, diff, compare, blame or search route succeeds and every revision parameter of the request was given as a 40-character commit id",
+          "action": "mark the response immutable",
+          "contract": "the response carries `Cache-Control: private, max-age=31536000, immutable` and a non-empty quoted `ETag`",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the scm routes on an httptest server with a fixture repository of two commits"
+            ],
+            "pseudocode": "in internal/scm/cache_test.go, a table over {commits?ref=C, commits/C, tree?ref=C, file?ref=C&path=f.txt, diff?base=C1&head=C, compare?base=C1&head=C, blame?ref=C&path=f.txt, search?ref=C&q=x} with C and C1 full ids: r = get(route); assert r.header('Cache-Control') == 'private, max-age=31536000, immutable'; assert r.header('ETag') matches a quoted string; and diff?base=main&head=C is not immutable"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "event_driven",
+          "condition": "any other read succeeds: a revision given as a name or an abbreviated id, an omitted `ref`, or one of the two refs routes",
+          "action": "answer with a revalidation tag derived from the resolved commit ids, the query and the representation",
+          "contract": "the response carries `Cache-Control: private, no-cache` and an `ETag` that is equal for two identical requests while no named ref moves, differs after a named ref moves, and differs between the raw and the JSON form of the file route, which also carries `Vary: Accept`",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/scm/cache_test.go: a = get('/scm/file?ref=main&path=f.txt'); b = same; assert a.header('Cache-Control') == 'private, no-cache' and a.header('ETag') == b.header('ETag'); j = same with Accept: application/json; assert j.header('ETag') != a.header('ETag') and a.header('Vary') contains 'Accept'; move main to c2; c = get(same); assert c.header('ETag') != a.header('ETag'); l1 = get('/scm/refs'); create branch x; l2 = get('/scm/refs'); assert l1.header('ETag') != l2.header('ETag'); assert get('/scm/tree').header('Cache-Control') == 'private, no-cache'"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "event_driven",
+          "condition": "a read arrives with an `If-None-Match` header that contains the `ETag` the response would carry, alone or in a comma-separated list",
+          "action": "answer that the caller's copy is current, without a body",
+          "contract": "HTTP 304 with an empty body and the same `ETag` and `Cache-Control` headers a 200 would carry; a header that does not contain the tag gets the full 200 response",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/scm/cache_test.go, a table over {file by name, file by full id, refs list, diff by names}: e = get(route).header('ETag'); r = get(route, If-None-Match: e); assert r.status == 304 and len(r.body) == 0 and r.header('ETag') == e; r2 = get(route, If-None-Match: '\"other\", ' + e); assert r2.status == 304; r3 = get(route, If-None-Match: '\"other\"'); assert r3.status == 200; move main; assert get(file by name, If-None-Match: e).status == 200"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "unwanted",
+          "condition": "a read has not finished when `[scm].read_timeout` (default 30 s) has passed since the read route began handling it",
+          "action": "end the read's `git` subprocess and answer that the read timed out",
+          "contract": "HTTP 503 with `error_type` `scm_timeout`; the subprocess's context is cancelled and no `git` process of the request is left running",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/scm/timeout_test.go, a table over {tree, file, diff, compare, blame, search}: configure read_timeout = 50ms and a git runner stub that blocks until its context is done and records the cancellation; t0 = now; r = get(route); assert r.status == 503 and r.json.error.error_type == 'scm_timeout'; assert now - t0 < 2s; assert stub.cancelled == true; and in internal/gitrepo/read_test.go: run a real `git` command through the runner with a context that is cancelled; assert the call returns the context error and the process has exited"
+          }
+        },
+        {
+          "id": "REQ-3.5",
+          "pattern": "optional",
+          "condition": "the configuration sets `[scm].read_timeout` or `[scm].max_file_size`",
+          "action": "use the configured values in place of the defaults of 30 s and 32 MiB",
+          "contract": "with `max_file_size = \"1KB\"` a 2,000-byte file answers 413 and a 500-byte file answers 200; with no `[scm]` section the loaded values are 30 s and 33,554,432 bytes",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/config/scm_test.go: cfg = load(''); assert cfg.SCM.ReadTimeout == 30s and cfg.SCM.MaxFileSize == 32 << 20; cfg = load('[scm]\\nread_timeout = \"5s\"\\nmax_file_size = \"1KB\"'); assert cfg.SCM.ReadTimeout == 5s; and in internal/scm/file_test.go: with the limit taken from that configuration, get(file of 2000 bytes).status == 413 and get(file of 500 bytes).status == 200"
+          }
+        },
+        {
+          "id": "REQ-3.6",
+          "pattern": "unwanted",
+          "condition": "the configuration sets `[scm].read_timeout` or `[scm].max_file_size` to zero or to a negative value",
+          "action": "refuse to start",
+          "contract": "configuration loading returns an error whose message names the key; `parleyd` exits with a non-zero status without opening its listener",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/config/scm_test.go, a table over {read_timeout = \"0s\", read_timeout = \"-1s\", max_file_size = \"0\"}: _, err = load(text); assert err != nil and err.Error() contains the key name '[scm].read_timeout' or '[scm].max_file_size'"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Refs",
+      "rationale": "Listing and reading refs is how a client without a clone finds the commits to read.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "a caller requests `GET …/scm/refs`, with or without `prefix`, `limit` and `cursor`",
+          "action": "list the refs under `refs/heads/`, `refs/tags/` and `refs/parley/` whose full name starts with `prefix` (default `refs/heads/`) as ref objects in ascending byte order of name, paged",
+          "contract": "HTTP 200 with `{items, next_cursor}`; a prefix that matches no ref answers `items: []` and `next_cursor: null`; following `next_cursor` to the end returns every matching ref exactly once; refs in other namespaces (for example `refs/notes/x`) never appear",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a fixture repository with five branches (one named `feature/x`), tags `v1` and `v2`, `refs/parley/changes/12/3` and `refs/notes/x`"
+            ],
+            "pseudocode": "in internal/scm/refs_test.go: r = get('/scm/refs'); assert names(r) == sorted names of all branches; assert names(get('/scm/refs?prefix=refs/tags/')) == ['refs/tags/v1','refs/tags/v2']; assert names(get('/scm/refs?prefix=refs/parley/changes/')) == ['refs/parley/changes/12/3']; assert names(get('/scm/refs?prefix=refs/heads/feature/')) == ['refs/heads/feature/x']; assert get('/scm/refs?prefix=refs/none/').json == {items: [], next_cursor: null}; assert 'refs/notes/x' not in names(get('/scm/refs?prefix=refs/')); page with limit=2 until next_cursor is null; assert the concatenation == the unpaged list"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "ubiquitous",
+          "action": "for any ref object returned, set `name` to the full ref name, `kind` to `branch`, `tag` or `hub` by namespace, `sha` to the full id of the commit the ref points at (the peeled commit for an annotated tag), `protected` to true for a branch in the workspace's protected branches and for every `refs/parley/` ref, `tracking` to true for a fork's tracking branch, and `change` to `{workspace_slug, number}` when the change lookup names an open or draft change whose source is the branch, else null",
+          "contract": "each ref object has exactly the six members `name`, `kind`, `sha`, `protected`, `tracking`, `change`; with the default lookups only the default branch and hub-owned refs are protected and `change` is null",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/scm/refs_test.go, a table over {refs/heads/main -> kind branch, protected true; refs/heads/feature/x -> branch, protected false; refs/tags/v2 -> tag, sha == commit the annotated tag peels to, protected false; refs/parley/changes/12/3 -> hub, protected true}: o = get('/scm/refs/' + name).json; assert keys(o) == {name, kind, sha, protected, tracking, change}; assert the row's values; assert o.tracking == false and o.change == null; then with stub lookups (protected = ['feature/x'], change of feature/x = {demo, 12}): assert get('/scm/refs/feature/x').json.protected == true and .change == {workspace_slug: 'demo', number: 12}"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "event_driven",
+          "condition": "a caller requests `GET …/scm/refs/*name` with a full ref name, or with a branch name that does not start with `refs/`",
+          "action": "return that ref's object, reading a name without the `refs/` start as `refs/heads/<name>`",
+          "contract": "HTTP 200 with the ref object; `…/refs/feature/x` and `…/refs/refs/heads/feature/x` answer the same object",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/scm/refs_test.go: a = get('/scm/refs/feature/x'); b = get('/scm/refs/refs/heads/feature/x'); assert a.status == 200 and a.json == b.json and a.json.name == 'refs/heads/feature/x'; assert get('/scm/refs/refs/tags/v1').json.kind == 'tag'"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "unwanted",
+          "condition": "`GET …/scm/refs/*name` names a ref that does not exist, or a ref outside `refs/heads/`, `refs/tags/` and `refs/parley/`",
+          "action": "refuse the read",
+          "contract": "HTTP 404 with `error_type` `ref_not_found`",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/scm/refs_test.go, a table over name = {'nope', 'refs/heads/nope', 'v1' (a tag, not a branch), 'refs/notes/x'}: r = get('/scm/refs/' + name); assert r.status == 404 and r.json.error.error_type == 'ref_not_found'"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Commits",
+      "rationale": "History, of a ref or of one path, answers who changed what and under which change, without a checkout.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "a caller requests `GET …/scm/commits`",
+          "action": "list the commits reachable from `ref`, newest first, following first parents only unless `first_parent=false`, paged, and name the resolved commit",
+          "contract": "HTTP 200 with `{items, next_cursor, resolved_sha}`; with `first_parent` absent the commits of a merged side branch are not listed and with `first_parent=false` they are; all pages of one listing come from the commit the first page resolved, also when the ref moves between pages",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a fixture repository whose `main` is c1 <- c2 <- m, where m merges a side branch holding commit s1"
+            ],
+            "pseudocode": "in internal/scm/commits_test.go: r = get('/scm/commits?ref=main'); assert shas(r) == [m, c2, c1] (merge m, then its first-parent line) and r.json.resolved_sha == m; assert s1 (side-branch commit) not in shas(r); assert s1 in shas(get('/scm/commits?ref=main&first_parent=false')); p1 = get('/scm/commits?ref=main&limit=2'); move main to a new commit; p2 = get('/scm/commits?ref=main&limit=2&cursor=' + p1.json.next_cursor); assert shas(p1) + shas(p2) == [m, c2, c1] and p2.json.resolved_sha == m and p2.json.next_cursor == null"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "event_driven",
+          "condition": "a commit listing carries `path`, `follow`, `since`, `until` or `author`",
+          "action": "return only the commits that changed `path` (across renames of that single file when `follow=true`), whose committer time is at or after `since` and at or before `until`, and whose author name or e-mail contains `author` without regard to case",
+          "contract": "HTTP 200 with the filtered list; a `path` that no commit changed answers `items: []`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a fixture repository with commits by two authors at fixed committer times T1 < T2 < T3, a file renamed from old.md to new.md, and a directory docs/"
+            ],
+            "pseudocode": "in internal/scm/commits_test.go, a table over query -> expected shas: {path=docs/a.md -> commits that changed it; path=docs (a directory) -> commits that changed anything below it; path=new.md -> [rename commit]; path=new.md&follow=true -> [rename commit, commits that changed old.md]; since=T2 -> commits with committer time >= T2; until=T1 -> commits with committer time <= T1; author=ALICE -> commits of 'Alice <alice@example.com>'; author=example.org -> commits of bob@example.org; path=never.txt -> []}"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "ubiquitous",
+          "action": "for any commit object returned by a read route, set `sha`, `parents` and `tree_sha` to full ids, `author` and `committer` to `{name, email, time}` with `time` as an RFC 3339 UTC timestamp, `message` to the full commit message, `change` to `{workspace_slug, number, version}` when the change lookup knows the commit as a version head or as landed by a change and null otherwise, and `session_id` to the session the session lookup names or null; and include `stats` (`{files_changed, insertions, deletions}`) on a list only when `stats=true`",
+          "contract": "a listed commit without `stats=true` has no `stats` member; with it, `stats` equals the commit's numbers against its first parent; with the default lookups `change` and `session_id` are null",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/scm/commits_test.go: o = get('/scm/commits?ref=main').json.items[1]; assert o.sha == c2 and o.parents == [c1] and o.tree_sha == tree(c2); assert o.author == {name: 'Alice', email: 'alice@example.com', time: '2026-01-02T03:04:05Z'}; assert o.message == the full multi-line message; assert 'stats' not in o and o.change == null and o.session_id == null; s = get('/scm/commits?ref=main&stats=true').json.items[1].stats; assert s == {files_changed: 2, insertions: 5, deletions: 1}; with stub lookups (c2 -> change {demo, 12, 3}, session 'sess-1'): assert o.change == {workspace_slug: 'demo', number: 12, version: 3} and o.session_id == 'sess-1'"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "event_driven",
+          "condition": "a caller requests `GET …/scm/commits/:sha` with any revision in `:sha`",
+          "action": "return that commit's object with `stats`, and with `files=true` also `files`, the file changes against the commit's first parent, or against the empty tree for a commit without a parent",
+          "contract": "HTTP 200 with the commit object including `stats`; `files` is absent unless `files=true`; each entry of `files` is a file change `{path, old_path, status, insertions, deletions, binary, old_sha, new_sha}`",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/scm/commits_test.go: r = get('/scm/commits/' + c2); assert r.json.sha == c2 and r.json.stats.files_changed == 2 and 'files' not in r.json; f = get('/scm/commits/main?files=true'); assert f.json.files is the changes of m against its first parent c2; root = get('/scm/commits/' + c1 + '?files=true'); assert every root.json.files[i].status == 'added'; assert get('/scm/commits/feature%2Fx').status == 200"
+          }
+        },
+        {
+          "id": "REQ-5.5",
+          "pattern": "unwanted",
+          "condition": "a commits request carries a boolean parameter (`follow`, `first_parent`, `stats`, `files`) that is neither `true` nor `false`, a `since` or `until` that is not an RFC 3339 timestamp, or `follow=true` without `path`",
+          "action": "refuse the request",
+          "contract": "HTTP 400 with `error_type` `invalid_request`",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/scm/commits_test.go, a table over {commits?stats=yes, commits?first_parent=1, commits?since=yesterday, commits?until=2026-13-01T00:00:00Z, commits?follow=true, commits/main?files=maybe}: r = get(route); assert r.status == 400 and r.json.error.error_type == 'invalid_request'"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Tree and file",
+      "rationale": "One directory listing or one file at a ref is the smallest useful read; it must cost one request.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "a caller requests `GET …/scm/tree`",
+          "action": "list the entries of the directory `path` (default: the root) at `ref`, ordered by `path` in ascending byte order, as tree entries `{path, name, type, mode, sha, size}`, with `resolved_sha` and the listed directory's `tree_sha`",
+          "contract": "HTTP 200 with `{items, next_cursor, resolved_sha, tree_sha}`; `type` is `blob`, `tree`, `commit` for a submodule entry or `symlink`; `mode` is git's six-digit octal string; `size` is present only on entries of type `blob`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a fixture repository whose `main` holds README.md, an executable run.sh, a symlink `link`, a directory docs/ with a.md and api/b.md, and a submodule entry at vendor/sub"
+            ],
+            "pseudocode": "in internal/scm/tree_test.go: r = get('/scm/tree?ref=main'); assert paths(r) == sorted root entries and r.json.tree_sha == tree(main) and r.json.resolved_sha == head(main); by type: assert entry('README.md') == {path: 'README.md', name: 'README.md', type: 'blob', mode: '100644', sha: blob id, size: byte length}; assert entry('run.sh').mode == '100755'; assert entry('docs').type == 'tree' and 'size' not in entry('docs'); assert entry('link').type == 'symlink' and entry('link').mode == '120000'; assert entry('vendor/sub').type == 'commit' via get('/scm/tree?path=vendor'); d = get('/scm/tree?ref=main&path=docs'); assert d.json.items[0].path == 'docs/a.md' and d.json.items[0].name == 'a.md' and d.json.tree_sha == tree id of docs"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "event_driven",
+          "condition": "a tree request carries `recursive=true`, `limit` or `cursor`",
+          "action": "with `recursive=true` list every entry below `path`, directories and their contents alike; return at most `limit` entries per page, where `limit` defaults to 1,000 and may be 1 to 10,000",
+          "contract": "the recursive listing of the fixture contains `docs`, `docs/a.md`, `docs/api` and `docs/api/b.md` in that order; a listing of 1,500 entries answers 1,000 entries and a non-null `next_cursor`, and the second page answers the remaining 500 with `next_cursor: null`; `limit=10000` is accepted",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the tree fixture plus a branch `big` whose root holds 1,500 files, created with `git fast-import`"
+            ],
+            "pseudocode": "in internal/scm/tree_test.go: r = get('/scm/tree?ref=main&recursive=true'); assert ['docs','docs/a.md','docs/api','docs/api/b.md'] is a contiguous run of paths(r); big = get('/scm/tree?ref=big'); assert len(big.json.items) == 1000 and big.json.next_cursor != null; p2 = get('/scm/tree?ref=big&cursor=' + big.json.next_cursor); assert len(p2.json.items) == 500 and p2.json.next_cursor == null and no path repeats; assert get('/scm/tree?ref=big&limit=10000').status == 200 and len(items) == 1500"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "unwanted",
+          "condition": "a tree request names a `path` that does not exist at the commit, a `path` that is a file, a `path` that is not a legal repository path (an empty segment, a leading `/`, a `.` or `..` segment, or anything under `.git`), or a `limit` outside 1 to 10,000",
+          "action": "refuse the request",
+          "contract": "HTTP 404 with `error_type` `path_not_found` for a path that does not exist; HTTP 400 with `error_type` `invalid_request` for a file, an illegal path and a `limit` out of bounds",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/scm/tree_test.go, a table: {path=nope -> 404 path_not_found; path=docs/nope -> 404 path_not_found; path=README.md -> 400 invalid_request; path=/docs, path=docs//api, path=docs/../x, path=./docs, path=.git/config -> 400 invalid_request; limit=0, limit=10001, limit=x -> 400 invalid_request}: r = get('/scm/tree?ref=main&' + q); assert (r.status, r.json.error.error_type) == want"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "event_driven",
+          "condition": "a caller requests `GET …/scm/file` with `path` naming a file or a symlink, without `Accept: application/json`",
+          "action": "return the file's bytes, or the link target as text for a symlink",
+          "contract": "HTTP 200 with the exact bytes as body, `Content-Type: application/octet-stream`, `Content-Length`, `X-Parley-Blob-Sha` (the blob id), `X-Parley-Resolved-Sha` (the commit's full id) and `X-Parley-File-Mode` (`100644`, `100755` or `120000`)",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the tree fixture plus bin.dat and empty.txt on `main`"
+            ],
+            "pseudocode": "in internal/scm/file_test.go, a table over path = {README.md (text, 100644), run.sh (100755), bin.dat (bytes 0x00..0xff), empty.txt (0 bytes), link (symlink to README.md)}: r = get('/scm/file?ref=main&path=' + path); assert r.status == 200 and r.body == git cat-file bytes (for link: 'README.md'); assert r.header('Content-Type') == 'application/octet-stream'; assert r.header('X-Parley-Blob-Sha') == blob id and r.header('X-Parley-Resolved-Sha') == head(main) and r.header('X-Parley-File-Mode') == mode"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "event_driven",
+          "condition": "a raw file request carries a `Range` header with exactly one byte range that starts inside the file",
+          "action": "return only that part of the file",
+          "contract": "HTTP 206 with the bytes of the range, `Content-Range: bytes <first>-<last>/<size>` and the same `X-Parley-*` headers; the forms `bytes=a-b`, `bytes=a-` and `bytes=-n` are honoured and an end past the file is cut to its last byte; a header with several ranges, and any `Range` on a request with `Accept: application/json`, gets the whole file with HTTP 200",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/scm/file_test.go, on a 100-byte file, a table: {'bytes=0-9' -> 206, body[0:10], 'bytes 0-9/100'; 'bytes=90-' -> 206, body[90:100], 'bytes 90-99/100'; 'bytes=-5' -> 206, body[95:100]; 'bytes=50-500' -> 206, 'bytes 50-99/100'; 'bytes=0-1,5-6' -> 200 whole file}: r = get(file, Range: h); assert status, body and Content-Range; r = get(file, Range: 'bytes=0-9', Accept: 'application/json'); assert r.status == 200 and r.json.size == 100"
+          }
+        },
+        {
+          "id": "REQ-6.6",
+          "pattern": "event_driven",
+          "condition": "a file request carries `Accept: application/json`",
+          "action": "return the file as a JSON object whose `content` is the text when the bytes are valid UTF-8 and their base64 encoding otherwise",
+          "contract": "HTTP 200 with `{path, sha, mode, size, encoding, content, resolved_sha}`: `sha` is the blob id, `size` the byte length, `encoding` is `utf8` or `base64`, and decoding `content` by `encoding` gives the file's exact bytes",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/scm/file_test.go, a table over {README.md -> utf8; a file with multi-byte UTF-8 text -> utf8; bin.dat -> base64; empty.txt -> utf8 with content ''}: r = get('/scm/file?ref=main&path=' + p, Accept: 'application/json'); assert r.header('Content-Type') starts with 'application/json'; assert keys(r.json) == {path, sha, mode, size, encoding, content, resolved_sha}; assert r.json.encoding == want; assert decode(r.json.content, r.json.encoding) == file bytes; assert r.json.size == len(file bytes) and r.json.mode == '100644'"
+          }
+        },
+        {
+          "id": "REQ-6.7",
+          "pattern": "unwanted",
+          "condition": "a file request has no `path`, names a path that does not exist at the commit, names a directory or a submodule entry, names an illegal repository path, or carries a single `Range` that starts at or after the end of the file",
+          "action": "refuse the request and send no file content",
+          "contract": "HTTP 400 with `error_type` `invalid_request` for a missing `path`, a directory, a submodule entry and an illegal path; HTTP 404 with `error_type` `path_not_found` for a path that does not exist; HTTP 416 with `error_type` `range_not_satisfiable` and `Content-Range: bytes */<size>` for the range; in the raw and the JSON form alike the body is the JSON error envelope",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/scm/file_test.go, a table: {no path -> 400 invalid_request; path=docs -> 400 invalid_request; path=vendor/sub -> 400 invalid_request; path=../x -> 400 invalid_request; path=nope.txt -> 404 path_not_found; path=README.md with Range 'bytes=99999-' -> 416 range_not_satisfiable}: for accept in {none, 'application/json'} (the range row raw only): r = get(route); assert (r.status, r.json.error.error_type) == want and r.json.error.code == r.status"
+          }
+        },
+        {
+          "id": "REQ-6.8",
+          "pattern": "unwanted",
+          "condition": "the file named by a file request is larger than `[scm].max_file_size` (default 32 MiB)",
+          "action": "refuse the read without sending content, for whole-file and ranged requests alike",
+          "contract": "HTTP 413 with `error_type` `payload_too_large` and the member `size` (the file's size in bytes) inside `error`; a file of exactly the limit is served with HTTP 200",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/scm/file_test.go, with max_file_size configured to 1024: big = file of 1025 bytes, edge = file of 1024 bytes; for accept in {none, 'application/json'}: r = get(big); assert r.status == 413 and r.json.error.error_type == 'payload_too_large' and r.json.error.size == 1025; assert get(big, Range: 'bytes=0-9').status == 413; assert get(edge).status == 200 and len(body) == 1024"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "Diff and compare",
+      "rationale": "A reviewer needs what a head adds as data, and whether it would still apply, without fetching either side.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "event_driven",
+          "condition": "a caller requests `GET …/scm/diff` with `base` and `head`",
+          "action": "compare the merge base of `base` and `head` with `head` when `mode` is absent or `merge_base`, and `base` itself with `head` when `mode=direct`, and return the result as JSON",
+          "contract": "HTTP 200 with `{base_sha, head_sha, merge_base_sha, files, stats, truncated}`: in `merge_base` mode a file changed only on `base` since the merge base is not in `files`, in `direct` mode it is; `merge_base_sha` is the merge base's full id in both modes, or null when the two commits share no ancestor, in which case the left side in `merge_base` mode is the empty tree; `stats` is `{files_changed, insertions, deletions}` over the whole diff",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a fixture repository in which `main` and `feature` diverge from commit mb: `main` adds only-main.txt, `feature` changes several files; and a branch `orphan` with no common ancestor"
+            ],
+            "pseudocode": "in internal/scm/diff_test.go: r = get('/scm/diff?base=main&head=feature'); assert r.json.base_sha == head(main) and r.json.head_sha == head(feature) and r.json.merge_base_sha == mb; assert paths(r) == files changed on feature since mb and 'only-main.txt' not in paths(r); assert r.json.truncated == false and r.json.stats.files_changed == len(r.json.files); d = get('/scm/diff?base=main&head=feature&mode=direct'); assert 'only-main.txt' in paths(d) and d.json.merge_base_sha == mb; o = get('/scm/diff?base=main&head=orphan'); assert o.json.merge_base_sha == null and every file of orphan has status 'added'"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "ubiquitous",
+          "action": "for any file change returned by diff, compare or a commit read, set `path`, `status` (`added`, `modified`, `deleted`, `renamed`, `copied` or `type_changed`, with rename detection on), `old_path` (the previous path for `renamed` and `copied`, null otherwise), `insertions` and `deletions` (line counts, 0 for a binary file), `binary`, and `old_sha` and `new_sha` (blob ids, null on the side where the file does not exist); on the diff route with patches on, add `patch`, the file's unified diff text, except for binary files",
+          "contract": "a file moved with small edits is one entry with `status` `renamed` and both paths, not a deletion and an addition; a file whose mode changes from regular file to symlink is `type_changed`; files are ordered by `path`",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/scm/diff_test.go, on base = c1 and head = c2 of a fixture built for the table: f = files of get('/scm/diff?base=' + c1 + '&head=' + c2) by path; assert f['new.txt'].status == 'added' and old_sha == null and insertions == 3; assert f['gone.txt'].status == 'deleted' and new_sha == null; assert f['edit.txt'] == {status: 'modified', insertions: 2, deletions: 1, binary: false, old_path: null, ...} and f['edit.txt'].patch contains '@@'; assert f['moved/b.txt'].status == 'renamed' and old_path == 'a.txt' and 'a.txt' not in f; assert f['img.bin'].binary == true and insertions == 0 and 'patch' not in f['img.bin']; assert f['kind'].status == 'type_changed'; assert paths are sorted"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "event_driven",
+          "condition": "a diff request carries `path`, `patches`, `context` or `format`",
+          "action": "keep only the files whose path matches at least one `path` glob (`*` within one segment, `**` across segments), omit `patch` when `patches=false`, use `context` lines of context (default 3) in patch text, and with `format=patch` answer the unified diff as text",
+          "contract": "with `path=docs/**` only files under `docs/` are in `files` and in `stats`; with `patches=false` no file has a `patch` member; with `context=0` a one-line edit's patch has no context lines; with `format=patch` the response is HTTP 200 with `Content-Type: text/x-diff` and a body that `git apply --check` accepts on the left side's tree",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/scm/diff_test.go: r = get(diff + '&path=docs/**&path=*.md'); assert every path matches one of the globs and r.json.stats.files_changed == len(files); assert no file in get(diff + '&patches=false').json.files has 'patch'; p0 = patch of edit.txt from get(diff + '&context=0'); assert p0 has no line starting with ' '; p20 = get(diff + '&context=20'); assert p20.status == 200; t = get(diff + '&format=patch'); assert t.header('Content-Type') starts with 'text/x-diff'; check out the merge base in a temp work tree and assert `git apply --check` of t.body exits 0"
+          }
+        },
+        {
+          "id": "REQ-7.4",
+          "pattern": "event_driven",
+          "condition": "the diff to return holds more than 5,000 files or more than 8 MiB of patch text",
+          "action": "return the first 5,000 files in path order, add patch text file by file until the next file's patch would take the total past 8 MiB, return the later files without `patch`, and say that the result is cut",
+          "contract": "`truncated` is true; `files` has at most 5,000 entries; the sum of the lengths of all `patch` members is at most 8,388,608 bytes; `stats` still counts the whole diff; with `format=patch` the text ends at a file boundary within the same limits and the response carries `X-Parley-Truncated: true`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a branch `many` adding 5,001 one-line files and a branch `wide` adding three text files of 3 MiB each, both created with `git fast-import` on top of an empty root commit `empty`"
+            ],
+            "pseudocode": "in internal/scm/diff_test.go: r = get('/scm/diff?base=' + empty + '&head=many'); assert len(r.json.files) == 5000 and r.json.truncated == true and r.json.stats.files_changed == 5001; w = get('/scm/diff?base=' + empty + '&head=wide'); assert w.json.truncated == true and len(w.json.files) == 3 and sum(len(f.patch) for files with patch) <= 8 << 20 and exactly the last file has no patch; t = get(same + '&format=patch'); assert t.header('X-Parley-Truncated') == 'true' and len(t.body) <= 8 << 20; small = get(diff of the ordinary fixture); assert small.json.truncated == false"
+          }
+        },
+        {
+          "id": "REQ-7.5",
+          "pattern": "unwanted",
+          "condition": "a diff or compare request lacks `base` or `head`, or a diff request carries a `mode` other than `merge_base` and `direct`, a `format` other than `json` and `patch`, a `context` that is not an integer from 0 to 20, or a `patches` value that is neither `true` nor `false`",
+          "action": "refuse the request",
+          "contract": "HTTP 400 with `error_type` `invalid_request`",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/scm/diff_test.go, a table over {diff?head=main, diff?base=main, compare?base=main, compare?head=main, diff?base=a&head=b&mode=three_dot, &format=html, &context=21, &context=-1, &context=x, &patches=no}: r = get(route); assert r.status == 400 and r.json.error.error_type == 'invalid_request'"
+          }
+        },
+        {
+          "id": "REQ-7.6",
+          "pattern": "event_driven",
+          "condition": "a caller requests `GET …/scm/compare` with `base` and `head`, and every commit of `head` that is not in `base` applies on top of `base` in a trial rebase",
+          "action": "report how the two commits relate and that the rebase would succeed, without moving any ref",
+          "contract": "HTTP 200 with `{base_sha, head_sha, merge_base_sha, ahead, behind, commits, files, mergeable: \"clean\", conflict: null}`: `ahead` and `behind` count the commits only in `head` and only in `base`; `commits` holds at most 200 commit objects of `head` not in `base`, oldest first, without `stats`; `files` holds at most 5,000 file changes from the merge base to `head` without `patch`; a `head` contained in `base` answers `ahead: 0`, `commits: []`, `files: []` and `clean`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a fixture repository in which `feature` (commits f1, f2) and `main` (one commit) diverge from mb and touch different files, and a branch `long` with 250 commits on top of mb"
+            ],
+            "pseudocode": "in internal/scm/compare_test.go: before = all refs with ids; r = get('/scm/compare?base=main&head=feature'); assert r.json.ahead == 2 and r.json.behind == 1 and r.json.merge_base_sha == mb; assert shas(r.json.commits) == [f1, f2] and 'stats' not in r.json.commits[0]; assert paths(r.json.files) == files changed by f1 and f2; assert r.json.mergeable == 'clean' and r.json.conflict == null; assert all refs with ids == before; s = get('/scm/compare?base=main&head=' + mb); assert s.json.ahead == 0 and s.json.commits == [] and s.json.mergeable == 'clean'; l = get('/scm/compare?base=main&head=long'); assert l.json.ahead == 250 and len(l.json.commits) == 200 and l.json.commits[0].sha == oldest commit of long not in main"
+          }
+        },
+        {
+          "id": "REQ-7.7",
+          "pattern": "event_driven",
+          "condition": "a compare request's trial rebase stops because a commit of `head` does not apply on top of `base`",
+          "action": "report the conflict as data, without moving any ref",
+          "contract": "HTTP 200 with `mergeable: \"conflict\"` and `conflict` set to a conflict report: `target_sha` (= `base_sha`), `head_sha`, `base_sha` (the merge base), `commit_sha` (the first commit that did not apply), `files` with one entry per conflicted file `{path, kind, base, ours, theirs, landed_by: []}` where each side is `{sha, mode, path}` or null, `landed_changes: []` and `change: null`; `kind` is `content` when both sides edited the same lines, `add_add` when both added the path, `modify_delete` when the target changed a file the head deleted and `delete_modify` for the reverse",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a fixture repository with `main` and four branches that each conflict with it on f.txt in one of the four ways"
+            ],
+            "pseudocode": "in internal/scm/compare_test.go, a table over head = {both-edit (content), both-add (add_add), head-deletes (modify_delete), base-deletes (delete_modify)}: before = all refs with ids; r = get('/scm/compare?base=main&head=' + head); assert r.status == 200 and r.json.mergeable == 'conflict'; c = r.json.conflict; assert c.target_sha == r.json.base_sha and c.head_sha == r.json.head_sha and c.base_sha == r.json.merge_base_sha; assert c.commit_sha == the conflicting commit of head (the second of two for 'both-edit', whose first commit applies); assert c.files == [{path: 'f.txt', kind: want, base: ..., ours: ..., theirs: ..., landed_by: []}] with null on the side where the file does not exist and ours.sha == blob of f.txt on main; assert c.landed_changes == [] and c.change == null; assert all refs with ids == before; and in internal/gitrepo/trial_test.go the same table against the trial rebase function directly"
+          }
+        },
+        {
+          "id": "REQ-7.8",
+          "pattern": "unwanted",
+          "condition": "the commits of `head` that are not in `base` in a compare request include a merge commit",
+          "action": "refuse the comparison",
+          "contract": "HTTP 400 with `error_type` `merge_commits_unsupported`",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/scm/compare_test.go: r = get('/scm/compare?base=old&head=main') where main holds merge commit m after old; assert r.status == 400 and r.json.error.error_type == 'merge_commits_unsupported'; assert get('/scm/diff?base=old&head=main').status == 200 (diff has no such limit)"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "Blame",
+      "rationale": "Tools answer \"who changed this and in which change\" from the hub when blame names commits and changes.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "a caller requests `GET …/scm/blame` with `path` naming a text file of at most 2 MiB",
+          "action": "return, for the whole file, the ranges of adjacent lines that were last changed by the same commit at adjacent original lines",
+          "contract": "HTTP 200 with `{resolved_sha, path, ranges}`; each range is `{start_line, end_line, commit, original_path, original_start_line}` with 1-based inclusive lines; the ranges are in line order, do not overlap and cover lines 1 to the last line; an empty file answers `ranges: []`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a fixture repository in which f.txt has six lines: 1-2 from c1, 4-6 from c2, line 3 from c3; and an empty file empty.txt"
+            ],
+            "pseudocode": "in internal/scm/blame_test.go: r = get('/scm/blame?ref=main&path=f.txt'); assert r.json.resolved_sha == head(main) and r.json.path == 'f.txt'; assert [(x.start_line, x.end_line, x.commit.sha) for x in ranges] == [(1,2,c1),(3,3,c3),(4,6,c2)]; assert ranges[0].original_path == 'f.txt' and ranges[0].original_start_line == 1; assert get('/scm/blame?path=empty.txt').json.ranges == []; and in internal/gitrepo/blame_test.go the same expectation against the blame function"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "event_driven",
+          "condition": "a blame request carries `start_line`, `end_line` or both",
+          "action": "return only the ranges inside lines `start_line` (default 1) to `end_line` (default: the last line), cutting ranges at the boundaries and cutting an `end_line` past the last line to it",
+          "contract": "HTTP 200; with `start_line=2&end_line=4` on the fixture the ranges are lines 2-2, 3-3 and 4-4; with `end_line=999` the last range ends at the file's last line",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/scm/blame_test.go: r = get('/scm/blame?path=f.txt&start_line=2&end_line=4'); assert [(x.start_line, x.end_line, x.commit.sha)] == [(2,2,c1),(3,3,c3),(4,4,c2)]; assert ranges[0].original_start_line == 2; e = get('/scm/blame?path=f.txt&start_line=5&end_line=999'); assert e.json.ranges == [range 5-6 of c2]; assert get('/scm/blame?path=f.txt&start_line=6').json.ranges[0].end_line == 6"
+          }
+        },
+        {
+          "id": "REQ-8.3",
+          "pattern": "ubiquitous",
+          "action": "for any blame range, set `commit` to the commit object of the commit that last changed the lines, without `stats` and with `change` and `session_id` from the lookups, and set `original_path` and `original_start_line` to the file's path and the range's first line in that commit, following renames of the file",
+          "contract": "lines last changed before the file was renamed carry the old path in `original_path`; no range's `commit` has a `stats` member; with a change lookup that knows the commit, `commit.change` is `{workspace_slug, number, version}`",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the blame fixture plus a file written as before.txt and later renamed to renamed.txt with one more line added"
+            ],
+            "pseudocode": "in internal/scm/blame_test.go: r = get('/scm/blame?path=renamed.txt'); x = the range from the commit before the rename; assert x.original_path == 'before.txt' and x.commit.sha == that commit; assert 'stats' not in x.commit and x.commit.message != ''; with a stub change lookup (c2 -> {demo, 12, 3}): assert the range of c2 in f.txt has commit.change == {workspace_slug: 'demo', number: 12, version: 3}"
+          }
+        },
+        {
+          "id": "REQ-8.4",
+          "pattern": "unwanted",
+          "condition": "a blame request has no `path`, names a path that does not exist at the commit, a directory or a submodule entry, a binary file, a file larger than 2 MiB (2,097,152 bytes), or a line range in which `start_line` is below 1, above `end_line` or past the file's last line, or a value is not an integer",
+          "action": "refuse the request",
+          "contract": "HTTP 404 with `error_type` `path_not_found` for a path that does not exist; HTTP 413 with `error_type` `payload_too_large` for a file over 2 MiB, while a file of exactly 2 MiB is served; HTTP 400 with `error_type` `invalid_request` for every other case",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the blame fixture plus bin.dat (contains NUL bytes), big.txt of 2,097,153 bytes and edge.txt of 2,097,152 bytes of text lines"
+            ],
+            "pseudocode": "in internal/scm/blame_test.go, a table: {no path -> 400 invalid_request; path=nope -> 404 path_not_found; path=docs -> 400 invalid_request; path=bin.dat -> 400 invalid_request; path=big.txt (2 MiB + 1 byte) -> 413 payload_too_large; path=f.txt&start_line=0, start_line=5&end_line=4, start_line=7, start_line=x -> 400 invalid_request}: r = get('/scm/blame?' + q); assert (r.status, r.json.error.error_type) == want; assert get('/scm/blame?path=edge.txt').status == 200 for a file of exactly 2,097,152 bytes"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-9",
+      "title": "Search",
+      "rationale": "Finding where a string occurs at a ref should not need a checkout either.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-9.1",
+          "pattern": "event_driven",
+          "condition": "a caller requests `GET …/scm/search` with `q` of 1 to 500 characters",
+          "action": "match `q` as a literal string, with regard to case, against the contents of every non-binary file at `ref` and return one `{path, line, text}` per matching line, ordered by path and then by line, with the resolved commit",
+          "contract": "HTTP 200 with `{items, next_cursor, resolved_sha}`; `line` is the 1-based line number and `text` the line without its line ending; characters of `q` that are special in regular expressions match themselves; a `q` that matches nothing answers `items: []`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a fixture repository whose `main` holds api/greeting.go, docs/a.md, literal.txt containing the text `a.b(c)*`, and a binary file that contains the bytes of `Greeting`"
+            ],
+            "pseudocode": "in internal/scm/search_test.go: r = get('/scm/search?ref=main&q=Greeting'); assert r.json.items == [{path: 'api/greeting.go', line: 3, text: 'func Greeting() string {'}, {path: 'docs/a.md', line: 1, text: '# Greeting'}] and r.json.resolved_sha == head(main); assert get('/scm/search?q=greeting').json.items does not contain the 'Greeting' lines (case matters); assert paths of get('/scm/search?q=' + urlencode('a.b(c)*')) == ['literal.txt']; assert get('/scm/search?q=zzz-not-there').json == {items: [], next_cursor: null, resolved_sha: head}; and in internal/gitrepo/grep_test.go the same expectations against the grep function"
+          }
+        },
+        {
+          "id": "REQ-9.2",
+          "pattern": "event_driven",
+          "condition": "a search request carries `regex=true`, `case_sensitive=false` or `path`",
+          "action": "with `regex=true` match `q` as an extended regular expression, with `case_sensitive=false` ignore case, and with `path` search only files whose path matches at least one glob",
+          "contract": "HTTP 200 with the matching lines under the same ordering and shape",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/scm/search_test.go, a table over query -> expected (path, line) pairs: {q=func +[A-Z]\\w*\\(&regex=true -> the Go function lines; q=greeting&case_sensitive=false -> lines with 'Greeting' and 'greeting'; q=Greeting&path=docs/** -> only docs/a.md; q=Greeting&path=*.go&path=api/* -> only api/greeting.go; q=a.b&regex=true -> also lines where '.' stands for another character}"
+          }
+        },
+        {
+          "id": "REQ-9.3",
+          "pattern": "ubiquitous",
+          "action": "for any search, skip binary files and cut each match's `text` to its first 500 characters",
+          "contract": "a file that git treats as binary yields no match even when it contains the bytes of `q`; a matching line of 2,000 characters is returned with a `text` of exactly 500 characters",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the search fixture plus long.txt with one line of 2,000 characters that starts with `needle`"
+            ],
+            "pseudocode": "in internal/scm/search_test.go: r = get('/scm/search?q=Greeting'); assert 'blob.bin' not in paths(r); l = get('/scm/search?q=needle').json.items[0]; assert l.path == 'long.txt' and len(l.text) == 500 and l.text == first 500 characters of the line"
+          }
+        },
+        {
+          "id": "REQ-9.4",
+          "pattern": "event_driven",
+          "condition": "a search has more matches than `limit` (default 50, at most 200)",
+          "action": "return `limit` matches and a cursor for the next page, drawn from the commit the first page resolved",
+          "contract": "the first page of a search with 450 matches and `limit=200` has 200 items and a non-null `next_cursor`; the third page has 50 items and `next_cursor: null`; no match repeats or is skipped; without `limit` a page has 50 items",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the search fixture plus hits.txt with 450 lines that each contain `hit`"
+            ],
+            "pseudocode": "in internal/scm/search_test.go: p1 = get('/scm/search?q=hit&limit=200'); p2 = get(same + '&cursor=' + p1.next_cursor); p3 = get(same + '&cursor=' + p2.next_cursor); assert [len(p.items)] == [200, 200, 50] and p3.json.next_cursor == null; assert (path, line) pairs of p1+p2+p3 are 450 distinct pairs in order; assert len(get('/scm/search?q=hit').json.items) == 50; move main between p1 and p2 in a second run and assert p2.json.resolved_sha == p1.json.resolved_sha"
+          }
+        },
+        {
+          "id": "REQ-9.5",
+          "pattern": "unwanted",
+          "condition": "a search request has no `q`, an empty `q`, a `q` longer than 500 characters, `regex=true` with a `q` that is not a valid extended regular expression, or a `regex` or `case_sensitive` value that is neither `true` nor `false`",
+          "action": "refuse the request without searching",
+          "contract": "HTTP 400 with `error_type` `invalid_request`; a `q` of exactly 500 characters is accepted",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/scm/search_test.go, a table over {no q, q=, q of 501 characters, q=(unclosed&regex=true, q=x&regex=1, q=x&case_sensitive=no}: r = get('/scm/search?' + query); assert r.status == 400 and r.json.error.error_type == 'invalid_request'; assert get('/scm/search?q=' + 500 characters).status == 200; assert get('/scm/search?q=(unclosed').status == 200 (literal)"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-10",
+      "title": "Read commands of `parley scm`",
+      "rationale": "A person or a script reaches the reads most often needed from the shell, with the output and exit codes every other command has.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-10.1",
+          "pattern": "event_driven",
+          "condition": "a user runs one of `parley scm refs|log|show|ls|diff|compare|blame|search` with its positional arguments and flags, and the hub answers 200",
+          "action": "send one `GET` to the command's route under `/api/v1/workspaces/<slug>/scm` with each flag as the query parameter of the route, and print the response body",
+          "contract": "stdout holds the response body as one JSON document and the exit status is 0; the request per command is: `refs <slug> --prefix P --limit N --cursor C` -> `/refs?prefix=P&limit=N&cursor=C`; `log <slug> --ref R --path P --follow --since S --until U --author A --stats --limit N --cursor C` -> `/commits` with `ref`, `path`, `follow=true`, `since`, `until`, `author`, `stats=true`, `limit`, `cursor`; `show <slug> <rev> --files` -> `/commits/<rev as one percent-encoded segment>?files=true`; `ls <slug> [path] --ref R --recursive` -> `/tree?path=…&ref=R&recursive=true`; `diff <slug> <base> <head> --mode M --path G…` -> `/diff?base=…&head=…&mode=M&path=G…`; `compare <slug> <base> <head>` -> `/compare?base=…&head=…`; `blame <slug> <path> --ref R --lines 3:9` -> `/blame?path=…&ref=R&start_line=3&end_line=9`; `search <slug> <query> --ref R --path G… --regex --ignore-case` -> `/search?q=…&ref=R&path=G…&regex=true&case_sensitive=false`; a flag that is not given sends no parameter",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server standing in for the hub; endpoint URL and credential given by flags"
+            ],
+            "pseudocode": "in internal/cli/scm_test.go, a table with one row per command line above plus each command with no flags: run the root command with the args against an httptest server that records the request and answers a canned JSON body; assert recorded method == GET, recorded path and recorded query (as a multimap) == want; assert stdout == the canned body indented by 2 spaces plus newline; assert exit == 0; rows include `show demo feature/x` -> escaped path '/api/v1/workspaces/demo/scm/commits/feature%2Fx' and `diff demo a b --path 'docs/**' --path '*.md'` -> two `path` values"
+          }
+        },
+        {
+          "id": "REQ-10.2",
+          "pattern": "event_driven",
+          "condition": "a user runs `parley scm cat <slug> <path>` with or without `--ref` and `--output <file>`, and the hub answers 200",
+          "action": "request `GET …/scm/file?path=<path>` (with `ref` when given) without `Accept: application/json`, and write the body's raw bytes to stdout, or to the file when `--output` is given",
+          "contract": "exit status 0; stdout holds exactly the file's bytes and no JSON framing; with `--output` stdout is empty and the named file holds exactly the bytes",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/scm_test.go: the test hub answers bytes 0x00..0xff for /scm/file; run `scm cat demo bin.dat --ref v1`; assert recorded query == {path: bin.dat, ref: v1} and recorded Accept does not contain 'application/json'; assert stdout bytes == 0x00..0xff and exit == 0; out = t.TempDir()/f; run `scm cat demo bin.dat --output out`; assert stdout is empty and read(out) == the bytes"
+          }
+        },
+        {
+          "id": "REQ-10.3",
+          "pattern": "unwanted",
+          "condition": "`parley scm cat` receives an error answer from the hub, or cannot write the `--output` file",
+          "action": "write no file content anywhere",
+          "contract": "stdout is empty; no file is created at the `--output` path and an existing file there is left unchanged; for a hub error stderr holds the hub's error envelope and the exit status is 1; for a file that cannot be written stderr holds an envelope with `error_type` `client_error` and the exit status is 2",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/scm_test.go: the test hub answers 404 path_not_found; out = t.TempDir()/f; run `scm cat demo nope --output out`; assert exit == 1 and stdout == '' and stderr json.error.error_type == 'path_not_found' and out does not exist; write 'keep' to out, run again; assert read(out) == 'keep'; with the hub answering 200: run `scm cat demo f --output <t.TempDir()>/missing-dir/f`; assert exit == 2 and stderr json.error.error_type == 'client_error'"
+          }
+        },
+        {
+          "id": "REQ-10.4",
+          "pattern": "event_driven",
+          "condition": "a user runs `parley scm diff` with `--patch` or with `--name-only`",
+          "action": "with `--patch` request `format=patch` and print the unified diff text as received; with `--name-only` request `patches=false` and print the JSON response",
+          "contract": "exit status 0; with `--patch` stdout is the response's text byte for byte, not JSON; with `--name-only` stdout is the JSON document, whose files carry no patch text",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/scm_test.go: the test hub answers 'diff --git a/x b/x\\n…' with Content-Type text/x-diff when format=patch; run `scm diff demo main feature --patch`; assert recorded query has format=patch and stdout == the text exactly; run `scm diff demo main feature --name-only`; assert recorded query has patches=false and no format, and stdout parses as the canned JSON"
+          }
+        },
+        {
+          "id": "REQ-10.5",
+          "pattern": "event_driven",
+          "condition": "a user runs `parley scm compare <slug> <base> <head> --fail-on-conflict` and the hub's answer has `mergeable` equal to `conflict`",
+          "action": "print the response and report that the requested condition was not met",
+          "contract": "stdout holds the response body as one JSON document; stderr holds an envelope with `code` 0 and `error_type` `condition_not_met`; the exit status is 3; with `mergeable` `clean`, or without the flag, the exit status is 0 and stderr is empty",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/scm_test.go, a table over (mergeable, flag) -> exit: {(conflict, --fail-on-conflict) -> 3; (clean, --fail-on-conflict) -> 0; (conflict, no flag) -> 0}: run `scm compare demo main feature` with the row's flag against a test hub answering the row's body; assert exit == want; assert stdout parses to the canned body in every row; for the first row assert stderr json.error == {code: 0, error_type: 'condition_not_met', message: non-empty}"
+          }
+        },
+        {
+          "id": "REQ-10.6",
+          "pattern": "unwanted",
+          "condition": "a `parley scm` read command is run with the wrong number of positional arguments, with `--mode` other than `merge_base` or `direct`, with `--patch` together with `--name-only`, with a `--lines` value that is not `<start>:<end>` with two positive integers, or with a `--limit` that is not an integer",
+          "action": "fail before sending any request",
+          "contract": "stdout is empty; stderr holds an envelope with `code` 0 and `error_type` `usage_error`; the exit status is 2; the hub receives no request",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/scm_test.go, a table over args = {scm refs; scm show demo; scm cat demo; scm diff demo main; scm compare demo a b c; scm diff demo a b --mode sideways; scm diff demo a b --patch --name-only; scm blame demo f --lines 3; scm blame demo f --lines a:b; scm blame demo f --lines 0:2; scm refs demo --limit many}: run against a test hub that counts requests; assert exit == 2 and stdout == '' and stderr json.error.error_type == 'usage_error' and hub.requests == 0"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "An agent reads a file by name, then by commit id, then a diff, without a clone",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "sends GET /api/v1/workspaces/demo/scm/file?ref=main&path=README.md with a PAT that holds git:read"
+        },
+        {
+          "actor": "parleyd",
+          "action": "authenticates the PAT, checks the scope and the workspace access, resolves `main` to its head commit and answers the file's bytes with X-Parley-Resolved-Sha, an ETag and Cache-Control private, no-cache"
+        },
+        {
+          "actor": "agent",
+          "action": "repeats the request with If-None-Match set to the ETag, then with ref set to the 40-character id from X-Parley-Resolved-Sha"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers 304 to the first, and to the second the same bytes with Cache-Control private, max-age=31536000, immutable"
+        },
+        {
+          "actor": "agent",
+          "action": "sends GET …/scm/diff with base and head set to two commit ids taken from GET …/scm/commits"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers the file changes between the two commits with their patch text and reports each read to the request recorder"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the parleyd HTTP server with the conventions of package 02",
+          "authentication and the scope check of packages 04 and 06",
+          "the access rule of package 07",
+          "the workspace record and state precondition of package 10",
+          "the scm read routes of internal/scm",
+          "internal/gitrepo running the real git binary on a bare repository on disk"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with its data directory in t.TempDir()",
+          "workspace `demo` in status ready whose repository holds two commits on `main`, the second changing README.md, registered the way the end-to-end tests of package 10 register a workspace",
+          "a PAT of the workspace's owner with scope git:read"
+        ],
+        "end_state": [
+          "the first read answered 200 with the bytes of README.md at the head of main",
+          "the conditional read answered 304 with an empty body",
+          "the read by commit id answered the same bytes with the immutable Cache-Control value",
+          "the diff answered one file change for README.md with status modified and a patch",
+          "the repository's refs are unchanged"
+        ],
+        "pseudocode": "in test/e2e/scm_read_test.go: r = GET(file?ref=main&path=README.md, pat); assert r.status == 200 and r.body == readmeV2; sha = r.header('X-Parley-Resolved-Sha'); assert len(sha) == 40; assert GET(same, If-None-Match: r.header('ETag')).status == 304; i = GET(file?ref=sha&path=README.md, pat); assert i.body == readmeV2 and i.header('Cache-Control') == 'private, max-age=31536000, immutable'; log = GET(commits?ref=main, pat).json.items; d = GET(diff?base=log[1].sha&head=log[0].sha, pat); assert [(f.path, f.status) for f in d.json.files] == [('README.md','modified')] and d.json.files[0].patch != ''"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "A review agent asks from the shell whether a branch still applies and gets the conflict as data",
+      "steps": [
+        {
+          "actor": "review agent",
+          "action": "runs `parley scm compare demo main feature --fail-on-conflict`"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends GET /api/v1/workspaces/demo/scm/compare?base=main&head=feature with the configured credential"
+        },
+        {
+          "actor": "parleyd",
+          "action": "resolves both revisions, counts ahead and behind, runs a trial rebase of feature onto main that stops at a conflicting commit, and answers 200 with mergeable conflict and the conflict report, moving no ref"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints the response on stdout, reports condition_not_met on stderr and exits 3"
+        },
+        {
+          "actor": "review agent",
+          "action": "runs `parley scm cat demo f.txt --ref main` to read the target's side of the conflicted file"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers the raw bytes of f.txt at the head of main, which the CLI writes to stdout"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the parley CLI binary's root command with its HTTP client",
+          "the parleyd HTTP server and its authentication, scope and access checks",
+          "the scm read routes of internal/scm",
+          "the trial rebase of internal/gitrepo running the real git binary on a bare repository on disk"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with its data directory in t.TempDir()",
+          "workspace `demo` in status ready with branches `main` and `feature` that both changed the same line of f.txt after their merge base",
+          "the CLI configured with the hub's URL and the API key of the workspace's owner through PARLEY_ENDPOINT_URL and PARLEY_API_KEY"
+        ],
+        "end_state": [
+          "the compare command exited 3",
+          "its stdout is one JSON document with mergeable conflict and a conflict report naming f.txt with kind content",
+          "its stderr holds an envelope with error_type condition_not_met",
+          "the cat command exited 0 and its stdout equals the bytes of f.txt on main",
+          "every ref of the repository points at the commit it pointed at before"
+        ],
+        "pseudocode": "in test/e2e/scm_read_test.go: before = `git for-each-ref` of the workspace repository; out, errOut, code = runCLI('scm','compare','demo','main','feature','--fail-on-conflict'); assert code == 3; j = json(out); assert j.mergeable == 'conflict' and j.conflict.files[0].path == 'f.txt' and j.conflict.files[0].kind == 'content' and j.ahead == 1 and j.behind == 1; assert json(errOut).error.error_type == 'condition_not_met'; out2, _, code2 = runCLI('scm','cat','demo','f.txt','--ref','main'); assert code2 == 0 and out2 == bytes of f.txt at main; assert `git for-each-ref` == before"
+      }
+    }
+  ],
+  "external_apis": [
+    {
+      "package": "github.com/spf13/cobra",
+      "version": "v1.10.2",
+      "verified": true,
+      "symbols": [
+        {
+          "name": "Command",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "type Command struct { Use string; Args PositionalArgs; RunE func(cmd *Command, args []string) error; … }"
+        },
+        {
+          "name": "Command.AddCommand",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) AddCommand(cmds ...*Command)"
+        },
+        {
+          "name": "Command.Flags",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) Flags() *pflag.FlagSet"
+        },
+        {
+          "name": "ExactArgs",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func ExactArgs(n int) PositionalArgs"
+        },
+        {
+          "name": "RangeArgs",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func RangeArgs(min int, max int) PositionalArgs"
+        },
+        {
+          "name": "Command.OutOrStdout",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) OutOrStdout() io.Writer"
+        }
+      ]
+    },
+    {
+      "package": "github.com/spf13/pflag",
+      "version": "v1.0.10",
+      "verified": true,
+      "symbols": [
+        {
+          "name": "FlagSet.StringVar",
+          "import_path": "github.com/spf13/pflag",
+          "signature": "func (f *FlagSet) StringVar(p *string, name string, value string, usage string)"
+        },
+        {
+          "name": "FlagSet.BoolVar",
+          "import_path": "github.com/spf13/pflag",
+          "signature": "func (f *FlagSet) BoolVar(p *bool, name string, value bool, usage string)"
+        },
+        {
+          "name": "FlagSet.IntVar",
+          "import_path": "github.com/spf13/pflag",
+          "signature": "func (f *FlagSet) IntVar(p *int, name string, value int, usage string)"
+        },
+        {
+          "name": "FlagSet.StringArrayVar",
+          "import_path": "github.com/spf13/pflag",
+          "signature": "func (f *FlagSet) StringArrayVar(p *[]string, name string, value []string, usage string)"
+        }
+      ]
+    }
+  ]
+}

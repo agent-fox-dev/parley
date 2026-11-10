@@ -1,0 +1,280 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "39",
+  "spec_name": "secrets",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/secret/... ./internal/cli/... ./internal/identity/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "05",
+      "reason": "users, organizations, memberships and the organization selector; the user and org deletes that remove a scope's secrets"
+    },
+    {
+      "spec": "07",
+      "reason": "the workspace record and the access decision with need owner on the workspace secret routes"
+    },
+    {
+      "spec": "09",
+      "reason": "the command helper, HTTP client, output and exit codes the parley secrets commands are built on"
+    },
+    {
+      "spec": "52",
+      "reason": "writes each secret event in the transaction of its change"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Load the operator's keys and seal values with them",
+      "criteria": [
+        "REQ-1.1",
+        "REQ-2.1",
+        "REQ-2.2",
+        "REQ-8.7"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/secret/keys_test.go and internal/secret/cipher_test.go and confirm they fail",
+        "Add key loading: it takes an environment lookup and the configured `[secrets].key_file` value and returns the current and the previous key, each optional; a set-but-empty variable counts as unset; the file is read only when PARLEY_SECRETS_KEY is unset; a value is trimmed of surrounding white space and must be standard padded base64 of exactly 32 bytes",
+        "Return an error that names the variable or the file path, and never the value, for a malformed key or an unreadable file; library code returns the error and does not end the process",
+        "Add the key id: the first 8 bytes of the key's SHA-256 in lowercase hex",
+        "Add sealing with AES-256-GCM from the standard library: a fresh 12-byte nonce from crypto/rand per call, the caller's binding as additional authenticated data, the result carrying the key id of the sealing key; sealing without a current key returns ErrUnavailable",
+        "Add opening: choose the current or the previous key by the sealed value's key id; return an error matching ErrUnreadable when neither fits or authentication fails",
+        "Export SealValue, OpenValue and NeedsReseal for values that are not named secrets (package 53 seals webhook signing secrets with them), taking a binding string of the caller's"
+      ],
+      "touches": [
+        "internal/secret/keys.go",
+        "internal/secret/keys_test.go",
+        "internal/secret/cipher.go",
+        "internal/secret/cipher_test.go"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Build the secret store and the component hub code calls",
+      "criteria": [
+        "REQ-2.3",
+        "REQ-4.6",
+        "REQ-8.1",
+        "REQ-8.2",
+        "REQ-8.3",
+        "REQ-8.4",
+        "REQ-8.6",
+        "REQ-8.8"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/secret/store_test.go against a real store in t.TempDir() and confirm they fail",
+        "Register a schema step with internal/store that creates the secret table: secret scope, scope id, key as given, key lowered (A to Z only), sealed value, key id, created_at, updated_at, unique on (scope, scope id, lowered key)",
+        "Add the component, built from the store, the loaded keys, a clock and the scrubber of internal/scrub: Available reports whether a current key is configured",
+        "Add Get(scope, scope id, name): look the entry up by the lowered name in exactly that scope on every call, open it with the binding (scope, scope id, lowered key), register a non-empty value with the scrubber, and return (value, found, error); an entry that cannot be opened returns an error matching ErrUnreadable with the message `secret \"<stored key>\" cannot be decrypted` and never found == false",
+        "Add Put inside a caller's transaction: check the key (1 to 255 characters of ASCII letters, digits and `_`, not starting with a digit) and the value (at most 262144 bytes) and return ErrInvalid; return ErrUnavailable without a current key; count the scope inside the transaction and return ErrLimitReached when a new entry would be the 101st; otherwise insert with created_at == updated_at, or overwrite the value and updated_at of the matching entry keeping its key casing and created_at; write no event",
+        "Add Delete(tx, scope, scope id, name) inside a caller's transaction: remove the entry matched by the lowered name without opening its value, return whether one existed, and write no event; package 43 unsets the forge webhook secret with it",
+        "Add the operations the routes of later tasks use, each inside a transaction: create several entries all-or-nothing (the limit check and the uniqueness check run in the same transaction, a conflict naming the first conflicting key in request order), list a page ordered by lowered key, update a value, delete an entry, count a scope",
+        "Add RemoveScope(tx, scope, scope id), which deletes every secret of that scope and nothing else and writes no event, and export RemoveWorkspace(tx, slug), the same for one workspace scope, for the removers of owned data that package 14 adds to internal/workspace; package 14 registers it, and a fork's secrets are removed by package 14's RemoveOwned, which runs secret.RemoveWorkspace",
+        "Export the HTTP error for ErrUnavailable (503, error_type `secrets_unavailable`) so that packages 10, 43 and 53 answer it the same way",
+        "Make concurrent creates safe: the store admits one writer at a time, so the count, the uniqueness check and the insert of one request run in one write transaction"
+      ],
+      "touches": [
+        "internal/secret/store.go",
+        "internal/secret/store_test.go",
+        "internal/secret/errors.go"
+      ],
+      "done_when": [
+        "`go test ./internal/secret/... -count=1 -race` passes"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Start the hub with secret encryption and report its state",
+      "criteria": [
+        "REQ-1.2",
+        "REQ-1.3",
+        "REQ-1.4",
+        "REQ-1.5"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/secret/report_test.go, internal/secret/keys_test.go and internal/secret/secret_integration_test.go and confirm they fail",
+        "Register the configuration key `[secrets].key_file` (string, default unset) with the key registry of internal/config",
+        "In internal/hub, load the keys from the hub's environment lookup and the configuration before the listener opens; a loading error stops the start with exit status 1 through the hub's one-line start error, which names the variable or file and not the value",
+        "Build the secret component in internal/hub and hand it to the collaborators that later packages wire",
+        "Register a start hook that writes the start report: one info line with the message `secret encryption` and the members key_configured, previous_key_present and undecryptable_secrets, the last being the number of rows whose key id is neither configured key's (compared by id, decrypting nothing)",
+        "When no current key is configured, also write the warn line `secrets cannot be stored: no encryption key configured` and go on starting",
+        "Never log, store or return key material: the report and every error carry booleans, counts and source names only"
+      ],
+      "touches": [
+        "internal/secret/report.go",
+        "internal/secret/report_test.go",
+        "internal/secret/keys_test.go",
+        "internal/secret/secret_integration_test.go",
+        "internal/hub/"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Serve the secret lists of the three scopes behind their access rules",
+      "criteria": [
+        "REQ-3",
+        "REQ-5"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/secret/handlers_test.go, with one route table that the access tests iterate, and confirm they fail",
+        "Register GET /api/v1/user/secrets, /api/v1/orgs/{slug}/secrets and /api/v1/workspaces/{slug}/secrets through the route registration of internal/server, each declaring the PAT scope `secrets:read`",
+        "Resolve the user scope at the access step: a caller with a user gets the scope of that user's id; the admin token gets 403 `forbidden` with the message `user-scoped endpoints require a user credential` (do not use the needs-a-user declaration of package 04, whose message differs)",
+        "Resolve the org scope: find the org with the organization selector of internal/identity (slug or UUID); the admin token passes for any existing org; a user passes when the org is active and the user is a member; every other case, an unknown org included, answers the same 404 `not_found` body",
+        "Resolve the workspace scope through the access component of internal/access with need `owner`, which gives 404 `workspace not found` and the member's 403; the scope id is the slug in the path; apply no state guard, so the workspace's status and a maintenance operation do not matter",
+        "Write the three resolvers as one function per scope that every secret route uses, so that the write routes of the next tasks inherit the same answers",
+        "Implement the list handler with the list helper of internal/server: order by lowered key, `limit` and `cursor` per the list convention, items of exactly {key, created_at, updated_at}, `items` an empty array for an empty scope; it reads no value and so works without a key and with undecryptable entries",
+        "Register the routes in internal/hub"
+      ],
+      "touches": [
+        "internal/secret/handlers.go",
+        "internal/secret/handlers_test.go",
+        "internal/secret/scope.go",
+        "internal/hub/"
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Create secrets all-or-nothing with their events",
+      "criteria": [
+        "REQ-4.1",
+        "REQ-4.2",
+        "REQ-4.3",
+        "REQ-4.4",
+        "REQ-4.5",
+        "REQ-7.1"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/secret/handlers_test.go, add the three POST routes to the route table of the access tests, and confirm the new tests fail",
+        "Register POST on the three secrets collections with the PAT scope `secrets:write`, as a create route so that the Idempotency-Key handling of internal/server applies",
+        "Validate the body in this order and answer 400 `invalid_request` at the first fault, naming the entry's key where there is one: `entries` is a non-empty array; each key is a legal key; each value is absent (stored as the empty string) or a JSON string of at most 262144 bytes; no two keys are equal ignoring ASCII case",
+        "After validation answer 503 `secrets_unavailable` when no current key is configured",
+        "In one write transaction: answer 429 `secret_limit_reached` with the message `maximum of 100 entries per scope exceeded` when the scope's count plus the entries exceeds 100, checked before conflicts; answer 409 `conflict` with `key \"<k>\" already exists` for the first key in request order that is already stored ignoring case; otherwise store every entry with one shared timestamp from the clock",
+        "In the same transaction write one `parley.secret.create` event per entry through internal/event: resource_type `secret`, action `create`, resource_id the stored key, metadata {scope, scope_id, key}, workspace the slug for the workspace scope and null otherwise, actor the caller",
+        "Answer 201 with {\"items\":[{key, created_at, updated_at}]} in request order"
+      ],
+      "touches": [
+        "internal/secret/handlers.go",
+        "internal/secret/handlers_test.go",
+        "internal/secret/validate.go"
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Update and delete secrets with their events",
+      "criteria": [
+        "REQ-6",
+        "REQ-7.2"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/secret/handlers_test.go, add the PATCH and DELETE routes to the route table of the access tests, and confirm the new tests fail",
+        "Register PATCH and DELETE on /secrets/{key} under the three scopes with the PAT scope `secrets:write`",
+        "PATCH: answer 400 `invalid_request` when `value` is absent, null, not a string or longer than 262144 bytes; then 503 `secrets_unavailable` when no current key is configured; then 404 `not_found` with `key \"<k>\" not found` (the key as the path gave it) when no entry matches ignoring ASCII case; the path's key is not validated",
+        "On a match seal the new value under the current key without opening the old one, keep the key casing and created_at, set updated_at from the clock, and answer 200 with {key, created_at, updated_at}",
+        "DELETE: remove the matching entry without reading its value, so it works without a key and on an undecryptable entry; answer 204 with no body, or the same 404 when nothing matches",
+        "Write `parley.secret.update` or `parley.secret.delete` in the transaction of the change, with resource_id and metadata.key in the stored casing"
+      ],
+      "touches": [
+        "internal/secret/handlers.go",
+        "internal/secret/handlers_test.go"
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Prove that values never leave the hub and that a change and its event are one",
+      "criteria": [
+        "REQ-7.3",
+        "REQ-7.4",
+        "REQ-7.5"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/secret/handlers_test.go and internal/secret/secret_integration_test.go and confirm which fail",
+        "Make every refusal path of the secret routes leave the event log untouched: validation, the key check, the limit, the conflict, the lookup and every access refusal answer before any event is written or roll the transaction back",
+        "When the event writer returns an error, roll the transaction back and answer 500 `internal`; the cause is not sent",
+        "Go through every error and log statement of internal/secret and make each carry the key name, the scope and counts only: no value, no sealed bytes, no request body",
+        "Mark the create route so that the idempotency record of internal/server holds the response body only, which carries no value",
+        "Run the sentinel test end to end and fix every place where the sentinel shows up"
+      ],
+      "touches": [
+        "internal/secret/handlers.go",
+        "internal/secret/handlers_test.go",
+        "internal/secret/store.go",
+        "internal/secret/secret_integration_test.go"
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Remove a user's and an organization's secrets with their owner",
+      "criteria": [
+        "REQ-8.5"
+      ],
+      "steps": [
+        "Add the behaviour to internal/secret/secret_integration_test.go with the real identity routes and confirm it fails",
+        "Use the scope removers of package 05, RegisterUserRemover and RegisterOrgRemover of internal/identity/removers.go, a file package 05 owns: each takes a function of a transaction and an id, and package 05's delete of a user and of an organization call every registered function inside their transaction, before the record is removed, a remover's error rolling the deletion back with 500 `internal`; this package only registers and edits no file of internal/identity; package 40 registers its variable removal with the same two functions",
+        "Register in internal/hub the secret component's RemoveScope for the user scope with RegisterUserRemover and for the org scope with RegisterOrgRemover",
+        "Keep the refusal of deleting the only active admin user unchanged: nothing is removed when the deletion is refused"
+      ],
+      "touches": [
+        "internal/secret/secret_integration_test.go",
+        "internal/hub/"
+      ],
+      "depends_on": [
+        3
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Re-encrypt values under the current key in the maintenance pass",
+      "criteria": [
+        "REQ-9"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/secret/reencrypt_test.go and confirm they fail",
+        "Add the task function: with a current and a previous key, read the secrets whose key id is the previous key's in batches of 100, open each under the previous key and seal it under the current key",
+        "Write each re-sealed value with a compare on the sealed bytes read, so that a value a request updated or deleted in between is left as the request made it; do not touch key, created_at or updated_at and write no event",
+        "Leave a value that fails to open unchanged and go on; return an error only when the store fails, keeping what was converted",
+        "Add a converter registry: another package registers a function that re-seals its own values and returns (converted, remaining); the task runs every converter after the secrets and adds its numbers; a converter's error fails the task after the log line",
+        "With no previous key or no current key convert nothing",
+        "End every run with one info line, message `secret re-encryption`, members converted and remaining, where remaining counts the secrets whose key id is not the current key's (every secret when there is no current key) plus the converters' remaining",
+        "Register the function with the maintenance task registry of internal/maintenance under the name `secret_reencryption` in internal/hub"
+      ],
+      "touches": [
+        "internal/secret/reencrypt.go",
+        "internal/secret/reencrypt_test.go",
+        "internal/hub/"
+      ],
+      "depends_on": [
+        3
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Add the parley secrets commands",
+      "criteria": [
+        "REQ-10"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/cli/secrets_test.go against an httptest server that records requests, and confirm they fail",
+        "Declare the group `parley secrets` and its commands create, list, update and delete through the command helper of internal/cli, with the flags --user, --org <slug>, --workspace <slug> and, on create and update, --from-stdin; the group alone prints help",
+        "Parse entries: join the positional arguments, split at commas, split each entry at its first `=`; an entry without `=` or with nothing before it is a usage error; do not check key naming",
+        "With --from-stdin take exactly one bare KEY, read standard input to its end and drop one trailing line feed or carriage return and line feed",
+        "create: send one POST per scope flag in the order user, org, workspace (user alone without a flag), go on after a failed scope, print {\"results\":[{scope, items}]} for the scopes that succeeded, print each failed scope's envelope once on stderr and exit 1 if any failed",
+        "list: request limit=200, follow next_cursor to the last page with the shared client and print {\"items\":[…]} with the items of all pages",
+        "update: send PATCH with {\"value\"} to /<scope>/secrets/<KEY> and print the entry; delete: send DELETE and print {\"deleted\":\"<KEY>\"}; the key is one percent-encoded path segment",
+        "Refuse malformed arguments, more than one scope flag on list, update and delete, and an empty --org or --workspace as `usage_error` with exit status 2 before any request",
+        "Register the group on the CLI's root command"
+      ],
+      "touches": [
+        "internal/cli/secrets.go",
+        "internal/cli/secrets_test.go",
+        "cmd/parley/"
+      ],
+      "depends_on": [
+        6
+      ]
+    }
+  ]
+}

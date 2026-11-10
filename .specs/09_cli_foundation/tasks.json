@@ -1,0 +1,249 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "09",
+  "spec_name": "cli_foundation",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/cli/... ./cmd/parley/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "02",
+      "reason": "defines the error envelope and the error_type catalogue the hub answers with, which the CLI prints as received and mirrors for its own errors"
+    },
+    {
+      "spec": "04",
+      "reason": "provides the credentials the client sends as Authorization: Bearer and parley login, the command that creates the configuration file this package reads and saves"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Declare commands through one helper and turn every failure into an error envelope and an exit status",
+      "criteria": [
+        "REQ-4.4",
+        "REQ-5.1",
+        "REQ-5.2"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/cli/errors_test.go and internal/cli/root_test.go and confirm they fail",
+        "Create internal/cli/errors.go: one error type for a hub error (HTTP status and the envelope's bytes as received) and constructors for the five CLI error types usage_error, client_error, wait_failed, wait_timeout and condition_not_met, each carrying a message",
+        "Add the exit status mapping: no error 0; hub error, wait_failed and wait_timeout 1; usage_error, client_error and any error of no named kind 2; condition_not_met 3",
+        "Add the error printer: a CLI error is written to stderr as {\"error\":{\"code\":0,\"message\":...,\"error_type\":...}} indented by 2 spaces with a newline; an error of no named kind is written as client_error with its text as the message",
+        "Create internal/cli/command.go: the one helper every command is declared through, taking the command's words, description, HTTP method and path relative to /api/v1 (or none), named arguments with required or optional, the auth value none, user or admin, and the run step; it stores the declaration in the cobra command's Annotations and sets Args from the declared arguments",
+        "In internal/cli/root.go add the persistent global flags --api-key (string) and --json (bool) beside --endpoint-url, silence cobra's own error and usage printing, and route flag errors, argument-count errors and unknown commands (at the top level and under a group) into usage_error; a group given an unknown word is a usage error, not help",
+        "Make cli.Run a thin wrapper over an unexported run that accepts extra commands for tests: it executes the root, prints any returned error with the error printer and returns the mapped exit status; a usage error is raised before settings are resolved and before any request, and prints the envelope alone with no usage text",
+        "Declare parley version through the helper (method GET, path /version, auth none, no arguments) so that an extra argument is a usage error; keep its behaviour otherwise",
+        "In test/e2e/build_test.go run the built parley binary with an unknown command and assert exit status 2 and a usage_error envelope on stderr"
+      ],
+      "touches": [
+        "internal/cli/errors.go",
+        "internal/cli/errors_test.go",
+        "internal/cli/command.go",
+        "internal/cli/root.go",
+        "internal/cli/root_test.go",
+        "internal/cli/version.go",
+        "cmd/parley/main.go",
+        "test/e2e/build_test.go"
+      ],
+      "done_when": [
+        "`go test ./internal/cli/... ./test/e2e/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Locate, read and save the client configuration file",
+      "criteria": [
+        "REQ-2.1",
+        "REQ-2.4",
+        "REQ-2.5",
+        "REQ-2.6"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/cli/config_test.go and confirm they fail",
+        "Use github.com/BurntSushi/toml v1.6.0, which package 03 added to go.mod and package 04's login already uses; add no second TOML module; confirm the signatures recorded in the package's external API against the module",
+        "Extend internal/cli/config.go, which package 04 created for parley login, into the one implementation every command uses, keeping package 04's tests in internal/cli/config_test.go passing: the path function returns $PARLEY_CONFIG_DIR/config.toml when the variable is set and non-empty, otherwise .parley/config.toml under the home directory, and reports when no home directory can be determined",
+        "Add the read function: a missing file, or no determinable path, gives empty settings and no error; a file that cannot be read, is not valid TOML, or holds endpoint_url, api_key or user_id with a non-string value gives a client error naming the path; reading creates nothing",
+        "Add the save function that parley login calls with endpoint_url, api_key and user_id: create the directory with mode 0700 when missing; decode the existing file into a map so that unknown keys and tables are kept; set the three keys; encode",
+        "Write the encoded bytes to a temporary file in the same directory created with mode 0600, sync it, set mode 0600 explicitly so that the umask and the old file's mode do not matter, and rename it over config.toml",
+        "On any failure (directory not writable, existing file unparseable, rename refused, no determinable path) return a client error naming the path, remove the temporary file and leave the previous file untouched",
+        "Make package 04's login command call this read and this save function and delete the read and save code it brought, so that internal/cli holds one implementation of the file"
+      ],
+      "touches": [
+        "go.mod",
+        "go.sum",
+        "internal/cli/config.go",
+        "internal/cli/config_test.go",
+        "internal/cli/login.go"
+      ],
+      "done_when": [
+        "`go test ./internal/cli/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Resolve the hub URL and the credential and send a command's request",
+      "criteria": [
+        "REQ-1",
+        "REQ-2.2",
+        "REQ-2.3",
+        "REQ-3.1"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/cli/config_test.go, internal/cli/client_test.go, internal/cli/root_test.go and internal/cli/version_test.go and confirm they fail; set PARLEY_CONFIG_DIR to an empty temporary directory in the existing version tests so that they do not read the developer's own file",
+        "Add settings resolution to internal/cli/config.go: for each of hub URL and credential take the first non-empty value of the flag (--endpoint-url, --api-key), the variable (PARLEY_ENDPOINT_URL, PARLEY_API_KEY) and the file key (endpoint_url, api_key); values are not trimmed",
+        "Read the configuration file only when a flag and the environment leave a needed setting empty; a read failure is then the client error of the read function",
+        "For a command whose auth is user or admin, resolve both settings before the run step; when one is missing, fail with a client error whose message names the flag, the variable and the file path of each missing setting and of no other",
+        "Validate the hub URL: an absolute URL with scheme http or https and a host, otherwise a client error naming the value; strip every trailing slash and keep any path it carries",
+        "Create internal/cli/client.go: the shared client built from the resolved settings; a request takes a method, a path relative to /api/v1, an optional query and an optional JSON body, and goes to <hub URL>/api/v1<path> with Authorization: Bearer <credential>; Content-Type: application/json only with a body",
+        "Hand the client to the run step of every declared command, so that no command builds a request by itself",
+        "Extend parley version in internal/cli/version.go: the configuration file's endpoint_url is the third source of its hub URL; it still sends no Authorization header; when the file cannot be parsed it writes one line 'warning: ' naming the file and goes on with no hub URL from the file, exit status 0",
+        "Confirm that the global flags are accepted before, between and after the command's words and that --json without help changes neither the request nor stdout"
+      ],
+      "touches": [
+        "internal/cli/config.go",
+        "internal/cli/config_test.go",
+        "internal/cli/client.go",
+        "internal/cli/client_test.go",
+        "internal/cli/command.go",
+        "internal/cli/root.go",
+        "internal/cli/root_test.go",
+        "internal/cli/version.go",
+        "internal/cli/version_test.go"
+      ],
+      "done_when": [
+        "`go test ./internal/cli/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Print results on stdout, hub errors on stderr and conditions with exit status 3",
+      "criteria": [
+        "REQ-4.1",
+        "REQ-4.2",
+        "REQ-4.3",
+        "REQ-4.5",
+        "REQ-5.3",
+        "REQ-5.4"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/cli/output_test.go and confirm they fail",
+        "Create internal/cli/output.go: the result printer writes a JSON body to stdout re-indented with 2 spaces and one trailing newline, without decoding it into values, so member order and number text stay as received",
+        "Make the default run step of a declared command send its request through the shared client and print the response body with the result printer",
+        "For a 2xx answer without a body print {} or, where the command's declaration carries a confirmation document, that document in the same form",
+        "For a status of 400 or above whose body is an object with an error member holding error_type, return a hub error carrying the body; the error printer writes it to stderr re-indented with 2 spaces, every member as received; stdout stays empty and the exit status is 1",
+        "Add the show-once mark to the declaration helper: after a successful result of a marked command write the line 'warning: this value is shown once and will not be shown again' to stderr; never on an error",
+        "Add the warning and progress writers (plain text lines on stderr; a warning begins with 'warning: ') and use the warning writer in parley version",
+        "Add the shared --fail-on helper: a command registers a bool flag whose name begins with --fail-on-, a condition over the result and a message; when the flag is given and the condition holds, the result is printed first and the command then returns condition_not_met with that message (exit status 3); otherwise exit status 0 with nothing on stderr"
+      ],
+      "touches": [
+        "internal/cli/output.go",
+        "internal/cli/output_test.go",
+        "internal/cli/command.go",
+        "internal/cli/errors.go",
+        "internal/cli/client.go",
+        "internal/cli/version.go"
+      ],
+      "done_when": [
+        "`go test ./internal/cli/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Encode path segments, bound every request in time, send it once and fail as a client error",
+      "criteria": [
+        "REQ-3.2",
+        "REQ-3.3",
+        "REQ-3.4",
+        "REQ-3.5",
+        "REQ-3.6"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/cli/client_test.go and test/e2e/cli_test.go and confirm they fail",
+        "Build request paths from the declared path pattern and the command's values: each :param is replaced by its value percent-encoded as one segment (a / becomes %2F; ?, #, % and spaces are encoded), and the encoded form is what goes on the wire",
+        "Give the client a request timeout of 30 seconds, held in a field tests can shorten, and let a command's declaration or a single request state another; the timeout covers connecting, sending and reading the whole body",
+        "Map a refused connection, an unresolvable host and a TLS failure to a client error whose message names the hub URL's host, and a timeout to a client error; return the error, never end the process from the client",
+        "Map an undecodable response to a client error whose message names the HTTP status: a 2xx with a non-empty body that is not JSON, and a status of 400 or above whose body is not an object with an error member holding error_type; offer a raw-response form of the request for the commands of later packages whose output is not one JSON document",
+        "Send every request exactly once: no retry on 429, on 5xx, on a timeout or on a broken connection; Retry-After is not acted on",
+        "Move the login command of package 04 (internal/cli/login.go) onto the shared client, the result and error printers, the exit-code mapping and the save function, and delete the error type, request code and printing it brought; its flags, flows and exit statuses do not change",
+        "Create test/e2e/cli_test.go with the two end-to-end cases of this package's execution paths: parley version through the configuration file, and parley login --api-key with a key the hub does not know, both against the hub's real handler listening on a free loopback port"
+      ],
+      "touches": [
+        "internal/cli/client.go",
+        "internal/cli/client_test.go",
+        "internal/cli/command.go",
+        "internal/cli/login.go",
+        "test/e2e/cli_test.go"
+      ],
+      "done_when": [
+        "`go test ./internal/cli/... ./test/e2e/... -count=1` passes",
+        "the non-test files of internal/cli import no package under internal/server (checked with `go list -deps ./cmd/parley`)"
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Show help as text and as JSON without a credential",
+      "criteria": [
+        "REQ-7"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/cli/help_test.go and confirm they fail",
+        "Create internal/cli/help.go: bare parley and a command group without a subcommand print their help on stdout and return 0, listing each direct subcommand with its description; help never resolves settings, never reads the configuration file and never sends a request",
+        "Add the command parley help [command], declared with auth none and no route; parley help <words> prints exactly what parley <words> --help prints: description, argument names, the command's flags with defaults and the global flags",
+        "With --json and a command that is not a group, print one object built from the declaration: name (the words after parley joined by single spaces), description, method and path (null for both when the command calls no single route), args as {name, required} in order, flags sorted by name as {name without dashes, type as the flag library names it, required, default as a string, description} with the three global flags included, and auth",
+        "With --json and a group, or no command, print {\"commands\":[...]} holding the object of every command under it that is not a group, at any depth, sorted by name",
+        "parley help with words that name no command is a usage error naming the words, with and without --json",
+        "Declare parley help, parley version and package 04's parley login through the helper with their auth and route, and add the test that walks the real command tree and fails for any command that is not a group and lacks a description, a valid auth or a consistent method and path"
+      ],
+      "touches": [
+        "internal/cli/help.go",
+        "internal/cli/help_test.go",
+        "internal/cli/command.go",
+        "internal/cli/root.go",
+        "internal/cli/version.go",
+        "internal/cli/login.go"
+      ],
+      "depends_on": [
+        4
+      ],
+      "done_when": [
+        "`go test ./internal/cli/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Wait for a long operation with --wait, --timeout and --poll-interval",
+      "criteria": [
+        "REQ-6"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/cli/wait_test.go and confirm they fail",
+        "Create internal/cli/wait.go: a duration flag type that accepts a whole number followed by exactly one of s, m, h, d (d is 24 hours) and reports its type as duration; zero, a sign, a fraction, a missing or unknown unit, spaces and compound forms are refused",
+        "Add the wait helper a command is declared with: it registers --wait (bool), --timeout (default 5m) and --poll-interval (default 5s), and takes the request that starts the operation, a function from a record to the request that polls it, and a function that classifies a record as not terminal, successful or unsuccessful",
+        "Validate --timeout and --poll-interval before the start request whether or not --wait is given; a refused value is a usage error naming the flag and nothing is sent",
+        "Without --wait, print the start request's answer and send nothing else",
+        "With --wait: classify the start record first and end at once when it is terminal; otherwise set the deadline to the moment the start request returned plus --timeout, wait one poll interval, poll, classify, and repeat one interval after each answer; a state that is not terminal, 'waiting to retry' included, never ends the wait",
+        "Write progress to stderr as 'waiting: <state>' when the wait begins and at each change of the observed state; stdout receives nothing until the end",
+        "On a successful terminal record print it as the one document on stdout and return no error; on an unsuccessful one print it and return wait_failed naming the state",
+        "At the deadline, abandon a poll in flight, print nothing on stdout and return wait_timeout; send no request that cancels the operation",
+        "End the wait with the hub's error when a poll is answered with the envelope (exit status 1) and with a client error when a poll fails on the client side (exit status 2), printing nothing on stdout in both cases",
+        "Let a command receive the final record and print a document of its own in place of it, and give tests a hook that sets the poll interval below one second"
+      ],
+      "touches": [
+        "internal/cli/wait.go",
+        "internal/cli/wait_test.go",
+        "internal/cli/command.go",
+        "internal/cli/output.go"
+      ],
+      "depends_on": [
+        5,
+        6
+      ],
+      "done_when": [
+        "`go test ./internal/cli/... -count=1` passes"
+      ]
+    }
+  ]
+}

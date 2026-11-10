@@ -1,0 +1,185 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "19",
+  "spec_name": "git_push_to_change",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/gitserver/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "18",
+      "reason": "registers its options stage and its mapping stage with the push processor in internal/gitserver, and reads from the ref writer the accepted ref updates with their direct flag and the version a ref-updated stage recorded; the parley.git.push event receives the session id the options stage sets"
+    },
+    {
+      "spec": "22",
+      "reason": "calls its change component to find the open change of a source branch, open a change and, after a lost race, record a version; the versions of pushes to existing changes are recorded by the ref-updated stage package 22 registers with package 18"
+    },
+    {
+      "spec": "52",
+      "reason": "emits its hub events through the event log component"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Parse and validate the parley push options",
+      "criteria": [
+        "REQ-1.1",
+        "REQ-1.2",
+        "REQ-1.3",
+        "REQ-1.4",
+        "REQ-1.5"
+      ],
+      "steps": [
+        "Add the accepted-options table and the refusal tables to internal/gitserver/pushoptions_test.go and confirm they fail",
+        "Add a validation function in internal/gitserver/pushoptions.go that takes the raw option strings of a push, the caller, the pushed workspace and a session-linking collaborator, and returns either the validated option set (change requested, target, title, intent, draft, session id) or a refusal carrying the exact message the client will see",
+        "Check the number of options first: more than 16 is refused with `too many push options: at most 16 are accepted`",
+        "Then walk the options in the order sent and refuse at the first invalid one: longer than 1,024 bytes (name and value together, for every option, the name being the text before the first `=`); for names starting with `parley.`: unknown name, given more than once, a `=` on `parley.change` or `parley.draft`, no `=` or an empty value on the other four, a `parley.title` over 200 Unicode characters",
+        "Split each option at its first `=` only, so a value may itself contain `=`; ignore every option whose name does not start with `parley.`; set change requested when `parley.target` is present",
+        "Validate `parley.target` by asking the ref-name check that package 21 adds to internal/gitrepo for its ref routes (git check-ref-format) whether `refs/heads/<value>` is a well-formed ref name; a branch that does not exist is not refused here",
+        "Declare the interface SessionLinker in internal/gitserver with one operation (caller, session id, workspace -> accepted, refused, or internal error), the same name and operation packages 21 and 22 declare in their own Go packages; package 49 owns the check and hands it to all three. Call it for `parley.session` after the other checks of that option; map refused, and no registered linker, to `invalid push option parley.session: unknown session` and an internal error to `internal error; try again`, never to an accepted session",
+        "Use the wording of the reasons exactly as the criteria give them; they are matched by tests and by agents"
+      ],
+      "touches": [
+        "internal/gitserver/pushoptions.go",
+        "internal/gitserver/pushoptions_test.go",
+        "internal/gitrepo/"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Refuse invalid options before the pack and attribute the push to its session",
+      "criteria": [
+        "REQ-1.6",
+        "REQ-2.1",
+        "REQ-2.2"
+      ],
+      "steps": [
+        "Add the invalid-option push cases and the session-on-events cases to internal/gitserver/pushchange_integration_test.go, driving a real git client against an in-process hub, and confirm they fail",
+        "Register the option validation of task 1 as the options stage of package 18's push processor, which runs it right after the commands and push options are read and before the pack is received into quarantine",
+        "On a refusal return the message M to the processor of package 18, which discards the rest of the request body without storing any object, skips the push rules, and answers HTTP 200 with a receive-pack result of `unpack ok`, `ng <ref> M` for every command of the push, and one side-band line `error: M` when the client negotiated a side band",
+        "Make sure a refused push moves no ref, emits no event and touches no change, and that the request is counted with result `refused` in `parley_git_requests_total` through the result package 18 returns to the counter of package 17",
+        "Leave the SessionLinker of the git server unset here: package 49 hands its session-linking check to it where the hub assembles its components, and until then every `parley.session` is refused; the tests of this package register an accepting linker",
+        "Have the options stage set the validated session id on the push, so that the ref writer of package 18 gives it to the ref-updated stages (the version package 22 records) and to each `parley.git.push` event in `session_id`, null when the option is absent; this applies to pushes of tags and other refs too"
+      ],
+      "touches": [
+        "internal/gitserver/",
+        "internal/gitserver/pushoptions.go",
+        "internal/gitserver/pushchange_integration_test.go",
+        "cmd/parleyd/"
+      ],
+      "done_when": [
+        "`git push -o parley.titel=x` against the test hub exits non-zero with the `remote: error:` line and leaves no object in the hub repository"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Decide the outcome of each pushed branch and word its line",
+      "criteria": [
+        "REQ-3.1",
+        "REQ-3.2",
+        "REQ-3.3",
+        "REQ-3.4",
+        "REQ-3.5",
+        "REQ-3.6",
+        "REQ-3.7",
+        "REQ-5.1",
+        "REQ-5.2"
+      ],
+      "steps": [
+        "Add the decision tables to internal/gitserver/changemap_test.go, with a fake change service that records calls and returns scripted results, and the line table to internal/gitserver/pushreport_test.go; confirm they fail",
+        "Declare in internal/gitserver/changemap.go the narrow change-service interface the mapping needs: find the `draft` or `open` change whose source is a given workspace and branch; record a version of kind `push` for a change with a head, the caller's credential and an optional session (used only after a lost race to open); open a change from a source with optional target, title, intent, draft flag, session, the author and the caller's credential",
+        "Add the mapper: it takes the accepted ref updates of a push in command order (each with its ref, new head, created, deleted and direct flags and the version the ref writer reported for it), the pushed workspace (kind, parent, `auto_change`), the caller, the validated options and a line sink, and returns one outcome per mapped branch",
+        "Skip every update that is not under `refs/heads/` and every delete, with no call and no line",
+        "For each remaining branch apply the first rule that fits: a version the ref writer reported for the update (recorded by the ref-updated stage of package 22 inside the commit step) is the outcome 'new version', whatever the options and with no call; a branch with no reported version that the lookup finds as the source of a `draft` or `open` change already has the pushed head as its current version and gets no call and no line; a branch flagged as a direct push opens nothing and gets the `branch is protected and was pushed directly` warning only when change was requested; change requested, or a task fork with `auto_change` true, opens a change; otherwise nothing and no line",
+        "When the open is refused with `change_exists`, record a version on the change that refusal names, through the change service in a store transaction of the mapping, and report it as a new version",
+        "When recording a version reports that the head is already the current version's head, send no line",
+        "Pass the push's session id with every open request and with a record-version request after a lost race, and pass none when the option is absent",
+        "Add the line formatter in internal/gitserver/pushreport.go for the four outcomes: `change <workspace>#<number> version <n>`, `change <workspace>#<number> version 1 (opened)`, `change <workspace>#<number> version 1 (opened, draft)` and `warning: no change for <branch>: <reason>`, where the workspace is the slug the change belongs to and the branch is the ref name without `refs/heads/`; no URL"
+      ],
+      "touches": [
+        "internal/gitserver/changemap.go",
+        "internal/gitserver/changemap_test.go",
+        "internal/gitserver/pushreport.go",
+        "internal/gitserver/pushreport_test.go"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Run the mapping in the push pipeline and report it to the git client",
+      "criteria": [
+        "REQ-3.8",
+        "REQ-5.3",
+        "REQ-5.4",
+        "REQ-5.5",
+        "REQ-2.3"
+      ],
+      "steps": [
+        "Add the ordering, no-side-band, refused-push and session-on-versions cases to internal/gitserver/pushchange_integration_test.go and the open-then-version scenario to test/e2e/push_change_test.go; confirm they fail",
+        "Implement the change-service interface of task 3 with the real internal/change component (OpenChangeOfBranch, RecordVersion, Open, each in a store transaction the adapter opens) and give it to the git server where the hub assembles its components",
+        "Register the mapper as the mapping stage of package 18's push processor, which calls it after all refs of an accepted push are written and before the `parley.git.push` events are emitted and the push is answered, passing the accepted updates in command order with the direct flag and the reported version of each",
+        "Rely on package 18 not to call the mapping stage for a push in which any ref was refused (a failed ref-updated stage included), whose pack failed, whose options were refused, or that has no commands, and cover each case in the integration tests",
+        "Write each outcome's line to the side band, in command order, before the status report; when the client negotiated no side band, write no line and still run the mapping",
+        "Answer the push only after the mapper has returned, so the change a line names is readable through the changes API when `git push` returns"
+      ],
+      "touches": [
+        "internal/gitserver/",
+        "internal/gitserver/changemap.go",
+        "internal/gitserver/pushreport.go",
+        "internal/gitserver/pushchange_integration_test.go",
+        "cmd/parleyd/",
+        "test/e2e/push_change_test.go"
+      ],
+      "done_when": [
+        "`git push -o parley.change` against the test hub prints `remote: change demo#1 version 1 (opened)` and the next plain push of the same branch prints `remote: change demo#1 version 2`"
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Open changes in the right workspace with the options of the push",
+      "criteria": [
+        "REQ-4"
+      ],
+      "steps": [
+        "Add the open-request cases to internal/gitserver/changemap_test.go and the fork, defaults, several-branches and existing-change cases to internal/gitserver/pushchange_integration_test.go; add the fork scenario to test/e2e/push_change_test.go; confirm they fail",
+        "For a push to a repository workspace, open the change in that workspace with source `{pushed slug, branch}`",
+        "For a push to a task fork, open the change in the fork's parent with source `{fork slug, branch}`",
+        "Pass `parley.target` as the target branch when given and no target otherwise, so that the default of the change component applies (the fork's base branch in a fork, the default branch elsewhere)",
+        "Pass `parley.title`, `parley.intent` and the draft flag when given and nothing otherwise, so that the title and intent defaults of the change component apply (head commit subject; head commit body, then the fork's `purpose`)",
+        "Pass the pushing credential's actor as the author of the change",
+        "Give the same options to every open request of one push",
+        "Send none of target, title, intent or draft with a record-version request, and rely on the ref-updated stage to pass none: a push to a branch that already has a `draft` or `open` change leaves that change's title, intent, target branch and state as they were"
+      ],
+      "touches": [
+        "internal/gitserver/changemap.go",
+        "internal/gitserver/changemap_test.go",
+        "internal/gitserver/pushchange_integration_test.go",
+        "test/e2e/push_change_test.go"
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Report a change that cannot be opened as a warning, never as a failed push",
+      "criteria": [
+        "REQ-6"
+      ],
+      "steps": [
+        "Add the refusal-to-reason table, the own-target, scope and internal-failure cases to internal/gitserver/changemap_test.go and the accepted-push-with-warning cases to internal/gitserver/pushchange_integration_test.go; confirm they fail",
+        "Before calling the open operation, check that the branch is not its own target (target workspace equal to the pushed workspace and the given or default target branch equal to the pushed branch); if it is, the outcome is the warning `branch is its own target`",
+        "Before calling the open operation, check the scope of a PAT: without `changes:write` the outcome is the warning `token lacks scope changes:write`; API keys and the admin token are not scope-checked; recording a version on an existing change makes no such check",
+        "Translate a refusal of the open operation into the reason text: `target_not_found`, `nothing_to_land`, `merge_commits_unsupported` and `intent_required` get the fixed texts of the criteria with the target branch name filled in; any other refusal gets its message followed by its `error_type` in parentheses",
+        "Turn an untyped error and a recovered panic from the lookup, the open or the record-version call after a lost race into the reason `internal error`, log the underlying error on the server, and never send its text to the client",
+        "Go on with the next branch after any failure; the mapper itself never returns an error to the push pipeline",
+        "Confirm in the integration cases that a push whose mapping failed keeps its ref, reports `ok <ref>`, emits its `parley.git.push` event and lets `git push` exit 0"
+      ],
+      "touches": [
+        "internal/gitserver/changemap.go",
+        "internal/gitserver/changemap_test.go",
+        "internal/gitserver/pushchange_integration_test.go"
+      ]
+    }
+  ]
+}

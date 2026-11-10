@@ -1,0 +1,214 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "02",
+  "spec_name": "http_api_conventions",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/server/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "01",
+      "reason": "the parleyd HTTP server in internal/server, with /healthz, /readyz and /version, that this middleware wraps and registers routes on"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Write every REST error as one envelope from one catalogue",
+      "criteria": [
+        "REQ-2.1",
+        "REQ-2.2",
+        "REQ-2.3",
+        "REQ-2.4"
+      ],
+      "steps": [
+        "Add the envelope and catalogue behaviours to internal/server/errors_test.go as table-driven tests against a response recorder and confirm they fail",
+        "Add the API error value in internal/server/errors.go: an error type, a status, a message for people and optional extra members; it implements Go's error interface so handlers and checks can return it",
+        "Add one constructor per catalogued type that fixes its status: the 13 generic types and insufficient_scope, token_bound, path_not_allowed and workspace_archived, with exactly the statuses the catalogue criterion lists",
+        "Add the constructor other packages use for a specific type of their own: a name and a status given by the caller",
+        "Let an error carry extra members: named members beside the standard three, or one details object; refuse an extra member named code, message or error_type so it cannot replace a standard one",
+        "Add the writer that answers an API error: status from the error, body {\"error\":{code, message, error_type, extras}} with code equal to the status, content type application/json; charset=utf-8",
+        "Add the JSON success writer beside it (a status and a value, same content type) so that later tasks and packages answer bodies in one way"
+      ],
+      "touches": [
+        "internal/server/errors.go",
+        "internal/server/errors_test.go"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Register routes under /api/v1 and run the installed checks in fixed positions",
+      "criteria": [
+        "REQ-1",
+        "REQ-3.3",
+        "REQ-3.4",
+        "REQ-3.5",
+        "REQ-3.6"
+      ],
+      "steps": [
+        "Add the route-matching behaviours to internal/server/route_test.go and the position behaviours to internal/server/pipeline_test.go, driving the server's handler with net/http/httptest, and confirm they fail",
+        "Add the route registration call in internal/server/route.go: a method, a pattern relative to the fixed mount /api/v1 with :param parameters, a handler that returns an error, and the route's declarations (public, create route with its show-once members, own body limit, own request content type, own Cache-Control value, own feature check, the one scope a PAT needs as a name this package does not interpret, and named marks with a value that packages 04, 05, 07 and 08 define); later tasks of this package and the installed checks read these declarations",
+        "Mount the registered routes on the server that package 01 builds, using the standard library's method-and-pattern router, and give handlers the path parameter values",
+        "Answer a path that matches no route with the 404 not_found envelope, also outside /api/v1, and never redirect: a trailing slash or a doubled slash is simply another, unknown path",
+        "Answer a known path under an unregistered method with the 405 method_not_allowed envelope and an Allow header listing the methods registered for that path, joined by a comma and a space",
+        "Add the check pipeline in internal/server/pipeline.go: after route matching it runs, in this order, the authentication position, a rate-limit stage and a body stage (both pass everything until their tasks fill them), the route's feature check, the binding-guard position, the scope position, the access position and then the handler; the first error returned ends the request and is written as its envelope",
+        "Add the calls with which later packages install an authenticator, a binding guard, a scope check and access checks; the access position holds every access check installed (package 05's admin check, package 07's workspace access check) and runs them in installation order; give each check the matched route (method, pattern as registered, declarations, path parameter values); an empty guard, scope or access position and an undeclared feature check pass",
+        "Refuse every non-public route with 401 unauthenticated while no authenticator is installed, before the handler",
+        "Define the caller the authenticator reports (the credential's id, and a user id or the admin-token marker) and carry it in the request's context so that each later check and the handler read the caller of their own request",
+        "Keep the pipeline free of any lock held across a handler call, so that a request blocked in its handler does not hold up another request on the same or another route"
+      ],
+      "touches": [
+        "internal/server/route.go",
+        "internal/server/route_test.go",
+        "internal/server/pipeline.go",
+        "internal/server/pipeline_test.go",
+        "internal/server"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Bound and type-check request bodies before any handler sees them",
+      "criteria": [
+        "REQ-4"
+      ],
+      "steps": [
+        "Add the body behaviours to internal/server/body_test.go as tables over sizes, transfer forms, methods and content types, and confirm they fail",
+        "Add the body-limit option to the server's options with the default 1048576 bytes; package 03 will set it from configuration",
+        "Fill the pipeline's body stage in internal/server/body.go: read the whole body up to one byte past the limit that applies (the route's own, else the server's), refuse with 413 payload_too_large when the declared length or the bytes read exceed it, and hand the buffered bytes on to the later checks and the handler",
+        "After the size check, on POST, PUT and PATCH with a non-empty body, compare the Content-Type as a media type, ignoring letter case and parameters, with application/json or with the content type the route states; refuse a missing or different type with 415 unsupported_media_type",
+        "Let a request with no body pass both checks whatever its Content-Type says",
+        "Add the JSON body helper handlers call: decode the buffered body into the handler's value, ignore unknown members, and return 400 invalid_request for an empty body, invalid JSON, a value that is not an object, or bytes other than white space after the object"
+      ],
+      "touches": [
+        "internal/server/body.go",
+        "internal/server/body_test.go",
+        "internal/server/pipeline.go"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Rate-limit requests per credential and complete the order of checks",
+      "criteria": [
+        "REQ-9",
+        "REQ-3.1",
+        "REQ-3.2"
+      ],
+      "steps": [
+        "Add the rate-limit behaviours to internal/server/ratelimit_test.go with a clock the test advances, and the full-order and public-route tables to internal/server/pipeline_test.go with recording stubs in every position, and confirm they fail",
+        "Add the requests-per-minute option to the server's options with the default 600, and a clock option that tests replace",
+        "Add the limiter in internal/server/ratelimit.go as an exported component keyed by a string: a fixed window of 60 seconds per key that starts at the key's first counted request, admits the configured number of requests, and reports for a refused request the seconds to the window's end rounded up, at least 1; a limit of 0 admits everything; counts live in memory only; package 17 calls the same limiter for the git server",
+        "Make the limiter safe for concurrent use and drop a key's window once it has ended, so the map does not grow without bound",
+        "Fill the pipeline's rate-limit stage: the key is the caller's credential id when authentication reported a caller, otherwise the connection's remote IP address without the port; forwarding headers are not read",
+        "Refuse an over-limit request with 429 rate_limited and a Retry-After header in whole seconds, before the body stage",
+        "Count a request that authentication refused against its client address and still answer it with the authenticator's own error; the address count decides the answer only on public routes",
+        "Count every request that reaches the stage whatever its later outcome, and never count or refuse /healthz, /readyz, /version, /metrics or a request answered 404 or 405 at route matching",
+        "On a public route skip the authentication, binding-guard, scope and access positions, and keep the rate-limit stage (by client address) and the body stage",
+        "Confirm with the full-order table that each failing position answers with its own error and that no later position or the handler ran"
+      ],
+      "touches": [
+        "internal/server/ratelimit.go",
+        "internal/server/ratelimit_test.go",
+        "internal/server/pipeline.go",
+        "internal/server/pipeline_test.go"
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Stamp every response with a request id and headers, log it, and answer unexpected failures as internal",
+      "criteria": [
+        "REQ-8",
+        "REQ-2.5"
+      ],
+      "steps": [
+        "Add the request-id, header, Cache-Control and access-log behaviours to internal/server/headers_test.go and the unexpected-failure table to internal/server/pipeline_test.go, with the server's logger writing JSON lines to a buffer, and confirm they fail",
+        "Add the outermost middleware in internal/server/headers.go, wrapped around the whole server of package 01 so that it also covers /healthz, /readyz, /version, unknown paths and surfaces other packages mount later",
+        "Take the request id from an incoming X-Request-ID that has the 36-character hyphenated hexadecimal UUID form in either letter case, and otherwise generate a random version 4 UUID from crypto/rand; put it in the request's context and in the response's X-Request-ID",
+        "Set X-Content-Type-Options: nosniff, X-Frame-Options: DENY and Referrer-Policy: no-referrer on every response before any handler writes",
+        "Set Cache-Control: no-store on every response under /api/v1, errors from route matching and from the checks included, unless the matched route states its own value; set no-cache on /healthz and /readyz and public, max-age=300 on /version",
+        "Add the health-probe logging option (default off) and write the access log in internal/server/accesslog.go: one JSON line per finished request with method, path (the URL path only, never the query string), status, duration_ms and request_id through the server's logger; write the line for /healthz and /readyz at debug level and only while the option is on",
+        "Recover a panic in a handler or check, and treat an error that is not an API error the same way: answer 500 internal with the fixed message internal error, log the cause with the request id, put nothing of the cause in the response, and keep the server serving"
+      ],
+      "touches": [
+        "internal/server/headers.go",
+        "internal/server/headers_test.go",
+        "internal/server/accesslog.go",
+        "internal/server/pipeline.go",
+        "internal/server/pipeline_test.go",
+        "internal/server"
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Page every list with a limit and an opaque cursor",
+      "criteria": [
+        "REQ-5"
+      ],
+      "steps": [
+        "Add the list behaviours to internal/server/list_test.go over a test route that pages an in-memory ordered collection, the page walk as a loop over collection sizes and limits, and confirm they fail",
+        "Add the page-request helper in internal/server/list.go: read limit (default 50, bounds 1 to 200, or the default and bounds the route states) and cursor from the query; return 400 invalid_request for a limit that is not an integer or is out of bounds",
+        "Encode a cursor as URL-safe base64 of a JSON document holding the position after the last item of the page and a fingerprint of the query: the route pattern, the values of its path parameters and every query parameter except cursor and limit",
+        "Return 400 invalid_request for a cursor that does not decode, lacks a position, or carries a fingerprint other than the current request's; accept the same cursor with a different limit",
+        "Add the page-response helper: the handler fetches one item more than the limit, the helper writes at most limit items as items (an empty array for none, never null) and sets next_cursor to the cursor after the last written item when the extra item exists, else to null",
+        "Give the handler the decoded position as an opaque value of its own choosing (the keyset of its total order), so that paging continues after the last item seen and an item inserted earlier in the order neither repeats nor hides another"
+      ],
+      "touches": [
+        "internal/server/list.go",
+        "internal/server/list_test.go"
+      ],
+      "depends_on": [
+        2
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Replay a create that is sent again under the same Idempotency-Key",
+      "criteria": [
+        "REQ-6"
+      ],
+      "steps": [
+        "Add the idempotency behaviours to internal/server/idempotency_test.go with a clock the test advances and a create test route that counts its handler calls, the concurrent case under the race detector, and confirm they fail",
+        "Add the record store interface, its in-memory implementation (the default) and the server option with which package 03 installs its store-backed implementation, in internal/server/idempotency.go; write every later step of this task against the interface only: a record is found by key, caller (the user id, or the admin-token marker) and route (method and concrete request path) and holds the SHA-256 of the request body, the response body and the time it was written",
+        "Add an idempotency stage to the pipeline after the access position and before the handler, active only on routes declared as create routes; on every other route the header is ignored",
+        "Refuse an Idempotency-Key header that is present but empty, or longer than 255 characters, with 400 invalid_request; a request without the header runs the handler and records nothing",
+        "On a record younger than 24 hours with the same body hash, answer 200 with the recorded body and do not run the handler; with a different body hash, answer 409 conflict and leave the record as it is",
+        "Otherwise run the handler while capturing its response; when the status is 2xx, remove the route's declared show-once members (top-level or dotted paths such as token.token) from a copy of the body and store that copy; send the caller the handler's response unchanged",
+        "Record nothing when the request ends with any other status",
+        "Hold a per-record gate while a first request with a key is running, so that concurrent requests with the same key, caller and route wait for it: they replay its record when it succeeded, and exactly one of them runs next when it failed; the gate is never held across unrelated keys",
+        "Treat a record 24 hours old or older as absent, and remove expired records when a new record is written"
+      ],
+      "touches": [
+        "internal/server/idempotency.go",
+        "internal/server/idempotency_test.go",
+        "internal/server/pipeline.go"
+      ],
+      "depends_on": [
+        3
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Format timestamps and parse durations in one helper package",
+      "criteria": [
+        "REQ-7"
+      ],
+      "steps": [
+        "Add the timestamp and duration tables to internal/server/timefmt/timefmt_test.go and confirm they fail",
+        "Create the leaf package internal/server/timefmt, which imports nothing else of the project so that the configuration loader can use it",
+        "Add the formatter: any instant becomes RFC 3339 in UTC with whole seconds and the suffix Z, the fraction of a second cut off, not rounded",
+        "Add a timestamp type for response structs that marshals to that form, so that every response field is written the same way",
+        "Add the duration parser: a non-negative whole number followed by exactly one of s, m, h or d, where d is 24 hours",
+        "Return an error that names the value, and a zero duration, for every other form: empty, no unit, unknown unit, upper-case unit, sign, fraction, spaces, compound forms and a number too large to represent; never panic"
+      ],
+      "touches": [
+        "internal/server/timefmt/timefmt.go",
+        "internal/server/timefmt/timefmt_test.go"
+      ],
+      "depends_on": [
+        1
+      ]
+    }
+  ]
+}

@@ -1,0 +1,345 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "25",
+  "spec_name": "optimistic_landing",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/land/... ./internal/gitrepo/... ./internal/config/... ./internal/cli/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "09",
+      "reason": "builds its CLI commands on the client, output and exit-code helpers of the CLI foundation"
+    },
+    {
+      "spec": "11",
+      "reason": "reads the workspace settings land.strategy, land.by_author and land.delete_source it defines"
+    },
+    {
+      "spec": "22",
+      "reason": "lands the versions of the change record it defines and writes landed commits into its commit-to-change mapping"
+    },
+    {
+      "spec": "23",
+      "reason": "moves a change from open to landed through its state machine, records mergeable conflict and schedules mergeability checks after a land"
+    },
+    {
+      "spec": "52",
+      "reason": "emits its hub events through the event log component"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Record land attempts durably and serve them read-only",
+      "criteria": [
+        "REQ-9"
+      ],
+      "steps": [
+        "Add the read behaviours to internal/land/routes_test.go and the store behaviours to internal/land/attempt_test.go, with a fixture that builds a real store and a workspace in t.TempDir(), and confirm they fail",
+        "Add the land attempt record in internal/land/attempt.go with every field of the attempt object: id (UUID), workspace slug, target branch, changes bottom first, status, trigger, strategy, attempts, onto_sha, landed_sha, noop, commits, conflict, blocked, error, override, policy_revision, requested_by, session_id, created_at, finished_at; and the version number each covered change had when the attempt was created",
+        "Add the store schema for attempts through the migration mechanism of internal/store, with a lookup of the attempts that cover a change number and of the running attempts",
+        "Add store operations: create a running attempt, read one by workspace and id, finish one (set a final status and its result fields in one write, refused when the attempt is already final), list by change, list by workspace with filters",
+        "Encode the attempt as JSON with every member always present, null where it has no value, commits as an empty array, and timestamps as RFC 3339 UTC whole seconds",
+        "Register GET /workspaces/:slug/changes/:number/lands, GET /workspaces/:slug/lands and GET /workspaces/:slug/lands/:id on the server of package 02 with scope changes:read and workspace need read",
+        "Order both lists by created_at descending then id descending and page them with the list helper of package 02; the workspace list filters by repeatable status (joined by or), target_branch and since (created at or after), and refuses an unknown status, a since that is not an RFC 3339 timestamp, an out-of-range limit and a foreign cursor with 400 invalid_request",
+        "Answer 404 land_not_found for an id that is unknown, malformed or belongs to another workspace, and 404 change_not_found for a change number the workspace does not have"
+      ],
+      "touches": [
+        "internal/land/attempt.go",
+        "internal/land/attempt_test.go",
+        "internal/land/routes.go",
+        "internal/land/routes_test.go",
+        "internal/store"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Replay one commit onto another in a bare repository and classify conflicts",
+      "criteria": [
+        "REQ-4.6"
+      ],
+      "steps": [
+        "Add the replay behaviours to internal/gitrepo/replay_test.go and the classification table to internal/land/conflict_test.go, each building small two-sided histories with the real git binary in t.TempDir(), and confirm they fail",
+        "Build the replay on the trial rebase that package 20 adds to internal/gitrepo (one step of `git merge-tree --write-tree` with an explicit merge base, the replayed commit's parent) and the commit-keeping form package 21 adds for its rebase route; add internal/gitrepo/replay.go only for what they lack, with `git commit-tree`, and add no second primitive",
+        "The primitive takes the commit to replay, the commit to put it on, and the committer identity; it returns the new commit id, or 'empty' when the resulting tree equals the tree it was put on, or a conflict with one entry per conflicted path carrying the three index stages (id, mode and path of base, ours, theirs; absent sides empty)",
+        "Keep the replayed commit's author name, email, author date and message; set committer name and email from the arguments, never from the process environment",
+        "Make the primitive take a context and kill the git subprocess when the context ends; return an error value for any git failure that is not a conflict",
+        "Report a conflict as ConflictReport, the type package 20 declares in internal/gitrepo/conflictreport.go, with the kind (content, add_add, modify_delete, delete_modify, rename, mode, binary or submodule) and base, ours and theirs as {sha, mode, path} or null as that replay classifies them; where the classification of internal/gitrepo lacks a kind, complete it there; internal/land/conflict.go declares no report type and no classification of its own",
+        "Add a commit-creation helper for a given tree, parents, author, committer and message, which the squash strategy will use"
+      ],
+      "touches": [
+        "internal/gitrepo/replay.go",
+        "internal/gitrepo/replay_test.go",
+        "internal/land/conflict.go",
+        "internal/land/conflict_test.go"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Land one change by rebase with atomic bookkeeping",
+      "criteria": [
+        "REQ-4.1",
+        "REQ-4.2",
+        "REQ-4.4",
+        "REQ-5.3"
+      ],
+      "steps": [
+        "Add the engine fixture (real store, bare repository, a helper that opens a change from a branch through package 22's entry point) and the rebase, no-op and bookkeeping behaviours to internal/land/replay_test.go and internal/land/engine_test.go, and confirm they fail",
+        "Add two registration points in internal/land/gate.go: the policy gate (asked with workspace, change, version and caller; answers status, reason, requirements and policy revision), which package 27 registers and whose default answers ready with revision 0; and the override rule (asked with the request's override and a gate answer that is not ready; answers whether the override lets it pass), which package 29 registers and whose default passes nothing; the engine asks the gate once per change before the replay and stores the revision on the attempt",
+        "Add the run of one attempt in internal/land/engine.go: read the target head, compute the change's own commits (those of the landed version that are not in its base), and build the commits to land in internal/land/replay.go",
+        "With strategy rebase replay each own commit in order with the landing identity as committer; when the first own commit's parent is the target head use the commits unchanged; drop a commit whose replay is empty",
+        "When no commit is left finish the attempt landed with noop true, landed_sha and onto_sha equal to the target head and no commits entries, mark the change landed with landed.sha equal to that head, write parley.change.land with noop true and no parley.git.push",
+        "Move the target from the head that was read to the new head by compare-and-swap through pushrule.Apply, the ref writer of package 18 in internal/gitserver/pushrule, with via land and an allowed verdict for the one update built here, so that parley.git.push is written for the ref with direct false; do not call Evaluate, so a protected target moves like any other",
+        "In internal/land/commit.go do the bookkeeping in one store transaction: each change to landed through package 23's state transition with landed {sha, at, by, land_id, commits}, each landed commit into package 22's commit-to-change mapping, the attempt to landed with onto_sha, landed_sha, attempts, commits and finished_at, and one parley.change.land event per change with the caller as actor, the request's session and the metadata land_id, target_branch, onto_sha, landed_sha, strategy, attempts, noop, trigger, override, policy_revision",
+        "Read the landing identity from the [land] committer_name and committer_email options the engine is constructed with (defaults Parley and parley@localhost)"
+      ],
+      "touches": [
+        "internal/land/engine.go",
+        "internal/land/engine_test.go",
+        "internal/land/replay.go",
+        "internal/land/replay_test.go",
+        "internal/land/commit.go",
+        "internal/land/gate.go"
+      ],
+      "depends_on": [
+        1,
+        2
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Retry on a moved target and survive a crash in the atomic step",
+      "criteria": [
+        "REQ-5.1",
+        "REQ-5.2",
+        "REQ-5.4",
+        "REQ-5.7"
+      ],
+      "steps": [
+        "Add the retry, contention, failure and fault-injection behaviours to internal/land/engine_test.go and internal/land/commit_test.go and confirm they fail; add a test-only hook the engine calls between the replay and the compare-and-swap, and fault points around the atomic step",
+        "When the compare-and-swap reports that the target moved, read the new head and build the commits again on it; count every compare-and-swap try in attempts and set onto_sha to the head of the last try",
+        "Stop after the configured max_attempts tries (default 10) and finish the attempt failed with error contention; leave the change open",
+        "Finish the attempt failed with error internal when the target branch does not exist at the read or at the move, or when the gate, the store or a git command returns an error that is not a conflict; never create the missing branch, and return the error to the caller of the engine instead of ending the process",
+        "Before each compare-and-swap commit a journal entry to the store: attempt id, target ref, old head, new head and the commits entries; remove it in the bookkeeping transaction, and remove it when the compare-and-swap loses",
+        "Add journal reconciliation, run at start before requests are served: for an entry whose ref holds the new head, run the bookkeeping transaction and write the events exactly once; drop any other entry and leave its attempt running",
+        "Make reconciliation idempotent: a second run over the same store changes nothing"
+      ],
+      "touches": [
+        "internal/land/engine.go",
+        "internal/land/engine_test.go",
+        "internal/land/commit.go",
+        "internal/land/commit_test.go",
+        "internal/store"
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Run attempts on a bounded pool under a deadline and load the [land] keys",
+      "criteria": [
+        "REQ-5.6",
+        "REQ-8.2",
+        "REQ-8.6"
+      ],
+      "steps": [
+        "Add the pool and deadline behaviours to internal/land/pool_test.go and the configuration table to internal/config/land_test.go and confirm they fail",
+        "Add the [land] keys to the configuration of package 03 in internal/config/land.go: max_attempts (int, 10), timeout (duration, 5m), workers (int, 8), committer_name (Parley), committer_email (parley@localhost)",
+        "Fail loading with an error that names the key (land.max_attempts, land.workers, land.timeout, land.committer_name, land.committer_email) for max_attempts or workers below 1, a timeout that is not a positive duration, and an empty committer name or email, so that parleyd exits non-zero before listening",
+        "Add the pool in internal/land/pool.go: at most `workers` attempts are computed at once; a submitted attempt that finds no free worker waits and stays running; waiting attempts are started in no promised order and submission never fails because the pool is full",
+        "Give every attempt a deadline of `timeout` counted from its creation (or from its re-queue at start); when it passes, cancel the attempt's context so a running git command is killed, and finish the attempt failed with error timeout, also when it never got a worker",
+        "Make sure an attempt that timed out cannot move the target afterwards: the engine checks its context immediately before the compare-and-swap and the finish operation refuses a second final status",
+        "Let waiters subscribe to an attempt's end, so that the land route can wait for a final status without polling the store",
+        "Start the pool from the composition in internal/hub/land.go with the loaded [land] options and stop it at shutdown without finishing running attempts (they stay running for recovery)"
+      ],
+      "touches": [
+        "internal/land/pool.go",
+        "internal/land/pool_test.go",
+        "internal/config/land.go",
+        "internal/config/land_test.go",
+        "internal/hub/land.go"
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Serve the land route: who may land, what the request may carry, and the answer",
+      "criteria": [
+        "REQ-1",
+        "REQ-2.1",
+        "REQ-5.5",
+        "REQ-8.4"
+      ],
+      "steps": [
+        "Add the entry-check, attempt-creation, concurrency and wait behaviours to internal/land/routes_test.go, with the routes mounted on the real pipeline of package 02 and a clock the test controls, and confirm they fail",
+        "Register POST /workspaces/:slug/changes/:number/land with scope changes:write, workspace need read and the create-route declaration for Idempotency-Key",
+        "In internal/land/authz.go admit the caller whose level on the target workspace is owner or admin, or whose user is the change's author while the setting land.by_author is true; answer every other member 403 forbidden; answer 409 workspace_archived for an archived target after that check",
+        "For a caller whose token is bound to a task fork of the target, answer 403 token_bound when the change's source workspace is not that fork, when a stack land would cover a change with another source, on GET …/changes/:number/lands for such a change, on GET …/lands/:id for an attempt none of whose changes comes from the fork, and on GET …/lands; an unknown change or id keeps its 404",
+        "Validate the body and query: expected_version an integer of at least 1, stack a boolean, override an object with a non-empty string reason, session_id a string, wait a whole number from 0 to 60 with default 30; answer 400 invalid_request otherwise",
+        "Declare the session interface of internal/land with two operations, check and record, which package 49 installs from the linking check and the recording operation of internal/session; check a given session_id through it (same user or admin token; the session's workspace is the target, a fork of it or its parent) and answer 400 unknown_session on failure; with no implementation installed every session id fails the rule",
+        "Create the running attempt with trigger manual, the strategy read once from land.strategy, requested_by from the caller, the session and the current version of the change, record a land link for the session through the session interface in the same transaction, then submit it to the pool; expose the same start as a function that takes the change, the trigger, the requested_by to store and the actor of the attempt's events, checks the preconditions and asks no request guard, for package 29's automatic landing",
+        "Wait for the attempt's end for up to `wait` seconds; answer 200 with the attempt when it is landed and 202 with the running attempt when the wait runs out; a client that disconnects does not cancel the attempt",
+        "Hold no lock across an attempt: two attempts for different changes on one target run at the same time and meet only in the compare-and-swap"
+      ],
+      "touches": [
+        "internal/land/routes.go",
+        "internal/land/routes_test.go",
+        "internal/land/authz.go",
+        "internal/land/engine.go",
+        "internal/hub/land.go"
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Refuse a land whose preconditions fail",
+      "criteria": [
+        "REQ-2.2",
+        "REQ-2.3",
+        "REQ-2.4",
+        "REQ-2.5",
+        "REQ-2.6"
+      ],
+      "steps": [
+        "Add the precondition tables to internal/land/routes_test.go, including the simultaneous calls for one change and the pairs of failing preconditions, and confirm they fail",
+        "Check, in this order and before an attempt exists: the change is open (409 change_not_open); expected_version, when given, equals the current version (409 version_mismatch); no running attempt covers the change (409 land_in_progress with that attempt as error.details); every change down the depends_on chain is landed unless stack is true (409 depends_on_unlanded)",
+        "Make the check for a running attempt and the creation of the new attempt one store transaction, so that of several simultaneous calls for one change exactly one creates an attempt",
+        "Keep the same checks as a function the engine can call again, for the re-run after a restart",
+        "Give change_not_open, version_mismatch and depends_on_unlanded no details member"
+      ],
+      "touches": [
+        "internal/land/routes.go",
+        "internal/land/routes_test.go",
+        "internal/land/engine.go",
+        "internal/land/attempt.go"
+      ]
+    },
+    {
+      "id": 8,
+      "title": "End an attempt as conflict, blocked or failed and tell the caller",
+      "criteria": [
+        "REQ-4.5",
+        "REQ-3",
+        "REQ-8.3",
+        "REQ-8.5"
+      ],
+      "steps": [
+        "Add the conflict, gate and answer behaviours to internal/land/routes_test.go, internal/land/gate_test.go and internal/land/engine_test.go and confirm they fail",
+        "When a commit does not apply, fill the ConflictReport of internal/gitrepo in internal/land/conflict.go: target_sha (the head replayed onto), head_sha (the version's head), base_sha (the version's base), commit_sha (the first commit that did not apply), the classified files, and change null for a single-change attempt",
+        "Add the attribution as one exported function of internal/land/conflict.go that takes a report and fills landed_changes and each file's landed_by from the landed-commit mapping: the changes whose landed commits lie between base_sha and target_sha and touch a conflicted path, each as {number, title, landed_sha, session_id}; it leaves both empty when none is found, when base_sha is not an ancestor of target_sha or when the mapping cannot be read; package 26 calls the same function for the other producers of a report",
+        "Finish the attempt conflict with the report, leave the target untouched, and record mergeable conflict with the same report on the change through package 23's mergeability recorder",
+        "When the gate answers pending or blocked for a change, finish the attempt blocked with blocked {change, status, requirements} of the first such change, bottom first, without replaying",
+        "Ask the gate once per change per attempt and not again on a compare-and-swap retry; for an answer that is not ready on a request with override, ask the override rule and treat a passed answer as ready; record override {reason} on the attempt and in the parley.change.land metadata only when the rule let at least one change pass",
+        "Write one parley.change.land_fail event in the transaction that finishes an attempt as conflict, blocked or failed: resource the change that stopped it (else the top change), actor the caller, the request's session, metadata land_id, status, reason and, for a conflict, files; reason is conflict, the gate's reason or policy, or the error value",
+        "Answer a final attempt on the land route as 409 land_conflict, 409 policy_blocked or 503 land_failed, each with the attempt as error.details, through the error value of package 02"
+      ],
+      "touches": [
+        "internal/land/conflict.go",
+        "internal/land/conflict_test.go",
+        "internal/land/engine.go",
+        "internal/land/engine_test.go",
+        "internal/land/gate.go",
+        "internal/land/gate_test.go",
+        "internal/land/routes.go",
+        "internal/land/routes_test.go"
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Land with the squash strategy and land a whole stack",
+      "criteria": [
+        "REQ-4.3",
+        "REQ-6"
+      ],
+      "steps": [
+        "Add the squash behaviours to internal/land/squash_test.go and the stack behaviours to internal/land/stack_test.go and confirm they fail",
+        "With strategy squash, replay the change's own commits to obtain the resulting tree, then create one commit on the head it was replayed onto: author the author of the version's head commit, committer the landing identity, message the change title, a blank line, the intent, a blank line and the trailers Parley-Change: <slug>#<number>, Parley-Session: <id> when the change has a session, and one Co-authored-by per other distinct author",
+        "Record one commits entry per squashed change with version_sha the version's head",
+        "With stack true, collect the named change and every change down its depends_on chain, skip those already landed, and order them bottom first into the attempt's changes",
+        "Apply the open check and the running-attempt check to every covered change before the attempt is created: 409 change_not_open for a draft or abandoned change below, 409 land_in_progress with the running attempt for one that is being landed; a single-change land of a change covered by a running stack attempt gets land_in_progress too",
+        "Replay all covered changes bottom first, each on the result of the one below, and move the target once to the top; with squash produce one commit per change in order",
+        "Do the bookkeeping for all covered changes in the one transaction: each landed with landed.sha the new target head and its own commits, one parley.change.land event per change, one parley.git.push",
+        "On a conflict or a gate miss in any covered change, land nothing: set conflict.change or blocked.change to that change, mark only that change mergeable conflict, and write the one land_fail event on it"
+      ],
+      "touches": [
+        "internal/land/squash.go",
+        "internal/land/squash_test.go",
+        "internal/land/stack_test.go",
+        "internal/land/engine.go",
+        "internal/land/replay.go",
+        "internal/land/routes.go"
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Do the follow-up work of a land and offer guards, hooks and observers",
+      "criteria": [
+        "REQ-7"
+      ],
+      "steps": [
+        "Add the follow-up behaviours to internal/land/after_test.go and internal/land/hooks_test.go and confirm they fail",
+        "Add four registration points in internal/land/hooks.go: request guards (asked with the caller, the workspace, the changes the attempt would cover and the request's override; answer allow or a refusal with HTTP status, error_type and optional path), target guards (asked with workspace, target branch, old head and new head; answer allow, refuse with a reason, or origin rejected with a message, or return an error instead of an answer), after-landing hooks (called with the landed attempt, the target workspace, the update of the target branch as ref, before and after, the attempt's session id and, per landed change, its number, source workspace and branch and landed commit) and final observers (called with the final attempt, its result, attempts and duration)",
+        "Ask the request guards in the land route after the entry checks and the body validation and before the preconditions; return the first refusal as the route's answer and create no attempt; the start function for trigger auto_land asks none",
+        "Ask the guards after the replay and before the first compare-and-swap: a refusal finishes the attempt blocked with blocked {change, status blocked, requirements empty} and the guard's reason as the land_fail reason; an origin rejection finishes it failed with error origin_rejected; a guard error finishes it failed with error internal and never allows; the target does not move in any of the three cases",
+        "After the atomic step of a landed attempt, also a no-op one, delete each landed change's source branch when land.delete_source is true, by compare-and-swap against the landed version's head and only when no other draft or open change has that branch as source",
+        "Then ask package 23's scheduler for a mergeability check of every other draft or open change on the target branch, and call each after-landing hook once; this package registers none itself: package 24 registers its landing entry point, package 16 its fork activity hook and package 37 its rebuild trigger",
+        "Run every follow-up step independently: recover from a panic, log a failure, and change neither the attempt nor the HTTP answer nor the remaining steps",
+        "Report every attempt that reaches a final status once to every final observer, with the time from its creation to its end",
+        "Make no call to origin or to a forge anywhere in the land"
+      ],
+      "touches": [
+        "internal/land/hooks.go",
+        "internal/land/hooks_test.go",
+        "internal/land/after.go",
+        "internal/land/after_test.go",
+        "internal/land/engine.go",
+        "internal/land/routes.go"
+      ]
+    },
+    {
+      "id": 11,
+      "title": "Finish the attempts that were running when the hub stopped",
+      "criteria": [
+        "REQ-8.1"
+      ],
+      "steps": [
+        "Add the recovery behaviours to internal/land/recover_test.go, closing one engine and opening another on the same store and repository, and confirm they fail",
+        "At start, after journal reconciliation, read every attempt with status running and submit it to the pool again with a fresh deadline",
+        "Run a recovered attempt from the preconditions with the caller, trigger, session, strategy and versions stored on it: a change that is no longer open, or whose target is gone, finishes the attempt failed with error internal",
+        "Keep the attempt's id, requested_by and created_at; write its events with the original caller as actor",
+        "Register recovery in internal/hub/land.go as a start hook of package 03, so that journal reconciliation runs after the store is open and before the listener accepts requests; the re-run itself may proceed while requests are served",
+        "Add a test option to the composition in internal/hub/land.go that starts the hub with the land pool paused; the restart flow in test/e2e/land_test.go uses it to stop a hub while an attempt is still running"
+      ],
+      "touches": [
+        "internal/land/recover.go",
+        "internal/land/recover_test.go",
+        "internal/land/pool.go",
+        "internal/hub/land.go",
+        "test/e2e/land_test.go"
+      ]
+    },
+    {
+      "id": 12,
+      "title": "Land and read land attempts from the command line",
+      "criteria": [
+        "REQ-10"
+      ],
+      "steps": [
+        "Add the command behaviours to internal/cli/land_test.go, running the CLI root of package 09 in-process against a scripted httptest server, and confirm they fail",
+        "Add `parley change land <slug> <number>` under the change group with --stack, --expected-version, --override, --session and the shared --wait, --timeout, --poll-interval flags of package 09; send one POST whose body holds only the members the flags set and no wait query, with a 70-second request timeout",
+        "Print a 200 or 202 answer as one indented JSON document and exit 0; print a hub error as its envelope on stderr and exit 1",
+        "With --wait and a 202 answer, poll GET /workspaces/<slug>/lands/<id> through the wait helper of package 09 with terminal states landed (success) and conflict, blocked, failed (failure); a land answered with a final status is not polled",
+        "Add `parley change lands <slug> <number>`, and the group `parley land` with `list <slug>` (--status repeatable, --target as target_branch, --since, --limit, --cursor) and `show <slug> <land-id>`; `parley land` alone prints help and exits 0",
+        "Fail with a usage error (exit 2, no request) for a missing argument, a number or --expected-version below 1 or not an integer, an empty --override, and a --limit that is not an integer",
+        "Register the commands on the CLI root in cmd/parley"
+      ],
+      "touches": [
+        "internal/cli/land.go",
+        "internal/cli/land_test.go",
+        "cmd/parley"
+      ],
+      "depends_on": [
+        1
+      ]
+    }
+  ]
+}

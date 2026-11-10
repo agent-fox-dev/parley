@@ -1,0 +1,301 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "43",
+  "spec_name": "forge_webhook_ingress",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/forge/... ./internal/cli/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "41",
+      "reason": "provides the origin and upstream repository derived from a workspace's remote URLs, the diagnostic route that reports the webhook member, the forge command group of the CLI and, through it, the secret component that holds FORGE_WEBHOOK_SECRET"
+    },
+    {
+      "spec": "52",
+      "reason": "provides the event component through which the webhook and delivery events are appended in the same transaction as the state they report"
+    },
+    {
+      "spec": "09",
+      "reason": "provides the HTTP client, output and exit codes the three parley forge commands are built on"
+    },
+    {
+      "spec": "14",
+      "reason": "provides the removers of owned data that the workspace delete runs, with which the remover of a workspace's deliveries is registered"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Set and rotate a workspace's webhook secret over the API",
+      "criteria": [
+        "REQ-1"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/forge/webhook_test.go as table-driven tests against the handler with a real store, the secret component and the event component, and confirm they fail",
+        "Register PUT /workspaces/:slug/forge/webhook on the REST mount through the route registration of package 02, with the scope forge:write and the need `write` of the workspace access rule, so that scope and access refusals come from the shared check order",
+        "In the handler decide in this order after access: a task fork answers 400 fork_has_no_origin; then the body; then an archived workspace answers 409 workspace_archived; then a missing encryption key (Available of package 39 reports false) answers the 503 secrets_unavailable error that package 39 exports; then a full secret scope (Put returns ErrLimitReached) answers 429 secret_limit_reached with the message `maximum of 100 entries per scope exceeded`; this is the order the write routes of package 42 use for the steps both have (body before archived)",
+        "Read the body: zero length, an object without `secret` and an object with `secret` null mean generate; a string `secret` must have 16 to 255 characters, each from `!` to `~`; anything else, and a body that is not a JSON object, answers 400 invalid_request with a fixed message that states the rule and never echoes the value; unknown members are ignored",
+        "Generate a secret as 32 bytes from the cryptographic random source, written as 64 lower-case hex characters",
+        "Store the value as the workspace-scope secret FORGE_WEBHOOK_SECRET with Put of package 39's secret component, inside this handler's store transaction: Put replaces the value of an entry whose key matches ignoring case and keeps its stored casing; otherwise it creates the entry, which is where the limit of 100 applies; Put writes no parley.secret.* event and this handler emits none",
+        "In the same store transaction append parley.forge.webhook.set through Emit of the event component of package 52; when Emit fails, roll the transaction back and answer 500 internal: workspace the slug, the caller as actor, resource_type webhook, resource_id the slug, action set, metadata generated true or false; the value appears in no event and no log line",
+        "Compute the webhook URL from the server.external_url the handler is constructed with: strip one trailing `/` and append /hooks/forge/<slug>; an empty external_url gives JSON null",
+        "Answer 200 with configured true, url, and secret only when the hub generated it"
+      ],
+      "touches": [
+        "internal/forge/webhook.go",
+        "internal/forge/webhook_test.go",
+        "internal/forge/"
+      ],
+      "done_when": [
+        "`go test ./internal/forge/... -count=1` passes with an encryption key and without one"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Remove the webhook secret in any workspace state",
+      "criteria": [
+        "REQ-2"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/forge/webhook_test.go and confirm they fail",
+        "Register DELETE /workspaces/:slug/forge/webhook with the scope forge:write and the need `write`; the route has no archived check and no body",
+        "Answer 400 fork_has_no_origin for a task fork before anything else is done",
+        "Remove the workspace secret FORGE_WEBHOOK_SECRET with Delete of package 39's secret component inside this handler's store transaction; Delete matches ignoring case, writes no parley.secret.delete and reports whether an entry existed; nothing else of the workspace is touched",
+        "In the same transaction append parley.forge.webhook.unset with resource_type webhook, resource_id the slug, action unset and metadata existed true or false; the event is written in both cases; when Emit fails, roll the transaction back and answer 500 internal, for this route and for the PUT",
+        "Answer 204 with no body",
+        "Add the test that sets, rotates and removes a secret on a workspace whose forge_api_url points at a counting httptest server and asserts that the server saw no request; the handlers of this file take no forge client"
+      ],
+      "touches": [
+        "internal/forge/webhook.go",
+        "internal/forge/webhook_test.go"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Reduce a verified payload to an action, a target and an outcome",
+      "criteria": [
+        "REQ-5"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/forge/reduce_test.go as table-driven tests and confirm they fail",
+        "Define the reduction in internal/forge as a pure function of the forge kind (github or gitlab), the event name, the raw body and the workspace's repositories (the origin `owner/name`, and the upstream one for a carry-patch workspace with an upstream_url); it returns the action, the target, the outcome and the ordered event drafts, and performs no I/O",
+        "Decode the body as exactly one JSON value that must be an object; trailing data, any other value and an empty body give the outcome malformed with action \"\", no target and no events",
+        "Read the action from `action` (GitHub) or `object_attributes.action` (GitLab); a missing or non-string value is \"\"; cut it to 64 bytes at a UTF-8 character boundary with a helper that the event name cut also uses",
+        "Read the repository path from `repository.full_name` (GitHub) or `project.path_with_namespace` (GitLab); compare it ignoring case with the origin repository first and then with the upstream repository; the first match is the target; a missing or non-string path names no repository",
+        "Define the mapping contract the two forge mappings implement: given the event name, the action and the decoded object it reports one of `no mapping`, `a required field is missing or of the wrong type`, or a list of event drafts that may be empty; provide helpers for a required integer of at least 1 and a required non-empty string at a member path",
+        "Apply the decision table in order: no mapping gives ignored; a missing required field gives malformed; an empty list gives ignored; events without a repository path give malformed; events with a path that matched neither repository give repository_mismatch; otherwise relayed with the events",
+        "Return events only with the outcome relayed; until the forge mappings exist the reduction is tested with a mapping supplied by the test"
+      ],
+      "touches": [
+        "internal/forge/reduce.go",
+        "internal/forge/reduce_test.go"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Map GitHub events and actions to hub event types",
+      "criteria": [
+        "REQ-6"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/forge/github_hook_test.go as table-driven tests over payloads built in the test, and confirm they fail",
+        "Implement the GitHub mapping against the mapping contract of the reduction; event names and actions are matched exactly, case included",
+        "`issues` with opened, edited, closed or reopened requires an integer issue.number of at least 1 and yields parley.forge.issue.<action> with resource issue/<number>",
+        "`issues` with labeled or unlabeled also requires a non-empty string label.name and puts it in the draft as the label",
+        "`issue_comment` with created requires issue.number and yields parley.forge.comment.created with resource comment/<number>; the draft records whether issue.pull_request is an object",
+        "`pull_request` with opened, reopened or synchronize requires pull_request.number and yields parley.forge.pull_request.<action>; closed yields .merged when pull_request.merged is the JSON value true and .closed in every other case, never both",
+        "`push` requires a non-empty string ref and yields parley.forge.push with resource ref/<ref>",
+        "Report `no mapping` for every other event name and action, among them ping, edited and deleted comments and an `issues` payload without an action",
+        "Select this mapping in the reduction for the forge kind github and add reduction rows that show an unlisted GitHub event ends as ignored"
+      ],
+      "touches": [
+        "internal/forge/github_hook.go",
+        "internal/forge/github_hook_test.go",
+        "internal/forge/reduce.go",
+        "internal/forge/reduce_test.go"
+      ],
+      "depends_on": [
+        3
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Map GitLab hooks to hub event types, including label updates",
+      "criteria": [
+        "REQ-7"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/forge/gitlab_hook_test.go as table-driven tests over payloads built in the test, and confirm they fail",
+        "Implement the GitLab mapping against the mapping contract of the reduction; the event name is the value of X-Gitlab-Event, matched exactly",
+        "`Issue Hook` with open, close or reopen requires an integer object_attributes.iid of at least 1 and yields parley.forge.issue.opened, .closed or .reopened",
+        "`Issue Hook` with update requires the iid; yield .edited when changes.title or changes.description is present; compute removed labels as the titles of changes.labels.previous that are not in changes.labels.current and added labels as the reverse; yield one .unlabeled per removed title and then one .labeled per added title, each group sorted by the bytes of the title",
+        "Keep at most the first 100 label events of a delivery in that order; the .edited event does not count against the 100; an update with none of these changes returns an empty list",
+        "`Note Hook` reads object_attributes.noteable_type: Issue requires issue.iid, MergeRequest requires merge_request.iid, and both yield parley.forge.comment.created with the draft's pull-request flag false or true; any other kind is `no mapping`; the note's action is not looked at",
+        "`Merge Request Hook` with open, close, reopen or merge requires object_attributes.iid and yields parley.forge.pull_request.opened, .closed, .reopened or .merged; update yields .synchronize when object_attributes.oldrev is a non-empty string and an empty list otherwise",
+        "`Push Hook` and `Tag Push Hook` require a non-empty string ref and yield parley.forge.push",
+        "Report `no mapping` for every other event name and action; select this mapping in the reduction for the forge kind gitlab"
+      ],
+      "touches": [
+        "internal/forge/gitlab_hook.go",
+        "internal/forge/gitlab_hook_test.go",
+        "internal/forge/reduce.go",
+        "internal/forge/reduce_test.go"
+      ],
+      "depends_on": [
+        3
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Fill each relayed event with its metadata and nothing else from the payload",
+      "criteria": [
+        "REQ-8.2",
+        "REQ-8.3",
+        "REQ-8.4",
+        "REQ-8.5",
+        "REQ-8.6"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/forge/hook_event_test.go as table-driven tests over payloads of both forges, and confirm they fail",
+        "Turn every event draft of the two mappings into a full description: type, resource_type, resource_id, and a metadata map with exactly the keys of its kind",
+        "Issue events: number, url and labels (the names of the issue's current labels, the first 100 in payload order, entries that are not objects with a string name skipped); title on opened, edited, closed and reopened, cut to 256 bytes at a UTF-8 boundary; label on labeled and unlabeled. GitHub reads issue.title, issue.html_url and issue.labels[].name; GitLab reads object_attributes.title, object_attributes.url and the top-level labels[].title",
+        "Comment events: number, comment_url and pull_request. GitHub reads comment.html_url; GitLab reads the note's object_attributes.url",
+        "Pull request events: number, url, head, base and merged. GitHub reads pull_request.html_url, pull_request.head.ref and pull_request.base.ref; GitLab reads object_attributes.url, .source_branch and .target_branch; merged is true exactly when the type ends in .merged",
+        "Push events: ref, before and after from the top-level members of either forge",
+        "Read the forge login as the draft's actor: sender.login on GitHub, user.username on GitLab and user_username on the two GitLab push hooks; \"\" when absent",
+        "An optional value that is missing or of the wrong type becomes \"\", [] or false and never changes the outcome",
+        "Pass every URL through one helper that parses it, requires an absolute URL, removes userinfo and returns \"\" for anything it cannot parse",
+        "Copy nothing else from the payload: no body, description, note text, commit message or other free text reaches a draft"
+      ],
+      "touches": [
+        "internal/forge/hook_event.go",
+        "internal/forge/hook_event_test.go",
+        "internal/forge/github_hook.go",
+        "internal/forge/gitlab_hook.go"
+      ],
+      "depends_on": [
+        4,
+        5
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Record a delivery once and append its events in the same transaction",
+      "criteria": [
+        "REQ-4",
+        "REQ-8.1"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/forge/delivery_test.go and the common-field rows to internal/forge/hook_event_test.go, against a real store in t.TempDir() and the event component, and confirm they fail",
+        "Register a schema step with the store of package 03 for the delivery table: workspace slug, delivery id, forge, event, action, target (nullable), outcome, the relayed types, received_at and an insertion sequence, with a unique key on workspace and delivery id; the table has no column for a payload or a secret",
+        "Implement the recording step: given the workspace, the forge kind, the delivery id, the event name and the raw body, it loads the workspace's origin and upstream repositories through the repository derivation of package 41, runs the reduction and stores the result",
+        "Inside one store transaction insert the delivery, relying on the unique key to detect an existing id; on a key conflict return the outcome duplicate and write nothing; otherwise append every relayed event through the event component of package 52 in order and commit",
+        "Build each event from its description: workspace the slug, actor_type forge, actor_id null, action the last segment of the type, and metadata extended by forge, target, delivery_id and actor",
+        "Store the event name cut to 64 bytes, received_at from the injected clock in whole seconds UTC, and relayed as the ordered list of event types, [] unless the outcome is relayed",
+        "Run the transaction under a context detached from the request, so that a forge that closes the connection early does not cancel it",
+        "On any failure roll back so that neither the delivery nor an event remains, and return the error; the error text holds neither the payload nor the secret",
+        "Make concurrent copies safe by the unique key and the store's write serialisation, not by an in-process lock keyed on the id; a copy that loses the race returns duplicate without an error",
+        "Provide the read operations the later tasks use: get one delivery, list a workspace's deliveries, the newest received_at of a workspace, delete older than an instant, delete by workspace inside a given transaction"
+      ],
+      "touches": [
+        "internal/forge/delivery.go",
+        "internal/forge/delivery_test.go",
+        "internal/forge/hook_event.go",
+        "internal/forge/hook_event_test.go"
+      ],
+      "depends_on": [
+        6
+      ],
+      "done_when": [
+        "`go test -race ./internal/forge/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Serve the public ingress and decide each delivery in the fixed order",
+      "criteria": [
+        "REQ-3"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/forge/ingress_test.go and confirm they fail",
+        "Register POST /hooks/forge/:slug outside the /api/v1 mount as a public route: no authentication, no bearer credential read, not counted or refused by the rate limiter of package 02, no content-type check, and a body limit of its own in place of the server's; its errors use the error envelope helper",
+        "Step 1: look the slug up; an unknown slug, a task fork, and a workspace whose FORGE_WEBHOOK_SECRET is absent or empty all answer the same 404 not_found body with the message `not found`; an archived workspace continues. Read the secret with Get of package 39's secret component on every request; an error from Get (ErrUnreadable included) answers 500 internal",
+        "Step 2: choose the scheme from the headers: X-Hub-Signature-256 present means GitHub, otherwise X-Gitlab-Token present means GitLab, otherwise 401",
+        "Step 3, GitLab: the token header must have exactly one value and equal the secret under a constant-time comparison, else 401",
+        "Step 4: read the body through a reader limited to 1,048,576 bytes plus one; more than the limit answers 413 payload_too_large without reading further, also when Content-Length already says so",
+        "Step 5, GitHub: the signature header must have exactly one value and equal `sha256=` plus the lower-case hex HMAC-SHA256 of the raw body under the secret, compared in constant time, else 401",
+        "Every 401 uses error_type unauthenticated and the message `delivery signature missing or invalid` and writes nothing",
+        "Step 6: take the delivery id from X-GitHub-Delivery, or from Idempotency-Key and else X-Gitlab-Event-UUID, and the event name from X-GitHub-Event or X-Gitlab-Event, using the first value of a repeated header; a missing or empty id or event name, an id longer than 255 characters or with a character outside 0x20 to 0x7E answers 400 invalid_request",
+        "Steps 7 to 9: call the recording step; duplicate answers 202 with {\"outcome\":\"duplicate\"}; malformed answers 400 invalid_request while its record stays; relayed, ignored and repository_mismatch answer 202 with the outcome; an error answers 500 internal",
+        "Never call the forge client from this handler, and log neither the body, the signature, the token nor the secret"
+      ],
+      "touches": [
+        "internal/forge/ingress.go",
+        "internal/forge/ingress_test.go",
+        "internal/hub/"
+      ],
+      "depends_on": [
+        2,
+        7
+      ]
+    },
+    {
+      "id": 9,
+      "title": "List the delivery log, prune it after 7 days and delete it with its workspace",
+      "criteria": [
+        "REQ-9"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/forge/delivery_log_test.go with a replaceable clock and confirm they fail",
+        "Register GET /workspaces/:slug/forge/deliveries with the scope forge:read and the need `read`; it has no archived check; a task fork answers 400 fork_has_no_origin; unknown query parameters, `target` among them, are ignored",
+        "Parse `since` as RFC 3339 when the parameter is present; an empty or unparseable value answers 400 invalid_request",
+        "Answer through the list helper of package 02 with limit and cursor: order by received_at descending and then insertion sequence descending, filter received_at at or after `since`, and bind the cursor to the workspace and the `since` value so that a cursor of another query is refused as that helper specifies",
+        "Render each item with delivery_id, forge, event, action, target (null when unset), outcome, relayed (always an array) and received_at",
+        "Register the task `forge_delivery_pruning` with the maintenance registry of package 03: it deletes every delivery whose received_at is earlier than the clock's now minus 604,800 seconds and returns the store's error unchanged, so the loop logs it and the next pass repeats the work; the retention is a constant, not a configuration key",
+        "Register a remover with the removers of owned data of package 14 (internal/workspace; a function of the transaction and one slug that returns the ids of the tokens it revoked) that deletes all deliveries of the workspace inside the delete transaction it is handed and returns no token ids",
+        "Provide the last-delivery provider of package 41's forge component: a function of a context and a workspace slug that returns the newest received_at of the workspace, whether there is one, and the store's error",
+        "Register the provider with SetLastDeliveryProvider of package 41 (internal/forge/service.go), so that the diagnostic route GET /workspaces/:slug/forge reports it as webhook.last_delivery_at; leave that route's handler, which computes configured and url, unchanged",
+        "Wire the routes of this package, the pruning task and the remover into the process composition in internal/hub"
+      ],
+      "touches": [
+        "internal/forge/delivery_log.go",
+        "internal/forge/delivery_log_test.go",
+        "internal/forge/delivery.go",
+        "internal/forge/webhook.go",
+        "internal/hub/"
+      ],
+      "depends_on": [
+        8
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Add the webhook and deliveries commands to the parley CLI",
+      "criteria": [
+        "REQ-10"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/cli/forge_test.go against an httptest server and confirm they fail",
+        "Add the subgroup `webhook` and the command `deliveries` to the `forge` command group of package 41 in internal/cli/forge.go; every request goes through the HTTP client of package 09, which percent-encodes the slug as one path segment",
+        "`parley forge webhook set <workspace-slug>` takes --secret, --from-stdin and --generate; more than one of them, or a missing slug, is a usage error raised through the usage-error helper of package 09 before any request",
+        "With no flag or --generate send the PUT without a body; with --secret send {\"secret\": value}; with --from-stdin read all of the command's stdin, drop one trailing `\\n` or `\\r\\n`, and send it the same way; the CLI does not check the value's length or characters",
+        "Print the hub's answer with the output helper; when the answer has a `secret` member write one line to stderr saying that the secret will not be shown again",
+        "`parley forge webhook unset <workspace-slug>` sends the DELETE and on 204 prints the document with status unset and workspace the slug as given",
+        "`parley forge deliveries <workspace-slug>` takes --since, --limit and --cursor and adds a query parameter only for a flag that was given; it prints the hub's answer",
+        "Hub errors and exit codes come from package 09: the envelope on stderr and exit 1; nothing on stdout",
+        "Write the end-to-end test test/e2e/forge_webhook_test.go that runs the two flows of this package against a hub started in-process: set, signed GitHub delivery, redelivery, read back; and GitLab label update, unset, refused delivery"
+      ],
+      "touches": [
+        "internal/cli/forge.go",
+        "internal/cli/forge_test.go",
+        "test/e2e/forge_webhook_test.go"
+      ],
+      "depends_on": [
+        9
+      ]
+    }
+  ]
+}

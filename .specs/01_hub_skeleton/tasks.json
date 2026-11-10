@@ -1,0 +1,105 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "01",
+  "spec_name": "hub_skeleton",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./cmd/... ./internal/buildinfo/... ./internal/server/... ./internal/cli/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Serve liveness, readiness and build information over HTTP",
+      "criteria": [
+        "REQ-2",
+        "REQ-3.1",
+        "REQ-3.2"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/buildinfo/buildinfo_test.go and internal/server/server_test.go as table-driven tests and confirm they fail",
+        "Create internal/buildinfo: three package-level string variables Version, Commit and BuildTime that the linker can set with -X, and a Get function that returns them with the defaults dev, unknown and unknown for empty values, plus the Go runtime's version",
+        "Create internal/server: a server type built from options (listen address, shutdown grace, a list of readiness probes, each a function taking a context and returning an error) that exposes its http.Handler, using the standard library's method-and-pattern router",
+        "Register GET /healthz answering 200 with the status document ok",
+        "Register GET /readyz: call every registered probe with the request's context; answer 200 with status ready when all return nil or none is registered, and 503 with status not ready when any returns an error, never putting the probe's error text in the body",
+        "Register GET /version answering 200 with the version, commit, build_time and go_version members from internal/buildinfo",
+        "Write all three bodies through one JSON helper that sets Content-Type to application/json; charset=utf-8; none of the three routes reads the Authorization header",
+        "Leave unknown paths and wrong methods to the router's own answers; their envelope belongs to package 02"
+      ],
+      "touches": [
+        "internal/buildinfo/buildinfo.go",
+        "internal/buildinfo/buildinfo_test.go",
+        "internal/server/server.go",
+        "internal/server/server_test.go"
+      ],
+      "done_when": [
+        "`go test ./internal/buildinfo/... ./internal/server/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Start parleyd, listen, and stop it on a signal",
+      "criteria": [
+        "REQ-1",
+        "REQ-4"
+      ],
+      "steps": [
+        "Add the behaviours of this task to cmd/parleyd/main_test.go and internal/server/server_test.go and confirm they fail",
+        "Give the server of internal/server a Serve method taking a context: bind the listen address, report the bound address to the caller (so that port 0 yields the chosen port), serve until the context is cancelled, then stop accepting connections and wait for in-flight requests for at most the shutdown grace; when the grace passes, close the remaining connections; return nil for a signalled stop in both cases and the bind error when the address cannot be bound",
+        "Let tests add routes to the server's router (a slow handler, a blocking handler) through the same registration function later packages will use to mount their routes",
+        "Create cmd/parleyd/main.go with a run function taking a context, the arguments, the listen address, the shutdown grace, stdout and stderr and returning the exit status; main calls it with the default listen address (all interfaces, port 8080) and a grace of 15 seconds and passes its result to os.Exit",
+        "In run, parse the arguments with the standard flag package: --help prints usage on stdout and returns 0; an undefined flag or a positional argument prints usage and the rejected argument on stderr and returns 2; neither opens a listener; write no test for the word backup as first argument, which package 03 turns into its subcommand",
+        "In run, derive the serving context from the given one with signal.NotifyContext for SIGTERM and SIGINT, registered before the listener is bound",
+        "Once the listener is bound, write one JSON log line to stderr with log/slog whose msg is listening and whose addr is the bound host and port",
+        "When the address cannot be bound, write exactly one line to stderr that names the address and return 1; write no listening line",
+        "Return 0 when Serve returns after a signal, whether or not the grace passed"
+      ],
+      "touches": [
+        "cmd/parleyd/main.go",
+        "cmd/parleyd/main_test.go",
+        "internal/server/server.go",
+        "internal/server/server_test.go"
+      ],
+      "done_when": [
+        "`go test ./cmd/parleyd/... ./internal/server/... -count=1` passes",
+        "`go build ./cmd/parleyd` succeeds"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Build the parley client with its root command and parley version",
+      "criteria": [
+        "REQ-5",
+        "REQ-3.3"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/cli/root_test.go, internal/cli/version_test.go and test/e2e/build_test.go and confirm they fail",
+        "Add github.com/spf13/cobra to go.mod at the version the module cache holds (v1.10.2) and confirm the signatures recorded in the package's external API against it",
+        "Create internal/cli/root.go: a root cobra command named parley with the persistent string flag --endpoint-url, and a Run function taking a context, the arguments, stdout and stderr and returning the exit status; with no arguments the root prints its help on stdout and returns 0 without reading a credential or sending a request",
+        "Create internal/cli/version.go: the version command resolves the hub URL as the first non-empty value of --endpoint-url and PARLEY_ENDPOINT_URL",
+        "With no hub URL, print the document with the cli member alone (version and commit from internal/buildinfo), send no request and write nothing to stderr",
+        "With a hub URL, send GET to the URL without its trailing slash plus /version, with no Authorization header and a timeout of 5 seconds held in a field tests can shorten; on 200 with a JSON object, print the document with the cli member and the server member holding version, commit, build_time and go_version as answered",
+        "On a refused connection, a timeout, a status other than 200 or a body that is not a JSON object, write one warning line that begins with 'warning: ' and names the hub URL to stderr and print the document without the server member",
+        "Print stdout as one JSON document indented by 2 spaces followed by a newline, and return 0 in every case",
+        "Create cmd/parley/main.go: call the Run function of internal/cli with os.Args[1:], os.Stdout and os.Stderr and exit with its result; internal/cli imports internal/buildinfo and nothing from internal/server",
+        "In test/e2e/build_test.go build ./cmd/parley and ./cmd/parleyd into a temporary directory with the three -X linker flags for internal/buildinfo, run the built parley version with PARLEY_ENDPOINT_URL unset and the built parleyd --help, and assert the values and exit statuses"
+      ],
+      "touches": [
+        "go.mod",
+        "go.sum",
+        "cmd/parley/main.go",
+        "internal/cli/root.go",
+        "internal/cli/root_test.go",
+        "internal/cli/version.go",
+        "internal/cli/version_test.go",
+        "test/e2e/build_test.go"
+      ],
+      "done_when": [
+        "`go test ./internal/cli/... ./test/e2e/... -count=1` passes",
+        "`go build ./cmd/parley ./cmd/parleyd` succeeds"
+      ]
+    }
+  ]
+}

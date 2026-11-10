@@ -1,0 +1,813 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "14",
+  "spec_name": "workspace_archive_reclone_delete",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Exclusive maintenance and the rules the four routes share",
+      "rationale": "An archive, a reclone and a delete each change a whole workspace; a second one running beside it, or a caller without write access, must never leave it half changed.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "state_driven",
+          "condition": "an archive, reclone or delete call is running on a workspace",
+          "action": "answer every further archive, reactivate, reclone and delete request for that workspace with a busy refusal and make the state guard of other routes report the workspace as busy",
+          "contract": "HTTP 409 with error_type workspace_busy; the workspace record, its copy and the event log are unchanged by the refused request",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a store with repository workspaces 'demo' and 'other'",
+              "stub collaborators that record their calls"
+            ],
+            "pseudocode": "in internal/workspace/maintenance_test.go: set the marker for 'demo' by hand; table over {POST archive, POST reactivate, POST reclone, DELETE} on 'demo' for each stored status {ready, failed, archived}: assert status 409 and error.error_type == 'workspace_busy'; assert the state guard of package 10 returns workspace_busy for 'demo'; assert the same four requests on 'other' are judged by their own status; assert no store row changed and no event was written"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "event_driven",
+          "condition": "an archive, reclone or delete call ends, by success, by a refusal after the marker was set, or by a failure",
+          "action": "release the maintenance marker of that workspace",
+          "contract": "after the call has answered, the marker is not set and the next request for the workspace is judged by its status alone",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/maintenance_test.go, table over {archive succeeds, archive whose transaction is made to fail, reclone whose transaction is made to fail, delete whose sandbox remover fails, delete whose removal step fails, delete succeeds}: run the call; assert the marker for the slug is not set afterwards; assert a second call of the same kind on a workspace that still qualifies does not answer workspace_busy"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "ubiquitous",
+          "action": "for any two archive, reclone or delete calls that arrive for the same workspace at the same time, run exactly one and answer the other with a busy refusal, and let calls for different workspaces run side by side",
+          "contract": "one call answers its success status, the other HTTP 409 with error_type workspace_busy; exactly one event of the operation exists for the workspace",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "two ready repository workspaces 'demo' and 'other' cloned from a test origin of internal/gitrepo/gitrepotest"
+            ],
+            "pseudocode": "in internal/workspace/maintenance_test.go: the test origin blocks the first push until released; start archive of 'demo' in a goroutine and wait until origin was contacted; send archive, reclone and DELETE for 'demo': each answers 409 workspace_busy; send archive for 'other': it answers 200 while 'demo' is still blocked; release origin: the first call answers 200; exactly one parley.workspace.archive event exists for 'demo'"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "unwanted",
+          "condition": "a caller without write access to the workspace, or a personal access token without the scope workspaces:write, calls archive, reactivate, reclone or delete",
+          "action": "refuse the request, contact neither origin nor any collaborator, and change nothing",
+          "contract": "organization member: HTTP 403 with error_type forbidden, whatever the workspace's status; caller with no access or unknown slug: HTTP 404 with error_type not_found; token without the scope: HTTP 403 with error_type insufficient_scope; no record, copy or event changes",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/maintenance_test.go, table over the four routes x {organization member on a ready workspace: 403 forbidden; organization member on an archived workspace: 403 forbidden; user outside the organization: 404 not_found; unknown slug: 404 not_found with the same body shape; owner PAT with only workspaces:read: 403 insufficient_scope}: assert status and error.error_type; assert the stub origin, sandbox remover, removers, session closer and observers recorded no call; assert the workspace row is byte-equal to before; and one positive row: an admin token archives a ready workspace with 200"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "event_driven",
+          "condition": "the caller of an archive, reclone or delete disconnects after the request passed its checks",
+          "action": "carry the operation through to its end as if the caller were still connected",
+          "contract": "the store, the copy and the event log end in the same state as for a connected caller, and the marker is released",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/workspace/maintenance_test.go, table over {archive, reclone, delete}: the test origin (for delete: the stub sandbox remover) blocks; send the request with a context the test cancels once the collaborator was reached; release the collaborator; poll the store: archive ends with status archived and one archive event, reclone ends with status pending or later and one reclone event, delete ends with no workspace row and one delete event; the marker is released"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Safety copy to origin",
+      "rationale": "Commits that exist only in the hub should reach origin before the hub stops serving or discards them, yet origin must never be able to block the owner.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "an archive or a reclone has passed its checks on a workspace whose copy exists",
+          "action": "offer every branch under refs/heads/ of the hub's copy to the branch of the same name on origin as a fast-forward, with the origin credential resolved from the workspace's secrets, sending no tag, forcing nothing and deleting nothing on origin, and record the pushed commit as the origin head of every branch origin accepted, by setting the ref refs/remotes/origin/<name> of the hub's copy",
+          "contract": "after the offer origin holds every accepted branch at the hub's commit, no branch of origin was rewound or deleted, origin has no new tag, and the ref refs/remotes/origin/<name> of the hub's copy resolves to the pushed commit for each accepted branch",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a test origin of internal/gitrepo/gitrepotest in its push mode (SmartOrigin, added by package 13) that requires Basic authentication and holds branches main, stale and old",
+              "a hub copy cloned from it in which main is two commits ahead, a branch feat and a tag v-hub exist only in the hub, branch old was deleted, and stale was rewritten so that it is not a descendant of origin's stale",
+              "the workspace secret GIT_PAT holds the token origin accepts"
+            ],
+            "pseudocode": "in internal/workspace/safetycopy_test.go with a real git subprocess: run the safety copy; assert origin main == hub main, origin has feat at the hub's commit, origin stale still exists at its old commit, origin old still exists although the hub has no such branch, origin has no tag v-hub; assert refs/remotes/origin/main and refs/remotes/origin/feat of the hub's copy equal the pushed commits and refs/remotes/origin/stale is unchanged; assert the request origin received carried Basic authentication for user x-token-auth; assert the outcome is partial"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "optional",
+          "condition": "the workspace's workspace_mode is carry_patch",
+          "action": "leave the integration branch out of the offer and offer the branches of patches like any other branch",
+          "contract": "origin's integration branch is unchanged; every other branch is offered",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a carry-patch workspace whose integration_branch is 'deploy'",
+              "in the hub copy both deploy and patch/a are ahead of origin"
+            ],
+            "pseudocode": "in internal/workspace/safetycopy_test.go beside the test above: run the safety copy; assert origin's deploy is still at its old commit; assert origin has patch/a at the hub's commit; assert the outcome is ok"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "ubiquitous",
+          "action": "for any safety copy, report exactly one outcome: ok when origin accepted every offered branch or there was no branch to offer, partial when origin accepted at least one branch and refused at least one, failed when at least one branch was offered and origin accepted none",
+          "contract": "the outcome is one of the strings ok, partial, failed and is the value of origin_push in the event of the operation",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/safetycopy_test.go, table over per-branch results from a stub pusher: {all pushed -> ok; all already up to date -> ok; pushed + up to date -> ok; no branches -> ok; workspace in status failed with no copy -> ok and the pusher is not called; one pushed + one rejected as non-fast-forward -> partial; one up to date + one rejected -> partial; all rejected -> failed; pusher returns a connection error with no per-branch result -> failed}: assert the outcome string"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "unwanted",
+          "condition": "the origin credential cannot be read, origin refuses the credential, origin cannot be reached, or 2 minutes pass before the offer has finished",
+          "action": "end the safety copy with the outcome failed, or partial when origin had already accepted a branch, and return to the operation without an error",
+          "contract": "outcome failed or partial; the archive or reclone goes on and answers as it would with outcome ok; no anonymous attempt is made when the credential could not be read; the git subprocess is stopped at the deadline",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/safetycopy_test.go, table over {secret reader returns an error: outcome failed and the pusher is never called, so no anonymous attempt is made; pusher returns 'authentication failed': failed; pusher returns a dial error: failed; pusher blocks past a deadline the test shortens: failed and the git subprocess context is cancelled; pusher accepted one branch then blocks past the deadline: partial}: assert the outcome; assert the function returns no error; and in archive_test.go for the first and third rows: POST archive answers 200 with status archived"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "ubiquitous",
+          "action": "for any safety copy, keep the origin credential and every text origin sent out of the response, the event and the log line of the operation",
+          "contract": "the response body and the event carry the outcome word only; no log line contains the credential",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the workspace secret GIT_PAT is 's3cr3t-token'"
+            ],
+            "pseudocode": "in internal/workspace/safetycopy_test.go: the stub pusher fails with the message 'remote: denied for https://x-token-auth:s3cr3t-token@origin.test/r.git'; POST archive; assert the response body, the JSON of the parley.workspace.archive event and the captured log output contain neither 's3cr3t-token' nor 'remote: denied'; assert the event's origin_push is 'failed'"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Archive a repository workspace",
+      "rationale": "An owner retires a workspace without losing anything the hub holds, and agents stop working on it.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "the owner or an admin token sends POST /workspaces/:slug/archive for a repository workspace in status ready or failed",
+          "action": "make the safety copy, then in one transaction set the status to archived and clear clone_error, and answer with the workspace",
+          "contract": "HTTP 200 with the workspace object, status \"archived\" and clone_error null; the stored status is archived",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/archive_test.go with net/http/httptest, table over {ready workspace; failed workspace with clone_error 'boom' and no copy}: r = POST /api/v1/workspaces/demo/archive as owner; assert r.status == 200; assert r.json.status == 'archived' and r.json.clone_error == null and r.json.slug == 'demo'; assert the stored status is archived; assert the safety copy ran before the status changed (the stub pusher saw status ready or failed in the store)"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "unwanted",
+          "condition": "the target of an archive request is a fork, has its maintenance marker set, is already archived, or is in status pending or cloning",
+          "action": "refuse the archive without contacting origin and without changing the workspace",
+          "contract": "fork: HTTP 400 with error_type not_supported_on_fork; marker set: HTTP 409 with error_type workspace_busy; otherwise archived: HTTP 409 with error_type workspace_archived; pending or cloning: HTTP 409 with error_type workspace_busy; no event is written and origin is not contacted",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/archive_test.go, table over {fork slug 'demo--t1': 400 not_supported_on_fork; archived workspace: 409 workspace_archived; archived workspace with the marker set: 409 workspace_busy; pending: 409 workspace_busy; cloning: 409 workspace_busy}: assert status and error.error_type; assert the stub pusher, the session closer and the observers recorded no call; assert the row is unchanged and no parley.workspace.archive event exists"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "ubiquitous",
+          "action": "for any archive, leave the hub's copy of the repository, the workspace's forks and every registered remover's data untouched",
+          "contract": "every ref of the copy resolves to the same commit as before the archive; fork records exist; no remover of owned data and no sandbox remover is called",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready workspace whose copy has a branch local-only that origin refuses and a ref refs/parley/changes/1/v1",
+              "one fork 'demo--t1'",
+              "stub removers of owned data registered"
+            ],
+            "pseudocode": "in internal/workspace/archive_test.go with a real copy: snapshot `git for-each-ref` of the copy; POST archive; assert the snapshot after is equal to the snapshot before, refs/heads/local-only and refs/parley/changes/1/v1 among them; assert the fork row 'demo--t1' still exists; assert the stub removers and the sandbox remover recorded no call; assert GET of the stored record still returns the workspace with status archived"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "event_driven",
+          "condition": "the transaction of an archive commits",
+          "action": "write the event parley.workspace.archive in that transaction, with the caller as actor, the slug as workspace, and the metadata head_sha, origin_push and forks",
+          "contract": "exactly one parley.workspace.archive event with metadata {head_sha: 40-character commit id or null, origin_push: \"ok\"|\"partial\"|\"failed\", forks: integer}; when the event cannot be written the status change is rolled back and the answer is HTTP 500 with error_type internal",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/archive_test.go, table over {stub outcome ok, 0 forks; partial, 2 forks; failed, 1 fork; failed workspace with head_sha null}: POST archive; assert r.status == 200 and r.json.status == 'archived' in every row; read the one parley.workspace.archive event: assert actor == caller id, workspace == 'demo', metadata.head_sha == the record's head_sha (40 hex or null), metadata.origin_push == the stub outcome, metadata.forks == the number of fork rows; and a row where the event writer fails: assert 500 internal, status still ready, no event"
+          }
+        },
+        {
+          "id": "REQ-3.5",
+          "pattern": "unwanted",
+          "condition": "origin refuses some or all branches of the safety copy made for an archive",
+          "action": "archive the workspace all the same and report the outcome in the event",
+          "contract": "HTTP 200 with status \"archived\"; the event's origin_push is \"partial\" or \"failed\"; the refused branches are still in the hub's copy",
+          "check": {
+            "same_as": "REQ-3.4"
+          }
+        },
+        {
+          "id": "REQ-3.6",
+          "pattern": "event_driven",
+          "condition": "the transaction of an archive runs",
+          "action": "ask the session closer, inside that transaction, to end every active agent session of the workspace and of each of its forks with the reason workspace archived",
+          "contract": "the session closer receives the slug of the workspace, the slug of every fork of it and the reason \"workspace archived\", and writes in the archive's transaction",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/archive_test.go: POST archive on 'demo' with forks 'demo--a' and 'demo--b' and a stub closer that writes one marker row through the transaction it is given; assert the closer was called once with slugs ['demo', 'demo--a', 'demo--b'] in any order and reason 'workspace archived'; assert its marker row is committed together with status archived; and with no closer registered: assert 200"
+          }
+        },
+        {
+          "id": "REQ-3.7",
+          "pattern": "unwanted",
+          "condition": "the session closer returns an error during an archive",
+          "action": "undo the writes the closer made, keep the status change and the event, and answer as for a successful archive",
+          "contract": "HTTP 200 with status \"archived\"; none of the closer's writes is stored; the archive event is stored",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/archive_test.go beside the test above: the stub closer writes its marker row and then returns an error; POST archive; assert r.status == 200 and r.json.status == 'archived'; assert the marker row does not exist; assert the parley.workspace.archive event exists; assert the failure was logged with the slug"
+          }
+        },
+        {
+          "id": "REQ-3.8",
+          "pattern": "event_driven",
+          "condition": "the transaction of an archive has committed",
+          "action": "tell every registered archive observer the slug of the workspace and the slugs of its forks, and log an observer's failure without changing the answer",
+          "contract": "each observer is called once, after the status archived is readable in the store; an observer's error does not change the HTTP 200 answer",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/archive_test.go: register two stub observers, the first returns an error; POST archive on 'demo' with fork 'demo--a'; assert both were called once with ('demo', ['demo--a']); assert each read status archived from the store when it was called; assert r.status == 200; and a row where the archive is refused with 409: assert no observer was called"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Reactivate an archived workspace",
+      "rationale": "An archived workspace comes back with everything it held, without a new clone in the normal case.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "the owner or an admin token sends POST /workspaces/:slug/reactivate for an archived repository workspace",
+          "action": "in one transaction set the status to pending, clear clone_error and write the event parley.workspace.reactivate with the caller as actor and empty metadata, then wake the clone workers and answer with the workspace",
+          "contract": "HTTP 200 with the workspace object, status \"pending\"; one parley.workspace.reactivate event; clone work is outstanding for the workspace",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/reactivate_test.go: r = POST /api/v1/workspaces/demo/reactivate as owner on an archived workspace; assert r.status == 200 and r.json.status == 'pending' and r.json.clone_error == null; assert exactly one parley.workspace.reactivate event with actor == caller, workspace == 'demo' and metadata == {}; assert the stub clone entry point of package 10 was called once with 'demo' after the commit; and a row where the event writer fails: assert 500 internal, status still archived, entry point not called"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "unwanted",
+          "condition": "the target of a reactivate request is a fork, is not archived, or has its maintenance marker set",
+          "action": "refuse the reactivate and change nothing",
+          "contract": "fork: HTTP 400 with error_type not_supported_on_fork; marker set: HTTP 409 with error_type workspace_busy; any status other than archived: HTTP 409 with error_type workspace_not_archived; no event is written",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/reactivate_test.go, table over {fork slug: 400 not_supported_on_fork; ready: 409 workspace_not_archived; failed: 409 workspace_not_archived; pending: 409 workspace_not_archived; cloning: 409 workspace_not_archived; archived with the marker set: 409 workspace_busy}: assert status and error.error_type; assert the row is unchanged, no event exists and the clone entry point was not called"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "event_driven",
+          "condition": "clone work runs for a reactivated workspace whose kept copy is valid",
+          "action": "bring the workspace to status ready with the head_sha it had before the archive, without cloning from origin",
+          "check": {
+            "same_as": "PATH-1"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "unwanted",
+          "condition": "the kept copy of a reactivated workspace is missing or does not open as a repository",
+          "action": "let clone work make a fresh copy from origin and bring the workspace to status ready",
+          "contract": "the workspace becomes ready; its copy holds origin's branches; commits that existed only in the hub are not in it",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a workspace cloned from a test origin, with a branch local-only that origin does not have, archived with a stub pusher that refuses every branch",
+              "the copy is damaged or removed on disk after the archive"
+            ],
+            "pseudocode": "in internal/workspace/reactivate_test.go with the real clone workers of package 10: table over {copy directory removed, copy's HEAD file truncated}: POST reactivate; wait until the stored status is ready; assert the copy has origin's main at origin's commit; assert refs/heads/local-only does not resolve in the copy; assert head_sha equals origin's main"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Reclone a repository workspace",
+      "rationale": "An owner recovers a damaged or failed copy by throwing it away and fetching origin again.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "the owner or an admin token sends POST /workspaces/:slug/reclone for a repository workspace in status ready or failed that has no fork",
+          "action": "make the safety copy, then in one transaction set the status to pending, clear sync_error and origin_head_sha and give the record a new instance id, then discard the copy on disk and with it the origin head of every branch (the refs refs/remotes/origin/<name>), wake the clone workers and answer with the workspace",
+          "contract": "HTTP 200 with the workspace object, status \"pending\", sync_error null and origin_head_sha null; the old copy is gone from disk, and with it every origin head; clone work is outstanding",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/reclone_test.go, table over {ready workspace with sync_error 'x' and three origin heads under refs/remotes/origin/ of its copy; failed workspace with no copy}: r = POST /api/v1/workspaces/demo/reclone as owner; assert r.status == 200, r.json.status == 'pending', r.json.sync_error == null, r.json.origin_head_sha == null; assert the record's instance id differs from before; assert the copy's directory does not exist; assert the stub pusher was called before the directory was removed; assert the clone entry point was called once after the directory was removed; assert head_sha and default_branch are as before"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "unwanted",
+          "condition": "the target of a reclone request is a fork, is archived, is in status pending or cloning or has its maintenance marker set, or has at least one fork",
+          "action": "refuse the reclone with the first refusal that applies, in the order fork, maintenance marker set, archived, pending or cloning, has forks, without contacting origin and without touching the copy",
+          "contract": "fork: HTTP 400 with error_type fork_has_no_origin; marker set: HTTP 409 with error_type workspace_busy; archived: HTTP 409 with error_type workspace_archived; pending or cloning: HTTP 409 with error_type workspace_busy; at least one fork: HTTP 409 with error_type has_forks; the copy and the record are unchanged",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/reclone_test.go, table over {fork slug: 400 fork_has_no_origin; archived: 409 workspace_archived; archived with one fork: 409 workspace_archived; archived with the marker set: 409 workspace_busy; pending: 409 workspace_busy; cloning with one fork: 409 workspace_busy; ready with the marker set: 409 workspace_busy; ready with one fork: 409 has_forks; failed with one fork: 409 has_forks}: assert status and error.error_type; assert the stub pusher was not called, the copy directory still exists, the row is unchanged and no parley.workspace.reclone event exists"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "event_driven",
+          "condition": "the transaction of a reclone commits",
+          "action": "write the event parley.workspace.reclone in that transaction, with the caller as actor, the slug as workspace and the metadata origin_push",
+          "contract": "exactly one parley.workspace.reclone event with metadata {origin_push: \"ok\"|\"partial\"|\"failed\"}; a refused safety copy does not stop the reclone",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/reclone_test.go, table over the stub outcomes {ok, partial, failed}: POST reclone; assert r.status == 200 in every row; assert exactly one parley.workspace.reclone event with actor == caller, workspace == 'demo' and metadata == {origin_push: outcome}"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "unwanted",
+          "condition": "the transaction of a reclone cannot be committed",
+          "action": "answer with an internal error and leave the status, the cleared fields, the instance id and the copy as they were",
+          "contract": "HTTP 500 with error_type internal; record and copy unchanged; no event",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/reclone_test.go: make the event writer fail; POST reclone on a ready workspace with sync_error 'x'; assert r.status == 500 and error.error_type == 'internal'; assert the stored status is ready, sync_error is 'x', origin_head_sha and the instance id are as before and the refs under refs/remotes/origin/ of the copy are unchanged; assert the copy directory exists; assert no event exists and the clone entry point was not called"
+          }
+        },
+        {
+          "id": "REQ-5.5",
+          "pattern": "ubiquitous",
+          "action": "for any reclone, end with a copy that holds exactly the branches and tags origin holds once the clone that follows has completed",
+          "contract": "after the clone, a branch origin did not accept and every ref under refs/parley/ are absent from the copy; no remover of owned data was called",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready workspace cloned from a test origin",
+              "in the hub copy: a branch accepted that fast-forwards on origin, a branch rejected that origin refuses, and a ref refs/parley/changes/1/v1",
+              "stub removers of owned data registered"
+            ],
+            "pseudocode": "in internal/workspace/reclone_test.go with the real clone workers and a real git subprocess: POST reclone; wait until the stored status is ready; assert `git for-each-ref` of the new copy lists exactly origin's branches and tags; assert refs/heads/rejected and refs/parley/changes/1/v1 do not resolve; assert refs/heads/accepted resolves to the hub's former commit, because origin took it; assert head_sha == origin's main and origin_head_sha == head_sha; assert the stub removers recorded no call"
+          }
+        },
+        {
+          "id": "REQ-5.6",
+          "pattern": "unwanted",
+          "condition": "the hub stops after the transaction of a reclone committed and before the copy was discarded",
+          "action": "treat the surviving copy as not belonging to the record, so that clone work discards it and clones origin fresh",
+          "contract": "after the next start the workspace becomes ready with a fresh copy of origin; the old copy is not kept",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready workspace whose copy has a branch local-only that origin does not have and refuses"
+            ],
+            "pseudocode": "in internal/workspace/reclone_test.go: run the reclone with the discard step replaced by a no-op, as a hub that stopped there; assert the stored status is pending and the old copy is still on disk; run package 10's start-up scan and clone workers; wait for ready; assert refs/heads/local-only does not resolve in the copy and the copy's branches equal origin's"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Delete request for a workspace",
+      "rationale": "Permanent removal is a two-step decision: only an archived repository workspace can be deleted, and the slug is free again afterwards.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "the owner or an admin token sends DELETE /workspaces/:slug for an archived repository workspace and every stage succeeds",
+          "action": "delete the sandboxes, run the removal step, discard the repository data and answer with an empty success",
+          "contract": "HTTP 204 with an empty body; no record of the workspace or of any of its forks is stored; the repository data is gone from disk",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/delete_test.go: r = DELETE /api/v1/workspaces/demo as owner on an archived workspace with forks 'demo--a' and 'demo--b'; assert r.status == 204 and len(r.body) == 0; assert no workspace row exists for 'demo', 'demo--a' or 'demo--b'; assert no stored settings of them exist; assert the copy directory of 'demo' does not exist; assert the recorded order is sandbox remover, removal transaction commit, discard of the copy; and one row with an admin token: 204"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "unwanted",
+          "condition": "the target of a delete request is a repository workspace that is not archived, or one whose maintenance marker is set",
+          "action": "refuse the delete and call no collaborator",
+          "contract": "marker set: HTTP 409 with error_type workspace_busy; any status other than archived: HTTP 409 with error_type workspace_not_archived; nothing is deleted",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/delete_test.go, table over {ready: 409 workspace_not_archived; failed: 409 workspace_not_archived; pending: 409 workspace_not_archived; cloning: 409 workspace_not_archived; archived with the marker set: 409 workspace_busy}: assert status and error.error_type; assert the sandbox remover, the removers and the session closer recorded no call; assert the row and the copy are unchanged and no parley.workspace.delete event exists"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "event_driven",
+          "condition": "a caller with write access sends DELETE /workspaces/:slug for a fork",
+          "action": "hand the fork's slug and the caller to DeleteFork of the registered fork remover and return its answer: HTTP 204 with an empty body when it returns no error, and its API error unchanged otherwise, without running the removal step of a repository workspace",
+          "contract": "DeleteFork of the fork remover is called once with the fork's slug and the caller; no error gives HTTP 204, an API error gives that error's status and body",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/delete_test.go: register a stub fork remover whose DeleteFork returns no error; DELETE /api/v1/workspaces/demo--a as the fork's owner; assert the stub was called once with slug 'demo--a' and the caller's identity; assert r.status == 204; assert the parent's row is unchanged and this package's removers were not called; and a row where the stub returns the error 409 workspace_busy: assert the response is that error"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "unwanted",
+          "condition": "a delete request names a fork and no fork remover is registered",
+          "action": "answer with an internal error and delete nothing",
+          "contract": "HTTP 500 with error_type internal; the fork is unchanged",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/delete_test.go beside the test above, with no fork remover registered: DELETE /api/v1/workspaces/demo--a; assert r.status == 500 and error.error_type == 'internal'; assert the fork row exists"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "unwanted",
+          "condition": "the repository data cannot be discarded after the removal step committed",
+          "action": "log the failure with the slug and the path, and answer as for a complete delete",
+          "contract": "HTTP 204; the workspace record is gone and its delete event is stored; the failure is in the log",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/delete_test.go: make the copy remover return an error; DELETE on an archived workspace; assert r.status == 204; assert no workspace row exists; assert the parley.workspace.delete event exists; assert one log line names the slug and the copy's path"
+          }
+        },
+        {
+          "id": "REQ-6.6",
+          "pattern": "event_driven",
+          "condition": "a user registers a repository under the slug of a deleted workspace",
+          "action": "accept the registration as for a slug that was never used",
+          "contract": "POST /workspaces answers HTTP 201 with status \"pending\"",
+          "check": {
+            "same_as": "PATH-2"
+          }
+        },
+        {
+          "id": "REQ-6.7",
+          "pattern": "ubiquitous",
+          "action": "for any delete, keep every event that was written about the workspace and its forks before the delete readable in the event log",
+          "contract": "the event log holds every earlier event of the deleted workspaces and the delete events",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/delete_test.go: write three events with workspace 'demo' and one with workspace 'demo--a' through the event component; DELETE 'demo'; assert those four events are still returned by the event component's read, unchanged; assert the log now also holds one parley.workspace.delete for 'demo--a' and one for 'demo'"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "Transactional removal of a workspace, its forks and what they own",
+      "rationale": "A delete that stops half-way would leave live tokens for a workspace that no longer exists, or a workspace without its policy; one step or nothing rules that out.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "event_driven",
+          "condition": "a delete of an archived repository workspace has passed its checks",
+          "action": "ask the sandbox remover to delete the sandboxes of the workspace and of every fork of it before any record is changed",
+          "contract": "the sandbox remover is called once with the slugs of the workspace and of all its forks, before the removal transaction begins",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/delete_test.go: DELETE 'demo' with forks 'demo--a', 'demo--b' and a stub sandbox remover that reads the store when called; assert it was called once with the slugs {'demo', 'demo--a', 'demo--b'}; assert at that moment all three workspace rows existed and no remover of owned data had been called"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "unwanted",
+          "condition": "the sandbox remover returns an error",
+          "action": "stop the delete, answer with an internal error and change no workspace record, token or other owned data",
+          "contract": "HTTP 500 with error_type internal; workspace still archived; forks, tokens, owned data, copy and event log unchanged; a repeated delete can succeed",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/delete_test.go: the stub sandbox remover returns an error; DELETE 'demo'; assert r.status == 500 and error.error_type == 'internal'; assert the rows of 'demo' and its forks are unchanged with 'demo' archived; assert no remover and no session closer was called; assert the copy exists and no parley.workspace.delete event exists; then make the remover succeed and DELETE again: assert 204"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "event_driven",
+          "condition": "the sandboxes of an archived repository workspace under deletion have been deleted",
+          "action": "in one transaction remove first the forks and then the workspace. The forks are removed by RemoveForksOf of the registered fork remover, called once with the transaction, the workspace's slug and the caller; when no fork remover is registered each fork, in ascending slug order, is removed by the same per-workspace removal as the workspace. The per-workspace removal revokes the live tokens bound to the slug through the token revoker, runs every registered remover of owned data with the slug, asks the session closer to end the remaining active sessions of the slug with the reason workspace deleted, and removes the workspace record with its settings",
+          "contract": "without a fork remover: the token revoker, every registered remover and the session closer (reason \"workspace deleted\") are called once for each removed workspace; with a fork remover: RemoveForksOf is called once and the revoker, the removers and the closer are called by this package for the workspace's own slug only; every call receives the transaction that removes the workspace records, and nothing is visible to other readers before the commit",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/delete_test.go: register a stub token revoker and two stub removers (secrets, changes) that each delete their own test rows keyed by slug through the transaction they are given, and a stub session closer; DELETE 'demo' with forks 'demo--b', 'demo--a'; assert the revoker and each remover were called exactly three times with slugs in the order 'demo--a', 'demo--b', 'demo'; assert the closer was called with those three slugs and reason 'workspace deleted'; assert every call received the same transaction; assert the removers' test rows and the three workspace rows are gone after the commit and were still visible to a second connection before it. Then register also a stub fork remover whose RemoveForksOf deletes the two fork rows through the transaction and returns ['demo--a', 'demo--b'] with a discard function: DELETE 'demo'; assert RemoveForksOf was called once with the same transaction, 'demo' and the caller; assert the revoker, the removers and the closer were called by this package once each, with 'demo' only; assert the discard function was called once, after the commit"
+          }
+        },
+        {
+          "id": "REQ-7.4",
+          "pattern": "unwanted",
+          "condition": "the token revoker, a remover of owned data, the fork remover, the session closer, the removal of a record or the write of an event fails inside the removal step",
+          "action": "roll the whole transaction back, answer with an internal error, and discard no repository data",
+          "contract": "HTTP 500 with error_type internal; the workspace is still archived, every fork exists, no token is revoked, no owned data is removed, no delete event is stored, and the repository data is intact",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/delete_test.go, table over the part made to fail {first remover on the first fork; last remover on the parent; the token revoker; RemoveForksOf of a registered stub fork remover, whose discard function must then not run; the session closer; removal of the parent's record; the write of the parent's event}: DELETE 'demo' with two forks; assert r.status == 500 and error.error_type == 'internal'; assert all three workspace rows exist and 'demo' is archived; assert the test rows of removers that ran before the failure exist again; assert no parley.workspace.delete event exists; assert the copy directory exists; assert the marker is released"
+          }
+        },
+        {
+          "id": "REQ-7.5",
+          "pattern": "event_driven",
+          "condition": "the removal step of a delete commits",
+          "action": "write, in the removal transaction, one event parley.workspace.delete for each fork and one for the workspace, the workspace's last, each with the caller as actor, the deleted slug as workspace and the metadata kind, parent_slug and revoked_tokens (the ids the token revoker returned for that slug), and on the workspace's event also deleted_forks; when a fork remover is registered it writes the forks' events inside RemoveForksOf and this package writes the workspace's event with the slugs RemoveForksOf returned as deleted_forks",
+          "contract": "for a workspace with n forks, n+1 parley.workspace.delete events: fork events carry {kind: \"fork\", parent_slug: string, revoked_tokens: sorted string array}; the workspace's event carries {kind: \"repository\", parent_slug: null, revoked_tokens: sorted string array, deleted_forks: sorted string array}",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/delete_test.go: with no fork remover registered, the stub token revoker returns ['t9', 't2'] for 'demo--a', [] for 'demo--b' and ['t5'] for 'demo'; DELETE 'demo'; read the parley.workspace.delete events in sequence order: assert three events with workspace 'demo--a', 'demo--b', 'demo'; assert the first has metadata {kind: 'fork', parent_slug: 'demo', revoked_tokens: ['t2', 't9']} and no deleted_forks member; the second has revoked_tokens []; the third has {kind: 'repository', parent_slug: null, revoked_tokens: ['t5'], deleted_forks: ['demo--a', 'demo--b']}; assert actor == caller on all; and a workspace without forks: one event with deleted_forks []; and with a stub fork remover whose RemoveForksOf returns ['demo--b', 'demo--a'] and writes no event: assert this package wrote exactly one event, for 'demo', with deleted_forks ['demo--a', 'demo--b']"
+          }
+        },
+        {
+          "id": "REQ-7.6",
+          "pattern": "optional",
+          "condition": "no sandbox remover, no token revoker, no remover of owned data, no fork remover, no session closer and no archive observer is registered",
+          "action": "complete the archive and the delete by changing only the workspace records, the copy and the event log",
+          "contract": "archive answers HTTP 200 and delete HTTP 204; delete events carry revoked_tokens []",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/delete_test.go with an empty collaborator set: POST archive on a ready workspace with one fork: assert 200; DELETE it: assert 204, both rows gone, two parley.workspace.delete events with revoked_tokens []"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "CLI commands for archive, reactivate, reclone and delete",
+      "rationale": "The owner retires, revives, repairs and removes a workspace from the shell, and cannot destroy data by a mistyped command.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "a user runs `parley workspace archive <slug>`",
+          "action": "send POST /workspaces/:slug/archive with a request timeout of 3 minutes and print the returned workspace",
+          "contract": "exit code 0; stdout is the workspace object as one JSON document",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/workspace_test.go against an httptest server: run `parley workspace archive demo`; assert the server received POST /api/v1/workspaces/demo/archive with the Bearer credential and no body; assert stdout is the workspace JSON with status 'archived' and the exit code is 0; assert the command's request timeout is 3 minutes (a server that answers after 31 seconds on a fake clock still yields exit 0)"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "event_driven",
+          "condition": "a user runs `parley workspace reactivate <slug>` or `parley workspace reclone <slug> --confirm` without --wait",
+          "action": "send POST /workspaces/:slug/reactivate, or POST /workspaces/:slug/reclone with a request timeout of 3 minutes, and print the returned workspace",
+          "contract": "exit code 0; stdout is the workspace object with status \"pending\"",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/workspace_test.go, table over {`workspace reactivate demo` -> POST /api/v1/workspaces/demo/reactivate, timeout 30 seconds; `workspace reclone demo --confirm` -> POST /api/v1/workspaces/demo/reclone, timeout 3 minutes}: assert method and path, no body; assert stdout is the returned workspace with status 'pending' and exit code 0; assert exactly one request was sent"
+          }
+        },
+        {
+          "id": "REQ-8.3",
+          "pattern": "optional",
+          "condition": "`parley workspace reactivate` or `parley workspace reclone` is run with --wait",
+          "action": "poll GET /workspaces/:slug after the route answered 200, every --poll-interval under --timeout, until the status is ready or failed, and print only the final workspace",
+          "contract": "ready: the final workspace on stdout, exit code 0; failed: the final workspace on stdout, error_type wait_failed on stderr, exit code 1; timeout: nothing on stdout, error_type wait_timeout on stderr, exit code 1",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/workspace_test.go, table over {reactivate, reclone --confirm} x {server reports pending, cloning, then ready: stdout holds one document with status 'ready', exit 0; server reports failed: stdout holds the workspace with status 'failed', stderr holds an envelope with error_type 'wait_failed', exit 1; server stays pending with --timeout 50ms --poll-interval 10ms: stdout empty, stderr error_type 'wait_timeout', exit 1}: assert the first request is the POST and the later ones are GET /api/v1/workspaces/demo"
+          }
+        },
+        {
+          "id": "REQ-8.4",
+          "pattern": "event_driven",
+          "condition": "a user runs `parley workspace delete <slug> --confirm`",
+          "action": "send DELETE /workspaces/:slug and print a confirmation document that names the slug",
+          "contract": "exit code 0; stdout is {\"status\": \"deleted\", \"slug\": \"<slug>\"}; a hub error gives exit code 1 with the hub's envelope on stderr and nothing on stdout",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/workspace_test.go: the httptest server answers 204 with no body; run `parley workspace delete demo --confirm`; assert the server received DELETE /api/v1/workspaces/demo; assert stdout parsed as JSON equals {status: 'deleted', slug: 'demo'}; assert exit code 0; and a row where the server answers 409 workspace_not_archived: assert stdout is empty, stderr holds that envelope, exit code 1"
+          }
+        },
+        {
+          "id": "REQ-8.5",
+          "pattern": "unwanted",
+          "condition": "`parley workspace reclone` or `parley workspace delete` is run without --confirm",
+          "action": "stop before any request is sent and report a usage error",
+          "contract": "exit code 2; an error envelope with error_type usage_error on stderr; nothing on stdout; no HTTP request is sent",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/workspace_test.go, table over {`workspace reclone demo`, `workspace reclone demo --wait`, `workspace delete demo`, `workspace delete demo --confirm=false`}: assert exit code 2; assert stderr holds an envelope with code 0 and error_type 'usage_error' whose message names --confirm; assert stdout is empty; assert the httptest server received no request"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "A developer archives a workspace and reactivates it",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "runs `parley workspace archive demo`"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends POST /api/v1/workspaces/demo/archive with a 3-minute timeout"
+        },
+        {
+          "actor": "parleyd",
+          "action": "sets the maintenance marker and offers every branch of its copy to origin as a fast-forward"
+        },
+        {
+          "actor": "origin",
+          "action": "accepts the branch main, which was ahead in the hub"
+        },
+        {
+          "actor": "parleyd",
+          "action": "sets status archived, writes parley.workspace.archive with origin_push ok, releases the marker and answers 200"
+        },
+        {
+          "actor": "developer",
+          "action": "runs `parley workspace reactivate demo --wait`"
+        },
+        {
+          "actor": "parleyd",
+          "action": "sets status pending, writes parley.workspace.reactivate and wakes the clone workers, which find the kept copy valid and set status ready"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "polls GET /api/v1/workspaces/demo until status is ready and prints the workspace"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parleyd started in-process on 127.0.0.1:0",
+          "the transactional store",
+          "internal/workspace handlers, safety copy and clone workers",
+          "internal/gitrepo with the git command",
+          "the parley CLI command tree",
+          "a test origin served over TLS by internal/gitrepo/gitrepotest"
+        ],
+        "setup": [
+          "a developer with an API key registered the workspace demo from the test origin and it is ready",
+          "a commit was added to main in the hub's copy that origin does not have",
+          "the read route GET /workspaces/:slug of package 11 is mounted"
+        ],
+        "end_state": [
+          "origin's main is at the commit that existed only in the hub",
+          "after the archive command the stored status is archived and one parley.workspace.archive event with origin_push ok exists",
+          "the reactivate command exits 0 and prints the workspace with status ready and the head_sha it had before the archive",
+          "origin received no clone or fetch request between the reactivate and ready",
+          "one parley.workspace.reactivate event exists"
+        ],
+        "pseudocode": "new test in test/e2e/workspace_retire_test.go: hub = startHub(t); origin = gitrepotest.Serve(t); create 'demo' and wait for ready; commit to main in the hub copy; out, code = cli('workspace', 'archive', 'demo'); assert code == 0 and out.status == 'archived'; assert origin.head('main') == hubCommit; n = origin.requestCount(); out, code = cli('workspace', 'reactivate', 'demo', '--wait', '--poll-interval', '50ms'); assert code == 0 and out.status == 'ready' and out.head_sha == hubCommit; assert origin.requestCount() == n; assert events('parley.workspace.archive') has 1 with origin_push 'ok'; assert events('parley.workspace.reactivate') has 1"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "A developer deletes an archived workspace with a fork and registers the slug again",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "runs `parley workspace archive demo` and then `parley workspace delete demo --confirm`"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends DELETE /api/v1/workspaces/demo"
+        },
+        {
+          "actor": "parleyd",
+          "action": "sets the maintenance marker and asks the sandbox remover to delete the sandboxes of demo and of its fork"
+        },
+        {
+          "actor": "parleyd",
+          "action": "in one transaction revokes bound tokens and runs the removers of owned data for the fork and for demo, removes both records and writes two parley.workspace.delete events"
+        },
+        {
+          "actor": "parleyd",
+          "action": "discards the repository data of demo, releases the marker and answers 204"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints {\"status\": \"deleted\", \"slug\": \"demo\"} and exits 0"
+        },
+        {
+          "actor": "developer",
+          "action": "runs `parley workspace create --slug demo --git-url <origin>`"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers 201 with a new workspace in status pending and clones origin into a fresh copy"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parleyd started in-process on 127.0.0.1:0",
+          "the transactional store and the event log",
+          "internal/workspace handlers and removal step",
+          "internal/gitrepo with the git command",
+          "the parley CLI command tree",
+          "a test origin served over TLS by internal/gitrepo/gitrepotest"
+        ],
+        "setup": [
+          "the workspace demo is ready and has one fork record demo--t1, inserted through the store when the fork route of package 15 is not mounted",
+          "a recording token revoker is registered in place of package 08's that returns the token id tok1 for demo--t1"
+        ],
+        "end_state": [
+          "the delete command exits 0 and prints {status: deleted, slug: demo}",
+          "no workspace record exists for demo or demo--t1 and the copy's directory is gone",
+          "two parley.workspace.delete events exist: one for demo--t1 with kind fork and revoked_tokens [tok1], then one for demo with kind repository and deleted_forks [demo--t1]",
+          "the events written for demo before the delete are still in the event log",
+          "a new create with the slug demo answers 201 and the new workspace becomes ready with origin's branches only"
+        ],
+        "pseudocode": "new test in test/e2e/workspace_retire_test.go: hub = startHub(t, withTokenRevoker(rec)); create 'demo', wait ready; add fork row 'demo--t1'; push a branch local-only into the hub copy that origin refuses; cli('workspace', 'archive', 'demo'); out, code = cli('workspace', 'delete', 'demo', '--confirm'); assert code == 0 and out == {status: 'deleted', slug: 'demo'}; assert store has no row for 'demo' or 'demo--t1'; assert !exists(copyPath); ev = events('parley.workspace.delete'); assert len(ev) == 2 and ev[0].workspace == 'demo--t1' and ev[0].metadata.revoked_tokens == ['tok1'] and ev[1].metadata.deleted_forks == ['demo--t1']; assert events('parley.workspace.create', workspace 'demo') still has the first one; out, code = cli('workspace', 'create', '--slug', 'demo', '--git-url', origin.url, '--wait'); assert code == 0 and out.status == 'ready'; assert the new copy has no branch local-only"
+      }
+    },
+    {
+      "id": "PATH-3",
+      "title": "A developer reclones a workspace from the shell",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "runs `parley workspace reclone demo --confirm --wait`"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends POST /api/v1/workspaces/demo/reclone with a 3-minute timeout"
+        },
+        {
+          "actor": "parleyd",
+          "action": "sets the maintenance marker and offers every branch of its copy to origin as a fast-forward"
+        },
+        {
+          "actor": "origin",
+          "action": "accepts the branch feat and refuses the branch stale, which is not a fast-forward"
+        },
+        {
+          "actor": "parleyd",
+          "action": "sets status pending, clears sync_error and the origin heads, writes parley.workspace.reclone with origin_push partial, discards its copy and answers 200"
+        },
+        {
+          "actor": "parleyd",
+          "action": "clones origin into a fresh copy and sets status ready"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "polls GET /api/v1/workspaces/demo until status is ready, prints the workspace and exits 0"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parleyd started in-process on 127.0.0.1:0",
+          "the transactional store",
+          "internal/workspace handlers, safety copy and clone workers",
+          "internal/gitrepo with the git command",
+          "the parley CLI command tree",
+          "a test origin served over TLS by internal/gitrepo/gitrepotest"
+        ],
+        "setup": [
+          "the workspace demo is ready, cloned from the test origin, which has branches main and stale",
+          "in the hub's copy a branch feat exists that origin lacks and stale was rewritten so that origin refuses it",
+          "the read route GET /workspaces/:slug of package 11 is mounted"
+        ],
+        "end_state": [
+          "the command exits 0 and prints the workspace with status ready",
+          "origin has feat at the hub's former commit and stale at its own old commit",
+          "the hub's new copy has stale at origin's commit and feat at the accepted commit",
+          "one parley.workspace.reclone event with origin_push partial exists",
+          "running the command without --confirm exits 2 and origin and the hub receive no request"
+        ],
+        "pseudocode": "new test in test/e2e/workspace_retire_test.go: hub, origin as above; create 'demo', wait ready; add feat and rewrite stale in the hub copy; _, code = cli('workspace', 'reclone', 'demo'); assert code == 2 and hub.requestCount unchanged; out, code = cli('workspace', 'reclone', 'demo', '--confirm', '--wait', '--poll-interval', '50ms'); assert code == 0 and out.status == 'ready'; assert origin.head('feat') == featCommit and origin.head('stale') == originStale; assert hubCopy.head('stale') == originStale; assert events('parley.workspace.reclone')[0].metadata.origin_push == 'partial'"
+      }
+    }
+  ],
+  "external_apis": [
+    {
+      "package": "github.com/spf13/cobra",
+      "version": "v1",
+      "verified": false,
+      "symbols": [
+        {
+          "name": "Command",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "type Command struct { Use string; Short string; Args PositionalArgs; RunE func(cmd *Command, args []string) error }"
+        },
+        {
+          "name": "Command.AddCommand",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) AddCommand(cmds ...*Command)"
+        },
+        {
+          "name": "Command.Flags",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) Flags() *pflag.FlagSet"
+        },
+        {
+          "name": "ExactArgs",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func ExactArgs(n int) PositionalArgs"
+        }
+      ]
+    }
+  ]
+}

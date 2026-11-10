@@ -1,0 +1,1088 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "21",
+  "spec_name": "scm_write_api",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Write-route gate",
+      "rationale": "A write must be refused before it reads or changes anything when the caller may not write or the workspace cannot take a write.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "unwanted",
+          "condition": "a write route is called with a PAT that lacks the scope `git:write`",
+          "action": "refuse the request without reading the repository",
+          "contract": "HTTP 403 with `error_type` `insufficient_scope`; no ref moves and no event is emitted; the answer is the same whether or not the workspace exists",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the write gate of internal/scm with a stub access component and a stub workspace lookup"
+            ],
+            "pseudocode": "in internal/scm/write_test.go: wrap a probe handler in the write gate; send a request with a PAT whose scopes are {git:read}; assert status == 403 and error.error_type == 'insufficient_scope'; assert the probe handler did not run; the same request with scopes {git:write} runs the probe; an API key runs the probe"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "unwanted",
+          "condition": "a write route is called by a caller whose access to the workspace is below write",
+          "action": "refuse the request without reading the repository",
+          "contract": "HTTP 404 with `error_type` `not_found` when the caller has no access to the workspace; HTTP 403 with `error_type` `forbidden` when the caller has read access only; no ref moves",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/scm/write_test.go beside the scope test, a table over the access level the stub access component reports {none -> 404 not_found, read -> 403 forbidden, write -> probe runs, owner -> probe runs, admin -> probe runs}: assert status and error.error_type; assert the probe ran only in the last three rows"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "unwanted",
+          "condition": "a write route is called by a caller with write access on a workspace that is not writable",
+          "action": "refuse the request by the workspace's status and leave the repository untouched",
+          "contract": "HTTP 409 with `error_type` `workspace_archived` for an archived workspace, `parent_archived` for a fork whose parent is archived, `workspace_busy` for a workspace (or a fork's parent) that is `pending`, `cloning` or in a reclone, archive or delete, and `workspace_not_ready` for a `failed` workspace",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/scm/write_test.go, a table over the workspace the stub lookup returns {status archived -> 409 workspace_archived; a fork with status ready whose parent is archived -> 409 parent_archived; pending -> 409 workspace_busy; cloning -> 409 workspace_busy; ready with an archive running -> 409 workspace_busy; a fork whose parent is cloning -> 409 workspace_busy; failed -> 409 workspace_not_ready; ready -> probe runs}: assert status and error.error_type; assert the probe ran only for ready"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "ubiquitous",
+          "action": "for any of the five write routes (`POST /workspaces/:slug/scm/commits`, `POST /workspaces/:slug/scm/refs`, `PATCH /workspaces/:slug/scm/refs/*name`, `DELETE /workspaces/:slug/scm/refs/*name`, `POST /workspaces/:slug/scm/rebase`), run the write gate before the route's own validation",
+          "contract": "each route answers the gate's refusal (`insufficient_scope`, `forbidden`, `not_found`, `workspace_archived`, `parent_archived`, `workspace_busy`, `workspace_not_ready`) and never `invalid_request` when both apply",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready workspace whose bare repository was made with git init in t.TempDir() and holds main with the files README.md, api/old.go and the directory docs/",
+              "the real router of internal/server with the scm routes registered"
+            ],
+            "pseudocode": "in internal/scm/write_routes_test.go, a table over the five routes, each sent with an empty JSON body {} (which would fail the route's own validation) in three set-ups {PAT with git:read only -> 403 insufficient_scope; org member with read access -> 403 forbidden; owner on an archived workspace -> 409 workspace_archived}: assert status and error.error_type for every route and set-up; assert git for-each-ref output is unchanged after the table"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Commit creation and its compare-and-swap",
+      "rationale": "An agent commits its edits in one request and is told when the branch moved under it, so it never overwrites work it has not seen (SCM-US-02).",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "`POST /workspaces/:slug/scm/commits` names an existing branch and an `expected_head_sha` equal to its head",
+          "action": "create one commit whose parent is the branch head and whose tree is the parent's tree with the operations applied, and move the branch to it",
+          "contract": "HTTP 201 with `{commit, branch, change, change_error}`: `commit` is the commit object (40-character `sha`, `parents` holding exactly the old head), `branch` is the ref object at the new commit; `base_ref` is ignored",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready workspace whose bare repository was made with git init in t.TempDir() and holds main with the files README.md, api/old.go and the directory docs/",
+              "an unprotected branch work at main's head",
+              "the caller is the workspace owner with an API key"
+            ],
+            "pseudocode": "in internal/scm/commit_test.go: head = rev-parse('work'); r = post('/workspaces/w/scm/commits', {branch:'work', expected_head_sha: head, message:'m', operations:[put a.txt 'hi']}); assert r.status == 201; assert r.json.commit.parents == [head]; assert r.json.commit.message == 'm'; assert r.json.branch.name == 'refs/heads/work' and r.json.branch.sha == r.json.commit.sha; assert len(r.json.commit.sha) == 40; assert git rev-parse refs/heads/work == r.json.commit.sha; assert git show work:a.txt == 'hi'; assert 'change' and 'change_error' are present and null; a second row sends base_ref:'nope' together with the right expected_head_sha and still gets 201"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "event_driven",
+          "condition": "`POST /workspaces/:slug/scm/commits` names a branch that does not exist and a `base_ref` that resolves to a commit",
+          "action": "create the commit on top of the commit `base_ref` resolves to and create the branch at the new commit",
+          "contract": "HTTP 201; `commit.parents` holds exactly the resolved base commit; the branch exists afterwards at `commit.sha`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready workspace whose bare repository was made with git init in t.TempDir() and holds main with the files README.md, api/old.go and the directory docs/"
+            ],
+            "pseudocode": "in internal/scm/commit_test.go, a table over base_ref {'main', 'refs/heads/main', the full id of main's head, a 7-character prefix of it}: r = post commits {branch:'new-<i>', base_ref, message, operations:[put x 'y']}; assert r.status == 201; assert r.json.commit.parents == [main head]; assert git rev-parse refs/heads/new-<i> == r.json.commit.sha"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "ubiquitous",
+          "action": "for any created commit, record the request's `author` name and e-mail as the author, or the caller's name and e-mail when `author` is absent, and the hub's identity as the committer",
+          "contract": "`commit.author` and `commit.committer` in the 201 answer, and the same values in the stored commit",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a ready workspace whose bare repository was made with git init in t.TempDir() and holds main with the files README.md, api/old.go and the directory docs/"
+            ],
+            "pseudocode": "in internal/scm/commit_test.go, a table {author {name:'A', email:'a@x'} given -> commit.author.name == 'A' and email == 'a@x'; author absent, caller user (Kim, kim@x) -> author is Kim; author absent, admin token -> author equals the hub identity}: in every row assert r.json.commit.committer.name and .email equal the hub's configured committer identity and git log -1 --format='%an|%ae|%cn|%ce' agrees with the response"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "unwanted",
+          "condition": "the named branch exists and `expected_head_sha` is absent or differs from the branch head",
+          "action": "refuse the request, create no visible commit and leave the branch where it is",
+          "contract": "HTTP 409 with `error_type` `ref_moved` and `error.details.current_sha` equal to the branch's current head; no event is emitted",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready workspace whose bare repository was made with git init in t.TempDir() and holds main with the files README.md, api/old.go and the directory docs/",
+              "a recording event sink"
+            ],
+            "pseudocode": "in internal/scm/commit_test.go, a table over expected_head_sha for the existing branch work {absent, main's old parent id, 40 zeros}: r = post commits; assert r.status == 409; assert r.json.error.error_type == 'ref_moved'; assert r.json.error.details.current_sha == rev-parse(work); assert rev-parse(work) is unchanged; assert no event was recorded by the test event sink"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "unwanted",
+          "condition": "the commit request is malformed: `branch` is missing or not a valid branch name, `message` is missing or empty, `operations` holds more than 1,000 entries, `author` lacks `name` or `email`, or the branch does not exist and `base_ref` is absent or resolves to no commit",
+          "action": "refuse the request and move no ref",
+          "contract": "HTTP 400 with `error_type` `invalid_request`, except HTTP 404 with `error_type` `ref_not_found` for a `base_ref` that resolves to no commit; exactly 1,000 operations are accepted",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a ready workspace whose bare repository was made with git init in t.TempDir() and holds main with the files README.md, api/old.go and the directory docs/"
+            ],
+            "pseudocode": "in internal/scm/commit_test.go, a table over bodies {no branch; branch ''; branch 'a..b'; no message; message ''; operations not an array; 1001 put operations; author without email; branch missing and no base_ref} each -> 400 invalid_request, and {branch missing, base_ref 'no-such-ref'} -> 404 ref_not_found; a body with exactly 1000 put operations -> 201; assert for-each-ref is unchanged after every refused row"
+          }
+        },
+        {
+          "id": "REQ-2.6",
+          "pattern": "unwanted",
+          "condition": "the body of `POST /workspaces/:slug/scm/commits` is larger than `[scm].max_commit_size` (default 32 MiB)",
+          "action": "refuse the request without parsing it",
+          "contract": "HTTP 413 with `error_type` `payload_too_large`; a body at or under the limit is read in full even when it is larger than `[server].max_body_size`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready workspace whose bare repository was made with git init in t.TempDir() and holds main with the files README.md, api/old.go and the directory docs/"
+            ],
+            "pseudocode": "in internal/scm/commit_test.go: start the routes with max_commit_size = 1024; post a commit body of 2000 bytes -> assert 413 and error.error_type == 'payload_too_large'; post one of 900 bytes -> 201; with the default configuration post a body of 2 MiB (over the 1 MiB default body limit of other routes) -> 201; in internal/config/config_test.go: a file with [scm] max_commit_size = '64MB' loads as 64 MiB and a file without the key loads as 32 MiB"
+          }
+        },
+        {
+          "id": "REQ-2.7",
+          "pattern": "unwanted",
+          "condition": "another write moves the branch between the read of its head and the compare-and-swap of a commit request",
+          "action": "answer the loser of the race as moved and leave only the winner's commit reachable from the branch",
+          "contract": "HTTP 409 with `error_type` `ref_moved` and `details.current_sha`; of several concurrent commit requests with one `expected_head_sha` exactly one answers 201; the losers emit no event and touch no change",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready workspace whose bare repository was made with git init in t.TempDir() and holds main with the files README.md, api/old.go and the directory docs/",
+              "a recording event sink"
+            ],
+            "pseudocode": "in internal/scm/commit_test.go: start 8 goroutines posting different put operations to branch work with the same expected_head_sha; assert exactly one answer is 201 and seven are 409 with error_type 'ref_moved' and details.current_sha equal to the winner's commit.sha or the old head; assert git rev-list --count old..work == 1; assert the event sink holds events for one commit only"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "File operations",
+      "rationale": "The four operations are the whole vocabulary a client has for describing an edit; each must do one predictable thing or fail the whole request.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "a `put` operation carries a valid `path`, exactly one of `content` (UTF-8 text) and `content_base64`, and no `mode` or a `mode` of `100644`, `100755` or `120000`",
+          "action": "create the file at `path`, or replace it, with the given bytes and mode, creating missing parent directories",
+          "contract": "the resulting tree holds the path as a blob with those bytes and that mode (`100644` when none is given); with mode `120000` the content is the link target",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the operation applier of internal/gitrepo over a repository made with git init in t.TempDir() whose parent tree holds a.txt (100644), bin/run (100755), docs/guide.md and a submodule entry vendor/lib"
+            ],
+            "pseudocode": "in internal/gitrepo/treewrite_test.go, a table {put new/deep/f.txt content 'x' -> blob 'x' mode 100644; put a.txt content 'new' -> replaced, mode 100644; put img.bin content_base64 of bytes 00 ff 10 -> blob equals those bytes; put tool mode '100755' -> mode 100755; put link mode '120000' content 'a.txt' -> tree entry is a symlink whose target is 'a.txt'; put a.txt with its current content -> tree id equals the parent's tree id}: apply, then read back with git ls-tree -r and git cat-file blob"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "event_driven",
+          "condition": "a `delete`, `move` or `chmod` operation names an existing file (and, for `move`, a `to` that does not exist)",
+          "action": "remove the path for `delete`, rename `from` to `to` keeping content and mode for `move`, and change only the mode for `chmod`",
+          "contract": "the resulting tree lacks the deleted path; holds the moved file under `to` with the blob id and mode it had under `from`; holds the chmod-ed file with the same blob id and the new mode",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the operation applier of internal/gitrepo over a repository made with git init in t.TempDir() whose parent tree holds a.txt (100644), bin/run (100755), docs/guide.md and a submodule entry vendor/lib"
+            ],
+            "pseudocode": "in internal/gitrepo/treewrite_test.go, a table {delete a.txt -> a.txt absent; delete docs/guide.md -> docs/ absent from the tree (no empty directory); move bin/run -> tools/run: tools/run has the old blob id and mode 100755, bin/run absent; chmod a.txt 100755 -> same blob id, mode 100755}: apply and compare git ls-tree -r output with the expected entries"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "ubiquitous",
+          "action": "for any list of operations, apply them one at a time in request order, each to the tree the previous one left",
+          "contract": "`put a` followed by `delete a` leaves no `a`; a later operation may use a path an earlier one created or freed",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the operation applier of internal/gitrepo over a repository made with git init in t.TempDir() whose parent tree holds a.txt (100644), bin/run (100755), docs/guide.md and a submodule entry vendor/lib"
+            ],
+            "pseudocode": "in internal/gitrepo/treewrite_test.go, a table {[put a 'x', delete a] on a tree without a -> no a, tree equals the parent's; [delete a.txt, put a.txt 'z'] -> a.txt is 'z'; [put n 'x', move n -> m, chmod m 100755] -> only m, mode 100755; [move a.txt -> b.txt, put a.txt 'again'] -> both exist; [put d/f 'x', delete d/f, put d 'file'] -> d is a file}: apply and compare the tree"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "unwanted",
+          "condition": "an operation cannot apply to the tree as the earlier operations left it: `delete`, `move` or `chmod` of a missing path, `move` onto an existing path, `put` under a path that is a file, `put` onto a directory, or any operation on or under a submodule entry",
+          "action": "refuse the whole request, naming the first operation that does not apply, and move no ref",
+          "contract": "HTTP 400 with `error_type` `invalid_operation` and `error.details.index` holding the zero-based index of that operation",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a ready workspace whose bare repository was made with git init in t.TempDir() and holds main with the files README.md, api/old.go and the directory docs/ plus a submodule entry vendor/lib"
+            ],
+            "pseudocode": "in internal/scm/commit_test.go, a table of operation lists posted to the commit route with the failing operation at index 1 after one valid put {delete missing.txt; move missing.txt -> x; move a.txt -> bin/run (existing); move a.txt -> docs (a directory); chmod missing.txt 100755; put a.txt/child (a.txt is a file); put docs (a directory); put vendor/lib; delete vendor/lib; put vendor/lib/x}: assert status == 400; assert error.error_type == 'invalid_operation'; assert error.details.index == 1; assert the branch head is unchanged"
+          }
+        },
+        {
+          "id": "REQ-3.5",
+          "pattern": "unwanted",
+          "condition": "an operation is malformed: an unknown or missing `op`; a path that is empty, starts with `/`, has a `.` or `..` segment or a `.git` segment; a `put` with both or neither of `content` and `content_base64` or with invalid base64; a `put` mode outside `100644`, `100755`, `120000`; a `chmod` mode outside `100644`, `100755`; a missing field",
+          "action": "refuse the request before resolving the parent",
+          "contract": "HTTP 400 with `error_type` `invalid_request`; the answer does not depend on the branch's state",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a ready workspace whose bare repository was made with git init in t.TempDir() and holds main with the files README.md, api/old.go and the directory docs/"
+            ],
+            "pseudocode": "in internal/scm/commit_test.go, a table of single operations {op 'copy'; no op; put with path ''; path '/abs'; path 'a/./b'; path 'a/../b'; path '.git/config'; path 'x/.git/hooks/h'; put with content and content_base64; put with neither; put content_base64 '!!!'; put mode '100600'; put mode '160000'; chmod without mode; chmod mode '120000'; move without to; delete without path}: assert 400 invalid_request for every row; the request carries a stale expected_head_sha and still answers 400, not 409"
+          }
+        },
+        {
+          "id": "REQ-3.6",
+          "pattern": "unwanted",
+          "condition": "the tree after all operations equals the parent's tree and `allow_empty` is absent or false",
+          "action": "refuse the request and move no ref",
+          "contract": "HTTP 400 with `error_type` `empty_commit`; a request in which at least one operation changes the tree is accepted even when another operation changes nothing",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready workspace whose bare repository was made with git init in t.TempDir() and holds main with the files README.md, api/old.go and the directory docs/"
+            ],
+            "pseudocode": "in internal/scm/commit_test.go, a table {operations [] ; operations absent; [put README.md with its current content]; [put t 'x', delete t]} each without allow_empty -> assert 400 and error.error_type == 'empty_commit' and the branch head unchanged; a row [put README.md same content, put new.txt 'x'] -> 201"
+          }
+        },
+        {
+          "id": "REQ-3.7",
+          "pattern": "optional",
+          "condition": "the request sets `allow_empty` to true",
+          "action": "create a commit whose tree is its parent's tree",
+          "contract": "HTTP 201; `commit.tree_sha` equals the parent's tree id",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready workspace whose bare repository was made with git init in t.TempDir() and holds main with the files README.md, api/old.go and the directory docs/"
+            ],
+            "pseudocode": "in internal/scm/commit_test.go: r = post commits {branch work, expected_head_sha, message 'marker', operations: [], allow_empty: true}; assert r.status == 201; assert r.json.commit.tree_sha == the parent's tree id; assert r.json.commit.parents == [old head]"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Consequences of a commit",
+      "rationale": "A commit through the API must be indistinguishable, afterwards, from a push of the same commit: same events, same versions, same changes.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "a commit request has moved or created its branch",
+          "action": "emit one `parley.git.push` event and one `parley.scm.commit` event for the moved branch after the branch has moved and before answering",
+          "contract": "`parley.git.push` with metadata `ref` (full name), `before` (null for a created branch), `after`, `created`, `deleted: false`, `forced: false`, `direct`, `via: \"api\"`; `parley.scm.commit` with metadata `branch`, `sha`, `parent_sha` and `files` (the paths the commit touched, both paths of a move, at most 100); both carry the request's `session_id` or null",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready workspace whose bare repository was made with git init in t.TempDir() and holds main with the files README.md, api/old.go and the directory docs/",
+              "a recording event sink behind the real event emitter interface"
+            ],
+            "pseudocode": "in internal/scm/commit_events_test.go: post a commit touching 3 paths (one of them a move a.txt -> b.txt) on existing branch work; assert the sink holds exactly [parley.git.push, parley.scm.commit]; push.metadata == {ref:'refs/heads/work', before: old, after: new, created:false, deleted:false, forced:false, direct:false, via:'api'}; commit.metadata.branch == 'work', sha == new, parent_sha == old, files == sorted paths incl. both a.txt and b.txt; post a commit creating branch n from base_ref -> push.before == null and created == true; post a commit with 150 puts -> len(commit.metadata.files) == 100"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "event_driven",
+          "condition": "a commit request has moved a branch that is the source of a `draft` or `open` change",
+          "action": "have the ref-updated stage that package 22 registers with the ref writer of package 18 record a new version of kind `commit` at the new commit, in the store transaction of the ref update, and name the change and version in the answer",
+          "contract": "`change` in the 201 answer is `{workspace_slug, number, version}`, the version the ref writer reports for the update; this package passes the version kind `commit`, the session and the caller's credential to the ref writer and makes no record call of its own",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a ready workspace whose bare repository was made with git init in t.TempDir() and holds main with the files README.md, api/old.go and the directory docs/",
+              "a recording ref-updated stage registered with the ref writer of package 18 in place of package 22's, which reports a scripted version for the moved branch; a fake change linker registered in place of package 22's that records its calls and returns scripted answers"
+            ],
+            "pseudocode": "in internal/scm/commit_events_test.go: the stage reports version {w, 12, 4} for refs/heads/work; post a commit to work; assert r.status == 201 and r.json.change == {workspace_slug:'w', number:12, version:4}; assert the stage was called once with via 'api', version kind 'commit', the update before == old head and after == new commit, the session id of the request and the caller's credential id, while rev-parse(work) still returned the old head; assert change_error == null"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "event_driven",
+          "condition": "a commit request on an unprotected branch carries a `change` object that passes the change component's checks",
+          "action": "have the change component open a change with the request's `target_branch`, `title`, `intent` and `draft`, with the committed branch as source, and name it in the answer",
+          "contract": "HTTP 201 with `change` `{workspace_slug, number, version: 1}`; the change component is asked to check the opening before the branch moves and to open the change after it",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a ready workspace whose bare repository was made with git init in t.TempDir() and holds main with the files README.md, api/old.go and the directory docs/",
+              "a fake change linker registered in place of package 22's that records its calls and returns scripted answers"
+            ],
+            "pseudocode": "in internal/scm/commit_events_test.go: the fake linker accepts the pre-check and returns {w, 13, version 1} from open; post a commit with change {target_branch:'main', title:'T', intent:'I', draft:true}; assert 201 and r.json.change == {workspace_slug:'w', number:13, version:1}; assert the linker saw the pre-check before the branch moved (rev-parse inside the fake equals the old head) and the open call after it, with the four fields unchanged"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "unwanted",
+          "condition": "a commit request carries a `change` object and the change component refuses the opening (a PAT without `changes:write`, or a failed check of CHG-FR-003)",
+          "action": "refuse the whole request with the change component's error and move no ref",
+          "contract": "the change component's status and `error_type` (`403 insufficient_scope`, `400 target_not_found`, `400 source_not_related`, `400 nothing_to_land`, `400 merge_commits_unsupported`, `400 intent_required`, `409 change_exists`); no ref moves and no event is emitted",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a ready workspace whose bare repository was made with git init in t.TempDir() and holds main with the files README.md, api/old.go and the directory docs/",
+              "a fake change linker registered in place of package 22's that records its calls and returns scripted answers",
+              "a recording event sink"
+            ],
+            "pseudocode": "in internal/scm/commit_events_test.go, a table over the error the fake linker's pre-check returns {403 insufficient_scope, 400 target_not_found, 400 nothing_to_land, 400 merge_commits_unsupported, 400 intent_required, 409 change_exists}: post a commit with a change object; assert the status and error_type are passed through unchanged; assert the branch head is unchanged, the event sink is empty and the linker's open call never ran; one more row with no linker registered -> 400 invalid_request"
+          }
+        },
+        {
+          "id": "REQ-4.5",
+          "pattern": "event_driven",
+          "condition": "a commit request without a `change` object has moved or created an own branch of a fork whose `auto_change` is true, and that branch is not the source of a `draft` or `open` change",
+          "action": "ask the change component to open a change in the parent workspace with the fork's branch as source and the fork's base branch as target, and keep the commit whatever the outcome",
+          "contract": "HTTP 201 in every case; `change` names the opened change, or is null with `change_error` `{error_type, message}` when the opening failed; `change_error` is null in every other answer",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a fork workspace with auto_change true whose base branch is main",
+              "a fake change linker registered in place of package 22's that records its calls and returns scripted answers",
+              "a recording event sink"
+            ],
+            "pseudocode": "in internal/scm/commit_events_test.go, a table {linker opens {parent, 20, 1} -> 201, change == {workspace_slug:'parent', number:20, version:1}, change_error == null; linker fails with intent_required 'intent is required' -> 201, change == null, change_error == {error_type:'intent_required', message:'intent is required'}; linker fails with insufficient_scope -> 201, change == null, change_error.error_type == 'insufficient_scope'; fork with auto_change false -> 201, change == null, change_error == null, the linker's open call never ran; branch already has an open change -> a version is recorded and no change opened}: in every row assert the branch moved and both events were emitted"
+          }
+        },
+        {
+          "id": "REQ-4.6",
+          "pattern": "unwanted",
+          "condition": "a commit or rebase request carries a `session_id` that the session linker (the interface SessionLinker of internal/scm, to which package 49 hands its session-linking check) does not accept for the caller and the workspace, or no session linker is registered",
+          "action": "refuse the request and write nothing",
+          "contract": "HTTP 400 with `error_type` `unknown_session`; no ref moves and no event is emitted; an accepted `session_id` appears on the emitted events and on any version recorded",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a ready workspace whose bare repository was made with git init in t.TempDir() and holds main with the files README.md, api/old.go and the directory docs/",
+              "a recording event sink"
+            ],
+            "pseudocode": "in internal/scm/session_test.go, a table over the routes {POST commits, POST rebase} and the session linker {fake that refuses, none registered}: send a valid request with session_id 's-1'; assert 400 and error.error_type == 'unknown_session'; assert the branch head is unchanged and the event sink is empty; with a fake linker that accepts: assert 2xx, the linker saw (caller, workspace, 's-1'), and every emitted event's session_id == 's-1' and commit.session_id == 's-1' in a commit answer"
+          }
+        },
+        {
+          "id": "REQ-4.7",
+          "pattern": "event_driven",
+          "condition": "a `POST` to the commits, refs or rebase route repeats an `Idempotency-Key` that the same caller used on the same route for a request that succeeded within 24 hours, with the same body",
+          "action": "answer with the recorded body of the first request and create nothing",
+          "contract": "HTTP 200 with the first answer's body; no second commit, ref update or event; the same key with a different body answers HTTP 409 with `error_type` `conflict`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready workspace whose bare repository was made with git init in t.TempDir() and holds main with the files README.md, api/old.go and the directory docs/",
+              "the real idempotency helper of internal/server",
+              "a recording event sink"
+            ],
+            "pseudocode": "in internal/scm/commit_events_test.go: r1 = post commits with header Idempotency-Key 'k1' -> 201; r2 = the identical request with 'k1' (its expected_head_sha is now stale) -> assert 200 and r2.body == r1.body; assert rev-list --count old..work == 1 and the sink holds events of one commit; the same key with a different message -> 409 conflict; a first request refused with 409 ref_moved and retried with the same key and a fresh expected_head_sha -> 201; the same replay sequence for POST refs (201 then 200) and POST rebase (200 then 200, one branch move)"
+          }
+        },
+        {
+          "id": "REQ-4.8",
+          "pattern": "event_driven",
+          "condition": "a commit, ref create, ref move, ref delete or rebase request has moved a ref through the ref writer of package 18",
+          "action": "leave the notification of the post-push listeners to that ref writer, to which it passed `via: \"api\"` and the request's `session_id`",
+          "contract": "a listener registered with the ref writer of package 18 is called exactly once per accepted request with the workspace slug, the accepted update, via `api` and the request's session id, or null without one; the call comes from the event step of `Apply`; internal/scm holds no listener registry and calls no listener; a refused request causes no call",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready workspace whose bare repository was made with git init in t.TempDir() and holds main with the files README.md, api/old.go and the directory docs/",
+              "the real rule engine and ref writer of package 18 with a recording post-push listener registered through its registration function, and a fake session linker that accepts 's-1'"
+            ],
+            "pseudocode": "in internal/scm/commit_events_test.go, a table over the routes {POST commits with session_id 's-1' on branch work; POST refs creating refs/heads/n; PATCH of refs/heads/n; DELETE of refs/heads/n; POST rebase of work with session_id 's-1'}: send the request; wait for the listener; assert it was called exactly once more, with the workspace slug, one update for the ref of the row, via == 'api' and session == 's-1' on the commit and rebase rows, null on the others; then a commit refused with 409 ref_moved -> assert no further call"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Push-rule refusals over the API",
+      "rationale": "The API and the git server are two doors to one repository; a write refused over git must be refused here too, with a machine-readable type per rule.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "ubiquitous",
+          "action": "for any ref update a write route is about to make, submit it to the push rule engine of package 18 (Evaluate in internal/gitserver/pushrule) with the caller facts, the full ref name, the `before` commit (none for a create) and the `after` commit (none for a delete), and make the update only when the engine accepts it, through the ref writer of the same package (Apply with via `api`)",
+          "contract": "one evaluation per request, made before the compare-and-swap; the commit named as `after` exists in the repository when the engine is called; the compare-and-swap, the workspace's `head_sha`, the ref-updated stages and `parley.git.push` are the ref writer's, and this package has no second writer",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a ready workspace whose bare repository was made with git init in t.TempDir() and holds main with the files README.md, api/old.go and the directory docs/",
+              "a fake rule engine that records each evaluation and accepts"
+            ],
+            "pseudocode": "in internal/scm/rules_test.go, with a recording fake engine: a table {commit on existing branch -> (refs/heads/work, old, new); commit creating a branch -> (refs/heads/n, none, new); POST refs tag -> (refs/tags/v1, none, sha); PATCH ref -> (name, expected_sha, sha); DELETE ref -> (name, current, none); rebase -> (refs/heads/work, old, rebased head)}: assert exactly one engine call per request with those values and the request's credential; assert the call happened while rev-parse(ref) still returned the before value"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "unwanted",
+          "condition": "the push rule engine refuses the ref update of a write",
+          "action": "refuse the request with the engine's message and the `error_type` of the refusing rule",
+          "contract": "HTTP 403 with `error.message` equal to the rule's message and `error_type` `hub_owned_ref` (rule 1), `protected_branch` (rule 2), `default_branch` (rule 2a), `tracking_branch` (rule 3), `integration_branch` or `patch_branch` (rule 4, by the kind of branch), `path_not_allowed` (rule 5)",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a ready workspace whose bare repository was made with git init in t.TempDir() and holds main with the files README.md, api/old.go and the directory docs/",
+              "a fake rule engine with scripted refusals"
+            ],
+            "pseudocode": "in internal/scm/rules_test.go, a table over the refusal the fake engine returns {rule hub-owned -> hub_owned_ref; rule protected -> protected_branch; rule default-branch -> default_branch; rule tracking -> tracking_branch; rule carry-patch on the integration branch -> integration_branch; rule carry-patch on a patch branch -> patch_branch; rule path -> path_not_allowed} crossed with the five write routes: assert status == 403; assert error.error_type as mapped; assert error.message == the engine's message verbatim (for example 'main is protected and cannot be force-pushed or deleted')"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "unwanted",
+          "condition": "a path-scoped PAT writes a commit that changes a file outside the token's `paths`",
+          "action": "refuse the commit and name the first offending path",
+          "contract": "HTTP 403 with `error_type` `path_not_allowed` and the named member `error.path` holding the offending path",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready workspace whose bare repository was made with git init in t.TempDir() and holds main with the files README.md, api/old.go and the directory docs/",
+              "the real push rule engine of package 18"
+            ],
+            "pseudocode": "in internal/scm/rules_integration_test.go with the real rule engine: PAT with git:write and paths ['docs/**']; post a commit with [put docs/a.md, put src/b.go] on branch work -> assert 403, error.error_type == 'path_not_allowed', error.path == 'src/b.go', branch unchanged; post [put docs/a.md] -> 201; post [move docs/guide.md -> guide.md] -> 403 with error.path == 'guide.md'"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "unwanted",
+          "condition": "a write names a tracking branch of a task fork",
+          "action": "refuse the write and name the fork's base branch",
+          "contract": "HTTP 403 with `error_type` `tracking_branch` and `error.details.base_ref` equal to the fork's `fork_point.ref`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready workspace whose bare repository was made with git init in t.TempDir() and holds main with the files README.md, api/old.go and the directory docs/",
+              "a task fork of the workspace",
+              "the real push rule engine of package 18"
+            ],
+            "pseudocode": "in internal/scm/rules_integration_test.go with the real rule engine: a fork of w taken from main; post a commit to branch main of the fork with the right expected_head_sha -> assert 403, error.error_type == 'tracking_branch', error.details.base_ref == 'main'; PATCH and DELETE of refs/heads/main in the fork -> the same answer; post a commit to a new branch with base_ref 'main' -> 201"
+          }
+        },
+        {
+          "id": "REQ-5.5",
+          "pattern": "ubiquitous",
+          "action": "for any write the push rule engine refuses, leave every ref at its commit, emit no event and call neither the change component nor the idempotency record",
+          "contract": "after a 403 push-rule refusal the output of `git for-each-ref` is byte-identical to before the request and no `parley.*` event exists for it",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a ready workspace whose bare repository was made with git init in t.TempDir() and holds main with the files README.md, api/old.go and the directory docs/",
+              "a fake rule engine with scripted refusals",
+              "a recording event sink",
+              "a fake change linker registered in place of package 22's that records its calls and returns scripted answers"
+            ],
+            "pseudocode": "in internal/scm/rules_test.go, extending the refusal table: after each refused request assert git for-each-ref output equals the output before, the event sink is empty, the fake linker recorded no call, and a retry with the same Idempotency-Key reaches the engine again"
+          }
+        },
+        {
+          "id": "REQ-5.6",
+          "pattern": "unwanted",
+          "condition": "the push rule engine cannot evaluate a ref update because of an internal failure",
+          "action": "refuse the write and move no ref",
+          "contract": "HTTP 500 with `error_type` `internal`; the write is never accepted",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a ready workspace whose bare repository was made with git init in t.TempDir() and holds main with the files README.md, api/old.go and the directory docs/",
+              "a fake rule engine that fails"
+            ],
+            "pseudocode": "in internal/scm/rules_test.go: the fake engine returns an internal failure (not a refusal); a table over the five routes: assert 500 and error.error_type == 'internal'; assert error.message does not contain the failure's text; assert refs unchanged and no event"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Direct push through the API",
+      "rationale": "The owner exemption must behave the same at both doors, or the API becomes a way around (or a stricter copy of) branch protection.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "the workspace's owner or the admin token, with a credential the owner exemption accepts and `protect.owner_push` true, creates a commit on a protected branch",
+          "action": "accept the commit as a direct push, mark the push event as direct and open no change and record no version for the branch",
+          "contract": "HTTP 201; `parley.git.push` has `direct: true`; `change` and `change_error` are null; when the branch is the default branch the workspace's `head_sha` equals the new commit",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready workspace whose bare repository was made with git init in t.TempDir() and holds main with the files README.md, api/old.go and the directory docs/",
+              "the real push rule engine of package 18 and the workspace setting protected_branches at its default (main)",
+              "a fake change linker registered in place of package 22's that records its calls and returns scripted answers",
+              "a recording event sink"
+            ],
+            "pseudocode": "in internal/scm/direct_push_test.go, a table over the caller {owner with API key, admin token, owner with an unbound PAT (git:write) without paths}: post a commit to main with the right expected_head_sha; assert 201; assert the push event's metadata.direct == true and via == 'api'; assert r.json.change == null and change_error == null; assert the fake linker's record and open calls never ran even though it reports an open change with source main; assert GET /workspaces/w reports head_sha == the new commit"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "unwanted",
+          "condition": "a commit on a protected branch comes from a caller or credential the owner exemption does not cover: the owner's workspace-bound PAT, the owner's path-scoped PAT, or any caller while `protect.owner_push` is false",
+          "action": "refuse the commit and leave the protected branch where it is",
+          "contract": "HTTP 403 with `error_type` `protected_branch` and the fast-forward message of rule 2",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready workspace whose bare repository was made with git init in t.TempDir() and holds main with the files README.md, api/old.go and the directory docs/",
+              "the real push rule engine of package 18 and the workspace setting protected_branches at its default (main)"
+            ],
+            "pseudocode": "in internal/scm/direct_push_test.go, a table {owner's PAT bound to the workspace; owner's PAT with paths ['**']; owner API key with protect.owner_push false; admin token with protect.owner_push false}: post a commit to main; assert 403 and error.error_type == 'protected_branch'; assert error.message == 'main is protected; push another branch and open a change (git push -o parley.change)'; assert rev-parse(main) unchanged"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "unwanted",
+          "condition": "a commit request on a protected branch carries a `change` object",
+          "action": "refuse the request before resolving the parent or writing any object",
+          "contract": "HTTP 400 with `error_type` `invalid_request` for every caller that passes the write gate; no object is written",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a ready workspace whose bare repository was made with git init in t.TempDir() and holds main with the files README.md, api/old.go and the directory docs/",
+              "the real push rule engine of package 18 and the workspace setting protected_branches at its default (main)",
+              "a fake change linker registered in place of package 22's that records its calls and returns scripted answers"
+            ],
+            "pseudocode": "in internal/scm/direct_push_test.go, a table over the caller {owner API key, admin token, owner's workspace-bound PAT}: post a commit to main with a change object {target_branch:'release'} and a stale expected_head_sha; assert 400 and error.error_type == 'invalid_request' (not 409, not 403); assert git count-objects reports the same object count as before; assert the linker's pre-check never ran"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "event_driven",
+          "condition": "the workspace's owner or the admin token, under the owner exemption, moves a protected branch forward with `PATCH /workspaces/:slug/scm/refs/*name`, or rebases a protected branch so that its new head descends from its old head",
+          "action": "accept the update as a direct push",
+          "contract": "HTTP 200; `parley.git.push` has `direct: true` and `forced: false`; no version is recorded",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready workspace whose bare repository was made with git init in t.TempDir() and holds main with the files README.md, api/old.go and the directory docs/",
+              "the real push rule engine of package 18 and the workspace setting protected_branches at its default (main)",
+              "a recording event sink"
+            ],
+            "pseudocode": "in internal/scm/direct_push_test.go: as owner with API key, c = a commit on branch work that descends from main; PATCH refs/heads/main {sha: c, expected_sha: main} -> 200 and the push event has direct == true and forced == false; then POST rebase {branch:'main', onto: a commit that descends from main's new head} -> 200 status 'rebased', new_head_sha descends from old_head_sha, push event direct == true; the same two requests with the owner's workspace-bound PAT -> 403 protected_branch"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "unwanted",
+          "condition": "a write would create a protected branch, move one to a commit that does not descend from its head, or delete one",
+          "action": "refuse the update for every caller, the admin token included",
+          "contract": "HTTP 403 with `error_type` `protected_branch` and the rule's message; the ref is unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready workspace whose bare repository was made with git init in t.TempDir() and holds main with the files README.md, api/old.go and the directory docs/",
+              "the real push rule engine of package 18 and the workspace setting protected_branches at its default (main)"
+            ],
+            "pseudocode": "in internal/scm/direct_push_test.go, with protected_branches set to ['main', 'release/*'], a table over the caller {owner API key, admin token} and the update {POST refs name 'release/1' (create); PATCH main to its parent (backwards); PATCH main to a sibling commit (sideways); DELETE refs/heads/release/0; POST rebase of main, which has a commit of its own, onto a divergent commit, so the result is not a fast-forward of the old head}: assert 403 and error.error_type == 'protected_branch'; assert the message is 'release/1 is protected; push another branch and open a change (git push -o parley.change)' for the create and '<branch> is protected and cannot be force-pushed or deleted' for the others; assert refs unchanged"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "Ref create, move and delete",
+      "rationale": "Review and revert tooling needs to make and remove branches and tags without a clone, under the same compare-and-swap discipline as commits.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "event_driven",
+          "condition": "`POST /workspaces/:slug/scm/refs` carries a valid `name` that does not exist and exactly one of `sha` and `ref`, resolving to a commit",
+          "action": "create the ref at the named commit and emit one `parley.git.push` event with `created: true`",
+          "contract": "HTTP 201 with the ref object; a bare `name` creates `refs/heads/<name>`; a tag is lightweight",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready workspace whose bare repository was made with git init in t.TempDir() and holds main with the files README.md, api/old.go and the directory docs/",
+              "a recording event sink"
+            ],
+            "pseudocode": "in internal/scm/refs_write_test.go, a table {name 'x', sha full id of main -> refs/heads/x, kind branch; name 'refs/heads/feat/y', ref 'main' -> refs/heads/feat/y; name 'refs/tags/v1', ref 'main' -> kind tag; name 'z', ref a 7-character abbreviation -> created}: assert 201; assert r.json.name, r.json.kind, r.json.sha == main head; assert git rev-parse <full name> == main head; assert git cat-file -t refs/tags/v1 == 'commit' (a lightweight tag); assert the sink holds one parley.git.push with before == null, after == sha, created == true, via == 'api'"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "unwanted",
+          "condition": "a ref creation request is invalid: `name` is missing, is not a valid git ref name, is `HEAD`, or lies outside `refs/heads/`, `refs/tags/` and `refs/parley/`; both or neither of `sha` and `ref` are given; `sha` is not a full 40-character id; the target resolves to no commit; or the ref already exists",
+          "action": "refuse the request and create nothing",
+          "contract": "HTTP 400 with `error_type` `invalid_request` for a bad name or target field; HTTP 404 with `error_type` `ref_not_found` for a target that resolves to no commit; HTTP 409 with `error_type` `ref_exists` for an existing ref; a name under `refs/parley/` answers HTTP 403 with `error_type` `hub_owned_ref`",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a ready workspace whose bare repository was made with git init in t.TempDir() and holds main with the files README.md, api/old.go and the directory docs/"
+            ],
+            "pseudocode": "in internal/scm/refs_write_test.go, a table {no name; name ''; name 'a..b'; name 'x.lock'; name 'refs/heads/'; name 'refs/notes/n'; name 'refs/remotes/o/m'; name 'HEAD'; both sha and ref; neither; sha of 7 characters; sha not hexadecimal} -> 400 invalid_request; {sha 40 hex naming no object; sha naming a tree; ref 'nope'} -> 404 ref_not_found; {name 'main'; name 'refs/heads/main'} -> 409 ref_exists; {name 'refs/parley/changes/1/1'} with the real rule engine -> 403 hub_owned_ref: assert for-each-ref unchanged in every row"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "event_driven",
+          "condition": "`PATCH /workspaces/:slug/scm/refs/*name` names an existing unprotected branch or a tag, by full name or by branch name, with a `sha` that is a commit of the repository and an `expected_sha` equal to the ref's commit",
+          "action": "move the ref to `sha` by compare-and-swap and emit one `parley.git.push` event whose `forced` is true exactly when the old commit is not an ancestor of the new one",
+          "contract": "HTTP 200 with the ref object at `sha`; a move to the commit the ref already has answers 200 and emits no event; a branch that is the source of a `draft` or `open` change gets a version of kind `ref`, recorded by the ref-updated stage of package 22 from the version kind this route passes to the ref writer",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready workspace whose bare repository was made with git init in t.TempDir() and holds main with the files README.md, api/old.go and the directory docs/",
+              "a recording event sink",
+              "a recording ref-updated stage registered with the ref writer of package 18 in place of package 22's, which reports a scripted version for the moved branch; a fake change linker registered in place of package 22's that records its calls and returns scripted answers"
+            ],
+            "pseudocode": "in internal/scm/refs_write_test.go, a table addressed once as '/scm/refs/work' and once as '/scm/refs/refs/heads/work' {sha a descendant of work -> forced false; sha the parent of work -> forced true; sha a sibling commit -> forced true; a tag refs/tags/v1 moved -> 200; sha equal to the current commit -> 200 and no event}: assert 200 and r.json.sha == sha; assert rev-parse; assert the event's before, after, forced, created == false, via == 'api'; with the recording stage registered: assert it was called once per moved ref with via 'api' and version kind 'ref'"
+          }
+        },
+        {
+          "id": "REQ-7.4",
+          "pattern": "unwanted",
+          "condition": "a ref move names a ref that does not exist, omits `sha` or `expected_sha`, gives a `sha` that is not a full id of a commit in the repository, or gives an `expected_sha` that differs from the ref's commit",
+          "action": "refuse the move and leave the ref where it is",
+          "contract": "HTTP 409 with `error_type` `ref_moved` and `error.details.current_sha` for a mismatch; HTTP 404 with `error_type` `ref_not_found` for a missing ref or a `sha` naming no commit; HTTP 400 with `error_type` `invalid_request` for a missing or abbreviated field",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a ready workspace whose bare repository was made with git init in t.TempDir() and holds main with the files README.md, api/old.go and the directory docs/"
+            ],
+            "pseudocode": "in internal/scm/refs_write_test.go, a table {expected_sha differs -> 409 ref_moved with error.details.current_sha == rev-parse(work); name 'nope' -> 404 ref_not_found; no expected_sha -> 400 invalid_request; no sha -> 400; sha abbreviated -> 400; sha naming no commit -> 404 ref_not_found; name 'refs/notes/n' -> 400 invalid_request}: assert status, error_type and that rev-parse(work) is unchanged; a concurrent pair of PATCHes with one expected_sha -> exactly one 200 and one 409 ref_moved"
+          }
+        },
+        {
+          "id": "REQ-7.5",
+          "pattern": "event_driven",
+          "condition": "`DELETE /workspaces/:slug/scm/refs/*name` names an existing unprotected, non-default branch that is not a change's source, or a tag, with no `expected_sha` or one equal to the ref's commit",
+          "action": "delete the ref by compare-and-swap against its current commit and emit one `parley.git.push` event with `deleted: true`",
+          "contract": "HTTP 204; the ref no longer exists",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready workspace whose bare repository was made with git init in t.TempDir() and holds main with the files README.md, api/old.go and the directory docs/",
+              "unprotected branches tmp and tmp2 and the tag v1",
+              "a recording event sink"
+            ],
+            "pseudocode": "in internal/scm/refs_write_test.go, a table {DELETE /scm/refs/tmp; DELETE /scm/refs/refs/heads/tmp2?expected_sha=<its head>; DELETE /scm/refs/refs/tags/v1}: assert 204 with an empty body; assert git rev-parse --verify <ref> fails; assert the event's before == the old commit, after == null, deleted == true, forced == false, via == 'api'; assert the commit is still readable by full id (git cat-file -e)"
+          }
+        },
+        {
+          "id": "REQ-7.6",
+          "pattern": "unwanted",
+          "condition": "a ref delete gives an `expected_sha` that differs from the ref's commit, names a branch that is the source of a `draft` or `open` change, names the default branch, or names a ref that does not exist",
+          "action": "refuse the delete and keep the ref",
+          "contract": "HTTP 409 with `error_type` `ref_moved` and `details.current_sha`; HTTP 409 with `error_type` `ref_in_use`; HTTP 403 with `error_type` `default_branch`; HTTP 404 with `error_type` `ref_not_found`",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a ready workspace whose bare repository was made with git init in t.TempDir() and holds main with the files README.md, api/old.go and the directory docs/",
+              "a fake change linker registered in place of package 22's that records its calls and returns scripted answers",
+              "a recording event sink"
+            ],
+            "pseudocode": "in internal/scm/refs_write_test.go, a table {expected_sha differs -> 409 ref_moved with details.current_sha; the fake linker reports work as the source of a draft change -> 409 ref_in_use; of an open change -> 409 ref_in_use; of a landed change only -> 204; name 'nope' -> 404 ref_not_found; expected_sha of 7 characters -> 400 invalid_request}; and with the real rule engine and protected_branches set to [] : DELETE the default branch -> 403 default_branch with message 'main is the default branch and cannot be deleted': assert the ref still exists after every refused row and no event was emitted"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "Server-side rebase",
+      "rationale": "An agent keeps its branch current with the target without fetching, and gets a conflict as data when it cannot (SCM-US-05).",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "`POST /workspaces/:slug/scm/rebase` names a branch that has commits not in `onto`, where `onto` is not an ancestor of the branch head, and the replay applies without conflict",
+          "action": "replay those commits in order on top of the commit `onto` resolves to, keeping each commit's author and message and setting the hub as committer, move the branch to the result by compare-and-swap and emit one `parley.git.push` event",
+          "contract": "HTTP 200 with `{status: \"rebased\", branch, old_head_sha, new_head_sha, onto_sha, change}`; `branch` is the ref object at `new_head_sha`; the event has `forced: true` when the old head is not an ancestor of the new one",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready workspace whose repository holds main (commits M1, M2) and the unprotected branch topic (commits T1, T2 on top of M1)",
+              "a recording event sink"
+            ],
+            "pseudocode": "in internal/scm/rebase_test.go: r = post('/workspaces/w/scm/rebase', {branch:'topic', onto:'main', expected_head_sha: T2}); assert 200; assert r.json.status == 'rebased'; old_head_sha == T2; onto_sha == M2; new_head_sha == rev-parse(topic) != T2; branch.sha == new_head_sha; change == null; assert git rev-list --count main..topic == 2 and merge-base(main, topic) == M2; assert the two new commits keep the authors and messages of T1 and T2 and have the hub as committer; assert git diff T1^ T1 equals the diff of the first new commit; assert one push event {before: T2, after: new, forced: true, via:'api'}; a second row without expected_head_sha -> 200"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "event_driven",
+          "condition": "a rebase request names an `onto` that is an ancestor of the branch head or equal to it",
+          "action": "answer without moving the branch and without emitting an event",
+          "contract": "HTTP 200 with `status` `up_to_date` and `new_head_sha` equal to `old_head_sha`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready workspace whose repository holds main (commits M1, M2) and the unprotected branch topic (commits T1, T2 on top of M1)",
+              "a recording event sink"
+            ],
+            "pseudocode": "in internal/scm/rebase_test.go, a table over onto {M1 (an ancestor of topic), T2 (the head itself), 'topic'}: assert 200, status == 'up_to_date', old_head_sha == new_head_sha == T2, onto_sha == the resolved commit; assert rev-parse(topic) == T2 and the sink is empty and the rule engine was not called"
+          }
+        },
+        {
+          "id": "REQ-8.3",
+          "pattern": "event_driven",
+          "condition": "a rebase request names a branch whose every commit is already contained in `onto`, by ancestry or because each replayed commit changes nothing",
+          "action": "move the branch to the `onto` commit",
+          "contract": "HTTP 200 with `status` `rebased` and `new_head_sha` equal to `onto_sha`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready workspace whose repository holds main (commits M1, M2) and the unprotected branch topic (commits T1, T2 on top of M1)",
+              "a recording event sink"
+            ],
+            "pseudocode": "in internal/scm/rebase_test.go, a table {branch behind at M1, onto main -> new_head_sha == M2, event forced false; branch whose two commits were cherry-picked onto main as M3, M4, onto main -> new_head_sha == M4, event forced true}: assert 200 and status == 'rebased'; assert rev-parse(branch) == rev-parse(main)"
+          }
+        },
+        {
+          "id": "REQ-8.4",
+          "pattern": "unwanted",
+          "condition": "a commit of the branch does not apply on top of `onto`",
+          "action": "abandon the rebase, leave the branch at its old head and report the conflict",
+          "contract": "HTTP 409 with `error_type` `rebase_conflict` and `error.details` holding the conflict report, the type ConflictReport of internal/gitrepo that package 20 declares (`target_sha`, `head_sha`, `base_sha`, `commit_sha`, `files` with `path`, `kind`, `base`, `ours`, `theirs`, `landed_by`; `landed_changes`; `change`); no ref moves, no event is emitted and no temporary file of the rebase remains",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready workspace whose repository holds main (commits M1, M2) and the unprotected branch topic (commits T1, T2 on top of M1), with a conflicting edit of a.txt on both sides",
+              "a recording event sink"
+            ],
+            "pseudocode": "in internal/scm/rebase_test.go: M2 and T1 both change line 1 of a.txt; r = post rebase {branch:'topic', onto:'main'}; assert 409; assert error.error_type == 'rebase_conflict'; d = error.details; assert d.target_sha == M2, d.head_sha == T2, d.base_sha == M1, d.commit_sha == T1; assert d.files == [{path:'a.txt', kind:'content', base, ours, theirs each with sha, mode and path, landed_by: []}]; assert d.landed_changes == [] and d.change == null; assert rev-parse(topic) == T2; assert the sink is empty; assert the repository directory holds no leftover worktree, index or lock file created by the request; a modify/delete conflict reports kind 'modify_delete' with theirs or ours null on the side that lacks the file"
+          }
+        },
+        {
+          "id": "REQ-8.5",
+          "pattern": "unwanted",
+          "condition": "a rebase request is invalid: `branch` or `onto` is missing, `branch` is not an existing branch, `onto` resolves to no commit, or the commits to replay include a merge commit",
+          "action": "refuse the rebase and move nothing",
+          "contract": "HTTP 400 with `error_type` `merge_commits_unsupported` for a merge commit in the range; HTTP 400 with `error_type` `invalid_request` for a missing field or a `branch` that is not under `refs/heads/`; HTTP 404 with `error_type` `ref_not_found` for an unknown branch or `onto`",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a ready workspace whose repository holds main (commits M1, M2) and the unprotected branch topic (commits T1, T2 on top of M1)"
+            ],
+            "pseudocode": "in internal/scm/rebase_test.go, a table {topic contains a merge commit not in main -> 400 merge_commits_unsupported; no branch -> 400 invalid_request; no onto -> 400 invalid_request; branch 'nope' -> 404 ref_not_found; onto 'nope' -> 404 ref_not_found; branch 'refs/tags/v1' -> 400 invalid_request; expected_head_sha abbreviated -> 400 invalid_request}: assert status and error_type; assert refs unchanged"
+          }
+        },
+        {
+          "id": "REQ-8.6",
+          "pattern": "unwanted",
+          "condition": "a rebase request's `expected_head_sha` differs from the branch head, or the branch moves between the read of its head and the compare-and-swap",
+          "action": "refuse the rebase and keep the other writer's head",
+          "contract": "HTTP 409 with `error_type` `ref_moved` and `error.details.current_sha`; the branch stays at the commit the other writer gave it",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready workspace whose repository holds main (commits M1, M2) and the unprotected branch topic (commits T1, T2 on top of M1)",
+              "a recording event sink"
+            ],
+            "pseudocode": "in internal/scm/rebase_test.go: post rebase with expected_head_sha == T1 (stale) -> assert 409, error_type 'ref_moved', details.current_sha == T2; then with a hook in the test's rebase runner that moves topic to a new commit X while the replay runs (no expected_head_sha sent) -> assert 409 ref_moved with details.current_sha == X and rev-parse(topic) == X; assert no event from the rebase"
+          }
+        },
+        {
+          "id": "REQ-8.7",
+          "pattern": "event_driven",
+          "condition": "a rebase has moved a branch that is the source of a `draft` or `open` change",
+          "action": "have the ref-updated stage of package 22 record a version of kind `rebase` at the new head, in the store transaction of the ref update, and name the change and version in the answer",
+          "contract": "`change` in the 200 answer is `{workspace_slug, number, version}`",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a ready workspace whose repository holds main (commits M1, M2) and the unprotected branch topic (commits T1, T2 on top of M1)",
+              "a recording ref-updated stage registered with the ref writer of package 18 in place of package 22's, which reports a scripted version for the moved branch; a fake change linker registered in place of package 22's that records its calls and returns scripted answers"
+            ],
+            "pseudocode": "in internal/scm/rebase_test.go: the stage reports version {w, 7, 3} for refs/heads/topic; post a clean rebase; assert r.json.change == {workspace_slug:'w', number:7, version:3}; assert the stage saw version kind 'rebase', before T2, after new_head_sha; an up_to_date answer makes no ref update and no stage call and reports change {w, 7} with the current version the fake linker's lookup returns"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-9",
+      "title": "CLI commands for commit and rebase",
+      "rationale": "A person or a script commits local files and rebases a branch from a shell with one command each.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-9.1",
+          "pattern": "event_driven",
+          "condition": "`parley scm commit <slug>` runs with `--branch`, `--message`, `--expected-head` and any number of `--put <repo-path>=<local-file>`, `--delete <repo-path>` and `--move <from>=<to>` flags",
+          "action": "send one `POST /workspaces/:slug/scm/commits` whose `operations` follow command-line order, with each `--put` file's bytes as `content_base64`, and print the hub's answer",
+          "contract": "exit code 0; stdout holds the hub's 201 body as one JSON document; `--base` is sent as `base_ref`",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a net/http/httptest server that records requests and returns scripted answers",
+              "the real parley root command of internal/cli run in-process with PARLEY_ENDPOINT_URL and PARLEY_API_KEY set"
+            ],
+            "pseudocode": "in internal/cli/scm_write_test.go: run ['scm','commit','w','--branch','b','--expected-head',H,'--message','m','--delete','old.go','--put','api/g.go=<tmp>/g.go','--move','a=b','--put','bin.dat=<tmp>/bin.dat']; assert exactly one request, POST /api/v1/workspaces/w/scm/commits; assert body.branch == 'b', expected_head_sha == H, message == 'm'; assert body.operations == [{op:'delete',path:'old.go'},{op:'put',path:'api/g.go',content_base64: base64(file bytes)},{op:'move',from:'a',to:'b'},{op:'put',path:'bin.dat',content_base64: base64(non-UTF-8 bytes)}] with no mode member; assert body has no base_ref, session_id or change member; assert stdout is the scripted 201 body indented by 2 spaces and exit code 0; a second run with --base main and no --expected-head against a 404 for the ref read sends base_ref 'main' and no expected_head_sha"
+          }
+        },
+        {
+          "id": "REQ-9.2",
+          "pattern": "event_driven",
+          "condition": "`parley scm commit` runs without `--expected-head`",
+          "action": "read the branch with `GET /workspaces/:slug/scm/refs/*name` first and send the `sha` it returns as `expected_head_sha`",
+          "contract": "the ref read precedes the commit request; a `404 ref_not_found` from the read means a new branch and the commit request is sent without `expected_head_sha`; any other error from the read is printed and ends the command with exit code 1",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a net/http/httptest server that records requests and returns scripted answers",
+              "the real parley root command of internal/cli run in-process with PARLEY_ENDPOINT_URL and PARLEY_API_KEY set"
+            ],
+            "pseudocode": "in internal/cli/scm_write_test.go, a table over the ref read's answer {200 {sha: H} -> two requests in order GET /api/v1/workspaces/w/scm/refs/feat%2Fx then POST commits with expected_head_sha == H; 404 ref_not_found with --base main -> POST without expected_head_sha and with base_ref 'main'; 403 forbidden -> no POST, the envelope on stderr, exit 1}: run ['scm','commit','w','--branch','feat/x','--message','m','--put','f=<tmp>/f']"
+          }
+        },
+        {
+          "id": "REQ-9.3",
+          "pattern": "optional",
+          "condition": "`parley scm commit` is given `--session`, `--change-target`, `--title`, `--intent` or `--draft`",
+          "action": "send `session_id` for `--session` and a `change` object holding `target_branch`, `title`, `intent` and `draft` for the flags that were given",
+          "contract": "the `change` member is present exactly when at least one of `--change-target`, `--title`, `--intent`, `--draft` is given, and holds only the members whose flags were given",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a net/http/httptest server that records requests and returns scripted answers",
+              "the real parley root command of internal/cli run in-process with PARLEY_ENDPOINT_URL and PARLEY_API_KEY set"
+            ],
+            "pseudocode": "in internal/cli/scm_write_test.go, a table {--session s1 -> body.session_id == 's1', no change member; --change-target main --title T --intent I -> change == {target_branch:'main', title:'T', intent:'I'}; --draft alone -> change == {draft:true}; --title T alone -> change == {title:'T'}; none -> no change member}"
+          }
+        },
+        {
+          "id": "REQ-9.4",
+          "pattern": "unwanted",
+          "condition": "`parley scm commit` or `parley scm rebase` is run without a required flag or argument, with a `--put` or `--move` value that lacks `=` or has an empty side, or with a `--put` local file that cannot be read",
+          "action": "fail before sending any request",
+          "contract": "exit code 2; stderr holds the error envelope with `code` 0 and `error_type` `usage_error`; nothing on stdout; no HTTP request is sent",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a net/http/httptest server that records requests and returns scripted answers",
+              "the real parley root command of internal/cli run in-process with PARLEY_ENDPOINT_URL and PARLEY_API_KEY set"
+            ],
+            "pseudocode": "in internal/cli/scm_write_test.go, a table {no --branch; no --message; no slug argument; --put 'nopath'; --put '=file'; --put 'p=<missing file>'; --move 'onlyfrom'; scm rebase w (no branch); scm rebase w topic (no --onto)}: assert exit code 2; assert stderr is the error envelope with code 0 and error_type 'usage_error'; assert stdout is empty and the test server received no request"
+          }
+        },
+        {
+          "id": "REQ-9.5",
+          "pattern": "unwanted",
+          "condition": "the hub answers `parley scm commit` or `parley scm rebase` with an error, such as `409 ref_moved` or `409 rebase_conflict`",
+          "action": "print the hub's error envelope as received and stop without retrying",
+          "contract": "exit code 1; stderr holds the envelope with its `details` (the current head, or the conflict report); nothing on stdout; exactly one write request was sent",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a net/http/httptest server that records requests and returns scripted answers",
+              "the real parley root command of internal/cli run in-process with PARLEY_ENDPOINT_URL and PARLEY_API_KEY set"
+            ],
+            "pseudocode": "in internal/cli/scm_write_test.go: the server answers POST commits with 409 {error:{code:409, error_type:'ref_moved', message, details:{current_sha:X}}}; run scm commit with --expected-head; assert exit code 1; assert stderr parses to the same envelope including details.current_sha; assert stdout is empty; assert the server saw exactly one POST; the same for scm rebase answered 409 rebase_conflict with a conflict report in details: stderr holds the report unchanged, exit code 1"
+          }
+        },
+        {
+          "id": "REQ-9.6",
+          "pattern": "event_driven",
+          "condition": "`parley scm rebase <slug> <branch>` runs with `--onto`",
+          "action": "send one `POST /workspaces/:slug/scm/rebase` with `branch`, `onto` and, when given, `expected_head_sha`, and print the hub's answer",
+          "contract": "exit code 0 for `status` `rebased` and `up_to_date`; stdout holds the hub's 200 body as one JSON document",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a net/http/httptest server that records requests and returns scripted answers",
+              "the real parley root command of internal/cli run in-process with PARLEY_ENDPOINT_URL and PARLEY_API_KEY set"
+            ],
+            "pseudocode": "in internal/cli/scm_write_test.go, a table {['scm','rebase','w','topic','--onto','main'] -> body == {branch:'topic', onto:'main'}; with '--expected-head', H -> body.expected_head_sha == H}: assert one request POST /api/v1/workspaces/w/scm/rebase; assert stdout is the scripted 200 body {status:'rebased', ...} and exit code 0; a scripted status 'up_to_date' also exits 0"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "An agent commits edits to its fork without a clone and is told when the branch moved",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "sends POST /api/v1/workspaces/<fork>/scm/commits with a fork-bound PAT, branch greeting, base_ref main, a message and three operations (two puts and a delete)"
+        },
+        {
+          "actor": "parleyd",
+          "action": "passes the write gate, validates the body, resolves main in the fork and applies the operations to its tree"
+        },
+        {
+          "actor": "parleyd",
+          "action": "creates the commit, has the push rule engine accept the creation of refs/heads/greeting and creates the branch by compare-and-swap"
+        },
+        {
+          "actor": "parleyd",
+          "action": "emits parley.git.push (created, via api) and parley.scm.commit and answers 201 with the commit and the branch"
+        },
+        {
+          "actor": "agent",
+          "action": "reads GET /api/v1/workspaces/<fork>/scm/file?ref=greeting&path=api/greeting.go and receives the bytes it put"
+        },
+        {
+          "actor": "git client",
+          "action": "fetches the fork over /git and sees refs/heads/greeting at the commit the API answered"
+        },
+        {
+          "actor": "agent",
+          "action": "posts a second commit to greeting with expected_head_sha set to main's head"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers 409 ref_moved with details.current_sha equal to the first commit and leaves greeting where it is"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the parleyd HTTP server and its check pipeline",
+          "the write gate and commit handler of internal/scm",
+          "internal/gitrepo running the git binary on a bare repository",
+          "the push rule engine of package 18",
+          "the event log",
+          "the read routes of package 20",
+          "the git smart HTTP server"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 by the Run function of internal/hub with a real store and a data directory in t.TempDir()",
+          "a registered workspace cloned from a local origin repository made with git init, and a task fork of it with a fork-bound PAT holding git:read and git:write"
+        ],
+        "end_state": [
+          "refs/heads/greeting exists in the fork at the commit the first answer named, with one parent equal to main's head",
+          "the file route returns the put content at ref greeting",
+          "a stock git ls-remote of the fork lists refs/heads/greeting at that commit",
+          "the event log holds one parley.git.push with via api and created true and one parley.scm.commit for the branch, and none for the refused second request",
+          "the second request was answered 409 ref_moved with the first commit as current_sha"
+        ],
+        "pseudocode": "in test/e2e/scm_write_test.go: r = POST commits {branch:'greeting', base_ref:'main', message, operations:[put api/greeting.go, put docs/g.md, delete api/old.go]}; assert r.status == 201; sha = r.json.commit.sha; assert GET file(ref greeting, api/greeting.go).body == content; assert exec('git ls-remote <hub>/git/<org>/<fork>.git refs/heads/greeting') starts with sha; r2 = POST commits {branch:'greeting', expected_head_sha: mainHead, ...}; assert r2.status == 409 and r2.json.error.details.current_sha == sha; assert GET /events/log filtered to the fork lists parley.git.push then parley.scm.commit once each"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "A developer commits a local file and rebases the branch from the shell",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "runs parley scm commit <slug> --branch topic --base main --message 'Add notes' --put notes.md=./notes.md"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "reads GET …/scm/refs/topic, receives 404 ref_not_found, and sends POST …/scm/commits with base_ref main and the file as content_base64"
+        },
+        {
+          "actor": "parleyd",
+          "action": "creates the commit and the branch topic and answers 201"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints the answer on stdout and exits 0"
+        },
+        {
+          "actor": "developer",
+          "action": "after another commit reached main, runs parley scm rebase <slug> topic --onto main"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends POST …/scm/rebase with branch topic and onto main"
+        },
+        {
+          "actor": "parleyd",
+          "action": "replays the commit of topic onto main's head, has the push rule engine accept the non-fast-forward move, moves topic by compare-and-swap and emits parley.git.push with forced true"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints the answer with status rebased and exits 0"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the parley CLI root command and its HTTP client",
+          "the parleyd HTTP server",
+          "the commit, ref and rebase handlers of internal/scm",
+          "internal/gitrepo running the git binary",
+          "the push rule engine of package 18",
+          "the event log"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 by the Run function of internal/hub with a real store and a data directory in t.TempDir()",
+          "a registered workspace owned by the developer, whose API key is in PARLEY_API_KEY",
+          "a local file notes.md in t.TempDir()",
+          "main is not protected in this workspace (protected_branches set to an empty list) so a second commit can be put on main through the API"
+        ],
+        "end_state": [
+          "topic holds exactly one commit ahead of main and its parent is main's current head",
+          "notes.md at ref topic has the local file's bytes",
+          "the first command printed a document with commit and branch; the second printed status rebased with old_head_sha different from new_head_sha",
+          "both commands exited 0",
+          "the event log holds a parley.git.push for topic with forced true and via api"
+        ],
+        "pseudocode": "in test/e2e/scm_write_test.go: out1, code1 = runCLI('scm','commit',slug,'--branch','topic','--base','main','--message','Add notes','--put','notes.md='+local); assert code1 == 0 and json(out1).branch.name == 'refs/heads/topic'; POST commits on main (other file) with the owner key; out2, code2 = runCLI('scm','rebase',slug,'topic','--onto','main'); assert code2 == 0; j = json(out2); assert j.status == 'rebased' and j.onto_sha == main head and j.new_head_sha != j.old_head_sha; assert GET compare(base main, head topic).ahead == 1 and .behind == 0; assert GET file(topic, notes.md) == local bytes"
+      }
+    },
+    {
+      "id": "PATH-3",
+      "title": "The owner pushes directly to a protected branch through the API and other credentials cannot",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "as the workspace's owner, sends POST …/scm/commits with an API key, branch main and main's head as expected_head_sha"
+        },
+        {
+          "actor": "parleyd",
+          "action": "builds the commit and submits the fast-forward update of the protected branch to the push rule engine, which accepts it under the owner exemption"
+        },
+        {
+          "actor": "parleyd",
+          "action": "moves main, updates the workspace's head_sha, emits parley.git.push with direct true, opens no change and answers 201 with change null"
+        },
+        {
+          "actor": "agent",
+          "action": "sends the same kind of request to main with the owner's workspace-bound PAT and the new head as expected_head_sha"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers 403 protected_branch with the rule's message and leaves main where the owner put it"
+        },
+        {
+          "actor": "org member",
+          "action": "sends a commit request for main with an API key"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers 403 forbidden at the write gate, because a member has read access only, and moves nothing"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the parleyd HTTP server and its check pipeline",
+          "the workspace access rule",
+          "the commit and ref handlers of internal/scm",
+          "the push rule engine of package 18 with the owner exemption",
+          "internal/gitrepo running the git binary",
+          "the event log"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 by the Run function of internal/hub with a real store and a data directory in t.TempDir()",
+          "a registered workspace in an organization, with default settings (main protected, protect.owner_push true)",
+          "its owner's API key, a PAT of the owner bound to the workspace with git:write, and the API key of a second user who is a member of the organization"
+        ],
+        "end_state": [
+          "main is at the owner's commit and the workspace record's head_sha equals it",
+          "the event log holds exactly one parley.git.push for refs/heads/main, with direct true and via api",
+          "no change exists whose source is main",
+          "the bound PAT's commit request was answered 403 with error_type protected_branch and the member's was answered 403 with error_type forbidden",
+          "refs/heads/main still exists"
+        ],
+        "pseudocode": "in test/e2e/scm_write_test.go: r = POST commits as owner {branch:'main', expected_head_sha: head, message, operations:[put CHANGELOG.md]}; assert r.status == 201 and r.json.change == null; assert GET /workspaces/<slug>.head_sha == r.json.commit.sha; ev = events of type parley.git.push for refs/heads/main; assert len(ev) == 1 and ev[0].metadata.direct == true; r2 = POST commits with the owner's bound PAT and expected_head_sha == r.json.commit.sha; assert r2.status == 403 and r2.json.error.error_type == 'protected_branch'; r3 = the same request with the member's API key; assert r3.status == 403 and r3.json.error.error_type == 'forbidden'; assert GET /scm/refs/main .sha == r.json.commit.sha"
+      }
+    }
+  ]
+}

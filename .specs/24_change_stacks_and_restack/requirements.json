@@ -1,0 +1,971 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "24",
+  "spec_name": "change_stacks_and_restack",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Automatic stack link",
+      "rationale": "An agent that pushes one branch on top of another expects the hub to see the stack without being told.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "package 22 calls LinkVersion of its StackLinker interface, which this package implements, for a version it records for a draft or open change that has no explicit depends_on for that version, and the current head of at least one other draft or open change of the same workspace with the same target branch is a proper ancestor of the new head",
+          "action": "set the change's depends_on to the nearest such change (the one with the fewest commits between its head and the new head) and the version's base_sha to that change's head, both through the setters of package 22",
+          "contract": "the change object has depends_on equal to the lower change's number and base_sha equal to the lower change's head_sha",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/stack_test.go, a table over {B opened on top of A; C opened on top of B on top of A (C must link to B, not A); A in state draft and B open; A's source in the target workspace and B's source in a fork of it; B at version 1 and B at a later pushed version}: record the version through the version recording of package 22; assert change.depends_on == number of the nearest lower change; assert change.base_sha == that change's head_sha"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "event_driven",
+          "condition": "a version is recorded for a draft or open change and no other draft or open change with the same target branch has a current head that is a proper ancestor of the new head",
+          "action": "clear the change's depends_on and set the version's base_sha to the merge base of the new head and the target branch",
+          "contract": "the change object has depends_on null and base_sha equal to the merge base with the target branch",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/stack_test.go, a table over {a first change on main; B that depended on A and is then force-pushed directly onto main}: record the version; assert change.depends_on == null; assert change.base_sha == mergeBase(head, main); for the second row assert A.dependants does not contain B"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "ubiquitous",
+          "action": "for any version it records, never choose as depends_on a change that is landed or abandoned, a change with another target branch, a change of another workspace, or a change whose head equals the new head, and choose the lowest number when two candidates share the nearest head",
+          "contract": "depends_on names only a draft or open change of the same workspace and target branch whose head is a proper ancestor of the change's head",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/stack_test.go, a table over the lower candidate {landed, abandoned, open with target branch release while the new change targets main, open in another workspace whose repository holds the same commits, open with the same head as the new version}: record a version on top of the candidate's head; assert change.depends_on == null. One more row: changes 3 and 5 are open with the same head, a new change is pushed on top of it; assert depends_on == 3"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "ubiquitous",
+          "action": "for any link it sets or clears, store it through the depends_on setter of package 22, so that the dependants package 22 derives for every change list exactly the draft and open changes whose depends_on is that change",
+          "contract": "dependants on the change object (rendered by package 22): array of integers, ascending, [] when there is none; this package keeps no second list of dependants",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/stack_test.go: A with B and C both opened on top of A, and D on top of B; assert A.dependants == [B, C]; assert B.dependants == [D]; assert D.dependants == []; abandon C through the store; assert A.dependants == [B]"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "ubiquitous",
+          "action": "for any dependent change, compute stats and paths of the current version from the commits after base_sha only, so that they cover the change's own commits and none of the change below",
+          "contract": "stats.commits equals the number of commits after the lower change's head; paths lists only files those commits touch",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/stack_test.go: A has 2 commits touching a.txt; B is opened on top of A with 1 commit touching b.txt; assert B.stats.commits == 1; assert B.stats.files_changed == 1; assert B.paths == ['b.txt']"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Explicit depends_on",
+      "rationale": "A caller sometimes knows the order of its changes before the commit graph shows it, and must be told when the order it asks for is impossible.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "a caller sends depends_on with the number of a draft or open change of the same workspace and target branch, in the body of POST /api/v1/workspaces/:slug/changes or of PATCH /api/v1/workspaces/:slug/changes/:number, and the link would not form a cycle",
+          "action": "set the change's depends_on to that number and, when the lower change's head is an ancestor of the change's head, set base_sha to that head and recompute stats and paths against it",
+          "contract": "HTTP 201 (open) or 200 (PATCH) with the change object carrying depends_on equal to the given number",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/stack_test.go with httptest, a table over {POST …/changes with depends_on: A for a branch built on A; PATCH B with depends_on: A where B is built on A's head and its link was cleared before by PATCH depends_on: null; PATCH B with depends_on: A where B is built on main only}: assert status == 201 or 200; assert json.depends_on == A.number; where B is built on A assert json.base_sha == A.head_sha; assert GET A .dependants contains B"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "unwanted",
+          "condition": "the depends_on sent at open or by PATCH names a change number that does not exist in the workspace, the change itself, a change whose own stack contains the change (a cycle), a change with a different target branch, or a change that is not draft or open",
+          "action": "refuse the request and change nothing: no change is created at open, and no field of an existing change is modified",
+          "contract": "HTTP 400 with error_type invalid_dependency, returned as an error from LinkVersion (open) or SetDependsOn (the PATCH of package 23), whose transaction is rolled back; the stored change (or the count of changes, at open) is unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/stack_test.go with httptest, a table over the value {999 (unknown), the change's own number, a change that depends on this one directly, a change that depends on this one through one change in between, a change targeting release, a landed change, an abandoned change} and the route {PATCH; POST …/changes for the rows that apply at open}: r = request; assert r.status == 400; assert r.json.error.error_type == 'invalid_dependency'; assert the stored change equals its state before the request, or count(changes) is unchanged; one row sends title together with the invalid depends_on and asserts the title is unchanged"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "event_driven",
+          "condition": "a caller sends PATCH /api/v1/workspaces/:slug/changes/:number with depends_on null on a change that has a depends_on",
+          "action": "clear the link, set base_sha to the merge base of the change's head and the target branch, and recompute stats and paths against it",
+          "contract": "HTTP 200 with the change object carrying depends_on null; the former lower change's dependants no longer lists the change",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/stack_test.go with httptest: B depends on A; r = PATCH B {depends_on: null}; assert r.status == 200; assert r.json.depends_on == null; assert r.json.base_sha == mergeBase(B.head, main); assert r.json.stats.commits == commits of A plus commits of B; assert GET A .dependants == []"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "event_driven",
+          "condition": "an explicit depends_on is accepted, the lower change's head is not an ancestor of the change's head, and the target workspace's setting changes.auto_restack is true",
+          "action": "record a pending restack of the change onto the lower change's head in the same transaction as the link, and let the background worker run it with trigger manual",
+          "contract": "after the worker runs, the change has a new version of kind restack with created_by.actor_type system and base_sha equal to the lower change's head; parley.change.restack carries trigger manual",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/restack_test.go: A and B are both built on main and touch different files; PATCH B {depends_on: A}; assert a pending restack for B exists; runPending(); v = latest version of B; assert v.kind == 'restack'; assert v.base_sha == A.head_sha; assert isAncestor(A.head_sha, B.head_sha); assert last event of type parley.change.restack has metadata.trigger == 'manual'"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "state_driven",
+          "condition": "the target workspace's setting changes.auto_restack is false and an explicit depends_on is accepted whose lower change's head is not an ancestor of the change's head",
+          "action": "record no pending restack, move no branch, and set needs_restack to true with restack_reason auto_restack_off on the change",
+          "contract": "the change object has needs_restack true and restack_reason auto_restack_off; its version number and source branch head are unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/restack_test.go: as the check above but with changes.auto_restack false: r = PATCH B {depends_on: A}; assert r.json.needs_restack == true; assert r.json.restack_reason == 'auto_restack_off'; assert no pending restack exists; assert B.version and head(B.source) are unchanged"
+          }
+        },
+        {
+          "id": "REQ-2.6",
+          "pattern": "event_driven",
+          "condition": "a change is opened with an explicit depends_on, and a later version of it is recorded",
+          "action": "keep the explicit link for version 1 whatever the commit graph says, and apply the automatic rule to the later version",
+          "contract": "after the open, depends_on is the given number; after the later version, depends_on is what the automatic rule yields",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch",
+              "changes.auto_restack is false, so that no restack moves B between the two steps"
+            ],
+            "pseudocode": "in internal/change/stack_test.go: A and X are open on main; B's branch is built on X's head; open B with depends_on: A; assert B.depends_on == A.number; push one more commit to B's branch (still on X); assert B.depends_on == X.number"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Stack depth limit",
+      "rationale": "An unbounded chain makes every push at the bottom cost a rebase per change above; the limit caps that cost without losing a pushed head.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "a recorded version or an accepted explicit depends_on puts a change at a depth (the number of changes in its chain of depends_on links down to a change with none, itself included) above [changes].max_stack_depth",
+          "action": "record the version and the link all the same, and set needs_restack to true with restack_reason stack_too_deep on that change, leaving every change at or under the limit unflagged",
+          "contract": "the change object past the limit has needs_restack true and restack_reason stack_too_deep, its version is recorded and its depends_on is set; a change at exactly the limit has needs_restack false",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/stack_test.go, a table over {max_stack_depth 3 with a chain of 5 opened bottom first: changes 1-3 unflagged, 4 and 5 flagged; the key absent from configuration with a chain of 21: change 20 unflagged, change 21 flagged; max_stack_depth 3 and PATCH depends_on that attaches a change on top of a chain of 3: flagged, answered 200}: for each change assert needs_restack and restack_reason as listed; assert every change has a recorded version 1 and the depends_on of the change below"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "state_driven",
+          "condition": "a change has restack_reason stack_too_deep",
+          "action": "start no restack of that change, and none of any change above it, when a change below it gets a new version or lands",
+          "contract": "the too-deep change's source branch head and version number are unchanged, and no pending restack exists for it",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/restack_test.go: max_stack_depth 2, chain A, B, C (C flagged); push a new version of A; runPending(); assert latest version of B has kind 'restack'; assert C.version == 1; assert head(C.source) is unchanged; assert no pending restack exists for C; assert C.restack_reason == 'stack_too_deep'"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "event_driven",
+          "condition": "a link of a too-deep change or of a change below it changes so that the change's depth is at or under [changes].max_stack_depth",
+          "action": "clear needs_restack and restack_reason on it and, when its head does not have the head of the change below as an ancestor, record a pending restack for it (or set restack_reason auto_restack_off when changes.auto_restack is false)",
+          "contract": "the change object has needs_restack false and restack_reason null once it sits on the head below",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/restack_test.go: max_stack_depth 2, chain A, B, C (C flagged); push a new version of A and runPending() (B restacked, C untouched); move main to a landed commit that holds A's patch, mark A landed through the store, call the landing entry point for A with a landed commit on main and runPending(); assert B.depends_on == null; assert C.needs_restack == false; assert C.restack_reason == null; assert latest version of C has kind 'restack' and base_sha == B.head_sha"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "unwanted",
+          "condition": "the configuration sets [changes].max_stack_depth to a value below 1",
+          "action": "refuse to start",
+          "contract": "the server process exits with status 1 and writes one error line naming changes.max_stack_depth to stderr; it never listens",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/config/config_test.go, a table over max_stack_depth {0, -1}: err = Load(file); assert err != nil; assert err message contains 'changes.max_stack_depth'. And over {1, 20, 500}: assert err == nil and cfg.Changes.MaxStackDepth == the value; with the key absent assert the value is 20"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Restack on a new version below",
+      "rationale": "The agent that amends the bottom of a stack should find the changes above it rebased without doing anything.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "a change that has direct dependants gets a new version while the target workspace's setting changes.auto_restack is true",
+          "action": "record one pending restack per direct dependant in the same transaction as the version, and answer the push or commit that caused the version without running any of them",
+          "contract": "when the triggering request has been answered, a pending restack exists for each direct dependant and each dependant's source branch head and version number are still what they were",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/restack_queue_test.go: A with dependants B and C (both on A); record a new version of A with the worker stopped; assert pending restacks == {B, C}; assert B.version == 1 and C.version == 1; assert head(B.source) and head(C.source) are unchanged; and with a store that fails the pending write, assert the version of A is not recorded either"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "event_driven",
+          "condition": "the worker runs a pending restack for a dependant whose head does not have the new head of the change below as an ancestor, and the replay of the dependant's commits applies",
+          "action": "move the dependant's source branch with a compare-and-swap to the replayed commits and record a version of kind restack with created_by.actor_type system, base_sha equal to the new head below, the session_id of the version it replaces, and patch_equivalent_to naming the previous version when the diff against its base is identical; clear needs_restack and remove the pending record",
+          "contract": "the dependant has a new version {kind: restack, created_by.actor_type: system, base_sha: <new head below>}; its source branch head equals that version's head_sha, which has the new head below as its ancestor; needs_restack is false",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/restack_test.go: B (1 commit touching b.txt, session s1) depends on A; amend A (touching a.txt) and record its version; runPending(); v = latest version of B; assert v.number == 2; assert v.kind == 'restack'; assert v.created_by.actor_type == 'system'; assert v.base_sha == A.head_sha; assert v.session_id == 's1'; assert v.patch_equivalent_to == 1; assert head(B.source) == v.head_sha; assert isAncestor(A.head_sha, v.head_sha); assert B.needs_restack == false; assert no pending restack exists"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "event_driven",
+          "condition": "the hub records a restack version on its own after a new version below",
+          "action": "emit parley.change.version with kind restack and then parley.change.restack with onto_sha set to the new head below and trigger version, both with actor system and with ref, version and head_sha of the dependant in the metadata",
+          "contract": "two events in this order for the dependant: parley.change.version {kind: restack}, parley.change.restack {onto_sha, trigger: version}; actor system; resource_type change; resource_id the change number",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/restack_test.go, in the scenario of the check above with the event log of package 52: evs = events for resource B after the amend; assert types(evs) == ['parley.change.version', 'parley.change.restack']; assert evs[0].metadata.kind == 'restack'; assert evs[1].metadata.onto_sha == A.head_sha; assert evs[1].metadata.trigger == 'version'; assert both have actor system, metadata.version == 2 and metadata.head_sha == B.head_sha"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "event_driven",
+          "condition": "a restack version is recorded for a change that itself has dependants",
+          "action": "restack those dependants in the same way, so that the work continues up the stack bottom first",
+          "contract": "every change above the amended one ends with a restack version whose base_sha is the current head of the change directly below it",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/restack_test.go: chain A, B, C, D, each one commit on a file of its own; amend A; runPending() until no pending restack is left; for X in (B, C, D): assert latest version of X has kind 'restack' and base_sha == head_sha of the change below; assert the restack events were written in the order B, C, D"
+          }
+        },
+        {
+          "id": "REQ-4.5",
+          "pattern": "event_driven",
+          "condition": "the worker runs a pending restack for a dependant whose head already has the new head of the change below as an ancestor",
+          "action": "record no version, emit no event, clear a needs_restack flag whose reason is conflict or auto_restack_off, and remove the pending record",
+          "contract": "the dependant's version number and source branch head are unchanged; no parley.change.version or parley.change.restack event is written for it",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/restack_test.go: B depends on A; the author rebases B onto A's amended head and pushes it before the worker runs; runPending(); assert B.version == 2 and its kind is 'push'; assert no event of type parley.change.restack exists for B; assert no pending restack exists"
+          }
+        },
+        {
+          "id": "REQ-4.6",
+          "pattern": "event_driven",
+          "condition": "the dependant's source branch moved between the hub reading its head and the compare-and-swap",
+          "action": "run the restack again on the new head, at most 5 attempts in one run",
+          "contract": "the restack version's head contains the commit that was pushed in between, replayed onto the new head below",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/restack_test.go, with a hook that pushes one more commit to B's source branch after the first read of its head: amend A; runPending(); v = latest version of B; assert v.kind == 'restack'; assert the commits after v.base_sha have the subjects of B's original commit and of the commit pushed in between; assert head(B.source) == v.head_sha"
+          }
+        },
+        {
+          "id": "REQ-4.7",
+          "pattern": "unwanted",
+          "condition": "the compare-and-swap of a background restack is lost 5 times in one run",
+          "action": "stop the run, change nothing and keep the pending record",
+          "contract": "no restack version and no parley.change.restack event exist for the dependant; its needs_restack is unchanged; the pending record is still present",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/restack_test.go, with a hook that moves B's source branch before every compare-and-swap: amend A; runPending(); assert the rebase ran exactly 5 times; assert no version of kind 'restack' exists for B; assert a pending restack for B exists; assert no parley.change.restack event exists for B"
+          }
+        },
+        {
+          "id": "REQ-4.8",
+          "pattern": "ubiquitous",
+          "action": "for any restack, replay exactly the commits after the change's base_sha up to its head, in order, including when the change below was force-pushed to a head unrelated to its previous one",
+          "contract": "the new version has the same number of commits after its base_sha as the old one, with the same subjects and the same patches",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/restack_test.go: B has 3 commits on top of A; A's branch is force-pushed to a new commit created from main that shares none of A's old commits and touches other files; runPending(); v = latest version of B; assert count(v.base_sha..v.head_sha) == 3; assert their subjects equal B's original subjects in order; assert git patch-id of each equals the original's; assert none of A's old commits is an ancestor of v.head_sha"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Restack on landing and on reparenting",
+      "rationale": "When the bottom of a stack lands or is abandoned, the next change must sit on what replaced it, not on commits that are no longer a change.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "the landing entry point is called for a change that landed with a landed commit on the target, and changes.auto_restack is true",
+          "action": "in one transaction, clear depends_on of each direct dependant and record a pending restack of it onto the landed commit; record nothing when the landed change has no dependants",
+          "contract": "each direct dependant has depends_on null and a pending restack whose onto commit is the landed commit",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/restack_queue_test.go: chain A, B, C; move main to a landed commit L that holds A's patch and mark A landed through the store; OnLanded(A, L) with the worker stopped; assert B.depends_on == null; assert pending restacks == {B onto L}; assert C.depends_on == B.number. Second row: OnLanded for a change without dependants; assert no pending restack exists"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "event_driven",
+          "condition": "the worker runs a pending restack onto a landed commit and the replay of the dependant's commits applies",
+          "action": "move the dependant's source branch with a compare-and-swap, record a restack version whose base_sha is the landed commit, and emit parley.change.version and then parley.change.restack with onto_sha equal to the landed commit and trigger land",
+          "contract": "the dependant has depends_on null and a new version {kind: restack, base_sha: <landed commit>}; parley.change.restack carries trigger land",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/restack_test.go, continuing the scenario above: runPending(); v = latest version of B; assert v.kind == 'restack'; assert v.base_sha == L; assert count(v.base_sha..v.head_sha) == number of B's own commits; assert the last parley.change.restack event for B has metadata.onto_sha == L and metadata.trigger == 'land'"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "event_driven",
+          "condition": "a direct dependant of a landed change has been restacked and has dependants of its own",
+          "action": "keep the depends_on of the changes further up and restack them in turn onto the new head of the change directly below",
+          "contract": "a change two levels above the landed one still has depends_on naming the change directly below it, and a restack version whose base_sha is that change's new head",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/restack_test.go, continuing the scenario above until no pending restack is left: assert C.depends_on == B.number; v = latest version of C; assert v.kind == 'restack'; assert v.base_sha == B.head_sha; assert isAncestor(L, v.head_sha)"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "event_driven",
+          "condition": "the abandon of package 23, called with dependants=reparent, has set a direct dependant's depends_on to the abandoned change's depends_on and asks the Restacker interface, which this package implements, to restack that dependant with trigger abandon",
+          "action": "record a pending restack of the dependant in the transaction it is given and restack it onto the head of the change it now depends on, or onto the current head of the target branch when there is none, replaying only the dependant's own commits; emit parley.change.restack with trigger abandon",
+          "contract": "each dependant's new version has none of the abandoned change's commits among its ancestors; its depends_on is the one package 23 set (the abandoned change's former depends_on) and this package does not write it; parley.change.restack carries trigger abandon; with changes.auto_restack false the dependant gets needs_restack true with restack_reason auto_restack_off and no pending restack",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/restack_test.go, a table over {chain A, B, C with B abandoned: C.depends_on == A.number and C's restack version has base_sha == A.head_sha; chain A, B with A abandoned: B.depends_on == null and B's restack version has base_sha == head(main)}: abandon through the abandon route of package 23 with dependants=reparent; runPending(); assert the listed values; assert no commit of the abandoned change is an ancestor of the dependant's head; assert the last parley.change.restack event has metadata.trigger == 'abandon'"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Restack failure",
+      "rationale": "A conflict must be visible on the change as data and must never leave a branch half rebased.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "unwanted",
+          "condition": "the replay of a change's commits in a restack conflicts",
+          "action": "move no branch for that change, set needs_restack to true with restack_reason conflict, set mergeable to conflict and conflict to the conflict report through the storing function of package 23, for the pair of the change's head and the commit replayed onto, and remove the pending record",
+          "contract": "the change object has needs_restack true, restack_reason conflict, mergeable conflict and a non-null conflict; its version number and source branch head are unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/restack_test.go: A and B (on A) both edit line 1 of f.txt; amend A to rewrite line 1 again; runPending(); assert B.needs_restack == true; assert B.restack_reason == 'conflict'; assert B.mergeable == 'conflict'; assert B.conflict != null; assert B.version == 1; assert head(B.source) is unchanged; assert no pending restack exists; assert no worktree or temporary ref of the rebase is left in the repository"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "unwanted",
+          "condition": "a restack conflicts for a change that has dependants",
+          "action": "start no restack for any change above it",
+          "contract": "every change above keeps its version number, its source branch head and needs_restack false; no pending restack exists for it",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/restack_test.go: chain A, B, C where the amend of A conflicts with B and C touches another file; runPending(); assert C.version == 1; assert head(C.source) is unchanged; assert C.needs_restack == false; assert C.depends_on == B.number; assert no pending restack exists"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "event_driven",
+          "condition": "a restack of a change fails with a conflict and the change was not already in conflict",
+          "action": "have the storing function of package 23 emit parley.change.conflict with actor system and metadata files (the conflicted paths) and needs_restack true, by setting the flag before calling it",
+          "contract": "one event parley.change.conflict for the change with metadata {files: [paths], needs_restack: true, ref, version, head_sha}",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/restack_test.go, in the first scenario of this requirement: evs = events of type parley.change.conflict for B; assert len(evs) == 1; assert evs[0].metadata.files == ['f.txt']; assert evs[0].metadata.needs_restack == true; assert evs[0].actor is system; assert evs[0].metadata.version == 1"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "unwanted",
+          "condition": "a restack fails with a conflict for a change that already has needs_restack true with restack_reason conflict",
+          "action": "replace the stored conflict report with the new one through the storing function of package 23, which emits no further parley.change.conflict event",
+          "contract": "the count of parley.change.conflict events for the change stays 1; conflict.target_sha is the newest head below",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/restack_test.go, continuing the first scenario: amend A a second time, again conflicting; runPending(); assert count(events of type parley.change.conflict for B) == 1; assert B.conflict.target_sha == A.head_sha"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "ubiquitous",
+          "action": "for any conflict it reports from a restack, use the one report type ConflictReport of internal/gitrepo that package 20 declares, and give it the members target_sha (the commit replayed onto), head_sha (the change's head), base_sha (the change's base), commit_sha (the first commit that did not apply), files, landed_changes as [] and change as null, where each file entry has path, kind (one of content, add_add, modify_delete, delete_modify, rename, mode, binary, submodule), base, ours and theirs (each {sha, mode, path}, or null where the file does not exist on that side) and landed_by as []",
+          "contract": "a JSON object with exactly the members target_sha, head_sha, base_sha, commit_sha, files, landed_changes, change; every sha is 40 hexadecimal characters",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/restack_test.go, a table over the conflict {both sides edit the same line: kind content, base, ours and theirs non-null; both sides add the same new path with different content: kind add_add, base null; the lower change deletes a file the dependant edits: kind delete_modify or modify_delete as internal/gitrepo reports it, the deleting side null}: rep = B.conflict after the failed restack; assert keys(rep) == the seven members; assert rep.target_sha == A.head_sha; assert rep.head_sha == B.head_sha; assert rep.base_sha == B.base_sha; assert rep.commit_sha is the first of B's commits touching the path; assert rep.landed_changes == []; assert rep.change == null; assert rep.files[0].path, kind and null sides as listed; assert rep.files[0].landed_by == []"
+          }
+        },
+        {
+          "id": "REQ-6.6",
+          "pattern": "event_driven",
+          "condition": "a version is recorded for a change that has needs_restack true with restack_reason conflict or auto_restack_off, and the new head has as an ancestor the commit the change must sit on (the current head of the change named by depends_on, or the landed commit of the change that was below)",
+          "action": "clear needs_restack and restack_reason",
+          "contract": "the change object has needs_restack false and restack_reason null; a version whose head lacks that commit leaves both unchanged when the change has no depends_on",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/stack_test.go, a table over {B in conflict on A, the author pushes B rebased onto A's current head: cleared; B flagged auto_restack_off, same push: cleared; B's lower change landed as L and the restack conflicted, the author pushes B rebased onto L: cleared; the same but the author pushes an amended B still on its old base: needs_restack stays true with restack_reason conflict}: record the version; assert needs_restack and restack_reason as listed"
+          }
+        },
+        {
+          "id": "REQ-6.7",
+          "pattern": "event_driven",
+          "condition": "a version is recorded for a linked change that has needs_restack true with restack_reason conflict or auto_restack_off, and the automatic rule leaves the change with no depends_on",
+          "action": "clear needs_restack and restack_reason together with the link",
+          "contract": "the change object has depends_on null, needs_restack false and restack_reason null",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/stack_test.go: B in conflict on A; the author force-pushes B's branch rebased directly onto main; assert B.depends_on == null; assert B.needs_restack == false; assert B.restack_reason == null; assert A.dependants == []"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "Workspaces with automatic restack off",
+      "rationale": "Some teams want every branch move to be asked for; the hub then only says which changes are behind.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "state_driven",
+          "condition": "the target workspace's setting changes.auto_restack is false and a change with direct dependants gets a new version",
+          "action": "record no pending restack, move no branch, and set needs_restack to true with restack_reason auto_restack_off on each direct dependant whose head does not have the new head as an ancestor",
+          "contract": "each such dependant has needs_restack true and restack_reason auto_restack_off with its version number and source branch head unchanged; a dependant already on the new head is not flagged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/restack_test.go: changes.auto_restack false; A with dependants B and C; amend A by adding a commit on top (so that B, built on the old head, is behind) and then push C rebased onto A's new head; assert B.needs_restack == true; assert B.restack_reason == 'auto_restack_off'; assert B.version == 1; assert head(B.source) is unchanged; assert C.needs_restack == false; assert no pending restack exists; assert no parley.change.restack event exists"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "state_driven",
+          "condition": "the target workspace's setting changes.auto_restack is false and the landing entry point is called for a change with direct dependants",
+          "action": "clear depends_on of each direct dependant, set needs_restack to true with restack_reason auto_restack_off on it, record no pending restack and move no branch",
+          "contract": "each direct dependant has depends_on null, needs_restack true and restack_reason auto_restack_off; its source branch head is unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/restack_test.go: changes.auto_restack false; chain A, B; land A as L through the store and OnLanded(A, L); assert B.depends_on == null; assert B.needs_restack == true; assert B.restack_reason == 'auto_restack_off'; assert head(B.source) is unchanged; assert no pending restack exists"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "event_driven",
+          "condition": "a caller sends the manual restack for a change that has restack_reason auto_restack_off",
+          "action": "do the rebase the automatic restack would have done and clear the flag",
+          "contract": "HTTP 200 with status restacked and a change object with needs_restack false and restack_reason null",
+          "check": {
+            "same_as": "REQ-8.1"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "Manual restack",
+      "rationale": "An agent must be able to ask for the rebase itself and get the outcome in the same call, including the conflict as data.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "the change's author, a caller with write access to the target workspace or the admin token sends POST /api/v1/workspaces/:slug/changes/:number/restack, with no body or a JSON object, for a draft or open change whose head does not have as an ancestor the commit it must sit on (the current head of the change named by depends_on, or the current head of the target branch when depends_on is null), and the replay applies",
+          "action": "replay the change's own commits onto that commit, move the source branch with a compare-and-swap, record a version of kind restack created by the caller with the body's session_id (or the previous version's when the body has none), emit parley.change.version and then parley.change.restack with trigger manual and the caller as actor, and clear needs_restack unless its reason is stack_too_deep",
+          "contract": "HTTP 200 with body {status: \"restacked\", change: <change object>}; change.version is one higher, change.base_sha is the commit sat on, change.needs_restack is false",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/restack_handler_test.go with httptest, a table over the change {B depends on A and A has a newer head (auto_restack false, B flagged auto_restack_off); a change with depends_on null whose target branch main has moved ahead; B in conflict on A after A was amended again so that the replay now applies} and the caller {author who is an org member with read-only access to the target, non-author with write access, admin token} and the body {none, {}, {session_id: a session of the caller}}: r = POST …/restack; assert r.status == 200; assert r.json.status == 'restacked'; assert r.json.change.version == old + 1; assert r.json.change.base_sha == A.head_sha or head(main); assert r.json.change.needs_restack == false and restack_reason == null; v = latest version; assert v.kind == 'restack'; assert v.created_by names the caller; assert v.session_id == the body's session_id or the previous version's; assert the last two events are parley.change.version then parley.change.restack with metadata.trigger == 'manual' and the caller as actor"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "event_driven",
+          "condition": "a permitted caller sends the manual restack for a draft or open change whose head already has the commit it must sit on as an ancestor",
+          "action": "record no version, emit no event, and clear a needs_restack flag whose reason is conflict or auto_restack_off, asking the mergeability trigger of package 23 to compute mergeable again when a flag was cleared",
+          "contract": "HTTP 200 with body {status: \"up_to_date\", change: <change object>}; change.version is unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/restack_handler_test.go with httptest, a table over {B built on A's current head; a change with depends_on null built on the current head of main}: r = POST …/restack; assert r.status == 200; assert r.json.status == 'up_to_date'; assert r.json.change.version == old; assert head(source) is unchanged; assert no event was written"
+          }
+        },
+        {
+          "id": "REQ-8.3",
+          "pattern": "unwanted",
+          "condition": "the replay of a manual restack conflicts",
+          "action": "move no branch, leave the change with needs_restack true, restack_reason conflict, mergeable conflict and the conflict report, emit parley.change.conflict unless the change was already in conflict, and answer with the report",
+          "contract": "HTTP 409 with error_type rebase_conflict and the conflict report as the envelope's details object; the source branch head and the version number are unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/restack_handler_test.go with httptest: B (on A) and A's amended head both rewrite line 1 of f.txt, auto_restack false; r = POST B/restack; assert r.status == 409; assert r.json.error.error_type == 'rebase_conflict'; assert r.json.error.code == 409; assert r.json.error.details.target_sha == A.head_sha; assert r.json.error.details.files[0].path == 'f.txt'; assert B.restack_reason == 'conflict'; assert B.version == 1; assert head(B.source) is unchanged; repeat the POST; assert 409 again and count(parley.change.conflict events for B) == 1"
+          }
+        },
+        {
+          "id": "REQ-8.4",
+          "pattern": "unwanted",
+          "condition": "the manual restack names a change that is landed or abandoned, or a change with depends_on null whose target branch no longer exists",
+          "action": "refuse the request and change nothing",
+          "contract": "HTTP 409 with error_type change_closed for a landed or abandoned change; HTTP 400 with error_type target_not_found when the target branch is missing; no version, no event, no branch move",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/restack_handler_test.go with httptest, a table over {landed change -> 409 change_closed, abandoned change -> 409 change_closed, open change with depends_on null whose target branch was deleted -> 400 target_not_found}: r = POST …/restack; assert r.status and r.json.error.error_type as listed; assert the change's version and head(source) are unchanged; assert no event was written"
+          }
+        },
+        {
+          "id": "REQ-8.5",
+          "pattern": "unwanted",
+          "condition": "the manual restack is sent by a caller who may read the change but is neither its author, nor a caller with write access to the target workspace, nor the admin token; or with a PAT that lacks changes:write; or for a change number that does not exist; or by a caller with no read access to the workspace",
+          "action": "refuse the request and change nothing",
+          "contract": "HTTP 403 with error_type forbidden for the reader; HTTP 403 with error_type insufficient_scope for the PAT; HTTP 404 with error_type change_not_found for the unknown number; HTTP 404 with error_type not_found for the caller without access",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/restack_handler_test.go with httptest, a table over the caller {org member who is not the author -> 403 forbidden, author's PAT with only changes:read -> 403 insufficient_scope, owner asking for number 999 -> 404 change_not_found, user outside the organization -> 404 not_found, PAT with only changes:read asking for a workspace that does not exist -> 403 insufficient_scope}: r = POST …/restack; assert r.status and r.json.error.error_type as listed; assert head(source) and the version number are unchanged"
+          }
+        },
+        {
+          "id": "REQ-8.6",
+          "pattern": "unwanted",
+          "condition": "the body of the manual restack carries a session_id that fails the session-linking rule",
+          "action": "refuse the request before any rebase and change nothing",
+          "contract": "HTTP 400 with error_type unknown_session; no version, no event, no branch move",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch",
+              "the session-linking rule of package 49, or a stub of it where that package is not yet implemented"
+            ],
+            "pseudocode": "in internal/change/restack_handler_test.go with httptest, a table over session_id {an id that does not exist, a session of another user on another workspace}: r = POST …/restack {session_id}; assert r.status == 400; assert r.json.error.error_type == 'unknown_session'; assert the rebase function was not called; assert the version number is unchanged"
+          }
+        },
+        {
+          "id": "REQ-8.7",
+          "pattern": "unwanted",
+          "condition": "the compare-and-swap of a manual restack is lost 5 times in a row because the source branch keeps moving",
+          "action": "stop, change nothing and report the branch's current head",
+          "contract": "HTTP 409 with error_type ref_moved and details {current_sha: <the source branch head>}; no restack version exists",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/restack_handler_test.go with httptest and a hook that moves the source branch before every compare-and-swap: r = POST …/restack; assert r.status == 409; assert r.json.error.error_type == 'ref_moved'; assert r.json.error.details.current_sha == head(source); assert no version of kind 'restack' exists"
+          }
+        },
+        {
+          "id": "REQ-8.8",
+          "pattern": "unwanted",
+          "condition": "a version guard is registered and refuses the version a manual restack would record",
+          "action": "refuse the request with the guard's error before the source branch moves and change nothing",
+          "contract": "the guard (the interface VersionGuard of internal/change, which package 29 registers through RegisterVersionGuard) is called once per attempt, after the replay is computed and before the compare-and-swap, with the caller's credential (type, id and paths) and the base and head of the version to record; its refusal is answered unchanged (HTTP 403 with error_type path_not_allowed and the path); the source branch head, the version number, needs_restack, restack_reason and mergeable are unchanged and no event is written; the guard is not called for an up_to_date answer, for a conflict, nor by a background restack; with no guard registered the restack proceeds",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch",
+              "B depends on A and A has a newer head, changes.auto_restack false; a recording version guard stub registered through RegisterVersionGuard"
+            ],
+            "pseudocode": "in internal/change/restack_handler_test.go with httptest: (a) the guard refuses with an error carrying 403 path_not_allowed and path 'src/x.go': before = get(B); r = POST B/restack with the author's PAT whose paths are ['docs/**']; assert r.status == 403 and r.json.error.error_type == 'path_not_allowed' and r.json.error.path == 'src/x.go'; assert the guard was called once with credential {pat, its id, ['docs/**']}, base == A.head_sha and a head whose parent chain reaches A.head_sha, and that head(B.source) still was the old head when it was called; assert get(B) == before, head(B.source) unchanged and no event written; (b) the guard accepts: POST -> 200 restacked, guard calls == 1; (c) B already on A's head -> 200 up_to_date and no guard call; (d) runPending() for a background restack of another dependant -> no guard call; (e) no guard registered -> 200 restacked"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-9",
+      "title": "Durable restacks",
+      "rationale": "A restack the hub owes must not be forgotten because the hub stopped between a push and its background work.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-9.1",
+          "pattern": "event_driven",
+          "condition": "the hub starts and the store holds pending restacks",
+          "action": "run every one of them",
+          "contract": "after the start, each change that had a pending restack has its restack version (or its conflict state) and no pending record remains",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/restack_queue_test.go: open a real store in t.TempDir(); chain A, B; record a new version of A with the worker stopped; close the store; reopen it and start the worker as the server start does; wait until no pending restack is left; assert latest version of B has kind 'restack' and base_sha == A.head_sha"
+          }
+        },
+        {
+          "id": "REQ-9.2",
+          "pattern": "event_driven",
+          "condition": "the worker runs a pending restack for a change that is no longer draft or open",
+          "action": "remove the pending record and do nothing else",
+          "contract": "no version, no event and no branch move for that change; no pending record remains",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/restack_queue_test.go, a table over the state B reaches before the worker runs {abandoned, landed}: runPending(); assert B's version number and head(B.source) are unchanged; assert no pending restack exists; assert no parley.change.restack event exists"
+          }
+        },
+        {
+          "id": "REQ-9.3",
+          "pattern": "event_driven",
+          "condition": "a pending restack is recorded for a change that already has one",
+          "action": "replace the older record, so that one restack runs, onto the newest commit",
+          "contract": "one pending record for the change; after the worker runs, one new restack version whose base_sha is the newest head below",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/restack_queue_test.go: B depends on A; with the worker stopped record two new versions of A one after the other; assert count(pending restacks for B) == 1; runPending(); assert B.version == 2; assert latest version of B has base_sha == A.head_sha"
+          }
+        },
+        {
+          "id": "REQ-9.4",
+          "pattern": "unwanted",
+          "condition": "the git command of a restack fails for a reason other than a conflict (it cannot be started, it exits with an error that is not a conflict, or the repository cannot be read)",
+          "action": "change nothing; in the background keep the pending record, write one error log line and keep the worker and the server process running; in the manual call answer with an internal error",
+          "contract": "background: no version, no event, needs_restack unchanged, the pending record still present, a later pending restack of another change is still run; manual: HTTP 500 with error_type internal",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/restack_queue_test.go and internal/change/restack_handler_test.go, with a gitrepo stub whose rebase returns a non-conflict error for B only: (background) amend A, which has dependants B and C; runPending(); assert B.version == 1; assert a pending restack for B exists; assert B.needs_restack == false; assert latest version of C has kind 'restack'; (manual) r = POST B/restack; assert r.status == 500; assert r.json.error.error_type == 'internal'; assert B.version == 1"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-10",
+      "title": "Stack route and CLI commands",
+      "rationale": "Whoever works on one change of a stack needs the whole stack in one read, and both operations from the shell.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-10.1",
+          "pattern": "event_driven",
+          "condition": "a caller with changes:read and read access to the target workspace sends GET /api/v1/workspaces/:slug/changes/:number/stack",
+          "action": "answer with the target branch and the summaries of the chain of depends_on links below the change, the change itself and every draft or open change above it, bottom first, each summary having the members number, title, state, version, head_sha, mergeable, needs_restack, restack_reason and landing with its status",
+          "contract": "HTTP 200 with body {target_branch: string, changes: [{number, title, state, version, head_sha, mergeable, needs_restack, restack_reason, landing: {status}}]}; the same list whichever change of the stack is asked for",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/stack_handler_test.go with httptest, a table over {chain A, B, C asked for A, for B and for C: changes numbers == [A, B, C]; a change with no link and no dependants: a list of one; chain A, B where B is in conflict: B's summary has needs_restack true and restack_reason 'conflict'}: r = GET …/stack; assert r.status == 200; assert r.json.target_branch == 'main'; assert the numbers in order; assert keys of each summary == the nine members; assert keys(summary.landing) == ['status']; assert head_sha has 40 characters"
+          }
+        },
+        {
+          "id": "REQ-10.2",
+          "pattern": "event_driven",
+          "condition": "the stack asked for has a change with more than one draft or open dependant, or changes above it that are abandoned",
+          "action": "list every draft or open change reachable through dependants, ordered by depth from the bottom and then by number, and leave out abandoned and landed changes above",
+          "contract": "changes is ordered by (depth, number); no abandoned or landed change appears above the change asked for",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/stack_handler_test.go with httptest: A (1) with dependants B (2) and C (3), D (4) on C, E (5) on B, and F (6) on A which is then abandoned; r = GET A/stack; assert numbers == [1, 2, 3, 4, 5]; r = GET D/stack; assert numbers == [1, 3, 4]"
+          }
+        },
+        {
+          "id": "REQ-10.3",
+          "pattern": "unwanted",
+          "condition": "the stack route is asked for a change number that does not exist, with a PAT that lacks changes:read, or by a caller with no read access to the workspace",
+          "action": "refuse the request",
+          "contract": "HTTP 404 with error_type change_not_found for the unknown number; HTTP 403 with error_type insufficient_scope for the PAT; HTTP 404 with error_type not_found for the caller without access",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace whose bare repository was created with git init in t.TempDir(), with a main branch"
+            ],
+            "pseudocode": "in internal/change/stack_handler_test.go with httptest, a table over {owner asking for 999 -> 404 change_not_found, PAT with only workspaces:read -> 403 insufficient_scope, user outside the organization -> 404 not_found}: r = GET …/stack; assert r.status and r.json.error.error_type as listed"
+          }
+        },
+        {
+          "id": "REQ-10.4",
+          "pattern": "event_driven",
+          "condition": "a user runs parley change stack <slug> <number>",
+          "system": "parley CLI",
+          "action": "send GET /api/v1/workspaces/<slug>/changes/<number>/stack with the slug percent-encoded as one segment and print the response body",
+          "contract": "stdout holds the response as one JSON document indented by 2 spaces; exit status 0",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/change_test.go against an httptest server that records requests and answers {target_branch: 'main', changes: [...]}: run(['change', 'stack', 'demo', '12']); assert request == GET /api/v1/workspaces/demo/changes/12/stack; assert stdout parses to the served body; assert exit == 0"
+          }
+        },
+        {
+          "id": "REQ-10.5",
+          "pattern": "event_driven",
+          "condition": "a user runs parley change restack <slug> <number> and the hub answers 200",
+          "system": "parley CLI",
+          "action": "send POST /api/v1/workspaces/<slug>/changes/<number>/restack with the body {} and print the response body",
+          "contract": "stdout holds {status, change} as one JSON document; stderr is empty; exit status 0",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/change_test.go against an httptest server, a table over the served status {restacked, up_to_date}: run(['change', 'restack', 'demo', '12']); assert request == POST /api/v1/workspaces/demo/changes/12/restack with Content-Type application/json and body {}; assert stdout.status == the served status; assert exit == 0"
+          }
+        },
+        {
+          "id": "REQ-10.6",
+          "pattern": "unwanted",
+          "condition": "the hub answers parley change restack with 409 rebase_conflict",
+          "system": "parley CLI",
+          "action": "print the error envelope as received, with the conflict report in details, on stderr and nothing on stdout",
+          "contract": "exit status 1; stderr holds the envelope with error_type rebase_conflict and details.files; stdout is empty",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/change_test.go against an httptest server that answers 409 {error: {code: 409, error_type: 'rebase_conflict', message, details: {target_sha, files: [{path: 'f.txt', kind: 'content'}]}}}: run(['change', 'restack', 'demo', '12']); assert exit == 1; assert stdout == ''; e = parse(stderr); assert e.error.error_type == 'rebase_conflict'; assert e.error.details.files[0].path == 'f.txt'"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "An agent amends the bottom of a three-change stack and the hub restacks the two above",
+      "steps": [
+        {
+          "actor": "git client",
+          "action": "pushes three branches to the workspace, each one commit on top of the previous"
+        },
+        {
+          "actor": "agent",
+          "action": "opens a change for each branch with POST /api/v1/workspaces/:slug/changes, bottom first"
+        },
+        {
+          "actor": "parleyd",
+          "action": "records version 1 of each change and links them: change 2 depends on change 1, change 3 on change 2"
+        },
+        {
+          "actor": "git client",
+          "action": "force-pushes the amended bottom branch"
+        },
+        {
+          "actor": "parleyd",
+          "action": "records version 2 of change 1 and a pending restack of change 2 in one transaction, and answers the push"
+        },
+        {
+          "actor": "parleyd",
+          "action": "replays change 2 onto the new head, moves its source branch, records a restack version and emits parley.change.version and parley.change.restack"
+        },
+        {
+          "actor": "parleyd",
+          "action": "does the same for change 3 onto the new head of change 2"
+        },
+        {
+          "actor": "agent",
+          "action": "reads GET /api/v1/workspaces/:slug/changes/3/stack and sees the three changes bottom first with needs_restack false"
+        },
+        {
+          "actor": "git client",
+          "action": "fetches the third branch and finds the amended bottom commit among its ancestors"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parleyd HTTP server and router",
+          "git smart HTTP server",
+          "change store on a real SQLite file",
+          "internal/gitrepo running the git binary",
+          "restack worker",
+          "event log"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with a data directory in t.TempDir()",
+          "a ready workspace demo with a main branch and changes.auto_restack true",
+          "a user with write access and an API key",
+          "the git command on PATH"
+        ],
+        "end_state": [
+          "changes 2 and 3 each have a version 2 of kind restack with created_by.actor_type system",
+          "the hub's branch of change 3 has the amended bottom commit as an ancestor",
+          "the stack route lists changes 1, 2, 3 in that order, each with needs_restack false",
+          "the event log holds parley.change.restack for change 2 and then for change 3, both with trigger version"
+        ],
+        "pseudocode": "in test/e2e/stack_restack_test.go: start the hub; git push branches a, b, c; open changes 1..3 over HTTP; assert GET changes/3 .depends_on == 2; amend a and git push --force; poll GET changes/3 until version == 2 (deadline 10 s); assert versions/2 of changes 2 and 3 have kind 'restack'; git fetch; assert git merge-base --is-ancestor <amended a> origin/c; s = GET changes/3/stack; assert numbers == [1, 2, 3] and every needs_restack == false; assert GET /events/log filtered to parley.change.restack lists change 2 then change 3"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "A restack conflicts, the agent sees it as data and fixes it with a push",
+      "steps": [
+        {
+          "actor": "git client",
+          "action": "pushes two stacked branches that edit the same line of one file"
+        },
+        {
+          "actor": "agent",
+          "action": "opens a change for each branch"
+        },
+        {
+          "actor": "git client",
+          "action": "pushes a new commit to the lower branch that rewrites that line"
+        },
+        {
+          "actor": "parleyd",
+          "action": "tries to restack the upper change, hits a conflict, leaves its branch where it was, sets needs_restack with restack_reason conflict and the conflict report, and emits parley.change.conflict"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "runs parley change restack for the upper change, prints the rebase_conflict envelope with the conflict report on stderr and exits 1"
+        },
+        {
+          "actor": "git client",
+          "action": "rebases the upper branch onto the new lower head, resolving the line, and force-pushes it"
+        },
+        {
+          "actor": "parleyd",
+          "action": "records the pushed version, finds the lower head among its ancestors and clears needs_restack"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "runs parley change stack for the upper change and prints both changes with needs_restack false"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parleyd HTTP server and router",
+          "git smart HTTP server",
+          "change store on a real SQLite file",
+          "internal/gitrepo running the git binary",
+          "restack worker",
+          "parley CLI binary code path with its HTTP client"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with a data directory in t.TempDir()",
+          "a ready workspace demo with a main branch and changes.auto_restack true",
+          "a user with write access and an API key in PARLEY_API_KEY",
+          "the git command on PATH"
+        ],
+        "end_state": [
+          "after the conflicting push the upper change has version 1, needs_restack true, restack_reason conflict and a conflict report naming the file",
+          "parley change restack exited 1 with error_type rebase_conflict on stderr and nothing on stdout",
+          "after the fixing push the upper change has version 2 of kind push, needs_restack false and restack_reason null",
+          "parley change stack exited 0 and printed two changes, lower first"
+        ],
+        "pseudocode": "in test/e2e/stack_restack_test.go: start the hub; push a and b (b on a, both editing line 1 of f.txt); open changes 1 and 2; push a new commit on a rewriting line 1; poll GET changes/2 until needs_restack == true (deadline 10 s); assert restack_reason == 'conflict', version == 1, conflict.files[0].path == 'f.txt'; code, out, errOut = parley('change', 'restack', 'demo', '2'); assert code == 1 and out == '' and parse(errOut).error.error_type == 'rebase_conflict'; locally git rebase b onto a with the line resolved, git push --force; ch = GET changes/2; assert ch.version == 2 and ch.needs_restack == false and ch.restack_reason == null; code, out, _ = parley('change', 'stack', 'demo', '2'); assert code == 0 and numbers(parse(out).changes) == [1, 2]"
+      }
+    }
+  ]
+}

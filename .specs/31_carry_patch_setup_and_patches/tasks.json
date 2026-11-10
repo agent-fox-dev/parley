@@ -1,0 +1,258 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "31",
+  "spec_name": "carry_patch_setup_and_patches",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/carrypatch/... ./internal/gitrepo/... ./internal/cli/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "10",
+      "reason": "uses the workspace record with its carry-patch fields, the state guard, the post-clone step registry, the origin credential resolver, the settings reader and internal/gitrepo with its test origin helper"
+    },
+    {
+      "spec": "12",
+      "reason": "uses the origin fetch and the compare-and-swap ref update it adds to internal/gitrepo"
+    },
+    {
+      "spec": "09",
+      "reason": "builds the parley patch commands on the CLI's HTTP client, output and exit codes"
+    },
+    {
+      "spec": "52",
+      "reason": "writes the event parley.patch.create through the event component in the transaction that creates the patch"
+    },
+    {
+      "spec": "14",
+      "reason": "registers the remover of a workspace's patches with the removers of owned data it declares in internal/workspace"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Resolve the upstream credential from workspace secrets",
+      "criteria": [
+        "REQ-1"
+      ],
+      "steps": [
+        "Add the task's behaviours as table-driven tests to internal/carrypatch/credential_test.go and confirm they fail",
+        "Create the package internal/carrypatch with ResolveUpstreamCredential(ctx, workspace), which reads the workspace's secrets through the same secret reader that package 10's ResolveOriginCredential uses, on every call and without a cache",
+        "Return user name x-token-auth with the token when UPSTREAM_GIT_PAT is set and not empty; otherwise UPSTREAM_GIT_USERNAME with UPSTREAM_GIT_PASSWORD when both are set and not empty; a user name without a password is skipped",
+        "Otherwise return what ResolveOriginCredential of internal/workspace returns for the workspace, which may be 'no credential'",
+        "Return a read error of the secret reader as an error; never turn it into 'no credential'",
+        "Return the credential in the type internal/gitrepo takes for its fetches, so that it reaches git through the process environment only"
+      ],
+      "touches": [
+        "internal/carrypatch/credential.go",
+        "internal/carrypatch/credential_test.go"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Fetch upstream and resolve the upstream base",
+      "criteria": [
+        "REQ-2"
+      ],
+      "steps": [
+        "Add the task's behaviours to internal/carrypatch/upstream_test.go, using gitrepotest.NewOrigin as the upstream, and confirm they fail",
+        "Add to internal/gitrepo a fetch of all branches of a URL into a named remote-tracking namespace (refs/heads/* to refs/remotes/<name>/*) that prunes refs the remote no longer has, fetches no tags, takes a credential and a deadline option, and writes no remote section and no credential into the copy's configuration; the URL and ref names are passed after an end-of-options marker so that no value is read as a git option",
+        "Add the carry-patch git runner in internal/carrypatch/gitrun.go, through which every git operation of internal/carrypatch runs (this package's and those of packages 32 to 38): it calls the operations of internal/gitrepo, gives each operation its own deadline of 10 minutes or the caller's shorter one (replaceable by an option for tests), on expiry kills the git process and its children and returns an error that wraps the exported ErrGitTimeout, and cleans the text of every failed operation with SanitizeGitText of internal/gitrepo/safety.go (added here: URL user information becomes ***@ and every credential value resolved for the operation is removed)",
+        "Add FetchUpstream(ctx, workspace) to internal/carrypatch: resolve the upstream credential (task 1) and return its error without starting git; run the fetch into the namespace upstream through the runner, so under its deadline of 10 minutes; when the deadline passes the deadline error is returned",
+        "After a successful fetch ask the upstream for its default branch with ListRemote of internal/gitrepo and write it into the copy's configuration under parley.upstreamDefaultBranch; remove the value when the upstream reports none",
+        "On any failure leave the refs and the recorded default branch untouched and return the runner's cleaned error, so that URL user information reads ***@ and no secret appears",
+        "Add UpstreamBase(workspace): the commit of refs/remotes/upstream/<recorded default branch> when that resolves, else of refs/remotes/upstream/<the workspace's default_branch>, else the exported error ErrNoUpstreamBase; it reads the copy only and never fetches",
+        "Export FetchUpstream, UpstreamBase, ErrNoUpstreamBase, the runner and ErrGitTimeout for packages 32 to 38"
+      ],
+      "touches": [
+        "internal/carrypatch/upstream.go",
+        "internal/carrypatch/upstream_test.go",
+        "internal/gitrepo/remote.go",
+        "internal/gitrepo/remote_test.go",
+        "internal/carrypatch/gitrun.go",
+        "internal/gitrepo/safety.go",
+        "internal/gitrepo/safety_test.go"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Set up a carry-patch workspace after a fresh clone",
+      "criteria": [
+        "REQ-3"
+      ],
+      "steps": [
+        "Add the task's behaviours to internal/carrypatch/setup_test.go and confirm they fail; the tests that need a clone run package 10's clone work against an origin and an upstream built with gitrepotest.NewOrigin",
+        "Add IntegrationBranch(workspace): the stored integration_branch, or deploy while the stored value is null; every other piece of this package and packages 33 to 38 ask this exported function for the name, so the deploy fallback exists in one place",
+        "Add the set-up as four steps behind small interfaces (workspace store, upstream fetcher, copy) so that tests can fail each one: write deploy into the record when integration_branch is null; FetchUpstream; set the copy's configuration value rerere.enabled to true; write the integration branch",
+        "Run all four steps whatever the outcome of the earlier ones and return one error that names every failed step and lets a caller tell whether the upstream fetch was among them (packages 34 and 36 treat that one as their upstream failure), or nil; never panic and never end the process",
+        "The target of the integration branch is UpstreamBase when the fetch succeeded and a base resolves, otherwise the workspace's head_sha (the head of origin's default branch)",
+        "In the post-clone form, write refs/heads/<integration branch> to the target unconditionally, so that a branch of that name brought by the clone is replaced; leave refs/remotes/origin/* as the clone recorded them",
+        "Add EnsureSetup(ctx, workspace) for a ready workspace: the same steps, but the integration branch is created with a create-if-absent compare-and-swap (CompareAndSwapRef of internal/gitrepo) and an existing one is never moved; export it for the rebuild and sync packages",
+        "Register the post-clone form with the post-clone step registry of internal/workspace for the mode carry_patch from a Register function that cmd/parleyd calls while it builds the hub, before the clone workers start",
+        "Write neither upstream_head_sha nor clone_error and emit no event; the error returned to the clone work is already scrubbed of credentials",
+        "Add the end-to-end test of the create-and-set-up path to test/e2e/carry_patch_setup_test.go, up to the point where the workspace is ready and the copy is inspected; the patch-list assertions are added by the task that ships the list route"
+      ],
+      "touches": [
+        "internal/carrypatch/setup.go",
+        "internal/carrypatch/setup_test.go",
+        "cmd/parleyd/main.go",
+        "test/e2e/carry_patch_setup_test.go"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Store patches and guard carry-patch routes by mode and state",
+      "criteria": [
+        "REQ-4.1",
+        "REQ-4.2"
+      ],
+      "steps": [
+        "Add the task's behaviours to internal/carrypatch/guard_test.go, with one read route and one write route built with the guard and mounted on the server pipeline of internal/server, and confirm they fail",
+        "Add the patch record with the fields of the PRD's patch object and a schema migration registered with internal/store: a patches table keyed by id, with the workspace slug, branch_name, nullable position, status, conflict_files, upstream_pr_url, description, added_at, updated_at, deleted_at and the three origin fields; a unique index on (workspace, branch_name) over the rows whose status is not deleted; export a remover that deletes the patches of one workspace inside a transaction it is given, and register it with the removers of owned data that package 14 declares in internal/workspace/teardown.go, where the hub is composed",
+        "Add store functions usable inside a caller's transaction: insert a patch, read one by workspace and id, find the non-deleted patch of a branch, find the deleted patch of a branch, list the non-deleted patches in position order, list the deleted patches by deleted_at descending then id, shift positions at and after a position down by one, count the non-deleted patches, and remove a patch row for good",
+        "Add the encoder of the patch object: all 14 members always present, null for unset ones, conflict_files an array that is never null, timestamps in the hub's whole-second UTC form, and an optional replaced_sha that is written only when a value is given",
+        "Add the guard every carry-patch route uses, as a function the handlers call after their own request validation: load the workspace the access component resolved; answer 400 with error_type workspace_mode_mismatch when workspace_mode is not carry_patch (which covers every task fork); for a write route then apply RequireReady of internal/workspace, which gives 409 workspace_busy, workspace_not_ready or workspace_archived; for a read route skip the state check",
+        "Add the route registration helper of the package: a route is declared with its scope (patches:read or patches:write), its access need (read or write) and whether it is a write route, and is registered with internal/server and the access component so that authentication, scope and access run before the handler",
+        "Raise workspace_mode_mismatch through the error helper of internal/server so that it leaves the hub as the error envelope with status 400",
+        "Export the guard and the registration helper for packages 32 to 38",
+        "Declare in internal/carrypatch/rebuild_enqueuer.go the interface RebuildEnqueuer that every source of a rebuild calls (packages 32, 34, 36 and 37) and package 33 implements: one operation EnqueueRebuild(ctx, slug, options) whose options carry an optional strategy and fail mode, submitted_by, the event's actor and session id and an optional follow-up-of job id, and whose result says whether a job was queued, its id, and on a duplicate the existing job's id with a nil error; add a default that queues nothing and reports no job, and a registration call with which package 33 replaces it when the hub is composed"
+      ],
+      "touches": [
+        "internal/carrypatch/patch.go",
+        "internal/carrypatch/store.go",
+        "internal/carrypatch/guard.go",
+        "internal/carrypatch/guard_test.go",
+        "internal/carrypatch/routes.go",
+        "internal/carrypatch/rebuild_enqueuer.go",
+        "internal/hub/"
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Serve the patch list and a single patch",
+      "criteria": [
+        "REQ-8",
+        "REQ-4.3"
+      ],
+      "steps": [
+        "Add the task's behaviours to internal/carrypatch/read_test.go, writing patches (deleted ones included) directly through the patch store, and confirm they fail",
+        "Register GET /workspaces/:slug/patches with the scope patches:read, read access and the guard in its read form, so that it answers in every workspace state",
+        "Parse include_deleted: absent or false means no deleted patches, true adds them, any other value (the empty string included) is 400 invalid_request; take limit and cursor through the list helper of internal/server, which refuses a limit outside 1 to 200 and a foreign cursor",
+        "Order the list as one total order: non-deleted patches by position, then, when include_deleted is true, deleted patches by deleted_at descending and id ascending; page it with the list helper so that a cursor continues across the boundary between the two groups; answer {items, next_cursor} with items never null",
+        "Register GET /workspaces/:slug/patches/:id the same way; answer 404 not_found with the message 'patch not found' when the id is not a UUID, names no patch, or names a patch of another workspace",
+        "For a found patch, deleted or not, look up refs/parley/replaced/<branch_name> in the workspace's copy and add replaced_sha with the full commit id when it resolves; when the ref is missing, the copy does not exist or git fails, leave the member out and still answer 200",
+        "Extend test/e2e/carry_patch_setup_test.go with the last step of the create-and-set-up path: the empty patch list on the new workspace and 400 workspace_mode_mismatch on a standard one"
+      ],
+      "touches": [
+        "internal/carrypatch/read.go",
+        "internal/carrypatch/read_test.go",
+        "internal/carrypatch/routes.go",
+        "cmd/parleyd/main.go",
+        "test/e2e/carry_patch_setup_test.go"
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Resolve a patch branch on the hub or on origin",
+      "criteria": [
+        "REQ-5"
+      ],
+      "steps": [
+        "Add the task's behaviours to internal/carrypatch/resolve_test.go against a real bare copy and an origin built with gitrepotest.NewOrigin that counts requests, and confirm they fail",
+        "Add ResolveBranch(ctx, workspace, branch, skip) returning one of the resolutions local, origin_tracking, origin_fetch and skipped, or an error; with skip true return skipped at once, reading no ref and contacting no remote",
+        "Look first for refs/heads/<branch> in the copy: found means local and nothing is written",
+        "Else look for refs/remotes/origin/<branch>: found means create refs/heads/<branch> at that commit with a create-if-absent compare-and-swap (CompareAndSwapRef of internal/gitrepo) and return origin_tracking",
+        "Else, only when the workspace's effective setting patch_branch_source reads origin (a missing key means hub): resolve the origin credential with ResolveOriginCredential and run the single-branch origin fetch this task adds to internal/gitrepo/remote.go and exports (package 32 uses it too): it fetches refs/heads/<branch> of origin, forced, into refs/remotes/origin/<branch> and nothing else, and returns origin's tip or a distinguishable 'no such branch on origin' error; run it through the runner under a deadline of 2 minutes (replaceable by an option for tests), create refs/heads/<branch> at the tip and return origin_fetch",
+        "When no lookup that applies finds the branch, return the error for HTTP 404 with error_type branch_not_found through the error helper of internal/server; in hub mode this happens without any request to origin",
+        "When the credential cannot be read, origin cannot be reached or refuses, or the deadline passes, return the error for HTTP 502 with error_type origin_fetch_failed, whose message is the runner's cleaned text; create no ref",
+        "When the create-if-absent write finds that the branch has appeared in the meantime, treat the branch as found and return the resolution already determined",
+        "Pass the branch name to git only in full ref form after an end-of-options marker"
+      ],
+      "touches": [
+        "internal/carrypatch/resolve.go",
+        "internal/carrypatch/resolve_test.go",
+        "internal/gitrepo/remote.go"
+      ],
+      "depends_on": [
+        4
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Register one patch with POST /workspaces/:slug/patches",
+      "criteria": [
+        "REQ-6",
+        "REQ-4.4"
+      ],
+      "steps": [
+        "Add the task's behaviours to internal/carrypatch/add_test.go with the patch routes on the real server pipeline, a temporary store, the real event component and a test clock, and confirm they fail",
+        "Register POST /workspaces/:slug/patches with the scope patches:write, write access, as a route that creates a resource (so internal/server handles Idempotency-Key and replays) and with the guard in its write form",
+        "Decode the body as an object here (an array goes to the batch code of the next task; any other JSON value is 400 invalid_request) and validate it before the guard runs and before any lookup: branch_name a string that passes ValidateBranchName of internal/workspace and differs from IntegrationBranch(workspace); position, when present, a JSON integer of at least 1; upstream_pr_url and description strings; skip_branch_check and if_not_exists booleans; null counts as absent; unknown members are ignored",
+        "Then the guard, then the registered check: when a non-deleted patch has the branch, answer 409 with error_type patch_exists, or, when if_not_exists is true, 200 with that patch unchanged; do this before branch resolution so that neither answer creates a ref",
+        "Then ResolveBranch (previous task) with skip_branch_check; pass its 404 or 502 to the caller unchanged and store nothing",
+        "Then one store transaction: remove for good a deleted patch that has the same branch and remember that its backup ref must go; read the count N of non-deleted patches; take position N+1 when position is absent or greater than N+1, otherwise shift the patches at and after the position down by one and take it; insert the patch with a new UUID, status active, empty conflict_files, added_at and updated_at from the clock, description and upstream_pr_url null when absent or empty; write parley.patch.create through the event component with resource_type patch, the patch id, the caller as actor and the metadata branch_name, final position and branch_resolution",
+        "Make the transaction safe against concurrent adds on the same workspace: positions are read and written inside one write transaction of the store, and a unique-index violation on (workspace, branch_name) is answered as the registered check would have answered it (409 patch_exists, or 200 with the existing patch for if_not_exists)",
+        "After the commit, when a deleted patch was removed, delete refs/parley/replaced/<branch> from the copy; log a failure of that deletion with the ref name and still answer 201",
+        "Answer 201 with the patch object; answer any other storage failure with 500 internal after the rollback",
+        "Take no per-workspace lock that outlives the transaction and hold no lock during branch resolution"
+      ],
+      "touches": [
+        "internal/carrypatch/add.go",
+        "internal/carrypatch/add_test.go",
+        "internal/carrypatch/routes.go",
+        "cmd/parleyd/main.go"
+      ],
+      "depends_on": [
+        5,
+        6
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Register a batch of patches atomically",
+      "criteria": [
+        "REQ-7"
+      ],
+      "steps": [
+        "Add the task's behaviours to internal/carrypatch/batch_test.go and confirm they fail",
+        "Route an array body of POST /workspaces/:slug/patches to the batch code; an empty array is 400 invalid_request",
+        "Validate every element with the single-patch validation, in array order, before the guard and before any lookup; refuse an element that is not an object, an element with if_not_exists true (false and absent are accepted) and an element whose branch_name an earlier element already named; the message of each refusal is 'patch[<i>]: ' followed by the reason, with the zero-based index of the offending element",
+        "After the guard, run the registered check for every element and answer 409 patch_exists for the first registered branch, before any branch is resolved",
+        "Resolve the branch of every element in array order with ResolveBranch; stop at the first refusal and answer it (404 or 502); branches created for earlier elements are left in place",
+        "In one store transaction: remove deleted patches that have one of the branches; place the elements that carry a position first, in array order, each by the single-add position rule against the list as it then stands; then append the elements without a position in array order; insert every patch and write one parley.patch.create per patch with its final position, read after all placements, and its branch_resolution",
+        "Roll the transaction back on any failure so that no patch and no event of the batch remains; answer a unique-index violation with 409 patch_exists and any other storage failure with 500 internal",
+        "After the commit delete the backup refs of the removed deleted patches as the single add does",
+        "Answer 201 with the one member items: the created patches in request order, each with its final position"
+      ],
+      "touches": [
+        "internal/carrypatch/batch.go",
+        "internal/carrypatch/batch_test.go",
+        "internal/carrypatch/add.go"
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Add the commands parley patch add, list and show",
+      "criteria": [
+        "REQ-9"
+      ],
+      "steps": [
+        "Add the task's behaviours to internal/cli/patch_test.go, driving the commands against a net/http/httptest server that records requests and answers from a script, and confirm they fail",
+        "Add the command group patch to the CLI root through the command helper of internal/cli/command.go; the group without a subcommand prints help and exits 0",
+        "Add patch add <workspace-slug> with --branch, --position (an integer flag), --upstream-pr, --description, --skip-branch-check and --if-not-exists; fail with the CLI's usage error (exit 2, error_type usage_error, no request) when --branch was not given, the argument count is not 1 or --position does not parse as an integer",
+        "Build the body with branch_name and a member for each further flag that was given, telling a flag given with an empty value from one not given (--description '' sends an empty string); send POST /workspaces/:slug/patches through the CLI's HTTP client",
+        "Add patch list <workspace-slug> with --include-deleted: GET /workspaces/:slug/patches, with the query include_deleted=true only when the flag is given",
+        "Add patch show <workspace-slug> <patch-id>: GET /workspaces/:slug/patches/:id",
+        "Percent-encode each argument as one path segment through the client; print the response body on stdout and exit 0; leave hub errors to the client's common handling (envelope on stderr, exit 1)",
+        "Add the end-to-end test of the register-and-read path to test/e2e/carry_patch_patches_test.go: the CLI add of a branch held only by an origin-tracking ref, the batch over the API with an agent's PAT, then list and show through the CLI and the three events"
+      ],
+      "touches": [
+        "internal/cli/patch.go",
+        "internal/cli/patch_test.go",
+        "test/e2e/carry_patch_patches_test.go"
+      ]
+    }
+  ]
+}

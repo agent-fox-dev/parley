@@ -1,0 +1,253 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "40",
+  "spec_name": "variables_and_resolution",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/secret/... ./internal/cli/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "39",
+      "reason": "reads secrets by scope and name through its store for name resolution, and shares internal/secret"
+    },
+    {
+      "spec": "09",
+      "reason": "builds parley vars on its HTTP client, command helper, output and exit-code rules"
+    },
+    {
+      "spec": "52",
+      "reason": "writes parley.variable.create, update and delete through its event component in the transaction of the change"
+    },
+    {
+      "spec": "14",
+      "reason": "registers the removal of a workspace's variables with the removers of owned data that the workspace delete runs"
+    },
+    {
+      "spec": "16",
+      "reason": "registers the same removal with the removal participants of a fork's removal"
+    },
+    {
+      "spec": "05",
+      "reason": "registers its variable removal with RegisterUserRemover and RegisterOrgRemover, the scope removers it owns in internal/identity/removers.go"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Create variables in the user, org and workspace scopes",
+      "criteria": [
+        "REQ-2"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/secret/var_validate_test.go, internal/secret/var_store_test.go and internal/secret/var_routes_test.go, with a test hub helper that mounts the routes on the real router with a real store, a fixed clock, users, an organization and a workspace record, and confirm they fail",
+        "Write the key and value rules: a key is 1 to 255 ASCII letters, digits and underscores and does not start with a digit; a value is a string of at most 262,144 bytes counted in bytes; a missing value is the empty string; members of the wrong type are invalid",
+        "Register a schema migration with internal/store for a variable table keyed by scope, scope id and the lower-cased key, holding the key as given, the value, created_at and updated_at, so that the store refuses a second entry for a key ignoring case",
+        "Build the store's create operation: in one transaction count the scope's variables, refuse when the count plus the new entries is over 100, refuse when a key is present ignoring case, else insert every entry with one timestamp from the clock; a failure leaves nothing stored",
+        "Build the part that turns a request into a scope and a scope id: the caller's user id for /user/vars (the admin token refused with 403 forbidden and the message `user-scoped endpoints require a user credential`), the organization found with the organization selector of internal/identity (a slug or a UUID) for /orgs/:slug/vars (members of the active organization and the admin token; anyone else and an unknown organization 404 not_found with one body), answering as the scope resolvers of package 39's secret routes do, and the workspace for /workspaces/:slug/vars through the access component of internal/access with need write",
+        "Register POST /user/vars, POST /orgs/:slug/vars and POST /workspaces/:slug/vars through internal/server as creates that accept Idempotency-Key, needing the scope vars:write for a PAT; the user and org routes are declared as naming no workspace, the workspace route as naming :slug",
+        "Run the body checks in the fixed order (entries a non-empty array; each key valid; each value valid; no two keys equal ignoring case; the limit; no key present) and answer the first fault: 400 invalid_request naming the key, 429 secret_limit_reached with the message `maximum of 100 entries per scope exceeded`, or 409 conflict with the message `key \"<k>\" already exists`",
+        "Answer 201 with items of key, value, created_at and updated_at in request order, timestamps in RFC 3339 UTC with whole seconds",
+        "Make the routes independent of the secret encryption key: they answer the same with and without one"
+      ],
+      "touches": [
+        "internal/secret/var_validate.go",
+        "internal/secret/var_validate_test.go",
+        "internal/secret/var_store.go",
+        "internal/secret/var_store_test.go",
+        "internal/secret/var_access.go",
+        "internal/secret/var_routes.go",
+        "internal/secret/var_routes_test.go",
+        "internal/secret/var_testhub_test.go",
+        "internal/hub/"
+      ],
+      "done_when": [
+        "`go test ./internal/secret/... -count=1` passes against a real store",
+        "two concurrent creates of one key never leave two entries"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "List, update and delete variables",
+      "criteria": [
+        "REQ-3.1",
+        "REQ-3.2",
+        "REQ-3.3",
+        "REQ-3.4",
+        "REQ-3.5"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/secret/var_routes_test.go and internal/secret/var_store_test.go and confirm they fail",
+        "Add the store's list operation for one scope and scope id, ordered by the lower-cased key ascending, with a position to continue from",
+        "Register GET /user/vars, GET /orgs/:slug/vars and GET /workspaces/:slug/vars through the list helper of internal/server (limit default 50, 1 to 200, cursor), needing vars:read or vars:write for a PAT and, on a workspace, need read; a fork's list holds only the fork's own entries",
+        "Add the store's update operation: match the key ignoring case in the scope, replace the value, keep the stored key and created_at, set updated_at from the clock, and report no match",
+        "Register PATCH on /user/vars/:key, /orgs/:slug/vars/:key and /workspaces/:slug/vars/:key, needing vars:write and write access: validate the body first (value absent, null, not a string or over 262,144 bytes is 400 invalid_request; the empty string is valid), then answer 200 with the entry or 404 not_found with the message `key \"<k>\" not found` using the key as given in the path",
+        "Add the store's delete operation matching the key ignoring case, and register DELETE on the three key paths: 204 with no body, or the same 404",
+        "Register no GET on a key path, so that the router answers 405 with an Allow header there"
+      ],
+      "touches": [
+        "internal/secret/var_store.go",
+        "internal/secret/var_store_test.go",
+        "internal/secret/var_routes.go",
+        "internal/secret/var_routes_test.go"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Write one event for every variable change",
+      "criteria": [
+        "REQ-4"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/secret/var_events_test.go, reading the real event log after each request, and confirm they fail",
+        "Take the event component of internal/event as a collaborator of the variable store and write events inside the transaction of the change",
+        "On a create write one parley.variable.create per entry in request order; on an update one parley.variable.update; on a delete one parley.variable.delete; each with resource_type variable, the matching action, resource_id the stored key, the caller as actor and metadata of exactly scope, scope_id and key",
+        "Set the event's workspace to the slug for the workspace scope and leave it null for the user and org scopes; set scope_id to the user id, the organization id or the slug",
+        "Never pass a value to the event component",
+        "When the event cannot be written, roll the change back and answer 500 internal without the cause in the message",
+        "Confirm that refused requests and idempotent replays write nothing"
+      ],
+      "touches": [
+        "internal/secret/var_events.go",
+        "internal/secret/var_events_test.go",
+        "internal/secret/var_store.go",
+        "internal/secret/var_routes.go",
+        "internal/hub/"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Build the resolution chain and answer a workspace's resolved variables",
+      "criteria": [
+        "REQ-5",
+        "REQ-6",
+        "REQ-3.6"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/secret/chain_test.go, internal/secret/resolve_vars_test.go and internal/secret/var_routes_test.go, writing workspace and fork records through the record store of internal/access, and confirm they fail",
+        "Build the chain function: from a slug, read the workspace record and answer the ordered steps, each with origin, scope and scope id: the workspace's own scope; for a fork the parent's workspace scope with origin parent; the org scope of the workspace's organization (for a fork the parent's) when the owner is a member of that active organization; the user scope of the workspace's owner",
+        "Take the owner from the record, never from a caller: the function has no caller parameter",
+        "Ask identity for membership and for the owner's existence at every call and keep nothing between calls",
+        "Answer a distinct workspace-not-found error for an unknown slug; leave out the parent step when the parent record is missing, the org step when the organization is gone, blocked or the owner is not a member, and the user step when the owner no longer exists",
+        "Build the merge: read each step's variables in one read transaction and keep, for each key ignoring case, the whole entry of the first step that has it, with that step's origin; order the result by lower-cased key",
+        "Register GET /workspaces/:slug/vars/resolved with need read and the scope vars:read or vars:write, as a literal path beside the key path, answering the merged entries through the list helper with key, value, origin, created_at and updated_at",
+        "Leave PATCH and DELETE unregistered on the literal path so that both answer 405 with Allow: GET and never reach the key handlers, also when a variable with the key resolved exists",
+        "Answer 500 internal with no items when the chain or a scope cannot be read"
+      ],
+      "touches": [
+        "internal/secret/chain.go",
+        "internal/secret/chain_test.go",
+        "internal/secret/resolve_vars.go",
+        "internal/secret/resolve_vars_test.go",
+        "internal/secret/var_routes.go",
+        "internal/secret/var_routes_test.go",
+        "internal/hub/"
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Hold every variable route to its scope's access rule",
+      "criteria": [
+        "REQ-1"
+      ],
+      "steps": [
+        "Add the access tables of this task to internal/secret/var_access_test.go, covering all thirteen routes with an API key, PATs with and without the vars scopes, the admin token, an org member and a stranger, and confirm which rows fail",
+        "Make the scope check come before scope access on every route: a PAT without vars:read and vars:write on a read, or without vars:write on a write, gets 403 insufficient_scope whether or not the organization or workspace exists",
+        "Make every /user/vars route refuse the admin token with 403 forbidden and the fixed message, and confine a user to the entries of that user's own id",
+        "Make every /orgs/:slug/vars route answer one 404 not_found body for an unknown organization, a non-member and a member of a blocked organization, and serve the admin token without a membership",
+        "Declare the workspace read routes (list, resolved) with need read and the write routes (create, update, delete) with need write, so that a member's write is 403 forbidden with the message `org members have read-only access to this workspace` before the body is looked at, and a caller without access gets the 404 of an unknown slug",
+        "Add no state precondition to any variable route: every workspace status and the exclusive maintenance marker leave the answers unchanged"
+      ],
+      "touches": [
+        "internal/secret/var_access.go",
+        "internal/secret/var_access_test.go",
+        "internal/secret/var_routes.go"
+      ],
+      "depends_on": [
+        4
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Resolve secrets by name along the chain",
+      "criteria": [
+        "REQ-7"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/secret/resolve_secrets_test.go, using the real secret store with a test encryption key and a recording wrapper around its reads, and confirm they fail",
+        "Read secrets through package 39's Get(scope, scope id, name), which answers (value, found, error) and an error matching ErrUnreadable for an entry that cannot be decrypted; take that one method as the resolution's reader so the tests can wrap it, and define no second read operation",
+        "Build the exported resolution function: given a slug and a list of names, build the chain at that call and, for each distinct name in the order first asked, read the scopes in chain order and stop at the first that has the name; answer per name found with value and origin, or missing, and beside them the scopes searched in order",
+        "For a fork, ask the access component whether the fork's owner has write access to the parent; when not, drop the parent step for every name before any read, so the parent's scope is never read and is not among the scopes searched",
+        "Skip the parent step for the seven reserved names, compared ignoring case, for every fork owner, and still search the other steps for them",
+        "Treat a secret with an empty value as found",
+        "When the first scope that has a name answers unreadable, fail the whole call with an error that names the key and the scope and no value, return no values, and do not read a lower scope for that name",
+        "Return the workspace-not-found error for an unknown slug and a different error for a store failure; keep no value, chain or access answer between calls and write no value to a log",
+        "Export the function from internal/secret so that the sandbox packages can call it, and pass its collaborators in internal/hub"
+      ],
+      "touches": [
+        "internal/secret/resolve_secrets.go",
+        "internal/secret/resolve_secrets_test.go",
+        "internal/secret/chain.go",
+        "internal/secret/resolve_integration_test.go",
+        "internal/hub/"
+      ],
+      "depends_on": [
+        4
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Remove variables with their workspace, user or organization",
+      "criteria": [
+        "REQ-8"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/secret/var_remove_test.go and confirm they fail",
+        "Add RemoveVarScope(tx, scope, scope id), which deletes every variable of one scope inside a transaction it is given and writes no event, and export RemoveWorkspaceVars(tx, slug), the same for one workspace scope; both return the store's error when the delete fails",
+        "In internal/hub, register RemoveWorkspaceVars as a remover of owned data with the workspace removal of internal/workspace (package 14; it returns no revoked token ids) and as a removal participant with the fork removal of internal/fork (package 16; the cause is not looked at)",
+        "In internal/hub, register RemoveVarScope for the user scope with RegisterUserRemover and for the org scope with RegisterOrgRemover, the scope removers package 05 owns in internal/identity/removers.go (package 39 registers its own with the same two functions; this package only registers and edits no file of internal/identity), so that the delete of a user or an organization removes its variables in its own transaction; register no maintenance task",
+        "Confirm that a refused or rolled-back deletion of a user or an organization leaves its variables in place",
+        "Confirm that a workspace record created again under a removed slug lists no variables"
+      ],
+      "touches": [
+        "internal/secret/var_remove.go",
+        "internal/secret/var_remove_test.go",
+        "internal/secret/var_store.go",
+        "internal/hub/"
+      ],
+      "depends_on": [
+        4
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Add the parley vars commands",
+      "criteria": [
+        "REQ-9"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/cli/vars_test.go, running the commands in-process against a scripted httptest server that records requests, and confirm they fail",
+        "Declare the group `vars` with the commands create, list, update, delete and resolve through the command helper of internal/cli, each with its method and path, and add the group to the root command; the group alone prints help",
+        "Add the scope flags --user, --org <slug> and --workspace <slug> to create, list, update and delete; no flag means the user scope; list, update and delete refuse more than one with a usage error; resolve takes no scope flag",
+        "Parse entries: split arguments at commas, split each entry at its first `=`, refuse an entry without `=`, an empty key and an empty entry; with --from-stdin take exactly one bare key and read the value from the command's standard input, dropping one trailing `\\n` or `\\r\\n`; every refusal is a usage error raised before any request",
+        "create: send one POST per scope in the order user, org, workspace; collect each success as {scope, items}; print each failed scope's envelope once on stderr and go on; print the one results document, also when it is empty; exit 1 when any scope failed, else 0",
+        "list: read the scope's list with limit=200, follow next_cursor to the end, and print {\"items\":[…]} without next_cursor, as parley secrets list does; a hub error on any page prints nothing on stdout",
+        "update: accept exactly one entry, send PATCH with the value to the key's path through the shared client so the key is percent-encoded as one segment, and print the entry",
+        "delete: send DELETE to the key's path and print {\"deleted\": <the key as typed>}",
+        "resolve: take one workspace slug, read the resolved list with limit=200 to the last page and print {\"items\":[…]} without next_cursor",
+        "Add test/e2e/vars_test.go with the two end-to-end flows of this package that run against a hub started in-process"
+      ],
+      "touches": [
+        "internal/cli/vars.go",
+        "internal/cli/vars_test.go",
+        "internal/cli/root.go",
+        "test/e2e/vars_test.go"
+      ],
+      "depends_on": [
+        2
+      ]
+    }
+  ]
+}

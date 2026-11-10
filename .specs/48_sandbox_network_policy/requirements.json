@@ -1,0 +1,963 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "48",
+  "spec_name": "sandbox_network_policy",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Effective network policy of a sandbox",
+      "rationale": "A sandbox must reach the hub, its credentials' endpoints and what was allowed for its workspace, and nothing may weaken the rules that tie a credential to its endpoints.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "a sandbox is stored on a repository workspace or on a task fork",
+          "action": "supply, through the workspace rule provider registered with package 45 and in the transaction that stores the sandbox, the id and the rule body of every workspace sandbox rule held at that moment by the workspace, or by the parent when the workspace is a task fork, ordered by created_at and then id, oldest first, which package 45 records with the sandbox beside the allow_proposals value of its profile snapshot",
+          "contract": "the sandbox object's workspace_rules is the list of those rule ids in that order, [] when the workspace holds none; the same list is the workspace_rules metadata of parley.sandbox.create; the value of [sandbox].allow_workspace_rules and the sandbox's profile make no difference",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a real SQLite store in t.TempDir()",
+              "the fake runtime client of package 44"
+            ],
+            "pseudocode": "in internal/sandbox/policy_test.go, a table over {workspace 'demo' holding rules r1 (older) and r2; fork 'demo--a' of it; workspace 'empty' with no rule; 'demo' with allow_workspace_rules false; 'demo' with a second profile}: create a sandbox through the creation entry point of package 45; assert sandbox.workspace_rules == [r1.id, r2.id] for every row but 'empty', where it is []; assert the copies package 45 stored with the record equal r1.rule and r2.rule; assert the create event's metadata.workspace_rules equals the same list"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "event_driven",
+          "condition": "the provisioning work of package 45, after a create or after a start, asks the registered policy composer for the policy value of a sandbox",
+          "action": "return one policy value made of the base policy of the sandbox's profile snapshot, the protected rules (the hub rule when the sandbox has a hub credential, then the rule of each attached credential in the order of the sandbox's credentials list), and the added rules (the recorded copies of the workspace rules in their recorded order, then the rules approved for this sandbox with either scope in the order they were decided)",
+          "contract": "the CreateSandbox call of a create and the StartSandbox call of a start carry base == the profile's policy, protected == [hub rule, credential rules…] exactly as package 45 supplies them, and added == [workspace rule copies…, approved rules…]; a rule approved with scope workspace that is also among the recorded copies appears once",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a real SQLite store in t.TempDir()",
+              "the fake runtime client of package 44"
+            ],
+            "pseudocode": "in internal/sandbox/policy_test.go, a table over {no workspace rule and no approval -> added == []; rules r1, r2 -> added == [r1.rule, r2.rule]; r1 plus one approval a1 with scope sandbox, composed for a start -> added == [r1.rule, a1.rule]; hub_access none -> protected holds the credential rules only; an approval with scope workspace on a sandbox created after the rule existed -> the rule once}: call ComposePolicy(sandbox) and the provisioning step with the fake runtime; assert the recorded policy's base, protected and added parts; assert protected is deep-equal to the rules the test passed in for the hub and for each credential"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "ubiquitous",
+          "action": "for any combination of base policy, workspace sandbox rules and approved rules, place the hub rule and every credential rule unchanged in the protected part of the policy and in no other part",
+          "check": {
+            "same_as": "REQ-1.2"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "ubiquitous",
+          "action": "for any sandbox, keep the recorded set of workspace sandbox rules fixed for the sandbox's life: a rule saved after the sandbox was created is not added to it, and a rule deleted after it was created stays in its workspace_rules and in the policy composed at every later start",
+          "contract": "after a rule is deleted and another saved, an earlier sandbox's workspace_rules is unchanged and the policy composed for its next start carries the deleted rule's copy and not the new rule",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a real SQLite store in t.TempDir()",
+              "the fake runtime client of package 44"
+            ],
+            "pseudocode": "in internal/sandbox/policy_test.go: create sandbox s on 'demo' holding r1; delete r1 through the rule store; save r2 by a promotion from another sandbox; assert get(s).workspace_rules == [r1.id]; assert ComposePolicy(s).added == [r1.rule]; create sandbox t; assert t.workspace_rules == [r2.id]"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "unwanted",
+          "condition": "the base policy of the sandbox's profile contains a rule that refers to the provider of the hub credential",
+          "action": "return an error from the policy composer, so that package 45 fails the provisioning before the sandbox is created at the runtime",
+          "contract": "the sandbox reads with state failed, state_reason provision_failed and an error text that contains the profile's name and the words 'hub credential'; the runtime client received no create call for it",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a real SQLite store in t.TempDir()",
+              "the fake runtime client of package 44"
+            ],
+            "pseudocode": "in internal/sandbox/policy_test.go: the fake runtime's ValidatePolicy reports the hub credential's provider among the providers the base policy of profile 'leaky' refers to; create a sandbox with profile 'leaky' and run provisioning; assert state == 'failed' and state_reason == 'provision_failed'; assert error contains 'leaky' and 'hub credential'; assert fake.creates == 0; with profile 'agent', whose policy has no such reference, assert the sandbox becomes ready"
+          }
+        },
+        {
+          "id": "REQ-1.6",
+          "pattern": "unwanted",
+          "condition": "the runtime rejects the composed policy when the sandbox is created at the runtime",
+          "action": "end the sandbox as failed and, when the policy without workspace rules is accepted, find the rule to name, in the composer's Explain, by calling ValidatePolicy with the recorded workspace rules added one at a time in their order",
+          "contract": "state failed with state_reason provision_failed; the error text contains the id of the first workspace sandbox rule with which the runtime rejects, or the profile's name when the runtime rejects the policy without any workspace rule; the text is at most 1,024 bytes",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a real SQLite store in t.TempDir()",
+              "the fake runtime client of package 44"
+            ],
+            "pseudocode": "in internal/sandbox/policy_test.go, a table over the fake runtime's behaviour {rejects any policy that contains r2.rule, sandbox created with [r1, r2, r3] -> error contains r2.id and neither r1.id nor r3.id; rejects the base policy itself -> error contains the profile name and no rule id; reason text of 5,000 bytes -> len(error) <= 1024}: create, run provisioning; assert state == 'failed' and state_reason == 'provision_failed'; assert the error text"
+          }
+        },
+        {
+          "id": "REQ-1.7",
+          "pattern": "event_driven",
+          "condition": "a sandbox is created with restore_from naming a sandbox that has rules approved with scope sandbox",
+          "action": "compose the new sandbox's policy from the workspace sandbox rules that exist at the new sandbox's creation and from none of the rules approved for the source sandbox alone",
+          "contract": "the new sandbox's workspace_rules lists the rules the workspace holds now, including one promoted from the source sandbox; the policy the runtime receives for it holds no rule that was approved for the source with scope sandbox",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a real SQLite store in t.TempDir()",
+              "the fake runtime client of package 44",
+              "a source sandbox with a checkpoint record, as package 47 leaves one"
+            ],
+            "pseudocode": "in internal/sandbox/policy_test.go: source sandbox s has approval a1 (scope sandbox) and approval a2 (scope workspace, saved as rule r9); create sandbox n with restore_from s.id; assert n.workspace_rules contains r9.id; assert the fake's create policy for n has added == [r9.rule] and does not contain a1.rule"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Denials reported once per destination",
+      "rationale": "A person watching a workspace needs to learn that an agent was blocked, without one retrying program flooding the event log.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "the runtime reports a denial for a sandbox whose (program, host, port) has not been reported for that sandbox",
+          "action": "store the triple for the sandbox and write one parley.sandbox.deny event in the same transaction, with exposed secret values in its text replaced by package 45's redaction",
+          "contract": "one event of type parley.sandbox.deny with actor system, resource_type sandbox, resource_id the sandbox id, workspace the sandbox's workspace, session_id the sandbox's, and metadata {program, host, port, method, path}, where method and path are null for a blocked connection and an exposed value of 8 or more characters inside path reads [redacted]",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a real SQLite store in t.TempDir()",
+              "the fake runtime client of package 44",
+              "the event component of package 52 on the same store"
+            ],
+            "pseudocode": "in internal/sandbox/collector_test.go, a table over denials the fake emits for a ready sandbox with session ses1 {('curl', 'example.org', 443, 'GET', '/a') -> metadata equal to the five values; ('git', '10.0.0.5', 22, no method, no path) -> method and path null; path containing the exposed value 'supersecretvalue' -> path contains '[redacted]' and not the value}: run one collector pass; assert exactly one new parley.sandbox.deny per row with actor 'system', resource_type 'sandbox', resource_id, workspace and session_id of the sandbox"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "event_driven",
+          "condition": "the runtime reports a denial whose (program, host, port) was already reported for that sandbox",
+          "action": "write no event",
+          "contract": "the event log gains no parley.sandbox.deny for a repeated triple, whatever its method and path; the same triple on another sandbox, and a triple that differs in program, host or port, is a first denial",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a real SQLite store in t.TempDir()",
+              "the fake runtime client of package 44"
+            ],
+            "pseudocode": "in internal/sandbox/collector_test.go: the fake emits for sandbox s ('curl','example.org',443) three times with different paths, then ('curl','example.org',80), then for sandbox t ('curl','example.org',443); run passes; assert the event log holds exactly 3 parley.sandbox.deny events (two for s, one for t); assert the recording metrics recorder holds 5 Adds of parley_sandbox_denials_total"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "ubiquitous",
+          "action": "for any denial the runtime reports for a sandbox the hub holds, first or repeated, add 1 to parley_sandbox_denials_total through the metrics recorder of package 44",
+          "check": {
+            "same_as": "REQ-2.2"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "state_driven",
+          "condition": "a sandbox is in state ready",
+          "action": "follow that sandbox's policy log with Logs of the runtime client and take its deny entries, and stop following it within one collector pass after it leaves ready",
+          "contract": "the collector holds one open policy log stream per ready sandbox and none for a sandbox in another state",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a real SQLite store in t.TempDir()",
+              "the fake runtime client of package 44"
+            ],
+            "pseudocode": "in internal/sandbox/collector_test.go: sandboxes a (ready), b (stopped), c (provisioning); run a pass; assert the fake's open policy log streams == {a}; set c to ready and a to stopped in the store; run a pass; assert the fake's open policy log streams == {c}; cancel the collector's context; assert no stream is open and the pass function returned"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "unwanted",
+          "condition": "the runtime cannot be reached, or a policy log stream ends with an error",
+          "action": "keep the hub running, open the stream again after the retry delay of 5 seconds, and treat every triple stored before as reported, including after a hub restart",
+          "contract": "the collector returns no error to its caller and does not end; after the runtime answers again a new triple produces one event and a triple reported before the failure, or before a restart of the collector on the same store, produces none",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a real SQLite store in t.TempDir()",
+              "the fake runtime client of package 44"
+            ],
+            "pseudocode": "in internal/sandbox/collector_test.go with the retry delay passed as a parameter and a controlled clock: report triple X; make the fake's stream fail; run a pass and assert it returns nil and no stream is open; advance the clock by the delay and let the fake recover; the fake replays X and emits Y; assert one new event, for Y; build a second collector on the same store; the fake replays X and Y; assert no new event"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Collecting proposals from the runtime",
+      "rationale": "A blocked agent's request has to reach a person as a stored, listed item with the runtime's risk findings, and only from sandboxes whose operator allowed asking.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "a collector pass finds at the runtime a pending proposal that the hub has not stored, made by a sandbox whose recorded allow_proposals is true",
+          "action": "store it as a proposal in state open with a new id of the form sbp_ followed by 32 lowercase hex characters, the rule, summary and findings as the runtime gave them and the runtime's proposal id, and write one parley.sandbox.proposal event in the same transaction",
+          "contract": "a proposal {id, sandbox_id, rule, summary, findings, state: open, scope: null, workspace_rule_id: null, decided_by: null, decided_at: null, comment: null, created_at}; one event parley.sandbox.proposal with actor system, the sandbox as resource, its workspace and session_id, and metadata {proposal_id, summary, max_severity}, where max_severity is the highest finding severity in the order low < medium < high and null without findings",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a real SQLite store in t.TempDir()",
+              "the fake runtime client of package 44",
+              "the event component of package 52 on the same store"
+            ],
+            "pseudocode": "in internal/sandbox/collector_test.go, a table over the findings of the fake's pending proposal {[] -> max_severity null; [low, high, medium] -> 'high'; [medium] -> 'medium'; [low] -> 'low'}: run one pass; assert one stored proposal with id matching ^sbp_[0-9a-f]{32}$, state 'open', rule, summary and findings deep-equal to the fake's, and the six decision fields null; assert one parley.sandbox.proposal event with actor 'system', resource_id the sandbox id, the sandbox's workspace and session_id, and the metadata"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "event_driven",
+          "condition": "a collector pass finds a pending proposal whose runtime proposal id the hub already stored for that sandbox",
+          "action": "store nothing and write no event",
+          "contract": "after any number of passes over the same pending proposal there is one proposal record and one parley.sandbox.proposal event for it",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a real SQLite store in t.TempDir()",
+              "the fake runtime client of package 44"
+            ],
+            "pseudocode": "in internal/sandbox/collector_test.go: the fake keeps one pending proposal; run three passes, the third on a new collector over the same store; assert count(proposals) == 1 and count(parley.sandbox.proposal events) == 1"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "unwanted",
+          "condition": "a collector pass finds a pending proposal made by a sandbox whose recorded allow_proposals is false",
+          "action": "reject the proposal at the runtime, store nothing and write no event",
+          "contract": "the runtime client receives one reject call for that runtime proposal id; no proposal record and no parley.sandbox.proposal event exist for it; a pending proposal that names a sandbox the hub does not hold is left alone: no reject call, no record, no event",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a real SQLite store in t.TempDir()",
+              "the fake runtime client of package 44"
+            ],
+            "pseudocode": "in internal/sandbox/collector_test.go, a table over the sandbox of the fake's pending proposal {created from a profile with allow_proposals false -> one reject call; created from such a profile that the configuration no longer has -> one reject call; created with allow_proposals true whose profile now says false -> stored as open, no reject call; an id the store does not hold -> no reject call and no record}: run one pass; assert fake.rejects, count(proposals) and count(events)"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "event_driven",
+          "condition": "a sandbox that has proposals in state open is marked deleted",
+          "action": "set those proposals to withdrawn in the transaction that marks the sandbox deleted, through the delete hook this package registers with package 45, leaving decided proposals as they are and writing no event",
+          "contract": "GET of the sandbox's proposals with state=withdrawn lists the formerly open proposals with decided_by, decided_at and comment null; with state=open it lists none; proposals that were approved or rejected keep their state; an approve or reject of a withdrawn proposal answers HTTP 409 with error_type proposal_decided",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a real SQLite store in t.TempDir()",
+              "the fake runtime client of package 44",
+              "an httptest server with the proposal routes"
+            ],
+            "pseudocode": "in internal/sandbox/proposal_test.go: sandbox s with proposals p1 (open), p2 (approved), p3 (open); run the delete hooks of package 45 for s inside the transaction that sets s to state deleted, and commit; GET …/proposals?state=withdrawn; assert items ids == [p1, p3] and their decision fields are null; GET with state=approved; assert [p2]; POST approve p1; assert 409 and error_type 'proposal_decided'; assert no parley.sandbox.proposal_decided event was written; in a second run roll the transaction back instead: assert p1 and p3 are still open"
+          }
+        },
+        {
+          "id": "REQ-3.5",
+          "pattern": "unwanted",
+          "condition": "the runtime cannot be reached when a collector pass lists pending proposals",
+          "action": "end the pass without changing any record and list again at the next pass, 5 seconds later",
+          "contract": "the pass returns no error to its caller; stored proposals are unchanged; a proposal that was pending during the failure is stored and announced once by the first pass that succeeds",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a real SQLite store in t.TempDir()",
+              "the fake runtime client of package 44"
+            ],
+            "pseudocode": "in internal/sandbox/collector_test.go with the poll interval passed as a parameter: the fake fails ListProposals; run a pass; assert it returns nil and count(proposals) == 0; let the fake recover; run a pass; assert one proposal and one event"
+          }
+        },
+        {
+          "id": "REQ-3.6",
+          "pattern": "event_driven",
+          "condition": "a sandbox's record is removed, by the cleanup of deleted records or with its workspace",
+          "action": "remove the sandbox's proposals, reported denial triples and approved rules in the transaction that removes the record, through the purge hook this package registers with package 45",
+          "contract": "after the transaction commits the store holds no proposal, denial triple or approved rule that names the removed sandbox id; rows of other sandboxes, in any state, are untouched; after a rollback the rows are still there",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a real SQLite store in t.TempDir()"
+            ],
+            "pseudocode": "in internal/sandbox/proposal_test.go: sandboxes s and d (state deleted), each with one proposal, one denial triple and one approved rule; run the purge hooks of package 45 for s inside a transaction and commit; assert no row names s; assert the three rows of d exist; repeat for d with a rollback; assert the three rows of d exist"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Listing proposals and the checks every route shares",
+      "rationale": "The person who decides needs the open requests of a sandbox with their findings, and a hub without sandboxes must answer every route the same way.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "a caller with sandboxes:read and read access to the workspace sends GET /api/v1/workspaces/:slug/sandboxes/:id/proposals",
+          "action": "answer with the proposals of that sandbox in the state the query parameter state names, open when it is absent, ordered by created_at and then id, oldest first, paged by limit and cursor",
+          "contract": "HTTP 200 with {items: [proposal…], next_cursor}; each item carries id, sandbox_id, rule, summary, findings, state, scope, workspace_rule_id, decided_by, decided_at, comment and created_at; a token bound to the workspace gets the same answer",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server with the middleware of package 02, the access component and the binding guard",
+              "a real SQLite store in t.TempDir()"
+            ],
+            "pseudocode": "in internal/sandbox/proposal_routes_test.go: sandbox s with proposals o1, o2, o3 (open, created in that order), a1 (approved), r1 (rejected); a table {no query -> [o1, o2, o3]; state=approved -> [a1]; state=rejected -> [r1]; state=withdrawn -> []; limit=2 -> [o1, o2] with a next_cursor whose page is [o3] and next_cursor null; the same request with a PAT bound to the workspace -> [o1, o2, o3]}: assert status 200, the item ids in order and the twelve members of each item"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "unwanted",
+          "condition": "the state query parameter of the proposals list is not one of open, approved, rejected, withdrawn",
+          "action": "refuse the request",
+          "contract": "HTTP 400 with error_type invalid_request",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/sandbox/proposal_routes_test.go, a table over state {'', 'OPEN', 'pending', 'open,approved'}: GET …/proposals?state=<value>; assert status 400 and error.error_type == 'invalid_request'"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "unwanted",
+          "condition": "the caller of the proposals list lacks sandboxes:read, cannot read the workspace, or names a sandbox id that is unknown, belongs to another workspace or has no record any more",
+          "action": "refuse the request in that order of checks",
+          "contract": "HTTP 403 with error_type insufficient_scope for a PAT without sandboxes:read, also when the workspace does not exist; HTTP 404 with error_type not_found for a workspace the caller cannot read; HTTP 404 with error_type sandbox_not_found for the sandbox cases",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/sandbox/proposal_routes_test.go, a table {PAT with git:read only on an existing workspace -> 403 insufficient_scope; the same PAT on slug 'nope' -> 403 insufficient_scope; API key of a user outside the organization -> 404 not_found; id 'sbx_' + 32 zeros -> 404 sandbox_not_found; the id of a sandbox of workspace 'other' under slug 'demo' -> 404 sandbox_not_found}: assert status and error.error_type"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "unwanted",
+          "condition": "the configuration has no [sandbox] section and a request reaches one of the five routes of this package",
+          "action": "refuse the request before the binding guard, the scope check and the access check",
+          "contract": "HTTP 404 with error_type sandboxes_disabled on GET …/proposals, POST …/approve, POST …/reject, GET …/sandbox-rules and DELETE …/sandbox-rules/:rule_id, for every authenticated caller including a bound token outside its binding and a PAT without sandbox scopes",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/sandbox/proposal_routes_test.go: mount the routes with sandboxes disabled; a table over the five routes and the callers {API key, PAT without sandbox scopes, PAT bound to another workspace}: assert status 404 and error.error_type == 'sandboxes_disabled'; without a credential assert 401"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Approving a proposal for its sandbox",
+      "rationale": "A person, never the agent that asked, lets a sandbox reach one more destination, with the runtime's findings acknowledged when they are severe.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "a caller who is not a workspace-bound token, with sandboxes:write and write access to the sandbox's workspace, sends POST /api/v1/workspaces/:slug/sandboxes/:id/proposals/:proposal_id/approve for an open proposal with scope absent or sandbox, and the sandbox is provisioning or ready",
+          "action": "add the proposal's rule to that sandbox's policy at the runtime and then, in one transaction, set the proposal to approved with scope sandbox, decided_by the caller, decided_at now and the given comment, store the rule as a rule approved for the sandbox, increase the sandbox's policy_revision by one and write one parley.sandbox.proposal_decided event",
+          "contract": "HTTP 200 with the proposal {state: approved, scope: sandbox, workspace_rule_id: null, decided_by: {actor_type, actor_id, username}, decided_at, comment}; the sandbox's policy_revision is one higher; one event parley.sandbox.proposal_decided with the caller as actor, the sandbox as resource and metadata {proposal_id, decision: approved, acknowledged_findings, scope: sandbox, rule_id: null}; no workspace sandbox rule is saved",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server with the middleware of package 02, the access component and the binding guard",
+              "a real SQLite store in t.TempDir()",
+              "the fake runtime client of package 44",
+              "a ready sandbox on workspace 'demo' with an open proposal and policy_revision 0"
+            ],
+            "pseudocode": "in internal/sandbox/proposal_routes_test.go, a table over the body {{} ; {scope:'sandbox', comment:'ok'}; {acknowledge_findings:true} on a proposal with a high finding; {} on a proposal with a medium finding}: POST approve; assert 200, state 'approved', scope 'sandbox', decided_by.username the caller's, decided_at the controlled clock's time, comment as sent or null; assert fake.addedRules == [(sandbox, proposal.rule)]; assert get(sandbox).policy_revision == 1; assert one parley.sandbox.proposal_decided with the metadata, acknowledged_findings true only in the third row; assert count(workspace rules) == 0"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "optional",
+          "condition": "the sandbox of an approved proposal is stopped, completed or failed",
+          "action": "store the decision and the approved rule and increase policy_revision without calling the runtime, so that the rule is part of the policy of the next start",
+          "contract": "HTTP 200 with the approved proposal; the runtime client receives no AddPolicyRule call; the policy composed for the sandbox's next start contains the rule among the added rules",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server with the middleware of package 02, the access component and the binding guard",
+              "a real SQLite store in t.TempDir()",
+              "the fake runtime client of package 44",
+              "a ready sandbox on workspace 'demo' with an open proposal and policy_revision 0"
+            ],
+            "pseudocode": "in internal/sandbox/proposal_routes_test.go, a table over the sandbox state {stopped, completed, failed}: POST approve; assert 200; assert fake.addedRules is empty; assert policy_revision == 1; assert ComposePolicy(sandbox).added ends with proposal.rule"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "unwanted",
+          "condition": "an approval, with either scope, of a proposal that has a finding of severity high carries no acknowledge_findings: true",
+          "action": "refuse the approval and decide nothing",
+          "contract": "HTTP 409 with error_type findings_not_acknowledged; the proposal stays open; policy_revision is unchanged; the runtime client receives no call; no event and no workspace sandbox rule is written",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server with the middleware of package 02, the access component and the binding guard",
+              "a real SQLite store in t.TempDir()",
+              "the fake runtime client of package 44",
+              "a ready sandbox on workspace 'demo' with an open proposal and policy_revision 0"
+            ],
+            "pseudocode": "in internal/sandbox/proposal_routes_test.go, a table over {scope sandbox, scope workspace} x {acknowledge_findings absent, false} on a proposal with findings [low, high]: POST approve; assert 409 and error.error_type == 'findings_not_acknowledged'; assert get(proposal).state == 'open'; assert fake.addedRules is empty; assert no proposal_decided and no rule_add event; assert count(workspace rules) == 0"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "unwanted",
+          "condition": "an approve or a reject names a proposal that is approved, rejected or withdrawn",
+          "action": "refuse the request and change nothing",
+          "contract": "HTTP 409 with error_type proposal_decided; the proposal's state, scope, decided_by, decided_at and comment are unchanged; no event is written",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server with the middleware of package 02, the access component and the binding guard",
+              "a real SQLite store in t.TempDir()",
+              "the fake runtime client of package 44",
+              "a ready sandbox on workspace 'demo' with an open proposal and policy_revision 0"
+            ],
+            "pseudocode": "in internal/sandbox/proposal_routes_test.go, a table over {approve, reject} x the proposal state {approved, rejected, withdrawn}: POST; assert 409 and error.error_type == 'proposal_decided'; assert the proposal row is byte-equal to before; assert no new event"
+          }
+        },
+        {
+          "id": "REQ-5.5",
+          "pattern": "unwanted",
+          "condition": "an approve or a reject comes from a workspace-bound token, from a PAT without sandboxes:write, from a caller with read-only access to the sandbox's workspace, with an invalid body, or names a proposal id that is unknown or belongs to another sandbox",
+          "action": "refuse the request at the first failing check, in that order, and decide nothing",
+          "contract": "HTTP 403 with error_type token_bound for a bound token, including one bound to the sandbox's own workspace with sandboxes:write; HTTP 403 insufficient_scope; HTTP 403 forbidden; HTTP 400 invalid_request for a body that is not an object, a scope other than sandbox or workspace, a comment that is not a string or an acknowledge_findings that is not a boolean; HTTP 404 with error_type not_found for the proposal id; in every case the proposal stays open and no event is written; the bound-token refusal comes from the binding guard of package 08, for which both routes are declared as refusing every workspace-bound token",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server with the middleware of package 02, the access component and the binding guard",
+              "a real SQLite store in t.TempDir()",
+              "the fake runtime client of package 44",
+              "a ready sandbox on workspace 'demo' with an open proposal and policy_revision 0"
+            ],
+            "pseudocode": "in internal/sandbox/proposal_routes_test.go, a table over {approve, reject} x {PAT bound to 'demo' with sandboxes:write -> 403 token_bound; the hub credential of the sandbox itself -> 403 token_bound; PAT with sandboxes:read only -> 403 insufficient_scope; org member with read access -> 403 forbidden; body '[]' -> 400; {comment: 5} -> 400; proposal id 'sbp_' + 32 zeros -> 404 not_found; a proposal id of another sandbox of the workspace -> 404 not_found} plus for approve {scope:'org'} -> 400 and {acknowledge_findings:'yes'} -> 400: assert status and error.error_type; assert the proposal is open and no event exists; assert a bound PAT with a body that is also invalid gets 403 token_bound"
+          }
+        },
+        {
+          "id": "REQ-5.6",
+          "pattern": "unwanted",
+          "condition": "the runtime rejects the policy that results from an approval, or cannot be reached",
+          "action": "refuse the approval and decide nothing",
+          "contract": "HTTP 409 with error_type conflict and a message that carries the runtime's reason, cut to 1,024 bytes, when the runtime rejects; HTTP 502 with error_type sandbox_runtime_error when it cannot be reached; in both cases the proposal stays open, policy_revision is unchanged, no rule is stored and no event is written, and a repeated approval can succeed",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server with the middleware of package 02, the access component and the binding guard",
+              "a real SQLite store in t.TempDir()",
+              "the fake runtime client of package 44",
+              "a ready sandbox on workspace 'demo' with an open proposal and policy_revision 0"
+            ],
+            "pseudocode": "in internal/sandbox/proposal_routes_test.go, a table over the behaviour of the fake's AddPolicyRule {rejects with reason 'destination denied by base policy' -> 409 conflict and message contains the reason; rejects with a reason of 5,000 bytes -> 409 and len(message) <= 1024; connection error -> 502 sandbox_runtime_error}, each for scope sandbox and scope workspace: assert status and error_type; assert state 'open', policy_revision 0, count(workspace rules) == 0, no event; let the fake succeed and POST again; assert 200"
+          }
+        },
+        {
+          "id": "REQ-5.7",
+          "pattern": "unwanted",
+          "condition": "two decisions of one open proposal arrive at the same time",
+          "action": "apply exactly one of them, conditional on the proposal still being open, and refuse the other",
+          "contract": "one request is answered HTTP 200 and the other HTTP 409 with error_type proposal_decided; exactly one parley.sandbox.proposal_decided event exists; policy_revision rose by at most one",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server with the middleware of package 02, the access component and the binding guard",
+              "a real SQLite store in t.TempDir()",
+              "the fake runtime client of package 44",
+              "a ready sandbox on workspace 'demo' with an open proposal and policy_revision 0"
+            ],
+            "pseudocode": "in internal/sandbox/proposal_routes_test.go, a table over the pairs {approve + approve, approve + reject, reject + reject}: send both requests from two goroutines released together, 20 rounds each with a new proposal; assert the sorted statuses are [200, 409] and the 409 carries 'proposal_decided'; assert one proposal_decided event per proposal whose decision matches the proposal's state; assert policy_revision rose by 1 when the state is approved and by 0 when rejected"
+          }
+        },
+        {
+          "id": "REQ-5.8",
+          "pattern": "ubiquitous",
+          "action": "for any rule approved for a sandbox, keep it in that sandbox's policy for the sandbox's life, across stop and start",
+          "check": {
+            "same_as": "REQ-1.2"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Rejecting a proposal",
+      "rationale": "A refusal is a recorded decision too: the agent and the audit log learn who said no and why.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "a caller who is not a workspace-bound token, with sandboxes:write and write access to the sandbox's workspace, sends POST /api/v1/workspaces/:slug/sandboxes/:id/proposals/:proposal_id/reject for an open proposal",
+          "action": "set the proposal to rejected with decided_by the caller, decided_at now and the given comment, write one parley.sandbox.proposal_decided event in the same transaction, and then tell the runtime that the proposal is rejected",
+          "contract": "HTTP 200 with the proposal {state: rejected, scope: null, workspace_rule_id: null, decided_by, decided_at, comment}; one event with the caller as actor and metadata {proposal_id, decision: rejected, acknowledged_findings: false, scope: null, rule_id: null}; policy_revision is unchanged; the runtime client receives one RejectProposal call and no AddPolicyRule call; a proposal with a high finding needs no acknowledgement to be rejected",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server with the middleware of package 02, the access component and the binding guard",
+              "a real SQLite store in t.TempDir()",
+              "the fake runtime client of package 44",
+              "a ready sandbox on workspace 'demo' with an open proposal and policy_revision 0"
+            ],
+            "pseudocode": "in internal/sandbox/proposal_routes_test.go, a table over {body {} ; {comment:'not this host'}; a proposal with a high finding and body {}; a sandbox in state stopped}: POST reject; assert 200, state 'rejected', scope null, comment as sent or null; assert the event metadata; assert policy_revision == 0; assert fake.rejects == [runtime proposal id] and fake.addedRules is empty"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "unwanted",
+          "condition": "the runtime cannot be reached, or answers with an error, when it is told of a rejection",
+          "action": "keep the stored decision, log the failure with the sandbox and proposal ids, and answer as for a rejection that reached the runtime",
+          "contract": "HTTP 200 with the proposal in state rejected and one parley.sandbox.proposal_decided event; the log line contains no credential and no exposed secret value",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server with the middleware of package 02, the access component and the binding guard",
+              "a real SQLite store in t.TempDir()",
+              "the fake runtime client of package 44",
+              "a ready sandbox on workspace 'demo' with an open proposal and policy_revision 0"
+            ],
+            "pseudocode": "in internal/sandbox/proposal_routes_test.go: the fake's reject returns an error whose text contains the exposed value 'supersecretvalue'; POST reject; assert 200 and state 'rejected'; assert one proposal_decided event; assert the captured log holds one line with the sandbox id and the proposal id and without 'supersecretvalue'"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "ubiquitous",
+          "action": "for any reject request, apply the same refusals as an approve for a bound token, a missing scope, read-only access, an invalid body, an unknown proposal and a proposal that is not open",
+          "contract": "HTTP 403 token_bound, 403 insufficient_scope, 403 forbidden, 400 invalid_request, 404 not_found and 409 proposal_decided, in that order of checks; the proposal is unchanged and no event is written",
+          "check": {
+            "same_as": "REQ-5.5"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "Promoting an approved rule to the workspace",
+      "rationale": "The next sandbox on the workspace or on its forks should not have to ask again for a destination a person already allowed.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "event_driven",
+          "condition": "a permitted caller approves an open proposal with scope workspace and the workspace that will hold the rule has no identical rule and fewer than 50 rules",
+          "action": "do what an approval for the sandbox does and, in the same transaction, save the rule as a workspace sandbox rule with a new id of the form sbr_ followed by 32 lowercase hex characters, the proposal's rule, summary and findings, from_proposal, created_by the caller and created_at now, record scope workspace and the rule's id on the proposal, and write parley.sandbox.proposal_decided and parley.sandbox.rule_add",
+          "contract": "HTTP 200 with the proposal {state: approved, scope: workspace, workspace_rule_id: <rule id>}; policy_revision is one higher; GET …/sandbox-rules lists the rule with from_proposal {sandbox_id, proposal_id, workspace}; the proposal_decided event's metadata has scope workspace and rule_id the rule's id; one event parley.sandbox.rule_add with the caller as actor, resource_type sandbox_rule, resource_id the rule id, workspace the holding workspace, session_id the sandbox's and metadata {rule_id, summary, max_severity, from_proposal}",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server with the middleware of package 02, the access component and the binding guard",
+              "a real SQLite store in t.TempDir()",
+              "the fake runtime client of package 44",
+              "a ready sandbox on workspace 'demo' with an open proposal and policy_revision 0",
+              "a task fork 'demo--a' of 'demo' with its own ready sandbox and open proposal"
+            ],
+            "pseudocode": "in internal/sandbox/rule_test.go: POST approve {scope:'workspace', acknowledge_findings:true} on a proposal of a sandbox on 'demo' with findings [high] and session ses1; assert 200, scope 'workspace', workspace_rule_id matches ^sbr_[0-9a-f]{32}$; assert the stored rule's rule, summary and findings equal the proposal's, created_by is the caller and from_proposal == {sandbox_id, proposal_id, workspace:'demo'}; assert fake.addedRules has the rule once; assert policy_revision == 1; assert the proposal_decided metadata {decision:'approved', acknowledged_findings:true, scope:'workspace', rule_id}; assert one rule_add event with resource_type 'sandbox_rule', resource_id the rule id, workspace 'demo', session_id 'ses1', max_severity 'high'"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "optional",
+          "condition": "the sandbox of a proposal approved with scope workspace is on a task fork",
+          "action": "save the rule on the fork's parent, after checking that the caller has write access to the parent",
+          "contract": "the rule is listed under the parent's slug and under the fork's slug; its from_proposal.workspace is the fork's slug; parley.sandbox.rule_add has workspace the parent's slug; parley.sandbox.proposal_decided has workspace the fork's slug; the fork holds no rule of its own",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server with the middleware of package 02, the access component and the binding guard",
+              "a real SQLite store in t.TempDir()",
+              "the fake runtime client of package 44",
+              "a ready sandbox on workspace 'demo' with an open proposal and policy_revision 0",
+              "a task fork 'demo--a' of 'demo' with its own ready sandbox and open proposal"
+            ],
+            "pseudocode": "in internal/sandbox/rule_test.go: the owner of 'demo' approves the proposal of the sandbox on 'demo--a' with scope workspace; assert 200; assert rules('demo') == [rule] and GET /workspaces/demo--a/sandbox-rules lists the same rule; assert rule.from_proposal.workspace == 'demo--a'; assert the rule_add event's workspace == 'demo' and the proposal_decided event's workspace == 'demo--a'; assert no stored rule row has workspace 'demo--a'"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "optional",
+          "condition": "the workspace that will hold the rule already has a rule whose rule object equals the proposal's as a JSON value",
+          "action": "approve the proposal for the sandbox, save no second rule, and name the existing rule on the proposal",
+          "contract": "HTTP 200 with scope workspace and workspace_rule_id the existing rule's id; the workspace's rule count is unchanged; no parley.sandbox.rule_add is written; parley.sandbox.proposal_decided carries rule_id the existing rule's id; this holds when the workspace already has 50 rules",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server with the middleware of package 02, the access component and the binding guard",
+              "a real SQLite store in t.TempDir()",
+              "the fake runtime client of package 44",
+              "a ready sandbox on workspace 'demo' with an open proposal and policy_revision 0",
+              "a task fork 'demo--a' of 'demo' with its own ready sandbox and open proposal"
+            ],
+            "pseudocode": "in internal/sandbox/rule_test.go, a table over {the workspace holds rule r with the same rule object; the same object with its keys in another order and other whitespace; the workspace holds 50 rules of which one is identical}: POST approve {scope:'workspace'}; assert 200 and workspace_rule_id == r.id; assert count(rules) unchanged; assert no rule_add event; assert proposal_decided.metadata.rule_id == r.id; assert policy_revision == 1; and a rule object that differs in one port value is saved as a new rule"
+          }
+        },
+        {
+          "id": "REQ-7.4",
+          "pattern": "unwanted",
+          "condition": "an approval with scope workspace comes from a caller who has write access to the fork of the sandbox and no write access to the fork's parent",
+          "action": "refuse the approval and decide nothing",
+          "contract": "HTTP 403 with error_type forbidden; the proposal stays open; no rule is saved, no event is written and the runtime client receives no call; the same caller's approval of the same proposal with scope sandbox is answered HTTP 200",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server with the middleware of package 02, the access component and the binding guard",
+              "a real SQLite store in t.TempDir()",
+              "the fake runtime client of package 44",
+              "a ready sandbox on workspace 'demo' with an open proposal and policy_revision 0",
+              "a task fork 'demo--a' of 'demo' with its own ready sandbox and open proposal"
+            ],
+            "pseudocode": "in internal/sandbox/rule_test.go: an org member with read access to 'demo' owns the fork 'demo--a'; POST approve {scope:'workspace'} on the fork sandbox's proposal; assert 403 and error.error_type == 'forbidden'; assert state 'open', count(rules('demo')) == 0, fake.addedRules empty, no event; POST approve {scope:'sandbox'}; assert 200 and scope 'sandbox'"
+          }
+        },
+        {
+          "id": "REQ-7.5",
+          "pattern": "unwanted",
+          "condition": "an approval with scope workspace names a proposal of a sandbox on a fork whose parent is archived",
+          "action": "refuse the approval and decide nothing",
+          "contract": "HTTP 409 with error_type parent_archived; the proposal stays open; no rule is saved and no event is written",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server with the middleware of package 02, the access component and the binding guard",
+              "a real SQLite store in t.TempDir()",
+              "the fake runtime client of package 44",
+              "a ready sandbox on workspace 'demo' with an open proposal and policy_revision 0",
+              "a task fork 'demo--a' of 'demo' with its own ready sandbox and open proposal"
+            ],
+            "pseudocode": "in internal/sandbox/rule_test.go: archive 'demo' in the store; the owner POSTs approve {scope:'workspace'} on the fork sandbox's proposal; assert 409 and error.error_type == 'parent_archived'; assert state 'open' and count(rules('demo')) == 0; assert no event"
+          }
+        },
+        {
+          "id": "REQ-7.6",
+          "pattern": "unwanted",
+          "condition": "an approval with scope workspace would save a rule on a workspace that already has 50 rules, none identical to the proposal's",
+          "action": "refuse the approval and decide nothing, counting and saving in one transaction",
+          "contract": "HTTP 429 with error_type sandbox_rule_limit_reached; the proposal stays open; the workspace still has 50 rules; the runtime client receives no call and no event is written; of two promotions of different rules that race on a workspace with 49 rules exactly one is answered 200 and the other 429 with its proposal open and its rule absent from the sandbox's approved rules",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server with the middleware of package 02, the access component and the binding guard",
+              "a real SQLite store in t.TempDir()",
+              "the fake runtime client of package 44",
+              "a ready sandbox on workspace 'demo' with an open proposal and policy_revision 0",
+              "a task fork 'demo--a' of 'demo' with its own ready sandbox and open proposal"
+            ],
+            "pseudocode": "in internal/sandbox/rule_test.go: seed 50 rules on 'demo'; POST approve {scope:'workspace'}; assert 429 and error.error_type == 'sandbox_rule_limit_reached'; assert state 'open', count(rules) == 50, fake.addedRules empty, no event; then with 49 rules and two open proposals with different rules, send both approvals from two goroutines released together, 20 rounds; assert sorted statuses == [200, 429], count(rules) == 50 and exactly one proposal approved; delete one rule and POST the refused approval again; assert 200"
+          }
+        },
+        {
+          "id": "REQ-7.7",
+          "pattern": "unwanted",
+          "condition": "an approval with scope workspace arrives while [sandbox].allow_workspace_rules is false",
+          "action": "refuse the approval and decide nothing, while leaving rules saved earlier listed, deletable and added to new sandboxes",
+          "contract": "HTTP 403 with error_type workspace_rules_disabled; the proposal stays open; no rule is saved and no event is written; an approval with scope sandbox is answered 200; GET …/sandbox-rules still lists earlier rules, DELETE of one answers 204, and a sandbox created now lists the remaining earlier rules in workspace_rules",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server with the middleware of package 02, the access component and the binding guard",
+              "a real SQLite store in t.TempDir()",
+              "the fake runtime client of package 44",
+              "a ready sandbox on workspace 'demo' with an open proposal and policy_revision 0",
+              "a task fork 'demo--a' of 'demo' with its own ready sandbox and open proposal"
+            ],
+            "pseudocode": "in internal/sandbox/rule_test.go with allow_workspace_rules false and rules r1, r2 saved before: POST approve {scope:'workspace'} as the workspace owner; assert 403 and error.error_type == 'workspace_rules_disabled'; assert state 'open' and no event; assert the same answer for a fork owner without write access to the parent (the switch is checked first); GET sandbox-rules; assert [r1, r2]; DELETE r1; assert 204; create a sandbox; assert workspace_rules == [r2.id]; POST approve {scope:'sandbox'}; assert 200; with the key absent from the configuration assert a promotion is answered 200"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "Listing and deleting workspace sandbox rules",
+      "rationale": "Whoever owns a workspace must see which destinations every later sandbox may reach, with the findings that were accepted, and be able to take one back.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "a caller with sandboxes:read and read access to the workspace sends GET /api/v1/workspaces/:slug/sandbox-rules",
+          "action": "answer with the workspace's sandbox rules ordered by created_at and then id, oldest first, paged by limit and cursor, and with the rules of the parent when the slug names a task fork",
+          "contract": "HTTP 200 with {items: [{id, rule, summary, findings, from_proposal, created_by, created_at}…], next_cursor}; items is [] for a workspace without rules; under a fork's slug the items are the parent's rules, for a caller who can read the fork, including a token bound to the fork",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server with the middleware of package 02, the access component and the binding guard",
+              "a real SQLite store in t.TempDir()",
+              "workspace 'demo' holding rules r1, r2, r3 created in that order, and its task fork 'demo--a'"
+            ],
+            "pseudocode": "in internal/sandbox/rule_routes_test.go, a table {GET /workspaces/demo/sandbox-rules -> [r1, r2, r3]; limit=2 -> [r1, r2] and the next page [r3] with next_cursor null; slug 'demo--a' as the fork's owner -> [r1, r2, r3]; slug 'demo--a' with a PAT bound to the fork holding sandboxes:read -> [r1, r2, r3]; a workspace without rules -> []; a read-only org member on 'demo' -> [r1, r2, r3]}: assert 200, the ids in order and the seven members of each item"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "event_driven",
+          "condition": "a caller who is not a workspace-bound token, with sandboxes:write and write access to the workspace, sends DELETE /api/v1/workspaces/:slug/sandbox-rules/:rule_id for a rule the workspace holds, in any workspace state",
+          "action": "remove the rule and write one parley.sandbox.rule_remove event in the same transaction, changing no sandbox",
+          "contract": "HTTP 204 with no body; the rule is absent from the list; one event parley.sandbox.rule_remove with the caller as actor, resource_type sandbox_rule, resource_id the rule id, workspace the workspace's slug, session_id null and metadata {rule_id, summary}; a sandbox created before the delete still lists the rule in workspace_rules; the same answer on an archived workspace",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server with the middleware of package 02, the access component and the binding guard",
+              "a real SQLite store in t.TempDir()",
+              "workspace 'demo' holding rules r1, r2, r3 created in that order, and its task fork 'demo--a'",
+              "the fake runtime client of package 44"
+            ],
+            "pseudocode": "in internal/sandbox/rule_routes_test.go, a table over the workspace state {active, archived}: create sandbox s while r2 exists; DELETE /workspaces/demo/sandbox-rules/<r2>; assert 204 and an empty body; assert the list is [r1, r3]; assert one rule_remove event with resource_type 'sandbox_rule', resource_id r2.id, workspace 'demo', session_id null, metadata {rule_id: r2.id, summary: r2.summary}; assert get(s).workspace_rules still contains r2.id; create sandbox t; assert t.workspace_rules == [r1.id, r3.id]"
+          }
+        },
+        {
+          "id": "REQ-8.3",
+          "pattern": "unwanted",
+          "condition": "a request to the rule list or to the rule delete fails a check",
+          "action": "refuse the request at the first failing check and change nothing",
+          "contract": "for both routes: HTTP 403 insufficient_scope for a PAT without the route's scope, HTTP 404 not_found for a workspace the caller cannot read; for delete also: HTTP 403 token_bound for any workspace-bound token, HTTP 403 forbidden for read-only access, HTTP 400 not_supported_on_fork when the slug names a task fork, HTTP 404 with error_type sandbox_rule_not_found for an unknown rule id, a rule of another workspace and a rule already deleted; no rule is removed and no event is written",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server with the middleware of package 02, the access component and the binding guard",
+              "a real SQLite store in t.TempDir()",
+              "workspace 'demo' holding rules r1, r2, r3 created in that order, and its task fork 'demo--a'"
+            ],
+            "pseudocode": "in internal/sandbox/rule_routes_test.go, a table {GET with a PAT holding git:read only -> 403 insufficient_scope; GET as a user outside the organization -> 404 not_found; DELETE with a PAT bound to 'demo' holding sandboxes:write -> 403 token_bound; DELETE with a PAT holding sandboxes:read only -> 403 insufficient_scope; DELETE as a read-only org member -> 403 forbidden; DELETE /workspaces/demo--a/sandbox-rules/<r1> as the owner of both -> 400 not_supported_on_fork; DELETE 'sbr_' + 32 zeros -> 404 sandbox_rule_not_found; DELETE a rule id of workspace 'other' under 'demo' -> 404 sandbox_rule_not_found; DELETE r1 twice -> 204 then 404 sandbox_rule_not_found}: assert status and error.error_type; assert count(rules) and count(rule_remove events) changed only for the one successful delete"
+          }
+        },
+        {
+          "id": "REQ-8.4",
+          "pattern": "event_driven",
+          "condition": "the workspace removal of package 14 calls this package's remover with a workspace slug inside its transaction",
+          "action": "remove every workspace sandbox rule of that slug through the given transaction and write no event, returning an empty list of revoked token ids as a remover of owned data of package 14 does",
+          "contract": "after the transaction commits no rule of the slug exists and no parley.sandbox.rule_remove was written; rules of other workspaces are untouched; when the transaction rolls back the rules exist as before",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a real SQLite store in t.TempDir()"
+            ],
+            "pseudocode": "in internal/sandbox/rule_test.go: rules on 'demo' and on 'other'; begin a store transaction, call RemoveWorkspaceRules(tx, 'demo'), commit; assert count(rules('demo')) == 0, count(rules('other')) unchanged, no rule_remove event; repeat with a rollback; assert the rules of 'demo' exist"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-9",
+      "title": "CLI commands for proposals and rules",
+      "rationale": "The person who approves works from a shell, and scripts need the same five operations with a dependable exit status.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-9.1",
+          "pattern": "event_driven",
+          "condition": "a user runs parley sandbox proposals <workspace-slug> <id> or parley sandbox rules <workspace-slug> with valid flags",
+          "action": "send GET /api/v1/workspaces/<slug>/sandboxes/<id>/proposals with state from --state, or GET /api/v1/workspaces/<slug>/sandbox-rules with limit and cursor from --limit and --cursor, sending a query parameter only for a flag that was given, and print the response body",
+          "contract": "one JSON document on stdout and exit status 0",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server that records method, path, query and body and serves canned answers",
+              "the CLI root of package 09 with its endpoint and credential pointed at that server"
+            ],
+            "pseudocode": "in internal/cli/sandbox_policy_test.go, a table {['sandbox','proposals','demo','sbx_1'] -> GET /api/v1/workspaces/demo/sandboxes/sbx_1/proposals with no query; the same with --state approved -> state == 'approved'; ['sandbox','rules','demo'] -> GET /api/v1/workspaces/demo/sandbox-rules with no query; the same with --limit 10 --cursor abc -> limit == '10' and cursor == 'abc'; slug 'a/b' -> the path segment is 'a%2Fb'}: assert method, path and query; assert stdout parses to the served body; assert exit == 0"
+          }
+        },
+        {
+          "id": "REQ-9.2",
+          "pattern": "event_driven",
+          "condition": "a user runs parley sandbox approve <workspace-slug> <id> <proposal-id> or parley sandbox reject <workspace-slug> <id> <proposal-id> with valid flags",
+          "action": "send POST …/proposals/<proposal-id>/approve with a JSON object holding comment from --comment, acknowledge_findings: true from --acknowledge-findings and scope from --scope, or POST …/proposals/<proposal-id>/reject with comment from --comment, including a member only for a flag that was given, and print the returned proposal",
+          "contract": "the proposal as one JSON document on stdout and exit status 0; a hub error is printed on stderr as received, with its error_type, and the exit status is 1",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server that records method, path, query and body and serves canned answers",
+              "the CLI root of package 09 with its endpoint and credential pointed at that server"
+            ],
+            "pseudocode": "in internal/cli/sandbox_policy_test.go, a table {approve with no flag -> POST …/proposals/sbp_1/approve with body {}; --scope workspace --acknowledge-findings --comment 'npm registry' -> body {comment:'npm registry', acknowledge_findings:true, scope:'workspace'}; --scope sandbox -> body {scope:'sandbox'}; reject with no flag -> POST …/reject with body {}; reject --comment 'no' -> {comment:'no'}}: assert method, path and body; assert stdout parses to the served proposal and exit == 0; with the server answering 409 findings_not_acknowledged, and 429 sandbox_rule_limit_reached, assert exit == 1, empty stdout and stderr.json.error.error_type equal to the served type"
+          }
+        },
+        {
+          "id": "REQ-9.3",
+          "pattern": "event_driven",
+          "condition": "a user runs parley sandbox rule-delete <workspace-slug> <rule-id> and the hub answers 204",
+          "action": "send DELETE /api/v1/workspaces/<slug>/sandbox-rules/<rule-id> and print a document that names the deleted rule",
+          "contract": "stdout is the JSON document {\"id\": \"<rule-id>\", \"status\": \"deleted\"} and the exit status is 0; when the hub answers 404 sandbox_rule_not_found the envelope is on stderr, stdout is empty and the exit status is 1",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server that records method, path, query and body and serves canned answers",
+              "the CLI root of package 09 with its endpoint and credential pointed at that server"
+            ],
+            "pseudocode": "in internal/cli/sandbox_policy_test.go: run ['sandbox','rule-delete','demo','sbr_1'] against a server answering 204; assert the request is DELETE /api/v1/workspaces/demo/sandbox-rules/sbr_1; assert stdout.json == {id:'sbr_1', status:'deleted'} and exit == 0; with the server answering 404 sandbox_rule_not_found assert exit == 1, stdout empty and stderr.json.error.error_type == 'sandbox_rule_not_found'"
+          }
+        },
+        {
+          "id": "REQ-9.4",
+          "pattern": "unwanted",
+          "condition": "one of the five commands is run with a wrong number of arguments or parley sandbox approve is given a --scope other than sandbox or workspace",
+          "action": "report a usage error and send no request",
+          "contract": "exit status 2, an error envelope with code 0 on stderr, nothing on stdout, and no request reaches the hub",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server that records method, path, query and body and serves canned answers",
+              "the CLI root of package 09 with its endpoint and credential pointed at that server"
+            ],
+            "pseudocode": "in internal/cli/sandbox_policy_test.go, a table over the arguments {['sandbox','proposals','demo']; ['sandbox','approve','demo','sbx_1']; ['sandbox','approve','demo','sbx_1','sbp_1','--scope','org']; ['sandbox','reject','demo']; ['sandbox','rules']; ['sandbox','rules','demo','extra']; ['sandbox','rule-delete','demo']}: assert exit == 2; assert stdout is empty and stderr.json.error.code == 0; assert the server recorded no request"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "A blocked agent asks for a destination and a developer approves it for the workspace",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "runs a program in its sandbox on the fork demo--a that connects to registry.example.org:443, which no rule allows"
+        },
+        {
+          "actor": "OpenShell gateway",
+          "action": "blocks the connection and reports the denial; the workload then proposes a rule for that destination with the runtime's own mechanism"
+        },
+        {
+          "actor": "parleyd",
+          "action": "the collector reads the denial and emits parley.sandbox.deny, then finds the pending proposal, stores it as open and emits parley.sandbox.proposal"
+        },
+        {
+          "actor": "developer",
+          "action": "runs parley sandbox proposals demo--a <sandbox id>, reads the finding, and runs parley sandbox approve demo--a <sandbox id> <proposal id> --scope workspace --acknowledge-findings"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends GET …/proposals and then POST …/proposals/<proposal id>/approve with scope workspace, and prints the answers"
+        },
+        {
+          "actor": "parleyd",
+          "action": "checks that the caller is no bound token and can write to the parent demo, adds the rule to the sandbox at the runtime, saves it as a workspace sandbox rule of demo, raises policy_revision, emits parley.sandbox.proposal_decided and parley.sandbox.rule_add, and answers 200"
+        },
+        {
+          "actor": "developer",
+          "action": "creates a second sandbox on another fork of demo"
+        },
+        {
+          "actor": "parleyd",
+          "action": "records the rule's id in the new sandbox's workspace_rules and creates it at the runtime with a policy that carries the rule after the hub rule and the credential rules"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parley CLI command tree",
+          "parleyd HTTP server with its middleware, the access component and the binding guard",
+          "sandbox component: creation and provisioning of package 45, the collector, the proposal and rule stores and routes",
+          "event log",
+          "transactional store on SQLite"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with an empty data directory and a [sandbox] section with one profile that allows proposals; the OpenShell gateway is the fake runtime client of package 44, the only stand-in",
+          "a workspace demo, two task forks of it, a user who owns demo with an API key, and a ready sandbox on the first fork",
+          "the fake runtime is told to emit one denial of ('npm', 'registry.example.org', 443) and one pending proposal with a high finding for that sandbox"
+        ],
+        "end_state": [
+          "the proposal reads approved with scope workspace and a workspace_rule_id, and the first sandbox's policy_revision is 1",
+          "parley sandbox rules demo prints one rule whose from_proposal.workspace is the first fork's slug",
+          "the event log holds, in this order, one parley.sandbox.deny, one parley.sandbox.proposal, one parley.sandbox.proposal_decided and one parley.sandbox.rule_add whose workspace is demo",
+          "the second sandbox's workspace_rules holds the rule's id and the fake runtime's create call for it carries the rule among the added rules"
+        ],
+        "pseudocode": "in test/e2e/sandbox_policy_test.go: start the hub in-process with the fake runtime; create demo, forks f1 and f2 and sandbox s1 on f1; fake.EmitDenial(s1, npm, registry.example.org, 443); fake.AddPendingProposal(s1, rule, findings [high]); wait until parley sandbox proposals f1 s1 prints one item; run parley sandbox approve f1 s1 <id> --scope workspace --acknowledge-findings and assert exit 0 and scope 'workspace'; run parley sandbox rules demo and assert one item; create s2 on f2 and wait for ready; assert s2.workspace_rules == [rule id] and fake.CreatePolicy(s2).added contains the rule; read GET /api/v1/events/log and assert the four event types in order"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "A developer deletes a workspace sandbox rule and earlier sandboxes keep it",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "runs parley sandbox rules demo and then parley sandbox rule-delete demo <rule id>"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends GET /api/v1/workspaces/demo/sandbox-rules and DELETE /api/v1/workspaces/demo/sandbox-rules/<rule id>, and prints {\"id\": \"<rule id>\", \"status\": \"deleted\"}"
+        },
+        {
+          "actor": "parleyd",
+          "action": "removes the rule, emits parley.sandbox.rule_remove on demo and answers 204, changing no sandbox"
+        },
+        {
+          "actor": "developer",
+          "action": "creates a new sandbox on demo"
+        },
+        {
+          "actor": "parleyd",
+          "action": "creates the new sandbox with an empty workspace_rules and a policy without the rule, while the earlier sandbox still lists the rule"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parley CLI command tree",
+          "parleyd HTTP server with its middleware, the access component and the binding guard",
+          "sandbox component: creation and provisioning of package 45, the rule store and routes",
+          "event log",
+          "transactional store on SQLite"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with the fake runtime client of package 44 as the only stand-in",
+          "a workspace demo with one workspace sandbox rule saved by a promotion, and a ready sandbox s1 created after it"
+        ],
+        "end_state": [
+          "parley sandbox rules demo prints an empty items list",
+          "the event log holds one parley.sandbox.rule_remove with resource_type sandbox_rule and session_id null",
+          "s1.workspace_rules still holds the rule's id; the new sandbox's workspace_rules is [] and the fake runtime's create call for it carries no added rule",
+          "a second parley sandbox rule-delete of the same id exits 1 with error_type sandbox_rule_not_found on stderr"
+        ],
+        "pseudocode": "in test/e2e/sandbox_policy_test.go, after the flow above: run parley sandbox rule-delete demo <rule id>; assert exit 0 and stdout {id, status:'deleted'}; run parley sandbox rules demo; assert items == []; create s3 on demo and wait for ready; assert s3.workspace_rules == [] and fake.CreatePolicy(s3).added == []; assert get(s1).workspace_rules == [rule id]; run rule-delete again; assert exit 1 and 'sandbox_rule_not_found' on stderr"
+      }
+    }
+  ],
+  "external_apis": [
+    {
+      "package": "github.com/ai-openshell/sdk-go",
+      "version": "v1",
+      "verified": false,
+      "symbols": [
+        {
+          "name": "Client.StreamPolicyLog",
+          "import_path": "github.com/ai-openshell/sdk-go/openshell/v1",
+          "signature": "func (c *Client) StreamPolicyLog(ctx context.Context, sandboxID string) (<-chan PolicyLogEntry, error)"
+        },
+        {
+          "name": "Client.ListProposals",
+          "import_path": "github.com/ai-openshell/sdk-go/openshell/v1",
+          "signature": "func (c *Client) ListProposals(ctx context.Context, workspace string) ([]Proposal, error)"
+        },
+        {
+          "name": "Client.ApproveProposal",
+          "import_path": "github.com/ai-openshell/sdk-go/openshell/v1",
+          "signature": "func (c *Client) ApproveProposal(ctx context.Context, sandboxID, proposalID string) error"
+        },
+        {
+          "name": "Client.RejectProposal",
+          "import_path": "github.com/ai-openshell/sdk-go/openshell/v1",
+          "signature": "func (c *Client) RejectProposal(ctx context.Context, sandboxID, proposalID string) error"
+        },
+        {
+          "name": "Client.ValidatePolicy",
+          "import_path": "github.com/ai-openshell/sdk-go/openshell/v1",
+          "signature": "func (c *Client) ValidatePolicy(ctx context.Context, policy Policy) error"
+        }
+      ]
+    },
+    {
+      "package": "github.com/spf13/cobra",
+      "version": "v1",
+      "verified": false,
+      "symbols": [
+        {
+          "name": "Command",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "type Command struct { Use string; Short string; Args PositionalArgs; RunE func(cmd *Command, args []string) error; ... }"
+        },
+        {
+          "name": "Command.AddCommand",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) AddCommand(cmds ...*Command)"
+        }
+      ]
+    }
+  ]
+}

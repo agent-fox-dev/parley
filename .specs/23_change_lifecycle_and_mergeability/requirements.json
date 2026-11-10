@@ -1,0 +1,1344 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "23",
+  "spec_name": "change_lifecycle_and_mergeability",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Who may modify a change",
+      "rationale": "An org member must be able to edit the change they opened into a workspace they can only read, and nobody else who can merely read it may touch it.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "PATCH /workspaces/:slug/changes/:number, POST …/abandon or POST …/restore is called by the user whose id is the change's author.actor_id with any credential of that user, by a caller with write access to the target workspace, or with the admin token",
+          "action": "pass the request on to the validation and state checks of the route",
+          "contract": "the route answers with its own result (HTTP 200 for a valid request), never 403 forbidden",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "change demo#1 opened by mia from demo--t1 into main; a second, abandoned change demo#2 by mia for the restore rows"
+            ],
+            "pseudocode": "in internal/change/authz_test.go, a table over callers {mia's API key (author, member access only); mia's PAT with changes:write; owner's API key (not the author); the admin token} x routes {PATCH with {\"labels\":[\"x\"]}; POST abandon; POST restore on an abandoned change}: r = call(route, caller); assert r.status == 200"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "unwanted",
+          "condition": "one of the three routes is called by a caller who can read the target workspace and is neither the change's author, nor a caller with write access to the target workspace, nor the admin token",
+          "action": "refuse the request and leave the change unchanged",
+          "contract": "HTTP 403 with error_type forbidden; a following GET of the change returns the same body as before the call",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "change demo#1 opened by mia; a second org member 'noa' with an API key"
+            ],
+            "pseudocode": "in internal/change/authz_test.go beside the table above, over the three routes with the API key of 'noa', a second org member who did not open the change: before = get(change); r = call(route, noaKey); assert r.status == 403 and r.json.error.error_type == 'forbidden'; assert get(change) == before; assert no parley.change.* event was written"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "unwanted",
+          "condition": "one of the three routes is called with a PAT that lacks the scope changes:write",
+          "action": "refuse the request before looking at the workspace or the change",
+          "contract": "HTTP 403 with error_type insufficient_scope, with the same body for an existing workspace and for a slug that names no workspace",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "change demo#1"
+            ],
+            "pseudocode": "in internal/change/authz_test.go: pat = owner's PAT with only changes:read; for each of the three routes: a = call(route on 'demo', pat); b = call(route on 'nope', pat); assert a.status == 403 and a.json.error.error_type == 'insufficient_scope'; assert a.body == b.body"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "unwanted",
+          "condition": "one of the three routes names a number that no change of the workspace has, a :number that is not a positive decimal integer, or, for a caller whose token is bound to fork F and who addresses F's parent, a change whose source workspace is not F",
+          "action": "refuse the request without revealing whether the change exists",
+          "contract": "HTTP 404 with error_type change_not_found; the three cases have the same status and error_type",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "change demo#1 from demo--t1; change demo#3 opened by owner from a branch of demo itself; a PAT of mia bound to demo--t1 with changes:write"
+            ],
+            "pseudocode": "in internal/change/authz_test.go, a table over {number 999; number 'abc'; number '0'; mia's token bound to demo--t1 addressing demo#3 whose source workspace is demo} x the three routes: r = call(route); assert r.status == 404 and r.json.error.error_type == 'change_not_found'; then with the same bound token on demo#1 (source demo--t1): assert PATCH {\"labels\":[\"x\"]} answers 200"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "unwanted",
+          "condition": "one of the three routes is called by a caller who has no read access to the target workspace",
+          "action": "answer as for a workspace that does not exist",
+          "contract": "HTTP 404 with error_type not_found and the same body as the same route on a slug that names no workspace",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "change demo#1 opened by mia"
+            ],
+            "pseudocode": "in internal/change/authz_test.go: outsider = a user outside the organization; a = call(PATCH demo#1, outsiderKey); b = call(PATCH nope#1, outsiderKey); assert a.status == 404 and a.json.error.error_type == 'not_found'; assert a.body == b.body; then remove mia from the organization and assert mia's PATCH of her own demo#1 answers the same 404"
+          }
+        },
+        {
+          "id": "REQ-1.6",
+          "pattern": "unwanted",
+          "condition": "one of the three routes passes the caller rule and the body validation while the target workspace's status is pending, cloning, failed or archived, or a reclone, archive or delete of it is running",
+          "action": "refuse the request and leave the change unchanged",
+          "contract": "HTTP 409 with error_type workspace_busy (pending, cloning, running maintenance), workspace_not_ready (failed) or workspace_archived (archived)",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "change demo#1 (open) and demo#2 (abandoned)"
+            ],
+            "pseudocode": "in internal/change/authz_test.go, a table over workspace status {pending -> workspace_busy; cloning -> workspace_busy; failed -> workspace_not_ready; archived -> workspace_archived} x the three routes, called with the admin token: set the status on the workspace record; r = call(route); assert r.status == 409 and r.json.error.error_type == want; assert the change's state and updated_at are unchanged"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Edit title, intent, labels and auto_land",
+      "rationale": "The intent travels with the change, so its author must be able to state and correct it after opening.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "PATCH /workspaces/:slug/changes/:number is called on a draft or open change with a body holding any of title, intent, labels and auto_land, each within its limits",
+          "action": "store the named members together, keep every member that is absent from the body, replace the whole labels list with the given one after removing duplicates (first occurrence kept), advance updated_at and write no event",
+          "contract": "HTTP 200 with the change object carrying the new values; a following GET returns the same object",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "open change demo#1 with title 'T', intent 'i', labels ['old'], auto_land false"
+            ],
+            "pseudocode": "in internal/change/edit_test.go, a table over bodies {only title 'T2'; only intent 'why'; labels ['a','b','a'] -> ['a','b']; labels [] ; title of exactly 200 characters; intent of exactly 16000 characters; 20 distinct labels; a label of 63 characters 'a' + 62 x '.'; title and labels together; a body with an extra unknown member 'foo'}: before = get(change); r = patch(body); assert r.status == 200; assert the named members equal the wanted values and every other member except updated_at equals before; assert get(change) == r.json; assert the event log has no new event"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "unwanted",
+          "condition": "the PATCH body holds a title that is empty, longer than 200 characters or contains a line feed or carriage return, an intent longer than 16,000 characters, more than 20 distinct labels, a label that does not match ^[a-z0-9][a-z0-9_.:/-]{0,62}$, a state other than \"draft\" or \"open\", or a member of the wrong JSON type",
+          "action": "refuse the whole request and apply none of its members, including the valid ones",
+          "contract": "HTTP 400 with error_type invalid_request; a following GET returns the change as it was before the call",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "open change demo#1"
+            ],
+            "pseudocode": "in internal/change/edit_test.go, a table over bodies {title ''; title of 201 characters; title 'a\\nb'; title 'a\\rb'; intent of 16001 characters; 21 distinct labels; labels ['Upper']; labels ['-x']; a label of 64 characters; labels 'x' (string); title 5 (number); auto_land 'yes'; state 'landed'; state 'abandoned'; target_branch 7; a valid title 'ok' together with labels ['Bad Label']}: before = get(change); r = patch(body); assert r.status == 400 and r.json.error.error_type == 'invalid_request'; assert get(change) == before"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "unwanted",
+          "condition": "applying the PATCH body would leave the change in state open with an empty intent while the workspace setting changes.require_intent is true",
+          "action": "refuse the whole request and apply none of its members",
+          "contract": "HTTP 400 with error_type intent_required; the change's intent and state are unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "one change per row in the stated state; the workspace setting changes.require_intent set per row"
+            ],
+            "pseudocode": "in internal/change/edit_test.go, a table {open change, body {intent:''} -> 400; draft with empty intent, body {state:'open'} -> 400; draft with empty intent, body {state:'open', title:'new'} -> 400 and title unchanged; draft with empty intent, body {state:'open', intent:'why'} -> 200 open; draft with intent, body {intent:''} -> 200 (still draft); open change with require_intent false, body {intent:''} -> 200; draft with empty intent and require_intent false, body {state:'open'} -> 200}: r = patch(body); assert r.status == want; for 400 rows assert r.json.error.error_type == 'intent_required' and get(change) is unchanged"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "event_driven",
+          "condition": "a PATCH changes auto_land from false to true, or from true to false",
+          "action": "store the flag and, for true, the calling user as the user who set it, with the credential type and the token's paths globs; for false, clear the stored setter",
+          "contract": "HTTP 200 with auto_land as requested; the stored setter read through the accessor AutoLandSetter is the caller's user id, credential type and paths globs (null for a credential without paths) after true and absent after false",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "open change demo#1 by mia with auto_land false"
+            ],
+            "pseudocode": "in internal/change/edit_test.go: patch({auto_land:true}, miaKey); s = store.AutoLandSetter(change); assert response.auto_land == true and s.user_id == mia.id and s.credential_type == 'api_key' and s.paths == nil; patch({auto_land:true}, ownerKey); assert the setter's user_id is still mia.id (no change of value); patch({auto_land:false}, ownerKey); assert response.auto_land == false and the setter is absent; patch({auto_land:true}, ownerKey); assert the setter's user_id == owner.id"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "unwanted",
+          "condition": "a PATCH that holds at least one editable member addresses an abandoned change, or addresses a landed change with any of title, intent, auto_land, state or target_branch in its body",
+          "action": "refuse the whole request, labels included",
+          "contract": "HTTP 409 with error_type change_closed; the change is unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "an abandoned change demo#2 and a change demo#4 put into state landed through the change store"
+            ],
+            "pseudocode": "in internal/change/edit_test.go, a table {abandoned change x bodies {title}, {labels}, {state:'open'}, {target_branch}; landed change x bodies {title}, {intent}, {auto_land:true}, {state:'draft'}, {target_branch:'dev'}, {labels:['x'], title:'t'}}: before = get(change); r = patch(body); assert r.status == 409 and r.json.error.error_type == 'change_closed'; assert get(change) == before"
+          }
+        },
+        {
+          "id": "REQ-2.6",
+          "pattern": "event_driven",
+          "condition": "a PATCH whose only editable member is labels addresses a landed change",
+          "action": "replace the labels of the landed change and change nothing else",
+          "contract": "HTTP 200 with the change object: state landed, the new labels, every other member except updated_at as before",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "a change demo#4 put into state landed through the change store"
+            ],
+            "pseudocode": "in internal/change/edit_test.go beside the change_closed table: r = patch(landed change, {labels:['released']}); assert r.status == 200 and r.json.labels == ['released'] and r.json.state == 'landed' and r.json.landed equals the value before"
+          }
+        },
+        {
+          "id": "REQ-2.7",
+          "pattern": "event_driven",
+          "condition": "a PATCH body is a JSON object that holds none of title, intent, labels, auto_land, state and target_branch",
+          "action": "change nothing, whatever the change's state",
+          "contract": "HTTP 200 with the change object, updated_at included, equal to the object before the call; no event is written",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "an open, an abandoned and a landed change"
+            ],
+            "pseudocode": "in internal/change/edit_test.go, a table over bodies {{}; {\"foo\":1}; {\"depends_on\":null}} x changes {open; abandoned; landed}: before = get(change); r = patch(body); assert r.status == 200 and r.json == before; assert the event log has no new event"
+          }
+        },
+        {
+          "id": "REQ-2.8",
+          "pattern": "unwanted",
+          "condition": "a PATCH body holds an auto_land member and the registered auto_land guard refuses it",
+          "action": "refuse the whole request with the guard's error and apply none of its members",
+          "contract": "the guard (the interface AutoLandGuard of package 22, which package 29 registers) is called once inside the PATCH transaction, after validation and the state rules and before any member is written, with the caller (user and credential type, id and paths), the change and the value of the member; a refusal is answered unchanged (HTTP 403 with error_type path_not_allowed and the path) and a following GET returns the change as it was, the other members of the body included; a body without auto_land causes no call; a call with false is never refused; with no guard registered the flag is stored as given",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "open change demo#1 by mia with auto_land false and title 'T'",
+              "a recording auto_land guard stub registered through RegisterAutoLandGuard of package 22"
+            ],
+            "pseudocode": "in internal/change/edit_test.go: (a) the guard refuses with an error carrying 403 path_not_allowed and path 'src/x.go': before = get(change); r = patch({auto_land:true, title:'T2'}, mia's PAT with paths ['docs/**']); assert r.status == 403 and r.json.error.error_type == 'path_not_allowed' and r.json.error.path == 'src/x.go'; assert get(change) == before; assert the guard was called once with credential {pat, its id, ['docs/**']}, change 1 and value true, and that the title was still 'T' when it was called; (b) the guard accepts: patch({auto_land:true}) -> 200 and auto_land == true; (c) patch({auto_land:false}) -> 200, the guard was called with value false; (d) patch({title:'T3'}) -> no guard call; (e) no guard registered: patch({auto_land:true}) -> 200"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Move a change between draft and open",
+      "rationale": "A draft is work nobody should land or review yet; marking it ready is the moment reviewers and automation are told.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "a PATCH with state \"open\" addresses a draft whose resulting title and intent satisfy the title and intent rules",
+          "action": "move the change to open, re-evaluate its landing so that the structural reason draft no longer applies, and write one parley.change.open event in the same transaction",
+          "contract": "HTTP 200 with state open and landing.reason not 'draft'; one event parley.change.open with actor the caller, resource_type change, resource_id the number, and metadata number, ref, version, head_sha, title, target_branch, source_workspace, source_branch, depends_on and was_draft true",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "draft change demo#1 by mia with a title and a non-empty intent; no policy set on the workspace"
+            ],
+            "pseudocode": "in internal/change/edit_test.go: r = patch(draft, {state:'open'}, miaKey); assert r.status == 200 and r.json.state == 'open' and r.json.landing.reason != 'draft' and r.json.landing.status == 'ready' (default policy); ev = the events of type parley.change.open for the change; assert len(ev) == 1 and ev[0].actor_id == mia.id and ev[0].workspace == 'demo' and ev[0].resource_id == '1' and ev[0].metadata includes {number:1, ref:'demo#1', version:1, head_sha:<head>, title, target_branch:'main', source_workspace:'demo--t1', source_branch, depends_on:null, was_draft:true}"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "event_driven",
+          "condition": "a PATCH with state \"draft\" addresses an open change",
+          "action": "move the change to draft, re-evaluate its landing, keep its versions, labels, auto_land flag and mergeable value, and write no event",
+          "contract": "HTTP 200 with state draft and landing {status: 'blocked', reason: 'draft'}; the event log has no new event",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "open change demo#1 with auto_land true and mergeable clean"
+            ],
+            "pseudocode": "in internal/change/edit_test.go: before = get(open change); r = patch({state:'draft'}); assert r.status == 200 and r.json.state == 'draft' and r.json.landing.status == 'blocked' and r.json.landing.reason == 'draft'; assert r.json.version == before.version and r.json.mergeable == before.mergeable and r.json.auto_land == before.auto_land; assert no new event"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "event_driven",
+          "condition": "a PATCH names the state the change already has and no other editable member",
+          "action": "change nothing and write no event",
+          "contract": "HTTP 200 with the change object equal to the object before the call, updated_at included",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/change/edit_test.go, a table {open change, {state:'open'}; draft, {state:'draft'}}: before = get(change); r = patch(body); assert r.status == 200 and r.json == before; assert no parley.change.open event was written"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Retarget a change",
+      "rationale": "A change opened against the wrong branch, or one whose target was deleted, must be movable without losing its number, versions and approvals history.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "a PATCH names a target_branch that differs from the current one, on a draft or open change that has no depends_on and no dependants, and the branch passes the target rules of opening",
+          "action": "set target_branch, set base_sha to the merge base of head_sha with the new target's head, recompute stats and paths against it, create no version, re-evaluate landing, set mergeable to unknown, schedule the mergeability check, forget the ready announcement, and write one parley.change.version event with kind retarget in the same transaction",
+          "contract": "HTTP 200 with the new target_branch, base_sha, stats and paths, the same version number and head_sha, and mergeable 'unknown'; GET …/versions lists the same versions as before; one event parley.change.version with actor the caller and metadata number, ref, version, head_sha, kind 'retarget', base_sha, patch_equivalent_to null and draft",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "branches main and release in demo; open change demo#1 from a branch of demo--t1 into main"
+            ],
+            "pseudocode": "in internal/change/edit_test.go: main and release diverge by one commit each; the change has one commit on top of main touching a.txt; versionsBefore = get(versions); r = patch({target_branch:'release'}); assert r.status == 200 and r.json.target_branch == 'release' and r.json.base_sha == git merge-base(head, release) and r.json.version == 1 and r.json.head_sha == head and r.json.mergeable == 'unknown'; assert r.json.stats.commits == count(release..head) and r.json.paths == files of base_sha..head; assert get(versions) == versionsBefore; ev = events parley.change.version after the call; assert len(ev) == 1 and ev[0].metadata.kind == 'retarget' and ev[0].metadata.base_sha == r.json.base_sha and ev[0].metadata.draft == false; wait until get(change).mergeable != 'unknown'"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "unwanted",
+          "condition": "the named target_branch does not exist in the workspace, is the change's own source branch in the same workspace, or is the integration branch of a carry-patch workspace",
+          "action": "refuse the whole request with the answer opening a change gives for the same target, and leave the change unchanged",
+          "contract": "HTTP 400 with error_type target_not_found (missing branch); HTTP 400 with error_type invalid_request (own source branch); HTTP 403 with error_type integration_branch (integration branch); no event is written",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "the target validator of package 22 that POST …/changes uses, called unstubbed"
+            ],
+            "pseudocode": "in internal/change/edit_test.go, a table {target 'nope' -> 400 target_not_found; change demo#3 whose source is branch 'feat' of demo itself, target 'feat' -> 400 invalid_request; a workspace whose record names 'integration' as its integration branch, target 'integration' -> 403 integration_branch}: before = get(change); r = patch({target_branch}); assert r.status and r.json.error.error_type == want; assert get(change) == before and no parley.change.version event was written"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "unwanted",
+          "condition": "a PATCH names a differing target_branch on a draft or open change that has a depends_on or at least one dependant",
+          "action": "refuse the whole request and leave the change unchanged",
+          "contract": "HTTP 409 with error_type conflict; target_branch, base_sha and mergeable are unchanged and no event is written",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "changes demo#1 and demo#2 with demo#2.depends_on == 1, linked through the change store"
+            ],
+            "pseudocode": "in internal/change/edit_test.go, a table {the lower change of a two-change stack; the upper change of that stack}: before = get(change); r = patch({target_branch:'release'}); assert r.status == 409 and r.json.error.error_type == 'conflict'; assert get(change) == before"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "event_driven",
+          "condition": "a retarget names a branch that already contains every commit of the change, or a branch for which a merge commit lies between it and the change's head",
+          "action": "accept the retarget and report the structural reason through landing instead of refusing",
+          "contract": "HTTP 200 with the new target_branch and landing {status: 'blocked', reason: 'nothing_to_land'} or landing {status: 'blocked', reason: 'merge_commits'}",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "open change demo#1; branches 'ahead' and 'old' prepared with git in the test repository"
+            ],
+            "pseudocode": "in internal/change/edit_test.go, a table {branch 'ahead' created at the change's head -> nothing_to_land; branch 'old' such that old..head contains a merge commit -> merge_commits}: r = patch({target_branch}); assert r.status == 200 and r.json.target_branch == target and r.json.landing.status == 'blocked' and r.json.landing.reason == want"
+          }
+        },
+        {
+          "id": "REQ-4.5",
+          "pattern": "event_driven",
+          "condition": "a retarget addresses an open change whose current target branch has been deleted and names a branch that exists",
+          "action": "retarget the change as for any other change, so that the structural reason target_not_found no longer applies",
+          "contract": "HTTP 200 with the new target_branch and landing.reason not 'target_not_found'",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "open change demo#1 targeting branch 'release'"
+            ],
+            "pseudocode": "in internal/change/edit_test.go: delete branch 'release' in the repository; wait until get(change).landing.reason == 'target_not_found'; r = patch({target_branch:'main'}); assert r.status == 200 and r.json.target_branch == 'main' and r.json.landing.reason != 'target_not_found'"
+          }
+        },
+        {
+          "id": "REQ-4.6",
+          "pattern": "event_driven",
+          "condition": "a PATCH names the change's current target_branch and no other editable member",
+          "action": "change nothing, create no version and write no event",
+          "contract": "HTTP 200 with the change object equal to the object before the call, mergeable and updated_at included",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/change/edit_test.go: before = get(change with mergeable clean); r = patch({target_branch: before.target_branch}); assert r.status == 200 and r.json == before; assert no parley.change.version event was written"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Abandon a change",
+      "rationale": "Work that will not land must leave the list of open work without losing what was pushed.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "POST /workspaces/:slug/changes/:number/abandon is called on a draft or open change that has no dependants, with no body, an empty object, or a body with a string reason",
+          "action": "move the change to abandoned, drop its pending mergeability check, leave its source branch and every version ref in place, and write one parley.change.abandon event in the same transaction",
+          "contract": "HTTP 200 with state abandoned; the source branch still resolves to the same commit and refs/parley/changes/<number>/<version> still resolves for every version; one event parley.change.abandon with actor the caller and metadata number, ref, version, head_sha and reason (the given string, or the empty string when absent)",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "one change per row with one version"
+            ],
+            "pseudocode": "in internal/change/lifecycle_test.go, a table over {open change, no body; draft, body {}; open change, body {reason:'superseded'}; open change, body {reason:'x', dependants:'abandon'} (no dependants: the member has no effect)}: head = branch head; r = post(abandon, body); assert r.status == 200 and r.json.state == 'abandoned'; assert git rev-parse(source branch in the source workspace) == head; assert git rev-parse(refs/parley/changes/N/1 in demo) == head; ev = events parley.change.abandon; assert len(ev) == 1 and ev[0].metadata.reason == (body.reason or '') and ev[0].metadata.ref == 'demo#N' and ev[0].actor_id == caller.id"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "unwanted",
+          "condition": "abandon is called without the dependants member on a draft or open change that has at least one draft or open dependant",
+          "action": "refuse the request and change neither the change nor its dependants",
+          "contract": "HTTP 409 with error_type has_dependants; the change and its dependants keep their state and depends_on; no event is written",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "stack demo#1 <- demo#2 <- demo#3 linked through the change store, all open"
+            ],
+            "pseudocode": "in internal/change/lifecycle_test.go: r = post(abandon demo#1, {}); assert r.status == 409 and r.json.error.error_type == 'has_dependants'; assert get(demo#1).state == 'open' and get(demo#2).state == 'open' and get(demo#2).depends_on == 1; assert no parley.change.abandon event"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "event_driven",
+          "condition": "abandon is called with dependants \"abandon\" on a draft or open change that has dependants",
+          "action": "abandon the change and every draft or open change above it in its stack, direct or not, in one transaction, each with the request's reason and its own parley.change.abandon event",
+          "contract": "HTTP 200 with the addressed change in state abandoned; every change above it in the stack is abandoned; one parley.change.abandon event per abandoned change, all with the same reason and the caller as actor",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "stack demo#1 <- demo#2 <- demo#3, all open"
+            ],
+            "pseudocode": "in internal/change/lifecycle_test.go: r = post(abandon demo#1, {reason:'drop', dependants:'abandon'}); assert r.status == 200 and r.json.number == 1 and r.json.state == 'abandoned'; assert get(demo#2).state == 'abandoned' and get(demo#3).state == 'abandoned'; ev = events parley.change.abandon; assert the set of ev.resource_id == {'1','2','3'} and every ev.metadata.reason == 'drop'; assert the three source branches still exist"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "event_driven",
+          "condition": "abandon is called with dependants \"reparent\" on a draft or open change that has dependants",
+          "action": "abandon the change, set each direct dependant's depends_on to the abandoned change's own depends_on (null when it had none), leave the dependants in their state, and in the same transaction ask the registered restack collaborator (the interface Restacker of internal/change, which package 24 implements) to restack each direct dependant with trigger abandon; when no collaborator is registered, set each direct dependant's mergeable to unknown and schedule its mergeability check",
+          "contract": "HTTP 200 with the addressed change abandoned and an empty dependants list; each former direct dependant is still draft or open with depends_on equal to the abandoned change's former depends_on; the restack collaborator received, inside the abandon's store transaction, one request per direct dependant with trigger 'abandon'; an error it returns rolls the abandon back; exactly one parley.change.abandon event",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "stack demo#1 <- demo#2 <- demo#3, all open"
+            ],
+            "pseudocode": "in internal/change/lifecycle_test.go, two rows. Row 1 (a recording restack collaborator registered): r = post(abandon demo#2, {dependants:'reparent'}); assert r.status == 200 and r.json.state == 'abandoned' and r.json.dependants == []; assert get(demo#3).state == 'open' and get(demo#3).depends_on == 1; assert get(demo#1).dependants == [3]; assert the collaborator recorded exactly [(change 3, trigger 'abandon')] and that a row it wrote in the transaction it was given is stored; with a collaborator that returns an error the answer is 500 and demo#2 is still open; assert events parley.change.abandon has resource_ids ['2']. Row 2 (no collaborator; abandon demo#1 of a fresh stack): assert get(demo#2).depends_on == null and get(demo#2).mergeable == 'unknown' right after the call, and that it leaves 'unknown' within the test deadline"
+          }
+        },
+        {
+          "id": "REQ-5.5",
+          "pattern": "unwanted",
+          "condition": "abandon is called on a change that is already abandoned or is landed",
+          "action": "refuse the request and write no event",
+          "contract": "HTTP 409 with error_type change_closed; the change is unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "an abandoned change and a change put into state landed through the change store"
+            ],
+            "pseudocode": "in internal/change/lifecycle_test.go, a table {abandoned change; landed change}: before = get(change); r = post(abandon, {}); assert r.status == 409 and r.json.error.error_type == 'change_closed'; assert get(change) == before; assert no new parley.change.abandon event"
+          }
+        },
+        {
+          "id": "REQ-5.6",
+          "pattern": "unwanted",
+          "condition": "the abandon body holds a dependants value other than \"reparent\" or \"abandon\", or a reason that is not a JSON string",
+          "action": "refuse the request and leave the change open",
+          "contract": "HTTP 400 with error_type invalid_request; the change's state is unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "open change demo#1"
+            ],
+            "pseudocode": "in internal/change/lifecycle_test.go, a table over bodies {{dependants:'delete'}; {dependants:true}; {dependants:''}; {reason:5}; {reason:['a']}}: r = post(abandon, body); assert r.status == 400 and r.json.error.error_type == 'invalid_request'; assert get(change).state == 'open'"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Restore an abandoned change",
+      "rationale": "Abandoning must be reversible: the versions are kept so that the work can be taken up again under the same number.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "POST /workspaces/:slug/changes/:number/restore is called on an abandoned change whose source workspace exists and whose source branch points at the head of its last version",
+          "action": "move the change to open at its last version, re-evaluate its landing, set mergeable to unknown, schedule the mergeability check, and write one parley.change.restore event in the same transaction",
+          "contract": "HTTP 200 with state open, the version number and head_sha of the last version, and mergeable 'unknown'; one event parley.change.restore with actor the caller and metadata number, ref, version and head_sha; no parley.change.open event",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "change demo#1 by mia with two versions, abandoned; its source branch untouched"
+            ],
+            "pseudocode": "in internal/change/lifecycle_test.go: before = get(abandoned change); r = post(restore, miaKey); assert r.status == 200 and r.json.state == 'open' and r.json.version == before.version and r.json.head_sha == before.head_sha and r.json.mergeable == 'unknown' and r.json.landing.reason != 'draft'; ev = events after the call; assert types(ev) == ['parley.change.restore'] and ev[0].actor_id == mia.id and ev[0].metadata.ref == 'demo#1'; wait until get(change).mergeable == 'clean'; and a row for a change that was a draft when abandoned: restored state is 'open'"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "event_driven",
+          "condition": "restore is called on an abandoned change whose source branch no longer exists while the head commit of its last version still exists in the source workspace's repository",
+          "action": "create the source branch at the last version's head, with a create-only ref update that fails when the branch has appeared in the meantime, and then restore the change as when the branch exists",
+          "contract": "HTTP 200 with state open; the source branch resolves to the last version's head_sha; one parley.change.restore event and no new version",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "change demo#1 with two versions, abandoned"
+            ],
+            "pseudocode": "in internal/change/lifecycle_test.go: delete the source branch with git in the fork's repository; r = post(restore); assert r.status == 200 and r.json.state == 'open' and r.json.version == 2; assert git rev-parse(source branch in demo--t1) == r.json.head_sha; assert get(versions) has 2 entries"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "event_driven",
+          "condition": "restore is called on an abandoned change whose source branch exists and points at a commit other than the head of its last version",
+          "action": "restore the change and record the branch's head as a new version of kind ref (the kind of every version recorded for a head that was already on the source branch) created by the caller with the caller's credential, through the version recording of package 22, with everything a new version brings",
+          "contract": "HTTP 200 with state open, version one higher than the last version and head_sha equal to the branch head; GET …/versions ends with a version of kind 'ref'; the events after the call are parley.change.restore and parley.change.version",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "change demo#1 with two versions, abandoned; the fork has auto_change false"
+            ],
+            "pseudocode": "in internal/change/lifecycle_test.go: after the abandon, push one more commit to the source branch with git (no change is open on it, so no version is recorded); r = post(restore, miaKey); assert r.status == 200 and r.json.version == 3 and r.json.head_sha == new head; v = get(versions); assert v[-1].kind == 'ref' and v[-1].created_by.actor_id == mia.id; assert the set of event types after the call == {'parley.change.restore','parley.change.version'}"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "unwanted",
+          "condition": "restore is called on a change that is draft, open or landed",
+          "action": "refuse the request before any other restore check",
+          "contract": "HTTP 409 with error_type change_not_abandoned; the change is unchanged and no event is written",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/change/lifecycle_test.go, a table {draft; open; landed}: before = get(change); r = post(restore); assert r.status == 409 and r.json.error.error_type == 'change_not_abandoned'; assert get(change) == before"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "unwanted",
+          "condition": "restore is called on an abandoned change whose source workspace, a fork, no longer exists",
+          "action": "refuse the request, leave the change abandoned and keep its version refs",
+          "contract": "HTTP 409 with error_type source_workspace_gone; the change stays abandoned; refs/parley/changes/<number>/<version> still resolves in the target workspace for every version",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "change demo#1 from demo--t1, abandoned"
+            ],
+            "pseudocode": "in internal/change/lifecycle_test.go: remove the fork demo--t1 (record and repository) through the workspace store; r = post(restore demo#1, ownerKey); assert r.status == 409 and r.json.error.error_type == 'source_workspace_gone'; assert get(demo#1).state == 'abandoned'; assert git rev-parse(refs/parley/changes/1/1 in demo) == the version's head_sha"
+          }
+        },
+        {
+          "id": "REQ-6.6",
+          "pattern": "unwanted",
+          "condition": "restore is called on an abandoned change whose source workspace exists while another draft or open change has the same source workspace and branch",
+          "action": "refuse the request and leave both changes unchanged",
+          "contract": "HTTP 409 with error_type change_exists and a message that names the other change's ref; the addressed change stays abandoned",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "change demo#1 from branch 'feat' of demo--t1"
+            ],
+            "pseudocode": "in internal/change/lifecycle_test.go: abandon demo#1; open demo#5 from the same source branch; r = post(restore demo#1); assert r.status == 409 and r.json.error.error_type == 'change_exists' and 'demo#5' in r.json.error.message; assert get(demo#1).state == 'abandoned' and get(demo#5).state == 'open'; and two concurrent restores of two abandoned changes with the same source: exactly one answers 200 and the other 409 change_exists"
+          }
+        },
+        {
+          "id": "REQ-6.7",
+          "pattern": "unwanted",
+          "condition": "restore is called on an abandoned change whose source branch no longer exists and whose last version's head commit no longer exists in the source workspace's repository",
+          "action": "refuse the request and create no branch",
+          "contract": "HTTP 409 with error_type conflict; the change stays abandoned and the source branch does not exist",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "change demo#1, abandoned"
+            ],
+            "pseudocode": "in internal/change/lifecycle_test.go: delete the source branch and the version refs in both repositories and run git gc --prune=now so that the head commit is gone (the state after a reclone); r = post(restore); assert r.status == 409 and r.json.error.error_type == 'conflict'; assert get(change).state == 'abandoned'; assert git rev-parse(source branch) fails"
+          }
+        },
+        {
+          "id": "REQ-6.8",
+          "pattern": "unwanted",
+          "condition": "restore passes every other restore check on an abandoned change whose intent is empty while the workspace setting changes.require_intent is true",
+          "action": "refuse the request as the last of the restore checks and create no branch",
+          "contract": "HTTP 400 with error_type intent_required; the change stays abandoned; with changes.require_intent false the same restore answers 200",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "a draft change with an empty intent"
+            ],
+            "pseudocode": "in internal/change/lifecycle_test.go: a draft with empty intent is abandoned; r = post(restore); assert r.status == 400 and r.json.error.error_type == 'intent_required' and get(change).state == 'abandoned'; with another open change now using the same source: assert the answer is 409 change_exists (the earlier check wins); remove that change, set changes.require_intent false; assert post(restore).status == 200"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "Compute mergeability in the background",
+      "rationale": "An agent should learn that its change stopped applying when the target moves, not when someone tries to land it.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "event_driven",
+          "condition": "a mergeability check runs for a draft or open change",
+          "action": "trial-rebase the current version's own commits (base_sha to head_sha) onto the current head of the target branch, or onto the current head of the change named by depends_on when that change is draft or open, and store clean or conflict on the change together with the pair of commits it was computed for",
+          "contract": "GET of the change returns mergeable 'clean' when the commits apply and 'conflict' with a non-null conflict report when they do not; a draft is computed like an open change",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a workspace 'demo' with a real bare repository made with git in t.TempDir()",
+              "the change store and the mergeability worker with debounce 0s, driven directly without HTTP for the scheduling"
+            ],
+            "pseudocode": "in internal/change/mergeable_test.go, a table {change touching a.txt, target advanced by a commit touching b.txt -> clean; change editing line 1 of a.txt, target advanced by a commit editing line 1 of a.txt -> conflict with conflict.files[0].path == 'a.txt'; the same two rows for a draft; a change demo#2 with depends_on 1 whose commits apply to demo#1's head but conflict with main's head -> clean; demo#2 with depends_on 1 after demo#1 got a new head that edits the same line -> conflict; demo#2 whose depends_on names an abandoned change -> computed against main's head}: run the check to completion; c = get(change); assert c.mergeable == want; assert (c.conflict != null) == (want == 'conflict')"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "event_driven",
+          "condition": "a version is recorded for a draft or open change, a branch that is the target of draft or open changes moves, a draft or open change that other draft or open changes depend on gets a new version, a change is retargeted, or a change is restored",
+          "action": "set mergeable to unknown on each affected change no later than the triggering transaction commits, and schedule one check per affected change",
+          "contract": "the triggers arrive through the version observer of package 22 (every new version, a restack version of package 24 included) and the ref-updated stage this package registers with the ref writer of package 18 (target moves by push, API write and land); between the trigger and the stored result GET returns mergeable 'unknown'; afterwards it returns 'clean' or 'conflict' for the new pair of commits without any further request",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "changes demo#1 and demo#3 into main, demo#2 depending on demo#1, demo#4 into release, all with mergeable clean"
+            ],
+            "pseudocode": "in internal/change/mergeable_test.go, with the worker paused by a test gate, a table over triggers {push of a second commit to the source branch -> that change; push to main (target of demo#1 and demo#3, not of demo#4 which targets release) -> demo#1 and demo#3 unknown, demo#4 untouched; new version of demo#1 while demo#2 depends on it -> demo#1 and demo#2; retarget of demo#4 -> demo#4; restore of an abandoned change -> that change}: fire the trigger through the real route or a real git push; assert get(each affected change).mergeable == 'unknown' and each unaffected change keeps its value; open the gate; assert each affected change reaches 'clean' or 'conflict' within the test deadline; assert a move of a branch that is the target of no draft or open change schedules nothing"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "ubiquitous",
+          "action": "for any sequence of triggers that arrive for one change while a check of that change is waiting or running, compute only the pair of commits that is current when a computation starts, and discard a result whose pair of commits is no longer the change's current head and onto-commit when it would be stored",
+          "contract": "after ten target moves in a burst, at most two trial rebases ran for the change and the stored result is the one for the last target head; a result for a superseded pair never appears in GET",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the mergeability worker with debounce 0s and a real repository"
+            ],
+            "pseudocode": "in internal/change/mergeable_test.go, with a counting wrapper around the trial rebase and a gate that holds the first computation: trigger once and let the computation start; move main ten times, the last move making the change conflict; assert get(change).mergeable == 'unknown' throughout; release the gate; wait for a stored result; assert get(change).mergeable == 'conflict' and get(change).conflict.target_sha == the last head of main; assert the wrapper counted at most 2 trial rebases for the change"
+          }
+        },
+        {
+          "id": "REQ-7.4",
+          "pattern": "state_driven",
+          "condition": "[changes].mergeable_debounce is a positive duration d (default 5s)",
+          "action": "start two computations of the same change at least d apart, computing a trigger that arrives inside the interval when the interval ends, and never delay one change because of another change's interval",
+          "contract": "with d = 200ms, two triggers 10ms apart on one change produce computation starts at least 200ms apart, and a trigger on a second change in that interval starts within 100ms; with 0s there is no spacing; with the key absent d is 5s",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/change/mergeable_test.go with a fake clock injected into the worker and a recorder of computation start times: d = 200ms; trigger(A) at t0; trigger(A) at t0+10ms; trigger(B) at t0+20ms; advance the clock; assert starts(A)[1] - starts(A)[0] >= 200ms; assert starts(B)[0] < t0+120ms; second row d = 0: starts(A)[1] - starts(A)[0] < 50ms; in internal/config/config_test.go: a file without [changes] yields mergeable_debounce == 5s and '[changes]\\nmergeable_debounce = \"0s\"' yields 0"
+          }
+        },
+        {
+          "id": "REQ-7.5",
+          "pattern": "unwanted",
+          "condition": "a mergeability check runs for a change whose target branch does not exist",
+          "action": "leave mergeable at unknown, keep the change open, re-evaluate its landing so that it reports the missing target, and write no event",
+          "contract": "GET returns state unchanged, mergeable 'unknown', conflict null and landing {status: 'blocked', reason: 'target_not_found'}; no parley.change.conflict event",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "open change demo#4 into release with mergeable clean"
+            ],
+            "pseudocode": "in internal/change/mergeable_test.go: delete branch 'release' through the ref-update path that notifies the change component; wait for the check to finish; c = get(change); assert c.state == 'open' and c.mergeable == 'unknown' and c.conflict == null and c.landing.status == 'blocked' and c.landing.reason == 'target_not_found'; assert no parley.change.conflict event"
+          }
+        },
+        {
+          "id": "REQ-7.6",
+          "pattern": "unwanted",
+          "condition": "the trial rebase of a check ends with an error that is not a conflict, or has not finished after 30 seconds",
+          "action": "stop the git process, leave mergeable at unknown, log the failure with the workspace slug and change number, keep the worker running for other changes, and compute again at the change's next trigger",
+          "contract": "GET returns mergeable 'unknown' and conflict null; no event is written; a check of another change scheduled afterwards stores its result; the next trigger for the failed change stores a result",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/change/mergeable_test.go, with a trial-rebase function injected into the worker, a table {returns a non-conflict error; blocks until its context is cancelled, with the deadline shortened to 50ms by a worker option}: trigger(A); wait for the attempt to end; assert get(A).mergeable == 'unknown' and get(A).conflict == null; assert the blocked function saw its context cancelled; assert the log has one entry naming 'demo' and A's number; switch the injected function to the real one; trigger(B); assert get(B).mergeable == 'clean'; trigger(A); assert get(A).mergeable == 'clean'"
+          }
+        },
+        {
+          "id": "REQ-7.7",
+          "pattern": "ubiquitous",
+          "action": "for any mergeability check, leave every ref of the target and source repositories, the source branch included, at the commit it had before the check, and leave no temporary ref or worktree behind",
+          "contract": "git for-each-ref on both repositories prints the same lines before and after a check, for a clean and for a conflicting result",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/change/mergeable_test.go, a table {clean; conflict; trial rebase cancelled by its deadline}: before = git for-each-ref (target repo) + git for-each-ref (source repo) + git worktree list; run the check to its end; assert the same three outputs afterwards"
+          }
+        },
+        {
+          "id": "REQ-7.8",
+          "pattern": "unwanted",
+          "condition": "the configuration sets [changes].mergeable_debounce to a negative duration or to a value that is not a duration",
+          "action": "refuse to start",
+          "contract": "parleyd exits with a non-zero status before listening and writes an error to stderr that names the key changes.mergeable_debounce",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/config/config_test.go, a table over values {\"-1s\"; \"soon\"; 5 (a bare number); \"\"}: cfg, err = load(file with [changes] mergeable_debounce = value); assert err != nil and 'changes.mergeable_debounce' in err.Error()"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "Announce conflicts and landable changes",
+      "rationale": "Agents and automatic landing follow the event stream; each must hear once that a change broke and once that it can land.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "a computation finds a conflict for a change whose last computed mergeable value was clean or that has no computed value yet",
+          "action": "store conflict and the conflict report on the change and write one parley.change.conflict event in the same transaction",
+          "contract": "GET returns mergeable 'conflict' and a conflict object whose files list has one entry per conflicted path; one event parley.change.conflict with actor system, resource_type change, resource_id the number, the target workspace, and metadata number, ref, version, head_sha, files (the conflicted paths) and needs_restack (the change's current flag)",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "open change demo#1 with mergeable clean, editing line 1 of a.txt"
+            ],
+            "pseudocode": "in internal/change/landable_test.go: push to main a commit that edits the line the change edits in a.txt; wait for the result; c = get(change); assert c.mergeable == 'conflict' and paths(c.conflict.files) == ['a.txt'] and c.conflict.target_sha == head of main and c.conflict.head_sha == c.head_sha; ev = events parley.change.conflict; assert len(ev) == 1 and ev[0].actor_type == 'system' and ev[0].workspace == 'demo' and ev[0].metadata includes {number:1, ref:'demo#1', version:c.version, head_sha:c.head_sha, files:['a.txt'], needs_restack:false}; second row: a newly opened change that conflicts at its first computation also gets exactly one event"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "state_driven",
+          "condition": "the last computed mergeable value of a change is conflict",
+          "action": "on each further computation that finds a conflict, for the same or a later version or target head, replace the stored conflict report and write no event",
+          "contract": "after a new version that still conflicts and after a further target move that still conflicts, the count of parley.change.conflict events for the change is still 1 and conflict.target_sha and conflict.head_sha are those of the latest computation",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/change/landable_test.go beside the test above: after the first conflict event, push a new version that still edits line 1 (wait for the result), then push another unrelated commit to main (wait for the result); assert count(events parley.change.conflict for the change) == 1; assert get(change).conflict.head_sha == the new head and get(change).conflict.target_sha == the new head of main"
+          }
+        },
+        {
+          "id": "REQ-8.3",
+          "pattern": "event_driven",
+          "condition": "a computation finds clean for a change whose stored mergeable value was conflict",
+          "action": "store clean and clear the conflict report in one transaction, so that a later conflict is announced again",
+          "contract": "GET returns mergeable 'clean' and conflict null; a conflict found after that writes a second parley.change.conflict event",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/change/landable_test.go: from the conflicting state, push a version rebased onto main that applies; wait; c = get(change); assert c.mergeable == 'clean' and c.conflict == null; make main conflict again; wait; assert count(events parley.change.conflict for the change) == 2"
+          }
+        },
+        {
+          "id": "REQ-8.4",
+          "pattern": "event_driven",
+          "condition": "a mergeability result, a move from draft to open, a retarget or a restore leaves a change open with landing.status ready and mergeable clean, for a head_sha for which the change has not been announced since it last was not landable",
+          "action": "write one parley.change.ready event in the same transaction that makes the change landable and remember the announced head",
+          "contract": "one event parley.change.ready with actor system, resource_type change, resource_id the number, the target workspace and metadata number, ref, version and head_sha, and no further metadata",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "no policy set on the workspace, so landing.status is ready for every open change with commits to land"
+            ],
+            "pseudocode": "in internal/change/landable_test.go, a table {a change opened open under the default policy: one ready event after its first clean result; a draft with mergeable clean marked ready with PATCH: one ready event, written after parley.change.open; a change that went conflict -> clean through a new version: a second ready event carrying the new head_sha; a clean, ready change that gets a new version which is clean again: one more ready event for the new head}: assert the count and ev.actor_type == 'system' and set(keys(ev.metadata)) == {'number','ref','version','head_sha'} and ev.metadata.head_sha == get(change).head_sha"
+          }
+        },
+        {
+          "id": "REQ-8.5",
+          "pattern": "state_driven",
+          "condition": "a change has been announced as landable for its current head_sha and has not since been computed as not landable or retargeted",
+          "action": "write no further parley.change.ready event when the target branch moves and the recomputation finds clean again, or when the announcement step runs again without a change of state",
+          "contract": "after five target moves that leave the change clean, the count of parley.change.ready events for the change is still 1",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/change/landable_test.go: after the first ready event, push five commits touching other files to main, waiting for mergeable 'clean' after each; call AnnounceLandable twice more; assert count(events parley.change.ready for the change) == 1"
+          }
+        },
+        {
+          "id": "REQ-8.6",
+          "pattern": "event_driven",
+          "condition": "the announcement step runs for a change that is not landable while its mergeable value is clean or conflict (its state is not open, its landing.status is not ready, or its mergeable is conflict), or the change is retargeted",
+          "action": "forget the announced head and write no event, so that the next time the change is landable it is announced again",
+          "contract": "a change that is moved to draft and back to open with the same head gets a second parley.change.ready event; a draft, a change with landing.status pending or blocked, and a conflicting change get none",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/change/landable_test.go, a table {announced change -> PATCH draft -> PATCH open: ready count 2; announced change retargeted to release where it is clean: ready count 2; draft with clean result: 0; open change whose landing.status is forced to 'pending' by a stub landing evaluator, clean result: 0, then evaluator returns 'ready' and AnnounceLandable is called (as package 27 does after a policy re-evaluation): 1; conflicting change: 0}: assert count(events parley.change.ready for the change) == want"
+          }
+        },
+        {
+          "id": "REQ-8.7",
+          "pattern": "unwanted",
+          "condition": "writing the event of a mergeability transition fails, or the store transaction that holds the result fails",
+          "action": "store neither the result nor the event, leave mergeable at unknown, log the failure and compute again at the next trigger",
+          "contract": "GET returns mergeable 'unknown'; the event log has no parley.change.conflict or parley.change.ready event for the attempt; after the next trigger with a working event writer both the value and the event are present",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/change/landable_test.go with an event writer wrapper that fails once: trigger a check that finds a conflict; assert get(change).mergeable == 'unknown' and get(change).conflict == null and count(events parley.change.conflict) == 0; trigger again; assert get(change).mergeable == 'conflict' and count(events parley.change.conflict) == 1"
+          }
+        },
+        {
+          "id": "REQ-8.8",
+          "pattern": "event_driven",
+          "condition": "another package calls AnnounceLandable with its own store transaction after it stored a landing on a change",
+          "action": "decide and write the announcement inside that transaction, as for a result of this package",
+          "contract": "AnnounceLandable(tx, workspace, number) is exported from internal/change/landable.go and is the only code that writes parley.change.ready; called for an open, clean change whose landing the caller just set to ready it writes exactly one event and stores the announced head, both visible only when the caller commits; called again it writes nothing; called for a change whose landing the caller set to pending or blocked it forgets the announced head; called while mergeable is unknown it does nothing; a rolled-back caller leaves no event and no announced head",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "open change demo#1 with mergeable clean and a stub landing evaluator that answered 'pending', so that the change is not announced"
+            ],
+            "pseudocode": "in internal/change/landable_test.go: tx = begin; set landing {status:'ready'} on change 1 through the setter of package 22; AnnounceLandable(tx, 'demo', 1); roll back; assert count(events parley.change.ready) == 0; repeat and commit; assert count == 1 and the event's metadata.head_sha == get(change).head_sha; tx2: AnnounceLandable again; commit; assert count == 1; tx3: set landing {status:'pending'}; AnnounceLandable; commit; tx4: set landing ready; AnnounceLandable; commit; assert count == 2; set mergeable unknown, AnnounceLandable -> assert count == 2 and the announced head is kept"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-9",
+      "title": "Reconcile changes with their source branches at start",
+      "rationale": "A crash between a ref update and its bookkeeping must not lose a version.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-9.1",
+          "pattern": "event_driven",
+          "condition": "parleyd starts and the source branch of a draft or open change points at a commit other than the head of the change's current version",
+          "action": "record that commit as a new version of kind ref (the kind of every version recorded for a head that was already on the source branch) with created_by.actor_type system and no creating credential, through the version recording of package 22 with everything a new version brings, before the listener accepts a request",
+          "contract": "the first GET after start returns the change with version one higher and head_sha equal to the branch head; refs/parley/changes/<number>/<new version> resolves to it; one parley.change.version event with actor system and kind 'ref' exists for the new version",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub started in-process on 127.0.0.1:0 against a store and a repository directory in t.TempDir()",
+              "workspace 'demo' owned by user owner, with branch main and an org member user 'mia' who has a fork 'demo--t1'",
+              "open change demo#1 with one version; the hub can be stopped and started again on the same store and repositories"
+            ],
+            "pseudocode": "in internal/change/reconcile_test.go: stop the hub; move the source branch in the fork's bare repository with git update-ref to a new commit (a ref update whose bookkeeping was lost); start the hub on the same directories; c = get(change); assert c.version == 2 and c.head_sha == the new commit; assert git rev-parse(refs/parley/changes/1/2 in demo) == the new commit; v = get(versions)[-1]; assert v.kind == 'ref' and v.created_by.actor_type == 'system'; assert one parley.change.version event with metadata.version == 2 and actor_type 'system'; a row for a draft gives the same result"
+          }
+        },
+        {
+          "id": "REQ-9.2",
+          "pattern": "state_driven",
+          "condition": "the source branch of every draft or open change points at the head of its current version when parleyd starts",
+          "action": "record no version, write no event and leave updated_at of every change as it was",
+          "contract": "after two restarts in a row every change has the same version, head_sha and updated_at as before, and the event log has the same length",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/change/reconcile_test.go: before = list of changes and the highest event seq; restart the hub twice; assert the list of changes == before and the highest event seq == before; and after the restart of the test above (version 2 recorded) one more restart records no version 3"
+          }
+        },
+        {
+          "id": "REQ-9.3",
+          "pattern": "unwanted",
+          "condition": "parleyd starts and the source branch of a draft or open change does not exist while its source workspace exists",
+          "action": "abandon the change with reason source_deleted and actor system, keeping its versions and version refs",
+          "contract": "the first GET after start returns state abandoned; one parley.change.abandon event with actor system and metadata.reason 'source_deleted'; the version refs still resolve",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/change/reconcile_test.go: stop the hub; delete the source branch in the fork's bare repository with git update-ref -d; start the hub; assert get(change).state == 'abandoned'; ev = events parley.change.abandon; assert len(ev) == 1 and ev[0].actor_type == 'system' and ev[0].metadata.reason == 'source_deleted'; assert git rev-parse(refs/parley/changes/1/1 in demo) succeeds; landed and already abandoned changes with a missing branch are left as they are"
+          }
+        },
+        {
+          "id": "REQ-9.4",
+          "pattern": "event_driven",
+          "condition": "parleyd starts and a draft or open change has mergeable unknown after reconciliation",
+          "action": "schedule a mergeability check for that change",
+          "contract": "without any request, push or ref move after the start, GET returns mergeable 'clean' or 'conflict' for the change within the debounce interval plus the computation time",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/change/reconcile_test.go: set mergeable to 'unknown' on an open change through the change store (a check that was pending at shutdown); restart the hub with debounce 0s; poll get(change) without any other request; assert mergeable becomes 'clean' within the test deadline; assert the change reconciled to version 2 in the first test also reaches a computed value"
+          }
+        },
+        {
+          "id": "REQ-9.5",
+          "pattern": "unwanted",
+          "condition": "reconciling one change fails because its source or target repository cannot be read or the version cannot be recorded",
+          "action": "log the failure with the workspace slug and the change number, leave that change as it was, reconcile the remaining changes and finish the start",
+          "contract": "parleyd listens and answers GET /readyz with 200; the failed change is unchanged; a change of another workspace whose branch moved has its new version",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/change/reconcile_test.go: stop the hub; in workspace 'broken' replace the source repository's HEAD file by garbage; in workspace 'demo' move a source branch as in the first test; start the hub; assert start returned no error and get('/readyz').status == 200; assert get(demo#1).version == 2; assert the change of 'broken' has its old version and state; assert the log has one entry naming 'broken' and that change's number"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-10",
+      "title": "Drive the lifecycle from the CLI",
+      "rationale": "Agents script their work; each lifecycle step needs one command with a JSON result and a meaningful exit code.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-10.1",
+          "pattern": "event_driven",
+          "condition": "parley change edit <slug> <number> is run with at least one of --title, --intent, --auto-land, --no-auto-land and --target and no label flag",
+          "action": "send exactly one PATCH /workspaces/<slug>/changes/<number> whose body holds only the members the flags name (title; intent from the text, from the file after @, or from stdin for -; auto_land true or false; target_branch) and print the response",
+          "contract": "the change object from the response on stdout as one JSON document indented by 2 spaces, exit code 0; a hub error is printed on stderr as received with exit code 1",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server that records each request and answers with canned change objects",
+              "the parley root command run in-process with --endpoint-url set to that server and an API key"
+            ],
+            "pseudocode": "in internal/cli/change_test.go, a table {--title T -> {title:'T'}; --intent why -> {intent:'why'}; --intent @file (file holds 'from file\\n') -> {intent:'from file\\n'}; --intent - with stdin 'from stdin' -> {intent:'from stdin'}; --auto-land -> {auto_land:true}; --no-auto-land -> {auto_land:false}; --target release -> {target_branch:'release'}; --title T --target release -> both members; --title '' -> {title:''} (the hub decides)}: run; assert the server saw one request, method PATCH, path /api/v1/workspaces/demo/changes/12, body == want; assert stdout parses to the canned change and exit == 0; a row where the server answers 409 change_closed: stderr holds the envelope with error_type 'change_closed', stdout is empty, exit == 1"
+          }
+        },
+        {
+          "id": "REQ-10.2",
+          "pattern": "event_driven",
+          "condition": "parley change edit is run with --label or --remove-label, each repeatable",
+          "action": "read the change with GET, take its labels, remove every --remove-label value, append every --label value that is not yet present, and send the resulting list as labels in the one PATCH, together with the members of the other flags",
+          "contract": "requests in order: GET …/changes/<number>, then PATCH with labels equal to the computed list; stdout is the PATCH response; exit code 0; when the GET fails no PATCH is sent and the exit code is 1",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server that records each request and answers with canned change objects",
+              "the parley root command run in-process with --endpoint-url set to that server and an API key"
+            ],
+            "pseudocode": "in internal/cli/change_test.go, a table with the change's labels ['a','b'] {--label c -> ['a','b','c']; --remove-label a -> ['b']; --label a -> ['a','b']; --remove-label zz -> ['a','b']; --remove-label a --label a -> ['b','a']; --label c --title T -> body {labels:['a','b','c'], title:'T'}}: run; assert requests == [GET, PATCH] and PATCH body == want; a row where the GET answers 404 change_not_found: assert only one request was sent and exit == 1"
+          }
+        },
+        {
+          "id": "REQ-10.3",
+          "pattern": "unwanted",
+          "condition": "parley change edit is run without any edit flag or with both --auto-land and --no-auto-land, parley change abandon is run with a --dependants value other than reparent or abandon, parley change wait is run with a --for value other than landed, ready or mergeable or with a --timeout or --poll-interval that is not positive, or any of the six commands is run with other than two positional arguments",
+          "action": "send no request and report a usage error",
+          "contract": "exit code 2; stderr holds the error envelope with code 0 and error_type usage_error; stdout is empty; the server received no request",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server that records each request and answers with canned change objects",
+              "the parley root command run in-process with --endpoint-url set to that server and an API key"
+            ],
+            "pseudocode": "in internal/cli/change_test.go, a table over argument lists {edit demo 12; edit demo 12 --auto-land --no-auto-land; abandon demo 12 --dependants delete; wait demo 12 --for done; wait demo 12 --timeout 0s; wait demo 12 --poll-interval -1s; ready demo; draft demo 12 13; restore; abandon demo}: run; assert exit == 2 and stderr JSON error.error_type == 'usage_error' and error.code == 0 and stdout == '' and the server saw 0 requests"
+          }
+        },
+        {
+          "id": "REQ-10.4",
+          "pattern": "event_driven",
+          "condition": "parley change ready <slug> <number> or parley change draft <slug> <number> is run",
+          "action": "send PATCH /workspaces/<slug>/changes/<number> with the body {\"state\":\"open\"} for ready and {\"state\":\"draft\"} for draft, and print the response",
+          "contract": "one PATCH with exactly that body; the change object on stdout; exit code 0; exit code 1 with the hub's envelope on stderr when the hub answers an error such as 400 intent_required",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server that records each request and answers with canned change objects",
+              "the parley root command run in-process with --endpoint-url set to that server and an API key"
+            ],
+            "pseudocode": "in internal/cli/change_test.go, a table {ready -> {state:'open'}; draft -> {state:'draft'}}: run; assert one PATCH to /api/v1/workspaces/demo/changes/12 with body == want and exit == 0; a row where the server answers 400 intent_required to ready: exit == 1 and stderr error.error_type == 'intent_required'; a row with slug 'demo--t1' and a number: the path segment is sent percent-encoded as one segment"
+          }
+        },
+        {
+          "id": "REQ-10.5",
+          "pattern": "event_driven",
+          "condition": "parley change abandon <slug> <number> is run with optional --reason and --dependants, or parley change restore <slug> <number> is run",
+          "action": "send POST …/changes/<number>/abandon with a JSON body holding reason and dependants only when their flags were given, or POST …/changes/<number>/restore without a body, and print the response",
+          "contract": "one POST to the named route; the change object on stdout; exit code 0; exit code 1 with the hub's envelope on stderr when the hub answers an error such as 409 has_dependants",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server that records each request and answers with canned change objects",
+              "the parley root command run in-process with --endpoint-url set to that server and an API key"
+            ],
+            "pseudocode": "in internal/cli/change_test.go, a table {abandon -> POST …/abandon body {}; abandon --reason old -> {reason:'old'}; abandon --dependants reparent -> {dependants:'reparent'}; abandon --reason x --dependants abandon -> both; restore -> POST …/restore with an empty body}: run; assert method, path and body; assert exit == 0 and stdout is the canned change; rows where the server answers 409 has_dependants (abandon) and 409 source_workspace_gone (restore): exit == 1 and stderr carries that error_type"
+          }
+        },
+        {
+          "id": "REQ-10.6",
+          "pattern": "event_driven",
+          "condition": "parley change wait <slug> <number> is run and a poll of GET …/changes/<number> returns a change for which the condition of --for holds: state landed for landed (the default); landing.status ready and mergeable clean, or state landed, for ready; mergeable clean, or state landed, for mergeable",
+          "action": "poll every --poll-interval (default 5s) starting with an immediate first poll, stop at the first poll for which the condition holds, and print that change",
+          "contract": "exactly one JSON document on stdout, the change of the last poll; exit code 0; progress lines only on stderr",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server that records each request and answers with canned change objects",
+              "the parley root command run in-process with --endpoint-url set to that server and an API key"
+            ],
+            "pseudocode": "in internal/cli/change_test.go with --poll-interval 10ms, a table over (--for, sequence of canned changes) {(default, [open, open, landed]) -> 3 polls; (landed, [landed]) -> 1 poll; (ready, [open/pending/unknown, open/ready/unknown, open/ready/clean]) -> 3 polls; (ready, [landed]) -> 1 poll; (mergeable, [draft/blocked/unknown, draft/blocked/clean]) -> 2 polls (a blocked draft does not fail this wait); (mergeable, [landed]) -> 1 poll}: run; assert exit == 0; assert the number of GET requests == want; assert stdout parses as exactly one document equal to the last canned change"
+          }
+        },
+        {
+          "id": "REQ-10.7",
+          "pattern": "unwanted",
+          "condition": "a poll of parley change wait returns a change in state abandoned, or, with --for ready, a change with landing.status blocked or mergeable conflict, or, with --for mergeable, a change with mergeable conflict, or the hub answers a poll with an error",
+          "action": "stop polling at that poll and report the failed wait, or the hub's error",
+          "contract": "for a failed wait: the change of the last poll on stdout, the envelope with code 0 and error_type wait_failed on stderr, exit code 1; for a hub error: nothing on stdout, the hub's envelope on stderr, exit code 1",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server that records each request and answers with canned change objects",
+              "the parley root command run in-process with --endpoint-url set to that server and an API key"
+            ],
+            "pseudocode": "in internal/cli/change_test.go with --poll-interval 10ms, a table {(landed, [open, abandoned]); (ready, [abandoned]); (mergeable, [abandoned]); (ready, [open/pending/unknown, open/blocked/clean]); (ready, [draft/blocked/unknown]); (ready, [open/ready/conflict]); (mergeable, [open/ready/unknown, open/ready/conflict])}: run; assert exit == 1 and stderr error.error_type == 'wait_failed' and stdout parses to the last canned change and no further GET follows; rows (landed, [open, HTTP 404 change_not_found]) and (landed, [HTTP 401]): exit == 1, stdout == '', stderr carries the hub's error_type"
+          }
+        },
+        {
+          "id": "REQ-10.8",
+          "pattern": "unwanted",
+          "condition": "the condition of parley change wait has neither held nor failed when --timeout (default 5m) has passed since the command started",
+          "action": "stop polling and report the timeout without changing anything on the hub",
+          "contract": "nothing on stdout; the envelope with code 0 and error_type wait_timeout on stderr; exit code 1; the command returns no later than the timeout plus one poll's request time",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server that records each request and answers with canned change objects",
+              "the parley root command run in-process with --endpoint-url set to that server and an API key"
+            ],
+            "pseudocode": "in internal/cli/change_test.go: the server always answers an open change with landing.status pending; start = now; run wait demo 12 --timeout 100ms --poll-interval 20ms; assert exit == 1 and stdout == '' and stderr error.error_type == 'wait_timeout'; assert now - start < 1s; assert the server saw only GET requests, at least 2"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "An agent finishes a draft, marks it ready and waits until it is landable",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "pushes a branch to its fork with git and opens a draft change into main of the parent with an empty intent"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "runs `parley change edit demo 1 --intent \"why\" --label area:api`, reading the change and sending PATCH with intent and labels"
+        },
+        {
+          "actor": "parleyd",
+          "action": "checks that the caller is the change's author, stores intent and labels and answers 200 with the change object"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "runs `parley change ready demo 1`, sending PATCH with state open"
+        },
+        {
+          "actor": "parleyd",
+          "action": "moves the change to open, re-evaluates landing and writes parley.change.open with was_draft true"
+        },
+        {
+          "actor": "parleyd",
+          "action": "trial-rebases the change onto the head of main in the background, stores mergeable clean and writes parley.change.ready"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "runs `parley change wait demo 1 --for ready`, polls the change and exits 0 with the change on stdout"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the net/http router, middleware and error envelope of internal/server",
+          "authentication of internal/identity and the access rule of internal/access",
+          "the change store, routes and mergeability worker of internal/change",
+          "the event log of internal/event",
+          "the git binary through internal/gitrepo on bare repositories on disk",
+          "the SQLite store of internal/store",
+          "the parley CLI of internal/cli run in-process against the hub's address",
+          "a stock git client pushing over the git server of internal/gitserver"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with store and repositories in t.TempDir() and [changes].mergeable_debounce = \"0s\"",
+          "workspace 'demo' with branch main seeded by a real git push; org member mia with fork 'demo--t1' and a PAT bound to it with changes:read and changes:write; the workspace owner with an API key",
+          "no policy set on the workspace"
+        ],
+        "end_state": [
+          "the change is open with intent 'why', labels ['area:api'], landing.status ready and mergeable clean",
+          "the event log holds, for the change, parley.change.version (version 1, draft true), then parley.change.open (was_draft true), then exactly one parley.change.ready",
+          "`parley change wait --for ready` exited 0 and printed the change"
+        ],
+        "pseudocode": "in test/e2e/change_lifecycle_test.go: git push the branch to the fork with mia's bound token; open the draft with POST /api/v1/workspaces/demo/changes {source:{workspace_slug:'demo--t1',branch:'feat'}, draft:true}; cli('change','edit','demo','1','--intent','why','--label','area:api') exits 0; cli('change','ready','demo','1') exits 0 and prints state 'open'; out, code = cli('change','wait','demo','1','--for','ready','--timeout','20s','--poll-interval','100ms'); assert code == 0 and out.mergeable == 'clean' and out.landing.status == 'ready'; types = event types for change 1 in seq order; assert types == ['parley.change.version','parley.change.open','parley.change.ready']"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "A target move makes an open change conflict and a new version clears it",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "has an open change from its fork into main that edits a line of a.txt, with mergeable clean"
+        },
+        {
+          "actor": "developer",
+          "action": "pushes to main, as the workspace owner, a commit that edits the same line of a.txt"
+        },
+        {
+          "actor": "git client",
+          "action": "sends the push over smart HTTP and receives the accepted ref update"
+        },
+        {
+          "actor": "parleyd",
+          "action": "sets mergeable to unknown on every draft and open change that targets main and schedules their checks"
+        },
+        {
+          "actor": "parleyd",
+          "action": "trial-rebases the change onto the new head of main, stores mergeable conflict with the conflict report and writes one parley.change.conflict naming a.txt"
+        },
+        {
+          "actor": "agent",
+          "action": "rebases its branch onto main, resolves a.txt and force-pushes the branch to its fork"
+        },
+        {
+          "actor": "parleyd",
+          "action": "records the new version, recomputes, stores mergeable clean, clears the conflict report and writes parley.change.ready for the new head"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the net/http router, middleware and error envelope of internal/server",
+          "authentication of internal/identity and the access rule of internal/access",
+          "the change store, routes and mergeability worker of internal/change",
+          "the event log of internal/event",
+          "the git binary through internal/gitrepo on bare repositories on disk",
+          "the SQLite store of internal/store",
+          "a stock git client pushing over the git server of internal/gitserver, with the push rules of package 18 and the version recording of package 22"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with store and repositories in t.TempDir() and [changes].mergeable_debounce = \"0s\"",
+          "workspace 'demo' with branch main seeded by a real git push; org member mia with fork 'demo--t1' and a PAT bound to it with changes:read and changes:write; the workspace owner with an API key",
+          "no policy set on the workspace",
+          "open change demo#1 from branch 'feat' of demo--t1 editing line 1 of a.txt, already announced with one parley.change.ready"
+        ],
+        "end_state": [
+          "after the owner's push the change is open with mergeable conflict and conflict.files names a.txt, and exactly one parley.change.conflict event exists",
+          "after the agent's force push the change has version 2, mergeable clean and conflict null",
+          "two parley.change.ready events exist for the change, the second with the head_sha of version 2",
+          "main still points at the owner's commit and the fork's branch at the agent's pushed commit: no check moved a ref"
+        ],
+        "pseudocode": "in test/e2e/change_lifecycle_test.go: owner clones demo, edits line 1 of a.txt, git push origin main; poll GET change until mergeable != 'unknown'; assert mergeable == 'conflict' and conflict.files[0].path == 'a.txt'; assert count(parley.change.conflict) == 1 and its metadata.files == ['a.txt']; mia: git fetch, git rebase origin/main with the resolution, git push --force to the fork; poll until version == 2 and mergeable != 'unknown'; assert mergeable == 'clean' and conflict == null; ready = events parley.change.ready; assert len(ready) == 2 and ready[1].metadata.head_sha == change.head_sha; assert git ls-remote of main and of the fork branch equal the pushed commits"
+      }
+    },
+    {
+      "id": "PATH-3",
+      "title": "A developer abandons a change, deletes its branch and restores it",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "runs `parley change abandon demo 1 --reason \"parked\"` on an open change whose source is a branch of demo itself"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends POST …/changes/1/abandon with the reason and prints the change"
+        },
+        {
+          "actor": "parleyd",
+          "action": "moves the change to abandoned, keeps the source branch and the version refs, and writes parley.change.abandon with reason parked"
+        },
+        {
+          "actor": "git client",
+          "action": "deletes the source branch with `git push origin --delete feat`, which is accepted because no draft or open change uses the branch"
+        },
+        {
+          "actor": "developer",
+          "action": "runs `parley change restore demo 1`"
+        },
+        {
+          "actor": "parleyd",
+          "action": "recreates the source branch at the last version's head, moves the change to open, writes parley.change.restore and schedules the mergeability check"
+        },
+        {
+          "actor": "parleyd",
+          "action": "stores mergeable clean and writes parley.change.ready"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the net/http router, middleware and error envelope of internal/server",
+          "authentication of internal/identity and the access rule of internal/access",
+          "the change store, routes and mergeability worker of internal/change",
+          "the event log of internal/event",
+          "the git binary through internal/gitrepo on bare repositories on disk",
+          "the SQLite store of internal/store",
+          "the parley CLI of internal/cli run in-process against the hub's address",
+          "a stock git client pushing over the git server of internal/gitserver"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with store and repositories in t.TempDir() and [changes].mergeable_debounce = \"0s\"",
+          "workspace 'demo' with branch main seeded by a real git push; org member mia with fork 'demo--t1' and a PAT bound to it with changes:read and changes:write; the workspace owner with an API key",
+          "no policy set on the workspace",
+          "open change demo#2 opened by the owner from branch 'feat' of demo into main, with two versions"
+        ],
+        "end_state": [
+          "after the abandon: state abandoned, branch feat and refs/parley/changes/2/1 and /2/2 still present",
+          "after the restore: state open at version 2, branch feat exists again at the head of version 2, mergeable clean",
+          "the event log holds parley.change.abandon (reason 'parked') and parley.change.restore for the change, and no parley.change.open after the restore",
+          "a second `parley change restore demo 2` exits 1 with error_type change_not_abandoned"
+        ],
+        "pseudocode": "in test/e2e/change_lifecycle_test.go: out, code = cli('change','abandon','demo','2','--reason','parked'); assert code == 0 and out.state == 'abandoned'; assert git ls-remote lists refs/heads/feat and refs/parley/changes/2/2; git push origin --delete feat succeeds; assert GET change is still abandoned; out, code = cli('change','restore','demo','2'); assert code == 0 and out.state == 'open' and out.version == 2; assert git ls-remote refs/heads/feat == out.head_sha; poll until mergeable == 'clean'; assert event types for change 2 after the abandon call == ['parley.change.abandon','parley.change.restore','parley.change.ready']; _, code, err = cli('change','restore','demo','2'); assert code == 1 and err.error.error_type == 'change_not_abandoned'"
+      }
+    },
+    {
+      "id": "PATH-4",
+      "title": "A restart records a head whose bookkeeping was lost",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "has an open change from its fork with one version"
+        },
+        {
+          "actor": "operator",
+          "action": "stops parleyd; the source branch then moves in the fork's repository without a version being recorded, as after a crash between a ref update and its bookkeeping"
+        },
+        {
+          "actor": "operator",
+          "action": "starts parleyd again on the same data directory"
+        },
+        {
+          "actor": "parleyd",
+          "action": "compares each draft and open change's current version with its source branch head before listening, records the differing head as version 2 of kind ref and writes parley.change.version"
+        },
+        {
+          "actor": "parleyd",
+          "action": "starts listening, computes mergeability for the new head and stores the result"
+        },
+        {
+          "actor": "agent",
+          "action": "reads the change and finds version 2 at the branch head with a computed mergeable value"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the net/http router, middleware and error envelope of internal/server",
+          "authentication of internal/identity and the access rule of internal/access",
+          "the change store, routes and mergeability worker of internal/change",
+          "the event log of internal/event",
+          "the git binary through internal/gitrepo on bare repositories on disk",
+          "the SQLite store of internal/store",
+          "the start-up sequence of internal/hub/change.go run twice on the same data directory"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with store and repositories in t.TempDir() and [changes].mergeable_debounce = \"0s\"",
+          "workspace 'demo' with branch main seeded by a real git push; org member mia with fork 'demo--t1' and a PAT bound to it with changes:read and changes:write; the workspace owner with an API key",
+          "no policy set on the workspace",
+          "open change demo#1 from branch 'feat' of demo--t1 with one version"
+        ],
+        "end_state": [
+          "the first GET after the second start returns version 2 with head_sha equal to the moved branch head",
+          "refs/parley/changes/1/2 resolves to that head in demo",
+          "the versions list ends with a version of kind ref created by actor_type system",
+          "mergeable is clean without any push or request other than reads",
+          "a third start records no further version"
+        ],
+        "pseudocode": "in test/e2e/change_lifecycle_test.go: stop the hub; in the fork's bare repository create a commit on top of feat with git commit-tree and git update-ref refs/heads/feat; start the hub on the same directories; c = GET change; assert c.version == 2 and c.head_sha == the new commit; assert git ls-remote refs/parley/changes/1/2 == the new commit; v = GET versions; assert v[-1].kind == 'ref' and v[-1].created_by.actor_type == 'system'; poll until c.mergeable == 'clean'; stop and start again; assert GET change .version == 2"
+      }
+    }
+  ],
+  "external_apis": [
+    {
+      "package": "github.com/spf13/cobra",
+      "version": "v1.10.2",
+      "verified": true,
+      "symbols": [
+        {
+          "name": "Command.RunE",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "RunE func(cmd *Command, args []string) error"
+        },
+        {
+          "name": "Command.AddCommand",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) AddCommand(cmds ...*Command)"
+        },
+        {
+          "name": "Command.Flags",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) Flags() *pflag.FlagSet"
+        },
+        {
+          "name": "ExactArgs",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func ExactArgs(n int) PositionalArgs"
+        }
+      ]
+    },
+    {
+      "package": "github.com/spf13/pflag",
+      "version": "v1.0.10",
+      "verified": true,
+      "symbols": [
+        {
+          "name": "FlagSet.Changed",
+          "import_path": "github.com/spf13/pflag",
+          "signature": "func (f *FlagSet) Changed(name string) bool"
+        },
+        {
+          "name": "FlagSet.StringVar",
+          "import_path": "github.com/spf13/pflag",
+          "signature": "func (f *FlagSet) StringVar(p *string, name string, value string, usage string)"
+        },
+        {
+          "name": "FlagSet.StringArrayVar",
+          "import_path": "github.com/spf13/pflag",
+          "signature": "func (f *FlagSet) StringArrayVar(p *[]string, name string, value []string, usage string)"
+        },
+        {
+          "name": "FlagSet.BoolVar",
+          "import_path": "github.com/spf13/pflag",
+          "signature": "func (f *FlagSet) BoolVar(p *bool, name string, value bool, usage string)"
+        },
+        {
+          "name": "FlagSet.DurationVar",
+          "import_path": "github.com/spf13/pflag",
+          "signature": "func (f *FlagSet) DurationVar(p *time.Duration, name string, value time.Duration, usage string)"
+        }
+      ]
+    }
+  ]
+}

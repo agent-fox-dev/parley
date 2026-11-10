@@ -1,0 +1,213 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "36",
+  "spec_name": "carry_patch_sync",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/carrypatch/... ./internal/workspace/... ./internal/gitrepo/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "31",
+      "reason": "uses the carry-patch workspace fields, the repeatable set-up with its upstream fetch and credential order, the upstream base, the patch list, the patch record's origin fields, the RebuildEnqueuer interface and the carry-patch git runner"
+    },
+    {
+      "spec": "12",
+      "reason": "runs inside its sync through the two hooks of its extension point, registers its excluded-branch provider and reports moves through its branch-move observers"
+    },
+    {
+      "spec": "34",
+      "reason": "the first execution path waits for the rebuild it runs; the rebuild is queued through the RebuildEnqueuer interface of package 31 that package 33, on which it builds, implements"
+    },
+    {
+      "spec": "52",
+      "reason": "emits parley.patch.sync, parley.patch.replace and parley.patch.update through its event component"
+    },
+    {
+      "spec": "11",
+      "reason": "reads the effective values of the carry-patch settings it defines, and the end-to-end tests set them with PATCH /workspaces/:slug"
+    },
+    {
+      "spec": "32",
+      "reason": "writes the backup ref of a replaced patch branch with its WriteBackupRef, the one function that writes refs/parley/replaced/<branch>"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Run a carry-patch part inside sync that fetches upstream first and records its movement",
+      "criteria": [
+        "REQ-2",
+        "REQ-3"
+      ],
+      "steps": [
+        "Add the upstream fetch and upstream movement behaviours (fetch before any move, credentials per sync, the three 502 failures, refused requests, the movement table, the upstream_head_sha write) to internal/carrypatch/sync_test.go and confirm they fail",
+        "Implement the two hooks of the sync extension point that package 12 declares in internal/workspace and calls only for a workspace whose workspace_mode is carry_patch: the hook that runs after the origin fetch succeeded and before any branch or tag is created or moved, and the hook that runs after the per-branch pass and before the completion write; change no file of internal/workspace, and import internal/workspace from internal/carrypatch, never the reverse",
+        "Rely on package 12 for what a hook failure answers and prove it through the real sync in this task's tests: an error of the first hook ends the sync as a failed fetch does (HTTP 502 upstream_error, sync_error set to the message, nothing moved, no event), and the origin fetch failure message of a carry-patch workspace contains the word origin",
+        "Return from the second hook the extra members of the answer and the upstream_head_sha value to write, which package 12 writes in the same store transaction as last_sync_at; an error of the second hook makes package 12 answer HTTP 500 internal with no completion write and no parley.workspace.sync event; both hooks run on the context package 12 gives them, which is not cancelled when the caller disconnects",
+        "In internal/carrypatch/sync.go implement the first hook: run EnsureSetup of package 31, which fetches upstream with the upstream credentials resolved at the time of the call and repeats a missing set-up step (CP-FR-005), then resolve the upstream base with UpstreamBase of package 31; a credential or fetch failure returns an error whose message contains 'upstream', a failure of another set-up step is logged and does not fail the sync, and no resolvable base returns 'upstream base cannot be resolved'; every git operation of this package runs through the carry-patch git runner of package 31, which holds the 10-minute limit and cleans the message",
+        "Implement the second hook's movement report: upstream_advanced is true when the base differs from the stored upstream_head_sha or none is stored; force_push_detected is true when advanced, a head is stored and it is not an ancestor of the base or its commit is missing; return the base as the upstream_head_sha to write only when advanced",
+        "Return all eight members from the second hook with origin_fetched true and, until later tasks fill them, empty lists, rebuild_triggered false and rebuild_job_id null",
+        "Register the two hooks with the registration function of package 12's extension point in the process composition in internal/hub"
+      ],
+      "touches": [
+        "internal/carrypatch/sync.go",
+        "internal/carrypatch/sync_test.go",
+        "internal/hub"
+      ],
+      "done_when": [
+        "`go test ./internal/workspace/... -count=1` still passes with no extension registered"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Name the patch branches the general pass must leave out",
+      "criteria": [
+        "REQ-1"
+      ],
+      "steps": [
+        "Add the provider behaviours (non-deleted patches named, patch branches absent from branches with and without reset_to_origin, a deleted patch's branch synced as an ordinary branch, a store failure) to internal/carrypatch/excluded_test.go and internal/carrypatch/sync_test.go and confirm they fail",
+        "Implement the excluded-branch provider interface of package 12 in internal/carrypatch/excluded.go: given a workspace slug, return the branch_name of every patch whose status is not deleted, read from the patch list of package 31",
+        "Return the store's error unchanged when the patch list cannot be read; do not return a partial list",
+        "Register the provider with the registration function of package 12 in internal/hub, beside the registration of the two hooks"
+      ],
+      "touches": [
+        "internal/carrypatch/excluded.go",
+        "internal/carrypatch/excluded_test.go",
+        "internal/carrypatch/sync_test.go",
+        "internal/hub"
+      ],
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Refresh patch branches from origin",
+      "criteria": [
+        "REQ-4"
+      ],
+      "steps": [
+        "Add the refresh behaviours (the outcome table, the backup on replace, protected patch branches, no refresh under hub, merged and deleted patches skipped, branch-move observers) to internal/carrypatch/sync_refresh_test.go and confirm they fail",
+        "In internal/carrypatch/sync_refresh.go, when the effective setting patch_branch_source is origin, walk the patches in active, conflict or disabled in position order as the second hook's first step",
+        "For each patch read the hub's tip (refs/heads/<branch>) and origin's tip as this sync fetched it (refs/remotes/origin/<branch>) and choose the first rule that fits: missing on origin; missing in the hub; equal; hub tip an ancestor of origin's; otherwise by patch_divergence_policy",
+        "Create and move branches only by the compare-and-swap ref update of internal/gitrepo, expecting the tip that was compared, or absence for a create; consult no push rule, so protected patch branches move too",
+        "For a replace, first write the hub's tip to refs/parley/replaced/<branch>, overwriting what is there, with WriteBackupRef of package 32 (internal/carrypatch/backup_ref.go), the one function that writes a backup ref, then swap the branch",
+        "Collect one result per patch (branch_name, action, state, the hub's tip after the step or none, origin's tip or none, the saved tip for a replace) in position order and return them as patches_synced",
+        "After each create or move, report it through the notify function package 12 exports for its branch-move observers, with the slug, the branch, the heads before and after and the cause sync; log an observer's error and continue",
+        "When patch_branch_source is hub, read and move no patch branch and return an empty patches_synced"
+      ],
+      "touches": [
+        "internal/carrypatch/sync_refresh.go",
+        "internal/carrypatch/sync_refresh_test.go",
+        "internal/carrypatch/sync.go"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Store each refresh outcome on its patch and emit the patch events",
+      "criteria": [
+        "REQ-5"
+      ],
+      "steps": [
+        "Add the stored-state and event behaviours (the three origin fields per outcome, nulls under hub and for merged patches, parley.patch.sync only on a move or a state change, parley.patch.replace, outcome and events in one transaction) to internal/carrypatch/sync_refresh_test.go and confirm they fail",
+        "After each patch's outcome, in one store transaction: write origin_sync_state, origin_sha (null when missing on origin) and origin_synced_at from the replaceable clock, and write the events of that outcome through the event component of package 52",
+        "Emit parley.patch.sync (resource_type patch, resource_id the patch id, actor the caller, metadata branch_name, action, state, local_sha, origin_sha) when the branch was created or moved or the state differs from the origin_sync_state stored before; emit nothing for an unchanged state with action none",
+        "Emit parley.patch.replace (metadata branch_name, replaced_sha, origin_sha, trigger sync) for a replaced branch, in the same transaction",
+        "Treat a failure of that transaction as a failure of the refresh of that branch",
+        "When patch_branch_source is hub, set the three origin fields to null on every patch of the workspace that has one set, without an event; when it is origin, do the same for every patch in merged_upstream"
+      ],
+      "touches": [
+        "internal/carrypatch/sync_refresh.go",
+        "internal/carrypatch/sync_refresh_test.go",
+        "internal/carrypatch/sync.go"
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Detect patches that upstream merged",
+      "criteria": [
+        "REQ-7"
+      ],
+      "steps": [
+        "Add the merge detection behaviours (when it runs, the table of tests per setting, the pull request number window, marking a patch merged with its event, patches not examined) to internal/carrypatch/merge_detect_test.go, and tests for the two new git reads to internal/gitrepo/cherry_test.go, and confirm they fail",
+        "Add to internal/gitrepo/cherry.go a read that runs `git cherry <base> <tip>` and returns for each listed commit whether an equivalent exists in base, and a read that lists the subject lines of the commits in a range or of the N newest commits reachable from a commit; pass revisions so that a name beginning with a dash is never read as an option",
+        "In internal/carrypatch/merge_detect.go run detection after a refresh without failure when upstream advanced or the refresh created or moved a patch branch; otherwise return an empty patches_merged",
+        "Examine the patches in active and conflict in position order, skipping a patch whose branch does not exist in the hub; read the effective squash_merge_detection once per sync",
+        "Ancestry test (ancestry_only, both): the patch tip equals the upstream base or is its ancestor",
+        "Content test (content_based, both): the cherry read lists at least one commit and every listed commit has an equivalent",
+        "Pull request number test (content_based, both): take the decimal number after '/pull/' in upstream_pr_url; examine the subjects of the commits reachable from the new base and not from the stored head, or of the 50 newest commits of the new base on the first sync and when force_push_detected is true; a subject ending with '(#<n>)' matches",
+        "For a merged patch, in one store transaction: set status merged_upstream, clear conflict_files, set the three origin fields to null and emit parley.patch.update with the caller as actor and metadata branch_name, changed ['status'], from, to, reason merged_upstream; add the branch name to patches_merged",
+        "A git or store failure during detection ends the sync through the second hook's error (HTTP 500 internal, no completion write)"
+      ],
+      "touches": [
+        "internal/gitrepo/cherry.go",
+        "internal/gitrepo/cherry_test.go",
+        "internal/carrypatch/merge_detect.go",
+        "internal/carrypatch/merge_detect_test.go",
+        "internal/carrypatch/sync.go"
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Queue a rebuild when the sync changed its inputs",
+      "criteria": [
+        "REQ-8"
+      ],
+      "steps": [
+        "Add the rebuild trigger behaviours (the trigger table, the duplicate skip for queued, running and failed, no active patches, an enqueue failure) to internal/carrypatch/sync_test.go and confirm they fail",
+        "After merge detection decide the trigger: the effective auto_rebuild_after_sync is true and upstream advanced, or the refresh created or moved the branch of a patch whose status was active or conflict, or patches_merged is not empty",
+        "Queue through EnqueueRebuild of the interface RebuildEnqueuer (declared by package 31, implemented and registered by package 33) with submitted_by the caller's user id, the caller as the event's actor, and no strategy or fail mode, so that the enqueue applies the effective settings rebuild_strategy and rebuild_fail_mode; the enqueue does not apply the no_active_patches check of the submit route",
+        "When the enqueue's result reports a duplicate (an existing queued, running or failed rebuild), continue with rebuild_triggered false and rebuild_job_id null",
+        "When the enqueue fails for another reason, return an error from the second hook so that the sync answers HTTP 500 internal and the completion write does not happen",
+        "On success return rebuild_triggered true and the job id; the enqueue runs inside the second hook and so before the completion write of package 12"
+      ],
+      "touches": [
+        "internal/carrypatch/sync.go",
+        "internal/carrypatch/sync_test.go"
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Stop the sync on a refresh failure and keep what was done",
+      "criteria": [
+        "REQ-6"
+      ],
+      "steps": [
+        "Add the refresh failure behaviours (a lost swap stops the sync and is not retried, earlier outcomes and a written backup stay, no completion fields and no parley.workspace.sync, the rebuild still queued, the next sync completes) to internal/carrypatch/sync_refresh_test.go and confirm they fail",
+        "Give the refresh a seam through which a test moves a branch between the comparison and the swap",
+        "When the swap, another git step or the outcome transaction of one patch fails, stop the walk: do not retry, do not refresh later patches, do not run merge detection",
+        "Before returning the error, queue a rebuild by the trigger rule restricted to the branches moved so far (a branch of an active or conflict patch moved, and auto_rebuild_after_sync true), with the same duplicate skip",
+        "Return an error whose message contains the branch name, so that the sync answers HTTP 500 internal and writes neither upstream_head_sha, last_sync_at nor sync_error",
+        "Leave a backup ref written before a lost swap in place"
+      ],
+      "touches": [
+        "internal/carrypatch/sync_refresh.go",
+        "internal/carrypatch/sync_refresh_test.go",
+        "internal/carrypatch/sync.go"
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Return the carry-patch members in the sync answer",
+      "criteria": [
+        "REQ-9"
+      ],
+      "steps": [
+        "Add the answer behaviours (the shape with empty lists and a null rebuild_job_id, the six keys of a patches_synced entry, patches_diverged, a standard workspace without the members, completion after a disconnect) to internal/carrypatch/sync_test.go and confirm they fail",
+        "Encode the eight members beside the workspace object and branches: lists are encoded as [] when empty, rebuild_job_id as null when no job was queued, origin_fetched always true",
+        "Encode each patches_synced entry with exactly branch_name, action, state, local_sha, origin_sha and replaced_sha, with null for an absent commit id and full 40-character ids otherwise",
+        "Fill patches_diverged with the branch names of the entries whose state is diverged, in position order",
+        "Confirm that on a standard workspace neither hook is called, the answer has none of the eight keys and upstream is not contacted",
+        "Add the two end-to-end tests of the execution paths to test/e2e/carry_patch_sync_test.go, with test origin and upstream repositories from internal/gitrepo/gitrepotest"
+      ],
+      "touches": [
+        "internal/carrypatch/sync.go",
+        "internal/carrypatch/sync_test.go",
+        "test/e2e/carry_patch_sync_test.go"
+      ]
+    }
+  ]
+}

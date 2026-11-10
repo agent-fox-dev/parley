@@ -1,0 +1,263 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "27",
+  "spec_name": "landing_policy",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/policy/... ./internal/cli/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "09",
+      "reason": "builds its CLI commands on the client, output and exit-code helpers of the CLI foundation"
+    },
+    {
+      "spec": "11",
+      "reason": "validates and matches the targets of a rule with the branch-glob functions of internal/workspace/branchglob.go"
+    },
+    {
+      "spec": "22",
+      "reason": "evaluation reads a change's state, target branch, current version, touched files and mergeable from the change records of package 22 and stores the result as the change's landing"
+    },
+    {
+      "spec": "23",
+      "reason": "runs its landable announcement, the one writer of parley.change.ready, in every transaction that stores a landing"
+    },
+    {
+      "spec": "25",
+      "reason": "registers its evaluation as the policy gate that internal/land declares"
+    },
+    {
+      "spec": "52",
+      "reason": "emits its hub events through the event log component"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Validate a policy document and produce its normal form",
+      "criteria": [
+        "REQ-1"
+      ],
+      "steps": [
+        "Add the accepted-document table, the shared table of invalid documents, the unknown-username cases, the limit cases and the first-violation cases to internal/policy/document_test.go and confirm they fail",
+        "Define the document: default and an ordered list of rules (name, paths, exclude, targets, require), and the requirement (approvals, approvers, checks, fresh_checks, block), decoded from JSON text so that a member of the wrong JSON type is told apart from an absent one",
+        "Define the invalid-policy error carrying rule (name, 'default' or null), index (zero-based position or null) and field (member name, prefixed 'require.' inside a rule, with '[i]' for one entry), and the narrow user lookup the validator asks whether a username exists, in internal/policy/ports.go",
+        "Validate in the fixed order and stop at the first violation: text longer than 65 536 bytes (field 'document'); text that is not a JSON object ('document'); top-level member types; more than 200 rules ('rules'); default; then each rule in order by name, paths, exclude, targets, require",
+        "Check a rule name against ^[a-z0-9][a-z0-9_-]{0,62}$, refuse 'default' and a name an earlier rule has; check each path glob for 1 to 255 characters and no leading '/'; check each targets entry with ValidateBranchGlob of package 11 in internal/workspace/branchglob.go (a branch name of 1 to 255 characters in which * and ** may appear, by the branch-name rule quoted in the package PRD), writing no second validator; refuse an empty paths list and a targets list that is present and empty",
+        "Check a requirement: approvals an integer from 0 to 10; approvers, when present, non-empty with entries 'owner', 'member' or 'user:<username>' whose username the lookup knows; each check name against ^[a-z0-9][a-z0-9_.-]{0,62}$; fresh_checks and block booleans. Return a lookup failure as itself, never as an invalid-policy error",
+        "Produce the normal form of an accepted document: default always present, all five requirement members filled with their defaults, exclude filled with an empty list, targets kept only where given, undefined members dropped, and make validating a normal form return it unchanged"
+      ],
+      "touches": [
+        "internal/policy/document.go",
+        "internal/policy/document_test.go",
+        "internal/policy/ports.go"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Match globs and select the governing rule for a file",
+      "criteria": [
+        "REQ-4.1",
+        "REQ-4.2",
+        "REQ-4.3"
+      ],
+      "steps": [
+        "Add the path-glob table to internal/policy/glob_test.go and the target table and the rule-selection table to internal/policy/evaluate_test.go and confirm they fail",
+        "Match a path glob against a whole repository-relative path: * is any run without '/', possibly empty; ** is any run, possibly empty; a longer run of asterisks reads as ** followed by the rest; ? is exactly one character other than '/'; every other character, '[' and '\\' included, is itself; matching is case-sensitive",
+        "Match a targets entry against the change's target branch with MatchAnyBranchGlob of package 11 (internal/workspace/branchglob.go), in which '?' is an ordinary character; write no branch matcher here, and use the path matcher of this task for policy paths and exclude only, never for the paths of a token, which package 06's matcher decides",
+        "Keep matching free of exponential backtracking: a glob of 255 characters made of alternating * and letters against a 4 096-character path returns within the unit test's default time",
+        "Select for one file and one target branch the first rule in document order whose targets is absent or matches the branch, whose paths matches the file and whose exclude does not; return 'default' when none qualifies"
+      ],
+      "touches": [
+        "internal/policy/glob.go",
+        "internal/policy/glob_test.go",
+        "internal/policy/evaluate.go",
+        "internal/policy/evaluate_test.go"
+      ],
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Turn the selections of a change into requirements and a landing status",
+      "criteria": [
+        "REQ-5"
+      ],
+      "steps": [
+        "Add the requirement-shape, satisfaction, status, structural-reason, empty-change, no-evidence and failure tables to internal/policy/evaluate_test.go with stubbed change facts and evidence, and confirm they fail",
+        "Define in internal/policy/ports.go the change facts the evaluator works on (number, current version, state, target branch, mergeable, the structural reason the record carries, the touched files) and the evidence source: one question per requirement, given the workspace, the change, its current version, the requirement's approvers, its check names and its fresh_checks, answering the counted approvals, whether a counted rejection is outstanding, and a status per check name that has a result",
+        "Provide the evidence source that answers nothing (0 counted, no rejection, no check result) as the one installed at first, and a registration function that replaces the installed source, which package 28 calls with its own",
+        "Group the change's files by selected rule; build one requirement per distinct selection in document order with default last; list its files in ascending byte order cut to the first 50; list each check name of the rule once in the rule's order, with status pending where the evidence has no result",
+        "Mark a requirement satisfied exactly when block is false, counted is at least required, no counted rejection is outstanding and every named check is passed",
+        "Derive the result {status, reason, requirements}: a draft change is blocked with reason draft; otherwise a structural reason on the record gives blocked with that reason; otherwise blocked with reason null when a requirement blocks, pending when one is unsatisfied, ready when all are satisfied or there is none. Requirements are listed in every case",
+        "Offer a second mode used by the evaluate route: no evidence is asked, counted is 0, every check is pending and structural reasons are not applied",
+        "Return a failure of the file read or of the evidence source as the evaluation's failure, with no partial result"
+      ],
+      "touches": [
+        "internal/policy/evaluate.go",
+        "internal/policy/evaluate_test.go",
+        "internal/policy/ports.go"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Keep policy revisions and serve GET policy",
+      "criteria": [
+        "REQ-2"
+      ],
+      "steps": [
+        "Add the read cases (never set, current, by revision, not kept or malformed revision, fork, member and fork-bound and archived readers, refusals) to internal/policy/handlers_test.go against a hub started in-process, and confirm they fail",
+        "Register a schema step with internal/store for a table of policy revisions keyed by workspace slug and revision, holding the normal-form document, updated_at and the writer's actor_type, actor_id and username",
+        "Read the current revision of a workspace and one revision by number in internal/policy/store.go; a workspace with no row, and every task fork, has the revision-0 document with updated_at and updated_by null; revision 0 is readable only while no row exists",
+        "Register GET /workspaces/:slug/policy with internal/server with scope changes:read and need read, so that the scope, access and binding answers come from the shared pipeline; define in internal/policy/ports.go the narrow workspace lookup the handlers need (kind, status, default branch)",
+        "Answer 200 with {revision, default, rules, updated_at, updated_by} and the header ETag with the revision in double quotes; answer 404 not_found for a revision that is not kept and 400 invalid_request for a revision value that is not a non-negative integer",
+        "Wire the policy component into parleyd's start so the route is served by the real hub"
+      ],
+      "touches": [
+        "internal/policy/store.go",
+        "internal/policy/store_test.go",
+        "internal/policy/handlers.go",
+        "internal/policy/handlers_test.go",
+        "internal/policy/ports.go",
+        "cmd/parleyd/main.go"
+      ],
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Replace the policy with PUT under an optional revision condition",
+      "criteria": [
+        "REQ-3"
+      ],
+      "steps": [
+        "Add the replace cases (store and answer, the event, If-Match mismatch, invalid input, fork and archived, caller refusals, concurrent writers) to internal/policy/handlers_test.go and the 52-replacement retention case to internal/policy/store_test.go, and confirm they fail",
+        "Register PUT /workspaces/:slug/policy with scope workspaces:write and need owner; the route is not among the routes a fork-bound token reaches on its parent, so the binding guard answers 403 token_bound there",
+        "After access, decide in this order: a task fork is 400 not_supported_on_fork; a body that is not a JSON object or an If-Match that is not a non-negative integer, bare or in double quotes, is 400 invalid_request; an invalid document is 400 invalid_policy with details {rule, index, field} from the validator, the size being the byte length of the body; an archived workspace is 409 workspace_archived; an If-Match that differs from the stored revision is 412 revision_mismatch",
+        "Use the real user lookup over the identity data for user:<username> approvers",
+        "In one store transaction: read the stored revision, compare it with If-Match, write the normal form as revision stored + 1 with the caller as updated_by and the current time, delete revisions numbered new - 50 or lower, and hand parley.policy.update (resource_type policy, resource_id the slug, action update, actor the caller, metadata revision and rules count) to the event component; a failure of any part rolls all of it back and answers 500 internal",
+        "Make the revision read and the write one serialised step, so that two concurrent replacements get consecutive revisions and two with the same If-Match yield one 200 and one 412",
+        "Answer 200 with the body and ETag that GET returns for the new revision; leave a hook, run inside the same transaction before commit, where the re-evaluation of the workspace's changes is attached later"
+      ],
+      "touches": [
+        "internal/policy/handlers.go",
+        "internal/policy/handlers_test.go",
+        "internal/policy/store.go",
+        "internal/policy/store_test.go",
+        "internal/policy/ports.go"
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Read a change's files and keep its stored landing current",
+      "criteria": [
+        "REQ-4.4",
+        "REQ-4.5",
+        "REQ-6"
+      ],
+      "steps": [
+        "Add the rename, stacked-base and 2 100-file cases to internal/policy/changeadapter_test.go and the store-and-return, ready-event table, closed, not-found, failure and fork-target cases to internal/policy/reevaluate_test.go, and confirm they fail",
+        "Implement the change facts over the change records of internal/change and internal/gitrepo: state, target workspace and branch, current version, mergeable, the structural reason on the record, and the files that differ between the current version's base_sha and head_sha with both paths of every rename and no cap",
+        "Offer the operation 're-evaluate change N of workspace W': inside one store transaction read the current policy revision of the change's target workspace (the revision-0 document for a task fork), evaluate with the installed evidence source, write the result as the change's landing and return the result with the revision",
+        "After the landing is written, run the landable announcement that package 23 exports from internal/change/landable.go in the same transaction: it alone writes parley.change.ready (actor system, metadata number, ref, version, head_sha) when the change is open, ready and clean for a head not yet announced, and forgets the announcement when the change is no longer landable; write no event of that type in internal/policy",
+        "Return the change-closed error for a landed or abandoned change and the change-not-found error for an unknown number or slug, writing nothing in either case; roll back the landing when the event cannot be recorded",
+        "Wire the operation into parleyd: register it as the landing evaluator of the change component of package 22 (opening, new version, retarget, draft/open moves) and as the policy gate that package 25 declares in internal/land (answering status, reason, requirements and revision), each in place of the everything-is-ready default, and expose it for package 28 to call after an approval, a withdrawal and a check report"
+      ],
+      "touches": [
+        "internal/policy/changeadapter.go",
+        "internal/policy/changeadapter_test.go",
+        "internal/policy/reevaluate.go",
+        "internal/policy/reevaluate_test.go",
+        "internal/policy/ports.go",
+        "internal/change/",
+        "cmd/parleyd/main.go",
+        "internal/land/"
+      ],
+      "depends_on": [
+        3,
+        4
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Re-evaluate every draft and open change when the policy is replaced",
+      "criteria": [
+        "REQ-7"
+      ],
+      "steps": [
+        "Add the after-update cases (all changes follow, ready events, evidence kept, closed changes untouched, failure rolls back, concurrent single re-evaluation) to internal/policy/reevaluate_test.go and confirm they fail",
+        "List the draft and open changes whose target workspace is the workspace, in ascending number order, through the change facts",
+        "Attach to the PUT's transaction hook: evaluate each listed change against the new document, write its landing and run the landable announcement of package 23 for it, so that each open, clean change whose status moved to ready gets one parley.change.ready, all before the transaction commits and before the 200 is sent",
+        "Read approvals and checks only through the evidence source; delete or change none",
+        "Fail the whole PUT with 500 internal when any change's evaluation or write fails, leaving the revision, the document, every landing and the event log as before",
+        "Make a single-change re-evaluation read the policy revision inside its own write transaction, so that one racing with a policy update either runs before it and is overwritten by the update's pass or runs after it against the new revision"
+      ],
+      "touches": [
+        "internal/policy/reevaluate.go",
+        "internal/policy/reevaluate_test.go",
+        "internal/policy/handlers.go",
+        "internal/policy/store.go"
+      ],
+      "depends_on": [
+        5,
+        6
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Answer what paths or a change would need without writing anything",
+      "criteria": [
+        "REQ-8"
+      ],
+      "steps": [
+        "Add the evaluate cases (paths, change, candidate policy, nothing written, invalid requests, invalid candidate, unknown or foreign change, caller refusals) to internal/policy/handlers_test.go and confirm they fail",
+        "Register POST /workspaces/:slug/policy/evaluate with scope changes:read and need read; it creates no resource",
+        "Validate the body: exactly one of paths and change; paths of 1 to 2 000 non-empty strings without a leading '/', repeated entries counted once; change an integer; target_branch refused together with change, when empty and past 255 characters; paths without target_branch on a workspace with no default branch is refused; each is 400 invalid_request",
+        "Validate a candidate policy with the validator, its size being the byte length of the member's JSON text, and answer 400 invalid_policy with the validator's details when it is refused",
+        "With change, read the change's files and target branch in whatever state it is; answer 404 change_not_found for an unknown number and, with identical body, for a caller that is a token bound to a task fork when the change's source workspace is not that fork",
+        "Evaluate in the no-evidence, no-structural-reason mode against the candidate, else the stored document, else the revision-0 document for a task fork, for target_branch or the default branch, and answer 200 {policy_revision: the stored revision, status, requirements}",
+        "Open no write transaction on this route: no revision, no event and no landing changes"
+      ],
+      "touches": [
+        "internal/policy/handlers.go",
+        "internal/policy/handlers_test.go"
+      ],
+      "depends_on": [
+        5,
+        6
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Add parley policy get, set and evaluate",
+      "criteria": [
+        "REQ-9"
+      ],
+      "steps": [
+        "Add the get, set, TOML and standard input, evaluate and usage-error cases to internal/cli/policy_test.go against a fake hub and confirm they fail",
+        "Declare the command group policy with get, set and evaluate through the command helper of internal/cli, each with its method and path and one positional argument, the slug",
+        "policy get: optional --revision, a non-negative integer, sent as the query revision; print the response body",
+        "Read a policy file for --file and --policy-file: '-' is standard input; a name ending in .toml is decoded as TOML; anything else is decoded as JSON and, when that fails, as TOML; the TOML table default and array of tables rules become the JSON document; a file that cannot be read or decodes as neither is a usage error",
+        "policy set: required --file; optional --if-revision, a non-negative integer, sent as the header If-Match with the number in double quotes; send the document with PUT as application/json and print the response body",
+        "policy evaluate: exactly one of --paths (comma-separated, repeatable, order kept) and --change (a non-negative integer); optional --target as target_branch and --policy-file as policy; send POST and print the response body",
+        "Report every usage error before any request with exit status 2 and the usage_error envelope on stderr, through the shared error path of internal/cli",
+        "Add the two end-to-end scenarios (set a policy and read the changes; evaluate and a refused set with a fork-bound token) to test/e2e/policy_test.go, driving the real command tree against a hub started in-process"
+      ],
+      "touches": [
+        "internal/cli/policy.go",
+        "internal/cli/policy_test.go",
+        "internal/cli/root.go",
+        "test/e2e/policy_test.go"
+      ],
+      "depends_on": [
+        7,
+        8
+      ]
+    }
+  ]
+}

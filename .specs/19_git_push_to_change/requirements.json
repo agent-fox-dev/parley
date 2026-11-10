@@ -1,0 +1,634 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "19",
+  "spec_name": "git_push_to_change",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Push option validation",
+      "rationale": "An agent that mistypes an option must learn it before anything is written, from one line that names the option and the reason.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "a push arrives with at most 16 push options, each at most 1,024 bytes long and each either without the `parley.` prefix or a well-formed one of `parley.change`, `parley.target=<branch>`, `parley.title=<text>`, `parley.intent=<text>`, `parley.draft` and `parley.session=<id>`, including a push with no options",
+          "action": "accept the options, ignore every option whose name does not begin with `parley.`, and split each `parley.` option at its first `=` into a name and a value",
+          "contract": "the validated option set: change requested (true when `parley.change` or `parley.target` is present), target, title, intent, draft, session id; no refusal",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a session linker stub that accepts every reference"
+            ],
+            "pseudocode": "in internal/gitserver/pushoptions_test.go, a table over option lists that must all be accepted, asserting the parsed result of each: {[] -> nothing set; ['parley.change'] -> change; ['parley.target=release'] -> target 'release' and change implied; ['parley.draft','parley.change'] -> draft and change; ['parley.title=a=b'] -> title 'a=b'; ['parley.title=' + 200 characters, 10 of them multi-byte] -> accepted; ['parley.intent=' + text making the whole option exactly 1024 bytes] -> accepted; ['ci.skip','other=1','parley.change'] -> change, the two others ignored; 16 options of which 10 have no `parley.` prefix -> accepted; ['parley.session=<id>'] with a session linker that accepts -> session id set}; assert no refusal in any case"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "unwanted",
+          "condition": "a push option is a `parley.` name that is not one of the six, or a `parley.` option given twice, or `parley.change` or `parley.draft` written with `=`, or `parley.target`, `parley.title`, `parley.intent` or `parley.session` without `=` or with an empty value, or a `parley.target` for which `refs/heads/<value>` is not a well-formed git ref name, or a `parley.title` longer than 200 characters",
+          "action": "refuse the whole push with a message that names the first invalid option in the order sent and its reason",
+          "contract": "a refusal with the message `invalid push option <name>: <reason>`, where `<reason>` is `unknown option`, `given more than once`, `takes no value`, `value required`, `not a valid branch name` or `longer than 200 characters`",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a session linker stub that accepts every reference"
+            ],
+            "pseudocode": "in internal/gitserver/pushoptions_test.go, a table over option lists and the expected message: {['parley.titel=x'] -> 'invalid push option parley.titel: unknown option'; ['parley.change','parley.change'] -> 'invalid push option parley.change: given more than once'; ['parley.title=a','parley.title=b'] -> '... parley.title: given more than once'; ['parley.change=1'] -> '... parley.change: takes no value'; ['parley.draft='] -> '... parley.draft: takes no value'; ['parley.target'] and ['parley.target='] -> '... parley.target: value required'; ['parley.title='], ['parley.intent'], ['parley.session='] -> '... value required'; ['parley.target=a..b'], ['parley.target=bad name'], ['parley.target=x.lock'] -> '... parley.target: not a valid branch name'; ['parley.title=' + 201 characters] -> '... parley.title: longer than 200 characters'; ['parley.draft=1','parley.bogus'] -> names parley.draft, the first one}; assert the result is a refusal and its message equals the expected text exactly"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "unwanted",
+          "condition": "a push carries more than 16 push options, or any push option longer than 1,024 bytes counting its name and value",
+          "action": "refuse the whole push, whether or not the options at fault have the `parley.` prefix",
+          "contract": "a refusal with the message `too many push options: at most 16 are accepted` for the count, checked first, and `invalid push option <name>: longer than 1024 bytes` for the length, where `<name>` is the text before the first `=`",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/gitserver/pushoptions_test.go, a table: {17 options 'x1'..'x17' -> 'too many push options: at most 16 are accepted'; 17 options of which the first is 'parley.bogus' -> the too-many message (the count is checked first); ['parley.intent=' + text making the option 1025 bytes] -> 'invalid push option parley.intent: longer than 1024 bytes'; ['note=' + 1021 bytes] (1026 bytes, no parley prefix) -> 'invalid push option note: longer than 1024 bytes'}; assert refusal and exact message"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "unwanted",
+          "condition": "the session linker (the interface SessionLinker of internal/gitserver, to which package 49 hands its session-linking check) does not accept the value of `parley.session`, or no session linker is registered (the session does not exist, was created by another user while the caller is not the admin token, or belongs to a workspace that is neither the pushed workspace, its parent nor one of its forks)",
+          "action": "ask the session linker with the caller, the session id and the pushed workspace, and refuse the whole push",
+          "contract": "a refusal with the message `invalid push option parley.session: unknown session`",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/gitserver/pushoptions_test.go, with a session linker stub scripted to refuse: validate ['parley.session=3f2c…'] for caller U and workspace 'demo'; assert the stub was called once with (U, that id, 'demo'); assert refusal with message 'invalid push option parley.session: unknown session'; a second case with the value 'not-a-uuid' and the stub refusing gives the same message; a third case with no session linker registered gives the same message"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "unwanted",
+          "condition": "the session linker fails with an internal error",
+          "action": "refuse the whole push and never treat the session as accepted",
+          "contract": "a refusal with the message `internal error; try again`",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/gitserver/pushoptions_test.go, with a session linker stub that returns an internal error: validate ['parley.session=<id>']; assert refusal with message 'internal error; try again'; assert the result carries no session id"
+          }
+        },
+        {
+          "id": "REQ-1.6",
+          "pattern": "unwanted",
+          "condition": "a git client pushes with push options that validation refuses with message M",
+          "action": "answer the push without storing the pack, without evaluating the push rules, without moving a ref, without emitting an event and without touching a change, and report the refusal on the side band once and on every ref of the push",
+          "contract": "HTTP 200 with a receive-pack result holding `unpack ok`, then `ng <ref> M` for every ref of the push, and one side-band line `error: M`; the git client prints `remote: error: M` and `! [remote rejected] <ref> (M)` and exits non-zero; no object, ref, event or change is written; the request counts as `refused` in `parley_git_requests_total`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "an in-process hub on 127.0.0.1:0 with a real store, real repositories on disk, the real `internal/change` component and the event log; a workspace `demo` in organization `acme` with default branch `main`, owned by user U; a clone of it made with the real `git` client using U's API key",
+              "two local branches `topic` and `other`, each with one commit not on the hub"
+            ],
+            "pseudocode": "in internal/gitserver/pushchange_integration_test.go, a table over {`git push -o parley.titel=x origin topic other` -> message 'invalid push option parley.titel: unknown option'; `git push` with 17 `-o x<i>` options -> 'too many push options: at most 16 are accepted'}: run the real git client; assert exit code != 0; assert stderr has exactly one line 'remote: error: <message>' and for each pushed ref a line containing '! [remote rejected]' and '(<message>)'; assert the HTTP status seen by a recording transport is 200; assert neither branch exists in the hub repository and the commit object of `topic` is absent from it (`git cat-file -e` fails); assert the event log has no `parley.git.push` and the change list of `demo` is empty; assert parley_git_requests_total{service='receive-pack',result='refused'} grew by 1"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "The session of a push",
+      "rationale": "A consumer of the event stream follows what an agent does by its session, also for pushes that involve no change.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "an accepted push carries a valid `parley.session=<id>`",
+          "action": "give the session id to every `parley.git.push` event of the push, whether or not a change is involved",
+          "contract": "each `parley.git.push` event of the push has `session_id` equal to `<id>`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "an in-process hub on 127.0.0.1:0 with a real store, real repositories on disk, the real `internal/change` component and the event log; a workspace `demo` in organization `acme` with default branch `main`, owned by user U; a clone of it made with the real `git` client using U's API key",
+              "a session S created by U on `demo`"
+            ],
+            "pseudocode": "in internal/gitserver/pushchange_integration_test.go: push a tag and a branch in one push with `-o parley.session=<S>` and no other option; assert exit 0; read the event log; assert there are two `parley.git.push` events, one per ref, and each has session_id == S; assert the change list of `demo` is empty. Then push another branch with no option; assert its `parley.git.push` event has session_id == null"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "event_driven",
+          "condition": "an accepted push carries no `parley.session` option",
+          "action": "emit the `parley.git.push` events of the push with a null session",
+          "contract": "each `parley.git.push` event of the push has `session_id` null",
+          "check": {
+            "same_as": "REQ-2.1"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "event_driven",
+          "condition": "an accepted push records a version through the ref-updated stage of package 22, or its mapping opens a change",
+          "action": "hand the session id of `parley.session` to the ref writer of package 18, which gives it to the stage, and pass it with every open request of the mapping; pass no session when the option is absent",
+          "contract": "the version recorded for the push and the open requests carry the push's session id, or none; with none, the defaults of the change component apply",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "an in-process hub on 127.0.0.1:0 with a real store, real repositories on disk, the real `internal/change` component, the ref-updated stage of package 22 registered with the ref writer and a session linker that accepts session S; a workspace `demo` with an open change #1 whose source is branch `fix`; a clone made with the real `git` client"
+            ],
+            "pseudocode": "in internal/gitserver/pushchange_integration_test.go, a table over {session S given with -o parley.session=S, no session}: commit and push `fix`; assert the newest version of change 1 has session_id S in the first case and null in the second; push a new branch `other` with -o parley.change and the same session choice; assert the opened change has session_id S, or the default of the change component"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Mapping each pushed branch to a change",
+      "rationale": "An agent's push should open a change or add a version without a second call, and a plain branch should stay a plain branch.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "ubiquitous",
+          "action": "for any accepted push, consider only its created or updated `refs/heads/*` refs for change mapping, one at a time in command order, and skip tags, refs in other namespaces and deletes without a line and without change activity",
+          "contract": "change activity and side-band lines exist only for created or updated branches, in command order; `parley.change` on a push of only tags or only branch deletes has no effect and is not an error",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a mapper built with a fake change service that records every call (find open change of a source, record version, open change) and returns scripted results, and a recorder for side-band lines"
+            ],
+            "pseudocode": "in internal/gitserver/changemap_test.go: run the mapper with `parley.change` over the accepted updates, in this order, [create refs/tags/v1, update refs/heads/b, delete refs/heads/gone, create refs/notes/x, create refs/heads/a]; assert the fake saw find-open-change calls for exactly 'b' then 'a', in that order; assert two lines were sent, the first for b; a second run with only [create refs/tags/v1, delete refs/heads/gone] and `parley.change` makes no call, sends no line and returns no error"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "event_driven",
+          "condition": "a created or updated branch of an accepted push is the source of a change in state `open` or `draft`",
+          "action": "have the ref-updated stage that package 22 registers with the ref writer of package 18 record a new version of kind `push` for that change with the branch's new head, inside the commit step of the ref update, whatever options the push carries and without checking `changes:write`; the mapping takes the version the ref writer reports and records none itself",
+          "contract": "one version of kind `push` is recorded on the existing change, in the store transaction of the ref update; the mapping makes no record-version call and no open call for the branch; no change is opened",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a mapper built with a fake change service that records every call (find open change of a source, record version, open change) and returns scripted results, and a recorder for side-band lines"
+            ],
+            "pseudocode": "in internal/gitserver/changemap_test.go, a table over options {none, parley.change, parley.target=other} x credential {API key, PAT with only git:write}: the accepted update of the branch carries the version {demo, 7, 3} the ref writer reported; run the mapper; assert the outcome is 'new version 3 of #7'; assert no find, no record-version and no open call. In internal/gitserver/pushchange_integration_test.go, with the real stage: a push to the source branch of open change 1 leaves GET …/changes/1 with one more version of kind 'push' at the pushed head"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "event_driven",
+          "condition": "a created or updated branch of an accepted push is not the source of an `open` or `draft` change, was not moved by a direct push, and the push carries `parley.change` or `parley.target`",
+          "action": "open a change with the branch as its source",
+          "contract": "one change is opened for the branch, also when an earlier change of the same branch has landed or been abandoned",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a mapper built with a fake change service that records every call (find open change of a source, record version, open change) and returns scripted results, and a recorder for side-band lines"
+            ],
+            "pseudocode": "in internal/gitserver/changemap_test.go, a table over options {parley.change, parley.target=release, both} x earlier change of the branch {none, landed, abandoned}: the fake reports no open or draft change for the source; run the mapper on a repository workspace; assert exactly one open call whose source is (pushed workspace, branch); assert no record-version call"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "event_driven",
+          "condition": "a created or updated branch of an accepted push is not the source of an `open` or `draft` change, was not moved by a direct push, and the pushed workspace is a task fork whose `auto_change` is true",
+          "action": "open a change with the branch as its source, without any push option",
+          "contract": "one change is opened for the branch",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a mapper built with a fake change service that records every call (find open change of a source, record version, open change) and returns scripted results, and a recorder for side-band lines"
+            ],
+            "pseudocode": "in internal/gitserver/changemap_test.go: the pushed workspace is a task fork with auto_change true and the push has no options (as from a client without push-option support); the fake reports no open change; run the mapper; assert exactly one open call for (fork slug, branch). The same push to a fork with auto_change false makes no open call"
+          }
+        },
+        {
+          "id": "REQ-3.5",
+          "pattern": "event_driven",
+          "condition": "a created or updated branch of an accepted push is not the source of an `open` or `draft` change, the push carries neither `parley.change` nor `parley.target`, and the pushed workspace is not a task fork with `auto_change` true",
+          "action": "leave the branch without a change and send no line for it",
+          "contract": "no change is opened, no version is recorded and no side-band line is sent for the branch",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a mapper built with a fake change service that records every call (find open change of a source, record version, open change) and returns scripted results, and a recorder for side-band lines"
+            ],
+            "pseudocode": "in internal/gitserver/changemap_test.go, a table over the pushed workspace {repository workspace, task fork with auto_change false} x options {none, parley.title=x, parley.draft, parley.session=S}: the fake reports no open change; run the mapper; assert no open call, no record-version call and no line"
+          }
+        },
+        {
+          "id": "REQ-3.6",
+          "pattern": "event_driven",
+          "condition": "a branch that is not the source of an `open` or `draft` change is a protected branch that the push moved by a direct push under the owner exemption",
+          "action": "open no change for that branch and, when the push carries `parley.change` or `parley.target`, send the warning line for it",
+          "contract": "no change is opened for the branch; with `parley.change` or `parley.target` the client receives `warning: no change for <branch>: branch is protected and was pushed directly`, otherwise no line",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a mapper built with a fake change service that records every call (find open change of a source, record version, open change) and returns scripted results, and a recorder for side-band lines"
+            ],
+            "pseudocode": "in internal/gitserver/changemap_test.go, a table over the accepted update of `main` flagged direct x options {parley.change, parley.target=release, none} x workspace {repository, fork with auto_change true}: the fake reports no open change; run the mapper; assert no open call in every case; assert the line 'warning: no change for main: branch is protected and was pushed directly' is sent exactly when the options include parley.change or parley.target, and no line otherwise; in a push of [main (direct), topic] with parley.change, assert topic still gets its open call"
+          }
+        },
+        {
+          "id": "REQ-3.7",
+          "pattern": "unwanted",
+          "condition": "opening a change for a branch is refused with `change_exists` because another push opened a change for the same source in the meantime",
+          "action": "record a version of kind `push` on the existing change through the version recording of package 22, in a store transaction of the mapping, instead of reporting a failure",
+          "contract": "the outcome for the branch is a new version of the existing change, reported with the line `change <workspace>#<number> version <n>`",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a mapper built with a fake change service that records every call (find open change of a source, record version, open change) and returns scripted results, and a recorder for side-band lines"
+            ],
+            "pseudocode": "in internal/gitserver/changemap_test.go: the fake reports no open change at the first lookup, refuses the open with change_exists naming #9, then accepts a record-version for #9 returning version 2; run the mapper with parley.change; assert the calls are find, open, record-version(9) in that order; assert the outcome for the branch is 'new version 2 of #9' and no warning line is sent"
+          }
+        },
+        {
+          "id": "REQ-3.8",
+          "pattern": "unwanted",
+          "condition": "a push is refused (a ref was refused by a push rule, the pack could not be read, or an option was invalid) or carries no commands",
+          "action": "run no change mapping for that push",
+          "contract": "no version is recorded, no change is opened and no `change …` or `warning: no change …` line is sent",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "an in-process hub on 127.0.0.1:0 with a real store, real repositories on disk, the real `internal/change` component and the event log; a workspace `demo` in organization `acme` with default branch `main`, owned by user U; a clone of it made with the real `git` client using U's API key"
+            ],
+            "pseudocode": "in internal/gitserver/pushchange_integration_test.go, a table over {a push with `-o parley.change` of [topic, refs/parley/x] where the second ref is refused by the hub-owned-refs rule; a push with `-o parley.change` whose pack is over [git].max_push_size; `git push -o parley.change origin` with nothing to update}: assert the change list of `demo` is empty afterwards; assert stderr holds no line starting with 'remote: change ' or 'remote: warning: no change'"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "What a push-opened change is",
+      "rationale": "The push options describe the changes a push opens and nothing else; the change of a fork's branch belongs to the parent, where it will land.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "the mapping opens a change for a branch pushed to a repository workspace",
+          "action": "open the change in the pushed workspace with the source `{pushed workspace slug, branch}`, the target branch given by `parley.target` or none when the option is absent, and the pushing credential's actor as author",
+          "contract": "the change belongs to the pushed workspace; its source is the pushed branch; its target is the `parley.target` value, or the workspace's default branch when the option is absent; its author is the pushing credential's actor",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a mapper built with a fake change service that records every call (find open change of a source, record version, open change) and returns scripted results, and a recorder for side-band lines",
+              "an in-process hub on 127.0.0.1:0 with a real store, real repositories on disk, the real `internal/change` component and the event log; a workspace `demo` in organization `acme` with default branch `main`, owned by user U; a clone of it made with the real `git` client using U's API key"
+            ],
+            "pseudocode": "in internal/gitserver/changemap_test.go, a table over options {parley.change -> target absent; parley.target=release -> target 'release'}: run the mapper for a push by actor A to repository workspace 'demo', branch 'fix'; assert the open call has target workspace 'demo', source ('demo','fix'), the expected target and author A. In internal/gitserver/pushchange_integration_test.go: `git push -o parley.change origin fix`; assert GET /workspaces/demo/changes/1 has target_branch 'main' and source {workspace_slug 'demo', branch 'fix'} and author.username == U's"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "event_driven",
+          "condition": "the mapping opens a change for a branch pushed to a task fork",
+          "action": "open the change in the fork's parent workspace with the source `{fork slug, branch}`, and with the target branch given by `parley.target` or none when the option is absent",
+          "contract": "the change belongs to the fork's parent; its source is `{fork slug, branch}`; its target is the `parley.target` value, or the fork's base branch (`fork_point.ref`) when the option is absent",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "an in-process hub on 127.0.0.1:0 with a real store, real repositories on disk, the real `internal/change` component and the event log; a workspace `demo` in organization `acme` with default branch `main`, owned by user U; a clone of it made with the real `git` client using U's API key",
+              "a branch `release` in `demo`",
+              "a task fork of `demo` created from `release` (fork_point.ref == 'release') with auto_change false, cloned with a PAT bound to the fork carrying git:write and changes:write"
+            ],
+            "pseudocode": "in internal/gitserver/pushchange_integration_test.go: in a clone of the fork, commit on a new branch `work` and `git push -o parley.change origin work`; assert stderr has 'remote: change demo#1 version 1 (opened)'; assert GET /workspaces/demo/changes/1 has workspace_slug 'demo', source {workspace_slug: fork slug, branch: 'work'} and target_branch 'release'; assert the change list addressed by the fork's slug holds no change of its own"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "event_driven",
+          "condition": "the mapping opens a change",
+          "action": "pass the values of `parley.title` and `parley.intent` and the draft flag of `parley.draft` with the open request, and pass no title or intent for an absent option so that the defaults of the change component apply",
+          "contract": "the opened change has the title of `parley.title`, else the subject line of the branch's head commit; the intent of `parley.intent`, else the body of the head commit's message, then the `purpose` of the source fork; state `draft` with `parley.draft`, else `open`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "an in-process hub on 127.0.0.1:0 with a real store, real repositories on disk, the real `internal/change` component and the event log; a workspace `demo` in organization `acme` with default branch `main`, owned by user U; a clone of it made with the real `git` client using U's API key"
+            ],
+            "pseudocode": "in internal/gitserver/pushchange_integration_test.go, a table over pushes of a new branch whose head commit message is 'Fix retry loop\\n\\nRetries never stopped.': {`-o parley.change` -> title 'Fix retry loop', intent 'Retries never stopped.', state open; `-o parley.change -o parley.title=T -o parley.intent=I` -> title 'T', intent 'I', state open; `-o parley.change -o parley.draft` -> state draft, defaults for title and intent; head commit with no body, workspace setting changes.require_intent true, `-o parley.change -o parley.draft` -> opened, state draft, intent ''}: assert the fields of the opened change read through GET /workspaces/demo/changes/:number"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "event_driven",
+          "condition": "one push opens changes for several branches",
+          "action": "apply the same target, title, intent and draft options to each change the push opens",
+          "contract": "every change opened by the push has the target, title, intent and draft state the options give",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a mapper built with a fake change service that records every call (find open change of a source, record version, open change) and returns scripted results, and a recorder for side-band lines"
+            ],
+            "pseudocode": "in internal/gitserver/changemap_test.go: run the mapper over created branches [a, b, c] with parley.target=release, parley.title=T, parley.intent=I, parley.draft, where the fake reports an open change for b only; assert open calls for a and c, each with target 'release', title 'T', intent 'I', draft true; assert a record-version call for b"
+          }
+        },
+        {
+          "id": "REQ-4.5",
+          "pattern": "event_driven",
+          "condition": "a push carrying `parley.target`, `parley.title`, `parley.intent` or `parley.draft` updates a branch that is already the source of an `open` or `draft` change",
+          "action": "record the version and leave the existing change's title, intent, target branch and state as they were",
+          "contract": "the change gains one version; its `title`, `intent`, `target_branch` and `state` are unchanged; no second change is opened",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "an in-process hub on 127.0.0.1:0 with a real store, real repositories on disk, the real `internal/change` component and the event log; a workspace `demo` in organization `acme` with default branch `main`, owned by user U; a clone of it made with the real `git` client using U's API key",
+              "a branch `release` in `demo`"
+            ],
+            "pseudocode": "in internal/gitserver/pushchange_integration_test.go: open a change for `fix` with `git push -o parley.change -o parley.title=Old -o parley.intent=Why origin fix`; commit again and `git push -o parley.title=New -o parley.intent=Other -o parley.target=release -o parley.draft origin fix`; assert stderr has 'remote: change demo#1 version 2'; assert GET /workspaces/demo/changes/1 has version 2, title 'Old', intent 'Why', target_branch 'main', state 'open'; assert the change list still has exactly one change"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "What the git client sees",
+      "rationale": "The agent reads the number of its change and the version of its push from the output of `git push`, with no further request.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "the ref writer reports a version recorded for a branch of the push, or the mapping records one on an existing change after a lost race",
+          "action": "send the side-band line `change <workspace>#<number> version <n>` for that branch, where `<workspace>` is the slug of the workspace the change belongs to",
+          "contract": "one side-band line `change <workspace>#<number> version <n>`, shown by git as `remote: change <workspace>#<number> version <n>`; the line carries no URL",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/gitserver/pushreport_test.go, a table over outcomes: {new version 2 of change 12 in 'demo' -> 'change demo#12 version 2'; new version 31 of change 4 in parent 'demo' for a push to fork 'demo--k3x9w2ab' -> 'change demo#4 version 31'}: assert the formatted line equals the text exactly, ends with one newline when written to the side band, and holds no 'http'"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "event_driven",
+          "condition": "the mapping opens a change for a branch",
+          "action": "send the side-band line `change <workspace>#<number> version 1 (opened)` for that branch, or `change <workspace>#<number> version 1 (opened, draft)` when the change was opened in state `draft`",
+          "contract": "one side-band line `change <workspace>#<number> version 1 (opened)` or `change <workspace>#<number> version 1 (opened, draft)`",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/gitserver/pushreport_test.go, in the same table: {opened change 12 in 'demo', state open -> 'change demo#12 version 1 (opened)'; opened change 13 in 'demo', state draft -> 'change demo#13 version 1 (opened, draft)'; a failure for branch 'feat/x' with reason 'internal error' -> 'warning: no change for feat/x: internal error'}: assert exact text"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "ubiquitous",
+          "action": "for any accepted push, send at most one change line per created or updated branch, in command order, before the status report ends the answer",
+          "contract": "the `remote:` lines of one push appear in the order of its commands, one per mapped branch",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "an in-process hub on 127.0.0.1:0 with a real store, real repositories on disk, the real `internal/change` component and the event log; a workspace `demo` in organization `acme` with default branch `main`, owned by user U; a clone of it made with the real `git` client using U's API key",
+              "an open change #1 whose source is branch `a`"
+            ],
+            "pseudocode": "in internal/gitserver/pushchange_integration_test.go: `git push -o parley.change origin b a refs/tags/v1` where `a` already has an open change #1 and `b` has none; capture stderr; assert the lines starting with 'remote: change ' are exactly ['remote: change demo#2 version 1 (opened)', 'remote: change demo#1 version 2'] in the order the client listed the refs; assert no line mentions v1"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "event_driven",
+          "condition": "the git client of an accepted push did not negotiate a side band",
+          "action": "run the mapping as for any other push and send the status report without any change line",
+          "contract": "the response holds the status report only; the versions and changes exist as for a client with a side band",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "an in-process hub on 127.0.0.1:0 with a real store, real repositories on disk, the real `internal/change` component and the event log; a workspace `demo` in organization `acme` with default branch `main`, owned by user U; a clone of it made with the real `git` client using U's API key"
+            ],
+            "pseudocode": "in internal/gitserver/pushchange_integration_test.go: send a hand-built receive-pack request to POST /git/acme/demo.git/git-receive-pack that creates refs/heads/quiet with the capabilities 'report-status push-options' (no side-band) and the option parley.change; assert HTTP 200; assert the body is a plain status report with 'unpack ok' and 'ok refs/heads/quiet' and holds neither 'change demo#' nor a side-band channel byte; assert the change list of `demo` now has one change whose source branch is 'quiet'"
+          }
+        },
+        {
+          "id": "REQ-5.5",
+          "pattern": "ubiquitous",
+          "action": "finish the mapping of every branch of a push before answering the push, so that a change named on a `remote:` line is readable through the changes API as soon as `git push` returns",
+          "check": {
+            "same_as": "PATH-1"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Failures never fail the push",
+      "rationale": "The commits are the agent's work; a change that cannot be opened is a message to act on, not a reason to throw the push away.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "unwanted",
+          "condition": "the change component refuses to open a change for a branch because the target branch does not exist (including a `parley.target` that names no branch), the branch has no commits ahead of the target, a merge commit is among the commits ahead of the target, the intent is empty while `changes.require_intent` is true and `parley.draft` was not given, or for another reason that carries an `error_type`",
+          "action": "keep the push accepted and send `warning: no change for <branch>: <reason>` for that branch, with the reason of the refusal",
+          "contract": "the line `warning: no change for <branch>: <reason>` with `<reason>` equal to `target branch <target> does not exist (target_not_found)`, `no commits ahead of <target> (nothing_to_land)`, `merge commits are not supported (merge_commits_unsupported)`, `intent is required; push with -o parley.intent=<text> or -o parley.draft (intent_required)`, or for any other refusal its message followed by its `error_type` in parentheses; no change is created",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a mapper built with a fake change service that records every call (find open change of a source, record version, open change) and returns scripted results, and a recorder for side-band lines"
+            ],
+            "pseudocode": "in internal/gitserver/changemap_test.go, a table over the refusal the fake returns for the open call and the expected reason, for branch 'fix' and target 'main': {target_not_found with parley.target=nope -> 'target branch nope does not exist (target_not_found)'; target_not_found without parley.target (default target 'main' reported by the refusal) -> 'target branch main does not exist (target_not_found)'; nothing_to_land -> 'no commits ahead of main (nothing_to_land)'; merge_commits_unsupported -> 'merge commits are not supported (merge_commits_unsupported)'; intent_required -> 'intent is required; push with -o parley.intent=<text> or -o parley.draft (intent_required)'; error_type 'integration_branch' with message 'target is the integration branch' -> 'target is the integration branch (integration_branch)'; error_type 'invalid_request' with message 'title must be 1 to 200 characters' -> 'title must be 1 to 200 characters (invalid_request)'}: assert the single line sent is 'warning: no change for fix: <reason>'; assert the mapper returns no error"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "unwanted",
+          "condition": "the branch a push would open a change for is its own target: the target workspace is the pushed workspace and the target branch, given or default, is the pushed branch",
+          "action": "open no change and send the warning line for that branch without calling the open operation",
+          "contract": "the line `warning: no change for <branch>: branch is its own target`; no change is created",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a mapper built with a fake change service that records every call (find open change of a source, record version, open change) and returns scripted results, and a recorder for side-band lines"
+            ],
+            "pseudocode": "in internal/gitserver/changemap_test.go, a table: {repository workspace 'demo', branch 'rel', parley.target=rel; repository workspace with unprotected default branch 'main' pushed by a non-owner-exempt update (not direct), parley.change}: assert no open call; assert the line 'warning: no change for <branch>: branch is its own target'. A push of branch 'main' to a task fork whose base branch is 'main' is not this case (the target is in the parent): assert the open call is made"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "unwanted",
+          "condition": "a push made with a PAT that lacks `changes:write` would open a change for a branch",
+          "action": "open no change and send the warning line for that branch without calling the open operation",
+          "contract": "the line `warning: no change for <branch>: token lacks scope changes:write`; no change is created; API keys and the admin token are not scope-checked",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a mapper built with a fake change service that records every call (find open change of a source, record version, open change) and returns scripted results, and a recorder for side-band lines"
+            ],
+            "pseudocode": "in internal/gitserver/changemap_test.go, a table over the credential {PAT with git:write only -> warning 'warning: no change for fix: token lacks scope changes:write' and no open call; PAT with git:write and changes:write -> open call; API key -> open call; admin token -> open call} for a push with parley.change, and the first row again for a fork with auto_change true and no options; then, for the PAT with git:write only and a branch that has an open change, assert the record-version call is made and no warning is sent"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "unwanted",
+          "condition": "looking up the change of a branch, opening a change, or recording a version on an existing change after a lost race fails with an internal error or a panic",
+          "action": "send the warning line with the reason `internal error` for that branch and go on to map the remaining branches of the push",
+          "contract": "the line `warning: no change for <branch>: internal error`; the error's own text is not sent to the client; the other branches of the push get their own outcome",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a mapper built with a fake change service that records every call (find open change of a source, record version, open change) and returns scripted results, and a recorder for side-band lines"
+            ],
+            "pseudocode": "in internal/gitserver/changemap_test.go, a table over the failure for branch 'a' in a push of [a, b] with parley.change: {the open call returns an untyped error; the open call panics; the find-open-change lookup returns an error; a record-version call on an existing change after change_exists returns an error}: assert the line for a is 'warning: no change for a: internal error'; assert b is still mapped and gets 'change demo#<n> version 1 (opened)'; assert the mapper returns normally and the text of the underlying error appears in no line"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "ubiquitous",
+          "action": "for any branch whose mapping failed, keep the ref at the pushed head, report the ref `ok`, emit its `parley.git.push` event and let the git client exit 0",
+          "contract": "`ok <ref>` in the status report, the ref at the pushed head, one `parley.git.push` event for the ref, exit code 0 of `git push`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "an in-process hub on 127.0.0.1:0 with a real store, real repositories on disk, the real `internal/change` component and the event log; a workspace `demo` in organization `acme` with default branch `main`, owned by user U; a clone of it made with the real `git` client using U's API key"
+            ],
+            "pseudocode": "in internal/gitserver/pushchange_integration_test.go, a table over {`git push -o parley.target=nope origin fix` -> reason 'target branch nope does not exist (target_not_found)'; `git push -o parley.change origin same` where `same` points at the head of main -> 'no commits ahead of main (nothing_to_land)'; a branch holding a merge commit pushed with -o parley.change -> 'merge commits are not supported (merge_commits_unsupported)'; `git push -o parley.change origin fix` with a PAT of U carrying only git:write -> 'token lacks scope changes:write'}: assert git exits 0; assert stderr has 'remote: warning: no change for <branch>: <reason>' and no '[remote rejected]'; assert the hub's ref of the branch equals the local head; assert one `parley.git.push` event exists for the ref; assert the change list of `demo` is empty"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "An agent opens a change by pushing and adds a version with the next push",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "commits on a new branch `fix-retry` in a clone of workspace `demo` and runs `git push -o parley.change -o parley.title=\"Fix retry loop\" origin fix-retry`"
+        },
+        {
+          "actor": "git client",
+          "action": "sends the command, the two push options and the pack to the receive-pack route with the agent's PAT"
+        },
+        {
+          "actor": "parleyd",
+          "action": "validates the push options, receives the pack, applies the push rules and writes `refs/heads/fix-retry`"
+        },
+        {
+          "actor": "parleyd",
+          "action": "finds no open change for the branch, opens change `demo#1` with version 1 and the given title, emits `parley.git.push` and answers with the line `change demo#1 version 1 (opened)`"
+        },
+        {
+          "actor": "git client",
+          "action": "prints `remote: change demo#1 version 1 (opened)` and exits 0"
+        },
+        {
+          "actor": "agent",
+          "action": "commits again and runs `git push origin fix-retry` without options"
+        },
+        {
+          "actor": "parleyd",
+          "action": "writes the ref, records version 2 of change `demo#1` and answers with the line `change demo#1 version 2`"
+        },
+        {
+          "actor": "agent",
+          "action": "reads `GET /workspaces/demo/changes/1` and sees version 2 with the pushed head"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parleyd started in-process with its real router",
+          "git smart HTTP receive-pack and the push rules",
+          "the change component",
+          "the transactional store",
+          "bare repositories on disk",
+          "the event log",
+          "a stock git client"
+        ],
+        "setup": [
+          "a hub started on 127.0.0.1:0 with a temporary data directory",
+          "a user with a ready workspace `demo` in organization `acme` and a PAT carrying git:write, changes:read and changes:write",
+          "a clone of the workspace's git URL made with the git client"
+        ],
+        "end_state": [
+          "the first push printed `remote: change demo#1 version 1 (opened)` and the second `remote: change demo#1 version 2`",
+          "immediately after the second `git push` returns, `GET /workspaces/demo/changes/1` shows title `Fix retry loop`, state `open`, version 2 and `head_sha` equal to the local head of `fix-retry`",
+          "`refs/parley/changes/1/1` and `refs/parley/changes/1/2` are fetchable from the hub",
+          "the event log holds two `parley.git.push` events for `refs/heads/fix-retry`"
+        ],
+        "pseudocode": "in test/e2e/push_change_test.go: hub = startHub(t); clone = gitClone(hub.gitURL('acme','demo'), pat); commit(clone, 'fix-retry'); out1 = git(clone, 'push', '-o', 'parley.change', '-o', 'parley.title=Fix retry loop', 'origin', 'fix-retry'); assert out1.exit == 0 and contains(out1.stderr, 'remote: change demo#1 version 1 (opened)'); commit(clone, 'fix-retry'); out2 = git(clone, 'push', 'origin', 'fix-retry'); assert contains(out2.stderr, 'remote: change demo#1 version 2'); ch = apiGet('/workspaces/demo/changes/1'); assert ch.version == 2 and ch.head_sha == revParse(clone, 'fix-retry') and ch.title == 'Fix retry loop'; assert git(clone, 'fetch', 'origin', 'refs/parley/changes/1/1', 'refs/parley/changes/1/2').exit == 0"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "A push to a task fork opens a change in the parent without any option",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "clones a task fork of `demo` that has `auto_change` on, commits on a new branch `work` and runs `git push origin work`"
+        },
+        {
+          "actor": "git client",
+          "action": "sends the command and the pack to the fork's receive-pack route with the fork-bound PAT, with no push option"
+        },
+        {
+          "actor": "parleyd",
+          "action": "accepts the push, writes the branch in the fork and, because the fork has `auto_change` on, opens a change in `demo` with source `{fork slug, work}` and the fork's base branch as target"
+        },
+        {
+          "actor": "git client",
+          "action": "prints `remote: change demo#1 version 1 (opened)`"
+        },
+        {
+          "actor": "agent",
+          "action": "reads the change through `GET /workspaces/demo/changes/1` with the same token"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parleyd started in-process with its real router",
+          "task fork creation with a minted token",
+          "git smart HTTP receive-pack and the push rules",
+          "the change component",
+          "the transactional store",
+          "a stock git client"
+        ],
+        "setup": [
+          "a hub started on 127.0.0.1:0 with a ready workspace `demo` whose default branch is `main`",
+          "a task fork of `demo` created over the API with `auto_change` true, `purpose` `speed up retries` and a token carrying git:write, changes:read and changes:write"
+        ],
+        "end_state": [
+          "`git push origin work` exited 0 and printed `remote: change demo#1 version 1 (opened)`",
+          "`GET /workspaces/demo/changes/1` shows `workspace_slug` `demo`, source `{workspace_slug: <fork slug>, branch: work}`, `target_branch` `main` and state `open`",
+          "the branch `work` exists in the fork and not in `demo`"
+        ],
+        "pseudocode": "in test/e2e/push_change_test.go: fork = apiPost('/workspaces/demo/forks', {auto_change: true, purpose: 'speed up retries', token: {permissions: ['git:write','changes:read','changes:write']}}); clone = gitClone(hub.gitURL('acme', fork.slug), fork.token.secret); commit(clone, 'work'); out = git(clone, 'push', 'origin', 'work'); assert out.exit == 0 and contains(out.stderr, 'remote: change demo#1 version 1 (opened)'); ch = apiGet('/workspaces/demo/changes/1', fork.token.secret); assert ch.source.workspace_slug == fork.slug and ch.source.branch == 'work' and ch.target_branch == 'main'"
+      }
+    },
+    {
+      "id": "PATH-3",
+      "title": "A push with an invalid option is refused before anything is written",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "runs `git push -o parley.titel=x origin topic` in a clone of workspace `demo`"
+        },
+        {
+          "actor": "git client",
+          "action": "sends the command, the push option and the pack to the receive-pack route with the developer's API key"
+        },
+        {
+          "actor": "parleyd",
+          "action": "validates the push options before receiving the pack, finds `parley.titel` unknown, stores nothing and answers with `ng refs/heads/topic invalid push option parley.titel: unknown option` and the side-band line `error: invalid push option parley.titel: unknown option`"
+        },
+        {
+          "actor": "git client",
+          "action": "prints `remote: error: invalid push option parley.titel: unknown option` and `! [remote rejected] topic -> topic (invalid push option parley.titel: unknown option)` and exits non-zero"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parleyd started in-process with its real router",
+          "git smart HTTP receive-pack",
+          "the transactional store",
+          "bare repositories on disk",
+          "the event log",
+          "a stock git client"
+        ],
+        "setup": [
+          "a hub started on 127.0.0.1:0 with a ready workspace `demo`, cloned by its owner with an API key",
+          "a local branch `topic` with one commit the hub does not have"
+        ],
+        "end_state": [
+          "`git push` exited non-zero and its output names `parley.titel` and `unknown option`",
+          "`git ls-remote origin refs/heads/topic` returns nothing",
+          "the event log holds no `parley.git.push` event and `GET /workspaces/demo/changes` returns an empty list"
+        ],
+        "pseudocode": "in test/e2e/push_change_test.go: out = git(clone, 'push', '-o', 'parley.titel=x', 'origin', 'topic'); assert out.exit != 0; assert contains(out.stderr, 'remote: error: invalid push option parley.titel: unknown option'); assert git(clone, 'ls-remote', 'origin', 'refs/heads/topic').stdout == ''; assert len(apiGet('/workspaces/demo/changes').items) == 0; assert no event of type 'parley.git.push' in apiGet('/events/log?workspace=demo')"
+      }
+    }
+  ]
+}

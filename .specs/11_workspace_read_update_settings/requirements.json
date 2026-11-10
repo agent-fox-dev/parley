@@ -1,0 +1,792 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "11",
+  "spec_name": "workspace_read_update_settings",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "One workspace response object",
+      "rationale": "Clients read a workspace from many routes; one shape with no omitted field means they never have to guess whether a missing member is null.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "ubiquitous",
+          "action": "for any workspace it returns from a route of this package, return a JSON object that has exactly these members, with a member that has no value present as null and never left out: slug, kind, workspace_mode, git_url, default_branch, owner_id, org_id, status, display_name, description, head_sha, origin_head_sha, clone_error, last_sync_at, sync_error, upstream_url, integration_branch, upstream_head_sha, parent_slug, fork_point, expires_at, auto_change, purpose, session_id, settings, created_at, updated_at, org_slug, hub_url, access",
+          "contract": "a JSON object with the 30 named members; a nullable member without a value is the JSON value null",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/response_test.go, a table over {a standard repository workspace in status pending with nothing else set, a ready repository workspace with head_sha and last_sync_at set, a fork record}: obj = decode(render(workspace, caller)); assert the set of keys of obj equals the listed members; for the pending workspace assert default_branch, head_sha, origin_head_sha, clone_error, last_sync_at, sync_error, upstream_url, integration_branch, upstream_head_sha, parent_slug, fork_point, expires_at, auto_change, purpose and session_id are present and null; assert created_at and updated_at match the form 2026-01-02T03:04:05Z"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "ubiquitous",
+          "action": "for any workspace it returns, set org_slug to the slug of the workspace's organization and access to the caller's level on that workspace: admin for the admin token, owner for the owner, member for a member of the workspace's organization, whatever scopes the caller's token carries",
+          "contract": "org_slug: string; access: one of admin, owner, member",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace in an organization with slug acme that has an owner and one other member"
+            ],
+            "pseudocode": "in internal/workspace/response_test.go, a table over the callers {admin token, owner with an API key, owner with a PAT that carries only workspaces:read, member of the organization}: obj = render(workspace, caller); assert obj.org_slug == org.slug; assert obj.access == {admin, owner, owner, member} in table order"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "ubiquitous",
+          "action": "for any workspace it returns, set hub_url to <server.external_url>/git/<org_slug>/<slug>.git after removing one trailing slash from server.external_url, and to null when server.external_url is not set",
+          "contract": "hub_url: string or null",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/response_test.go, a table over external_url {'' -> null, 'https://hub.example' -> 'https://hub.example/git/acme/demo.git', 'https://hub.example/' -> 'https://hub.example/git/acme/demo.git', 'https://hub.example/parley/' -> 'https://hub.example/parley/git/acme/demo.git'}: assert render(workspace demo in org acme, caller).hub_url == expected"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Read one workspace",
+      "rationale": "A caller needs the full state of one workspace in every status, and a caller without access must learn nothing from asking.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "a caller with read access to a workspace sends GET /api/v1/workspaces/:slug",
+          "action": "answer with the workspace object of that workspace, whatever its status and whether it is a repository workspace or a fork",
+          "contract": "HTTP 200 with the workspace object",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/read_test.go with httptest, a table over the workspace {repository in status pending, cloning, ready, failed, archived; a fork record of a ready parent} and the caller {owner, member, admin token}: r = GET /api/v1/workspaces/<slug>; assert r.status == 200; assert r.json.slug == slug; assert r.json.status == the stored status; assert r.json.access == the caller's level"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "unwanted",
+          "condition": "GET /api/v1/workspaces/:slug names a workspace the caller has no read access to, or a slug that names no workspace",
+          "action": "refuse the request with the same status and the same body in both cases",
+          "contract": "HTTP 404 with error_type not_found and message 'workspace not found'; the two response bodies are byte-identical",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace private-one owned by another user in an organization the caller is not a member of"
+            ],
+            "pseudocode": "in internal/workspace/read_test.go: a = GET /api/v1/workspaces/private-one as a user who is neither owner nor member; b = GET /api/v1/workspaces/no-such-slug as the same user; assert a.status == 404 and b.status == 404; assert a.json.error.error_type == 'not_found'; assert a.json.error.message == 'workspace not found'; assert a.body == b.body; repeat with private-one archived and assert the same"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "unwanted",
+          "condition": "a PAT that holds neither workspaces:read nor workspaces:write sends GET /api/v1/workspaces or GET /api/v1/workspaces/:slug",
+          "action": "refuse the request before it looks the workspace up",
+          "contract": "HTTP 403 with error_type insufficient_scope, the same for an existing and for an unknown slug",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/read_test.go, a table over the route {GET /api/v1/workspaces, GET /api/v1/workspaces/demo, GET /api/v1/workspaces/no-such-slug} with a PAT whose scopes are [changes:read]: assert r.status == 403; assert r.json.error.error_type == 'insufficient_scope'; then with a PAT whose only scope is workspaces:write on the first two routes: assert r.status == 200"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "List the workspaces a caller can read",
+      "rationale": "A user sees their own workspaces and those of their organizations in one call, without archived workspaces and forks crowding the default view.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "a caller sends GET /api/v1/workspaces",
+          "action": "answer with the workspaces of the caller's readable set and no others, each as a workspace object whose access is owner for the caller's own workspaces and for the forks of those workspaces, member for workspaces of the caller's active organizations that the caller does not own, and admin for every workspace when the caller is the admin token",
+          "contract": "HTTP 200 with {items: [workspace object…], next_cursor: string or null}; items is an array also when empty",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "users alice, bob and carol; workspace a-own owned by alice in her personal organization; fork record a-own--t1 of a-own created by alice; workspace shared owned by alice in organization acme, of which alice and bob are members; workspace other owned by a fourth user in that user's personal organization"
+            ],
+            "pseudocode": "in internal/workspace/read_test.go with include_forks=true and include_archived=true, a table over the caller: alice -> {a-own: owner, a-own--t1: owner, shared: owner}; bob -> {shared: member, a-own--t1 absent, a-own absent}; carol (no workspace, no shared organization) -> items == [] and the JSON value of items is an array, not null; admin token -> all four with access admin. assert r.status == 200 and the map slug -> access equals the expected one"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "ubiquitous",
+          "action": "leave archived workspaces out of the list unless the query has include_archived=true, and leave forks out unless the query has include_forks=true or a parent parameter",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "repository workspace live in status ready, repository workspace old in status archived, fork record live--t1 of live"
+            ],
+            "pseudocode": "in internal/workspace/read_test.go as the owner of all three, a table over the query: '' -> [live]; 'include_archived=true' -> [live, old]; 'include_forks=true' -> [live, live--t1]; 'include_archived=true&include_forks=true' -> [live, old, live--t1]; 'include_archived=false&include_forks=false' -> [live]. assert the set of slugs in items equals the expected set"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "event_driven",
+          "condition": "GET /api/v1/workspaces carries parent=<slug>",
+          "action": "answer with only the forks of that workspace that the caller can read, whether or not include_forks is given, and with an empty list when the parent does not exist, is not readable by the caller or is itself a fork",
+          "contract": "HTTP 200; items holds only workspaces whose parent_slug equals the given slug",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "repository workspace live with fork records live--t1 and live--t2; another repository workspace with one fork"
+            ],
+            "pseudocode": "in internal/workspace/read_test.go, a table over (caller, parent): (owner of live, live) -> [live--t1, live--t2]; (owner, live with include_forks=false) -> [live--t1, live--t2]; (owner, no-such-slug) -> []; (a user with no access to live, live) -> []; (owner, live--t1) -> []. assert r.status == 200 and the slugs in items equal the expected list"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "ubiquitous",
+          "action": "order the list by created_at descending and then by slug ascending, and page it with limit and cursor so that following next_cursor from the first page until it is null returns every listed workspace exactly once in that order",
+          "contract": "next_cursor is a non-empty string while more items follow and null on the last page",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "five repository workspaces of one owner, three of them with the same created_at second and the slugs ab, aa and ac"
+            ],
+            "pseudocode": "in internal/workspace/read_test.go: all = GET /api/v1/workspaces?limit=200; assert slugs(all) == sorted by (created_at desc, slug asc), with aa before ab before ac among the three that share a timestamp; pages = follow next_cursor with limit=2; assert concat(pages) == slugs(all); assert the last page has next_cursor == null and every earlier page has a non-empty string"
+          }
+        },
+        {
+          "id": "REQ-3.5",
+          "pattern": "unwanted",
+          "condition": "GET /api/v1/workspaces carries include_archived or include_forks with a value other than true or false",
+          "action": "refuse the request",
+          "contract": "HTTP 400 with error_type invalid_request",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/read_test.go, a table over the query {include_archived=yes, include_archived=1, include_forks=TRUE, include_forks=}: r = GET /api/v1/workspaces?<query>; assert r.status == 400; assert r.json.error.error_type == 'invalid_request'"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Show every setting with its effective value and match branch globs",
+      "rationale": "A reader of a workspace must see how it behaves without knowing which keys were ever set.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "ubiquitous",
+          "action": "for any workspace object, return a settings object that holds exactly the 21 setting keys, each with its stored value when the key was set and otherwise its default: sync_enabled true; protected_branches [default_branch]; protect.owner_push true; land.strategy 'rebase'; land.by_author true; land.delete_source true; land.allow_override true; changes.require_intent true; changes.auto_restack true; audit_fetches false; forge_api_url ''; upstream_forge_api_url ''; patch_branch_source 'hub'; patch_divergence_policy 'replace'; push_patches_to_origin false; auto_rebuild_after_push true; auto_rebuild_after_sync true; rebuild_strategy 'rebase'; rebuild_fail_mode 'fail_fast'; rebuild_push_integration_branch false; squash_merge_detection 'both'",
+          "contract": "settings: an object with 21 members; bool keys are JSON booleans, enum and URL keys JSON strings, protected_branches a JSON array of strings",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/settings_test.go: eff = EffectiveSettings(stored = {}, default_branch = 'main'); assert the key set of eff equals the 21 keys; assert each value equals its default from the table, with protected_branches == ['main']; eff2 = EffectiveSettings(stored = {'land.strategy': 'squash', 'audit_fetches': true}, 'main'); assert eff2['land.strategy'] == 'squash'; assert eff2['audit_fetches'] == true; assert every other key of eff2 equals the same key of eff"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "ubiquitous",
+          "action": "for any workspace whose protected_branches was never set or was returned to its default, show protected_branches as a list holding the workspace's default_branch, or as the empty list while default_branch is null; and for any workspace whose protected_branches was set, show the stored list unchanged, the empty list included",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/settings_test.go, a table over (stored protected_branches, default_branch): (unset, null) -> []; (unset, 'main') -> ['main']; (unset, 'trunk') -> ['trunk']; ([], 'main') -> []; (['release/*'], 'main') -> ['release/*']; (['release/*'], null) -> ['release/*']. assert EffectiveSettings(stored, default_branch)['protected_branches'] == expected"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "state_driven",
+          "condition": "a workspace is a fork",
+          "action": "show in its settings the effective values of its parent, including a value the parent changed after the fork was created",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "repository workspace demo with default_branch main and fork record demo--t1 of it"
+            ],
+            "pseudocode": "in internal/workspace/read_test.go: f1 = GET /api/v1/workspaces/demo--t1; assert f1.json.settings == GET(/api/v1/workspaces/demo).json.settings; PATCH /api/v1/workspaces/demo {settings: {'land.strategy': 'squash'}}; f2 = GET /api/v1/workspaces/demo--t1; assert f2.json.settings['land.strategy'] == 'squash'; assert f2.json.settings.protected_branches == ['main']"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "ubiquitous",
+          "action": "for any branch glob and any branch name, report a match exactly when the glob matches the whole name, case-sensitive, where * matches any run of characters except /, ** matches any run of characters including /, and every other character matches itself; and for a list of globs, report a match exactly when at least one glob of the list matches",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/branchglob_test.go, a table over (glob, branch) -> MatchBranchGlob: (main, main) true; (main, main2) false; (main, Main) false; (release/*, release/1.x) true; (release/*, release/1/x) false; (release/*, release) false; (release/**, release/1/x) true; (**, a/b/c) true; (*, main) true; (*, a/b) false; (feature/*/wip, feature/x/wip) true; (a?b, a?b) true; (a?b, axb) false. MatchAnyBranchGlob: ([], main) false; ([dev, release/*], release/2) true; ([dev], main) false"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Apply a settings value key by key, all or nothing",
+      "rationale": "A caller changes one setting without restating the others, and a rejected request must leave the workspace as it was.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "an update carries settings as a JSON object whose keys and values are all valid",
+          "action": "store each given key with its value and leave every key not given at its current value",
+          "contract": "HTTP 200 with the workspace object; settings shows the given keys with the given values and every other key unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "repository workspace demo in status ready with default_branch main and no setting set"
+            ],
+            "pseudocode": "in internal/workspace/update_test.go: r1 = PATCH /api/v1/workspaces/demo {settings: {'land.strategy': 'squash'}}; assert r1.status == 200; r2 = PATCH /api/v1/workspaces/demo {settings: {'sync_enabled': false, 'protected_branches': ['main', 'release/**']}}; assert r2.status == 200; s = r2.json.settings; assert s['land.strategy'] == 'squash'; assert s['sync_enabled'] == false; assert s['protected_branches'] == ['main', 'release/**']; assert every other key equals its default; assert GET(/api/v1/workspaces/demo).json.settings == s"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "event_driven",
+          "condition": "a settings object carries a key with the value null",
+          "action": "return that key to its default and keep the other keys",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "repository workspace demo with default_branch main and the stored settings land.strategy squash, protected_branches [] and audit_fetches true"
+            ],
+            "pseudocode": "in internal/workspace/update_test.go: r = PATCH /api/v1/workspaces/demo {settings: {'land.strategy': null, 'protected_branches': null}}; assert r.status == 200; assert r.json.settings['land.strategy'] == 'rebase'; assert r.json.settings['protected_branches'] == ['main']; assert r.json.settings['audit_fetches'] == true"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "event_driven",
+          "condition": "an update carries settings with the value null",
+          "action": "return every setting key to its default",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/update_test.go with the setup of the null-key test: r = PATCH /api/v1/workspaces/demo {settings: null}; assert r.status == 200; assert r.json.settings == EffectiveSettings({}, 'main')"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "event_driven",
+          "condition": "POST /api/v1/workspaces carries a settings member",
+          "action": "apply the settings value by the same rules as an update, starting from the defaults, and create the workspace with the result",
+          "contract": "valid settings: HTTP 201 and the workspace object shows them; invalid settings: HTTP 400 with error_type invalid_request and no workspace is created",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/workspace/settings_test.go with httptest against the create route of package 10: r = POST /api/v1/workspaces {slug: 'demo', git_url: 'https://git.example/x/demo', settings: {'land.strategy': 'squash', 'sync_enabled': null}}; assert r.status == 201; assert r.json.settings['land.strategy'] == 'squash'; assert r.json.settings['sync_enabled'] == true; assert r.json.settings['protected_branches'] == []; bad = POST /api/v1/workspaces {slug: 'demo2', git_url: 'https://git.example/x/demo2', settings: {'land.strategy': 'merge'}}; assert bad.status == 400; assert bad.json.error.error_type == 'invalid_request'; assert GET(/api/v1/workspaces/demo2).status == 404"
+          }
+        },
+        {
+          "id": "REQ-5.5",
+          "pattern": "unwanted",
+          "condition": "a settings object carries at least one invalid key together with valid keys or other valid fields",
+          "action": "refuse the whole request and change no setting key and no other field of the workspace",
+          "contract": "HTTP 400 with error_type invalid_request; a following GET returns the workspace object unchanged, updated_at included",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/update_test.go: before = GET /api/v1/workspaces/demo; r = PATCH /api/v1/workspaces/demo {description: 'new', settings: {'sync_enabled': false, 'land.strategy': 'merge'}}; assert r.status == 400; assert r.json.error.error_type == 'invalid_request'; after = GET /api/v1/workspaces/demo; assert after.body == before.body"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Validate every setting key against its type",
+      "rationale": "Later features read settings without checking them again, so nothing invalid may ever be stored.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "unwanted",
+          "condition": "a settings value is neither null nor a JSON object",
+          "action": "refuse the request",
+          "contract": "HTTP 400 with error_type invalid_request",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/settings_test.go, a table over the settings value {'x', 5, true, []}: err = ApplySettings(current, value); assert err is an invalid-request error; and through PATCH /api/v1/workspaces/demo {settings: []}: assert r.status == 400 and r.json.error.error_type == 'invalid_request'"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "unwanted",
+          "condition": "a settings object carries a key that is not one of the 21 setting keys",
+          "action": "refuse the request with a message that names the key",
+          "contract": "HTTP 400 with error_type invalid_request and a message containing unknown setting \"<key>\"",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/settings_test.go, a table over the settings object {{'nope': 1}, {'land.Strategy': 'squash'}, {'land': {'strategy': 'squash'}}, {'': true}}: err = ApplySettings(current, obj); assert err.message contains 'unknown setting \"' + key + '\"'; and through PATCH with {settings: {'nope': 1}}: assert r.status == 400 and r.json.error.error_type == 'invalid_request' and r.json.error.message contains 'unknown setting \"nope\"'"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "unwanted",
+          "condition": "a bool setting key carries a value that is not a JSON boolean or null, or an enum setting key carries a value that is not one of its listed strings or null",
+          "action": "refuse the request with a message that names the key",
+          "contract": "HTTP 400 with error_type invalid_request and a message containing the key",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/settings_test.go, one table row per bool key with each of the values {'true', 1, 0, [], {}} and one row per enum key with each of the values {'Rebase', '', 'other', true, 3}; plus the accepted rows: every bool key with true and with false, every enum key with each of its listed strings (land.strategy: rebase, squash; patch_branch_source: hub, origin; patch_divergence_policy: replace, report; rebuild_strategy: rebase, merge; rebuild_fail_mode: fail_fast, continue; squash_merge_detection: ancestry_only, content_based, both). assert Apply fails with a message containing the key for the first group and succeeds, storing the value, for the second"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "event_driven",
+          "condition": "forge_api_url or upstream_forge_api_url carries a JSON string that, after trimming surrounding whitespace, is empty or an absolute https URL with a host and without userinfo, query or fragment",
+          "action": "store the value with surrounding whitespace removed",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/settings_test.go, a table over both URL keys and the value: 'https://api.github.com' -> same; '  https://ghe.example/api/v3  ' -> 'https://ghe.example/api/v3'; 'https://ghe.example:8443/api/v3/' -> same; '' -> ''; '   ' -> ''. assert ApplySettings succeeds and EffectiveSettings(...)[key] == expected"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "unwanted",
+          "condition": "forge_api_url or upstream_forge_api_url carries a value that is not null and not such a string",
+          "action": "refuse the request with a message that names the key",
+          "contract": "HTTP 400 with error_type invalid_request and a message containing the key",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/settings_test.go, a table over both URL keys and the value {'http://api.example', 'api.example/v3', '/api/v3', 'https://', 'https:///path', 'https://user@api.example', 'https://user:pw@api.example', 'https://api.example/v3?x=1', 'https://api.example/v3#frag', 'ssh://api.example', 5, true, []}: assert Apply fails with a message containing the key; and assert the message does not contain 'pw'"
+          }
+        },
+        {
+          "id": "REQ-6.6",
+          "pattern": "event_driven",
+          "condition": "protected_branches carries a JSON array of 0 to 50 distinct strings, each 1 to 255 characters long and a valid branch name in which * and ** may also appear",
+          "action": "store the list as given, in the given order",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/settings_test.go, a table over the list: [] ; ['main']; ['main', 'release/*', 'feature/**', '*']; a list of 50 distinct names; [a glob of exactly 255 characters]. assert ApplySettings succeeds and EffectiveSettings(...)['protected_branches'] == the list"
+          }
+        },
+        {
+          "id": "REQ-6.7",
+          "pattern": "unwanted",
+          "condition": "protected_branches carries a value that is not null and not such an array",
+          "action": "refuse the request with a message that names protected_branches",
+          "contract": "HTTP 400 with error_type invalid_request and a message containing protected_branches",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/settings_test.go, a table over the value {'main', 5, {}, ['main', 5], [''], ['main', 'main'], a list of 51 distinct names, [a glob of 256 characters], ['a b'], ['a..b'], ['-x'], ['x/'], ['x.lock'], ['a~b'], ['a^b'], ['a:b'], ['a?b'], ['a[b'], ['a\\\\b'], ['@'], ['a//b'], ['a@{b'], ['.hidden/x']}: assert Apply fails with a message containing 'protected_branches'"
+          }
+        },
+        {
+          "id": "REQ-6.8",
+          "pattern": "unwanted",
+          "condition": "a settings object carries more than one unknown or invalid key",
+          "action": "name in the error an unknown key before any invalid value, the first unknown key in byte order when there are several, and otherwise the invalid key that comes first in the order of the settings table",
+          "contract": "HTTP 400 with error_type invalid_request; the message names exactly one key, chosen by that rule",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/settings_test.go, a table over the settings object: {'squash_merge_detection': 'x', 'sync_enabled': 'x'} -> message contains 'sync_enabled' and not 'squash_merge_detection'; {'rebuild_strategy': 1, 'land.strategy': 1, 'protected_branches': 1} -> contains 'protected_branches'; {'forge_api_url': 'http://x', 'audit_fetches': 1} -> contains 'audit_fetches'; {'sync_enabled': 'x', 'zzz': 1, 'aaa': 1} -> contains 'unknown setting \"aaa\"'. each object is decoded from JSON text whose member order differs from the table order"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "Update the mutable fields of a workspace",
+      "rationale": "An owner corrects a name or a description without touching anything else, and nothing that defines the workspace can be changed by accident.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "event_driven",
+          "condition": "a caller with write access sends PATCH /api/v1/workspaces/:slug for a workspace that is not archived, with a JSON object that carries at least one valid mutable field",
+          "action": "change exactly the mutable fields given, leave every other field as it was, set updated_at to the current time and answer with the workspace object after the update",
+          "contract": "HTTP 200 with the workspace object after the update; members not named in the body are ignored",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "repository workspace demo with a clock the test controls"
+            ],
+            "pseudocode": "in internal/workspace/update_test.go, a table over the caller {owner, admin token} and the body: {display_name: 'Demo'} -> display_name 'Demo', description unchanged; {description: 'payments'} -> description 'payments', display_name unchanged; {display_name: 'D', description: 'p', unknown_member: 1} -> both changed. assert r.status == 200; assert r.json.updated_at >= before.updated_at; assert every member of r.json other than the given ones and updated_at equals before; assert GET(/api/v1/workspaces/demo).body == r.body. Then a table over the status {pending, cloning, ready, failed}: assert PATCH {description: 's'} answers 200"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "event_driven",
+          "condition": "an update carries display_name with the value null or the empty string, or description with the value null",
+          "action": "reset display_name to the slug, and description to the empty string, respectively",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "repository workspace demo with display_name 'Demo' and description 'payments'"
+            ],
+            "pseudocode": "in internal/workspace/update_test.go, a table over the body: {display_name: null} -> display_name 'demo'; {display_name: ''} -> display_name 'demo'; {description: null} -> description ''; {description: ''} -> description ''. assert r.status == 200 and the field equals the expected value"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "unwanted",
+          "condition": "the body of PATCH /api/v1/workspaces/:slug is not a JSON object, or is a JSON object that carries none of the mutable fields of the workspace's kind",
+          "action": "refuse the request and change nothing",
+          "contract": "HTTP 400 with error_type invalid_request; the workspace is unchanged",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/update_test.go, a table over the raw body {'[]', '\"x\"', '5', 'null', '{}', '{\"foo\": 1}', '{\"access\": \"owner\"}', '{not json'}: r = PATCH /api/v1/workspaces/demo with that body and Content-Type application/json; assert r.status == 400; assert r.json.error.error_type == 'invalid_request'; assert GET(/api/v1/workspaces/demo).body == before.body"
+          }
+        },
+        {
+          "id": "REQ-7.4",
+          "pattern": "unwanted",
+          "condition": "the body of an update of a repository workspace carries an immutable field (slug, kind, git_url, default_branch, owner_id, workspace_mode, upstream_url, integration_branch, parent_slug, fork_point) or a fork-only field (ttl, purpose, auto_change)",
+          "action": "refuse the request whatever the value of that field, including a value equal to the current one, and change nothing",
+          "contract": "HTTP 400 with error_type invalid_request; the workspace is unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "repository workspace demo in status ready"
+            ],
+            "pseudocode": "in internal/workspace/update_test.go, a table with one row per field in {slug, kind, git_url, default_branch, owner_id, workspace_mode, upstream_url, integration_branch, parent_slug, fork_point, ttl, purpose, auto_change}, each sent once with the workspace's current value (or null) and once with another value, always together with description: 'x': r = PATCH /api/v1/workspaces/demo; assert r.status == 400; assert r.json.error.error_type == 'invalid_request'; assert GET(/api/v1/workspaces/demo).json.description == before.description"
+          }
+        },
+        {
+          "id": "REQ-7.5",
+          "pattern": "unwanted",
+          "condition": "an update carries display_name that is not null and not a string of at most 128 characters, or description that is not null and not a string of at most 1024 characters",
+          "action": "refuse the request and change nothing",
+          "contract": "HTTP 400 with error_type invalid_request; the workspace is unchanged",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/update_test.go, a table: display_name of 128 code points -> 200; of 129 -> 400; of 128 two-byte characters -> 200; display_name 5 -> 400; display_name [] -> 400; description of 1024 code points -> 200; of 1025 -> 400; description false -> 400. for each 400 assert r.json.error.error_type == 'invalid_request' and the workspace is unchanged"
+          }
+        },
+        {
+          "id": "REQ-7.6",
+          "pattern": "unwanted",
+          "condition": "a caller with write access sends a valid update for a workspace in status archived",
+          "action": "refuse the request and change nothing",
+          "contract": "HTTP 409 with error_type workspace_archived; the workspace is unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "repository workspace old in status archived"
+            ],
+            "pseudocode": "in internal/workspace/update_test.go as the owner, a table over the body: {description: 'x'} -> 409 workspace_archived; {settings: {'sync_enabled': false}} -> 409 workspace_archived; {description: 5} -> 400 invalid_request (validation is decided before state); {slug: 'other'} -> 400 invalid_request. assert status and error_type; assert GET(/api/v1/workspaces/old).body == before.body"
+          }
+        },
+        {
+          "id": "REQ-7.7",
+          "pattern": "unwanted",
+          "condition": "PATCH /api/v1/workspaces/:slug comes from a member of the workspace's organization who is not its owner, from a PAT without the scope workspaces:write, or from a caller with no read access to the workspace",
+          "action": "refuse the request and change nothing",
+          "contract": "member: HTTP 403 with error_type forbidden, also for an archived workspace; PAT without workspaces:write: HTTP 403 with error_type insufficient_scope; no read access: HTTP 404 with error_type not_found",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/update_test.go, a table over (caller, workspace) with the body {description: 'x'}: (member of the organization, demo) -> 403 forbidden; (member, archived workspace old of the same organization) -> 403 forbidden, not 409; (owner with a PAT whose only scope is workspaces:read, demo) -> 403 insufficient_scope; (PAT without workspaces:write, no-such-slug) -> 403 insufficient_scope; (user with no access, demo) -> 404 not_found with a body identical to the one for no-such-slug. assert status and error_type; assert the description of demo is unchanged"
+          }
+        },
+        {
+          "id": "REQ-7.8",
+          "pattern": "state_driven",
+          "condition": "a workspace is a fork",
+          "action": "apply display_name and description in an update as for a repository workspace, and refuse an update whose body carries org_id or settings, whatever their values, changing nothing",
+          "contract": "display_name or description: HTTP 200 with the fork's workspace object; org_id or settings: HTTP 400 with error_type not_supported_on_fork",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "repository workspace demo in status ready and fork record demo--t1 of it"
+            ],
+            "pseudocode": "in internal/workspace/update_test.go as the fork's owner: r = PATCH /api/v1/workspaces/demo--t1 {display_name: 'task 1', description: 'fix'}; assert r.status == 200 and both fields changed; r2 = PATCH {display_name: null}; assert r2.json.display_name == 'demo--t1'; then a table over the body {{org_id: 'acme'}, {org_id: null}, {settings: {'sync_enabled': false}}, {settings: null}, {description: 'y', settings: {}}}: assert r.status == 400; assert r.json.error.error_type == 'not_supported_on_fork'; assert GET(/api/v1/workspaces/demo--t1).json.description == 'fix'"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "Move a workspace to another organization",
+      "rationale": "A repository registered under a personal organization must be able to follow its owner into a team without being registered again, and its forks must not be left behind.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "an update of a repository workspace carries org_id with the id or the slug of an organization of which the workspace's owner is a member",
+          "action": "set the workspace's organization to that organization, so that org_id, org_slug and hub_url of the workspace object show it, its members gain read access and the members of the previous organization who do not own the workspace lose it",
+          "contract": "HTTP 200 with the workspace object; org_id is the organization's canonical id whether the request gave the id or the slug",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "server.external_url https://hub.example; user alice owns workspace demo in her personal organization; organization acme with members alice and bob"
+            ],
+            "pseudocode": "in internal/workspace/update_test.go, a table over the org_id value {acme's id, 'acme'} and the caller {alice, admin token}: r = PATCH /api/v1/workspaces/demo {org_id: value}; assert r.status == 200; assert r.json.org_id == acme.id; assert r.json.org_slug == 'acme'; assert r.json.hub_url == 'https://hub.example/git/acme/demo.git'; assert GET /api/v1/workspaces/demo as bob answers 200 with access member; then move demo to a third organization of which alice is a member and bob is not, and assert bob's GET answers 404"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "event_driven",
+          "condition": "an update of a repository workspace carries org_id with the value null",
+          "action": "move the workspace to the personal organization of the workspace's owner",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "workspace demo owned by alice in organization acme"
+            ],
+            "pseudocode": "in internal/workspace/update_test.go, a table over the caller {alice, admin token}: r = PATCH /api/v1/workspaces/demo {org_id: null}; assert r.status == 200; assert r.json.org_id == alice's personal organization id; assert r.json.org_slug == that organization's slug"
+          }
+        },
+        {
+          "id": "REQ-8.3",
+          "pattern": "event_driven",
+          "condition": "an update moves a repository workspace that has forks to another organization",
+          "action": "move every fork of the workspace to the same organization in the same store transaction as the workspace",
+          "contract": "after HTTP 200 the workspace and all its forks show the new org_id; after a failure none of them does",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "workspace demo owned by alice in her personal organization, with fork records demo--t1 and demo--t2"
+            ],
+            "pseudocode": "in internal/workspace/update_test.go: PATCH /api/v1/workspaces/demo {org_id: 'acme'}; for each fork: f = GET /api/v1/workspaces/<fork>; assert f.json.org_id == acme.id and f.json.org_slug == 'acme'; assert bob (member of acme) reads both forks with status 200; then with a store that fails the write of the second fork: assert the PATCH answers 500 and demo and both forks still show the previous organization"
+          }
+        },
+        {
+          "id": "REQ-8.4",
+          "pattern": "unwanted",
+          "condition": "an update carries org_id naming an organization of which the workspace's owner is not a member",
+          "action": "refuse the request and change nothing, whoever the caller is",
+          "contract": "HTTP 403 with error_type forbidden; the workspace and its forks are unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "workspace demo owned by alice; organization beta of which alice is not a member"
+            ],
+            "pseudocode": "in internal/workspace/update_test.go, a table over the caller {alice, admin token} and the value {beta's id, 'beta'}: r = PATCH /api/v1/workspaces/demo {org_id: value, description: 'x'}; assert r.status == 403; assert r.json.error.error_type == 'forbidden'; assert GET(/api/v1/workspaces/demo).body == before.body"
+          }
+        },
+        {
+          "id": "REQ-8.5",
+          "pattern": "unwanted",
+          "condition": "an update carries org_id with a value that is neither null nor a string naming an existing organization by id or slug",
+          "action": "refuse the request and change nothing",
+          "contract": "HTTP 400 with error_type invalid_request; the workspace is unchanged",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/workspace/update_test.go, a table over the org_id value {'no-such-org', '00000000-0000-0000-0000-000000000000', '', 5, true, {}}: r = PATCH /api/v1/workspaces/demo {org_id: value}; assert r.status == 400; assert r.json.error.error_type == 'invalid_request'; assert the workspace's org_id is unchanged"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-9",
+      "title": "Record every successful update as a hub event",
+      "rationale": "Changes to a workspace's settings change what may land; the audit record must show who changed which fields and when.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-9.1",
+          "pattern": "event_driven",
+          "condition": "an update of a workspace succeeds, including one that leaves every value as it was",
+          "action": "write, in the same store transaction as the update, exactly one hub event of type parley.workspace.update whose workspace and resource_id are the workspace's slug, whose resource_type is workspace, whose actor is the caller and whose metadata.fields lists the names of the mutable fields the body carried, in the order display_name, description, org_id, settings",
+          "contract": "one event {type: parley.workspace.update, workspace: slug, resource_type: workspace, resource_id: slug, metadata: {fields: [string…]}} readable from the event log after the response",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/workspace/update_test.go against the real event log of internal/event, a table over the body: {description: 'x'} -> fields ['description']; {settings: {'sync_enabled': false}, display_name: 'D', foo: 1} -> ['display_name', 'settings']; {org_id: null, description: null} -> ['description', 'org_id']; the same {description: 'x'} sent a second time -> one more event with ['description']. assert the event log grew by exactly one event per request; assert e.type == 'parley.workspace.update', e.workspace == 'demo', e.resource_type == 'workspace', e.resource_id == 'demo', e.actor_id == the caller's user id (null with actor_type admin_token for the admin token); assert e.metadata.fields == expected; assert the serialized event contains neither a setting key nor a setting value"
+          }
+        },
+        {
+          "id": "REQ-9.2",
+          "pattern": "event_driven",
+          "condition": "an update of a fork succeeds",
+          "action": "add metadata.parent_slug with the slug of the fork's parent to the event",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "repository workspace demo and fork record demo--t1 of it"
+            ],
+            "pseudocode": "in internal/workspace/update_test.go: PATCH /api/v1/workspaces/demo--t1 {description: 'fix'}; e = the last event of the log; assert e.type == 'parley.workspace.update'; assert e.workspace == 'demo--t1'; assert e.metadata.parent_slug == 'demo'; assert e.metadata.fields == ['description']"
+          }
+        },
+        {
+          "id": "REQ-9.3",
+          "pattern": "unwanted",
+          "condition": "an update is refused or fails",
+          "action": "write no hub event",
+          "contract": "the event log holds no new event; when the event cannot be written the update answers HTTP 500 with error_type internal and the workspace is unchanged",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/workspace/update_test.go, a table over the refused request {body {slug: 'x'} -> 400; settings {'nope': 1} -> 400; a member's update -> 403; org_id of an organization the owner is not in -> 403; an update of an archived workspace -> 409; an update of an unknown slug -> 404; a store that fails the event write -> 500}: n = count(event log); send the request; assert count(event log) == n; for the 500 case assert GET(/api/v1/workspaces/demo).body == before.body"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-10",
+      "title": "List, read and update workspaces from the CLI",
+      "rationale": "Developers and scripts work from the shell; each route needs a command that sends exactly what the flags say.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-10.1",
+          "pattern": "event_driven",
+          "condition": "a user runs parley workspace list",
+          "action": "send GET /api/v1/workspaces with one query parameter per flag given (include_archived=true, include_forks=true, parent, limit, cursor) and none for a flag not given, and print the list page it receives",
+          "contract": "exit code 0; stdout is the JSON document {items, next_cursor} the hub answered",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/workspace_test.go against an httptest hub that records requests, a table over the arguments: [] -> query ''; [--include-archived] -> include_archived=true; [--include-forks, --parent, demo, --limit, 10, --cursor, abc] -> include_forks=true, parent=demo, limit=10, cursor=abc. assert the recorded method, path and query; assert stdout parses as JSON equal to the hub's body; assert exit code 0"
+          }
+        },
+        {
+          "id": "REQ-10.2",
+          "pattern": "event_driven",
+          "condition": "a user runs parley workspace get <slug>",
+          "action": "send GET /api/v1/workspaces/<slug> with the slug percent-encoded as one path segment and print the workspace it receives",
+          "contract": "exit code 0 and the workspace object on stdout; a hub error gives exit code 1 with the error envelope on stderr",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/workspace_test.go against the recording hub: run [workspace, get, demo--t1]; assert the recorded request is GET /api/v1/workspaces/demo--t1; run [workspace, get, a/b]; assert the raw request path is /api/v1/workspaces/a%2Fb; assert stdout equals the hub's body as indented JSON and exit code 0; with the hub answering 404 and the envelope: assert exit code 1, stdout empty and stderr holds the envelope with error_type not_found"
+          }
+        },
+        {
+          "id": "REQ-10.3",
+          "pattern": "event_driven",
+          "condition": "a user runs parley workspace update <slug> with at least one of its flags",
+          "action": "send PATCH /api/v1/workspaces/<slug> with a JSON body that holds exactly the fields the flags name (--display-name, --description and --org as strings under display_name, description and org_id; --clear-display-name, --clear-description and --clear-org as null, a clear flag winning over its value flag; every --setting under settings) and print the updated workspace",
+          "contract": "exit code 0; stdout is the workspace object the hub answered",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/workspace_test.go against the recording hub, a table over the arguments -> recorded body: [--description, x] -> {description: 'x'}; [--display-name, D, --org, acme] -> {display_name: 'D', org_id: 'acme'}; [--clear-description] -> {description: null}; [--display-name, D, --clear-display-name] -> {display_name: null}; [--clear-org] -> {org_id: null}; [--display-name, ''] -> {display_name: ''}; [--setting, land.strategy=squash] -> {settings: {'land.strategy': 'squash'}}. assert the method is PATCH, the path /api/v1/workspaces/demo, the Content-Type application/json and the decoded body equals the expected object with no other member; assert exit code 0 and stdout equals the hub's body"
+          }
+        },
+        {
+          "id": "REQ-10.4",
+          "pattern": "ubiquitous",
+          "action": "for any --setting argument, split it at the first = into key and value and send, under settings[key]: null when the value is empty; otherwise, when the key is protected_branches, the list of the value's comma-separated parts; otherwise the boolean when the value is true or false; otherwise the value as a string; and for a key given more than once, only the last value",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/workspace_test.go, a table over the --setting arguments -> the settings object sent: [sync_enabled=false] -> {sync_enabled: false}; [audit_fetches=true] -> {audit_fetches: true}; [land.strategy=] -> {'land.strategy': null}; [protected_branches=main,release/*] -> {protected_branches: ['main', 'release/*']}; [protected_branches=main] -> {protected_branches: ['main']}; [protected_branches=true] -> {protected_branches: ['true']}; [protected_branches=] -> {protected_branches: null}; [forge_api_url=https://x.example/api?a=b] -> {forge_api_url: 'https://x.example/api?a=b'}; [land.strategy=True] -> {'land.strategy': 'True'}; [land.strategy=rebase, land.strategy=squash] -> {'land.strategy': 'squash'}. assert the decoded settings member of the recorded PATCH body equals the expected object"
+          }
+        },
+        {
+          "id": "REQ-10.5",
+          "pattern": "unwanted",
+          "condition": "parley workspace update is run without any of its flags, or with a --setting argument that has no = or an empty key",
+          "action": "fail before sending any request",
+          "contract": "exit code 2; nothing on stdout; the error envelope with code 0 and error_type usage_error on stderr; no request is sent",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/workspace_test.go against the recording hub, a table over the arguments {[workspace, update, demo]; [workspace, update, demo, --setting, sync_enabled]; [workspace, update, demo, --setting, =true]; [workspace, update, demo, --description, x, --setting, novalue]}: assert exit code 2; assert stdout is empty; assert stderr parses as an envelope with error.code == 0 and error.error_type == 'usage_error'; assert the hub recorded no request"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "A developer changes a workspace from the CLI and reads it back",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "runs parley workspace update demo --description \"payments service\" --setting land.strategy=squash"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "parses the flags and sends PATCH /api/v1/workspaces/demo with description and settings"
+        },
+        {
+          "actor": "parleyd",
+          "action": "authenticates the caller, finds owner access, validates the body and the settings key, stores both fields and the parley.workspace.update event in one transaction and answers 200 with the workspace object"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints the workspace object on stdout and exits 0"
+        },
+        {
+          "actor": "developer",
+          "action": "runs parley workspace get demo and parley workspace list"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers both reads with the stored description and the effective settings"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parley CLI command tree",
+          "parleyd HTTP server with its middleware",
+          "access component",
+          "workspace store on SQLite",
+          "event log"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with an empty data directory",
+          "a user with an API key who owns the repository workspace demo, created through POST /api/v1/workspaces against a local bare repository made with git init in a temporary directory"
+        ],
+        "end_state": [
+          "parley workspace get demo prints description 'payments service' and settings['land.strategy'] 'squash' with the other 20 keys at their defaults",
+          "parley workspace list prints one item, demo, with access owner",
+          "the event log holds one parley.workspace.update event for demo with metadata.fields ['description', 'settings']"
+        ],
+        "pseudocode": "in test/e2e/workspace_read_update_test.go: hub = startHub(t); key = loginUser(hub); create demo; out = runCLI('workspace', 'update', 'demo', '--description', 'payments service', '--setting', 'land.strategy=squash'); assert out.exit == 0; got = json(runCLI('workspace', 'get', 'demo').stdout); assert got.description == 'payments service'; assert got.settings['land.strategy'] == 'squash'; assert len(got.settings) == 21; lst = json(runCLI('workspace', 'list').stdout); assert slugs(lst.items) == ['demo']; ev = GET /api/v1/events/log filtered to parley.workspace.update; assert ev.items[-1].metadata.fields == ['description', 'settings']"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "A developer moves a workspace into an organization and a member finds it",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "sends PATCH /api/v1/workspaces/demo with org_id set to the slug of an organization they belong to"
+        },
+        {
+          "actor": "parleyd",
+          "action": "confirms that the workspace's owner is a member of the organization, moves the workspace and its forks, records parley.workspace.update and answers 200"
+        },
+        {
+          "actor": "org member",
+          "action": "sends GET /api/v1/workspaces"
+        },
+        {
+          "actor": "parleyd",
+          "action": "computes the member's readable set and answers with demo, access member and a hub_url under the organization's slug"
+        },
+        {
+          "actor": "org member",
+          "action": "sends PATCH /api/v1/workspaces/demo with a new description"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers 403 forbidden and changes nothing"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parleyd HTTP server with its middleware",
+          "identity store with users, organizations and memberships",
+          "access component",
+          "workspace store on SQLite",
+          "event log"
+        ],
+        "setup": [
+          "a hub started in-process with server.external_url set",
+          "two users; the first owns workspace demo in a personal organization; an organization acme of which both are members"
+        ],
+        "end_state": [
+          "the member's list holds demo with access member, org_slug acme and hub_url ending in /git/acme/demo.git",
+          "the member's PATCH was answered 403 with error_type forbidden and the description of demo is unchanged",
+          "the event log holds exactly one parley.workspace.update event for demo, with metadata.fields ['org_id']"
+        ],
+        "pseudocode": "in test/e2e/workspace_read_update_test.go: before = GET /api/v1/workspaces as member; assert 'demo' not in slugs(before.items); r = PATCH /api/v1/workspaces/demo {org_id: 'acme'} as owner; assert r.status == 200; lst = GET /api/v1/workspaces as member; item = the item with slug demo; assert item.access == 'member'; assert item.hub_url endswith '/git/acme/demo.git'; p = PATCH /api/v1/workspaces/demo {description: 'mine'} as member; assert p.status == 403 and p.json.error.error_type == 'forbidden'; assert GET(/api/v1/workspaces/demo as owner).json.description == ''"
+      }
+    }
+  ],
+  "external_apis": [
+    {
+      "package": "github.com/spf13/cobra",
+      "version": "v1",
+      "verified": false,
+      "symbols": [
+        {
+          "name": "Command",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "type Command struct { Use string; Short string; Args PositionalArgs; RunE func(cmd *Command, args []string) error; ... }"
+        },
+        {
+          "name": "Command.Flags",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) Flags() *pflag.FlagSet"
+        },
+        {
+          "name": "FlagSet.StringArray",
+          "import_path": "github.com/spf13/pflag",
+          "signature": "func (f *FlagSet) StringArray(name string, value []string, usage string) *[]string"
+        },
+        {
+          "name": "FlagSet.Changed",
+          "import_path": "github.com/spf13/pflag",
+          "signature": "func (f *FlagSet) Changed(name string) bool"
+        }
+      ]
+    }
+  ]
+}

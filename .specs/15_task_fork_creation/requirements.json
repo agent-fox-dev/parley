@@ -1,0 +1,930 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "15",
+  "spec_name": "task_fork_creation",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Fork creation in one call",
+      "rationale": "An agent starts work with one request and needs no second call to learn where its fork is or when it ends.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "a caller with read access to a `ready` repository workspace sends `POST /api/v1/workspaces/:slug/forks` with a valid body",
+          "action": "create the fork synchronously as a workspace with slug `<parent slug>--<name>`, `kind` `fork`, `status` `ready`, `workspace_mode` `standard`, the caller as `owner_id`, the parent's `org_id`, `parent_slug` the parent, `display_name` the slug, `description` empty, and `git_url`, `origin_head_sha`, `upstream_url`, `integration_branch` and `upstream_head_sha` null",
+          "contract": "HTTP 201 with body `{workspace, remote}`; `workspace` is the fork's workspace object with `access` `owner` and `head_sha` equal to the parent's head of the base branch; `remote` equals `workspace.hub_url`, and is null when `[server].external_url` is empty; `token` and `sandbox` are absent when not requested; a `GET /api/v1/workspaces/<fork slug>` sent next answers 200",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub built in-process with a real store and a real `git`; a `ready` repository workspace `demo` owned by a developer in organization `acme`, with branches `main` (default) and `release` and tag `v1`",
+              "`[server].external_url` is `https://hub.test`"
+            ],
+            "pseudocode": "in internal/fork/create_test.go, TestCreate_AnswersReadyFork: r = post('/api/v1/workspaces/demo/forks', {name: 'task1'}) as the owner; assert r.status == 201; w = r.json.workspace; assert w.slug == 'demo--task1' and w.kind == 'fork' and w.status == 'ready' and w.workspace_mode == 'standard' and w.parent_slug == 'demo' and w.org_id == org('acme').id and w.owner_id == owner.id and w.access == 'owner' and w.git_url == null and w.display_name == 'demo--task1'; assert w.head_sha == git(demo, 'rev-parse main'); assert r.json.remote == w.hub_url == 'https://hub.test/git/acme/demo--task1.git'; assert 'token' not in r.json and 'sandbox' not in r.json; assert get('/api/v1/workspaces/demo--task1').status == 200; a second sub-test with external_url '' asserts r.json.remote == null; a third with a carry-patch parent asserts w.workspace_mode == 'standard' and w.upstream_url == null"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "event_driven",
+          "condition": "the request has no body, or a body `{}`, or a body whose members are null, or a body with members this route does not define",
+          "action": "treat a null member as absent and apply the defaults: a generated `name` of 8 characters from lower-case letters and digits, `ref` the parent's default branch, `ttl` `[forks].default_ttl`, `auto_change` true, `purpose` null and `session_id` null, and ignore the undefined members",
+          "contract": "HTTP 201; `workspace.slug` matches `^demo--[a-z0-9]{8}$`; `workspace.default_branch` is the parent's default branch; `workspace.auto_change` is true; `workspace.purpose` and `workspace.session_id` are null; `workspace.expires_at` is `created_at` plus `[forks].default_ttl`",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store and a real `git`; a `ready` repository workspace `demo` owned by a developer in organization `acme`, with branches `main` (default) and `release` and tag `v1`",
+              "a fixed clock; `[forks].default_ttl` `7d`"
+            ],
+            "pseudocode": "in internal/fork/create_test.go, TestCreate_Defaults, a table over the bodies {absent, '{}', '{\"colour\":\"red\"}', '{\"name\":null,\"ref\":null,\"ttl\":null,\"auto_change\":null,\"token\":null,\"purpose\":null,\"session_id\":null,\"sandbox\":null}'}: r = post(...); assert r.status == 201; assert regexp('^demo--[a-z0-9]{8}$').match(w.slug); assert w.default_branch == 'main' and w.auto_change == true and w.purpose == null and w.session_id == null; assert w.expires_at == clock.now + 7d; assert 'token' not in r.json and 'sandbox' not in r.json"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "event_driven",
+          "condition": "the caller is a member of the parent's organization who is not the parent's owner, or presents a PAT bound to the parent",
+          "action": "create the fork with that caller's user as its owner, in the parent's organization",
+          "contract": "HTTP 201; `workspace.owner_id` is the caller's user id; `workspace.org_id` is the parent's; `workspace.access` is `owner`; the same member's `PATCH /api/v1/workspaces/demo` still answers 403 `forbidden`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub built in-process with a real store and a real `git`; a `ready` repository workspace `demo` owned by a developer in organization `acme`, with branches `main` (default) and `release` and tag `v1`",
+              "the real access component and binding guard are installed"
+            ],
+            "pseudocode": "in internal/fork/create_test.go, TestCreate_MemberOwnsFork, a table over the callers {member of acme with an API key, the owner with a PAT bound to 'demo' holding workspaces:write}: r = post('/api/v1/workspaces/demo/forks', {}) as caller; assert r.status == 201; assert w.owner_id == caller.user and w.org_id == org('acme').id and w.access == 'owner'; for the member also assert patch('/api/v1/workspaces/demo', {description: 'x'}).status == 403"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "event_driven",
+          "condition": "the body's `ref` names a branch of the parent",
+          "action": "record that branch as the fork's base branch and `default_branch`, and record `fork_point` as `{ref, sha}` with the 40-character id of the parent's head of that branch at creation",
+          "contract": "HTTP 201; `workspace.default_branch` equals `ref`; `workspace.fork_point` equals `{ref: <ref>, sha: <parent head of ref at creation>}`; `workspace.head_sha` equals `fork_point.sha` at creation",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store and a real `git`; a `ready` repository workspace `demo` owned by a developer in organization `acme`, with branches `main` (default) and `release` and tag `v1`"
+            ],
+            "pseudocode": "in internal/fork/create_test.go, TestCreate_ForkPoint: r = post(..., {ref: 'release'}); assert w.default_branch == 'release'; assert w.fork_point == {ref: 'release', sha: git(demo, 'rev-parse release')}; assert len(w.fork_point.sha) == 40; assert w.head_sha == w.fork_point.sha"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "event_driven",
+          "condition": "the body's `ttl` is a duration of at least 5 minutes and at most `[forks].max_ttl`",
+          "action": "set `expires_at` to the creation time plus `ttl`",
+          "contract": "HTTP 201; `workspace.expires_at` minus `workspace.created_at` equals `ttl`, for `5m`, `90m`, `24h` and a `ttl` equal to `[forks].max_ttl`",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store and a real `git`; a `ready` repository workspace `demo` owned by a developer in organization `acme`, with branches `main` (default) and `release` and tag `v1`",
+              "a fixed clock"
+            ],
+            "pseudocode": "in internal/fork/create_test.go, TestCreate_TTL, a table over ttl {'5m', '90m', '24h', '30d'} with max_ttl '30d': r = post(..., {ttl}); assert r.status == 201; assert parse(w.expires_at) - parse(w.created_at) == duration(ttl)"
+          }
+        },
+        {
+          "id": "REQ-1.6",
+          "pattern": "event_driven",
+          "condition": "a fork is created",
+          "action": "write one hub event `parley.workspace.fork` in the same transaction as the fork, with the caller as actor, `workspace` and `resource_id` the fork's slug, the fork's `session_id` when it has one, and metadata `parent_slug`, `fork_point`, `expires_at`, `auto_change`, `purpose` and, when a token was minted, `token_id`",
+          "contract": "the event log holds exactly one `parley.workspace.fork` event for the fork with those members; metadata has no `token_id` when no token was requested and never a token value; a refused request adds no event",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub built in-process with a real store and a real `git`; a `ready` repository workspace `demo` owned by a developer in organization `acme`, with branches `main` (default) and `release` and tag `v1`",
+              "the real event log"
+            ],
+            "pseudocode": "in internal/fork/create_test.go, TestCreate_EmitsForkEvent: post(..., {name: 'e1', purpose: 'fix loader'}); ev = events(type 'parley.workspace.fork'); assert len(ev) == 1; assert ev[0].workspace == 'demo--e1' and ev[0].resource_id == 'demo--e1' and ev[0].actor == owner; assert ev[0].metadata == {parent_slug: 'demo', fork_point: w.fork_point, expires_at: w.expires_at, auto_change: true, purpose: 'fix loader'}; post(..., {name: 'e2', token: {permissions: ['git:read']}}); assert events()[1].metadata.token_id == r.json.token.token_id and the raw event text does not contain r.json.token.token; post(..., {name: 'BAD'}); assert len(events(type 'parley.workspace.fork')) == 2"
+          }
+        },
+        {
+          "id": "REQ-1.7",
+          "pattern": "event_driven",
+          "condition": "a request repeats an earlier successful fork creation with the same `Idempotency-Key`, caller and body within 24 hours",
+          "action": "answer with the recorded response without the member `token.token`, and create nothing",
+          "contract": "HTTP 200 with the original body except that `token.token` is absent; the parent has one fork and the caller one token from the two requests",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub built in-process with a real store and a real `git`; a `ready` repository workspace `demo` owned by a developer in organization `acme`, with branches `main` (default) and `release` and tag `v1`",
+              "the idempotency middleware of the server is installed"
+            ],
+            "pseudocode": "in internal/fork/create_test.go, TestCreate_IdempotentReplayOmitsSecret: body = {name: 'idem', token: {permissions: ['git:read']}}; a = post(..., body, header Idempotency-Key 'k1'); b = post(..., body, header Idempotency-Key 'k1'); assert a.status == 201 and b.status == 200; assert a.json.token.token != ''; assert 'token' not in b.json.token; assert b.json.workspace == a.json.workspace and b.json.token.token_id == a.json.token.token_id; assert count(forks of demo) == 1 and count(tokens bound to 'demo--idem') == 1"
+          }
+        },
+        {
+          "id": "REQ-1.8",
+          "pattern": "unwanted",
+          "condition": "a generated fork name is already in use for the parent",
+          "action": "generate another name, at most 8 times in all, and create the fork under the first free one",
+          "contract": "HTTP 201 with a slug different from every existing fork's; the caller never receives 409 for a name it did not give; when all 8 generated names are in use the answer is HTTP 500 with `error_type` `internal` and nothing is created",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store and a real `git`; a `ready` repository workspace `demo` owned by a developer in organization `acme`, with branches `main` (default) and `release` and tag `v1`"
+            ],
+            "pseudocode": "in internal/fork/create_test.go, TestCreate_GeneratedNameCollision: with the name generator stubbed to return 'aaaaaaaa', 'aaaaaaaa', 'bbbbbbbb' and a fork 'demo--aaaaaaaa' present: r = post(..., {}); assert r.status == 201 and w.slug == 'demo--bbbbbbbb'; with the generator stubbed to always return 'aaaaaaaa': r = post(..., {}); assert r.status == 500 and r.json.error.error_type == 'internal'; assert generator.calls == 8; assert count(forks of demo) == 2"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Refusals of fork creation",
+      "rationale": "A caller must be able to tell from the status and the error type alone why no fork was made, and a refusal must leave nothing to clean up.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "unwanted",
+          "condition": "the caller of `POST /api/v1/workspaces/:slug/forks` is the admin token",
+          "action": "refuse at the access step, before reading the body, because a fork needs a user as owner",
+          "contract": "HTTP 403 with `error_type` `forbidden`, for a valid and for an invalid body; no fork record, no repository directory, no token and no event are added",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store and a real `git`; a `ready` repository workspace `demo` owned by a developer in organization `acme`, with branches `main` (default) and `release` and tag `v1`",
+              "`unchanged(parent)` asserts: the count of fork records of the parent, the entries of the repository directory beside the parent's copy, the count of tokens and the count of events are what they were before the request"
+            ],
+            "pseudocode": "in internal/fork/create_refuse_test.go, TestCreate_RefusesAdminToken, a table over the bodies {'{}', '{\"name\":\"BAD\"}', 'not json'}: r = post('/api/v1/workspaces/demo/forks', body) with the admin token; assert r.status == 403 and r.json.error.error_type == 'forbidden'; assert unchanged(demo)"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "unwanted",
+          "condition": "the body is not a JSON object, or `name` breaks the fork-name rule, or `ref` is not a non-empty string, or `ttl` is not a duration or is shorter than 5 minutes or longer than `[forks].max_ttl`, or `auto_change` is not a boolean, or `purpose` is not a string or exceeds 1024 characters, or `token` or `sandbox` is not an object, or `session_id` is not a UUID",
+          "action": "refuse the request",
+          "contract": "HTTP 400 with `error_type` `invalid_request`; no fork record, no repository directory, no token and no event are added",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store and a real `git`; a `ready` repository workspace `demo` owned by a developer in organization `acme`, with branches `main` (default) and `release` and tag `v1`",
+              "`[forks].max_ttl` `30d`"
+            ],
+            "pseudocode": "in internal/fork/create_refuse_test.go, TestCreate_RefusesInvalidBody, a table over the bodies {'[]', '\"x\"', {name: ''}, {name: 'a'*33}, {name: 'Task'}, {name: '-a'}, {name: 'a-'}, {name: 'a--b'}, {name: 7}, {ref: ''}, {ref: 5}, {ttl: '4m'}, {ttl: '31d'} with max_ttl 30d, {ttl: '0m'}, {ttl: '90s'}, {ttl: '1.5h'}, {ttl: 60}, {auto_change: 'yes'}, {auto_change: 1}, {purpose: 'x'*1025}, {purpose: 3}, {token: 'git:read'}, {sandbox: []}, {session_id: 'not-a-uuid'}}: r = post(...); assert r.status == 400 and r.json.error.error_type == 'invalid_request'; assert unchanged(demo); and the accepted boundaries {name: 'a'}, {name: 'a'*32}, {purpose: 'x'*1024} answer 201"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "unwanted",
+          "condition": "the workspace named by `:slug` is itself a fork",
+          "action": "refuse the request",
+          "contract": "HTTP 400 with `error_type` `not_supported_on_fork`; no fork record, no repository directory, no token and no event are added",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store and a real `git`; a `ready` repository workspace `demo` owned by a developer in organization `acme`, with branches `main` (default) and `release` and tag `v1`"
+            ],
+            "pseudocode": "in internal/fork/create_refuse_test.go, TestCreate_RefusesForkOfFork: post('/api/v1/workspaces/demo/forks', {name: 'f1'}); r = post('/api/v1/workspaces/demo--f1/forks', {}); assert r.status == 400 and r.json.error.error_type == 'not_supported_on_fork'; assert count(all forks) == 1"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "unwanted",
+          "condition": "the parent is not `ready`, or a reclone, archive or delete is running on it",
+          "action": "refuse the request by the parent's state",
+          "contract": "HTTP 409 with `error_type` `workspace_busy` for `pending`, `cloning` and a set maintenance marker, `workspace_not_ready` for `failed`, and `workspace_archived` for `archived`; no fork record, no repository directory, no token and no event are added",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store and a real `git`; a `ready` repository workspace `demo` owned by a developer in organization `acme`, with branches `main` (default) and `release` and tag `v1`"
+            ],
+            "pseudocode": "in internal/fork/create_refuse_test.go, TestCreate_RefusesByParentState, a table {pending: workspace_busy, cloning: workspace_busy, ready with the maintenance marker set: workspace_busy, failed: workspace_not_ready, archived: workspace_archived}: set the parent's state in the store; r = post(..., {}); assert r.status == 409 and r.json.error.error_type == want; assert unchanged(demo)"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "unwanted",
+          "condition": "`ref` does not name a branch of the parent",
+          "action": "refuse the request, also when `ref` names a tag or is a commit id of the parent",
+          "contract": "HTTP 400 with `error_type` `fork_ref_not_found`; no fork record, no repository directory, no token and no event are added",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store and a real `git`; a `ready` repository workspace `demo` owned by a developer in organization `acme`, with branches `main` (default) and `release` and tag `v1`"
+            ],
+            "pseudocode": "in internal/fork/create_refuse_test.go, TestCreate_RefusesUnknownRef, a table over ref {'nope', 'v1' (a tag), 'refs/heads/main', the 40-character id of main's head, 'refs/tags/v1'}: r = post(..., {ref}); assert r.status == 400 and r.json.error.error_type == 'fork_ref_not_found'; assert unchanged(demo)"
+          }
+        },
+        {
+          "id": "REQ-2.6",
+          "pattern": "unwanted",
+          "condition": "the given `name` is already the name of a fork of the parent",
+          "action": "refuse the request; of several concurrent requests with the same `name`, create exactly one fork",
+          "contract": "HTTP 409 with `error_type` `conflict`; the existing fork is unchanged; of 8 concurrent requests with one `name`, exactly one answers 201 and seven answer 409 `conflict`, and one fork record and one repository directory exist for the name",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub built in-process with a real store and a real `git`; a `ready` repository workspace `demo` owned by a developer in organization `acme`, with branches `main` (default) and `release` and tag `v1`"
+            ],
+            "pseudocode": "in internal/fork/create_refuse_test.go, TestCreate_RefusesNameInUse: post(..., {name: 'dup'}); r = post(..., {name: 'dup'}); assert r.status == 409 and r.json.error.error_type == 'conflict'; then 8 goroutines post {name: 'race'} at once: assert count(status == 201) == 1 and count(status == 409) == 7; assert count(fork records named 'demo--race') == 1 and the fork's repository opens with git"
+          }
+        },
+        {
+          "id": "REQ-2.7",
+          "pattern": "unwanted",
+          "condition": "the parent already has `[forks].max_per_workspace` forks",
+          "action": "refuse the request, counting only forks that exist, and never let concurrent requests bring the parent above the limit",
+          "contract": "HTTP 429 with `error_type` `fork_limit_reached`; no fork record, no repository directory, no token and no event are added; after one fork's record is removed the next request answers 201; of 6 concurrent requests against a parent with 1 free place, exactly one answers 201",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub built in-process with a real store and a real `git`; a `ready` repository workspace `demo` owned by a developer in organization `acme`, with branches `main` (default) and `release` and tag `v1`",
+              "`[forks].max_per_workspace` 3; a second `ready` workspace `other`"
+            ],
+            "pseudocode": "in internal/fork/create_refuse_test.go, TestCreate_RefusesAtForkLimit: with max_per_workspace 3: three posts answer 201; r = post(..., {}); assert r.status == 429 and r.json.error.error_type == 'fork_limit_reached'; assert unchanged(demo); remove one fork record through the store; assert post(..., {}).status == 201; remove one again; 6 goroutines post at once: assert count(status == 201) == 1 and count(status == 429) == 5; assert count(forks of demo) == 3; forks of another parent 'other' do not count: post('/api/v1/workspaces/other/forks', {}).status == 201"
+          }
+        },
+        {
+          "id": "REQ-2.8",
+          "pattern": "unwanted",
+          "condition": "a request fails more than one check",
+          "action": "answer by the first failing check in this order: caller is the admin token; body values; session link; parent is a fork; parent state; `ref`; fork limit; name in use; token refusal; sandbox refusal",
+          "contract": "the status and `error_type` are those of the earliest failing check of that order, for each adjacent pair of checks",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store and a real `git`; a `ready` repository workspace `demo` owned by a developer in organization `acme`, with branches `main` (default) and `release` and tag `v1`",
+              "a session linker stub that refuses, and a sandbox component stub that refuses with 422 `credential_missing`"
+            ],
+            "pseudocode": "in internal/fork/create_refuse_test.go, TestCreate_RefusalOrder, a table of requests that fail two adjacent checks with the expected winner: {admin token + name 'BAD': 403 forbidden; name 'BAD' + unknown session: 400 invalid_request; unknown session + parent is a fork: 400 unknown_session; parent is a fork + (its parent archived): 400 not_supported_on_fork; parent archived + ref 'nope': 409 workspace_archived; ref 'nope' + limit reached: 400 fork_ref_not_found; limit reached + name in use: 429 fork_limit_reached; name in use + token with an unregistered scope: 409 conflict; token with an unregistered scope + refusing sandbox component: 400 invalid_request}: assert (r.status, r.json.error.error_type) == want"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "A token minted with the fork",
+      "rationale": "An orchestrator hands an untrusted agent a credential that works on one fork only, without a second call in which the fork exists unprotected.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "the body has a `token` object with a non-empty `permissions` list of registered scopes",
+          "action": "create, in the same transaction as the fork, a PAT owned by the caller and bound to the fork, with `name` defaulting to `fork:<fork slug>`, the given `permissions` and `paths`, and `expires_at` equal to the creation time plus `expires`, or null without `expires`",
+          "contract": "HTTP 201 whose `token` member is the token object with `workspace` the fork's slug, `user_id` the caller, `revoked_at` null and the secret in `token.token`; that secret authenticates `GET /api/v1/workspaces/<fork slug>` with 200 and gets 404 `not_found` on another workspace the caller owns; no later response of any route carries the secret",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub built in-process with a real store and a real `git`; a `ready` repository workspace `demo` owned by a developer in organization `acme`, with branches `main` (default) and `release` and tag `v1`",
+              "the real minting component and binding guard; a fixed clock; a second workspace `other` of the same owner"
+            ],
+            "pseudocode": "in internal/fork/token_test.go, TestCreate_MintsBoundToken: r = post(..., {name: 't1', token: {permissions: ['git:read', 'workspaces:read'], paths: ['src/**']}}); t = r.json.token; assert t.workspace == 'demo--t1' and t.name == 'fork:demo--t1' and t.user_id == owner.id and t.permissions == ['git:read', 'workspaces:read'] and t.paths == ['src/**'] and t.expires_at == null and t.revoked_at == null and t.token startswith 'parley_pat_'; assert get('/api/v1/workspaces/demo--t1', bearer t.token).status == 200; assert get('/api/v1/workspaces/other', bearer t.token).status == 404; the list of tokens bound to the fork shows t.token_id and no member 'token'; a second sub-test with {token: {name: 'ci', permissions: ['git:read'], expires: '2h'}} asserts t.name == 'ci' and t.expires_at == clock.now + 2h"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "unwanted",
+          "condition": "the `token` object has no `permissions`, an empty `permissions`, an unregistered scope, an invalid `paths` glob, an `expires` that is not a duration, or a `name` that is not a string",
+          "action": "refuse the request and create neither the token nor the fork",
+          "contract": "HTTP 400 with `error_type` `invalid_request`; no fork record, no repository directory, no token and no event are added",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub built in-process with a real store and a real `git`; a `ready` repository workspace `demo` owned by a developer in organization `acme`, with branches `main` (default) and `release` and tag `v1`",
+              "the real minting component"
+            ],
+            "pseudocode": "in internal/fork/token_test.go, TestCreate_RefusesInvalidToken, a table over token {{}, {permissions: []}, {permissions: 'git:read'}, {permissions: ['no:such']}, {permissions: ['git:read'], paths: ['/abs']}, {permissions: ['git:read'], expires: 'soon'}, {permissions: ['git:read'], expires: '0h'}, {permissions: ['git:read'], name: 5}}: r = post(..., {name: 'bad', token}); assert r.status == 400 and r.json.error.error_type == 'invalid_request'; assert unchanged(demo)"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "unwanted",
+          "condition": "the caller authenticates with a PAT and the body has `token`, and the caller's PAT lacks `tokens:manage`, or does not itself hold a requested scope, or is path-limited while the request has no `paths` or a glob that none of the caller's globs covers",
+          "action": "refuse the request and create neither the token nor the fork",
+          "contract": "HTTP 403 with `error_type` `insufficient_scope`; no fork record, no repository directory, no token and no event are added; the same PAT with a body without `token` answers 201",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub built in-process with a real store and a real `git`; a `ready` repository workspace `demo` owned by a developer in organization `acme`, with branches `main` (default) and `release` and tag `v1`",
+              "the real minting component with the subset rule"
+            ],
+            "pseudocode": "in internal/fork/token_test.go, TestCreate_RefusesTokenBeyondCaller, a table over (caller PAT, token) {(scopes [workspaces:write, git:read], {permissions: ['git:read']}); (scopes [workspaces:write, tokens:manage, git:read], {permissions: ['git:write']}); (scopes [workspaces:write, tokens:manage, git:write] paths ['src/**'], {permissions: ['git:write']}); (same path-limited PAT, {permissions: ['git:write'], paths: ['docs/**']})}: r = post(..., {name: 'p', token}) with the PAT; assert r.status == 403 and r.json.error.error_type == 'insufficient_scope'; assert unchanged(demo); then for each PAT: assert post(..., {}).status == 201; and the path-limited PAT with {permissions: ['git:write'], paths: ['src/loader/**']} answers 201"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "event_driven",
+          "condition": "the request that creates a fork is authenticated with a PAT",
+          "action": "record that PAT's id on the fork as its creating token, and record none for an API key",
+          "contract": "a PAT bound to the parent gets HTTP 200 on `GET /api/v1/workspaces/<slug>` of a fork it created and HTTP 404 `not_found` on a fork of the same parent created with another credential of the same user",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub built in-process with a real store and a real `git`; a `ready` repository workspace `demo` owned by a developer in organization `acme`, with branches `main` (default) and `release` and tag `v1`",
+              "the real binding guard"
+            ],
+            "pseudocode": "in internal/fork/token_test.go, TestCreate_RecordsCreatingToken: pat = a PAT bound to 'demo' with workspaces:write; post(..., {name: 'mine'}) with pat; post(..., {name: 'theirs'}) with the owner's API key; assert get('/api/v1/workspaces/demo--mine', bearer pat).status == 200; assert get('/api/v1/workspaces/demo--theirs', bearer pat).status == 404; assert store.fork('demo--mine').creating_token == pat.id and store.fork('demo--theirs').creating_token == null"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Session link and sandbox with the fork",
+      "rationale": "A fork is attributed to the agent session that asked for it, and an agent that asks for a sandbox never ends up with a fork it cannot run in.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "the body's `session_id` is a UUID that the session-linking rule accepts for the caller and the parent",
+          "action": "store the id on the fork, carry it on the fork's events and record the link of the fork to the session through the linker's record operation inside the fork's creation transaction",
+          "contract": "HTTP 201 with `workspace.session_id` equal to the id; the `parley.workspace.fork` event carries the same `session_id`; the linker's check was asked once with the session id, the caller and the parent's slug, and its record was called once, with the fork's open transaction, the session id, the parent's slug and the fork's slug",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store and a real `git`; a `ready` repository workspace `demo` owned by a developer in organization `acme`, with branches `main` (default) and `release` and tag `v1`"
+            ],
+            "pseudocode": "in internal/fork/session_test.go, TestCreate_LinksSession: sid = uuid(); linker = stub accepting (sid, owner, 'demo'); r = post(..., {session_id: sid}); assert r.status == 201 and w.session_id == sid; assert events(type 'parley.workspace.fork')[0].session_id == sid; assert linker.checks == [(sid, owner, 'demo')]; assert linker.records == [(sid, 'demo', w.slug)] and that the marker row the stub's record wrote through the transaction it was given is committed with the fork; a second sub-test whose record returns an error asserts 500 with error_type 'internal' and unchanged(demo)"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "unwanted",
+          "condition": "the body's `session_id` is a UUID that the session-linking rule refuses, or the hub has no session component",
+          "action": "refuse the request",
+          "contract": "HTTP 400 with `error_type` `unknown_session`; no fork record, no repository directory, no token and no event are added",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store and a real `git`; a `ready` repository workspace `demo` owned by a developer in organization `acme`, with branches `main` (default) and `release` and tag `v1`"
+            ],
+            "pseudocode": "in internal/fork/session_test.go, TestCreate_RefusesUnknownSession, a table over the linkers {stub refusing every id, none wired}: r = post(..., {session_id: uuid()}); assert r.status == 400 and r.json.error.error_type == 'unknown_session'; assert unchanged(demo)"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "event_driven",
+          "condition": "the body has a `sandbox` object and the sandbox component accepts it",
+          "action": "call the sandbox component once, inside the fork's transaction and after the fork's record, token and repository exist, with the caller, the fork, the `sandbox` object as received and the fork's `session_id` and `purpose` as defaults, and return the component's sandbox object",
+          "contract": "HTTP 201 with body `{workspace, remote, sandbox}` where `sandbox` is the component's object unchanged; the fork exists with `status` `ready`",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store and a real `git`; a `ready` repository workspace `demo` owned by a developer in organization `acme`, with branches `main` (default) and `release` and tag `v1`",
+              "a session linker stub that accepts"
+            ],
+            "pseudocode": "in internal/fork/sandbox_test.go, TestCreate_PassesSandboxThrough: comp = stub returning {id: 'sbx_1', state: 'provisioning'}; r = post(..., {name: 's1', purpose: 'p', session_id: sid, sandbox: {profile: 'default', command: ['make', 'test'], extra: 1}}); assert r.status == 201 and r.json.sandbox == {id: 'sbx_1', state: 'provisioning'} and w.status == 'ready'; assert comp.calls == 1; c = comp.last; assert c.caller == owner and c.fork.slug == 'demo--s1' and c.raw == the bytes of the sandbox member and c.default_session_id == sid and c.default_purpose == 'p'; assert c.fork_record_visible_in_tx and c.fork_repository_exists"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "unwanted",
+          "condition": "the body has a `sandbox` object and the sandbox component refuses it",
+          "action": "create no fork and answer with the component's error",
+          "contract": "the response has the status, `error_type` and extra members of the component's error unchanged; no fork record, no repository directory, no token and no event are added, also when the same request asked for a token",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store and a real `git`; a `ready` repository workspace `demo` owned by a developer in organization `acme`, with branches `main` (default) and `release` and tag `v1`"
+            ],
+            "pseudocode": "in internal/fork/sandbox_test.go, TestCreate_SandboxRefusalCreatesNoFork, a table over the component's errors {422 credential_missing, 429 sandbox_capacity with members limit, maximum, current, 403 insufficient_scope, 400 invalid_request}: r = post(..., {name: 's2', token: {permissions: ['git:read']}, sandbox: {profile: 'default'}}); assert r.status == err.status and r.json.error.error_type == err.type and r.json.error contains err.extras; assert unchanged(demo); assert post(..., {name: 's2'}).status == 201"
+          }
+        },
+        {
+          "id": "REQ-4.5",
+          "pattern": "unwanted",
+          "condition": "the body has a `sandbox` object and the hub has no sandbox component",
+          "action": "create no fork",
+          "contract": "HTTP 404 with `error_type` `sandboxes_disabled`; no fork record, no repository directory, no token and no event are added",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store and a real `git`; a `ready` repository workspace `demo` owned by a developer in organization `acme`, with branches `main` (default) and `release` and tag `v1`"
+            ],
+            "pseudocode": "in internal/fork/sandbox_test.go, TestCreate_SandboxWithoutComponent: with no sandbox component wired: r = post(..., {sandbox: {profile: 'default'}}); assert r.status == 404 and r.json.error.error_type == 'sandboxes_disabled'; assert unchanged(demo)"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "No copy of history",
+      "rationale": "A fork of a very large repository must be as quick and as small as a fork of an empty one.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "ubiquitous",
+          "action": "for any parent repository, create a fork's repository without writing an object or a pack into it and without changing the parent's repository",
+          "contract": "after creation `git count-objects -v` in the fork's repository reports `count: 0` and `in-pack: 0`; the parent's refs and object counts are what they were before",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a bare parent repository made with `git init` in `t.TempDir()` holding 3 commits on `main`, branch `release` and tag `v1`"
+            ],
+            "pseudocode": "in internal/gitrepo/fork_test.go, TestCreateFork_CopiesNothing, a table over parents {1 commit, 300 commits in a pack}: before = (git(parent, 'for-each-ref'), git(parent, 'count-objects -v')); CreateFork(parentDir, forkDir); c = git(forkDir, 'count-objects -v'); assert c.count == 0 and c['in-pack'] == 0; assert (git(parent, 'for-each-ref'), git(parent, 'count-objects -v')) == before; assert git(forkDir, 'rev-parse --is-bare-repository') == 'true'"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "ubiquitous",
+          "action": "for any commit reachable from a branch or tag of the parent, make it readable through the fork's repository from the moment the fork exists, including commits the parent receives after the fork was created",
+          "contract": "`git cat-file -e <id>` in the fork's repository succeeds for the heads of the parent's branches and tags and for a commit added to the parent afterwards; `git log <parent head>` in the fork lists the parent's full history",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a bare parent repository made with `git init` in `t.TempDir()` holding 3 commits on `main`, branch `release` and tag `v1`"
+            ],
+            "pseudocode": "in internal/gitrepo/fork_test.go, TestCreateFork_SharesHistory: CreateFork(parentDir, forkDir); for id in {rev-parse main, release, v1 in the parent}: assert git(forkDir, 'cat-file -e ' + id) exits 0; assert count(git(forkDir, 'rev-list ' + mainHead)) == 3; n = commit a new file on main in the parent; assert git(forkDir, 'cat-file -e ' + n) exits 0"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "ubiquitous",
+          "action": "for any branch and commit written to a fork, store them in the fork's repository alone",
+          "contract": "after a commit is pushed to a new branch of the fork, the parent's ref list is unchanged, `git cat-file -e <new id>` fails in the parent, and the fork's object count is the number of objects pushed",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a bare parent repository made with `git init` in `t.TempDir()` holding 3 commits on `main`, branch `release` and tag `v1`"
+            ],
+            "pseudocode": "in internal/gitrepo/fork_test.go, TestCreateFork_OwnWorkStaysInFork: CreateFork(parentDir, forkDir); refs = git(parent, 'for-each-ref'); clone the fork's directory into a working tree, commit one changed file on branch 'task' and push it to forkDir; id = the new commit; assert git(forkDir, 'rev-parse refs/heads/task') == id; assert git(parent, 'for-each-ref') == refs; assert git(parent, 'cat-file -e ' + id) exits non-zero; assert git(forkDir, 'count-objects -v').count == 3"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "unwanted",
+          "condition": "the fork's repository cannot be created, or the fork's transaction fails after the repository was created",
+          "action": "remove what was made and answer with an internal error; and when a directory without a fork record is found at a new fork's place, discard it and create the fork",
+          "contract": "HTTP 500 with `error_type` `internal`; no fork record, no repository directory, no token and no event are added; a request for a name whose directory is a leftover answers 201 with a repository that holds no object",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store and a real `git`; a `ready` repository workspace `demo` owned by a developer in organization `acme`, with branches `main` (default) and `release` and tag `v1`",
+              "fault injection on the repository creator, the store and the event sink"
+            ],
+            "pseudocode": "in internal/fork/create_test.go, TestCreate_CleansUpOnFailure, a table over the faults {repository creation returns an error, the store's commit returns an error, the event sink returns an error}: r = post(..., {name: 'x1'}); assert r.status == 500 and r.json.error.error_type == 'internal'; assert unchanged(demo) and not exists(forkDir('demo--x1')); then with no fault and a directory forkDir('demo--x2') holding a stray file: r = post(..., {name: 'x2'}); assert r.status == 201; assert the stray file is gone and git(forkDir('demo--x2'), 'count-objects -v').count == 0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "The fork's refs",
+      "rationale": "An agent sees the parent as it is now without a sync call, and cannot move what belongs to the parent.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "ubiquitous",
+          "action": "for any fork, show in its ref view every branch the parent had when the fork was created as a tracking branch whose head is the parent's current head of the branch of the same name",
+          "contract": "the view lists `main` and `release` with `tracking` true at the parent's heads; after the parent's `main` moves, the next read of the view shows `main` at the new head with no other call",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a parent with branches `main`, `release` and tag `v1`, and a fork `demo--f` of it taken from `main`, both on real repositories and a real store"
+            ],
+            "pseudocode": "in internal/fork/refs_test.go, TestRefs_TrackingFollowsParent: v = Refs('demo--f'); assert v.branches == [{name: 'main', sha: head(parent, 'main'), tracking: true}, {name: 'release', sha: head(parent, 'release'), tracking: true}]; n = commit on main in the parent; v = Refs('demo--f'); assert v.branch('main').sha == n; assert git(forkDir, 'for-each-ref refs/heads') == ''"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "event_driven",
+          "condition": "the parent's branch of a tracking branch's name is deleted, or the parent gains a branch after the fork was created",
+          "action": "leave the deleted branch out of the fork's ref view until the parent has a branch of that name again, and never show the later branch",
+          "contract": "after `release` is deleted in the parent the view has no `release`; after it is created again the view shows it at the parent's head with `tracking` true; a branch `later` created in the parent after the fork never appears in the view",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a parent with branches `main`, `release` and tag `v1`, and a fork `demo--f` of it taken from `main`, both on real repositories and a real store"
+            ],
+            "pseudocode": "in internal/fork/refs_test.go, TestRefs_DeletedAndLaterBranches: git(parent, 'branch -D release'); assert Refs('demo--f').branch('release') == none; git(parent, 'branch release main'); b = Refs('demo--f').branch('release'); assert b.tracking and b.sha == head(parent, 'main'); git(parent, 'branch later main'); assert Refs('demo--f').branch('later') == none"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "ubiquitous",
+          "action": "for any fork, show in its ref view the tags the parent had when the fork was created, each at the parent's current target of the tag of the same name, and no tag the parent gained later",
+          "contract": "the view's tags are exactly `v1` at the parent's target; a tag `v2` created in the parent afterwards is absent; after `v1` is deleted in the parent it is absent",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a parent with branches `main`, `release` and tag `v1`, and a fork `demo--f` of it taken from `main`, both on real repositories and a real store"
+            ],
+            "pseudocode": "in internal/fork/refs_test.go, TestRefs_Tags: assert Refs('demo--f').tags == [{name: 'v1', sha: git(parent, 'rev-parse v1')}]; git(parent, 'tag v2 main'); assert Refs('demo--f').tag('v2') == none; git(parent, 'tag -d v1'); assert Refs('demo--f').tags == []"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "ubiquitous",
+          "action": "for any branch created in the fork, show it in the fork's ref view as an own branch at its head in the fork, also when the parent later creates a branch of the same name",
+          "contract": "the view lists the own branch with `tracking` false at the fork's head; after the parent creates a branch of that name at another commit, the view still shows one branch of that name, `tracking` false, at the fork's head",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a parent with branches `main`, `release` and tag `v1`, and a fork `demo--f` of it taken from `main`, both on real repositories and a real store"
+            ],
+            "pseudocode": "in internal/fork/refs_test.go, TestRefs_OwnBranches: id = push a commit to branch 'task' of the fork; assert Refs('demo--f').branch('task') == {name: 'task', sha: id, tracking: false}; git(parent, 'branch task main'); bs = Refs('demo--f').branches where name == 'task'; assert len(bs) == 1 and bs[0].sha == id and bs[0].tracking == false; assert branch 'task' was not in the parent's refs before the parent created it; then git(fork repository, 'update-ref refs/heads/release <parent head of release>') and 'update-ref refs/parley/changes/7/1 <id>', as the copy package 17 makes before serving a fork; assert Refs('demo--f').branches where name == 'release' is one entry with tracking true, and that the entries with tracking false are exactly ['task']"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "unwanted",
+          "condition": "a component asks whether a branch of a fork may be created, moved or deleted and the branch's name is the name of one of the fork's tracking branches",
+          "action": "refuse, also while the parent has no branch of that name",
+          "contract": "the write check returns an error with HTTP status 403 and `error_type` `tracking_branch`; for any other branch name of a fork, and for every branch of a repository workspace, it returns no error",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a parent with branches `main`, `release` and tag `v1`, and a fork `demo--f` of it taken from `main`, both on real repositories and a real store"
+            ],
+            "pseudocode": "in internal/fork/refs_test.go, TestCheckBranchWrite, a table over (workspace, branch, want) {('demo--f', 'main', tracking_branch), ('demo--f', 'release', tracking_branch), ('demo--f', 'release' after the parent deleted it, tracking_branch), ('demo--f', 'task', ok), ('demo--f', 'later' created in the parent after the fork, ok), ('demo', 'main', ok)}: err = CheckBranchWrite(workspace, branch); if want == ok: assert err == nil; else: assert err.status == 403 and err.error_type == 'tracking_branch'"
+          }
+        },
+        {
+          "id": "REQ-6.6",
+          "pattern": "ubiquitous",
+          "action": "for any read of a fork, report `head_sha` as the parent's current head of the fork's base branch, or null when the parent has no such branch, and report `fork_point.sha` as recorded at creation",
+          "contract": "after the parent's base branch moves, `GET /api/v1/workspaces/<fork slug>` shows the new id in `head_sha` and the creation-time id in `fork_point.sha`; after the base branch is deleted in the parent it shows `head_sha` null and still answers 200",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a parent with branches `main`, `release` and tag `v1`, and a fork `demo--f` of it taken from `main`, both on real repositories and a real store",
+              "the workspace read route is served, or the workspace object is rendered directly when that route is not present yet"
+            ],
+            "pseudocode": "in internal/fork/refs_test.go, TestHeadSHA_FollowsBaseBranch: p = fork.fork_point.sha; n = commit on main in the parent; assert HeadSHA('demo--f') == n; w = get('/api/v1/workspaces/demo--f').json; assert w.head_sha == n and w.fork_point.sha == p; move main aside and delete it in the parent; r = get('/api/v1/workspaces/demo--f'); assert r.status == 200 and r.json.head_sha == null and r.json.fork_point.sha == p"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "A fork follows its parent's status",
+      "rationale": "Archiving a workspace must stop the work in its forks without losing what they hold, and the owner changes what a fork is for without making a new one.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "unwanted",
+          "condition": "a component asks whether a fork may be written while the fork's parent is `archived`",
+          "action": "refuse the write and allow a read",
+          "contract": "the parent-state check returns, for a write, an error with HTTP status 409 and `error_type` `parent_archived`, and for a read no error; with a `ready` parent it returns no error for both; for a repository workspace it returns no error",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a fork `demo--f` of `demo` in a real store"
+            ],
+            "pseudocode": "in internal/fork/guard_test.go, TestCheckParentState, a table over (parent state, use, want) {(ready, read, ok), (ready, write, ok), (archived, read, ok), (archived, write, 409 parent_archived), (pending, read, 409 workspace_busy), (pending, write, 409 workspace_busy), (cloning, read, 409 workspace_busy), (cloning, write, 409 workspace_busy), (ready with the maintenance marker set, read, 409 workspace_busy), (ready with the maintenance marker set, write, 409 workspace_busy), (failed, read, 409 workspace_not_ready), (failed, write, 409 workspace_not_ready)}: set the parent's state in the store; err = CheckParentState('demo--f', use); assert (err.status, err.error_type) == want or err == nil; and CheckParentState('demo', write) == nil"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "unwanted",
+          "condition": "a component asks whether a fork may be read or written while the fork's parent is `pending`, `cloning` or `failed`, or an archive or delete is running on the parent",
+          "action": "refuse both uses",
+          "contract": "the parent-state check returns an error with HTTP status 409 and `error_type` `workspace_busy` for `pending`, `cloning` and a set maintenance marker, and `workspace_not_ready` for `failed`",
+          "check": {
+            "same_as": "REQ-7.1"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "event_driven",
+          "condition": "a caller with write access to a fork sends `PATCH /api/v1/workspaces/<fork slug>` with `purpose` (a string of at most 1024 characters, or null) or `auto_change` (a boolean) while the parent is `ready`",
+          "action": "store the given values, clearing `purpose` on null, and record `parley.workspace.update` with the given names in `metadata.fields` and the fork's `session_id`",
+          "contract": "HTTP 200 with the fork's workspace object showing the new values and an `updated_at` not earlier than before; fields not given are unchanged; the event's `metadata.fields` lists `purpose` and `auto_change` in that order after any other given name, and `metadata.parent_slug` is the parent",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub in-process with the update route of the workspace component; a fork `demo--f` created with a session id by an org member"
+            ],
+            "pseudocode": "in internal/fork/update_test.go, TestUpdate_ForkFields: r = patch('/api/v1/workspaces/demo--f', {auto_change: false, purpose: 'new aim'}); assert r.status == 200 and r.json.auto_change == false and r.json.purpose == 'new aim' and r.json.expires_at == before.expires_at; ev = last event; assert ev.type == 'parley.workspace.update' and ev.metadata.fields == ['purpose', 'auto_change'] and ev.metadata.parent_slug == 'demo' and ev.session_id == fork.session_id; r = patch(..., {purpose: null}); assert r.json.purpose == null and r.json.auto_change == false; r = patch(..., {description: 'd', purpose: 'p'}); assert last event.metadata.fields == ['description', 'purpose']; as the parent's owner patch(..., {purpose: 'by parent owner'}).status == 200; as a member who is not the fork's owner patch(...).status == 403"
+          }
+        },
+        {
+          "id": "REQ-7.4",
+          "pattern": "unwanted",
+          "condition": "an update of a fork gives `auto_change` as null or as a value that is not a boolean, or `purpose` as a value that is not a string or null or as a string longer than 1024 characters",
+          "action": "refuse the update and change nothing",
+          "contract": "HTTP 400 with `error_type` `invalid_request`; the fork's record is unchanged and no event is recorded; a `purpose` of exactly 1024 characters answers 200",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub in-process with the update route of the workspace component; a fork `demo--f`"
+            ],
+            "pseudocode": "in internal/fork/update_test.go, TestUpdate_RefusesInvalidForkFields, a table over the bodies {{auto_change: null}, {auto_change: 'no'}, {auto_change: 0}, {purpose: 7}, {purpose: 'x'*1025}, {purpose: 'ok', auto_change: 'no'}}: before = store.fork('demo--f'); n = count(events); r = patch('/api/v1/workspaces/demo--f', body); assert r.status == 400 and r.json.error.error_type == 'invalid_request'; assert store.fork('demo--f') == before and count(events) == n; assert patch(..., {purpose: 'x'*1024}).status == 200"
+          }
+        },
+        {
+          "id": "REQ-7.5",
+          "pattern": "unwanted",
+          "condition": "a caller with write access sends a valid `PATCH /api/v1/workspaces/<fork slug>`, with whichever fields, while the fork's parent is `archived`, busy or `failed`",
+          "action": "refuse the update by the parent-state check for a write and change nothing",
+          "contract": "HTTP 409 with `error_type` `parent_archived` for an archived parent, `workspace_busy` for a `pending` or `cloning` parent or a set maintenance marker, `workspace_not_ready` for a `failed` parent; the fork's record is unchanged; `GET /api/v1/workspaces/<fork slug>` still answers 200 while the parent is archived",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub in-process with the update and read routes of the workspace component; a fork `demo--f`"
+            ],
+            "pseudocode": "in internal/fork/update_test.go, TestUpdate_RefusedByParentState, a table over (parent state, want) {(archived, parent_archived), (pending, workspace_busy), (maintenance marker set, workspace_busy), (failed, workspace_not_ready)} and over the bodies {{purpose: 'p'}, {auto_change: false}, {display_name: 'n'}}: set the parent's state in the store; r = patch('/api/v1/workspaces/demo--f', body); assert r.status == 409 and r.json.error.error_type == want; assert store.fork('demo--f') == before; with the parent archived: assert get('/api/v1/workspaces/demo--f').status == 200; and an invalid body {auto_change: null} with an archived parent answers 400, validation before state"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "Listing a workspace's forks",
+      "rationale": "An owner sees who works on their repository, and an orchestrator finds the forks of one run.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "a caller with read access to a workspace sends `GET /api/v1/workspaces/:slug/forks`, with an API key or with a PAT that holds `workspaces:read` or `workspaces:write`",
+          "action": "answer with the forks of that workspace as workspace objects carrying the caller's `access`, ordered by `created_at` descending and then `slug` ascending, in pages by `limit` and `cursor`, whatever the parent's status",
+          "contract": "HTTP 200 with `{items, next_cursor}`; walking the pages returns every fork once in that order; `next_cursor` is null on the last page; each item has `kind` `fork`, `parent_slug` the workspace and `access` `owner` for the fork's owner and the parent's owner and `member` for other members; a PAT with neither scope gets 403 `insufficient_scope`; a caller with no read access gets 404 `not_found`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub in-process; `demo` with forks `demo--a` (by the owner, oldest), `demo--b` (by a member, with session S) and `demo--c` and `demo--d` (by the owner, created in the same second, newest); a fixed clock"
+            ],
+            "pseudocode": "in internal/fork/list_test.go, TestList_OrderPagingAccess: r = get('/api/v1/workspaces/demo/forks') as the owner; assert r.status == 200 and slugs(r.json.items) == ['demo--c', 'demo--d', 'demo--b', 'demo--a'] and r.json.next_cursor == null; assert every item.access == 'owner' and item.kind == 'fork' and item.parent_slug == 'demo'; p1 = get('...?limit=3'); p2 = get('...?limit=3&cursor=' + p1.json.next_cursor); assert slugs(p1.items + p2.items) == the same four and p2.json.next_cursor == null; as the member: access is 'owner' on 'demo--b' and 'member' on the others; with a PAT holding only workspaces:write: status 200; with a PAT holding only git:read: 403 insufficient_scope; as a stranger: 404 not_found; with the parent archived in the store: status 200 with the same four"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "event_driven",
+          "condition": "the query has `owner=me` or `session_id=<UUID>`",
+          "action": "keep only the forks whose owner is the caller's user, and only the forks created with that session; with both, keep the forks that satisfy both",
+          "contract": "HTTP 200; `owner=me` for the member lists `demo--b` only; `session_id=S` lists `demo--b` only; `owner=me&session_id=S` for the owner lists nothing; `owner=me` with the admin token lists nothing; a session id no fork carries lists nothing",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub in-process; `demo` with forks `demo--a` (by the owner, oldest), `demo--b` (by a member, with session S) and `demo--c` and `demo--d` (by the owner, created in the same second, newest); a fixed clock"
+            ],
+            "pseudocode": "in internal/fork/list_test.go, TestList_Filters, a table over (caller, query, want slugs) {(member, 'owner=me', [demo--b]), (owner, 'owner=me', [demo--c, demo--d, demo--a]), (owner, 'session_id=' + S, [demo--b]), (owner, 'owner=me&session_id=' + S, []), (admin token, 'owner=me', []), (owner, 'session_id=' + uuid(), [])}: r = get('/api/v1/workspaces/demo/forks?' + query) as caller; assert r.status == 200 and slugs(r.json.items) == want and r.json.items is an array"
+          }
+        },
+        {
+          "id": "REQ-8.3",
+          "pattern": "event_driven",
+          "condition": "`:slug` names a fork, or a workspace that has no forks",
+          "action": "answer with an empty list",
+          "contract": "HTTP 200 with body `{\"items\": [], \"next_cursor\": null}`",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub in-process; `demo` with forks `demo--a` (by the owner, oldest), `demo--b` (by a member, with session S) and `demo--c` and `demo--d` (by the owner, created in the same second, newest); a fixed clock",
+              "a second workspace `other` without forks"
+            ],
+            "pseudocode": "in internal/fork/list_test.go, TestList_EmptyForForkAndNoForks, a table over the slugs {'demo--a', 'other' (no forks)}: r = get('/api/v1/workspaces/' + slug + '/forks'); assert r.status == 200 and r.json == {items: [], next_cursor: null}"
+          }
+        },
+        {
+          "id": "REQ-8.4",
+          "pattern": "unwanted",
+          "condition": "the query's `owner` is not `me`, or its `session_id` is not a UUID",
+          "action": "refuse the request",
+          "contract": "HTTP 400 with `error_type` `invalid_request`",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub in-process; `demo` with forks `demo--a` (by the owner, oldest), `demo--b` (by a member, with session S) and `demo--c` and `demo--d` (by the owner, created in the same second, newest); a fixed clock"
+            ],
+            "pseudocode": "in internal/fork/list_test.go, TestList_RefusesBadFilters, a table over the queries {'owner=you', 'owner=', 'session_id=abc', 'session_id='}: r = get('/api/v1/workspaces/demo/forks?' + query); assert r.status == 400 and r.json.error.error_type == 'invalid_request'"
+          }
+        },
+        {
+          "id": "REQ-8.5",
+          "pattern": "state_driven",
+          "condition": "the caller presents a workspace-bound PAT",
+          "action": "list only the forks the token's binding covers",
+          "contract": "HTTP 200; a PAT bound to `demo` that created one fork lists that fork alone; a PAT bound to a fork gets an empty list on its own fork's slug",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub in-process; `demo` with forks `demo--a` (by the owner, oldest), `demo--b` (by a member, with session S) and `demo--c` and `demo--d` (by the owner, created in the same second, newest); a fixed clock",
+              "the real binding guard and minting component"
+            ],
+            "pseudocode": "in internal/fork/list_test.go, TestList_BoundToken: pat = a PAT of the owner bound to 'demo' with workspaces:write; post('/api/v1/workspaces/demo/forks', {name: 'z'}) with pat; r = get('/api/v1/workspaces/demo/forks', bearer pat); assert slugs(r.json.items) == ['demo--z']; ft = the token minted with a fork 'demo--y' holding workspaces:read; r = get('/api/v1/workspaces/demo--y/forks', bearer ft); assert r.status == 200 and r.json.items == []"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-9",
+      "title": "Fork commands",
+      "rationale": "Agents and people create and find forks from the shell with the same contract as the REST routes.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-9.1",
+          "pattern": "event_driven",
+          "condition": "a user runs `parley fork create <parent>` with any of `--name`, `--ref`, `--ttl`, `--no-auto-change`, `--token-permissions`, `--token-paths`, `--purpose`, `--session`, `--sandbox-profile` and a trailing `-- command...`",
+          "action": "send one `POST /api/v1/workspaces/<parent>/forks` whose body has `name`, `ref`, `ttl`, `purpose` and `session_id` from their flags, `auto_change` false for `--no-auto-change`, `token.permissions` and `token.paths` as lists split at commas, `sandbox.profile` and `sandbox.command` as the list of trailing arguments, and no member for a flag that was not given, then print the response",
+          "contract": "stdout is the hub's response body as one JSON document indented by 2 spaces; exit code 0; with no flag the request body is `{}`; `auto_change`, `token` and `sandbox` are absent from the body unless their flags were given",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the command run in-process against a fake hub served by `net/http/httptest` that records each request and answers a canned response"
+            ],
+            "pseudocode": "in internal/cli/fork_test.go, TestForkCreate_FlagsToBody, a table over (args, want body) {(['demo'], {}), (['demo', '--name', 't1', '--ref', 'release', '--ttl', '2h', '--purpose', 'fix', '--session', S], {name: 't1', ref: 'release', ttl: '2h', purpose: 'fix', session_id: S}), (['demo', '--no-auto-change'], {auto_change: false}), (['demo', '--token-permissions', 'git:read,git:write', '--token-paths', 'src/**,docs/**'], {token: {permissions: ['git:read', 'git:write'], paths: ['src/**', 'docs/**']}}), (['demo', '--sandbox-profile', 'default', '--', 'make', 'test'], {sandbox: {profile: 'default', command: ['make', 'test']}}), (['demo', '--sandbox-profile', 'default'], {sandbox: {profile: 'default'}})}: run(args); assert hub.requests == [POST /api/v1/workspaces/demo/forks] and json(hub.requests[0].body) == want; assert exit == 0 and json(stdout) == the canned response"
+          }
+        },
+        {
+          "id": "REQ-9.2",
+          "pattern": "event_driven",
+          "condition": "the response of `parley fork create` carries a token secret in `token.token`",
+          "action": "print the response with the secret on stdout and write a warning on stderr that the secret is shown this once only",
+          "contract": "stdout holds the full response including `token.token`; stderr is non-empty and does not contain the secret; exit code 0; without a token in the response stderr is empty",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the command run in-process against a fake hub served by `net/http/httptest` that records each request and answers a canned response"
+            ],
+            "pseudocode": "in internal/cli/fork_test.go, TestForkCreate_WarnsAboutSecret: hub answers 201 {workspace, remote, token: {token_id: 'k', token: 'parley_pat_SECRET'}}; run(['demo', '--token-permissions', 'git:read']); assert json(stdout).token.token == 'parley_pat_SECRET'; assert stderr != '' and 'parley_pat_SECRET' not in stderr; assert exit == 0; hub answers 201 {workspace, remote}; run(['demo']); assert stderr == ''"
+          }
+        },
+        {
+          "id": "REQ-9.3",
+          "pattern": "unwanted",
+          "condition": "`parley fork create` is given `--token-paths` without `--token-permissions`, or a trailing command without `--sandbox-profile`, or no parent, or more than one argument before `--`",
+          "action": "fail as a usage error without sending a request",
+          "contract": "exit code 2; stderr holds the error envelope with `code` 0 and `error_type` `usage_error`; stdout is empty; the hub received no request",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the command run in-process against a fake hub served by `net/http/httptest` that records each request and answers a canned response"
+            ],
+            "pseudocode": "in internal/cli/fork_test.go, TestForkCreate_UsageErrors, a table over the args {['demo', '--token-paths', 'src/**'], ['demo', '--', 'make'], [], ['demo', 'extra']}: run(args); assert exit == 2; assert json(stderr).error.error_type == 'usage_error' and json(stderr).error.code == 0; assert stdout == '' and len(hub.requests) == 0"
+          }
+        },
+        {
+          "id": "REQ-9.4",
+          "pattern": "event_driven",
+          "condition": "a user runs `parley fork list <parent>` with any of `--mine`, `--session <id>`, `--limit` and `--cursor`",
+          "action": "send one `GET /api/v1/workspaces/<parent>/forks` with `owner=me` for `--mine`, `session_id`, `limit` and `cursor` from their flags and no parameter for a flag that was not given, with the parent percent-encoded as one path segment, then print the list page",
+          "contract": "stdout is the hub's `{items, next_cursor}` document; exit code 0; a hub error is printed on stderr as received with exit code 1",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the command run in-process against a fake hub served by `net/http/httptest` that records each request and answers a canned response"
+            ],
+            "pseudocode": "in internal/cli/fork_test.go, TestForkList_FlagsToQuery, a table over (args, want query) {(['demo'], ''), (['demo', '--mine'], 'owner=me'), (['demo', '--session', S, '--limit', '10', '--cursor', 'abc'], 'cursor=abc&limit=10&session_id=' + S)}: run(args); assert hub.requests[0].method == 'GET' and hub.requests[0].path == '/api/v1/workspaces/demo/forks' and sorted(hub.requests[0].query) == want; assert exit == 0 and json(stdout) == the canned page; hub answers 404 not_found: run(['nope']); assert exit == 1 and json(stderr).error.error_type == 'not_found' and stdout == ''"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-10",
+      "title": "Fork limits in configuration and the lifetime rule",
+      "rationale": "Creation needs the default and the bounds of a fork's lifetime and the fork limit before any fork exists; one rule decides every `ttl`, at creation here and at extension in package 16.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-10.1",
+          "pattern": "event_driven",
+          "condition": "parleyd loads a configuration that omits `[forks].default_ttl`, `[forks].max_ttl` or `[forks].max_per_workspace`",
+          "action": "use 7 days for `default_ttl`, 30 days for `max_ttl` and 200 for `max_per_workspace`, each for the key that is omitted, and the given value for a key that is present",
+          "contract": "the loaded configuration reports default_ttl 168h, max_ttl 720h and max_per_workspace 200 for an empty file, and 48h, 240h and 3 for a file that sets `2d`, `10d` and `3`",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/config/forks_test.go, a table over configuration texts {empty, only [forks] default_ttl=\"2d\", all three keys set}: cfg = Load(text); assert cfg.Forks.DefaultTTL, cfg.Forks.MaxTTL and cfg.Forks.MaxPerWorkspace equal the expected values of the row"
+          }
+        },
+        {
+          "id": "REQ-10.2",
+          "pattern": "unwanted",
+          "condition": "the configuration gives `[forks].default_ttl` or `[forks].max_ttl` a value that is not a duration, gives a `default_ttl` shorter than 5 minutes, or gives a `max_ttl` shorter than `default_ttl`",
+          "action": "refuse to start",
+          "contract": "the configuration load returns an error whose text names the offending key (`forks.default_ttl` or `forks.max_ttl`); parleyd writes one error line to stderr and exits with status 1 without listening",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/config/forks_test.go, a table over {default_ttl=\"soon\", max_ttl=\"-1d\", default_ttl=\"4m\", default_ttl=\"8d\" with max_ttl=\"7d\", default_ttl=\"7d\" with max_ttl=\"7d\" (accepted)}: _, err = Load(text); for the refused rows assert err != nil and err text contains the key named in the row; for the accepted row assert err == nil"
+          }
+        },
+        {
+          "id": "REQ-10.3",
+          "pattern": "ubiquitous",
+          "action": "for any requested `ttl`, accept it only when it is a positive whole number followed by one unit `m`, `h` or `d`, is at least 5 minutes and is at most `[forks].max_ttl`, and compute `expires_at` as the given instant plus the `ttl`, in whole seconds UTC",
+          "contract": "the lifetime rule returns the `expires_at` instant for an accepted `ttl` and a validation error naming `ttl` for a refused one",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/fork/lifetime_test.go, a table with max_ttl 30d and now = 2026-01-01T00:00:00Z over ttl {\"5m\" -> 00:05:00Z, \"30d\" -> 2026-01-31T00:00:00Z, \"720h\" -> same, \"43200m\" -> same, \"90m\" -> 01:30:00Z} accepted and {\"4m\", \"31d\", \"721h\", \"43201m\", \"300s\", \"0m\", \"-1h\", \"1.5h\", \"1h30m\", \"10\", \"\"} refused: at, err = ResolveTTL(ttl, now, limits); assert the row's outcome; a second table row set with max_ttl 1d refuses \"25h\" and accepts \"24h\""
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "An agent forks a workspace with a token from the shell and works in the fork",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "runs `parley fork create demo --name task1 --token-permissions git:read,git:write,workspaces:read` with an API key"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends POST /api/v1/workspaces/demo/forks with the name and the token object"
+        },
+        {
+          "actor": "parleyd",
+          "action": "authenticates the caller, grants read access to `demo`, validates the body and checks that `demo` is ready and below its fork limit"
+        },
+        {
+          "actor": "parleyd",
+          "action": "creates the fork's repository without copying an object and writes the fork, the bound token and the parley.workspace.fork event in one transaction"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers 201 with the fork in status ready, its remote and the token with its secret"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints the response on stdout and warns on stderr that the secret is shown once"
+        },
+        {
+          "actor": "agent",
+          "action": "reads GET /api/v1/workspaces/demo--task1 with the token and receives 200, and receives 404 for another workspace"
+        },
+        {
+          "actor": "git client",
+          "action": "pushes a commit to a new branch of the fork's repository and reads the parent's history through it"
+        },
+        {
+          "actor": "developer",
+          "action": "runs `parley fork list demo` as the owner of `demo` and finds `demo--task1` with access owner"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the parley CLI",
+          "the HTTP server with authentication, binding guard and access rule",
+          "the fork component",
+          "the minting component",
+          "the event log",
+          "the transactional store",
+          "the `git` command on real bare repositories"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with a data directory in a temporary directory and `[server].external_url` set to its address",
+          "a `ready` repository workspace `demo` with three commits on `main`, and a second workspace `other`, both owned by a developer; an agent user who is a member of the organization, with an API key"
+        ],
+        "end_state": [
+          "the fork `demo--task1` exists with status `ready`, owned by the agent's user, and its repository holds only the objects of the pushed commit",
+          "the minted token reads the fork and gets 404 on `other`",
+          "the event log holds one `parley.workspace.fork` event for `demo--task1` with the token's id in its metadata",
+          "the parent's refs are unchanged",
+          "`parley fork list demo` run by the developer lists `demo--task1`"
+        ],
+        "pseudocode": "in test/e2e/fork_test.go, TestForkWithTokenEndToEnd: out, errOut, code = parley('fork', 'create', 'demo', '--name', 'task1', '--token-permissions', 'git:read,git:write,workspaces:read') as the agent; assert code == 0 and errOut != ''; f = json(out); assert f.workspace.slug == 'demo--task1' and f.workspace.status == 'ready' and f.remote == f.workspace.hub_url; assert GET(f.workspace.slug, bearer f.token.token).status == 200 and GET('other', bearer f.token.token).status == 404; dir = the fork's repository directory; assert git(dir, 'count-objects -v').count == 0 and count(git(dir, 'rev-list ' + f.workspace.head_sha)) == 3; push one commit on branch 'work' into dir with git; assert git(parentDir, 'for-each-ref') is unchanged; assert one event of type parley.workspace.fork with metadata.token_id == f.token.token_id; l = json(parley('fork', 'list', 'demo') as the developer); assert 'demo--task1' in slugs(l.items)"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "An org member's fork follows the parent it can only read",
+      "steps": [
+        {
+          "actor": "org member",
+          "action": "sends POST /api/v1/workspaces/demo/forks with body {} to a workspace they can read and not write"
+        },
+        {
+          "actor": "parleyd",
+          "action": "grants the member read access, creates the fork with a generated name and the member as owner, and answers 201"
+        },
+        {
+          "actor": "developer",
+          "action": "moves `main` of `demo` to a new commit"
+        },
+        {
+          "actor": "org member",
+          "action": "reads GET /api/v1/workspaces/<fork slug>"
+        },
+        {
+          "actor": "parleyd",
+          "action": "resolves the fork's base branch in the parent and answers with the new `head_sha` and the unchanged `fork_point.sha`"
+        },
+        {
+          "actor": "parleyd",
+          "action": "shows `main` in the fork's ref view as a tracking branch at the parent's new head and refuses a write check on it with 403 tracking_branch"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the HTTP server with authentication and the access rule",
+          "the fork component with its ref view",
+          "the transactional store",
+          "the `git` command on real bare repositories"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0",
+          "a `ready` repository workspace `demo` owned by a developer in organization `acme`; a second user who is a member of `acme`"
+        ],
+        "end_state": [
+          "the fork is owned by the member and is in organization `acme`",
+          "the fork's `head_sha` is the parent's new head and its `fork_point.sha` is the head at creation",
+          "the fork's ref view shows `main` with `tracking` true at the new head",
+          "the member's PATCH of `demo` is still answered 403"
+        ],
+        "pseudocode": "in test/e2e/fork_test.go, TestMemberForkFollowsParent: r = POST('/api/v1/workspaces/demo/forks', {}) as the member; assert r.status == 201; slug = r.json.workspace.slug; old = r.json.workspace.fork_point.sha; assert r.json.workspace.owner_id == member.id and r.json.workspace.access == 'owner'; n = add a commit to main in the parent's repository with git; w = GET('/api/v1/workspaces/' + slug) as the member; assert w.json.head_sha == n and w.json.fork_point.sha == old; b = hub.Forks.Refs(slug).branch('main'); assert b.tracking and b.sha == n; assert hub.Forks.CheckBranchWrite(slug, 'main').error_type == 'tracking_branch'; assert PATCH('/api/v1/workspaces/demo', {description: 'x'}) as the member answers 403"
+      }
+    }
+  ]
+}

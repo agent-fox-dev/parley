@@ -1,0 +1,234 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "12",
+  "spec_name": "workspace_sync_from_origin",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/workspace/... ./internal/gitrepo/... ./internal/cli/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "09",
+      "reason": "builds its CLI commands on the client, output and exit-code helpers of the CLI foundation"
+    },
+    {
+      "spec": "10",
+      "reason": "syncs the repository workspace that package creates and clones: its record and sync fields, bare repository, origin credential resolver, state preconditions and the workspace command group"
+    },
+    {
+      "spec": "11",
+      "reason": "reads the effective setting sync_enabled, whose key that package registers, answers with the workspace object it defines, and its end-to-end checks read GET /workspaces/:slug"
+    },
+    {
+      "spec": "52",
+      "reason": "emits its hub events through the event log component"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Fetch origin's branches and tags into the workspace",
+      "criteria": [
+        "REQ-2",
+        "REQ-6.1"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/gitrepo/fetch_test.go, internal/gitrepo/refs_test.go and internal/workspace/sync_test.go and confirm they fail; build the shared sync fixture there (an origin and a hub bare repository made with git in t.TempDir(), a ready repository workspace record in a real store, a stub credential resolver, a recording fetcher and a recording event emitter)",
+        "In internal/gitrepo add FetchOrigin: one git fetch of every branch of origin into refs/remotes/origin/*, the origin heads that the clone of package 10 wrote and that its OriginHeads reads, forced, pruned and atomic, so that the origin heads change all together or not at all and no ref under refs/heads/ or refs/tags/ is written; tag objects are fetched but tag refs are not written by the fetch; it returns origin's branch heads and origin's tags",
+        "FetchOrigin takes the credential as a value (anonymous, or HTTP Basic user and password), passes it to git the way the clone of package 10 does so that it never appears in the process arguments, runs git with terminal prompts disabled, and takes a deadline after which the subprocess and its children are killed and a distinguishable deadline error is returned",
+        "In internal/gitrepo add CompareAndSwapRef (update, or create when the expected value is 'absent'; a distinguishable ErrRefMoved and no change when the current value differs) and IsAncestor",
+        "In internal/workspace add the sync operation's first stage: resolve the origin credential through the resolver of package 10 at the time of the call, fetch origin with it and a 2-minute deadline, then create every tag origin has and the hub lacks with a create-only compare-and-swap, leaving every existing tag as it is",
+        "Declare the fetcher and the credential resolver as narrow interfaces of the sync operation so that tests can replace them; the composition in internal/hub wires the real ones"
+      ],
+      "touches": [
+        "internal/gitrepo/fetch.go",
+        "internal/gitrepo/fetch_test.go",
+        "internal/gitrepo/refs.go",
+        "internal/gitrepo/refs_test.go",
+        "internal/workspace/sync.go",
+        "internal/workspace/sync_test.go"
+      ],
+      "done_when": [
+        "`go test ./internal/gitrepo/... ./internal/workspace/... -count=1` passes with the real git binary"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Compare every origin branch and move what may move",
+      "criteria": [
+        "REQ-4",
+        "REQ-5"
+      ],
+      "steps": [
+        "Add TestSync_PerBranchResults, TestSync_LeavesHubOnlyBranchesAlone, TestSync_BranchesListShape, TestSync_MovesProtectedBranches and TestSync_ProtectedBranchAheadIsNormal to internal/workspace/sync_test.go and confirm they fail",
+        "After the fetch, walk origin's branches in name order; for each read the hub's head and classify: no hub branch is created, equal heads is up_to_date, hub head an ancestor of origin's is fast_forward, origin's head an ancestor of the hub's is ahead, anything else is diverged, or reset when the caller asked for reset_to_origin",
+        "Apply created, fast_forward and reset with CompareAndSwapRef expecting the head that was classified; apply nothing for up_to_date, ahead and diverged; a diverged branch never stops the walk",
+        "Never look at branches that are not on origin: hub-only branches and branches deleted on origin stay as they are and are not reported",
+        "Do not consult the push rules or the protected_branches and protect.owner_push settings: sync treats protected branches as any other branch",
+        "Return the result list: one entry per origin branch with name, result, local_sha (the hub's head read after the branch was handled) and origin_sha, as full commit ids, sorted by name; an empty list, not null, when origin has no branches"
+      ],
+      "touches": [
+        "internal/workspace/sync.go",
+        "internal/workspace/sync_test.go"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Serve POST /workspaces/:slug/sync",
+      "criteria": [
+        "REQ-1"
+      ],
+      "steps": [
+        "Add the TestSyncRoute_* behaviours for the answer, callers without write access, reset_to_origin validation, forks, statuses, sync_disabled and the check order to internal/workspace/sync_handler_test.go and confirm they fail",
+        "Register POST /api/v1/workspaces/{slug}/sync beside the workspace routes of package 10, declaring scope workspaces:write and need write, so that the scope and access answers come from the shared middleware",
+        "Validate the query: reset_to_origin absent or false means no reset, true means reset, any other value (including an empty one and other spellings) is 400 invalid_request; the route reads no body",
+        "Then check in this order and answer the first failure: kind fork is 400 fork_has_no_origin; the status answers of package 10's precondition helper (409 workspace_busy, workspace_not_ready, workspace_archived); the effective setting sync_enabled, read with EffectiveSettings of the settings registry (the key is registered by package 11), false is 400 sync_disabled",
+        "Call the sync operation on a context detached from the request's cancellation, so that a caller who disconnects does not stop it, and map its outcomes: completed is 200 with the workspace object rendered by RenderWorkspace (the caller's access member included) plus branches; an upstream error is 502 upstream_error with the scrubbed message; an internal error is 500 internal",
+        "Wire the route, the real fetcher, the credential resolver and the event emitter on the composition value of internal/hub (package 03)"
+      ],
+      "touches": [
+        "internal/workspace/sync_handler.go",
+        "internal/workspace/sync_handler_test.go",
+        "internal/workspace/routes.go",
+        "internal/hub/workspace.go"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Record a completed sync, emit its event and notify observers",
+      "criteria": [
+        "REQ-7"
+      ],
+      "steps": [
+        "Add TestSync_RecordsCompletion, TestSync_EmitsOneEvent, TestSync_NotifiesBranchMoveObservers and TestSync_ObserverFailureDoesNotFailSync to internal/workspace/sync_test.go and TestSyncRoute_CompletesAfterDisconnect to internal/workspace/sync_handler_test.go, and confirm they fail",
+        "When the per-branch pass has finished, write in one store transaction, together with the event: last_sync_at (the injected clock's time, UTC, whole seconds), sync_error null, head_sha (the hub's head of the default branch) and origin_head_sha (origin's head of the default branch, null when origin has none)",
+        "Emit exactly one parley.workspace.sync event through the event component, actor the caller, with metadata created, fast_forward, ahead, diverged and reset (sorted branch names; up_to_date branches in none) and updated (one {ref, before, after} per created or moved branch and per created tag, full ref names, before null for a creation, sorted by ref)",
+        "Declare the branch-move observer interface (BranchMoveObserver) with the registration function RegisterBranchMoveObserver, and export NotifyBranchMove so that a sync extension reports its own moves to the same observers; after each successful created, fast_forward or reset move call every observer once with the slug, the branch, the heads before and after and the cause sync; log an observer's error with the branch name and carry on",
+        "Confirm with TestSyncRoute_CompletesAfterDisconnect that a caller who disconnects during the fetch changes nothing about the moves, the fields or the event; the 2-minute fetch deadline still applies",
+        "Return the workspace re-read after the transaction together with the result list"
+      ],
+      "touches": [
+        "internal/workspace/sync.go",
+        "internal/workspace/sync_test.go",
+        "internal/workspace/sync_handler.go",
+        "internal/workspace/sync_handler_test.go"
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Leave a workspace unchanged when origin cannot be fetched",
+      "criteria": [
+        "REQ-3"
+      ],
+      "steps": [
+        "Add TestSync_FetchFailureChangesNothing, TestSync_SecretReadFailureNeverFetchesAnonymously, TestSync_FetchDeadlineIsTwoMinutes and TestSync_FailureTextIsScrubbed to internal/workspace/sync_test.go and TestFetchOrigin_StopsAtDeadline to internal/gitrepo/fetch_test.go, and confirm they fail",
+        "Treat as one failure class: an error from the credential resolver (no fetch is then started, never an anonymous one), any error of the fetch, and the fetch deadline",
+        "On such a failure move no branch and create no tag, write only sync_error (last_sync_at, head_sha and origin_head_sha stay), emit no event, and return an upstream error that the route answers as 502 with error_type upstream_error",
+        "Build the failure text from git's error output, beginning it with 'origin fetch failed: ' so that a caller of a carry-patch workspace can tell it from an upstream failure of package 36, then scrub it with the hub's scrubber (PLAT-FR-098) given the resolved credential's secret values: secrets become [redacted], URL userinfo is removed, the text is cut to 1024 bytes; use the same text for sync_error and for the response message",
+        "A later sync that completes clears sync_error through the completion transaction"
+      ],
+      "touches": [
+        "internal/workspace/sync.go",
+        "internal/workspace/sync_test.go",
+        "internal/gitrepo/fetch.go",
+        "internal/gitrepo/fetch_test.go"
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Re-evaluate branches that move while a sync runs",
+      "criteria": [
+        "REQ-6.2",
+        "REQ-6.3",
+        "REQ-6.4",
+        "REQ-6.5"
+      ],
+      "steps": [
+        "Add TestSync_ReevaluatesBranchThatMoved, TestSync_GivesUpAfterFiveEvaluations and TestSync_TwoConcurrentSyncs to internal/workspace/sync_test.go and confirm they fail; add a hook on the sync operation, set only by tests, that runs after a branch is classified and before its ref is swapped",
+        "When a branch's compare-and-swap returns ErrRefMoved, read the branch's new head, classify it again against the same origin head and act on the new result; the reported result and local_sha are those of the last evaluation, and only a move that succeeded is reported to observers and listed in the event's updated",
+        "Count evaluations per branch; when the fifth swap is also lost, stop the sync with an internal error naming the branch: no sync field is written, no event is emitted, earlier moves stay",
+        "Take no lock on the workspace during a sync: two syncs, or a sync beside a push or a landing, meet only at the compare-and-swap of single refs, and sync never answers workspace_busy for that reason",
+        "Never write the workspace's status from the sync operation"
+      ],
+      "touches": [
+        "internal/workspace/sync.go",
+        "internal/workspace/sync_test.go"
+      ],
+      "depends_on": [
+        4
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Leave carry-patch branches out of the per-branch pass",
+      "criteria": [
+        "REQ-8"
+      ],
+      "steps": [
+        "Add TestSync_SkipsCarryPatchBranches and TestSync_ExcludedBranchProviderFailure to internal/workspace/sync_test.go and confirm they fail",
+        "Declare the excluded-branch provider interface (ExcludedBranchProvider: given a workspace slug, the branch names to leave out) with the registration function RegisterExcludedBranchProvider; none is registered by this package",
+        "For a workspace whose workspace_mode is carry_patch, build the excluded set before the per-branch pass from the workspace's integration_branch and, when a provider is registered, the names it returns; for a standard workspace the set is empty and the provider is not called",
+        "Skip excluded branches in the walk: not classified, not moved, not in branches, not in the event; their origin heads are still fetched",
+        "If the provider returns an error, stop before the walk with an internal error: nothing is moved, no sync field is written, no event is emitted"
+      ],
+      "touches": [
+        "internal/workspace/sync.go",
+        "internal/workspace/sync_test.go"
+      ],
+      "depends_on": [
+        4
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Add the parley workspace sync command",
+      "criteria": [
+        "REQ-9"
+      ],
+      "steps": [
+        "Add TestWorkspaceSync_PostsAndPrints, TestWorkspaceSync_FailOnDiverged, TestWorkspaceSync_WaitsForRebuild and TestWorkspaceSync_FailedWait to internal/cli/workspace_test.go against a stub hub and confirm they fail",
+        "Add the subcommand sync to the workspace command group: exactly one argument, the slug; flags --reset-to-origin, --fail-on-diverged, --wait, --timeout and --poll-interval, the last three with the shared wait behaviour of the CLI foundation (both must be positive, else a usage error before any request)",
+        "Send POST /workspaces/<slug>/sync through the shared client with the slug as one percent-encoded segment and a 3-minute request timeout for this request; add reset_to_origin=true for --reset-to-origin",
+        "Without --wait, or when the answer has no rebuild_job_id or a null one, print the answer as the one document on stdout",
+        "With --wait and a rebuild_job_id, poll GET /workspaces/<slug>/rebuilds/<id> from this command itself, through the client and the shared wait of the CLI foundation (package 09), importing no code of package 33 (this package does not depend on it, so its exported rebuild wait function is not called), under the overall --timeout until status is completed, dead_letter or cancelled (failed is not final); print the answer with the added member rebuild; completed is success, the other two report wait_failed and exit 1; a timeout prints nothing on stdout, reports wait_timeout and exits 1; a hub error while polling is printed and exits 1",
+        "With --fail-on-diverged, after printing and only when the exit code would be 0: collect the names of branches entries with result diverged and of patches_diverged when present, write them on stderr and exit 3 when the collection is not empty"
+      ],
+      "touches": [
+        "internal/cli/workspace.go",
+        "internal/cli/workspace_test.go"
+      ],
+      "depends_on": [
+        3
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Call a registered sync extension around the per-branch pass",
+      "criteria": [
+        "REQ-10"
+      ],
+      "steps": [
+        "Add TestSyncExtension_StagesRunInOrder, TestSyncExtension_FirstStageFailure, TestSyncExtension_SecondStageAddsMembers and TestSyncExtension_SecondStageFailure to internal/workspace/sync_extension_test.go and confirm they fail",
+        "Declare in internal/workspace/sync_extension.go the interface SyncExtension with two methods and the registration function RegisterSyncExtension: AfterFetch(ctx, run) returning an error, and BeforeCompletion(ctx, run, results) returning a SyncAddition (the extra members of the answer as a map from member name to JSON value, and an optional upstream_head_sha value) and an error; the run value carries the workspace record, the caller, the reset_to_origin flag and origin's branch heads as fetched",
+        "Call the stages only for a workspace whose workspace_mode is carry_patch, in this order within one sync: fetch of origin, AfterFetch, creation of tags, the excluded set, the per-branch pass, BeforeCompletion, the completion transaction; with no extension registered, and for a standard workspace, sync runs as before",
+        "Run both stages on the context of the sync operation, which is detached from the caller's connection",
+        "Treat an error of AfterFetch as the failure class of a failed fetch (task 5): scrub its text, write it to sync_error, answer 502 upstream_error, move nothing and emit no event",
+        "Treat an error of BeforeCompletion as an internal error: answer 500 internal with the scrubbed text of the error as message, skip the completion transaction and the event, and keep the branch moves already made",
+        "On success write a returned upstream_head_sha in the completion transaction of task 4 beside last_sync_at, and hand the extra members to the route, which adds each to the top level of the answer unless the workspace object or branches already has a member of that name",
+        "Keep internal/workspace free of any import of internal/carrypatch: package 36 implements the interface and registers it on the composition value of internal/hub"
+      ],
+      "touches": [
+        "internal/workspace/sync_extension.go",
+        "internal/workspace/sync_extension_test.go",
+        "internal/workspace/sync.go",
+        "internal/workspace/sync_handler.go"
+      ],
+      "depends_on": [
+        4,
+        7
+      ]
+    }
+  ]
+}

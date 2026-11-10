@@ -1,0 +1,819 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "36",
+  "spec_name": "carry_patch_sync",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Patch branches stay out of the general per-branch pass",
+      "rationale": "A patch branch is moved by the origin refresh or by its own reset route, never by the general pass or by reset_to_origin (WS-FR-048, CP-FR-069).",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "the sync of package 12 asks the registered excluded-branch provider for the branches of a carry-patch workspace",
+          "action": "return the branch_name of every patch of that workspace whose status is active, conflict, disabled or merged_upstream, and of no patch whose status is deleted",
+          "contract": "a list of branch names, one per non-deleted patch, and a nil error",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a workspace with patches patch/a (active), patch/b (conflict), patch/c (disabled), patch/d (merged_upstream) and patch/e (deleted), and a second workspace with patch/x"
+            ],
+            "pseudocode": "in internal/carrypatch/excluded_test.go, TestExcludedBranches_NonDeletedPatches: names = provider.ExcludedBranches(ctx, 'cp'); assert sorted(names) == ['patch/a', 'patch/b', 'patch/c', 'patch/d']; assert provider.ExcludedBranches(ctx, 'empty-ws') == []"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "event_driven",
+          "condition": "a caller syncs a carry-patch workspace whose origin has other heads than the hub for the branches of non-deleted patches",
+          "action": "leave those branches out of the per-branch pass, so that they are not compared, not moved by that pass and not listed in branches, for either value of patch_branch_source and with or without reset_to_origin=true",
+          "contract": "HTTP 200; no entry of branches names a branch of a non-deleted patch; with patch_branch_source hub every such ref under refs/heads/ is unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the carry-patch participant and the provider are registered as internal/hub registers them",
+              "patch_branch_source is hub; patches patch/a (active) and patch/b (disabled); origin is ahead on patch/a, has diverged on patch/b and is ahead on feat"
+            ],
+            "pseudocode": "in internal/carrypatch/sync_test.go, TestSync_PatchBranchesLeftOutOfBranchPass, a table over reset_to_origin in {false, true}: before = refs(hub, 'refs/heads/patch/*'); r = POST /api/v1/workspaces/cp/sync?reset_to_origin=<v>; assert r.status == 200; assert names(r.json.branches) contains 'feat' and contains neither 'patch/a' nor 'patch/b' nor the integration branch; assert refs(hub, 'refs/heads/patch/*') == before"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "event_driven",
+          "condition": "a caller syncs a carry-patch workspace that has a deleted patch whose branch exists on origin ahead of the hub",
+          "action": "treat the branch of the deleted patch as an ordinary branch of the per-branch pass",
+          "contract": "HTTP 200; branches has an entry for that branch with result fast_forward",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "patch/gone is a deleted patch; origin's patch/gone is one commit ahead of the hub's"
+            ],
+            "pseudocode": "in internal/carrypatch/sync_test.go, TestSync_DeletedPatchBranchIsOrdinary: r = POST .../sync; e = entry(r.json.branches, 'patch/gone'); assert e.result == 'fast_forward'; assert ref(hub, 'refs/heads/patch/gone') == ref(origin, 'refs/heads/patch/gone')"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "unwanted",
+          "condition": "the patch list of the workspace cannot be read when the provider is asked",
+          "action": "return an error from the provider, so that the sync stops before any branch is compared",
+          "contract": "the provider returns a non-nil error and no names; the sync answers HTTP 500 with error_type internal, every ref under refs/heads/ is unchanged and last_sync_at is unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the patch store is replaced by one whose list operation fails; origin is ahead on feat"
+            ],
+            "pseudocode": "in internal/carrypatch/excluded_test.go, TestExcludedBranches_StoreFailure: names, err = provider.ExcludedBranches(ctx, 'cp'); assert err != nil and names is empty; then r = POST .../sync; assert r.status == 500 and r.json.error_type == 'internal'; assert refs(hub, 'refs/heads/*') are unchanged; assert workspace.last_sync_at is unchanged"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Upstream is fetched before anything moves",
+      "rationale": "A sync that moved branches and then failed to reach upstream would leave the workspace half synced (CP-FR-067).",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "a caller syncs a carry-patch workspace that passed the checks of the sync route and whose origin fetch succeeded",
+          "action": "fetch the branches of upstream, with the upstream credentials resolved at that moment, before any branch under refs/heads/ is created or moved, updating refs/remotes/upstream/* and creating no tag from upstream",
+          "contract": "after the call refs/remotes/upstream/<branch> equals upstream's head for every upstream branch; no tag that exists only on upstream exists in the hub",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "upstream has branches main and next and a tag up-only; origin is ahead on feat",
+              "the upstream fetch function is wrapped so that it records refs(hub, 'refs/heads/*') at the moment it is called"
+            ],
+            "pseudocode": "in internal/carrypatch/sync_test.go, TestSync_FetchesUpstreamBeforeMoves: before = refs(hub, 'refs/heads/*'); r = POST .../sync; assert r.status == 200; assert the refs recorded at fetch time == before; assert ref(hub, 'refs/remotes/upstream/main') == head(upstream, 'main') and ref(hub, 'refs/remotes/upstream/next') == head(upstream, 'next'); assert ref(hub, 'refs/tags/up-only') does not exist; assert ref(hub, 'refs/heads/feat') == head(origin, 'feat')"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "event_driven",
+          "condition": "the upstream credentials of the workspace are changed between two syncs",
+          "action": "use the changed credentials for the upstream fetch of the second sync",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the test upstream requires the token 'two'; the workspace secret UPSTREAM_GIT_PAT is 'one'"
+            ],
+            "pseudocode": "in internal/carrypatch/sync_test.go, TestSync_UpstreamCredentialsResolvedPerSync: r1 = POST .../sync; assert r1.status == 502; set secret UPSTREAM_GIT_PAT = 'two'; r2 = POST .../sync; assert r2.status == 200"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "unwanted",
+          "condition": "the upstream credentials cannot be read, or the upstream fetch fails, during a sync of a carry-patch workspace",
+          "action": "refuse the sync as a fetch failure that names upstream, set sync_error to the message, and create or move no branch, write no patch field, upstream_head_sha or last_sync_at, emit no event and queue no rebuild",
+          "contract": "HTTP 502 with error_type upstream_error; the message and the workspace's sync_error contain the word upstream and contain no credential and no URL user information; refs under refs/heads/ unchanged; no event recorded; no job created",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "origin is ahead on feat and on patch/a; patch_branch_source is origin; upstream_url carries user information 'bot:s3cret@'"
+            ],
+            "pseudocode": "in internal/carrypatch/sync_test.go, TestSync_UpstreamFetchFailure, a table over {upstream unreachable, upstream refuses the credential, the secret store fails when the upstream credentials are read}: before = refs(hub, 'refs/heads/*'); r = POST .../sync; assert r.status == 502 and r.json.error_type == 'upstream_error'; assert r.json.message contains 'upstream' and not 's3cret' and not 'bot:'; ws = load workspace; assert ws.sync_error == r.json.message; assert ws.last_sync_at and ws.upstream_head_sha are unchanged; assert refs(hub, 'refs/heads/*') == before; assert patch('patch/a').origin_synced_at is unchanged; assert no event and no rebuild job was recorded"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "unwanted",
+          "condition": "the origin fetch of a sync of a carry-patch workspace fails",
+          "action": "name origin in the failure and not contact upstream",
+          "contract": "HTTP 502 with error_type upstream_error; the message and sync_error contain the word origin; the upstream fetch was not called",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "origin is unreachable; the upstream fetch function is wrapped to count its calls"
+            ],
+            "pseudocode": "in internal/carrypatch/sync_test.go, TestSync_OriginFailureNamesOrigin: r = POST .../sync; assert r.status == 502 and r.json.error_type == 'upstream_error'; assert r.json.message contains 'origin'; assert load workspace .sync_error contains 'origin'; assert upstream fetch calls == 0"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "unwanted",
+          "condition": "the upstream fetch succeeded and neither upstream's default branch nor an upstream branch named like the workspace's default_branch resolves",
+          "action": "refuse the sync in the same way as a failed upstream fetch",
+          "contract": "HTTP 502 with error_type upstream_error; the message and sync_error contain 'upstream base cannot be resolved'; refs under refs/heads/ unchanged; last_sync_at unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "upstream is an empty repository; the workspace's default_branch is main; origin is ahead on feat"
+            ],
+            "pseudocode": "in internal/carrypatch/sync_test.go, TestSync_NoUpstreamBase: before = refs(hub, 'refs/heads/*'); r = POST .../sync; assert r.status == 502 and r.json.error_type == 'upstream_error'; assert r.json.message contains 'upstream base cannot be resolved'; assert refs(hub, 'refs/heads/*') == before; assert load workspace .last_sync_at is unchanged"
+          }
+        },
+        {
+          "id": "REQ-2.6",
+          "pattern": "unwanted",
+          "condition": "a sync of a carry-patch workspace is refused by a check of the sync route (sync_enabled false, or status archived)",
+          "action": "contact neither origin nor upstream",
+          "contract": "the answer of the sync route for that check (HTTP 400 with error_type sync_disabled, HTTP 409 with error_type workspace_archived); the upstream fetch was not called",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the upstream fetch function is wrapped to count its calls"
+            ],
+            "pseudocode": "in internal/carrypatch/sync_test.go, TestSync_RefusedRequestDoesNotFetchUpstream, a table over {sync_enabled false -> 400 sync_disabled, archived -> 409 workspace_archived}: r = POST .../sync; assert r.status and r.json.error_type are the row's; assert upstream fetch calls == 0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Upstream movement is reported and recorded",
+      "rationale": "The caller and the next rebuild need to know whether the base moved, and whether it moved by a force-push (CP-FR-068, CP-FR-073).",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "a sync of a carry-patch workspace has fetched upstream and resolved the upstream base",
+          "action": "report upstream_advanced as true when the upstream base differs from the stored upstream_head_sha, including when none is stored, and as false when they are equal",
+          "contract": "the answer member upstream_advanced, a boolean",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/carrypatch/sync_test.go, TestSync_UpstreamMovement, a table of consecutive syncs on one workspace: {first sync, nothing stored -> advanced true, force false}; {no upstream change -> advanced false, force false}; {upstream gains a commit -> advanced true, force false}; {upstream main is rewritten to a commit that does not descend from the stored head -> advanced true, force true}; {the stored head's commit is removed from the hub repository and upstream differs -> advanced true, force true}; for each: r = POST .../sync; assert r.status == 200; assert r.json.upstream_advanced and r.json.force_push_detected equal the row's values"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "event_driven",
+          "condition": "a sync of a carry-patch workspace has computed upstream_advanced",
+          "action": "report force_push_detected as true when upstream advanced, an upstream head is stored and that head is not an ancestor of the new upstream base or its commit no longer exists, and as false otherwise, and complete the sync in either case",
+          "contract": "the answer member force_push_detected, a boolean; HTTP 200 also when it is true",
+          "check": {
+            "same_as": "REQ-3.1"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "event_driven",
+          "condition": "a sync of a carry-patch workspace completes",
+          "action": "write upstream_head_sha to the new upstream base when upstream advanced, in the same store transaction as last_sync_at, leave upstream_head_sha as it was when upstream did not advance while still writing last_sync_at, and return the workspace object as it is after the write",
+          "contract": "the workspace object in the answer and a later GET of the workspace show upstream_head_sha equal to the full 40-character id of upstream's head and last_sync_at equal to the completion time",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the clock is fixed at T1 for the first sync and T2 for the second; upstream does not change between them"
+            ],
+            "pseudocode": "in internal/carrypatch/sync_test.go, TestSync_WritesUpstreamHead: r1 = POST .../sync; assert r1.json.upstream_head_sha == head(upstream, 'main') and len == 40; assert r1.json.last_sync_at == T1; r2 = POST .../sync; assert r2.json.upstream_advanced == false; assert r2.json.upstream_head_sha == r1.json.upstream_head_sha; assert r2.json.last_sync_at == T2; assert load workspace .upstream_head_sha == r1.json.upstream_head_sha"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Patch branches are refreshed from origin when origin is their authority",
+      "rationale": "With patch_branch_source origin the team edits patches on origin; the hub's copies must follow without losing a tip the hub alone had (CP-FR-069).",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "optional",
+          "condition": "the workspace setting patch_branch_source is origin",
+          "action": "during a sync, after the per-branch pass, compare for every patch in active, conflict or disabled, in position order, the hub's tip of the patch branch with origin's tip as of this sync's fetch, and apply the first rule that fits: origin has no such branch gives action none and state missing_on_origin; the hub has no such branch gives created and in_sync; equal tips give none and in_sync; the hub's tip being an ancestor of origin's gives fast_forwarded and in_sync; otherwise patch_divergence_policy report gives none and diverged, and replace gives replaced and in_sync",
+          "contract": "after the sync the hub's branch equals origin's tip for created, fast_forwarded and replaced and is unchanged for none; patches_synced has one entry per such patch, in position order, with that action and state",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "patch_branch_source is origin; six patches in positions 1..6 with statuses mixed over active, conflict and disabled, one per row of the table"
+            ],
+            "pseudocode": "in internal/carrypatch/sync_refresh_test.go, TestRefresh_Outcomes, a table: {origin lacks the branch -> none, missing_on_origin, hub ref unchanged}; {hub lacks the branch -> created, in_sync, hub ref == origin tip}; {equal tips -> none, in_sync}; {hub tip is an ancestor of origin's -> fast_forwarded, in_sync, hub ref == origin tip}; {each side has a commit the other lacks, policy report -> none, diverged, hub ref unchanged}; {same, policy replace -> replaced, in_sync, hub ref == origin tip}; {hub tip ahead of origin's, policy report -> none, diverged}; r = POST .../sync; assert r.status == 200; assert [e.branch_name for e in r.json.patches_synced] is in position order; for each row assert the entry's action and state and the hub ref"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "event_driven",
+          "condition": "the origin refresh replaces a diverged patch branch",
+          "action": "save the hub's tip to refs/parley/replaced/<branch>, overwriting an earlier backup of that branch, before it moves the branch to origin's tip, and report the saved tip as replaced_sha",
+          "contract": "refs/parley/replaced/<branch> equals the hub's tip from before the sync; the patches_synced entry has replaced_sha equal to it; entries with another action have replaced_sha null",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "patch_branch_source origin, policy replace; patch/b diverged; refs/parley/replaced/patch/b already points at an older commit"
+            ],
+            "pseudocode": "in internal/carrypatch/sync_refresh_test.go, TestRefresh_ReplaceSavesBackup: old = ref(hub, 'refs/heads/patch/b'); r = POST .../sync; e = entry(r.json.patches_synced, 'patch/b'); assert e.action == 'replaced' and e.replaced_sha == old; assert ref(hub, 'refs/parley/replaced/patch/b') == old; assert ref(hub, 'refs/heads/patch/b') == head(origin, 'patch/b'); assert every other entry has replaced_sha == null"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "event_driven",
+          "condition": "the origin refresh meets a patch branch that the workspace's protected_branches lists",
+          "action": "create, fast-forward or replace it by the same rules as an unprotected patch branch, consulting no push rule",
+          "contract": "the patches_synced entry of the protected branch has the action of the matching rule and the hub's branch equals origin's tip",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "patch_branch_source origin, policy replace; protected_branches lists patch/a and patch/b; origin is ahead on patch/a and has diverged on patch/b"
+            ],
+            "pseudocode": "in internal/carrypatch/sync_refresh_test.go, TestRefresh_MovesProtectedPatchBranches: r = POST .../sync; assert entry(r.json.patches_synced, 'patch/a').action == 'fast_forwarded'; assert entry(r.json.patches_synced, 'patch/b').action == 'replaced'; assert ref(hub, 'refs/heads/patch/a') == head(origin, 'patch/a') and ref(hub, 'refs/heads/patch/b') == head(origin, 'patch/b')"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "optional",
+          "condition": "the workspace setting patch_branch_source is hub",
+          "action": "during a sync compare and move no patch branch and report patches_synced and patches_diverged as empty lists",
+          "contract": "patches_synced == [] and patches_diverged == []; every ref of a patch branch is unchanged; no parley.patch.sync event is recorded",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "patch_branch_source hub; origin is ahead on patch/a and has diverged on patch/b"
+            ],
+            "pseudocode": "in internal/carrypatch/sync_refresh_test.go, TestRefresh_NotRunWhenHubIsAuthority: before = refs(hub, 'refs/heads/patch/*'); r = POST .../sync; assert r.json.patches_synced == [] and r.json.patches_diverged == []; assert refs(hub, 'refs/heads/patch/*') == before; assert events of type parley.patch.sync == []"
+          }
+        },
+        {
+          "id": "REQ-4.5",
+          "pattern": "ubiquitous",
+          "action": "for any patch whose status is merged_upstream or deleted when the origin refresh runs, leave the patch out of the refresh, so that it has no patches_synced entry",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "patch_branch_source origin; patch/m is merged_upstream and patch/gone is deleted; origin is ahead on both; patch/a is active and in sync"
+            ],
+            "pseudocode": "in internal/carrypatch/sync_refresh_test.go, TestRefresh_SkipsMergedAndDeleted: before = ref(hub, 'refs/heads/patch/m'); r = POST .../sync; assert [e.branch_name for e in r.json.patches_synced] == ['patch/a']; assert ref(hub, 'refs/heads/patch/m') == before"
+          }
+        },
+        {
+          "id": "REQ-4.6",
+          "pattern": "event_driven",
+          "condition": "the origin refresh has created or moved a patch branch",
+          "action": "report the move once to the registered branch-move observers of the sync with the workspace slug, the branch name, the heads before and after and the cause sync, and continue the sync when an observer fails",
+          "contract": "each observer receives one call per created or moved patch branch (before is empty for a created branch); HTTP 200 also when the observer returns an error",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "patch_branch_source origin; origin is ahead on patch/a; patch/b is in sync; a recording observer is registered and returns an error"
+            ],
+            "pseudocode": "in internal/carrypatch/sync_refresh_test.go, TestRefresh_NotifiesBranchMoveObservers: old = ref(hub, 'refs/heads/patch/a'); r = POST .../sync; assert r.status == 200; assert the observer's calls for patch branches == [{slug 'cp', branch 'patch/a', before old, after head(origin, 'patch/a'), cause 'sync'}]"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Refresh outcomes are stored on the patch and emitted as events",
+      "rationale": "The patch record and the event stream are how anyone other than the caller learns that a patch followed origin, diverged or was replaced (CP-FR-070, CP-FR-075).",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "the origin refresh has reached an outcome for a patch",
+          "action": "store origin_sync_state as the outcome's state, origin_sha as origin's tip of the branch, or null when the branch is missing on origin, and origin_synced_at as the time of the comparison",
+          "contract": "a read of the patch returns the three fields with those values; origin_sha is a full 40-character commit id or null",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "patch_branch_source origin, policy report; patch/a in sync, patch/b diverged, patch/c missing on origin; the clock is fixed at T"
+            ],
+            "pseudocode": "in internal/carrypatch/sync_refresh_test.go, TestRefresh_StoresOriginState: POST .../sync; a = patch('patch/a'); assert a.origin_sync_state == 'in_sync' and a.origin_sha == head(origin, 'patch/a') and a.origin_synced_at == T; b = patch('patch/b'); assert b.origin_sync_state == 'diverged' and b.origin_sha == head(origin, 'patch/b'); c = patch('patch/c'); assert c.origin_sync_state == 'missing_on_origin' and c.origin_sha == null and c.origin_synced_at == T"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "event_driven",
+          "condition": "a sync of a carry-patch workspace completes",
+          "action": "leave origin_sync_state, origin_sha and origin_synced_at null on every patch of the workspace when patch_branch_source is hub, and on every patch whose status is merged_upstream when it is origin, including a patch this sync detected as merged",
+          "contract": "a read of each such patch returns null for the three fields",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a first sync ran with patch_branch_source origin, so patch/a and patch/b have origin fields set"
+            ],
+            "pseudocode": "in internal/carrypatch/sync_refresh_test.go, TestRefresh_OriginFieldsNull, two cases: (1) set patch_branch_source hub; POST .../sync; for p in patches: assert p.origin_sync_state == null and p.origin_sha == null and p.origin_synced_at == null; (2) keep origin; upstream merges patch/a by fast-forward; r = POST .../sync; assert r.json.patches_merged == ['patch/a']; a = patch('patch/a'); assert a.status == 'merged_upstream' and a.origin_sync_state == null and a.origin_sha == null and a.origin_synced_at == null; assert patch('patch/b').origin_sync_state == 'in_sync'"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "event_driven",
+          "condition": "the origin refresh has created or moved the branch of a patch, or reached a state that differs from the origin_sync_state stored before the sync",
+          "action": "emit one parley.patch.sync event for that patch with resource_type patch, the patch id as resource_id, the caller as actor and the metadata branch_name, action, state, local_sha and origin_sha, and emit none for a patch whose branch did not move and whose state did not change",
+          "contract": "one parley.patch.sync event per such patch, in position order, whose metadata equals the patch's patches_synced entry without replaced_sha",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "patch_branch_source origin, policy replace; a first sync left patch/a, patch/b and patch/c in_sync; then origin gains a commit on patch/a, rewrites patch/b and deletes patch/c; patch/d stays in sync"
+            ],
+            "pseudocode": "in internal/carrypatch/sync_refresh_test.go, TestRefresh_EmitsPatchSyncEvents: clear recorded events; r = POST .../sync as user U; ev = events of type parley.patch.sync; assert [e.metadata.branch_name for e in ev] == ['patch/a', 'patch/b', 'patch/c']; for e in ev: assert e.resource_type == 'patch' and e.resource_id == id of that patch and e.actor is U; assert e.metadata == {branch_name, action, state, local_sha, origin_sha} of the matching patches_synced entry; assert ev[2].metadata.state == 'missing_on_origin' and ev[2].metadata.action == 'none'; then POST .../sync again with nothing changed and assert no further parley.patch.sync event"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "event_driven",
+          "condition": "the origin refresh has replaced a patch branch",
+          "action": "emit one parley.patch.replace event for that patch with the caller as actor and the metadata branch_name, replaced_sha, origin_sha and trigger sync",
+          "contract": "one parley.patch.replace event per replaced branch with resource_type patch, the patch id as resource_id, and metadata.trigger == 'sync'",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "patch_branch_source origin, policy replace; patch/b diverged; patch/a fast-forwardable"
+            ],
+            "pseudocode": "in internal/carrypatch/sync_refresh_test.go, TestRefresh_EmitsPatchReplaceEvent: old = ref(hub, 'refs/heads/patch/b'); POST .../sync as user U; ev = events of type parley.patch.replace; assert len(ev) == 1; assert ev[0].resource_type == 'patch' and ev[0].resource_id == id('patch/b') and ev[0].actor is U; assert ev[0].metadata == {branch_name: 'patch/b', replaced_sha: old, origin_sha: head(origin, 'patch/b'), trigger: 'sync'}"
+          }
+        },
+        {
+          "id": "REQ-5.5",
+          "pattern": "ubiquitous",
+          "action": "for any refresh outcome, write the patch's origin fields and the events that report the outcome in one store transaction, so that neither exists without the other",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the event writer is replaced by one that fails for the patch patch/a"
+            ],
+            "pseudocode": "in internal/carrypatch/sync_refresh_test.go, TestRefresh_OutcomeAndEventAreAtomic: origin is ahead on patch/a; before = patch('patch/a'); r = POST .../sync; assert r.status == 500; after = patch('patch/a'); assert after.origin_sync_state == before.origin_sync_state and after.origin_synced_at == before.origin_synced_at; assert events of type parley.patch.sync == []"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "A refresh that fails stops the sync and keeps what was done",
+      "rationale": "A lost compare-and-swap must not hide the upstream movement from the next sync, and must not undo refreshes that already happened (CP-FR-071).",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "unwanted",
+          "condition": "the refresh of one patch branch fails, by a compare-and-swap that finds the branch at another tip than the one compared, by a git failure or by a failed store write",
+          "action": "stop the sync at that patch without retrying, refresh no later patch, run no merge detection and answer with an internal error that names the branch",
+          "contract": "HTTP 500 with error_type internal and a message that contains the branch name; the failing branch is at the tip the concurrent writer gave it; the branches of later patches are unchanged; no patch status changed",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "patch_branch_source origin; patches patch/a (1, active), patch/b (2, active), patch/c (3, active); origin is ahead on all three; upstream has merged patch/c by fast-forward",
+              "the repository used by the refresh is wrapped so that, immediately before the compare-and-swap of patch/b, another writer moves refs/heads/patch/b to commit X"
+            ],
+            "pseudocode": "in internal/carrypatch/sync_refresh_test.go, TestRefresh_LostSwapStopsSync: c = ref(hub, 'refs/heads/patch/c'); r = POST .../sync; assert r.status == 500 and r.json.error_type == 'internal'; assert r.json.message contains 'patch/b'; assert ref(hub, 'refs/heads/patch/b') == X; assert ref(hub, 'refs/heads/patch/c') == c; assert patch('patch/c').status == 'active'; assert the compare-and-swap of patch/b was attempted exactly once"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "event_driven",
+          "condition": "the refresh of a patch branch fails after earlier patches of the same sync were refreshed",
+          "action": "keep the moves, the stored origin fields and the emitted events of the earlier patches, and keep a backup ref written for the failing branch",
+          "contract": "the earlier patches' branches are at origin's tip, their origin fields are stored, their parley.patch.sync events are recorded; refs/parley/replaced/<failing branch> holds the tip saved before the lost swap when the failing action was a replace",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "as for the lost-swap behaviour, with policy replace and patch/b diverged from origin at tip B before the sync"
+            ],
+            "pseudocode": "in internal/carrypatch/sync_refresh_test.go, TestRefresh_FailureKeepsEarlierOutcomes: r = POST .../sync; assert r.status == 500; assert ref(hub, 'refs/heads/patch/a') == head(origin, 'patch/a'); assert patch('patch/a').origin_sync_state == 'in_sync'; assert [e.metadata.branch_name for e in events of type parley.patch.sync] == ['patch/a']; assert ref(hub, 'refs/parley/replaced/patch/b') == B; assert patch('patch/b').origin_synced_at is unchanged"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "unwanted",
+          "condition": "a sync of a carry-patch workspace ends with a refresh failure",
+          "action": "leave upstream_head_sha, last_sync_at and sync_error as they were and emit no parley.workspace.sync event",
+          "contract": "HTTP 500; the workspace's upstream_head_sha, last_sync_at and sync_error equal their values from before the call; no parley.workspace.sync event is recorded",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "as for the lost-swap behaviour; upstream advanced since the last completed sync"
+            ],
+            "pseudocode": "in internal/carrypatch/sync_refresh_test.go, TestRefresh_FailureWritesNoCompletion: w0 = load workspace; r = POST .../sync; assert r.status == 500; w1 = load workspace; assert w1.upstream_head_sha == w0.upstream_head_sha and w1.last_sync_at == w0.last_sync_at and w1.sync_error == w0.sync_error; assert events of type parley.workspace.sync == []"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "event_driven",
+          "condition": "a sync ends with a refresh failure after the refresh created or moved the branch of a patch whose status is active or conflict, and auto_rebuild_after_sync is true",
+          "action": "queue a rebuild before answering, by the same enqueue and with the same dedup as a completed sync",
+          "contract": "HTTP 500; one rebuild job with status queued exists for the workspace, with submitted_by equal to the caller's user id; none is created when no earlier branch moved or when auto_rebuild_after_sync is false",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "as for the lost-swap behaviour"
+            ],
+            "pseudocode": "in internal/carrypatch/sync_refresh_test.go, TestRefresh_FailureStillQueuesRebuild, a table: {patch/a moved before the failure, auto true -> 1 job, submitted_by == U}; {the first patch is the failing one, auto true -> 0 jobs}; {patch/a moved, auto_rebuild_after_sync false -> 0 jobs}; r = POST .../sync as U; assert r.status == 500; assert rebuild jobs of the workspace match the row"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "event_driven",
+          "condition": "a caller syncs again after a sync that ended with a refresh failure, and nothing interferes",
+          "action": "complete the sync, refreshing the patches the failed sync did not reach and reporting upstream_advanced as true when upstream had advanced before the failed sync",
+          "contract": "HTTP 200 with upstream_advanced true; patches_synced has an entry for every patch in active, conflict or disabled; last_sync_at and upstream_head_sha are written",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a first sync failed at patch/b by a lost swap, with upstream advanced; the interfering writer is removed; policy replace"
+            ],
+            "pseudocode": "in internal/carrypatch/sync_refresh_test.go, TestRefresh_NextSyncCompletes: r = POST .../sync; assert r.status == 200; assert r.json.upstream_advanced == true; assert [e.branch_name for e in r.json.patches_synced] == ['patch/a', 'patch/b', 'patch/c']; assert entry(r.json.patches_synced, 'patch/a').action == 'none'; assert ref(hub, 'refs/heads/patch/c') == head(origin, 'patch/c'); assert r.json.upstream_head_sha == head(upstream, 'main') and r.json.last_sync_at != null"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "Patches that upstream merged are detected",
+      "rationale": "A patch upstream has taken must stop being applied; detecting it by content and by pull request number covers squash merges, where ancestry fails (CP-FR-072).",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "event_driven",
+          "condition": "the origin refresh of a sync has finished without failure",
+          "action": "run merge detection when upstream advanced or the refresh created or moved a patch branch, and otherwise skip it and report patches_merged as an empty list",
+          "contract": "patches_merged is [] and no patch status changes when neither holds",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a completed sync has stored upstream_head_sha; then patch/a is moved in the hub to a commit that is an ancestor of the upstream base (patch_branch_source hub)"
+            ],
+            "pseudocode": "in internal/carrypatch/merge_detect_test.go, TestMergeDetection_Trigger: r1 = POST .../sync (upstream unchanged, no refresh); assert r1.json.patches_merged == [] and patch('patch/a').status == 'active'; upstream gains one unrelated commit; r2 = POST .../sync; assert r2.json.patches_merged == ['patch/a']; second fixture with patch_branch_source origin and upstream unchanged: origin moves patch/b to an ancestor of the upstream base that descends from the hub's tip; r3 = POST .../sync; assert entry(r3.json.patches_synced, 'patch/b').action == 'fast_forwarded' and r3.json.patches_merged == ['patch/b']"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "optional",
+          "condition": "squash_merge_detection is ancestry_only or both",
+          "action": "treat a patch in active or conflict as merged when the tip of its branch is the upstream base or an ancestor of it",
+          "contract": "the patch's branch name is in patches_merged and its status is merged_upstream",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "upstream advanced in every case; each row is its own workspace with one patch, status active unless the row says otherwise"
+            ],
+            "pseudocode": "in internal/carrypatch/merge_detect_test.go, TestMergeDetection_Tests, a table of {setting, situation -> merged?}: {both, patch tip is an ancestor of the upstream base -> yes}; {ancestry_only, patch tip equals the upstream base -> yes}; {content_based, patch tip is an ancestor of the base -> no}; {both, two patch commits each cherry-picked into upstream under new ids -> yes}; {content_based, same -> yes}; {ancestry_only, same -> no}; {both, one of two patch commits has no equivalent in upstream -> no}; {content_based, the branch has no commit beyond the base and is not examined by ancestry -> no}; {both, upstream_pr_url 'https://forge.example/o/r/pull/42' and a new upstream commit with subject 'Add dialer (#42)' whose content differs from the patch -> yes}; {content_based, same -> yes}; {ancestry_only, same -> no}; {both, subject 'Add dialer (#421)' -> no}; {both, subject '(#42) add dialer' -> no}; {both, upstream_pr_url null and subject ends '(#42)' -> no}; {both, patch status conflict and tip an ancestor of the base -> yes}; r = POST .../sync; assert (branch in r.json.patches_merged) == row.merged; assert patch.status == 'merged_upstream' iff row.merged"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "optional",
+          "condition": "squash_merge_detection is content_based or both",
+          "action": "treat a patch in active or conflict as merged when its branch has at least one non-merge commit that is not in the upstream base and every such commit has a commit with the same git patch id in upstream",
+          "contract": "the patch's branch name is in patches_merged and its status is merged_upstream",
+          "check": {
+            "same_as": "REQ-7.2"
+          }
+        },
+        {
+          "id": "REQ-7.4",
+          "pattern": "optional",
+          "condition": "squash_merge_detection is content_based or both",
+          "action": "treat a patch in active or conflict as merged when its upstream_pr_url contains /pull/<n> with <n> decimal digits and an examined upstream commit has a subject line that ends with (#<n>)",
+          "contract": "the patch's branch name is in patches_merged and its status is merged_upstream",
+          "check": {
+            "same_as": "REQ-7.2"
+          }
+        },
+        {
+          "id": "REQ-7.5",
+          "pattern": "ubiquitous",
+          "action": "for any sync, examine for the pull request number test the upstream commits reachable from the new upstream base and not from the stored upstream head, and, on the first sync or when force_push_detected is true, the 50 newest commits reachable from the new upstream base",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "squash_merge_detection both; the patch has upstream_pr_url ending /pull/7 and content that upstream does not have"
+            ],
+            "pseudocode": "in internal/carrypatch/merge_detect_test.go, TestMergeDetection_PRNumberWindow, a table: {first sync, the commit with subject ending '(#7)' is the 50th newest upstream commit -> merged}; {first sync, it is the 51st newest -> not merged}; {later sync, the '(#7)' commit is older than the stored upstream head and upstream gained other commits -> not merged}; {later sync, the '(#7)' commit is 60 commits after the stored head -> merged}; {later sync after an upstream force-push, the '(#7)' commit is the 3rd newest of the new base -> merged}; {force-push, it is the 51st newest -> not merged}; r = POST .../sync; assert (branch in r.json.patches_merged) == row.merged"
+          }
+        },
+        {
+          "id": "REQ-7.6",
+          "pattern": "event_driven",
+          "condition": "merge detection finds a patch merged",
+          "action": "set the patch's status to merged_upstream, clear its conflict_files, list its branch name in patches_merged in position order, and emit one parley.patch.update event with the caller as actor and the metadata branch_name, changed equal to [\"status\"], from, to merged_upstream and reason merged_upstream",
+          "contract": "a read of the patch returns status merged_upstream and conflict_files []; one parley.patch.update event with resource_type patch and the patch id as resource_id",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "patch/a (position 1, status conflict, conflict_files ['x.go']) and patch/c (position 3, active) are both ancestors of the new upstream base; patch/b (position 2) is not merged"
+            ],
+            "pseudocode": "in internal/carrypatch/merge_detect_test.go, TestMergeDetection_MarksPatchMerged: r = POST .../sync as user U; assert r.json.patches_merged == ['patch/a', 'patch/c']; a = patch('patch/a'); assert a.status == 'merged_upstream' and a.conflict_files == []; ev = events of type parley.patch.update; assert len(ev) == 2; assert ev[0].resource_type == 'patch' and ev[0].resource_id == a.id and ev[0].actor is U; assert ev[0].metadata == {branch_name: 'patch/a', changed: ['status'], from: 'conflict', to: 'merged_upstream', reason: 'merged_upstream'}; assert patch('patch/b').status == 'active'"
+          }
+        },
+        {
+          "id": "REQ-7.7",
+          "pattern": "ubiquitous",
+          "action": "for any patch whose status is disabled, merged_upstream or deleted, or whose branch does not exist in the hub, leave the patch out of merge detection, so that a sync never changes its status",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "upstream advanced; patch/d (disabled) has a tip that is an ancestor of the upstream base; patch/m is merged_upstream and upstream no longer contains its commits; patch/x (active) has no branch in the hub and an upstream_pr_url whose number matches a new upstream commit"
+            ],
+            "pseudocode": "in internal/carrypatch/merge_detect_test.go, TestMergeDetection_NotExamined: r = POST .../sync; assert r.status == 200 and r.json.patches_merged == []; assert patch('patch/d').status == 'disabled'; assert patch('patch/m').status == 'merged_upstream'; assert patch('patch/x').status == 'active'; assert events of type parley.patch.update == []"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "A sync that changed the rebuild's inputs queues a rebuild",
+      "rationale": "The point of syncing a carry-patch workspace is an integration branch built from current inputs, without a second call (CP-FR-074, CP-FR-039).",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "merge detection of a sync has finished, auto_rebuild_after_sync is true, the workspace has no rebuild that is queued, running or failed, and upstream advanced, or the refresh created or moved the branch of a patch in active or conflict, or a patch was detected as merged",
+          "action": "queue one rebuild with submitted_by equal to the caller's user id and the strategy and fail mode of the workspace settings rebuild_strategy and rebuild_fail_mode, and report it in the answer",
+          "contract": "HTTP 200 with rebuild_triggered true and rebuild_job_id equal to the id of a job whose status is queued, whose submitted_by is the caller's user id and whose strategy and fail_mode equal the settings",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the job workers are stopped so that queued jobs stay queued; rebuild_strategy is merge and rebuild_fail_mode is continue"
+            ],
+            "pseudocode": "in internal/carrypatch/sync_test.go, TestSync_RebuildTrigger, a table of {situation, auto_rebuild_after_sync -> triggered?}: {upstream advanced, true -> yes}; {source origin, origin moved the branch of an active patch, upstream unchanged, true -> yes}; {same with a conflict patch -> yes}; {source origin, origin moved only the branch of a disabled patch, upstream unchanged, true -> no}; {nothing changed, true -> no}; {upstream advanced, false -> no}; {upstream advanced and a patch detected merged, false -> no}; r = POST .../sync as user U; assert r.status == 200; assert r.json.rebuild_triggered == row.triggered; if triggered: j = job(r.json.rebuild_job_id); assert j.status == 'queued' and j.submitted_by == U.id and j.strategy == 'merge' and j.fail_mode == 'continue'; else: assert r.json.rebuild_job_id == null and rebuild jobs of the workspace == []"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "state_driven",
+          "condition": "none of the three causes holds for a sync, or auto_rebuild_after_sync is false",
+          "action": "queue no rebuild and report rebuild_triggered as false and rebuild_job_id as null",
+          "contract": "HTTP 200 with rebuild_triggered false and rebuild_job_id null; no rebuild job is created",
+          "check": {
+            "same_as": "REQ-8.1"
+          }
+        },
+        {
+          "id": "REQ-8.3",
+          "pattern": "state_driven",
+          "condition": "the workspace already has a rebuild that is queued, running or failed when a sync would queue one",
+          "action": "skip the trigger, complete the sync and report rebuild_triggered as false and rebuild_job_id as null",
+          "contract": "HTTP 200 with rebuild_triggered false and rebuild_job_id null; the workspace still has exactly one non-final rebuild job; last_sync_at and upstream_head_sha are written",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the job workers are stopped; upstream advanced"
+            ],
+            "pseudocode": "in internal/carrypatch/sync_test.go, TestSync_RebuildSkippedOnDuplicate, a table over the existing job's status in {queued, running, failed}: r = POST .../sync; assert r.status == 200; assert r.json.rebuild_triggered == false and r.json.rebuild_job_id == null; assert count(jobs of the workspace in queued, running or failed) == 1; assert r.json.upstream_head_sha == head(upstream, 'main')"
+          }
+        },
+        {
+          "id": "REQ-8.4",
+          "pattern": "event_driven",
+          "condition": "a sync would queue a rebuild on a workspace that has no patch in active or conflict",
+          "action": "queue the rebuild without applying the no_active_patches check of the rebuild submit route",
+          "contract": "HTTP 200 with rebuild_triggered true and a non-null rebuild_job_id",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the workspace's only patch is disabled; upstream advanced; the job workers are stopped"
+            ],
+            "pseudocode": "in internal/carrypatch/sync_test.go, TestSync_RebuildQueuedWithoutActivePatches: r = POST .../sync; assert r.status == 200 and r.json.rebuild_triggered == true and job(r.json.rebuild_job_id).status == 'queued'; second fixture with no patch at all: same assertions"
+          }
+        },
+        {
+          "id": "REQ-8.5",
+          "pattern": "unwanted",
+          "condition": "the rebuild enqueue of a sync fails for another reason than an existing queued, running or failed rebuild",
+          "action": "answer with an internal error and write neither upstream_head_sha nor last_sync_at, so that the next sync reports the upstream movement again",
+          "contract": "HTTP 500 with error_type internal; the workspace's upstream_head_sha and last_sync_at equal their values from before the call; a following sync with the enqueue working answers 200 with upstream_advanced true and rebuild_triggered true",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "upstream advanced; the enqueue is replaced by one that fails with a store error on its first call and delegates afterwards"
+            ],
+            "pseudocode": "in internal/carrypatch/sync_test.go, TestSync_EnqueueFailure: w0 = load workspace; r1 = POST .../sync; assert r1.status == 500 and r1.json.error_type == 'internal'; w1 = load workspace; assert w1.upstream_head_sha == w0.upstream_head_sha and w1.last_sync_at == w0.last_sync_at; r2 = POST .../sync; assert r2.status == 200 and r2.json.upstream_advanced == true and r2.json.rebuild_triggered == true"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-9",
+      "title": "The sync answer carries the carry-patch members",
+      "rationale": "One answer tells a scheduler what the sync saw and did, and which rebuild to wait for (CP-FR-076, §10.5).",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-9.1",
+          "pattern": "event_driven",
+          "condition": "a sync of a carry-patch workspace completes",
+          "action": "answer with the workspace object and branches of the general sync plus the members upstream_advanced, force_push_detected, origin_fetched, patches_merged, patches_synced, patches_diverged, rebuild_triggered and rebuild_job_id, with origin_fetched always true and every list present as a list also when empty",
+          "contract": "HTTP 200 with body {…workspace object, branches: object[], upstream_advanced: boolean, force_push_detected: boolean, origin_fetched: true, patches_merged: string[], patches_synced: object[], patches_diverged: string[], rebuild_triggered: boolean, rebuild_job_id: string or null}",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a carry-patch workspace with no patch; a completed sync already stored upstream_head_sha; nothing changed since"
+            ],
+            "pseudocode": "in internal/carrypatch/sync_test.go, TestSync_AnswerShape: r = POST .../sync; assert r.status == 200; assert r.json.slug == 'cp' and r.json.branches is a list; assert r.json.upstream_advanced == false and r.json.force_push_detected == false and r.json.origin_fetched == true; assert the raw JSON has patches_merged == [], patches_synced == [], patches_diverged == [] (lists, not null); assert r.json.rebuild_triggered == false; assert the raw JSON has the key rebuild_job_id with value null"
+          }
+        },
+        {
+          "id": "REQ-9.2",
+          "pattern": "ubiquitous",
+          "action": "for any patches_synced entry, return branch_name, action, state, local_sha as the hub's tip of the branch after the refresh or null when the hub has no such branch, origin_sha as origin's tip or null when the branch is missing on origin, and replaced_sha as the saved tip when action is replaced and null otherwise, every commit id in full 40-character form",
+          "contract": "each entry is {branch_name: string, action: created|fast_forwarded|replaced|none, state: in_sync|diverged|missing_on_origin, local_sha: string or null, origin_sha: string or null, replaced_sha: string or null}",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "patch_branch_source origin, policy report; patch/a fast-forwardable; patch/b diverged; patch/c exists in the hub and not on origin; patch/d exists neither in the hub nor on origin"
+            ],
+            "pseudocode": "in internal/carrypatch/sync_test.go, TestSync_PatchesSyncedEntries: r = POST .../sync; a, b, c, d = entries by branch_name; assert each entry has exactly the six keys; assert a.local_sha == a.origin_sha == head(origin, 'patch/a') and len(a.local_sha) == 40 and a.replaced_sha == null; assert b.local_sha == ref(hub, 'refs/heads/patch/b') and b.origin_sha == head(origin, 'patch/b') and b.local_sha != b.origin_sha; assert c.local_sha == ref(hub, 'refs/heads/patch/c') and c.origin_sha == null; assert d.action == 'none' and d.state == 'missing_on_origin' and d.local_sha == null and d.origin_sha == null"
+          }
+        },
+        {
+          "id": "REQ-9.3",
+          "pattern": "event_driven",
+          "condition": "the origin refresh of a sync leaves patches in state diverged",
+          "action": "list the branch names of those patches in patches_diverged, in position order, and still answer 200",
+          "contract": "HTTP 200; patches_diverged equals the branch_name of every patches_synced entry whose state is diverged, in the same order",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "patch_branch_source origin, policy report; patch/a (1) in sync, patch/b (2) and patch/c (3) diverged"
+            ],
+            "pseudocode": "in internal/carrypatch/sync_test.go, TestSync_PatchesDiverged: r = POST .../sync; assert r.status == 200; assert r.json.patches_diverged == ['patch/b', 'patch/c']; assert r.json.rebuild_triggered == false when upstream did not advance; set policy replace; r2 = POST .../sync; assert r2.json.patches_diverged == []"
+          }
+        },
+        {
+          "id": "REQ-9.4",
+          "pattern": "event_driven",
+          "condition": "a caller syncs a workspace whose workspace_mode is standard",
+          "action": "answer as the general sync does, with none of the eight carry-patch members, and contact no upstream",
+          "contract": "HTTP 200; the raw JSON has none of the keys upstream_advanced, force_push_detected, origin_fetched, patches_merged, patches_synced, patches_diverged, rebuild_triggered, rebuild_job_id",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a standard workspace; the carry-patch participant is registered; the upstream fetch function is wrapped to count its calls"
+            ],
+            "pseudocode": "in internal/carrypatch/sync_test.go, TestSync_StandardWorkspaceUnchanged: r = POST /api/v1/workspaces/std/sync; assert r.status == 200; for k in the eight member names: assert k not in keys(r.json); assert upstream fetch calls == 0; assert no rebuild job exists"
+          }
+        },
+        {
+          "id": "REQ-9.5",
+          "pattern": "event_driven",
+          "condition": "the caller disconnects while a sync of a carry-patch workspace is running",
+          "action": "run the carry-patch part to its end as if the caller had waited",
+          "contract": "after the call ends the patch branches, the patch fields, upstream_head_sha, last_sync_at, the events and the queued rebuild are the same as for a caller that waited",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "patch_branch_source origin; origin is ahead on patch/a; upstream advanced; the upstream fetch function is wrapped to block until the test releases it"
+            ],
+            "pseudocode": "in internal/carrypatch/sync_test.go, TestSync_CompletesAfterDisconnect: start POST .../sync with a cancellable request context; when the upstream fetch is entered, cancel the context, then release the fetch; wait until the handler returns; assert ref(hub, 'refs/heads/patch/a') == head(origin, 'patch/a'); assert patch('patch/a').origin_sync_state == 'in_sync'; w = load workspace; assert w.upstream_head_sha == head(upstream, 'main') and w.last_sync_at != null; assert one parley.patch.sync event and one queued rebuild job exist"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "A developer syncs after upstream merged a patch, and the integration branch is rebuilt",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "runs `parley workspace sync cp --wait` on a carry-patch workspace whose upstream has merged the commits of patch/a and gained other commits"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends POST /api/v1/workspaces/cp/sync"
+        },
+        {
+          "actor": "parleyd",
+          "action": "fetches origin, then upstream, and finds the upstream base different from the stored upstream_head_sha"
+        },
+        {
+          "actor": "parleyd",
+          "action": "runs the per-branch pass without the integration branch and the patch branches, detects patch/a as merged, sets it to merged_upstream and emits parley.patch.update"
+        },
+        {
+          "actor": "parleyd",
+          "action": "queues a rebuild, writes upstream_head_sha and last_sync_at, and answers 200 with upstream_advanced true, patches_merged [\"patch/a\"], rebuild_triggered true and the job id"
+        },
+        {
+          "actor": "parleyd",
+          "action": "runs the rebuild, publishes the integration branch as the new upstream base plus patch/b and soft-deletes patch/a"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "polls the rebuild job until it is completed, prints the sync answer with the final job record and exits 0"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parley CLI",
+          "parleyd HTTP server and sync route",
+          "internal/workspace sync",
+          "internal/carrypatch sync part, merge detection and rebuild",
+          "internal/jobs queue and worker",
+          "git binary and bare repositories for hub, origin and upstream",
+          "SQLite store",
+          "event log"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 as test/e2e starts it, with test origin and upstream repositories served by internal/gitrepo/gitrepotest",
+          "a carry-patch workspace cp created through the API, patches patch/a and patch/b added, and a first sync and rebuild completed",
+          "then upstream main receives patch/a's commits by fast-forward merge and one further unrelated commit"
+        ],
+        "end_state": [
+          "the command exits 0 and its stdout document has upstream_advanced true, patches_merged [\"patch/a\"], rebuild_triggered true and rebuild.status completed",
+          "GET /workspaces/cp shows upstream_head_sha equal to upstream's head",
+          "upstream's head is an ancestor of the integration branch, and the file added by patch/b is present in its tree",
+          "GET /workspaces/cp/patches lists only patch/b",
+          "GET /events/log holds parley.patch.update (reason merged_upstream) and parley.workspace.sync for the workspace"
+        ],
+        "pseudocode": "in test/e2e/carry_patch_sync_test.go, TestCarryPatchSync_MergedPatchIsRebuiltAway: out, code = run('parley', 'workspace', 'sync', 'cp', '--wait'); assert code == 0; d = json(out); assert d.upstream_advanced and d.patches_merged == ['patch/a'] and d.rebuild_triggered and d.rebuild.status == 'completed'; assert GET('/workspaces/cp').upstream_head_sha == head(upstream, 'main'); assert names(GET('/workspaces/cp/patches')) == ['patch/b']; assert git('merge-base', '--is-ancestor', head(upstream, 'main'), 'refs/heads/deploy') succeeds in the hub repository; assert the event log holds parley.patch.update with metadata.reason 'merged_upstream'"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "An agent syncs a workspace whose patch branches follow origin",
+      "steps": [
+        {
+          "actor": "origin",
+          "action": "holds a new commit on patch/a and a rewritten patch/b, while the workspace has patch_branch_source origin"
+        },
+        {
+          "actor": "agent",
+          "action": "sends POST /api/v1/workspaces/cp/sync with a workspaces:write token"
+        },
+        {
+          "actor": "parleyd",
+          "action": "fetches origin and upstream, fast-forwards patch/a, saves the hub's tip of patch/b to refs/parley/replaced/patch/b and moves patch/b to origin's tip"
+        },
+        {
+          "actor": "parleyd",
+          "action": "stores in_sync on both patches, emits parley.patch.sync twice and parley.patch.replace once, queues a rebuild and answers 200 with both entries in patches_synced"
+        },
+        {
+          "actor": "agent",
+          "action": "reads GET /api/v1/workspaces/cp/patches/<id of patch/b> and sees origin_sync_state in_sync and replaced_sha"
+        },
+        {
+          "actor": "developer",
+          "action": "sets patch_divergence_policy to report, lets origin rewrite patch/b again and runs `parley workspace sync cp --fail-on-diverged`"
+        },
+        {
+          "actor": "parleyd",
+          "action": "leaves patch/b untouched, stores diverged on it and answers 200 with patches_diverged [\"patch/b\"]"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints the answer, names patch/b on stderr and exits 3"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parley CLI",
+          "parleyd HTTP server and sync route",
+          "internal/workspace sync",
+          "internal/carrypatch sync part and origin refresh",
+          "git binary and bare repositories for hub, origin and upstream",
+          "SQLite store",
+          "event log"
+        ],
+        "setup": [
+          "a hub started in-process as test/e2e starts it; workspace cp in carry-patch mode with patches patch/a and patch/b; its settings changed through PATCH /workspaces/cp to patch_branch_source origin; one sync completed",
+          "then origin gains a commit on patch/a and patch/b is force-pushed on origin to an unrelated commit"
+        ],
+        "end_state": [
+          "the hub's patch/a and patch/b equal origin's tips",
+          "refs/parley/replaced/patch/b in the hub repository equals the hub's former tip of patch/b, and GET of the patch returns it as replaced_sha",
+          "the event log holds two parley.patch.sync events and one parley.patch.replace event with trigger sync",
+          "after the policy change and a second rewrite on origin, the hub's patch/b is unchanged, the command's stdout has patches_diverged [\"patch/b\"] and its exit code is 3"
+        ],
+        "pseudocode": "in test/e2e/carry_patch_sync_test.go, TestCarryPatchSync_OriginRefresh: old = hubRef('refs/heads/patch/b'); r = POST('/workspaces/cp/sync'); assert r.status == 200; assert actions(r.json.patches_synced) == {'patch/a': 'fast_forwarded', 'patch/b': 'replaced'}; assert hubRef('refs/heads/patch/b') == head(origin, 'patch/b') and hubRef('refs/parley/replaced/patch/b') == old; p = GET('/workspaces/cp/patches/' + idB); assert p.origin_sync_state == 'in_sync' and p.replaced_sha == old; assert count(events 'parley.patch.replace') == 1; PATCH('/workspaces/cp', settings patch_divergence_policy report); rewrite patch/b on origin; kept = hubRef('refs/heads/patch/b'); out, code = run('parley', 'workspace', 'sync', 'cp', '--fail-on-diverged'); assert code == 3; assert json(out).patches_diverged == ['patch/b']; assert hubRef('refs/heads/patch/b') == kept"
+      }
+    }
+  ]
+}

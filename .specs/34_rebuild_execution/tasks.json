@@ -1,0 +1,308 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "34",
+  "spec_name": "rebuild_execution",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/carrypatch/... ./internal/gitrepo/... ./internal/jobs/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "26",
+      "reason": "rebuild conflicts take their file entries from its conflict report component in internal/land"
+    },
+    {
+      "spec": "33",
+      "reason": "runs as the handler of the durable rebuild jobs that package queues: its worker calls the run operation once per attempt and the settlement hook inside each settlement, its job record holds the result this package writes, and its enqueue queues the follow-up"
+    },
+    {
+      "spec": "52",
+      "reason": "emits parley.rebuild.* and the rebuild-caused parley.patch.* events through its event component, in the transaction of the state change"
+    },
+    {
+      "spec": "13",
+      "reason": "pushes the integration branch to origin with the lease push operation it adds to internal/gitrepo"
+    },
+    {
+      "spec": "14",
+      "reason": "registers the remover of a workspace's remembered-resolution entries with the removers of owned data it declares"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Start an attempt: check the workspace, fetch upstream and resolve the upstream base",
+      "criteria": [
+        "REQ-1.1",
+        "REQ-1.2",
+        "REQ-1.3",
+        "REQ-1.4",
+        "REQ-1.5"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/carrypatch/rebuild_test.go and confirm they fail; build the shared rebuild fixture there: an upstream, an origin and a hub bare repository made with git in t.TempDir(), a carry-patch workspace record in status ready with integration_branch deploy in a real store, helpers that register patches and create their branches, a rebuild job claimed for one attempt, a fixed clock, a recording event emitter, the landing identity, and hooks that run test code before a given patch and before the publish",
+        "In internal/carrypatch add the rebuild handler: one operation that runs one attempt of a rebuild job and returns an outcome value that is completed, a retryable failure or a permanent failure, each failure with a reason word, a text and, for a conflict, the conflict report; library code returns the outcome and never ends the process",
+        "Declare what the handler needs as narrow interfaces so tests can replace them: the workspace reader, the patch store, the job record writer, the upstream fetcher with its credential resolver, the settings reader, the clock, the event emitter, the conflict-file describer, the pusher and the enqueuer (the interface RebuildEnqueuer of package 31)",
+        "At the start of an attempt read the workspace: archived ends the attempt as a permanent failure with reason workspace_archived and failed with workspace_not_ready; pending or cloning ends it as a retryable failure with reason workspace_busy; a workspace that no longer exists ends it with nothing written and no event; none of these starts a fetch",
+        "On a ready workspace start with an empty patch_results, then run EnsureSetup of package 31, which fetches upstream into refs/remotes/upstream/* without tags with the upstream credential resolution of that package (UPSTREAM_GIT_PAT, else UPSTREAM_GIT_USERNAME with UPSTREAM_GIT_PASSWORD, else the origin credential of the workspace) and repeats a missing set-up step; a failed fetch step is a retryable failure with reason upstream_fetch_failed, and a failure of another set-up step is logged and does not end the attempt",
+        "Resolve the upstream base with UpstreamBase of package 31: the head of the upstream's default branch, else the upstream branch named like the workspace's default_branch; store it on the job as upstream_head_sha; when neither resolves end the attempt as a retryable failure with reason upstream_unknown",
+        "Run every git operation of the rebuild, in this and the later tasks, through the carry-patch git runner of package 31 (internal/carrypatch/gitrun.go), and read the integration branch name from the job, where package 33 captured it through IntegrationBranch of package 31"
+      ],
+      "touches": [
+        "internal/carrypatch/rebuild.go",
+        "internal/carrypatch/rebuild_test.go"
+      ],
+      "done_when": [
+        "`go test ./internal/carrypatch/... -count=1` passes with the real git binary"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Replay the patches by rebase in a scratch working tree and publish the head",
+      "criteria": [
+        "REQ-2.1",
+        "REQ-3.1",
+        "REQ-3.2",
+        "REQ-3.6",
+        "REQ-6.1"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/gitrepo/scratch_test.go, internal/carrypatch/rebuild_test.go, internal/carrypatch/rebuild_strategy_test.go and internal/carrypatch/rebuild_publish_test.go and confirm they fail",
+        "In internal/gitrepo add the scratch working tree: a detached git working tree of a bare repository at <repository>/parley-rebuild/<job id>, checked out at a given commit, created without adding or moving any ref, with an operation that removes it and its administrative entry; git runs with the wrapper's scrubbed environment, with hooks off and without filters or merge drivers from repository content",
+        "Add to the scratch working tree the replay of one commit onto its HEAD: it keeps the commit's author, author date and message, sets the committer to an identity passed in by the caller and the committer date from the clock, and reports one of three results: applied (with the new commit), dropped because the commit's change is already present (HEAD unchanged), or conflicted (with the conflicted paths)",
+        "After the upstream base is resolved, list the non-deleted patches of the workspace in position order and read the tip of each patch branch once into source_sha (null when the branch does not exist); pass only these commits to every later step",
+        "Start the head under construction at the upstream base; for a patch applied with strategy rebase take the commits reachable from source_sha and not from the upstream base, oldest first, leave out commits with more than one parent, and replay the others; the patch result is success with new_head_sha the head under construction after the patch",
+        "Take the committer from the landing identity of the server configuration ([land].committer_name and [land].committer_email) and pass it explicitly to every git call that creates a commit",
+        "Publish: read the head of the integration branch named on the job, and move the branch to the head under construction with one compare-and-swap of internal/gitrepo against the head just read, creating the branch when it does not exist; store integration_head_sha and previous_integration_head_sha (null when the branch did not exist) on the job",
+        "Change no ref other than refs/remotes/upstream/* before the publish and only the integration branch at the publish"
+      ],
+      "touches": [
+        "internal/gitrepo/scratch.go",
+        "internal/gitrepo/scratch_test.go",
+        "internal/carrypatch/rebuild.go",
+        "internal/carrypatch/rebuild_build.go",
+        "internal/carrypatch/rebuild_publish.go",
+        "internal/carrypatch/rebuild_test.go",
+        "internal/carrypatch/rebuild_strategy_test.go",
+        "internal/carrypatch/rebuild_publish_test.go"
+      ],
+      "done_when": [
+        "`go test ./internal/gitrepo/... ./internal/carrypatch/... -count=1` passes with the real git binary"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Skip patches that do not apply to the run, store progress after every patch and watch the workspace",
+      "criteria": [
+        "REQ-1.6",
+        "REQ-2.2",
+        "REQ-2.3",
+        "REQ-2.4",
+        "REQ-2.5",
+        "REQ-2.6",
+        "REQ-6.4"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/carrypatch/rebuild_test.go and internal/carrypatch/result_test.go and confirm they fail",
+        "Define the patch result with its nine members (patch_id, branch_name, position, status, skipped_reason, source_sha, new_head_sha, conflict_files, conflict) so that every member is present in the JSON: null where unset, [] for conflict_files unless the status is conflict",
+        "Record a disabled patch as skipped with reason disabled, a merged_upstream patch as skipped with reason merged_upstream, and a patch whose source_sha is null as skipped with reason branch_not_found, leaving the head under construction as it is",
+        "Apply a patch whose status is conflict exactly as an active one",
+        "After every patch, whatever its result, write the results so far to the job record through the job record writer of package 33 before the next patch starts; leave the four counts at 0",
+        "Take no lock on the workspace or its branches for the length of a run: a compare-and-swap of a patch branch by another caller during the run succeeds, and the run keeps using the source_sha it recorded",
+        "Publish also when no patch was applied, which moves the integration branch to the upstream base",
+        "Run the workspace test of task 1 again before every patch and inside the publish, immediately before the compare-and-swap, so that an archive, a reclone or a delete during a run ends the attempt at its next step without moving the integration branch: archived or failed as a permanent failure, pending or cloning as a retryable failure, a deleted workspace with nothing written and no event"
+      ],
+      "touches": [
+        "internal/carrypatch/rebuild.go",
+        "internal/carrypatch/rebuild_build.go",
+        "internal/carrypatch/result.go",
+        "internal/carrypatch/result_test.go",
+        "internal/carrypatch/rebuild_test.go",
+        "internal/carrypatch/rebuild_publish.go",
+        "internal/carrypatch/rebuild_publish_test.go"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Apply patches by merge, skip a patch with nothing to apply, and fix the identity of hub commits",
+      "criteria": [
+        "REQ-3.3",
+        "REQ-3.4",
+        "REQ-3.5"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/gitrepo/scratch_test.go and internal/carrypatch/rebuild_strategy_test.go and confirm they fail",
+        "Add to the scratch working tree the merge of a commit into its HEAD that always creates a merge commit, never a fast-forward, with a message, an author and a committer passed in by the caller; it reports applied (with the merge commit) or conflicted (with the conflicted paths)",
+        "With strategy merge, merge the patch's source_sha into the head under construction with the message Merge branch '<branch_name>', the head under construction as first parent and source_sha as second, and the landing identity as author and committer",
+        "With strategy merge, record a patch whose source_sha is already reachable from the head under construction as skipped with reason nothing_to_apply, without creating a commit",
+        "With strategy rebase, record a patch as skipped with reason nothing_to_apply when it has no commit to replay or every one of its commits was dropped as already present",
+        "Make every commit of a rebuild independent of the process environment and of the repository's configuration: with GIT_AUTHOR_* and GIT_COMMITTER_* set in the environment of the test process and user.name set in the repository, the committer is still the landing identity and a replayed commit keeps its original author"
+      ],
+      "touches": [
+        "internal/gitrepo/scratch.go",
+        "internal/gitrepo/scratch_test.go",
+        "internal/carrypatch/rebuild_build.go",
+        "internal/carrypatch/rebuild_strategy_test.go"
+      ],
+      "depends_on": [
+        2
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Report a conflicting patch, follow the fail mode, and clean up after every attempt",
+      "criteria": [
+        "REQ-4",
+        "REQ-9.4"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/carrypatch/rebuild_conflict_test.go and internal/carrypatch/rebuild_outcome_test.go and confirm they fail",
+        "When a replayed commit or a merge reports conflicted paths, undo the patch: abort the operation in the scratch working tree and return its HEAD to the head under construction before the patch, so that none of the patch's commits stays in what the run goes on with",
+        "In one store transaction set the patch's status to conflict and its conflict_files to the conflicted paths in ascending order, and, only when the status was not conflict before, emit parley.patch.update (resource_type patch, resource_id the patch id, actor system, metadata branch_name, changed [\"status\"], from, to conflict, reason rebuild_conflict)",
+        "Build the conflict report in one exported builder, which the preview of package 35 also calls so that both reports are one type: patch_id; target_sha the head under construction before the patch; head_sha the source_sha; base_sha the merge base of source_sha and target_sha; commit_sha the commit that did not apply, or source_sha with strategy merge; landed_changes [] and change null; files from the conflict-file describer for the conflicted paths, ours being the file in target_sha and theirs the file in commit_sha, each with landed_by []",
+        "Declare the conflict-file describer as a narrow interface of the rebuild that returns the file entries of the conflict report of package 26 (path, kind, base, ours, theirs) for a target commit, a patch commit and a list of paths; the real one is the conflict report component of internal/land",
+        "Record the patch result as conflict with the same conflict_files and the report, and store progress",
+        "With fail_mode fail_fast stop the run there: process no later patch, do not publish, and return a permanent failure with reason conflict, the report, and a text that names the patch's branch and the number of conflicted files",
+        "With fail_mode continue go on with the next patch from the head under construction before the conflicting patch, and publish at the end",
+        "Every git operation of a run has the runner's deadline of 10 minutes (a value tests can shorten), after which the runner kills the git process and its children; return a retryable failure with reason timeout for the runner's ErrGitTimeout, shutdown when the attempt's context was cancelled, and git_error for any other git failure that is not a conflict; in these cases record no result for the patch in work, change no patch and do not publish",
+        "Remove the scratch working tree before the attempt returns on every path out of it (completed, either kind of failure, cancelled context), and at the start of an attempt remove every entry left under <repository>/parley-rebuild/ and prune the repository's working-tree list, through one exported operation of internal/gitrepo/scratch.go that package 38 also calls for every workspace when the hub starts"
+      ],
+      "touches": [
+        "internal/carrypatch/rebuild.go",
+        "internal/carrypatch/rebuild_build.go",
+        "internal/carrypatch/rebuild_conflict.go",
+        "internal/carrypatch/rebuild_conflict_test.go",
+        "internal/carrypatch/rebuild_outcome_test.go",
+        "internal/gitrepo/scratch.go",
+        "internal/gitrepo/scratch_test.go"
+      ],
+      "depends_on": [
+        3,
+        4
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Replay remembered resolutions and learn them from the patch branch",
+      "criteria": [
+        "REQ-5"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/gitrepo/scratch_test.go and internal/carrypatch/rebuild_rerere_test.go and confirm they fail",
+        "Run every replay and merge of the scratch working tree with git rerere on and with automatic staging of replayed resolutions, set per command and not in the repository's configuration file; resolutions live in the rr-cache of the workspace's own bare repository, so no other workspace reads them",
+        "After a conflicted replay or merge, ask git which paths are still unresolved; when none is left, conclude the commit with the resolved content (same author, message and committer rules as an applied commit) and report it as applied; otherwise report only the paths still unresolved as conflicted",
+        "Expose from the scratch working tree, for a conflicted operation, the pairs of rerere id and path that git recorded, and whether git holds a resolution for an id",
+        "Add the remembered-resolution entries to the store, keyed by workspace and id, with path and recorded_at; for every pair git recorded in a run insert an entry with the clock's time when none exists; resolved is read from git (a resolution exists for the id), not stored twice; export the reads and writes package 38 builds its list, forget and count on: the entries of a workspace with resolved filled in, their number, and the removal of one entry by workspace and id",
+        "Learn from the patch branch when paths are still unresolved: list the commits with exactly two parents that are reachable from source_sha and not from the upstream base, newest first, 50 at most; for each, in the scratch working tree, check out the first parent and merge the second with rerere on; where that merge conflicts, write the merge commit's own content for each conflicted path, let git record it as the resolution, and set recorded_at of the entry to the clock's time; then return the working tree to the head under construction",
+        "After learning, replay the commit that did not apply once more; when it now applies, go on with the patch; when paths are still unresolved, treat the patch as conflicting as task 5 does; learn at most once per patch per attempt",
+        "Keep the conflict report and conflict_files to the paths still unresolved after the replay of resolutions",
+        "Make the entries end with what they describe: register a remover of a workspace's entries with the removers of owned data of package 14 (internal/workspace/teardown.go), and a post-clone step for the mode carry_patch with the post-clone step registry of package 10 that deletes the workspace's entries after every fresh clone, because a reclone starts with an empty rr-cache"
+      ],
+      "touches": [
+        "internal/gitrepo/scratch.go",
+        "internal/gitrepo/rerere.go",
+        "internal/gitrepo/scratch_test.go",
+        "internal/carrypatch/rebuild_build.go",
+        "internal/carrypatch/rerere_entries.go",
+        "internal/carrypatch/rebuild_rerere_test.go",
+        "internal/hub/"
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Change the patch list in the same step as the publish",
+      "criteria": [
+        "REQ-6.2",
+        "REQ-6.3"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/carrypatch/rebuild_publish_test.go and confirm they fail",
+        "Make the publish one unit: open a store transaction, prepare the patch list changes in it, make the compare-and-swap of the integration branch, and commit the transaction only when the swap won; then write integration_head_sha and previous_integration_head_sha to the job's result document with SetResult of internal/jobs",
+        "In that transaction soft-delete every patch the run skipped as merged_upstream whose present status is still merged_upstream (status deleted, position null, deleted_at the clock's time) and emit parley.patch.delete for each with actor system and metadata branch_name and reason merged_upstream",
+        "In that transaction set every patch the run recorded as success whose present status is conflict to active with empty conflict_files and emit parley.patch.update for each with actor system and metadata branch_name, changed [\"status\"], from conflict, to active, reason rebuild_clean",
+        "In that transaction renumber the remaining non-deleted patches 1..N in their present order, without an event for the renumbering",
+        "Do all of this also in a continue run in which other patches conflicted; leave a patch whose status a caller changed during the run to its present status",
+        "When the compare-and-swap reports that the branch moved (ErrRefMoved of internal/gitrepo), roll the transaction back, so that no patch change, no event and no job field of the publish is written, and return a retryable failure with reason ref_moved",
+        "Remember the number of patches soft-deleted by the publish for the count patches_removed"
+      ],
+      "touches": [
+        "internal/carrypatch/rebuild_publish.go",
+        "internal/carrypatch/rebuild_publish_test.go"
+      ],
+      "depends_on": [
+        5
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Record the outcome of every attempt through the queue and emit the rebuild events",
+      "criteria": [
+        "REQ-9.1",
+        "REQ-9.2",
+        "REQ-9.3"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/carrypatch/rebuild_outcome_test.go, with the real durable queue of internal/jobs and the real event log of internal/event, and confirm they fail",
+        "Register the rebuild handler with the durable queue of package 33 for the job type rebuild, and wire it in internal/hub with the real collaborators: the store, internal/gitrepo, the upstream and origin credential resolvers, the settings reader, the event component, the conflict report component of internal/land as the conflict-file describer, the scrubber and the clock",
+        "Implement the handler interface of internal/jobs exactly as package 33 declares it in internal/jobs/handler.go: the run operation (context and job in, error out) and the settlement hook (transaction, job as settled, will-retry flag in, error out). The run operation returns nil for a completed outcome, a plain error for a retryable failure, Permanent(err) for a permanent one and WithDetail(err, report) when the failure carries a conflict report; it keeps the outcome of the attempt it just ran (reason, text, counts, follow-up) for the hook, which the queue calls inside the transaction of the settlement",
+        "On a completed outcome store, with SetResult of internal/jobs before the run operation returns, the result document with the counts over patch_results (success, skipped and conflict results, and patches_removed from the publish); the queue's settlement clears error and conflict; in the settlement hook emit parley.rebuild.complete with metadata upstream_head_sha, integration_head_sha, previous_integration_head_sha and the four counts",
+        "On a failure return the error whose text is the failure text, with the conflict report as its detail when the reason is conflict, so that the queue's settlement stores them as the job's error and conflict; in the settlement hook emit parley.rebuild.fail with metadata reason, will_retry (the hook's flag: true when the job is failed, false when it is dead_letter), retry_count after the transition and conflict (the report or null); a settlement the queue made for a panic, for which no outcome was kept, has reason git_error",
+        "Give every rebuild event resource_type rebuild, the job id as resource_id, actor system and the session id package 33 kept in the job's payload when there is one",
+        "Pass every failure text and every event text, which the runner of package 31 has already cleaned of URL user information, through the scrubber of internal/scrub, with the secret values the attempt used registered, before it is stored or emitted",
+        "When the workspace and its jobs were deleted during the attempt, write nothing and emit nothing"
+      ],
+      "touches": [
+        "internal/carrypatch/rebuild.go",
+        "internal/carrypatch/rebuild_outcome.go",
+        "internal/carrypatch/rebuild_outcome_test.go",
+        "internal/hub/"
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Push the integration branch to origin after the publish",
+      "criteria": [
+        "REQ-7"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/carrypatch/rebuild_push_test.go and confirm they fail",
+        "After a publish that won, and before the attempt is finished through the queue, read the workspace setting rebuild_push_integration_branch at that moment; when it is false contact origin not at all and leave integration_branch_pushed false",
+        "When it is true push the published head to the integration branch on origin with the origin credential resolver of package 10 and an explicit force-with-lease for that one ref: the lease is the commit in refs/remotes/origin/<integration_branch>, or that origin has no such branch when the hub has no such ref; never a plain force; use the push operation with its lease argument that package 13 adds to internal/gitrepo/push.go, run through the runner of package 31",
+        "Bound the push to 120 seconds (a value tests can shorten), killing the git process and its children when it expires",
+        "On success set integration_branch_pushed to true on the job and move refs/remotes/origin/<integration_branch> to the pushed head",
+        "On any failure (stale lease, origin unreachable, time limit, credential resolution error) emit parley.rebuild.push_failed with metadata integration_branch and reason, the reason scrubbed; leave refs/remotes/origin/<integration_branch> and integration_branch_pushed as they were, and go on to complete the rebuild"
+      ],
+      "touches": [
+        "internal/carrypatch/rebuild_push.go",
+        "internal/carrypatch/rebuild_push_test.go"
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Queue a follow-up rebuild when a patch tip or the upstream base went stale",
+      "criteria": [
+        "REQ-8"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/carrypatch/rebuild_followup_test.go and confirm they fail",
+        "After a publish and its push, and after a fail_fast conflict, compare the inputs with the present without fetching: a patch listed at the start and not deleted since is stale when its branch exists and its tip differs from the recorded source_sha; upstream is stale when the upstream base resolved from the present refs differs from the job's upstream_head_sha",
+        "Read auto_rebuild_after_push and auto_rebuild_after_sync at that moment; drop the stale patches when the first is false and the stale upstream when the second is false",
+        "When anything stale remains, before the run operation returns and so while the job is still running, queue one rebuild through EnqueueRebuild of the RebuildEnqueuer interface (package 33's implementation) with the follow-up-of id set to this job, the job's strategy and fail mode, submitted_by system:followup, actor system and the job's session; then, in the settlement hook of task 8, emit parley.rebuild.followup with resource_id the ended job's id and metadata follow_up_job_id, stale_patches (the branch names, in position order) and upstream_stale",
+        "When the enqueue reports a duplicate, skip silently: no event, no error on the ended job, the job's own outcome unchanged",
+        "Make no check after a retryable failure",
+        "Add the end-to-end tests of both execution paths to test/e2e/rebuild_test.go: the rebuild that publishes, removes a merged patch and pushes to origin, and the fail_fast conflict whose resolution a requeued attempt learns from a merge commit on the patch branch"
+      ],
+      "touches": [
+        "internal/carrypatch/rebuild_followup.go",
+        "internal/carrypatch/rebuild_followup_test.go",
+        "internal/carrypatch/rebuild_outcome.go",
+        "test/e2e/rebuild_test.go"
+      ],
+      "done_when": [
+        "`go test ./internal/carrypatch/... ./test/e2e/... -count=1` passes with the real git binary"
+      ]
+    }
+  ]
+}

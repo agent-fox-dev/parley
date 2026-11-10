@@ -1,0 +1,270 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "15",
+  "spec_name": "task_fork_creation",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/fork/... ./internal/gitrepo/... ./internal/config/... ./internal/workspace/... ./internal/cli/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "08",
+      "reason": "calls the minting component for the fork-bound token and sets the creating-token field its guard reads"
+    },
+    {
+      "spec": "09",
+      "reason": "builds its CLI commands on the client, output and exit-code helpers of the CLI foundation"
+    },
+    {
+      "spec": "10",
+      "reason": "uses the workspace store and record, the fork-name and duration validators, the state guard, the place of a repository copy, the workspace object and the git wrapper"
+    },
+    {
+      "spec": "11",
+      "reason": "registers purpose and auto_change and the parent-state guard with the update handler of that package (RegisterForkField, RegisterForkUpdateGuard), and its checks read forks through GET /workspaces/:slug"
+    },
+    {
+      "spec": "52",
+      "reason": "emits its hub events through the event log component"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Load the fork limits from configuration and resolve a ttl",
+      "criteria": [
+        "REQ-10"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/config/forks_test.go and internal/fork/lifetime_test.go as table-driven tests and confirm they fail",
+        "Register the keys default_ttl, max_ttl and max_per_workspace of the [forks] table with the configuration key registry of package 03 in internal/config, with the defaults 7 days, 30 days and 200; leave expire_on_land to package 16",
+        "Parse the two durations with the configuration duration form the loader already uses; refuse the load, with an error that names the key as forks.default_ttl or forks.max_ttl, when a value does not parse, when default_ttl is shorter than 5 minutes or when max_ttl is shorter than default_ttl; equal values are accepted",
+        "Create the lifetime rule in internal/fork/lifetime.go: ResolveTTL(ttl text, instant, limits) returns expires_at or a validation error that names ttl; it parses the text with ParseDuration of package 10 (units m, h, d), accepts 5 minutes to max_ttl inclusive, and truncates the result to whole seconds in UTC",
+        "Give the rule a second entry for an absent ttl that returns the instant plus default_ttl",
+        "Export both entries: the create handler of this package and the ttl update of package 16 call them and no other code judges a ttl"
+      ],
+      "touches": [
+        "internal/config/forks.go",
+        "internal/config/forks_test.go",
+        "internal/fork/lifetime.go",
+        "internal/fork/lifetime_test.go"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Create a fork's repository without copying history",
+      "criteria": [
+        "REQ-5.1",
+        "REQ-5.2",
+        "REQ-5.3"
+      ],
+      "steps": [
+        "Add the three behaviours to internal/gitrepo/fork_test.go against bare repositories made with git init in t.TempDir() and confirm they fail: nothing copied, the parent's history readable through the fork (also a commit added later), own work stored in the fork alone",
+        "Add fork repository creation to internal/gitrepo: given the parent's repository directory and the fork's directory, make an empty bare repository whose alternates file names the parent's object directory by absolute path",
+        "Build the repository in a temporary directory beside its place and rename it into place when complete, so that an interrupted creation leaves nothing that opens as a repository; return an error and remove the temporary directory on any failure",
+        "Refuse to create over an existing directory; add a separate removal function that deletes a fork's repository directory and is a no-op when it does not exist",
+        "Run every git subprocess through the wrapper of internal/gitrepo with the caller's context, and return its failure as an error; never terminate the process"
+      ],
+      "touches": [
+        "internal/gitrepo/fork.go",
+        "internal/gitrepo/fork_test.go"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Record a fork and resolve its refs from the parent",
+      "criteria": [
+        "REQ-6"
+      ],
+      "steps": [
+        "Add the ref behaviours to internal/fork/refs_test.go on real repositories and a real store in t.TempDir() and confirm they fail",
+        "Add a store migration for what the workspace record lacks for a fork: the base branch and the names of the parent's branches and tags at creation; fork_point, expires_at, auto_change, purpose and session_id are columns of package 10's record, and the parent slug, kind and creating-token field already exist on it (packages 07 and 08)",
+        "Add the fork store in internal/fork: insert a fork inside a given transaction, read one by slug, count the forks of a parent, list the forks of a parent; an insert of a slug in use returns a duplicate-slug error",
+        "Add the ref view Refs(fork slug): for each recorded branch name, read the parent's current head of that name from the parent's repository and list it with tracking true, leaving out names the parent does not have now; list the recorded tags the same way; list the branches of the fork's own repository with tracking false, leaving out every recorded tracking-branch name: package 17 copies the tracking refs and the version refs refs/parley/changes/* from the parent into the fork's repository before git serves it, so a branch found there under a recorded name is that copy and never an own branch, whether or not the parent has the branch now; a recorded name present in the fork's repository is listed once, as the tracking branch, at the parent's head; every other own-branch listing of internal/fork applies the same exclusion",
+        "Add CheckBranchWrite(workspace slug, branch): for a fork and a recorded tracking branch name return the API error 403 tracking_branch built with the error constructor of internal/server, whether or not the parent has the branch now; return nil for every other name and for a repository workspace",
+        "Add HeadSHA(fork slug): the parent's current head of the fork's base branch, or null when the parent has no such branch; never read the recorded fork point for it",
+        "Register a fork view with RegisterForkView of internal/workspace (package 10), which RenderWorkspace calls for a record of kind fork, so that the workspace object takes a fork's head_sha from HeadSHA and internal/workspace does not import internal/fork"
+      ],
+      "touches": [
+        "internal/fork/store.go",
+        "internal/fork/refs.go",
+        "internal/fork/refs_test.go",
+        "internal/workspace/"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Create a fork over REST",
+      "criteria": [
+        "REQ-1",
+        "REQ-5.4"
+      ],
+      "steps": [
+        "Add the creation behaviours to internal/fork/create_test.go against a hub built in-process (real store, real git, real access component, real event log, fixed clock) and confirm they fail",
+        "Register POST /workspaces/{slug}/forks with the router of internal/server: PAT scope workspaces:write, access need read, idempotent create with the member token.token declared as a secret shown once; wire the fork component on the composition value of internal/hub (package 03), in internal/hub/fork.go and not in cmd/parleyd, with [forks].default_ttl, max_ttl, max_per_workspace (task 1) and [server].external_url as values",
+        "Decode the body: absent body and {} are valid, a null member counts as absent, unknown members are ignored; apply the defaults (generated name, the parent's default branch, default_ttl, auto_change true)",
+        "Generate a name of 8 characters from lower-case letters and digits with a cryptographic random source behind an injectable generator; when the slug is in use generate again, at most 8 times in all, then answer 500 internal",
+        "Resolve ref to the parent's branch head with internal/gitrepo, read the names of the parent's branches and tags, and create the fork's repository at the place RepoPath of internal/workspace gives for the fork's slug; a directory found there without a fork record is removed first",
+        "In one store transaction: insert the fork (status ready, owner the caller's user, the parent's org, fork point, expires_at = now + ttl, the tracking names, the id of the authenticating PAT or none) and record parley.workspace.fork with the metadata of the event criterion and the fork's session_id; if the transaction fails remove the repository directory and answer 500 internal",
+        "Answer 201 with workspace (the workspace object with access owner), remote (the object's hub_url, null when external_url is empty), and token and sandbox only when requested",
+        "Compute expires_at only through ResolveTTL and its entry for an absent ttl (task 1), with the time of the injected clock; a ttl that is not a JSON string or that the rule refuses is 400 invalid_request before anything is stored"
+      ],
+      "touches": [
+        "internal/fork/create.go",
+        "internal/fork/create_test.go",
+        "internal/fork/fork.go",
+        "internal/hub/fork.go"
+      ],
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Refuse fork creation with one answer per cause",
+      "criteria": [
+        "REQ-2"
+      ],
+      "steps": [
+        "Add the refusal behaviours and the helper unchanged(parent) to internal/fork/create_refuse_test.go and confirm they fail",
+        "Refuse the admin token with 403 forbidden directly after the access step, before the body is read",
+        "Validate the body's own members in the order name, ref, ttl, auto_change, token, purpose, session_id, sandbox and answer 400 invalid_request for the first that fails; lengths count Unicode code points; name uses the fork-name validator of internal/workspace",
+        "After the body: ask the check operation of SessionLinker (400 unknown_session), refuse a parent that is a fork (400 not_supported_on_fork), then apply the state guard of internal/workspace to the parent (409 workspace_busy, workspace_not_ready, workspace_archived)",
+        "Answer 400 fork_ref_not_found when ref is not the short name of a branch of the parent: a tag, a commit id and a full ref name are refused",
+        "Inside the transaction, before the insert: count the parent's forks and answer 429 fork_limit_reached at max_per_workspace; map the duplicate-slug error of a given name to 409 conflict; the store's single writer makes the count and the insert one step, so concurrent requests cannot pass the limit or share a name",
+        "On every refusal after the repository directory was made, remove it; the refusal table order is the order the handler checks in"
+      ],
+      "touches": [
+        "internal/fork/create.go",
+        "internal/fork/create_refuse_test.go"
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Mint a fork-bound token with the fork",
+      "criteria": [
+        "REQ-3"
+      ],
+      "steps": [
+        "Add the token behaviours to internal/fork/token_test.go with the real minting component and binding guard of internal/access and confirm they fail",
+        "When the body has token: inside the fork's transaction, after the fork is inserted, call MintBound of package 08 (internal/access) with that transaction, the caller as owner, the authenticating credential as creator, the fork's slug as binding, name (default fork:<fork slug>), permissions, paths and the expiry instant now + expires (none without expires)",
+        "MintBound is the only way this package creates a token: never call the minting operation of package 06 directly and write no token row or parley.token.bind event here. Check here only what the minting component cannot see: token is an object, name is a string, expires has the WS-FR-013 form; every other rule (non-empty registered permissions, glob validity, tokens:manage, the subset rule, the cover rule for paths) is the minting component's, and its API error is returned unchanged",
+        "On any refusal or failure of minting roll the transaction back and remove the repository directory, so that neither token nor fork nor event exists",
+        "Put the minted token object with its secret into the response member token and its id into the event metadata as token_id; never write the secret to the event, the log or the fork record",
+        "Record the id of the PAT that authenticated the request in the fork's creating-token field (none for an API key), read from the authenticated principal"
+      ],
+      "touches": [
+        "internal/fork/create.go",
+        "internal/fork/token_test.go"
+      ],
+      "depends_on": [
+        4
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Link a session and pass a sandbox request through",
+      "criteria": [
+        "REQ-4"
+      ],
+      "steps": [
+        "Add the session and sandbox behaviours to internal/fork/session_test.go and internal/fork/sandbox_test.go with stub collaborators and confirm they fail",
+        "Declare the interface SessionLinker in internal/fork with two operations: a check taking the caller, the session id and the parent's slug, answering accepted (with the lower-case session id), refused or failed, and a record taking the fork's open store transaction, the session id, the parent's slug and the fork's slug as the key of the thing linked; with none registered every session_id is refused with 400 unknown_session; package 49 registers its session.Check and session.Record with it from internal/hub/session.go, through an adapter that builds the link of kind fork",
+        "Define the sandbox component interface in internal/fork: one call taking the context, the open transaction, the caller, the fork record, the raw bytes of the sandbox member and the fork's session_id and purpose as defaults, returning the sandbox object as JSON or an API error",
+        "When the body has sandbox and no component is wired, refuse with 404 sandboxes_disabled at the place in the order where a wired component would refuse, with the same roll-back",
+        "Call the component once as the last step inside the fork's transaction, after the fork and the token are written and the repository exists; do not read, validate or change the sandbox member",
+        "When the component returns an error: roll the transaction back, remove the repository directory and answer with that error unchanged (status, error_type, extra members); when it succeeds, commit and put its object into the response member sandbox",
+        "Call the check at fork creation, at its place in the order of refusals (task 5): refused is 400 unknown_session, failed is 500 internal, and the id the check returns is the one stored on the fork; call the record once inside the fork's creation transaction, after the fork is inserted, and roll the transaction back with 500 internal when it fails; call neither without a session_id",
+        "Give the fork component optional registration points for both collaborators on the composition value of internal/hub (wired in internal/hub/fork.go, never in cmd/parleyd), so that the session package registers its SessionLinker from internal/hub/session.go and the sandbox package its component from internal/hub/sandbox.go without changing this one"
+      ],
+      "touches": [
+        "internal/fork/collaborators.go",
+        "internal/fork/create.go",
+        "internal/fork/session_test.go",
+        "internal/fork/sandbox_test.go",
+        "internal/hub/fork.go"
+      ],
+      "depends_on": [
+        5,
+        6
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Make a fork follow its parent's status and update its own fields",
+      "criteria": [
+        "REQ-7"
+      ],
+      "steps": [
+        "Add the parent-state table to internal/fork/guard_test.go and the update behaviours to internal/fork/update_test.go and confirm they fail",
+        "Add CheckParentState(workspace slug, use) with use read or write: nil for a repository workspace; for a fork read the parent's status and maintenance marker and return 409 workspace_busy (pending, cloning, marker set), 409 workspace_not_ready (failed), 409 parent_archived (archived, write only), else nil",
+        "Build the errors with the constructors of internal/server so that every caller answers them unchanged",
+        "Register handlers for purpose and auto_change with RegisterForkField of package 11's update handler in internal/workspace: purpose a string of at most 1024 code points or null (cleared), auto_change a boolean and never null; any other value is 400 invalid_request and nothing changes; change no file of package 11 for it",
+        "Register CheckParentState for a write with RegisterForkUpdateGuard of package 11, which the update handler calls for every update of a fork, of whichever field, after validation and before any write, so that an invalid body is 400 and a valid one on an archived parent is 409 parent_archived; package 16's ttl update is guarded by the same registration",
+        "Rely on package 11's fixed order of metadata.fields (display_name, description, org_id, settings, ttl, purpose, auto_change), in which purpose and auto_change come last, and carry the fork's session_id on the parley.workspace.update event of a fork through the event field the update handler fills from the record"
+      ],
+      "touches": [
+        "internal/fork/guard.go",
+        "internal/fork/guard_test.go",
+        "internal/fork/update.go",
+        "internal/fork/update_test.go",
+        "internal/hub/fork.go"
+      ],
+      "depends_on": [
+        3
+      ]
+    },
+    {
+      "id": 9,
+      "title": "List a workspace's forks",
+      "criteria": [
+        "REQ-8"
+      ],
+      "steps": [
+        "Add the list behaviours to internal/fork/list_test.go and confirm they fail",
+        "Register GET /workspaces/{slug}/forks: PAT scope workspaces:read or workspaces:write, access need read, no state precondition",
+        "Validate the query: owner must be me when present, session_id must be a UUID when present, else 400 invalid_request; limit and cursor through the list helpers of internal/server",
+        "Query the forks whose parent is the slug, ordered by created_at descending then slug ascending, with the cursor carrying both keys; owner=me keeps the forks of the caller's user (none for the admin token); session_id keeps the forks created with that session",
+        "For a workspace-bound PAT keep only the forks its binding covers, using the covered set of the binding guard",
+        "Render each item as the workspace object with the caller's access from the access component; a fork's slug as parent and a workspace without forks give items [] and next_cursor null"
+      ],
+      "touches": [
+        "internal/fork/list.go",
+        "internal/fork/list_test.go",
+        "internal/fork/store.go",
+        "internal/hub/fork.go"
+      ],
+      "depends_on": [
+        6
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Add the fork create and fork list commands",
+      "criteria": [
+        "REQ-9"
+      ],
+      "steps": [
+        "Add the command behaviours to internal/cli/fork_test.go against a fake hub served by net/http/httptest and confirm they fail",
+        "Add the command group `parley fork` to the CLI root with the subcommands create and list; the group without a subcommand prints help",
+        "fork create <parent>: exactly one argument before `--`; build the body from the flags that were given and from no others; split --token-permissions and --token-paths at commas; send the trailing arguments after `--` as sandbox.command",
+        "Fail as a usage error before any request when --token-paths is given without --token-permissions, or a trailing command without --sandbox-profile",
+        "Send the request with the shared HTTP client, the parent percent-encoded as one path segment; print the response on stdout; when the response has token.token write the shown-once warning on stderr without the secret",
+        "fork list <parent>: send owner=me for --mine, session_id for --session, and limit and cursor when given; print the list page",
+        "Add test/e2e/fork_test.go with the two end-to-end flows against a hub started in-process on a loopback port the system chooses"
+      ],
+      "touches": [
+        "internal/cli/fork.go",
+        "internal/cli/fork_test.go",
+        "cmd/parley/",
+        "test/e2e/fork_test.go"
+      ],
+      "depends_on": [
+        7,
+        9
+      ]
+    }
+  ]
+}

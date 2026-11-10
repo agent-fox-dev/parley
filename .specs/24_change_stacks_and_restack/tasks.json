@@ -1,0 +1,279 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "24",
+  "spec_name": "change_stacks_and_restack",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/change/... ./internal/config/... ./internal/cli/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "09",
+      "reason": "builds its CLI commands on the client, output and exit-code helpers of the CLI foundation"
+    },
+    {
+      "spec": "23",
+      "reason": "implements the Restacker interface its abandon calls, receives depends_on from its PATCH through the StackLinker of package 22, uses the caller rule of CHG-FR-020 and the function that stores mergeable with its conflict report, and through it the change record and version recording of package 22"
+    },
+    {
+      "spec": "52",
+      "reason": "emits its hub events through the event log component"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Link changes into stacks from the commit graph",
+      "criteria": [
+        "REQ-1"
+      ],
+      "steps": [
+        "Add the behaviours of the automatic link, dependants and own-commit stats to internal/change/stack_test.go as table-driven tests over a repository made with git init in t.TempDir(), and confirm they fail",
+        "Use the fields depends_on, needs_restack and restack_reason that package 22 owns on the change record, through its setters; add only the commit a flagged change must sit on (the landed commit of the change that was below) as a column of this package's own, through a store migration",
+        "Add the link computation: among the other draft or open changes of the same workspace and target branch, keep those whose current head is a proper ancestor of the new head (ancestry asked of internal/gitrepo), take the one with the fewest commits to the new head, and the lowest number on a tie; a change with the same head, another target, another workspace or a closed state is never a candidate",
+        "Implement LinkVersion of the StackLinker interface that package 22 declares in internal/change/collaborators.go and register it: package 22 calls it inside its transaction for version 1 and for every later version; store depends_on through package 22's setter and set the version's base_sha to the lower change's head, or to the merge base with the target branch when there is no link, through package 22's setter for the base of the current version",
+        "Rely on that base setter to recompute stats, paths and the patch id from the commits after the new base_sha, so that a dependent change counts only its own commits",
+        "Leave dependants to package 22, which derives them from the stored links as the ascending numbers of the draft and open changes whose depends_on is the change; confirm it in the tests of this task",
+        "Use the source workspace's repository for the ancestry query when the source is a fork of the target workspace"
+      ],
+      "touches": [
+        "internal/change/stack.go",
+        "internal/change/stack_test.go",
+        "internal/store/"
+      ],
+      "done_when": [
+        "`go test ./internal/change/... -count=1` passes with the git binary on PATH"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Accept and refuse an explicit depends_on at open and by PATCH",
+      "criteria": [
+        "REQ-2.1",
+        "REQ-2.2",
+        "REQ-2.3",
+        "REQ-2.6"
+      ],
+      "steps": [
+        "Add the behaviours of the explicit link to internal/change/stack_test.go with httptest and confirm they fail",
+        "Add one validation function for an explicit depends_on that answers 400 invalid_dependency when the number names no change of the workspace, the change itself, a change whose chain of depends_on links reaches the change (walk the chain downward from the candidate), a change with another target branch, or a change that is not draft or open",
+        "For depends_on in the body of POST …/changes: package 22 validates its JSON type and hands it to LinkVersion with version 1; validate it there, before the link is stored, and return 400 invalid_dependency so that package 22's transaction rolls back and no change exists; when it is accepted, use it for version 1 in place of the automatic rule",
+        "For depends_on in the body of PATCH …/changes/:number: implement SetDependsOn of the StackLinker interface, which the PATCH of package 23 calls inside its transaction with a number or null; an error it returns leaves every field of the request unapplied",
+        "On an accepted number, store the link and, when the lower change's head is an ancestor of the change's head, set base_sha to it and recompute stats and paths; leave the case where it is not an ancestor to the task that adds the restack",
+        "On null, clear the link, set base_sha to the merge base with the target branch and recompute stats and paths",
+        "Keep the automatic rule for every version after the first, whatever the explicit link was"
+      ],
+      "touches": [
+        "internal/change/stack.go",
+        "internal/change/stack_test.go"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Limit stack depth and flag changes past the limit",
+      "criteria": [
+        "REQ-3.1",
+        "REQ-3.4"
+      ],
+      "steps": [
+        "Add the behaviours of the depth flag to internal/change/stack_test.go and of the configuration key to internal/config/config_test.go and confirm they fail",
+        "Add [changes].max_stack_depth to the configuration: an integer, 20 when absent, and a load error naming changes.max_stack_depth for a value below 1, which the server start of package 03 turns into exit status 1 with one error line",
+        "Compute the depth of a change as the number of changes in its chain of depends_on links down to a change with none, itself included",
+        "After every link change (version recording, accepted explicit link, cleared link), recompute the depth of the change and of every change above it through dependants; set needs_restack true with restack_reason stack_too_deep on each change deeper than the limit and leave changes at or under the limit unflagged",
+        "Record the version and the link of a too-deep change all the same; never answer an error because of depth"
+      ],
+      "touches": [
+        "internal/change/stack.go",
+        "internal/change/stack_test.go",
+        "internal/config/config.go",
+        "internal/config/config_test.go"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Restack dependants in the background when the change below gets a new version",
+      "criteria": [
+        "REQ-4",
+        "REQ-9.3"
+      ],
+      "steps": [
+        "Add the behaviours of the pending records to internal/change/restack_queue_test.go and of the restack itself to internal/change/restack_test.go, with a runPending helper that runs the worker once, and confirm they fail",
+        "Add the pending restack record to the store: one per change (workspace, change number, trigger, and the landed commit where there is one), where recording another for the same change replaces it",
+        "From LinkVersion, which runs in the transaction of the version, record one pending restack with trigger version for each direct dependant of the change when the target workspace's setting changes.auto_restack is true; a failure to write it fails the whole transaction",
+        "Add the restack operation: read the dependant's source branch head; resolve the commit to sit on (the current head of the change named by depends_on, or the landed commit of the record); when the head already has that commit as an ancestor, end as up to date; otherwise replay the commits after the change's base_sha up to its head onto that commit with the rebase of internal/gitrepo, which changes no ref",
+        "Move the source branch to the replayed head with a compare-and-swap on the head that was read; when it is lost, start again from reading the head, at most 5 attempts in one run; after the fifth, end without changing anything and keep the pending record",
+        "Record the result through the version recording of package 22 (RecordVersion, in a store transaction of the restack that also holds the compare-and-swap result) as a version of kind restack: created_by with actor_type system and no creating credential, the session_id of the version it replaces, base_sha the commit sat on, patch_equivalent_to as package 22 computes it; clear needs_restack and restack_reason unless the reason is stack_too_deep",
+        "Emit parley.change.version (kind restack) and then parley.change.restack with onto_sha and the record's trigger through the event component, in the transaction of the version, with actor system and the dependant's ref, version and head_sha",
+        "Because the restack version goes through the same version recording, it records the pending restacks of the dependant's own dependants; check with a chain of four that the work runs bottom first",
+        "Add the worker: a goroutine started from internal/hub/change.go that is woken when a record is written, runs pending restacks one at a time per workspace in the order they were recorded, removes a record when its restack ends as restacked or up to date, and stops when the server's context is cancelled",
+        "Add a test hook on the restack operation between reading the head and the compare-and-swap, used only by the tests that move the branch in between"
+      ],
+      "touches": [
+        "internal/change/restack.go",
+        "internal/change/restack_test.go",
+        "internal/change/restack_queue.go",
+        "internal/change/restack_queue_test.go",
+        "internal/store/",
+        "internal/hub/change.go"
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Restack dependants when the change below lands or is abandoned with reparent",
+      "criteria": [
+        "REQ-5"
+      ],
+      "steps": [
+        "Add the behaviours of the landing entry point and of reparenting to internal/change/restack_queue_test.go and internal/change/restack_test.go and confirm they fail",
+        "Add the landing entry point in internal/change: given a landed change and the landed commit on the target, in one transaction clear depends_on of each direct dependant, remember the landed commit as the commit the dependant must sit on, and record a pending restack with trigger land onto it; do nothing for a change without dependants",
+        "Make the restack operation use the landed commit of the record as the commit to sit on and as the new base_sha, and emit parley.change.restack with trigger land",
+        "Leave the changes further up linked; they are restacked by the pending records the dependant's restack version writes",
+        "Register the landing entry point from internal/hub/change.go as an after-landing hook of internal/land (package 25 declares the hook list in internal/land/hooks.go): the hook is called with the landed attempt (its workspace, the target branch update and the session) and, per landed change, its number, source workspace and branch and landed commit, and the adapter calls the entry point once per landed change with the workspace, the number and that landed commit; internal/change imports nothing of internal/land, package 25 is not a dependency of this package, and its tests call the entry point directly",
+        "Implement the interface Restacker that package 23 declares in internal/change/lifecycle.go and register it: package 23's abandon with dependants=reparent sets each direct dependant's depends_on itself and then calls it, inside its transaction, with the dependant and trigger abandon; record a pending restack with that trigger there (or set auto_restack_off when the setting is false), and resolve the commit to sit on as the head of the change the dependant now depends on, or the current head of the target branch when there is none",
+        "Recompute the depth flag of every change above after either operation"
+      ],
+      "touches": [
+        "internal/change/restack.go",
+        "internal/change/restack_test.go",
+        "internal/change/restack_queue.go",
+        "internal/change/restack_queue_test.go",
+        "internal/hub/change.go"
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Report a restack conflict on the change and move nothing",
+      "criteria": [
+        "REQ-6"
+      ],
+      "steps": [
+        "Add the behaviours of a failed restack to internal/change/restack_test.go and of clearing the flag on a later version to internal/change/stack_test.go and confirm they fail",
+        "When the replay returns a conflict, move no ref, remove the pending record and record no pending restack for any change above",
+        "Take the ConflictReport that the replay of internal/gitrepo returns (the one report type, declared by package 20; declare no other) and set: target_sha the commit replayed onto, head_sha the change's head, base_sha the change's base, commit_sha the first commit that did not apply, one file entry per conflicted path with path, kind, base, ours and theirs ({sha, mode, path} or null) and landed_by as an empty array, landed_changes as an empty array, change as null",
+        "In one transaction set needs_restack true and restack_reason conflict through package 22's setter, then store mergeable conflict and the report through the exported storing function of package 23, with the pair of the change's head and the commit replayed onto, so that one place writes mergeable, the report and the event",
+        "Leave the event to that function: it emits parley.change.conflict with actor system and metadata files (the conflicted paths) and needs_restack true only when the change was not already in conflict; when it was, it replaces the stored report and emits nothing",
+        "Confirm that a failed replay leaves no worktree, temporary ref or lock file in the repository",
+        "In LinkVersion, after the link is computed: when the change has needs_restack with reason conflict or auto_restack_off and the new head has the commit it must sit on as an ancestor (the lower change's current head, or the remembered landed commit), clear needs_restack and restack_reason; clear them too when a linked change loses its link by the automatic rule; otherwise leave them"
+      ],
+      "touches": [
+        "internal/change/restack.go",
+        "internal/change/restack_test.go",
+        "internal/change/conflict.go",
+        "internal/change/stack.go",
+        "internal/change/stack_test.go"
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Honour changes.auto_restack and restack changes that became eligible",
+      "criteria": [
+        "REQ-7.1",
+        "REQ-7.2",
+        "REQ-2.4",
+        "REQ-2.5",
+        "REQ-3.2",
+        "REQ-3.3"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/change/restack_test.go and confirm they fail",
+        "Read the setting changes.auto_restack of the target workspace through the settings of package 11 wherever a pending restack would be recorded",
+        "While it is false, on a new version below record no pending restack; set needs_restack true with restack_reason auto_restack_off on each direct dependant whose head does not have the new head as an ancestor, and leave a dependant that already sits on it unflagged",
+        "While it is false, in the landing entry point still clear depends_on and remember the landed commit, set the same flag and record nothing",
+        "After an accepted explicit depends_on whose lower head is not an ancestor of the change's head: record a pending restack with trigger manual when the setting is true, or set the auto_restack_off flag when it is false",
+        "Never record a pending restack for a change whose restack_reason is stack_too_deep, and let the worker skip one that became too deep after it was recorded; such a change records none for its own dependants because it gets no restack version",
+        "When the depth recomputation clears stack_too_deep on a change whose head lacks the head of the change below as an ancestor, record a pending restack with trigger version for it, or set auto_restack_off when the setting is false"
+      ],
+      "touches": [
+        "internal/change/restack.go",
+        "internal/change/restack_test.go",
+        "internal/change/restack_queue.go",
+        "internal/change/stack.go"
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Serve the manual restack route",
+      "criteria": [
+        "REQ-8",
+        "REQ-7.3"
+      ],
+      "steps": [
+        "Add the behaviours of the route to internal/change/restack_handler_test.go with httptest and confirm they fail",
+        "Register POST /api/v1/workspaces/{slug}/changes/{number}/restack on the router of package 02 with the scope changes:write and the access need read, and resolve the change through the lookup of package 22 so that an unknown number, and a change outside a fork-bound token's fork, answer 404 change_not_found",
+        "Apply the caller rule of CHG-FR-020 that package 23 provides: the author with any credential of that user, a caller with write access to the target workspace, or the admin token; any other reader gets 403 forbidden",
+        "Accept no body or a JSON object; read session_id and check it with the SessionLinker of package 22 (the session-linking check of package 49) before any rebase, answering 400 unknown_session; ignore a resolutions member, which package 26 gives its meaning",
+        "Answer 409 change_closed for a landed or abandoned change, and 400 target_not_found for a change with depends_on null whose target branch does not exist",
+        "Run the restack operation synchronously with trigger manual, the commit to sit on being the current head of the change named by depends_on or the current head of the target branch; remove any pending record of the change when it ends",
+        "Declare the interface VersionGuard with RegisterVersionGuard in internal/change/restack_handler.go (package 29 registers the implementation) and call it in the manual restack only, after the replay is computed and before the compare-and-swap of the source branch, with the caller's credential (type, id and paths) and the base and head of the version to record; answer its refusal unchanged (403 path_not_allowed with the path) and change nothing; do not call it for a background restack, and let every version pass while no guard is registered",
+        "On up to date answer 200 with status up_to_date and the change object, having cleared a conflict or auto_restack_off flag and, when one was cleared, called the mergeability trigger package 23 exports; on success answer 200 with status restacked and the change object, the version created by the caller, with the caller's credential as creating credential and the body's session_id or the previous version's, and the two events with the caller as actor",
+        "On a conflict leave the state the background restack leaves and answer 409 rebase_conflict with the conflict report as the envelope's details",
+        "After 5 lost compare-and-swaps answer 409 ref_moved with details current_sha set to the source branch head",
+        "Leave needs_restack true with reason stack_too_deep after a successful manual restack of a too-deep change"
+      ],
+      "touches": [
+        "internal/change/restack_handler.go",
+        "internal/change/restack_handler_test.go",
+        "internal/change/restack.go",
+        "internal/server/"
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Keep pending restacks across restarts and failures",
+      "criteria": [
+        "REQ-9.1",
+        "REQ-9.2",
+        "REQ-9.4"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/change/restack_queue_test.go and internal/change/restack_handler_test.go, using a real store file that is closed and reopened, and confirm they fail",
+        "In internal/hub/change.go, at server start, after the store is open and before listening, register the worker with the durable work the start of package 03 resumes, and make it run every pending record it finds",
+        "When the worker meets a record whose change is no longer draft or open, remove the record and do nothing else",
+        "When the git command fails for a reason other than a conflict, change nothing, keep the record, write one error log line with the workspace, the change number and the scrubbed error text, and go on to the next record; run a kept record again at the next start or when another restack is recorded for the same change",
+        "Return every failure of the restack operation as an error value; nothing in internal/change ends the process",
+        "In the manual route answer such a failure with 500 internal and change nothing"
+      ],
+      "touches": [
+        "internal/change/restack_queue.go",
+        "internal/change/restack_queue_test.go",
+        "internal/change/restack_handler.go",
+        "internal/change/restack_handler_test.go",
+        "internal/hub/change.go"
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Serve the stack route and add parley change restack and stack",
+      "criteria": [
+        "REQ-10"
+      ],
+      "steps": [
+        "Add the behaviours of the route to internal/change/stack_handler_test.go and of the two commands to internal/cli/change_test.go, the latter against an httptest server that records requests, and confirm they fail",
+        "Register GET /api/v1/workspaces/{slug}/changes/{number}/stack with the scope changes:read and the access need read; resolve the change through the lookup of package 22",
+        "Walk depends_on down from the change to the bottom, then collect every draft or open change reachable upward through dependants from the change; order the result by depth from the bottom and then by number",
+        "Answer 200 with target_branch and changes, each summary holding number, title, state, version, head_sha, mergeable, needs_restack, restack_reason and landing as an object with status only",
+        "Expose the same walk as a function so that the stack_of list filter and the include=stack expansion of package 22 can use it",
+        "Add parley change stack <slug> <number> to internal/cli/change.go: a GET through the HTTP client of package 09, the response printed by its output rules",
+        "Add parley change restack <slug> <number>: a POST with the body {}; a hub error, the rebase_conflict envelope with its details among them, is printed on stderr as received with exit status 1 by the rules of package 09",
+        "Add test/e2e/stack_restack_test.go with the two end-to-end flows, starting the hub in-process as the other end-to-end tests do and using the git binary for pushes and fetches"
+      ],
+      "touches": [
+        "internal/change/stack_handler.go",
+        "internal/change/stack_handler_test.go",
+        "internal/change/stack.go",
+        "internal/cli/change.go",
+        "internal/cli/change_test.go",
+        "internal/server/",
+        "test/e2e/stack_restack_test.go"
+      ],
+      "depends_on": [
+        1
+      ],
+      "done_when": [
+        "`go test ./internal/cli/... ./internal/change/... -count=1` passes"
+      ]
+    }
+  ]
+}

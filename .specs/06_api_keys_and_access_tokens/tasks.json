@@ -1,0 +1,288 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "06",
+  "spec_name": "api_keys_and_access_tokens",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/identity/... ./internal/cli/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "04",
+      "reason": "authenticates API keys, PATs and the admin token, defines their stored records and hashing, and reports the caller to the scope check and the handlers"
+    },
+    {
+      "spec": "05",
+      "reason": "provides the user record, the user selector and the admin check that the admin key and token routes use"
+    },
+    {
+      "spec": "09",
+      "reason": "builds its CLI commands on the client, output and exit-code helpers of the CLI foundation"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Fix the scope registry and install the PAT scope check",
+      "criteria": [
+        "REQ-1"
+      ],
+      "steps": [
+        "Add the scope behaviours to internal/identity/scope_test.go (the registry table, the implication table, the refusal through the server pipeline, the pass for the admin token and API keys) and confirm they fail",
+        "Define the registry of exactly 32 scopes from the PRD's list, with a validator for one name and an accessor that returns all of them in the PRD's order",
+        "Implement the satisfaction rule: the needed scope itself; R:write for a needed R:read; keys:manage for keys:read; tokens:manage for tokens:write and tokens:read; tokens:write for tokens:read; nothing else, so changes:approve and checks:write are satisfied only by themselves and satisfy nothing else",
+        "Read the one scope a PAT needs from the scope declaration of package 02's route registration, which every route states when it is registered with internal/server; add no second way to declare it",
+        "Implement the scope check for step 6 of the check order: it reads the caller that authentication (package 04) reported; the admin token, an API key and a route without a declared scope pass; a PAT passes when its permissions satisfy the declared scope",
+        "On failure answer through package 02's error helper: HTTP 403, error_type insufficient_scope, a message naming the needed scope; no later check and no handler runs",
+        "Install the check in the scope position of package 02's pipeline through the composition of package 03, in internal/hub/identity.go"
+      ],
+      "touches": [
+        "internal/identity/scope.go",
+        "internal/identity/scope_test.go",
+        "internal/hub/identity.go"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Validate, match and compare path globs",
+      "criteria": [
+        "REQ-5.2",
+        "REQ-5.3",
+        "REQ-5.4",
+        "REQ-5.5"
+      ],
+      "steps": [
+        "Add the glob behaviours to internal/identity/pathglob_test.go (the validation table, the match table, the cover table and the soundness property) and confirm they fail",
+        "Implement validation of a decoded paths value: null or absent is unrestricted; refuse a value that is not an array, an empty array, more than 50 entries, an entry that is not a string, an empty glob, a glob longer than 255 characters, a glob starting with /; return an error that names the offending entry",
+        "Implement matching of one glob against one file path over the whole path, case-sensitively: ** is any run including /, * is any run without /, runs may be empty, every other character (including ?, [ and backslash) is literal; a run of three or more asterisks reads as ** followed by the rest",
+        "Implement matching against a token's list: a path is allowed when the list is absent or any glob matches",
+        "Implement the cover test: equal globs cover; otherwise the caller's glob is matched against the requested glob's text, where its * may take a run with no / and without the sequence **, and its ** any run",
+        "Implement the list form of the cover test that returns the first requested glob no caller glob covers",
+        "Write the soundness property over generated globs and paths: whenever the cover test accepts and the requested glob matches a path, the covering glob matches it too",
+        "Export the matcher under stable names and document that packages 18, 21, 22 and 29 call it to enforce paths on writes; the HTTP rows of the validation table are added by the token-creation task"
+      ],
+      "touches": [
+        "internal/identity/pathglob.go",
+        "internal/identity/pathglob_test.go"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Create personal access tokens",
+      "criteria": [
+        "REQ-3.1",
+        "REQ-3.2",
+        "REQ-3.3",
+        "REQ-3.4",
+        "REQ-3.6",
+        "REQ-5.1"
+      ],
+      "steps": [
+        "Add the creation behaviours to internal/identity/token_routes_test.go against a hub started in-process with a temporary store and a test clock, and confirm they fail; add the HTTP rows of the paths validation table there too",
+        "Use the PAT table package 04 created and authenticates against (name, the ordered permissions list, the ordered paths list or null, the workspace slug or null, expires_at, revoked_at, created_at); add no table, no column and no schema step, and leave the hashing and the wire format to package 04",
+        "Define the Token JSON object with exactly the members token_id, user_id, name, permissions, paths, workspace, expires_at, revoked_at, created_at; null for unset members; timestamps through package 02's whole-second UTC format",
+        "Implement the minting operation as one exported function of internal/identity that takes the caller, the request (name, permissions, paths, expires), an optional workspace binding and, for hub-internal callers, an expiry instant in place of expires, can run inside the caller's transaction, and returns the stored token and its one-time value; it is the one way a PAT is created in production; besides POST /user/tokens its one caller is the minting component MintBound of package 08, and packages 15 and 45 mint only through MintBound",
+        "Validate in it: name 1 to 255 characters; permissions a non-empty array of registered scopes, duplicates dropped, order kept; expires an integer among 0, 30, 60, 90 with default 90; paths through the glob validation; every failure is 400 invalid_request and writes nothing",
+        "Write the token through the store-level PAT function of package 04, which this operation wraps: that function generates token_id (8) and secret (32) from [a-z0-9] with crypto/rand, generates the id again when it exists and stores only the hash; pass it expires_at as now plus expires times 24 hours, null for 0, or the caller's instant",
+        "Register POST /user/tokens as a creating route that declares scope tokens:manage and the show-once member token, so that a replay under the same Idempotency-Key answers 200 without the value (package 02's idempotency)",
+        "Answer 201 with the Token plus token; workspace is null on this route",
+        "Take the identity component's clock as a parameter so the tests can move time across expires_at"
+      ],
+      "touches": [
+        "internal/identity/token.go",
+        "internal/identity/token_routes.go",
+        "internal/identity/token_routes_test.go"
+      ],
+      "depends_on": [
+        1,
+        2
+      ],
+      "done_when": [
+        "`go test ./internal/identity/... -count=1` passes with the token value absent from every stored column"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Hold PAT callers to the subset rule",
+      "criteria": [
+        "REQ-4"
+      ],
+      "steps": [
+        "Add the subset-rule tables to internal/identity/token_routes_test.go and confirm they fail",
+        "In the minting operation, after body validation and before the write, apply the rule only when the caller is a PAT: every requested permission must be in the caller's own list exactly, with no implication",
+        "For a caller PAT that has paths: refuse a request without paths (absent or null) with a message saying paths is required; otherwise require every requested glob to be covered by one of the caller's globs",
+        "On a violation answer 403 insufficient_scope with a message that contains the first offending permission in request order, or else the first offending glob; write nothing",
+        "Keep validation first: a body that is invalid and also violates the rule is answered 400",
+        "Leave API key callers unrestricted",
+        "Expose the rule as a function over (caller, requested permissions, requested paths) so the permission-change routes and packages 08 and 15 apply the same code"
+      ],
+      "touches": [
+        "internal/identity/subset.go",
+        "internal/identity/token.go",
+        "internal/identity/token_routes_test.go"
+      ],
+      "depends_on": [
+        3
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Read and revoke personal access tokens",
+      "criteria": [
+        "REQ-6",
+        "REQ-3.5",
+        "REQ-3.7"
+      ],
+      "steps": [
+        "Add the read, revoke, ownership, scope and admin-token behaviours to internal/identity/token_routes_test.go, and the behaviours of the two hub-internal operations to internal/identity/token_ops_test.go, and confirm they fail",
+        "Register GET /user/tokens (scope tokens:read) as a list route with package 02's paging: every PAT of the caller's user in any state, bound ones included, ordered by created_at descending then token_id descending",
+        "Register GET /user/tokens/:token_id (scope tokens:read) answering the Token",
+        "Register DELETE /user/tokens/:token_id (scope tokens:manage): set revoked_at to now when it is null, including for an expired token and for the calling token itself; answer 200 with the Token; an already revoked token is answered 200 unchanged",
+        "Resolve :token_id through one lookup scoped to the caller's user, so that a missing id and another user's id give the same 404 not_found body; use it on every /user/tokens/:token_id route",
+        "Register every route under /user/keys and /user/tokens with package 04's needs-a-user mark (PLAT-FR-021), so that the admin token is answered 403 forbidden with package 04's message \"this route needs a user\"; write no second refusal in the handlers",
+        "Check that no Token object outside the creation response carries the token member or the secret text",
+        "Export from internal/identity/token.go the two operations hub-internal callers use inside a transaction of their own, with no route, no ownership check and no event: the revocation by id, RevokeTokenByID(tx, token_id), which sets revoked_at to now when it is null and leaves a revoked token unchanged, and the expiry update of one token by id, SetTokenExpiryByID(tx, token_id, instant), which sets expires_at in whole seconds and nothing else; an unknown token_id is the not-found error; neither commits; packages 45 and 47 call them for the hub credential of a sandbox"
+      ],
+      "touches": [
+        "internal/identity/token_routes.go",
+        "internal/identity/token_routes_test.go",
+        "internal/identity/token.go",
+        "internal/identity/token_ops_test.go"
+      ],
+      "depends_on": [
+        3
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Change a token's permissions",
+      "criteria": [
+        "REQ-7"
+      ],
+      "steps": [
+        "Add the permission-change behaviours to internal/identity/token_routes_test.go and confirm they fail",
+        "Register PUT, PATCH and DELETE on /user/tokens/:token_id/permissions, each declaring scope tokens:write and taking the body {permissions: string[]}",
+        "Order the handler's checks: ownership lookup (404), body validation (400), subset rule for a PAT caller (403), state (409 for a revoked or expired token), then the write",
+        "Validate: permissions must be an array of strings; PUT and PATCH refuse a string that is not a registered scope; PATCH and DELETE refuse an empty array; PUT accepts an empty array",
+        "PUT stores the list given with duplicates dropped; PATCH appends the scopes not yet present, in the order given; DELETE removes the given scopes and ignores strings the token does not have, registered or not",
+        "For a PAT caller apply the subset rule to the scopes the change would add (the scopes of the new list that the token does not have now); DELETE has no subset check",
+        "When the resulting list is empty, store the empty list and set revoked_at in the same transaction",
+        "Ignore body members named paths and workspace; never change paths, workspace, name or expires_at",
+        "Answer 200 with the Token after the change"
+      ],
+      "touches": [
+        "internal/identity/token_routes.go",
+        "internal/identity/token_routes_test.go"
+      ],
+      "depends_on": [
+        4,
+        5
+      ]
+    },
+    {
+      "id": 7,
+      "title": "List, refresh and revoke API keys",
+      "criteria": [
+        "REQ-2"
+      ],
+      "steps": [
+        "Add the key behaviours to internal/identity/key_routes_test.go against a hub started in-process with a test clock and confirm they fail",
+        "Define the Key JSON object with exactly the members key_id, user_id, expires_at, revoked_at, created_at; never a secret",
+        "Register GET /user/keys (scope keys:read) as a list route: every key of the caller's user in any state, ordered by created_at descending then key_id descending",
+        "Register POST /user/keys/:key_id/refresh without a declared scope and not as a creating route; answer 403 forbidden when the caller is a PAT or the admin token, before the key is looked up",
+        "Resolve :key_id through one lookup scoped to the caller's user, so that a missing id and another user's id give the same 404 not_found",
+        "On refresh of a live key: generate a new 32-character secret from [0-9A-Za-z], store its hash in place of the old one, set expires_at to now plus the key's expires_days (null for 0), and answer 200 with key, key_id and expires_at; a revoked or expired key is 409 conflict and unchanged",
+        "Register DELETE /user/keys/:key_id (scope keys:manage): set revoked_at to now when it is null, including for an expired key and for the calling key itself; answer 200 with the Key; an already revoked key is answered 200 unchanged",
+        "Use package 04's key record, hashing and expiry predicate; add no second definition of them"
+      ],
+      "touches": [
+        "internal/identity/key_routes.go",
+        "internal/identity/key_routes_test.go"
+      ],
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Let an admin list and revoke any user's keys and tokens",
+      "criteria": [
+        "REQ-8"
+      ],
+      "steps": [
+        "Add the admin route behaviours to internal/identity/admin_credential_routes_test.go and confirm they fail",
+        "Register GET /users/:id/keys, GET /users/:id/tokens, DELETE /users/:id/keys/:key_id and DELETE /users/:id/tokens/:token_id behind package 05's admin check, so that an API key of a role-user user and every PAT get 403 forbidden",
+        "Resolve :id with package 05's user selector (UUID, e-mail or username); an unknown user is 404 not_found",
+        "List with the same order and objects as the /user routes: newest first, any state, bound tokens included",
+        "Revoke by a lookup scoped to the selected user: a key or token that does not exist or belongs to another user is 404 not_found; set revoked_at when null (an expired one included); answer 200 with the object; an already revoked one is answered 200 unchanged"
+      ],
+      "touches": [
+        "internal/identity/admin_credential_routes.go",
+        "internal/identity/admin_credential_routes_test.go"
+      ],
+      "depends_on": [
+        5,
+        7
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Add the parley keys and parley admin keys commands",
+      "criteria": [
+        "REQ-9"
+      ],
+      "steps": [
+        "Add the command behaviours to internal/cli/keys_test.go and internal/cli/admin_keys_test.go against a stub hub and a temporary PARLEY_CONFIG_DIR, and confirm they fail",
+        "Add the command group keys with list, refresh and revoke, and the group admin keys with list <user> and revoke <user> <key_id>, under the root command, each declared through the command helper of package 09 with its method, path, arguments and auth value; a group without a subcommand prints help",
+        "keys list calls GET /user/keys and prints the body through package 09's output",
+        "Derive key_id from the configured credential for refresh and revoke: accept only the API key format parley_<8 characters>_<32 characters> from [0-9A-Za-z]; a PAT, the admin token or any other value is a client_error with exit 2 and no request",
+        "keys refresh: POST the refresh route, print the response, warn on stderr that the key is not shown again, then write api_key through the save function of package 09 in internal/cli/config.go (other keys kept, mode 0600); when the config file does not exist or cannot be written, write nothing, warn on stderr that the new key was not saved and exit 2 after the response has been printed",
+        "keys revoke: DELETE the key, print the response, clear api_key and user_id in the config file when it exists, and tell the user on stderr to run parley login; when the hub answers an error leave the file unchanged",
+        "admin keys list and revoke call GET /users/<user>/keys and DELETE /users/<user>/keys/<key_id> with each argument percent-encoded as one path segment; a wrong argument count is a usage_error"
+      ],
+      "touches": [
+        "internal/cli/keys.go",
+        "internal/cli/keys_test.go",
+        "internal/cli/admin_keys.go",
+        "internal/cli/admin_keys_test.go",
+        "internal/cli/root.go",
+        "test/e2e/keys_test.go"
+      ],
+      "depends_on": [
+        7,
+        8
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Add the parley tokens and parley admin tokens commands",
+      "criteria": [
+        "REQ-10"
+      ],
+      "steps": [
+        "Add the command behaviours to internal/cli/tokens_test.go and internal/cli/admin_tokens_test.go against a stub hub and confirm they fail",
+        "Add the command group tokens with list, create, show, revoke, replace, add and remove, and the group admin tokens with list <user> and revoke <user> <token_id>, under the root command, each declared through the command helper of package 09",
+        "tokens create takes --name (required), --permissions (required, comma-separated), --paths (comma-separated, repeatable, values appended in order), --expires (integer, default 90); it posts name, permissions, expires and, only when --paths was given, paths to /user/tokens; it prints the response and warns on stderr that the value is not shown again",
+        "tokens list, show <token_id> and revoke <token_id> call GET /user/tokens, GET /user/tokens/<token_id> and DELETE /user/tokens/<token_id>",
+        "tokens replace, add and remove <token_id> --permissions <list> send PUT, PATCH and DELETE to /user/tokens/<token_id>/permissions with {permissions: [...]}; an empty --permissions value sends an empty array; replace and remove write a note on stderr when the returned Token has revoked_at set",
+        "A missing required flag, a wrong argument count or a non-integer --expires is a usage_error with exit 2 before any request; allowed lifetimes and scope names are left to the hub",
+        "admin tokens list and revoke call GET /users/<user>/tokens and DELETE /users/<user>/tokens/<token_id> with each argument percent-encoded as one path segment",
+        "Leave the --workspace flag of both tokens create and tokens list to package 08, which adds it to these two commands in internal/cli/tokens.go; without the flag tokens list calls GET /user/tokens only"
+      ],
+      "touches": [
+        "internal/cli/tokens.go",
+        "internal/cli/tokens_test.go",
+        "internal/cli/admin_tokens.go",
+        "internal/cli/admin_tokens_test.go",
+        "internal/cli/root.go",
+        "test/e2e/tokens_test.go"
+      ],
+      "depends_on": [
+        6,
+        8
+      ]
+    }
+  ]
+}

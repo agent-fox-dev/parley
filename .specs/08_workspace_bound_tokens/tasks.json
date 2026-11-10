@@ -1,0 +1,281 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "08",
+  "spec_name": "workspace_bound_tokens",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/access/... ./internal/cli/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "06",
+      "reason": "mints through its one minting operation with a workspace binding, and uses the PAT record with its workspace member, the subset rule, the scope check and the parley tokens commands the --workspace flag is added to"
+    },
+    {
+      "spec": "07",
+      "reason": "uses the workspace record, the access rule with need owner and the readable set it cuts down"
+    },
+    {
+      "spec": "09",
+      "reason": "builds its CLI commands on the client, output and exit-code helpers of the CLI foundation"
+    },
+    {
+      "spec": "52",
+      "reason": "emits parley.token.bind inside the minting transaction and parley.token.bound_refused without one through the two emit calls of its event component"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Record what a binding covers and cut the readable set down to it",
+      "criteria": [
+        "REQ-4.6"
+      ],
+      "steps": [
+        "Add the coverage behaviours to internal/access/coverage_test.go as table-driven tests against a store in t.TempDir() and confirm they fail",
+        "Add a schema migration that gives the workspace record of package 07 a nullable creating-token id, and a store function that sets it when a workspace row is inserted; package 15 calls it at fork creation, the tests call it directly",
+        "Define the Binding value in internal/access: the bound slug and the relation of the named workspace to it, one of bound, created_fork and parent_of_bound_fork, with functions that put it into and read it from a request context",
+        "Add CoveredSet: for a PAT bound to W return W and every fork of W whose creating-token id is this token's id, sorted; for a PAT bound to a fork return the fork alone; a bound slug with no workspace record yields the slug alone",
+        "Add the relation lookup the guard will use: given a bound PAT and a slug, answer bound, created_fork, parent_of_bound_fork or none, reading the workspace record's kind and parent on every call so that nothing is cached between requests",
+        "Extend the readable set of package 07 so that for a bound PAT the result is the readable set of the token's user intersected with CoveredSet, and is unchanged for an API key, the admin token and an unbound PAT",
+        "Declare the EventEmitter interface in internal/access with the two emit calls of package 52's event component (emit inside a given store transaction; emit now, in a transaction of its own), because internal/event imports internal/access and cannot be imported back; give it no discarding default, and add a recording implementation in a test helper file that remembers each event and the transaction it came with"
+      ],
+      "touches": [
+        "internal/access/binding.go",
+        "internal/access/coverage.go",
+        "internal/access/coverage_test.go",
+        "internal/access/events.go",
+        "internal/access/testing_test.go"
+      ],
+      "done_when": [
+        "`go test ./internal/access/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Guard routes that name a workspace, including the fork's parent",
+      "criteria": [
+        "REQ-4.1",
+        "REQ-4.2",
+        "REQ-4.3",
+        "REQ-4.4",
+        "REQ-4.5",
+        "REQ-5"
+      ],
+      "steps": [
+        "Add the workspace-route behaviours to internal/access/guard_test.go and confirm they fail; build the test hub from the server pipeline of internal/server with authentication, the scope check and the access rule installed, and register probe routes that answer the binding found in the request context",
+        "Implement the binding guard as the check that package 02 runs at position 5 (after body checks, before the PAT scope check): it does nothing for an API key, the admin token and an unbound PAT",
+        "A request names a workspace when its matched route pattern lies under /api/v1/workspaces/:slug; take the slug from the path value exactly as typed",
+        "When the relation is bound or created_fork, put the Binding into the request context and pass the request on",
+        "Hold the 25 contributor routes of the PRD as one fixed table of method and route pattern relative to /api/v1/workspaces/:slug; when the relation is parent_of_bound_fork pass a request whose method and matched pattern are in the table, with the Binding in its context, and answer every other request 403 token_bound",
+        "When the relation is none answer 404 not_found with the message workspace not found, through the same error helper the access rule of package 07 uses, so that the body is the same for an existing and for an unknown slug",
+        "Make no access or scope decision in the guard: a passed request goes on to the scope check and the access rule unchanged, so a bound token never gets more than an unbound PAT of the same user",
+        "Call a refusal reporter (an interface with a discarding default, filled by the next tasks) once for each 403 and 404 the guard answers, with the token, the bound slug, the typed slug, the method, the matched pattern, the status and the surface api"
+      ],
+      "touches": [
+        "internal/access/guard.go",
+        "internal/access/guard_test.go",
+        "internal/access/contributor_routes.go",
+        "internal/access/testing_test.go"
+      ],
+      "done_when": [
+        "`go test ./internal/access/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Guard routes that name no workspace, and git",
+      "criteria": [
+        "REQ-6.1",
+        "REQ-6.2",
+        "REQ-6.4",
+        "REQ-6.5",
+        "REQ-6.6"
+      ],
+      "steps": [
+        "Add the behaviours for routes without a workspace, for unbound credentials, for earlier checks and for git to internal/access/guard_test.go and confirm they fail",
+        "Hold the allowlist of the PRD as a fixed table of 11 method-and-pattern pairs under /api/v1; a bound PAT on one of them passes with a Binding that carries the bound slug, from which the handler calls CoveredSet",
+        "Answer a bound PAT 403 token_bound on every other matched route that names no workspace, before the scope check, whatever scopes it holds; this covers every identity route, POST /workspaces and GET /sandboxes",
+        "Leave unknown paths, wrong methods and failed authentication to the earlier positions of the pipeline: the guard never runs for them and reports nothing",
+        "Add GuardGit for package 17: given the authenticated caller, the slug of the repository, the method and the matched git route pattern, return pass with the Binding when the relation is bound or created_fork, pass with no binding for an unbound credential, and otherwise a refusal with status 404, reported to the refusal reporter with surface git",
+        "Install the guard in the binding-guard position of package 02's pipeline through the composition, in internal/hub/access.go, so that every REST route gets it"
+      ],
+      "touches": [
+        "internal/access/guard.go",
+        "internal/access/guard_test.go",
+        "internal/access/allowlist.go",
+        "internal/hub/access.go"
+      ],
+      "done_when": [
+        "`go test ./internal/access/... ./internal/hub/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Report guard refusals as rate-limited events",
+      "criteria": [
+        "REQ-7"
+      ],
+      "steps": [
+        "Add the refusal-event behaviours to internal/access/refusal_test.go with a recording event emitter and a clock the test advances, and confirm they fail",
+        "Implement the refusal limiter as the guard's refusal reporter: in-memory state per token id holding the time of the last emitted event and the count of suppressed refusals, guarded for concurrent requests, with an injectable clock",
+        "On a refusal with no event for the token in the preceding 60 seconds, build parley.token.bound_refused (workspace the bound slug, actor the token's user with actor type pat, resource token and the token id, action bound_refused, metadata token_id, bound_workspace, method, route, status, surface, suppressed) and hand it to the event emitter; set the count to 0 and the time to now",
+        "Put requested_workspace into the metadata only when the request named a workspace, holding the slug as typed; route is the matched route pattern as registered, without the method",
+        "On a refusal inside the 60 seconds emit nothing and add 1 to the count; the count is carried as suppressed on the token's next event",
+        "Emit after the response decision and never let the emit change it: recover from a panic of the emitter, ignore its error, log it once at warn level without the token value, and do not retry",
+        "Drop a token's entry when its 60 seconds have passed and its count is 0, at the next refusal of any token, so the map does not grow with tokens that stopped being refused",
+        "Create the limiter in internal/hub/access.go with package 52's event component as its event emitter (the refusal event uses the emit call without a transaction) and pass it to the guard and to GuardGit; the state is not persisted, so a restart starts empty"
+      ],
+      "touches": [
+        "internal/access/refusal.go",
+        "internal/access/refusal_test.go",
+        "internal/access/guard.go",
+        "internal/hub/access.go"
+      ],
+      "done_when": [
+        "`go test ./internal/access/... -count=1 -race` passes"
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Mint bound tokens through one component and POST /workspaces/:slug/tokens",
+      "criteria": [
+        "REQ-1",
+        "REQ-2.1",
+        "REQ-2.2"
+      ],
+      "steps": [
+        "Add the minting behaviours to internal/access/mint_test.go and internal/access/bound_tokens_test.go and confirm they fail",
+        "Implement the minting component MintBound: inside the store transaction it is given, call the one minting operation of package 06 with the workspace binding set to the slug (it validates name, permissions, paths and expiry, applies the subset rule when the creating credential is a PAT and writes the token), and emit parley.token.bind through the event emitter, which is package 52's event component, with that same transaction",
+        "Accept the expiry either as 0, 30, 60 or 90 days (0 meaning never) or as an instant for hub-internal callers; return the token object and its value, and return package 06's errors unchanged so that the pipeline renders 400 invalid_request and 403 insufficient_scope",
+        "Build the bind event with workspace the bound slug, actor the owner with actor type api_key or pat from the creating credential, resource token and the token id, action bind, and metadata token_id, workspace, permissions, paths or null, expires_at or null; never put the value or its secret part into it",
+        "Register POST /api/v1/workspaces/:slug/tokens with scope tokens:manage, need owner, the mark that it refuses bound tokens, and token declared as its show-once member for idempotent replays",
+        "In the handler, after the pipeline's checks: answer the admin token 403 forbidden with the message \"this route needs a user\", the one message package 04 gives the admin token, before reading the body's content; then validate; then answer 409 workspace_archived for an archived workspace; then open one transaction, call MintBound, commit and answer 201 with the token object and its value",
+        "On any failure of the insert, the event emitter or the commit, roll back and answer 500 internal without the cause, so that no token exists without its binding and none exists without its event",
+        "Register the route on the hub's composition in internal/hub/access.go and pass it package 52's event component as the event emitter"
+      ],
+      "touches": [
+        "internal/access/mint.go",
+        "internal/access/mint_test.go",
+        "internal/access/bound_tokens.go",
+        "internal/access/bound_tokens_test.go",
+        "internal/hub/access.go"
+      ],
+      "depends_on": [
+        1
+      ],
+      "done_when": [
+        "`go test ./internal/access/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 6,
+      "title": "List bound tokens and keep the two routes closed to bound tokens",
+      "criteria": [
+        "REQ-3",
+        "REQ-2.3",
+        "REQ-2.4",
+        "REQ-6.3"
+      ],
+      "steps": [
+        "Add the listing, replay, immutability and bound-caller behaviours to internal/access/bound_tokens_test.go and confirm they fail",
+        "Add a store query for the PATs whose workspace is a given slug, in any state, ordered by created_at and then token_id, paged with the list helper of package 02",
+        "Register GET /api/v1/workspaces/:slug/tokens with scope tokens:read, need owner and the mark that it refuses bound tokens; it works on archived workspaces and for the admin token, and answers the list envelope with token objects that never carry a value",
+        "Read the refuses-bound-tokens mark, a named mark of package 02's route registration, in the guard: a bound PAT on a marked route of a covered workspace is answered 403 token_bound at position 5 and reported as a refusal; outside the binding the 404 still comes first",
+        "Confirm with the tests that a replay of the mint with the same Idempotency-Key and body answers 200 without the token member and writes neither a second token nor a second event",
+        "Confirm with the tests that the permission routes and the revoke route of package 06 leave workspace and paths of a bound token unchanged and ignore a workspace member in their body, as package 06 specifies; change no code of package 06"
+      ],
+      "touches": [
+        "internal/access/bound_tokens.go",
+        "internal/access/bound_tokens_test.go",
+        "internal/access/guard.go"
+      ],
+      "depends_on": [
+        3,
+        5
+      ],
+      "done_when": [
+        "`go test ./internal/access/... ./internal/identity/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Revoke the tokens bound to workspaces that are being removed",
+      "criteria": [
+        "REQ-8"
+      ],
+      "steps": [
+        "Add the revocation behaviours to internal/access/revoke_test.go and confirm they fail",
+        "Implement RevokeBoundTo: inside the store transaction it is given, set revoked_at to now (from an injectable clock) on every PAT whose workspace is one of the given slugs and that is neither revoked nor expired, and return the ids of those tokens sorted ascending",
+        "Return an empty, non-nil list for no slugs and for slugs without live tokens; leave revoked and expired tokens, tokens of other workspaces and unbound tokens untouched",
+        "On a failed write return the error and a nil list and leave the transaction for the caller to roll back; emit no event, because the removal's own event carries the ids",
+        "Confirm with the tests that a token revoked this way is answered 401 unauthenticated by authentication on every route and produces no refusal event"
+      ],
+      "touches": [
+        "internal/access/revoke.go",
+        "internal/access/revoke_test.go"
+      ],
+      "depends_on": [
+        3,
+        5
+      ],
+      "done_when": [
+        "`go test ./internal/access/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Sweep tokens whose workspace no longer exists on every maintenance pass",
+      "criteria": [
+        "REQ-9"
+      ],
+      "steps": [
+        "Add the sweep behaviours to internal/access/sweep_test.go and the maintenance flow to test/e2e/bound_tokens_test.go and confirm they fail",
+        "Implement SweepBindings: in one store transaction revoke every live PAT whose workspace is not null and has no workspace record, and return how many were revoked",
+        "Leave unbound tokens, tokens of existing workspaces in any state, and revoked or expired tokens untouched; on a store failure roll back and return 0 and the error without terminating the process",
+        "Register SweepBindings in the maintenance task registry of package 03 under the fixed name token_binding_sweep, on the composition in internal/hub/access.go; the registry fixes its place in the pass and logs a failure",
+        "Log one info line with the number of tokens revoked when it is greater than 0; emit no event"
+      ],
+      "touches": [
+        "internal/access/sweep.go",
+        "internal/access/sweep_test.go",
+        "internal/hub/access.go",
+        "test/e2e/bound_tokens_test.go"
+      ],
+      "depends_on": [
+        5
+      ],
+      "done_when": [
+        "`go test ./internal/access/... ./test/e2e/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Add --workspace to parley tokens create and parley tokens list",
+      "criteria": [
+        "REQ-10"
+      ],
+      "steps": [
+        "Add the CLI behaviours to internal/cli/tokens_test.go against an httptest server that records requests, and confirm they fail",
+        "Add the string flag --workspace to the create and list commands of the tokens group that package 06 created",
+        "When the flag was given with a non-empty value, send the same request body or query to /workspaces/<slug>/tokens in place of /user/tokens, building the path with the client's segment encoder of package 09 so that a slash in the slug becomes %2F",
+        "When the flag was given with an empty value, fail with the CLI's usage error (exit 2) before any request and name --workspace in the message",
+        "Keep output and errors on the shared paths of package 09: the token with its value on stdout and the show-once warning on stderr for create, the list document for list, the hub's envelope on stderr and exit 1 on a hub error",
+        "Add the mint-and-use and the refusal flows to test/e2e/bound_tokens_test.go, driving the CLI against the in-process hub with a probe route and the real event component of package 52, reading the events back from its log"
+      ],
+      "touches": [
+        "internal/cli/tokens.go",
+        "internal/cli/tokens_test.go",
+        "test/e2e/bound_tokens_test.go"
+      ],
+      "depends_on": [
+        6
+      ],
+      "done_when": [
+        "`go test ./internal/cli/... ./test/e2e/... -count=1` passes"
+      ]
+    }
+  ]
+}

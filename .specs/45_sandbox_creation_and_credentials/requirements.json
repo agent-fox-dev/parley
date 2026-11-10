@@ -1,0 +1,1156 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "45",
+  "spec_name": "sandbox_creation_and_credentials",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "The sandbox record and its state machine",
+      "rationale": "Four packages move sandbox records; one conditional transition operation is what keeps racing paths from producing two transitions or two events.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "a component calls the transition operation of `internal/sandbox` for a sandbox with an expected current state that the record has, a target state that the transition table allows from it, and an event",
+          "action": "write the new `state`, the given `state_reason`, `updated_at` equal to the current time, `ended_at` equal to the current time when the target is `failed`, `completed`, `stopped` or `deleted`, and the event when one is given, in one store transaction",
+          "contract": "returns applied true and a nil error; the stored record has the target state and reason; the event log holds exactly one new event, of the given type, with `resource_type` `sandbox`, `resource_id` the sandbox id, the sandbox's `workspace` and its `session_id`, and holds no new event when none was given",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a real store with the sandbox schema, a real event log and a fixed clock"
+            ],
+            "pseudocode": "in internal/sandbox/state_test.go, TestTransition_AppliesAllowed, a table over the allowed pairs {provisioning->ready, provisioning->failed, ready->completed, ready->failed, ready->stopped, ready->provisioning, stopped->provisioning, completed->provisioning, failed->provisioning, and each of provisioning, ready, stopped, completed, failed ->deleted}: seed a record in `from`; applied, err = Transition(tx, id, from, to, reason, event); assert applied and err == nil; rec = store.Get(id); assert rec.state == to and rec.state_reason == reason and rec.updated_at == clock.now; assert (rec.ended_at == clock.now) == (to in {failed, completed, stopped, deleted}); assert count(events for id of event.type) == 1 (0 for ready->provisioning, which is called with no event)"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "unwanted",
+          "condition": "the transition operation is called with an expected current state that differs from the state the record has",
+          "action": "change nothing and write no event",
+          "contract": "returns applied false and a nil error; the record's `state`, `state_reason`, `updated_at` and `ended_at` are unchanged; the event log holds no new event",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a real store with the sandbox schema, a real event log and a fixed clock"
+            ],
+            "pseudocode": "in internal/sandbox/state_test.go, TestTransition_SkipsOnStateMismatch: seed a record in `deleted`; applied, err = Transition(tx, id, 'provisioning', 'ready', '', readyEvent); assert !applied and err == nil; assert store.Get(id) == before; assert len(events) == before_events; repeat for a record in `failed` with expected `provisioning`"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "unwanted",
+          "condition": "the transition operation is called with a pair of states the transition table does not hold, with `deleted` as the expected state, or with an id that names no record",
+          "action": "change nothing and return an error",
+          "contract": "returns applied false and a non-nil error that is the invalid-transition error for a pair outside the table and the not-found error for an unknown id; no record and no event changed",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a real store with the sandbox schema, a real event log and a fixed clock"
+            ],
+            "pseudocode": "in internal/sandbox/state_test.go, TestTransition_RefusesUnknownPairs, a table over {provisioning->stopped, provisioning->completed, stopped->ready, completed->failed, deleted->provisioning, deleted->deleted, ready->ready}: applied, err = Transition(...); assert !applied and errors.Is(err, ErrInvalidTransition); and Transition(tx, 'sbx_' + 32 zeros, 'provisioning', 'ready', ...) returns errors.Is(err, ErrNotFound); assert store and events unchanged"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "event_driven",
+          "condition": "two callers run the transition operation at the same time on one sandbox in `provisioning`, one to `ready` and one to `deleted`",
+          "action": "apply exactly one of the two transitions that expect `provisioning`",
+          "contract": "exactly one call returns applied true for the expected state `provisioning`; the event log holds one event for that transition; a following call with the state now stored as expected applies normally",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a real store on a file in t.TempDir(), a real event log and a fixed clock"
+            ],
+            "pseudocode": "in internal/sandbox/state_test.go, TestTransition_RaceYieldsOne: run 50 rounds; each round seeds a record in provisioning and starts two goroutines, a = Transition(id, provisioning, ready, ...) and b = Transition(id, provisioning, deleted, ...); assert exactly one of a.applied, b.applied is true; assert count(events for id) == 1 and its type matches the applied transition; assert store.Get(id).state is the applied target"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "ubiquitous",
+          "action": "for any stored sandbox, render the sandbox object with every one of these members present: `id`, `workspace`, `session_id`, `profile`, `purpose`, `state`, `state_reason`, `command`, `env`, `exit_code`, `checkout`, `image`, `cpu`, `memory`, `gpu`, `credentials`, `exposed_secrets`, `workspace_rules`, `hub_access`, `policy_revision`, `expires_at`, `idle_timeout_seconds`, `last_activity_at`, `checkpoint`, `restored_from`, `runtime_reachable`, `labels`, `created_by`, `created_at`, `updated_at`, `ended_at`",
+          "contract": "the JSON object has exactly these 31 members; `credentials`, `exposed_secrets` and `workspace_rules` are arrays and `labels` and `env` are objects, never null; timestamps are RFC 3339 in UTC with whole seconds; `created_by` is `{actor_type, actor_id, username}`; no member holds a token value or a secret value",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/sandbox/object_test.go, TestObject_HasEveryMember, a table over records {freshly created with no optional value, fully populated with command, checkout, hub_access, checkpoint, restored_from, ended_at}: o = json(Object(rec, runtimeReachable=true)); assert sorted(keys(o)) == the 31 names; assert o.credentials, o.exposed_secrets, o.workspace_rules are arrays and o.labels, o.env are objects also when empty; assert o.created_at matches ^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$; assert keys(o.created_by) == {actor_type, actor_id, username}"
+          }
+        },
+        {
+          "id": "REQ-1.6",
+          "pattern": "ubiquitous",
+          "action": "for any applied transition of a sandbox from `ready` to `stopped`, `completed`, `failed` or `deleted`, observe in `parley_sandbox_seconds`, through the metrics recorder of package 44, the seconds since the sandbox became `ready`",
+          "contract": "the recorder receives one observation of `parley_sandbox_seconds` per such transition, equal to the seconds between the applied transition to `ready` and this one; a transition from `ready` to `provisioning` and back to `ready` (the runtime's pause, written without an event) neither observes nor restarts the count; a transition that did not apply observes nothing",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a real store with the sandbox schema, a real event log, a fixed clock and a recording metrics recorder"
+            ],
+            "pseudocode": "in internal/sandbox/state_test.go, TestTransition_ObservesSeconds, a table over the target {stopped, completed, failed, deleted}: Transition(provisioning -> ready) at T; clock.Advance(90s); Transition(ready -> target); assert recorder.observations('parley_sandbox_seconds') == [90]; one row: ready at T, ready -> provisioning at T+10s, provisioning -> ready at T+20s, ready -> stopped at T+60s: assert observations == [60]; one row: Transition(ready -> stopped) with expected state stopped (not applied): assert observations == []"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Creating a sandbox",
+      "rationale": "One request must either yield a stored sandbox the caller can follow or leave the hub exactly as it was.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "a caller with `sandboxes:write` and write access to a `ready` workspace sends `POST /api/v1/workspaces/:slug/sandboxes` with a valid body",
+          "action": "store the sandbox in state `provisioning` with the profile's `image`, `cpu`, `memory`, `gpu` and idle timeout as they are at that moment, and answer with the sandbox object",
+          "contract": "HTTP 201; the body is the sandbox object with `id` matching `^sbx_[0-9a-f]{32}$`, `workspace` the slug, `state` `provisioning`, `state_reason`, `exit_code`, `checkpoint`, `restored_from` and `ended_at` null, `policy_revision` 0, `runtime_reachable` true, `profile`, `command`, `env`, `purpose`, `labels` and `session_id` as requested, `image`, `cpu`, `memory`, `gpu` the profile's, `idle_timeout_seconds` 1800, `created_by` the caller, and `created_at`, `updated_at` and `last_activity_at` equal to the current time; a `GET` of that id sent next answers 200 with the same `id`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days",
+              "the provisioner is not started, so that the stored state can be read"
+            ],
+            "pseudocode": "in internal/sandbox/create_test.go, TestCreate_StoresProvisioningSandbox: r = post('/api/v1/workspaces/demo--t1/sandboxes', {profile: 'agent', command: ['make', 'test'], env: {CI: '1'}, purpose: 'run tests', labels: {team: 'core'}, ttl: '1h'}) as dana's API key; assert r.status == 201; s = r.json; assert regexp('^sbx_[0-9a-f]{32}$').match(s.id); assert s.workspace == 'demo--t1' and s.state == 'provisioning' and s.state_reason == null and s.exit_code == null and s.policy_revision == 0 and s.runtime_reachable; assert s.command == ['make', 'test'] and s.env == {CI: '1'} and s.purpose == 'run tests' and s.labels == {team: 'core'}; assert (s.image, s.cpu, s.memory, s.gpu) == ('img:1', '2', '4Gi', 0) and s.idle_timeout_seconds == 1800; assert s.created_by == {actor_type: 'api_key', actor_id: dana.id, username: 'dana'}; assert s.created_at == s.updated_at == s.last_activity_at == clock.now; assert s.expires_at == clock.now + 1h; assert get('/api/v1/workspaces/demo--t1/sandboxes/' + s.id).json.id == s.id"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "event_driven",
+          "condition": "the request has no body, or a body `{}`, or a body whose members are null, or a body with members this route does not define",
+          "action": "treat a null member as absent, ignore the undefined members and apply the defaults: the profile marked `default`, `command` null, `env` and `labels` empty, `purpose` empty, `ttl` the profile's, `session_id` the fork's session when the workspace is a fork that has one and null otherwise, and `expires_at` the current time plus `ttl`, cut to the fork's `expires_at` when the workspace is a fork",
+          "contract": "HTTP 201; `profile` is `agent`; `command` is null; `env` and `labels` are `{}`; `purpose` is `\"\"`; `expires_at` is the current time plus 4 hours on a repository workspace and on a fork that expires later, and equals the fork's `expires_at` on a fork that expires in 1 hour; `session_id` equals the fork's on a fork with a session and is null otherwise",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days",
+              "a second fork `demo--t2` that expires in 1 hour; a session linker stub that accepts"
+            ],
+            "pseudocode": "in internal/sandbox/create_test.go, TestCreate_Defaults, a table over the bodies {absent, '{}', '{\"colour\":\"red\"}', every member null} and the workspaces {demo, demo--t1 expiring in 7d with session S, demo--t2 expiring in 1h without a session}: r = post(...); assert r.status == 201; s = r.json; assert s.profile == 'agent' and s.command == null and s.env == {} and s.labels == {} and s.purpose == ''; assert s.expires_at == (clock.now + 1h for demo--t2, else clock.now + 4h); assert s.session_id == (S for demo--t1, else null)"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "unwanted",
+          "condition": "the body is not a JSON object, or `profile` names no profile, or `ttl` is not a duration or is shorter than 1 minute or longer than the profile's `ttl`, or `command` is not a list of 1 to 256 non-empty strings, or `env` is not a map of strings or has more than 64 entries or an entry whose key and value together exceed 8,192 bytes or a key that does not match `^[A-Za-z_][A-Za-z0-9_]*$` or starts with `PARLEY_` or `OPENSHELL_` or is a name the profile exposes as a secret, or `labels` has more than 16 entries or a key that is not 1 to 63 characters of letters, digits, `.`, `_` and `-` starting and ending with a letter or digit or that starts with `parley.` or `openshell.` or a value over 256 bytes or with a control character, or `purpose` is not a string or exceeds 200 characters, or `checkout` is neither `false` nor an object with string members, or `checkout.branch` is given on a workspace that is not a fork or is not a valid branch name, or `checkout.ref` does not resolve to a commit in the workspace's repository, or `restore_from` does not name a sandbox of the same workspace whose latest checkpoint has `ok` true or is given with `checkout: false` or with a profile whose `hub_access` is `none`",
+          "action": "refuse the request",
+          "contract": "HTTP 400 with `error_type` `invalid_request`; no sandbox record, no token and no event are added and the runtime receives no call",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days",
+              "the workspace `demo--t1` holds sandboxes with checkpoint null, with a checkpoint whose `ok` is false and with one whose `ok` is true"
+            ],
+            "pseudocode": "in internal/sandbox/create_refuse_test.go, TestCreate_RefusesInvalidBody, a table over the bodies {'[]', '\"x\"', {profile: 'nope'}, {profile: 7}, {ttl: '59s'}, {ttl: '4h1m'}, {ttl: 'soon'}, {ttl: 60}, {command: []}, {command: 'make'}, {command: ['make', '']}, {command: 257 entries}, {env: 65 entries}, {env: {A: 8192 bytes}}, {env: {A: 1}}, {env: {'1A': 'x'}}, {env: {'A-B': 'x'}}, {env: {PARLEY_X: 'x'}}, {env: {OPENSHELL_X: 'x'}}, {env: {NPM_TOKEN: 'x'}} with a profile that exposes NPM_TOKEN, {labels: 17 entries}, {labels: {'': 'v'}}, {labels: {'-a': 'v'}}, {labels: {'a-': 'v'}}, {labels: {'parley.x': 'v'}}, {labels: {'openshell.x': 'v'}}, {labels: {('a'*64): 'v'}}, {labels: {a: 257 bytes}}, {labels: {a: 'x\\u0001'}}, {purpose: 'x'*201}, {purpose: 3}, {checkout: true}, {checkout: 'main'}, {checkout: {ref: 5}}, {checkout: {ref: 'nope'}}, {checkout: {branch: 'a..b'}}, {checkout: {branch: 'work'}} on `demo`, {restore_from: 'sbx_' + 32 zeros}, {restore_from: id of a sandbox of `demo`} on `demo--t1`, {restore_from: id of a sandbox of `demo--t1` with checkpoint null}, {restore_from: id of one whose checkpoint has ok false}, {restore_from: valid id, checkout: false}, {restore_from: valid id} with a profile whose hub_access is none}: r = post(...); assert r.status == 400 and r.json.error.error_type == 'invalid_request'; assert unchanged(store, tokens, events) and len(runtime.calls) == 0; and the accepted boundaries {ttl: '1m'}, {ttl: '4h'}, {command: 256 entries}, {env: 64 entries}, {env: {A: 8191 bytes}}, {labels: 16 entries}, {labels: {('a'*63): 'v'}}, {labels: {a: 256 bytes}}, {purpose: 'x'*200}, {checkout: false}, {checkout: {}}, {checkout: {ref: 'main', branch: 'work'}} on demo--t1 answer 201"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "unwanted",
+          "condition": "`profile` is absent and no profile is marked `default`",
+          "action": "refuse the request with a message that lists the names of the configured profiles",
+          "contract": "HTTP 400 with `error_type` `invalid_request`; `error.message` contains every configured profile name; nothing is stored",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the hub of the other checks, configured with the profiles `agent` and `gpu-large`, neither marked `default`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days"
+            ],
+            "pseudocode": "in internal/sandbox/create_refuse_test.go, TestCreate_NoDefaultProfileListsNames: r = post('/api/v1/workspaces/demo/sandboxes', {}); assert r.status == 400 and r.json.error.error_type == 'invalid_request'; assert 'agent' in r.json.error.message and 'gpu-large' in r.json.error.message; assert unchanged(store)"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "unwanted",
+          "condition": "`session_id` names a session that the session-linking rule does not accept for the caller and the workspace, or no session linker is wired",
+          "action": "refuse the request",
+          "contract": "HTTP 400 with `error_type` `unknown_session`; no sandbox record, no token and no event are added",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days"
+            ],
+            "pseudocode": "in internal/sandbox/create_refuse_test.go, TestCreate_RefusesUnknownSession, a table over {linker stub that refuses, no linker wired}: r = post('/api/v1/workspaces/demo--t1/sandboxes', {session_id: '6f1c2f0e-0000-4000-8000-000000000001'}); assert r.status == 400 and r.json.error.error_type == 'unknown_session'; assert unchanged(store, tokens, events); and with a linker stub that accepts: r.status == 201 and r.json.session_id == the id, and linker.last == (id, caller dana, 'demo--t1')"
+          }
+        },
+        {
+          "id": "REQ-2.6",
+          "pattern": "unwanted",
+          "condition": "the workspace is archived, or is a fork whose parent is archived, or has a `status` other than `ready`",
+          "action": "refuse the request",
+          "contract": "HTTP 409 with `error_type` `workspace_archived` for an archived workspace, `parent_archived` for a fork of an archived parent and `workspace_not_ready` for any other `status` that is not `ready`; no sandbox record, no token and no event are added",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "workspaces `old` (archived) with fork `old--t1`, `new` (status `cloning`) and `bad` (status `failed`), all owned by `dana`"
+            ],
+            "pseudocode": "in internal/sandbox/create_refuse_test.go, TestCreate_RefusesByWorkspaceState, a table over (workspace, want) {(archived `old`, workspace_archived), (fork `old--t1` of archived `old`, parent_archived), (`new` in status cloning, workspace_not_ready), (`bad` in status failed, workspace_not_ready)}: r = post('/api/v1/workspaces/' + slug + '/sandboxes', {}) as the owner; assert r.status == 409 and r.json.error.error_type == want; assert unchanged(store, tokens, events)"
+          }
+        },
+        {
+          "id": "REQ-2.7",
+          "pattern": "unwanted",
+          "condition": "the caller is not allowed to create a sandbox on the workspace: sandboxes are not enabled, the PAT lacks `sandboxes:write`, the caller has no access to the workspace, the caller has read access only, or the caller is the admin token; or a request fails more than one check",
+          "action": "refuse the request by the first failing check in this order: feature enabled, PAT scope, workspace access, admin token, body values, session link, workspace state, secret store readable, required secrets present, quotas",
+          "contract": "HTTP 404 `sandboxes_disabled` when not enabled; 403 `insufficient_scope` for the PAT; 404 `not_found` without access; 403 `forbidden` for read access only and for the admin token; for a request that fails two adjacent checks of the order, the status and `error_type` of the earlier one; nothing is stored in any of these cases",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days",
+              "an org member `omar` of `acme` who can read `demo`; a profile `needs` with `credentials` `[\"model\"]` whose secret `MODEL_KEY` exists nowhere"
+            ],
+            "pseudocode": "in internal/sandbox/create_refuse_test.go, TestCreate_AuthorizationAndOrder: single refusals as a table {(hub without [sandbox], dana's key): 404 sandboxes_disabled; (PAT of dana with git:read only): 403 insufficient_scope; (stranger's key): 404 not_found; (org member `omar` with read access): 403 forbidden; (admin token): 403 forbidden}; then pairs that fail two adjacent checks with the expected winner {PAT without scope + unknown slug: 403 insufficient_scope; read-only member + body '[]': 403 forbidden; admin token + body '[]': 403 forbidden; {ttl: '1s'} + refused session: 400 invalid_request; refused session + archived workspace: 400 unknown_session; archived workspace + unreadable secret store: 409 workspace_archived; unreadable secret store + missing required secret: 503 secrets_unavailable; missing required secret + max_sandboxes reached: 422 credential_missing}: assert (r.status, r.json.error.error_type) == want; assert unchanged(store, tokens, events)"
+          }
+        },
+        {
+          "id": "REQ-2.8",
+          "pattern": "event_driven",
+          "condition": "a sandbox is stored by a create request",
+          "action": "write one `parley.sandbox.create` event in the transaction that stores the sandbox, with the caller as actor, `resource_type` `sandbox`, `resource_id` the sandbox id, the sandbox's `workspace` and `session_id`, and the metadata `profile`, `purpose`, `command` (the first argument only, or null), `credentials`, `exposed_secrets`, `workspace_rules`, `hub_access`, `expires_at` and `restored_from`",
+          "contract": "after a 201 the event log holds exactly one `parley.sandbox.create` for the sandbox id whose metadata has exactly those nine members, with `command` equal to the first argument of the request's command; after a refused request it holds none",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days"
+            ],
+            "pseudocode": "in internal/sandbox/create_test.go, TestCreate_WritesCreateEvent: r = post('/api/v1/workspaces/demo--t1/sandboxes', {command: ['make', 'test', '--secret=abc'], purpose: 'p'}); ev = events(type='parley.sandbox.create'); assert len(ev) == 1; e = ev[0]; assert e.resource_type == 'sandbox' and e.resource_id == r.json.id and e.workspace == 'demo--t1' and e.actor.id == dana.id; assert sorted(keys(e.metadata)) == [command, credentials, expires_at, exposed_secrets, hub_access, profile, purpose, restored_from, workspace_rules]; assert e.metadata.command == 'make' and e.metadata.hub_access == r.json.hub_access and e.metadata.expires_at == r.json.expires_at; then with an event log that fails its write: r.status == 500 and store holds no sandbox and no token"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Quotas",
+      "rationale": "The operator's limits protect the runtime only if no interleaving of requests can pass them.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "unwanted",
+          "condition": "storing the sandbox would make the number of sandboxes in state `provisioning` or `ready` exceed `max_sandboxes` on the hub, `max_per_org` in the organization of the workspace, `max_per_workspace` in the workspace family, or `max_per_user` for the creating user",
+          "action": "refuse the request and name the limit that was hit",
+          "contract": "HTTP 429 with `error_type` `sandbox_capacity`; the error object has `limit` (one of `max_sandboxes`, `max_per_org`, `max_per_workspace`, `max_per_user`), `maximum` (the configured value) and `current` (the count); `error.message` is `sandbox limit reached: <limit>`; no sandbox record, no token and no event are added",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days",
+              "a second organization `other` with workspaces, and a second user"
+            ],
+            "pseudocode": "in internal/sandbox/quota_test.go, TestQuota_RefusesAtEachLimit, a table over (limits, seeded sandboxes, want) {({max_sandboxes: 2}, 2 ready on other workspaces of another org by another user, max_sandboxes), ({max_per_org: 2}, 2 provisioning on other workspaces of acme by another user, max_per_org), ({max_per_workspace: 2}, 1 ready on demo and 1 ready on demo--t2 by another user, max_per_workspace), ({max_per_user: 2}, 2 ready created by dana on workspaces of another org, max_per_user)} with the other limits at 100: r = post('/api/v1/workspaces/demo--t1/sandboxes', {}) as dana; assert r.status == 429; e = r.json.error; assert e.error_type == 'sandbox_capacity' and e.limit == want and e.maximum == 2 and e.current == 2 and e.message == 'sandbox limit reached: ' + want; assert unchanged(store, tokens, events); and with one seeded sandbox fewer the same request answers 201"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "unwanted",
+          "condition": "the request would exceed more than one of the four limits",
+          "action": "report the first exceeded limit in the order `max_sandboxes`, `max_per_org`, `max_per_workspace`, `max_per_user`",
+          "contract": "HTTP 429 `sandbox_capacity` whose `limit`, `maximum` and `current` are those of the earliest exceeded limit of that order",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days"
+            ],
+            "pseudocode": "in internal/sandbox/quota_test.go, TestQuota_ReportsFirstExceeded, a table over the pairs {(max_sandboxes, max_per_org), (max_per_org, max_per_workspace), (max_per_workspace, max_per_user)} and all four at once, each reached by seeded ready sandboxes of dana on demo: r = post(...); assert r.json.error.limit == the earlier limit of the pair; assert r.json.error.current == its count"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "ubiquitous",
+          "action": "for any creation, count toward the limits only sandboxes in state `provisioning` or `ready`, count a fork's sandboxes toward its parent's workspace family and toward the parent's organization, and count toward `max_per_user` the sandboxes the creating user created on any workspace",
+          "contract": "with `max_per_workspace` 2, a create on a fork answers 429 when its parent and a sibling fork hold one `ready` sandbox each, and answers 201 when one of those two is `stopped`, `completed`, `failed` or `deleted`; sandboxes created by another user on the same workspace do not count toward `max_per_user`",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days",
+              "a sibling fork `demo--t2`; a second workspace of `acme` with a fork; an org member `omar`"
+            ],
+            "pseudocode": "in internal/sandbox/quota_test.go, TestQuota_CountingRules: with max_per_workspace 2: seed one ready on demo and one ready on demo--t2; assert post on demo--t1 is 429 max_per_workspace with current 2; then a table over the state of the sandbox on demo--t2 in {stopped, completed, failed, deleted}: assert post on demo--t1 is 201; with max_per_user 1: seed one ready on demo--t1 created by omar; assert post by dana is 201 and a second post by dana is 429 max_per_user with current 1; with max_per_org 1: seed one provisioning on a fork of another acme workspace; assert post on demo is 429 max_per_org"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "event_driven",
+          "condition": "more create requests arrive at the same time than a limit leaves room for",
+          "action": "count and insert in one atomic step, so that the number of accepted requests equals the room the limit left",
+          "contract": "of 12 concurrent requests on one workspace with `max_per_workspace` 5 and no sandbox stored, exactly 5 answer 201 and 7 answer 429 `sandbox_capacity` with `limit` `max_per_workspace`; the store then holds 5 sandboxes in `provisioning`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days",
+              "`max_per_workspace` 5; a store on a file in t.TempDir(); the provisioner is not started"
+            ],
+            "pseudocode": "in internal/sandbox/quota_test.go, TestQuota_ConcurrentCreates: start 12 goroutines that post('/api/v1/workspaces/demo/sandboxes', {}) as dana at once; collect statuses; assert count(201) == 5 and count(429) == 7; assert every 429 has error.limit == 'max_per_workspace' and error.maximum == 5; assert count(store sandboxes of demo in provisioning) == 5; assert count(tokens bound to demo) == 5"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Credentials and exposed secrets",
+      "rationale": "The operator decides which secrets a sandbox can use and which it can read; a caller must not be able to change either, and no value may leak through the hub's own output.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "a sandbox is created with a profile that lists `credentials`, `optional_credentials`, `expose_secrets` and `optional_expose_secrets`, and every required name resolves along the resolution chain of the workspace",
+          "action": "attach the required credentials and those optional ones whose secret resolves, place the required exposed secrets and those optional ones that resolve, and skip the optional ones that resolve nowhere",
+          "contract": "HTTP 201; `credentials` holds the names of the attached credentials sorted ascending; `exposed_secrets` holds the names of the placed secrets sorted ascending; a skipped optional name is in neither; with a profile that lists nothing both are `[]`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days",
+              "configured credentials `model` (provider profile `anthropic`, secret `MODEL_KEY`) and `mirror` (provider profile `mirror`, secret `MIRROR_KEY`); the real secret store and resolver of packages 39 and 40 with an encryption key"
+            ],
+            "pseudocode": "in internal/sandbox/credentials_test.go, TestCreate_ResolvesCredentialsAndExposedSecrets: profile `full` has credentials [model], optional_credentials [mirror], expose_secrets [NPM_TOKEN], optional_expose_secrets [EXTRA, ALSO]; set secrets MODEL_KEY on org acme, NPM_TOKEN on workspace demo--t1, ALSO on user dana; r = post('/api/v1/workspaces/demo--t1/sandboxes', {profile: 'full'}); assert r.status == 201; assert r.json.credentials == ['model'] and r.json.exposed_secrets == ['ALSO', 'NPM_TOKEN']; then set MIRROR_KEY and EXTRA on demo--t1: a second create has credentials == ['mirror', 'model'] and exposed_secrets == ['ALSO', 'EXTRA', 'NPM_TOKEN']; a create with profile `agent` has both == []"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "unwanted",
+          "condition": "the secret of a credential in the profile's `credentials`, or a name in the profile's `expose_secrets`, resolves in no scope of the workspace's resolution chain",
+          "action": "refuse the request and name what is missing and where it was searched",
+          "contract": "HTTP 422 with `error_type` `credential_missing`; the error object has `credentials` (names of the missing credentials, sorted), `secrets` (names of the missing exposed secrets, sorted) and `scopes_searched` (the searched scopes in chain order, a sub-list of `workspace`, `parent`, `org`, `user`); no sandbox record, no token and no event are added and the runtime receives no call",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days",
+              "configured credentials `model` (provider profile `anthropic`, secret `MODEL_KEY`) and `mirror` (provider profile `mirror`, secret `MIRROR_KEY`); the real secret store and resolver of packages 39 and 40 with an encryption key"
+            ],
+            "pseudocode": "in internal/sandbox/credentials_test.go, TestCreate_RefusesMissingRequiredSecret, a table {profile with credentials [model] and no MODEL_KEY anywhere: credentials == ['model'], secrets == []; profile with expose_secrets [NPM_TOKEN, AAA] and neither set: credentials == [], secrets == ['AAA', 'NPM_TOKEN']; both missing: both lists filled}: r = post('/api/v1/workspaces/demo--t1/sandboxes', {profile: p}); assert r.status == 422 and r.json.error.error_type == 'credential_missing'; assert r.json.error.scopes_searched == ['workspace', 'parent', 'org', 'user']; on `demo`: scopes_searched == ['workspace', 'org', 'user']; assert unchanged(store, tokens, events) and len(runtime.calls) == 0"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "unwanted",
+          "condition": "the workspace is a fork whose owner lacks write access to the parent, and a required credential's secret or required exposed secret is stored only in the parent's workspace scope",
+          "action": "resolve without the parent step and refuse the request, and for a name in `optional_credentials` or `optional_expose_secrets` create the sandbox without it",
+          "contract": "HTTP 422 `credential_missing` with `scopes_searched` equal to `[\"workspace\", \"org\", \"user\"]` for the required name; HTTP 201 with the name absent from `credentials` and `exposed_secrets` for the optional one; the same requests on a fork owned by the parent's owner answer 201 with the name present",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days",
+              "configured credentials `model` (provider profile `anthropic`, secret `MODEL_KEY`) and `mirror` (provider profile `mirror`, secret `MIRROR_KEY`); the real secret store and resolver of packages 39 and 40 with an encryption key",
+              "an org member `omar` with read access to `demo` who owns the fork `demo--m1`"
+            ],
+            "pseudocode": "in internal/sandbox/credentials_test.go, TestCreate_ReadOnlyForkOwnerGetsNoParentSecret: set NPM_TOKEN on workspace demo only; `omar` (read access to demo) owns fork demo--m1; a table over profiles {expose_secrets [NPM_TOKEN], optional_expose_secrets [NPM_TOKEN]}: r = post('/api/v1/workspaces/demo--m1/sandboxes', {profile: p}) as omar; assert required: r.status == 422 and r.json.error.secrets == ['NPM_TOKEN'] and r.json.error.scopes_searched == ['workspace', 'org', 'user']; optional: r.status == 201 and r.json.exposed_secrets == []; the same on demo--t1 as dana: 201 with exposed_secrets == ['NPM_TOKEN']"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "unwanted",
+          "condition": "the secret store cannot be read while the profile's secrets are resolved, because no encryption key is configured or a stored value cannot be decrypted",
+          "action": "refuse the request and create nothing",
+          "contract": "HTTP 503 with `error_type` `secrets_unavailable`; no sandbox record, no token and no event are added; a profile that lists no credential and no exposed secret is created with 201 on the same hub",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days"
+            ],
+            "pseudocode": "in internal/sandbox/credentials_test.go, TestCreate_SecretStoreUnreadable, a table over resolver stubs {returns the store's unavailable error, returns its undecryptable-value error}: r = post('/api/v1/workspaces/demo/sandboxes', {profile: 'full'}); assert r.status == 503 and r.json.error.error_type == 'secrets_unavailable'; assert unchanged(store, tokens, events); assert post(..., {profile: 'agent'}).status == 201"
+          }
+        },
+        {
+          "id": "REQ-4.5",
+          "pattern": "ubiquitous",
+          "action": "for any sandbox, keep every resolved secret value and the value of the hub credential out of every response body, every event and every line of the hub's log",
+          "contract": "after a sandbox was created, provisioned to `ready`, read and listed, and after another was provisioned to `failed` by a runtime error whose text contains the values, none of the response bodies, the stored events or the captured log contains the value of a credential's secret, of an exposed secret or of the hub credential",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days",
+              "configured credentials `model` (provider profile `anthropic`, secret `MODEL_KEY`) and `mirror` (provider profile `mirror`, secret `MIRROR_KEY`); the real secret store and resolver of packages 39 and 40 with an encryption key"
+            ],
+            "pseudocode": "in internal/sandbox/credentials_test.go, TestNoValueLeavesTheHub: set MODEL_KEY = 'sk-model-0123456789' on acme and NPM_TOKEN = 'npm_SECRETVALUE42' on demo--t1; capture the hub's log; create with profile `full`, run the provisioner to ready, get and list; then create a second one with the fake runtime failing sandbox creation with an error text that embeds both values and the hub credential's value (read from the fake's provider registration); run the provisioner; all = concat(every response body, json(every event), log); assert 'sk-model-0123456789' not in all and 'npm_SECRETVALUE42' not in all and neither hub credential value in all; assert '[redacted]' in the metadata.error of the parley.sandbox.fail event"
+          }
+        },
+        {
+          "id": "REQ-4.6",
+          "pattern": "ubiquitous",
+          "action": "for any text about a sandbox that is written to an event, an error or the log, replace every exact occurrence of that sandbox's resolved credential secrets, of its exposed secrets of at least 8 characters and of its hub credential by `[redacted]`, and then cut the text to 1,024 bytes",
+          "contract": "the scrubbing function returns the text with each such value replaced by `[redacted]`; an exposed value of 7 characters is left as it is; the result is at most 1,024 bytes and is valid UTF-8; a text without any value and of at most 1,024 bytes is returned unchanged",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/sandbox/scrub_test.go, TestScrub, a table over (values, text, want) {(exposed 'abcdefgh', 'x abcdefgh y abcdefgh', 'x [redacted] y [redacted]'), (exposed 'abcdefg', 'x abcdefg y', 'x abcdefg y'), (credential 'k1', 'key k1!', 'key [redacted]!'), (hub credential 'pat_abc123', 'Bearer pat_abc123', 'Bearer [redacted]'), (two values where one contains the other, text with the longer, the longer replaced whole), (none, 'plain', 'plain'), (none, 2000 bytes of 'é', a prefix of at most 1024 bytes that is valid UTF-8), (exposed value placed across byte 1020..1030 of the text, no fragment of the value in the result)}: assert Scrub(values, text) == want; assert len(result) <= 1024 and utf8.valid(result)"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "The hub credential",
+      "rationale": "A sandbox must be able to reach the hub for its own workspace without ever being a way to gain more access than its creator had.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "a sandbox is created with a profile whose `hub_access` is `fork`, by a credential that holds at least one of `git:read`, `git:write`, `changes:read`, `changes:write`, `sessions:write` and `audit:write`, on a hub whose `[server].external_url` is set",
+          "action": "mint, in the transaction that stores the sandbox and through `MintBound`, the minting component of package 08, one PAT bound to the sandbox's workspace and owned by the creating user, that expires at the sandbox's `expires_at`, and show its scopes, paths and expiry on the sandbox",
+          "contract": "HTTP 201 with `hub_access` equal to `{scopes, paths, expires_at}` where `expires_at` equals the sandbox's `expires_at`; the token store holds exactly one new live token whose `workspace` is the sandbox's workspace, whose owner is the caller's user and whose `expires_at` is the sandbox's; the event log holds one `parley.token.bind` for it; the response has no member that holds the token value",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days"
+            ],
+            "pseudocode": "in internal/sandbox/hubcred_test.go, TestCreate_MintsHubCredential: before = tokens(); r = post('/api/v1/workspaces/demo--t1/sandboxes', {ttl: '1h'}) as dana's API key; assert r.status == 201; h = r.json.hub_access; assert h.expires_at == r.json.expires_at == clock.now + 1h; new = tokens() - before; assert len(new) == 1; t = new[0]; assert t.workspace == 'demo--t1' and t.owner == dana.id and t.expires_at == h.expires_at and t.revoked_at == null and sorted(t.permissions) == h.scopes; assert count(events type parley.token.bind for t.id) == 1; assert the token's value (captured from the minting component by a wrapping spy) is not a substring of r.body"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "ubiquitous",
+          "action": "for any creating credential, give the hub credential exactly those of the six scopes `git:read`, `git:write`, `changes:read`, `changes:write`, `sessions:write` and `audit:write` that the creating credential holds, all six for an API key, and the `paths` limit of the creating credential",
+          "contract": "`hub_access.scopes` is the sorted intersection of the six scopes with the scopes the creating credential holds; `hub_access.paths` equals the creating PAT's `paths`, and is null for an API key and for a PAT without a limit; the minted token's permissions and paths equal them",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days"
+            ],
+            "pseudocode": "in internal/sandbox/hubcred_test.go, TestHubCredential_ScopesAndPaths, a table over (creating credential, want scopes, want paths) {(API key, all six sorted, null), (PAT [sandboxes:write, git:read, git:write, changes:read, changes:write, sessions:write, audit:write], all six, null), (PAT [sandboxes:write, git:read, changes:read], [changes:read, git:read], null), (PAT [sandboxes:write, git:write, secrets:read, workspaces:read], [git:write], null), (PAT [sandboxes:write, git:read, git:write] with paths ['src/**', 'docs/**'], [git:read, git:write], ['src/**', 'docs/**'])}: r = post('/api/v1/workspaces/demo--t1/sandboxes', {}) with it; assert r.status == 201 and r.json.hub_access.scopes == want_scopes and r.json.hub_access.paths == want_paths; t = the new token; assert sorted(t.permissions) == want_scopes and t.paths == want_paths"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "optional",
+          "condition": "the profile has `hub_access` `none`, or the creating credential holds none of the six scopes, or `[server].external_url` is empty",
+          "action": "create the sandbox without a hub credential",
+          "contract": "HTTP 201 with `hub_access` null and `checkout` null; the token store holds no new token and the event log holds no `parley.token.bind`",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days",
+              "a profile `plain` with `hub_access` `none`"
+            ],
+            "pseudocode": "in internal/sandbox/hubcred_test.go, TestCreate_WithoutHubCredential, a table over {profile `plain` with hub_access none as dana's API key, profile `agent` with a PAT holding only sandboxes:write, profile `agent` as dana's API key on a hub with external_url ''}: before = tokens(); r = post('/api/v1/workspaces/demo--t1/sandboxes', {profile: p}); assert r.status == 201 and r.json.hub_access == null and r.json.checkout == null; assert tokens() == before and count(events type parley.token.bind) == 0"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "unwanted",
+          "condition": "the minting component returns an error while the sandbox is being stored",
+          "action": "roll the creation back",
+          "contract": "HTTP 500 with `error_type` `internal`; no sandbox record, no token and no `parley.sandbox.create` event are stored; a following request with a working minting component answers 201",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days"
+            ],
+            "pseudocode": "in internal/sandbox/hubcred_test.go, TestCreate_MintFailureRollsBack: with a minting component stub that returns an error: r = post('/api/v1/workspaces/demo--t1/sandboxes', {}); assert r.status == 500 and r.json.error.error_type == 'internal'; assert unchanged(store, tokens, events); swap in the real component: assert post(...).status == 201"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Provisioning in the background",
+      "rationale": "The caller gets an answer at once; the hub alone is responsible for bringing the sandbox to `ready` or `failed`, also across its own restarts.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "the transaction that stored a sandbox in `provisioning` has committed",
+          "action": "resolve the secrets again, register one provider for each attached credential and one for the hub credential at the runtime, create the sandbox there with the profile's `image`, `cpu`, `memory`, `gpu` the policy value of the registered policy composer (by default the profile's base policy with the hub rule and the rule of each attached credential as protected rules), the providers, the working directory `/workspace` and the environment, prepare the checkout, start `command` when there is one, move the sandbox to `ready` and write `parley.sandbox.ready` with that change",
+          "contract": "without a further request the sandbox's `state` becomes `ready` and `updated_at` the time of the change; the event log holds exactly one `parley.sandbox.ready` for it with actor `system` and metadata `checkout` equal to the sandbox's `checkout`; the runtime holds one sandbox labelled with the sandbox id and one provider per attached credential plus one for the hub credential; the main process was started with `command` when one was given and not started otherwise",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days",
+              "configured credentials `model` (provider profile `anthropic`, secret `MODEL_KEY`) and `mirror` (provider profile `mirror`, secret `MIRROR_KEY`); the real secret store and resolver of packages 39 and 40 with an encryption key",
+              "a profile `full` with `credentials` `[\"model\"]`, `expose_secrets` `[\"NPM_TOKEN\"]` and `env` `{TIER: \"profile\"}`; `MODEL_KEY` and `NPM_TOKEN` are set"
+            ],
+            "pseudocode": "in internal/sandbox/provision_test.go, TestProvision_ReachesReady, a table over {command ['make', 'test'], no command}: r = post('/api/v1/workspaces/demo--t1/sandboxes', {profile: 'full', command: cmd}); wait until get(id).json.state != 'provisioning' (deadline 5s); s = get(id).json; assert s.state == 'ready'; ev = events(type='parley.sandbox.ready', resource_id=id); assert len(ev) == 1 and ev[0].actor.type == 'system' and ev[0].metadata.checkout == s.checkout; rt = runtime.sandbox(id); assert rt.image == 'img:1' and rt.cpu == '2' and rt.memory == '4Gi' and rt.workdir == '/workspace' and rt.policy.base == the profile's base policy and rt.policy.protected == [the hub rule for demo--t1, the rule of credential model] and rt.policy.added == []; assert sorted(runtime.providers(id).names) == ['hub', 'model']; assert runtime.provider(id, 'model').secret == 'sk-model-0123456789'; assert order(runtime.calls) == [register providers..., create sandbox, exec git..., start main process] and rt.main == cmd (no start call without a command)"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "ubiquitous",
+          "action": "for any sandbox created at the runtime, pass as its environment, later entries winning over earlier ones on the same name: the caller's `env`, the profile's `env`, each placed exposed secret under its own name with its real value, the variable each attached provider profile declares with that credential's placeholder, and `PARLEY_ENDPOINT_URL`, `PARLEY_WORKSPACE`, `PARLEY_REMOTE`, `PARLEY_SANDBOX_ID`, `PARLEY_SESSION_ID` when the sandbox has a session, and `PARLEY_API_KEY` with the placeholder of the hub credential",
+          "contract": "the environment the runtime receives equals that set exactly; a name set by both the caller and the profile holds the profile's value; `PARLEY_SESSION_ID` is absent for a sandbox without a session; `PARLEY_ENDPOINT_URL`, `PARLEY_REMOTE` and `PARLEY_API_KEY` are absent when `hub_access` is null; no variable holds the real value of a credential's secret or of the hub credential",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days",
+              "configured credentials `model` (provider profile `anthropic`, secret `MODEL_KEY`) and `mirror` (provider profile `mirror`, secret `MIRROR_KEY`); the real secret store and resolver of packages 39 and 40 with an encryption key",
+              "the fake runtime reports that provider profile `anthropic` declares the variable `ANTHROPIC_API_KEY`; the profiles `full` and `plain` of the other checks"
+            ],
+            "pseudocode": "in internal/sandbox/provision_test.go, TestProvision_Environment: create on demo--t1 with profile `full`, session S and env {CI: '1', TIER: 'caller'}; run the provisioner; assert runtime.sandbox(id).env == {PARLEY_ENDPOINT_URL: 'https://hub.test', PARLEY_WORKSPACE: 'demo--t1', PARLEY_REMOTE: 'https://hub.test/git/acme/demo--t1.git', PARLEY_SANDBOX_ID: id, PARLEY_SESSION_ID: S, PARLEY_API_KEY: placeholder of the hub provider, ANTHROPIC_API_KEY: placeholder of provider `model`, NPM_TOKEN: 'npm_SECRETVALUE42', TIER: 'profile', CI: '1'}; assert 'sk-model-0123456789' not in values(env) and the hub credential's value not in values(env); then a table {no session: 'PARLEY_SESSION_ID' not in env; profile `plain` (hub_access none): PARLEY_ENDPOINT_URL, PARLEY_REMOTE and PARLEY_API_KEY not in env and PARLEY_WORKSPACE and PARLEY_SANDBOX_ID present; profile `agent`: env has no name beyond the PARLEY_ ones and the caller's}"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "unwanted",
+          "condition": "a step of the provisioning fails: a required secret no longer resolves, the runtime refuses a provider, the runtime cannot be reached, the policy composer returns an error, the runtime refuses the sandbox or the policy, a git command of the checkout fails, the restorer fails, or the main process cannot be started",
+          "action": "move the sandbox from `provisioning` to `failed` with the reason of the step, delete at the runtime the sandbox and every provider that was created for it, revoke the hub credential, and write `parley.sandbox.fail` with that change",
+          "contract": "the sandbox's `state` is `failed`, `ended_at` is set, and `state_reason` is `credential_missing` for a secret that no longer resolves, `checkout_failed` for a failing git command and `provision_failed` for every other step; the event log holds exactly one `parley.sandbox.fail` with actor `system` and metadata `reason` equal to `state_reason` and `error` a scrubbed text of at most 1,024 bytes; the runtime holds no sandbox and no provider for the id; the hub credential has `revoked_at` set; `parley_sandbox_creates_total{result=\"failed\"}` grew by 1",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days",
+              "configured credentials `model` (provider profile `anthropic`, secret `MODEL_KEY`) and `mirror` (provider profile `mirror`, secret `MIRROR_KEY`); the real secret store and resolver of packages 39 and 40 with an encryption key",
+              "the profile `full` of the other checks; a restorer stub"
+            ],
+            "pseudocode": "in internal/sandbox/provision_test.go, TestProvision_FailureAtEachStep, a table over (fault, want reason) {(MODEL_KEY deleted after the 201, credential_missing), (fake refuses the second provider registration, provision_failed), (fake unreachable, provision_failed), (fake refuses sandbox creation naming a policy rule, provision_failed, and the event's error is the text the registered composer's Explain returned), (a registered composer whose Compose returns an error, provision_failed, and the fake received no create call), (fake fails the git clone exec with exit 128, checkout_failed), (fake fails the git checkout exec, checkout_failed), (restorer stub returns an error, provision_failed), (fake fails the main process start, provision_failed)}: create, run the provisioner to its end; s = get(id).json; assert s.state == 'failed' and s.state_reason == want and s.ended_at != null; ev = events(type='parley.sandbox.fail', resource_id=id); assert len(ev) == 1 and ev[0].metadata.reason == want and len(ev[0].metadata.error) <= 1024 and ev[0].actor.type == 'system'; assert runtime.sandbox(id) == nil and runtime.providers(id) == []; assert token(s hub credential).revoked_at != null; assert metric('parley_sandbox_creates_total', result='failed') == before + 1; assert events(type='parley.sandbox.ready', resource_id=id) == []"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "unwanted",
+          "condition": "a provisioning has not ended 10 minutes after it began",
+          "action": "abandon it and treat it as a failed step",
+          "contract": "the sandbox's `state` is `failed` with `state_reason` `provision_failed`; one `parley.sandbox.fail` is stored; the runtime call that was blocking received a cancelled context; the runtime holds no sandbox and no provider for the id after the clean-up",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days"
+            ],
+            "pseudocode": "in internal/sandbox/provision_test.go, TestProvision_TimesOutAfterTenMinutes: the fake blocks sandbox creation until its context is cancelled; create; start the provisioner; advance the clock by 9m59s: assert get(id).json.state == 'provisioning'; advance by 1s: wait until state != 'provisioning'; assert state == 'failed' and state_reason == 'provision_failed'; assert runtime.lastCreateCtxErr == context.DeadlineExceeded or context.Canceled; assert runtime.sandbox(id) == nil and runtime.providers(id) == []"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "unwanted",
+          "condition": "the sandbox is no longer in state `provisioning` when the provisioning ends, because another component moved it to `deleted` meanwhile",
+          "action": "leave the record as it is, write no event, delete at the runtime the sandbox and the providers this provisioning created, and revoke the hub credential it used",
+          "contract": "the sandbox's `state` stays `deleted`; the event log holds no `parley.sandbox.ready` and no `parley.sandbox.fail` for it; the runtime holds no sandbox and no provider for the id; neither `parley_sandbox_creates_total` series changed",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days"
+            ],
+            "pseudocode": "in internal/sandbox/provision_test.go, TestProvision_RecordDeletedMeanwhile: the fake pauses in sandbox creation; create; start the provisioner; while it is paused call Transition(id, provisioning, deleted, 'api', deleteEvent); release the fake; wait for the provisioner to end; assert get(id).json.state == 'deleted'; assert events(type in {parley.sandbox.ready, parley.sandbox.fail}, resource_id=id) == []; assert runtime.sandbox(id) == nil and runtime.providers(id) == []; assert token(hub credential).revoked_at != null; assert metric deltas == 0"
+          }
+        },
+        {
+          "id": "REQ-6.6",
+          "pattern": "event_driven",
+          "condition": "the hub starts while a stored sandbox still carries the provisioning marker of a provisioning that an earlier process did not finish",
+          "action": "provision it again from the first step: delete what the earlier run left at the runtime for that sandbox, revoke the hub credential minted before and mint a replacement with the same scopes, paths and expiry for the owning user, and end in `ready` or `failed`",
+          "contract": "after the start the sandbox reaches `ready` without a request; the event log holds exactly one `parley.sandbox.ready` for it; the runtime holds exactly one sandbox and one provider per credential for the id; the earlier hub credential has `revoked_at` set and one live token bound to the workspace exists with the permissions, paths and `expires_at` that `hub_access` shows; the sandbox object's `hub_access` is unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days",
+              "a store on a file in t.TempDir()"
+            ],
+            "pseudocode": "in internal/sandbox/provision_test.go, TestProvision_ResumesAfterRestart: the fake pauses after sandbox creation; create on demo--t1 as a PAT with [sandboxes:write, git:read, git:write] and paths ['src/**']; h = r.json.hub_access; t1 = the minted token; start the provisioner and stop the hub while the fake is paused (the fake keeps its sandbox and provider); build a second hub on the same store file and the same fake, unpaused, and run its start hooks; wait until get(id).json.state != 'provisioning'; assert state == 'ready'; assert count(events type parley.sandbox.ready for id) == 1; assert len(runtime.sandboxes(id)) == 1 and len(runtime.providers(id)) == 1; assert token(t1).revoked_at != null; live = live tokens bound to demo--t1; assert len(live) == 1 and sorted(live[0].permissions) == h.scopes and live[0].paths == ['src/**'] and live[0].expires_at == h.expires_at; assert get(id).json.hub_access == h"
+          }
+        },
+        {
+          "id": "REQ-6.7",
+          "pattern": "optional",
+          "condition": "a workspace rule provider is wired",
+          "action": "ask it once, in the transaction that stores the sandbox, for the workspace sandbox rules of the workspace, or of the parent when the workspace is a fork, and record their ids and a copy of each rule body with the sandbox, where the policy composer reads them",
+          "contract": "`workspace_rules` holds the ids the provider returned, in its order, in the 201 response, in the metadata of `parley.sandbox.create` and in every later read, also after the provider returns other rules; the copies stored with the record equal the rules returned at creation and are what the registered policy composer is given at every provisioning; without a provider `workspace_rules` is `[]` and no copy is stored",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days"
+            ],
+            "pseudocode": "in internal/sandbox/provision_test.go, TestCreate_RecordsWorkspaceRules: provider stub returns [{id: 'sbr_a', rule: R1}, {id: 'sbr_b', rule: R2}] for 'demo'; r = post('/api/v1/workspaces/demo--t1/sandboxes', {}); assert r.json.workspace_rules == ['sbr_a', 'sbr_b'] and provider.calls == [('demo')]; make the provider return [] from now on; run the provisioner with a recording policy composer registered; assert the copies the composer read from the record == [R1, R2] and runtime.sandbox(id).policy == the value the composer returned; assert get(id).json.workspace_rules == ['sbr_a', 'sbr_b']; assert events(type='parley.sandbox.create')[0].metadata.workspace_rules == ['sbr_a', 'sbr_b']; with no provider wired and the default composer: workspace_rules == [] and runtime.sandbox(id).policy.added == []"
+          }
+        },
+        {
+          "id": "REQ-6.8",
+          "pattern": "ubiquitous",
+          "action": "for any provisioning that ends, add 1, through the metrics recorder of package 44, to `parley_sandbox_creates_total` with `result` `ready` or `failed`, and report in `parley_sandboxes` the number of stored sandboxes in each of the states `provisioning`, `ready`, `stopped`, `completed` and `failed`",
+          "contract": "after two provisionings ended `ready` and one ended `failed`, `parley_sandbox_creates_total{result=\"ready\"}` is 2 and `{result=\"failed\"}` is 1; `parley_sandboxes{state}` equals the stored counts for the five states and has no series for `deleted`; with no sandbox stored all five series are 0",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days"
+            ],
+            "pseudocode": "in internal/sandbox/metrics_test.go, TestMetrics_CreatesAndStates: read the values a recording metrics recorder (the interface of package 44) holds; assert parley_sandboxes for each of the five states == 0 and no series with state='deleted'; provision two sandboxes to ready and one to failed (fake refuses creation), seed one stopped and one deleted record; read again; assert creates_total{ready} == 2 and creates_total{failed} == 1; assert parley_sandboxes == {provisioning: 0, ready: 2, stopped: 1, completed: 0, failed: 1}"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "The checkout",
+      "rationale": "An agent should find its fork checked out with git able to push, and nothing to set up.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "event_driven",
+          "condition": "a sandbox on a task fork is provisioned with a hub credential that carries `git:read` and the request did not say `checkout: false`",
+          "action": "clone the repository from `PARLEY_REMOTE` into the working directory as a partial clone with the filter `blob:none`, create a branch named `checkout.branch` (default: the fork's `name`) at `checkout.ref` (default: the fork's base branch) and check it out, before the sandbox becomes `ready`",
+          "contract": "the 201 response has `checkout` equal to `{path: \"/workspace\", ref, sha, branch}` with `sha` the full 40-character commit id that `ref` resolves to in the hub's copy of the fork; when the sandbox is `ready`, `checkout.sha` is the commit id the sandbox reports as `HEAD`; the commands run in the sandbox include one `git clone` with `--filter=blob:none` of the workspace's git URL into `/workspace` and the creation of the branch at the starting point, all before the main process is started",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days",
+              "`demo` also has a branch `release`",
+              "the fake runtime records every command run in a sandbox with its working directory and answers `git rev-parse HEAD` with a commit id the test sets"
+            ],
+            "pseudocode": "in internal/sandbox/checkout_test.go, TestCheckout_ForkGetsWorkBranch, a table over (request checkout, want ref, want branch) {(absent, 'main', 't1'), ({}, 'main', 't1'), ({ref: 'release'}, 'release', 't1'), ({branch: 'work'}, 'main', 'work'), ({ref: 'release', branch: 'work'}, 'release', 'work')}: r = post('/api/v1/workspaces/demo--t1/sandboxes', {checkout: c, command: ['true']}); assert r.json.checkout == {path: '/workspace', ref: want_ref, sha: git(demo, 'rev-parse ' + want_ref), branch: want_branch}; runtime.headSHA = H; run the provisioner; cmds = runtime.execs(id); clone = the one whose argv starts ['git', 'clone']; assert '--filter=blob:none' in clone.argv and 'https://hub.test/git/acme/demo--t1.git' in clone.argv and '/workspace' in clone.argv; assert some later command creates and checks out want_branch at origin's want_ref; assert every git command precedes runtime's main-process start; assert get(id).json.checkout.sha == H and get(id).json.state == 'ready'"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "event_driven",
+          "condition": "the fork already has a branch with the name of `checkout.branch`",
+          "action": "check that branch out as it is instead of creating it at the starting point",
+          "contract": "the 201 response's `checkout.sha` is the head of that branch in the fork and `checkout.branch` its name; the commands run in the sandbox check out the existing branch and none of them creates a branch of that name or resets it to `checkout.ref`",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days",
+              "the fake runtime records every command run in a sandbox with its working directory and answers `git rev-parse HEAD` with a commit id the test sets"
+            ],
+            "pseudocode": "in internal/sandbox/checkout_test.go, TestCheckout_ExistingBranchIsKept: push a commit X to branch `t1` of demo--t1 so that it is ahead of main; r = post('/api/v1/workspaces/demo--t1/sandboxes', {}); assert r.json.checkout.branch == 't1' and r.json.checkout.sha == X and r.json.checkout.ref == 'main'; run the provisioner; cmds = runtime.execs(id); assert some command checks out 't1' tracking origin/t1; assert no command has argv containing both '-b' (or '-B', or 'branch') and 't1' with a start point of main; assert no command contains 'reset'"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "event_driven",
+          "condition": "a sandbox on a workspace that is not a fork is provisioned with a hub credential that carries `git:read` and the request did not say `checkout: false`",
+          "action": "clone the repository in the same way and check out `checkout.ref` (default: the workspace's default branch) without creating a branch",
+          "contract": "`checkout` is `{path: \"/workspace\", ref, sha, branch: null}`; the commands run in the sandbox create no branch",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days",
+              "`demo` also has a branch `release`",
+              "the fake runtime records every command run in a sandbox with its working directory and answers `git rev-parse HEAD` with a commit id the test sets"
+            ],
+            "pseudocode": "in internal/sandbox/checkout_test.go, TestCheckout_RepositoryWorkspace, a table over {absent -> ref 'main', {ref: 'release'} -> ref 'release'}: r = post('/api/v1/workspaces/demo/sandboxes', {checkout: c}); assert r.json.checkout == {path: '/workspace', ref: want, sha: git(demo, 'rev-parse ' + want), branch: null}; run the provisioner; assert the clone targets 'https://hub.test/git/acme/demo.git'; assert some command checks out want; assert no command creates a branch"
+          }
+        },
+        {
+          "id": "REQ-7.4",
+          "pattern": "event_driven",
+          "condition": "the hub prepares a checkout",
+          "action": "configure git in the sandbox with a credential helper, limited to the hub's scheme and host, that answers with the username `x-token-auth` and the content of the environment variable `PARLEY_API_KEY`, and set `user.name` and `user.email` to the creating user's name and e-mail",
+          "contract": "the commands run in the sandbox before the clone include a `git config` that sets `credential.https://hub.test.helper` and whose value refers to `PARLEY_API_KEY` by name and does not contain the hub credential's value; after the clone `user.name` and `user.email` are set to the creating user's; no command's arguments contain the value of the hub credential",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days",
+              "the fake runtime records every command run in a sandbox with its working directory and answers `git rev-parse HEAD` with a commit id the test sets"
+            ],
+            "pseudocode": "in internal/sandbox/checkout_test.go, TestCheckout_ConfiguresGit: dana has name 'Dana Doe' and e-mail 'dana@example.com'; create on demo--t1; run the provisioner; cmds = runtime.execs(id); h = the git config command whose argv contains 'credential.https://hub.test.helper'; assert index(h) < index(clone); assert 'PARLEY_API_KEY' in join(h.argv) and 'x-token-auth' in join(h.argv); assert some command sets user.name to 'Dana Doe' and one sets user.email to 'dana@example.com'; v = the hub credential's value from the fake's provider registration; assert all(v not in join(c.argv) for c in cmds)"
+          }
+        },
+        {
+          "id": "REQ-7.5",
+          "pattern": "optional",
+          "condition": "the request says `checkout: false`, or the sandbox has no hub credential, or its hub credential does not carry `git:read`",
+          "action": "skip the checkout and run no git command in the sandbox",
+          "contract": "`checkout` is null in the 201 response and when the sandbox is `ready`; the fake runtime recorded no command whose first argument is `git`; the sandbox still becomes `ready` and its main process is started",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days",
+              "the profile `plain` of the other checks",
+              "the fake runtime records every command run in a sandbox with its working directory and answers `git rev-parse HEAD` with a commit id the test sets"
+            ],
+            "pseudocode": "in internal/sandbox/checkout_test.go, TestCheckout_Skipped, a table over {body {checkout: false} as dana's key, profile `plain` (hub_access none), a PAT with [sandboxes:write, changes:read]}: r = post('/api/v1/workspaces/demo--t1/sandboxes', {..., command: ['true']}); assert r.json.checkout == null; run the provisioner; assert get(id).json.state == 'ready' and get(id).json.checkout == null; assert [c for c in runtime.execs(id) if c.argv[0] == 'git'] == []; assert runtime.sandbox(id).main == ['true']"
+          }
+        },
+        {
+          "id": "REQ-7.6",
+          "pattern": "unwanted",
+          "condition": "a git command of the checkout exits with a non-zero code or cannot be run",
+          "action": "end the provisioning as failed with the reason `checkout_failed` and start no main process",
+          "contract": "the sandbox's `state` is `failed` with `state_reason` `checkout_failed`; the main process was never started; the runtime holds no sandbox for the id",
+          "check": {
+            "same_as": "REQ-6.3"
+          }
+        },
+        {
+          "id": "REQ-7.7",
+          "pattern": "optional",
+          "condition": "the sandbox was created with `restore_from`",
+          "action": "record the named sandbox's id in `restored_from` and, after the checkout and before the main process is started, call the restorer once with the new sandbox and the source sandbox",
+          "contract": "`restored_from` equals the given id in the 201 response, in the metadata of `parley.sandbox.create` and in later reads; the restorer was called exactly once, after the last checkout command and before the main-process start, with the two sandbox ids; when no restorer is wired the sandbox ends `failed` with `provision_failed`",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days",
+              "the fake runtime records every command run in a sandbox with its working directory and answers `git rev-parse HEAD` with a commit id the test sets"
+            ],
+            "pseudocode": "in internal/sandbox/checkout_test.go, TestCheckout_RestoreFrom: seed sandbox OLD on demo--t1 with checkpoint {ok: true, refs: [{branch: 't1', sha: X, dirty: true}]}; restorer = recording stub; r = post('/api/v1/workspaces/demo--t1/sandboxes', {restore_from: OLD, command: ['true']}); assert r.status == 201 and r.json.restored_from == OLD; run the provisioner; assert restorer.calls == [(r.json.id, OLD)]; assert position(restorer call) > position(last git exec) and < position(main start) in the shared call log; assert events(type='parley.sandbox.create')[0].metadata.restored_from == OLD; with no restorer wired: state == 'failed' and state_reason == 'provision_failed'"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "Reading sandboxes",
+      "rationale": "A caller that created a sandbox needs to follow it to `ready` and find it again without holding a connection to the runtime.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "a caller with `sandboxes:read` and read access to the workspace sends `GET /api/v1/workspaces/:slug/sandboxes/:id` for a sandbox of that workspace",
+          "action": "answer with the sandbox object from the stored record, in any state including `deleted`",
+          "contract": "HTTP 200 with the sandbox object; for a `deleted` record `state` is `deleted` and `ended_at` is set; a member with read access only receives the same answer as the owner",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days",
+              "an org member `omar` with read access to `demo`"
+            ],
+            "pseudocode": "in internal/sandbox/read_test.go, TestGet_AnswersObject, a table over records in {provisioning, ready, failed with reason provision_failed, deleted with reason api} and callers {dana's key, omar's key (read access), PAT of dana with sandboxes:read only}: r = get('/api/v1/workspaces/demo/sandboxes/' + id); assert r.status == 200 and r.json.id == id and r.json.state == rec.state and r.json.state_reason == rec.state_reason; for deleted: r.json.ended_at != null"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "unwanted",
+          "condition": "the id in a read names no stored sandbox, or names a sandbox of another workspace, or is not of the form `sbx_` and 32 lowercase hexadecimal characters",
+          "action": "answer that the sandbox was not found",
+          "contract": "HTTP 404 with `error_type` `sandbox_not_found`; the answer is the same for all three cases",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days"
+            ],
+            "pseudocode": "in internal/sandbox/read_test.go, TestGet_NotFound, a table over ids {'sbx_' + 32 zeros, the id of a sandbox of demo--t1 requested under /workspaces/demo, 'nope', 'SBX_' + 32 hex}: r = get('/api/v1/workspaces/demo/sandboxes/' + id) as dana; assert r.status == 404 and r.json.error.error_type == 'sandbox_not_found'; assert the four error objects are equal"
+          }
+        },
+        {
+          "id": "REQ-8.3",
+          "pattern": "event_driven",
+          "condition": "a read of one sandbox carries `wait_for` (`ready` or `ended`) and `wait` (whole seconds from 1 to 60)",
+          "action": "hold the request until the condition holds or `wait` seconds have passed, whichever comes first, and then answer with the sandbox as it is; `ready` holds when the state is not `provisioning`, and `ended` holds when the state is `stopped`, `completed`, `failed` or `deleted`",
+          "contract": "HTTP 200; when the condition already holds the answer is immediate; when the state changes during the wait the answer follows within 1 second of the change and shows the new state; when the time passes first the answer shows the current state, for example `provisioning`; a request whose client disconnects ends without an answer and holds no resource afterwards",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days"
+            ],
+            "pseudocode": "in internal/sandbox/read_test.go, TestGet_WaitFor, a table {(state ready, wait_for=ready, wait=30): answers at once with ready; (state failed, wait_for=ready): at once with failed; (state provisioning, wait_for=ready, wait=30, Transition to ready after the request started): answers within 1s of the transition with state ready; (state ready, wait_for=ended, wait=2, no change): answers after 2s of the test clock with state ready; (state ready, wait_for=ended, Transition to stopped during the wait): answers with stopped; (state provisioning, wait_for=ready, wait=1, no change): answers with provisioning}: assert r.status == 200 and r.json.state == want; and a request cancelled by its context returns from the handler within 1s"
+          }
+        },
+        {
+          "id": "REQ-8.4",
+          "pattern": "unwanted",
+          "condition": "a read of one sandbox carries `wait_for` without `wait` or `wait` without `wait_for`, a `wait_for` other than `ready` and `ended`, or a `wait` that is not a whole number from 1 to 60",
+          "action": "refuse the request without waiting",
+          "contract": "HTTP 400 with `error_type` `invalid_request`, answered at once",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days"
+            ],
+            "pseudocode": "in internal/sandbox/read_test.go, TestGet_RefusesBadWait, a table over the queries {'wait_for=ready', 'wait=10', 'wait_for=done&wait=10', 'wait_for=ready&wait=0', 'wait_for=ready&wait=61', 'wait_for=ready&wait=1.5', 'wait_for=ready&wait=x', 'wait_for=ended&wait=-1'}: r = get(path + '?' + q); assert r.status == 400 and r.json.error.error_type == 'invalid_request'; and 'wait_for=ended&wait=1' and 'wait_for=ready&wait=60' on a ready sandbox answer 200"
+          }
+        },
+        {
+          "id": "REQ-8.5",
+          "pattern": "event_driven",
+          "condition": "a caller with `sandboxes:read` and read access sends `GET /api/v1/workspaces/:slug/sandboxes`",
+          "action": "list the sandboxes of the workspace ordered by `created_at` descending and then `id` descending, without `deleted` ones unless `state` asks for them, filtered by every given `state` (any of them), `session_id` and `label` (all of them), and with `include_forks=true` on a workspace that is not a fork also the sandboxes of those of its forks the caller can read",
+          "contract": "HTTP 200 with `{items, next_cursor}`; `items` holds sandbox objects in that order; following `next_cursor` with `limit` 2 over 5 sandboxes yields each exactly once and ends with `next_cursor` null; a workspace without sandboxes answers `items` `[]`; `include_forks` on a fork changes nothing; `GET /api/v1/sandboxes` of package 44, called with the admin token, lists the stored sandboxes of every workspace through the sandbox source this package registers",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days",
+              "a fork `demo--m1`; an access component stub that decides per caller and slug"
+            ],
+            "pseudocode": "in internal/sandbox/read_test.go, TestList_FiltersAndOrder: seed on demo: A (ready, session S, labels {team: core, tier: 1}), B (stopped, labels {team: core}), C (deleted), all with the same created_at; on demo--t1: D (ready); on demo--m1: E (failed); the access stub lets dana read demo, demo--t1 and demo--m1 and lets omar read demo and demo--m1 only; a table over (caller, query, want ids) {(dana, '', [B, A] sorted by id desc), (dana, 'state=deleted', [C]), (dana, 'state=ready&state=stopped', [B, A]), (dana, 'session_id=S', [A]), (dana, 'label=team=core', [B, A]), (dana, 'label=team=core&label=tier=1', [A]), (dana, 'label=team=web', []), (dana, 'include_forks=true', the set {A, B, D, E}), (omar, 'include_forks=true', the set {A, B, E} without D), (dana on demo--t1, 'include_forks=true', [D])}: assert ids(r.json.items) == want in order; then page with limit=2 over 5 seeded sandboxes: assert the concatenation of pages == the full order with no repeat and the last next_cursor == null; r = get('/api/v1/sandboxes?state=ready') with the admin token: assert the set of ids(r.json.items) == {A, D}"
+          }
+        },
+        {
+          "id": "REQ-8.6",
+          "pattern": "unwanted",
+          "condition": "the list request carries a `state` that is not one of the six states, a `label` without `=`, or an `include_forks` that is neither `true` nor `false`",
+          "action": "refuse the request",
+          "contract": "HTTP 400 with `error_type` `invalid_request`",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days"
+            ],
+            "pseudocode": "in internal/sandbox/read_test.go, TestList_RefusesBadQuery, a table over {'state=running', 'state=ready&state=', 'label=team', 'label==x', 'include_forks=yes', 'include_forks=1'}: r = get('/api/v1/workspaces/demo/sandboxes?' + q) as dana; assert r.status == 400 and r.json.error.error_type == 'invalid_request'"
+          }
+        },
+        {
+          "id": "REQ-8.7",
+          "pattern": "unwanted",
+          "condition": "a read route is called while sandboxes are not enabled, by a PAT without `sandboxes:read`, or by a caller without access to the workspace",
+          "action": "refuse the request by the first failing check in the order feature enabled, PAT scope, workspace access",
+          "contract": "HTTP 404 `sandboxes_disabled` when not enabled; HTTP 403 `insufficient_scope` for the PAT, also for a slug that does not exist; HTTP 404 `not_found` without access; the admin token receives 200",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days"
+            ],
+            "pseudocode": "in internal/sandbox/read_test.go, TestRead_Authorization, a table over the two read routes and {(hub without [sandbox], dana's key): 404 sandboxes_disabled; (PAT of dana with git:read): 403 insufficient_scope; (the same PAT, slug 'ghost'): 403 insufficient_scope; (stranger's key): 404 not_found; (admin token): 200; (PAT of dana with sandboxes:write only): 403 insufficient_scope}: assert (r.status, error_type) == want"
+          }
+        },
+        {
+          "id": "REQ-8.8",
+          "pattern": "state_driven",
+          "condition": "the runtime client reports the runtime unreachable",
+          "action": "answer reads from the stored records with `runtime_reachable` false",
+          "contract": "HTTP 200 on both read routes; every sandbox object has `runtime_reachable` false and otherwise the stored values; once the client reports the runtime reachable again the same reads show `runtime_reachable` true",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days"
+            ],
+            "pseudocode": "in internal/sandbox/read_test.go, TestRead_RuntimeUnreachable: seed a ready sandbox; runtime.setReachable(false); g = get(one); l = get(list); assert g.status == 200 and g.json.runtime_reachable == false and g.json.state == 'ready'; assert all(i.runtime_reachable == false for i in l.json.items); runtime.setReachable(true); assert get(one).json.runtime_reachable == true"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-9",
+      "title": "Fork and sandbox in one call",
+      "rationale": "An agent should get a fork and a working environment for it with one request, and never a fork whose sandbox was refused.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-9.1",
+          "pattern": "event_driven",
+          "condition": "the fork-create route calls the sandbox component inside the fork's transaction with the caller, the new fork, the `sandbox` object as received and the fork's `session_id` and `purpose`",
+          "action": "treat the object as the body of a create request on the fork, use the fork's `session_id` and `purpose` (cut to its first 200 characters) where the object gives none, store the sandbox, its hub credential and `parley.sandbox.create` in the given transaction, and return the sandbox object",
+          "contract": "the component returns the sandbox object as JSON with `workspace` the fork's slug, `state` `provisioning`, `session_id` and `purpose` the fork's unless the object set them, and `expires_at` no later than the fork's `expires_at`; `POST /api/v1/workspaces/demo/forks` with a `sandbox` object answers 201 whose `sandbox` member is that object, and the fork and the sandbox are both stored",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days",
+              "the real fork component of package 15 with this package's sandbox component wired; a session linker stub that accepts"
+            ],
+            "pseudocode": "in internal/sandbox/forkcomponent_test.go, TestForkWithSandbox_CreatesBoth, a table over (fork body, want) {({name: 'f1', purpose: 'fix bug', session_id: S, sandbox: {}}, purpose 'fix bug', session S), ({name: 'f2', purpose: 'x'*300, sandbox: {}}, purpose 'x'*200, session null), ({name: 'f3', purpose: 'p', sandbox: {purpose: 'own', command: ['make']}}, purpose 'own'), ({name: 'f4', ttl: '30m', sandbox: {}}, expires_at == fork.expires_at)}: r = post('/api/v1/workspaces/demo/forks', body) as dana; assert r.status == 201; s = r.json.sandbox; assert s.workspace == 'demo--' + name and s.state == 'provisioning' and s.purpose == want.purpose and s.session_id == want.session; assert s.expires_at <= r.json.workspace.expires_at; assert get('/api/v1/workspaces/' + s.workspace + '/sandboxes/' + s.id).status == 200; assert s.hub_access.scopes == all six and the hub credential is bound to the fork's slug"
+          }
+        },
+        {
+          "id": "REQ-9.2",
+          "pattern": "unwanted",
+          "condition": "the sandbox component refuses the object: the caller's PAT lacks `sandboxes:write`, the object fails validation, its session is refused, a required secret is missing, the secret store cannot be read, or a quota would be exceeded",
+          "action": "write nothing in the given transaction and return the refusal that the create route gives for the same case",
+          "contract": "the component returns an API error with the status, `error_type` and extra members of the create route's refusal: 403 `insufficient_scope`, 400 `invalid_request`, 400 `unknown_session`, 422 `credential_missing` with `credentials`, `secrets` and `scopes_searched`, 503 `secrets_unavailable`, 429 `sandbox_capacity` with `limit`, `maximum` and `current`; `POST /api/v1/workspaces/demo/forks` answers with that error and neither a fork nor a sandbox nor a token nor an event is stored",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days",
+              "the real fork component of package 15 with this package's sandbox component wired; the profile `needs` of the other checks"
+            ],
+            "pseudocode": "in internal/sandbox/forkcomponent_test.go, TestForkWithSandbox_RefusalCreatesNeither, a table over (caller, sandbox object, set-up, want) {(PAT [workspaces:write, git:read], {}, -, 403 insufficient_scope), (dana, {ttl: '1s'}, -, 400 invalid_request), (dana, {profile: 'nope'}, -, 400 invalid_request), (dana, {session_id: X}, linker refuses X, 400 unknown_session), (dana, {profile: 'needs'}, MODEL_KEY unset, 422 credential_missing with credentials ['model']), (dana, {profile: 'needs'}, resolver stub unavailable, 503 secrets_unavailable), (dana, {}, max_per_user 0, 429 sandbox_capacity with limit 'max_per_user', maximum 0, current 0)}: r = post('/api/v1/workspaces/demo/forks', {name: 'g1', sandbox: obj}); assert (r.status, r.json.error.error_type) == want and the extra members are present; assert get('/api/v1/workspaces/demo--g1').status == 404; assert unchanged(sandbox store, tokens, events) and len(runtime.calls) == 0"
+          }
+        },
+        {
+          "id": "REQ-9.3",
+          "pattern": "unwanted",
+          "condition": "the fork's transaction is rolled back after the sandbox component returned a sandbox",
+          "action": "leave no sandbox, no hub credential and no event, and make no call to the runtime for it",
+          "contract": "after the roll-back the sandbox store, the token store and the event log are as before the call; 3 seconds of provisioner passes later the runtime has received no call; the value the component kept in memory for the provisioner is dropped once the provisioner finds no record for it",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days"
+            ],
+            "pseudocode": "in internal/sandbox/forkcomponent_test.go, TestComponent_RollbackLeavesNothing: tx = store.Begin(); obj, err = component.Create(ctx, tx, dana, forkRecord('demo--r1'), raw('{}'), defaults); assert err == nil and obj.id != ''; tx.Rollback(); run the provisioner and advance the clock by 3s in steps of 1s; assert sandboxes() == [] and tokens() == before and events() == before; assert len(runtime.calls) == 0; advance the clock by 60s; assert component.pendingValues() == 0"
+          }
+        },
+        {
+          "id": "REQ-9.4",
+          "pattern": "event_driven",
+          "condition": "the fork's transaction commits after the sandbox component returned a sandbox",
+          "action": "provision the sandbox without a further call from the fork route, starting no later than 1 second after the commit",
+          "contract": "the runtime receives no call before the commit; after the commit the sandbox reaches `ready` with the fork cloned and a branch named after the fork's `name` checked out; exactly one `parley.sandbox.ready` is stored",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub built in-process with a real store, a real event log, the real access and minting components, the fake runtime of package 44 and a fixed clock; sandboxes enabled with a profile `agent` marked `default` (`image` `img:1`, `cpu` `2`, `memory` `4Gi`, `ttl` `4h`, `idle_timeout` `30m`, `hub_access` `fork`, no credentials); `[server].external_url` `https://hub.test`",
+              "a `ready` repository workspace `demo` in organization `acme` owned by developer `dana`, with default branch `main`; a fork `demo--t1` of it owned by `dana` with `name` `t1`, base branch `main` and `expires_at` in 7 days"
+            ],
+            "pseudocode": "in internal/sandbox/forkcomponent_test.go, TestComponent_ProvisionsAfterCommit: start the provisioner; tx = store.Begin(); write the fork record demo--c1 in tx; obj, _ = component.Create(ctx, tx, dana, fork, raw('{}'), defaults); advance the clock by 2s; assert len(runtime.calls) == 0; tx.Commit(); advance the clock by 1s; wait until get(obj.id).json.state != 'provisioning'; s = get(obj.id).json; assert s.state == 'ready' and s.checkout.branch == 'c1'; assert count(events type parley.sandbox.ready for obj.id) == 1"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-10",
+      "title": "The sandbox commands create, list and get",
+      "rationale": "People and scripts drive sandboxes from a shell with the same flags, output and exit codes as every other command.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-10.1",
+          "pattern": "event_driven",
+          "condition": "a user runs `parley sandbox create <workspace-slug>` with any of `--profile`, `--env key=value`, `--no-checkout`, `--ref`, `--branch`, `--restore-from`, `--ttl`, `--purpose`, `--label key=value`, `--session` and a trailing `-- command...`",
+          "action": "send one `POST /api/v1/workspaces/<slug>/sandboxes` whose body has `profile`, `ttl`, `purpose`, `restore_from` and `session_id` from their flags, `env` and `labels` as maps built from the repeated flags, `checkout` `false` for `--no-checkout` or `{ref, branch}` with the members that were given, `command` as the list of trailing arguments, and no member for a flag that was not given, then print the response",
+          "contract": "stdout is the hub's response body as one JSON document indented by 2 spaces; exit code 0; with no flag the request body is `{}`; a value of `--env` or `--label` is split at its first `=`, so `--env A=b=c` sends `{\"A\": \"b=c\"}`",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the command run in-process against a fake hub served by `net/http/httptest` that records each request and answers canned responses"
+            ],
+            "pseudocode": "in internal/cli/sandbox_test.go, TestSandboxCreate_FlagsToBody, a table over (args, want body) {(['demo'], {}), (['demo', '--profile', 'agent', '--ttl', '1h', '--purpose', 'p', '--session', S, '--restore-from', 'sbx_x'], {profile: 'agent', ttl: '1h', purpose: 'p', session_id: S, restore_from: 'sbx_x'}), (['demo', '--env', 'A=1', '--env', 'B=b=c', '--label', 'team=core'], {env: {A: '1', B: 'b=c'}, labels: {team: 'core'}}), (['demo', '--no-checkout'], {checkout: false}), (['demo', '--ref', 'release'], {checkout: {ref: 'release'}}), (['demo', '--ref', 'main', '--branch', 'work'], {checkout: {ref: 'main', branch: 'work'}}), (['demo', '--', 'make', 'test', '--flag'], {command: ['make', 'test', '--flag']}), (['a/b'], path '/api/v1/workspaces/a%2Fb/sandboxes')}: run(args); assert hub.requests == [POST path with json body == want]; assert exit == 0 and stdout == indent2(canned response) + '\\n'"
+          }
+        },
+        {
+          "id": "REQ-10.2",
+          "pattern": "event_driven",
+          "condition": "`parley sandbox create` is run with `--wait` and without `--wait-exit`",
+          "action": "after the create, poll `GET /api/v1/workspaces/<slug>/sandboxes/<id>` at the poll interval under the overall timeout until the state is not `provisioning`, and end successfully for `ready` and `completed` and unsuccessfully for `failed`, `stopped` and `deleted`",
+          "contract": "for `ready` and `completed`: stdout holds exactly one document, the final sandbox object, and the exit code is 0; for `failed`, `stopped` and `deleted`: stdout holds the final object, stderr holds the error envelope with `error_type` `wait_failed`, and the exit code is 1; when the timeout passes first stdout is empty, stderr holds `wait_timeout` and the exit code is 1",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the command run in-process against a fake hub served by `net/http/httptest` that records each request and answers canned responses"
+            ],
+            "pseudocode": "in internal/cli/sandbox_test.go, TestSandboxCreate_Wait, a table over the sequence of states the fake hub answers to the polls {[provisioning, provisioning, ready] -> exit 0, [completed] -> exit 0, [provisioning, failed] -> exit 1 wait_failed, [stopped] -> exit 1 wait_failed, [deleted] -> exit 1 wait_failed, [provisioning forever] with --timeout 50ms --poll-interval 10ms -> exit 1 wait_timeout and empty stdout}: run(['demo', '--wait', '--poll-interval', '10ms']); assert exit == want; assert stdout parses as one JSON document whose state is the last polled state (except on timeout); assert json(stderr).error.error_type == want_type for the unsuccessful rows; assert the polls went to '/api/v1/workspaces/demo/sandboxes/' + id"
+          }
+        },
+        {
+          "id": "REQ-10.3",
+          "pattern": "event_driven",
+          "condition": "`parley sandbox create` is run with `--wait-exit` and a trailing command",
+          "action": "wait as with `--wait`, but until the state is `completed`, `failed`, `stopped` or `deleted`, and end successfully only for `completed`",
+          "contract": "the command keeps polling while the state is `provisioning` or `ready`; for `completed` stdout holds the final sandbox object and the exit code is 0; for `failed`, `stopped` and `deleted` stdout holds the final object, stderr holds `wait_failed` and the exit code is 1; `--wait` need not be given",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the command run in-process against a fake hub served by `net/http/httptest` that records each request and answers canned responses"
+            ],
+            "pseudocode": "in internal/cli/sandbox_test.go, TestSandboxCreate_WaitExit, a table over poll sequences {[provisioning, ready, ready, completed] -> exit 0 and 4 polls, [ready, failed with exit_code 2] -> exit 1 wait_failed, [ready, stopped] -> exit 1, [deleted] -> exit 1} with args ['demo', '--wait-exit', '--poll-interval', '10ms', '--', 'make'] and once with both '--wait' and '--wait-exit': assert exit == want and json(stdout).state == the last state and len(hub.polls) == len(sequence)"
+          }
+        },
+        {
+          "id": "REQ-10.4",
+          "pattern": "unwanted",
+          "condition": "`parley sandbox create` is given no workspace slug, more than one argument before `--`, `--wait-exit` without a trailing command, `--no-checkout` together with `--ref` or `--branch`, or an `--env` or `--label` value without `=` or with an empty key; or `parley sandbox list` is given no slug or two; or `parley sandbox get` is not given exactly a slug and an id",
+          "action": "fail as a usage error without sending a request",
+          "contract": "exit code 2; stderr holds the error envelope with `code` 0 and `error_type` `usage_error`; stdout is empty; the hub received no request",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the command run in-process against a fake hub served by `net/http/httptest` that records each request and answers canned responses"
+            ],
+            "pseudocode": "in internal/cli/sandbox_test.go, TestSandbox_UsageErrors, a table over the args {['sandbox', 'create'], ['sandbox', 'create', 'a', 'b'], ['sandbox', 'create', 'demo', '--wait-exit'], ['sandbox', 'create', 'demo', '--no-checkout', '--ref', 'main'], ['sandbox', 'create', 'demo', '--no-checkout', '--branch', 'w'], ['sandbox', 'create', 'demo', '--env', 'A'], ['sandbox', 'create', 'demo', '--label', '=v'], ['sandbox', 'list'], ['sandbox', 'list', 'a', 'b'], ['sandbox', 'get', 'demo'], ['sandbox', 'get', 'demo', 'id', 'x']}: run(args); assert exit == 2; assert json(stderr).error.error_type == 'usage_error' and json(stderr).error.code == 0; assert stdout == '' and len(hub.requests) == 0"
+          }
+        },
+        {
+          "id": "REQ-10.5",
+          "pattern": "event_driven",
+          "condition": "a user runs `parley sandbox list <workspace-slug>` with any of `--state` (repeatable), `--session`, `--label` (repeatable), `--include-forks`, `--limit` and `--cursor`, or `parley sandbox get <workspace-slug> <id>`",
+          "action": "send `GET /api/v1/workspaces/<slug>/sandboxes` with one `state` and one `label` query parameter per flag occurrence, `session_id`, `include_forks=true`, `limit` and `cursor` for the flags that were given, or `GET /api/v1/workspaces/<slug>/sandboxes/<id>`, and print the response",
+          "contract": "stdout is the hub's response body as one JSON document indented by 2 spaces and the exit code is 0; a flag that was not given adds no query parameter; when the hub answers an error, stderr holds that error envelope unchanged, stdout is empty and the exit code is 1",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the command run in-process against a fake hub served by `net/http/httptest` that records each request and answers canned responses"
+            ],
+            "pseudocode": "in internal/cli/sandbox_test.go, TestSandboxListAndGet, a table over (args, want request) {(['sandbox', 'list', 'demo'], GET /api/v1/workspaces/demo/sandboxes with no query), (['sandbox', 'list', 'demo', '--state', 'ready', '--state', 'failed', '--session', S, '--label', 'team=core', '--label', 'tier=1', '--include-forks', '--limit', '10', '--cursor', 'c1'], query state=[ready, failed], session_id=[S], label=[team=core, tier=1], include_forks=[true], limit=[10], cursor=[c1]), (['sandbox', 'get', 'demo', 'sbx_1'], GET /api/v1/workspaces/demo/sandboxes/sbx_1)}: run(args); assert hub.requests[0] matches; assert exit == 0 and stdout == indent2(canned) + '\\n'; with the hub answering 404 sandbox_not_found: assert exit == 1 and json(stderr).error.error_type == 'sandbox_not_found' and stdout == ''"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "A developer creates a sandbox from the shell and waits until it is ready",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "runs `parley sandbox create demo--t1 --profile full --wait -- make test`"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends `POST /api/v1/workspaces/demo--t1/sandboxes` with the profile and the command"
+        },
+        {
+          "actor": "parleyd",
+          "action": "checks the caller, validates the body, resolves the profile's credential and exposed secret, checks the quotas, stores the sandbox with its hub credential and the create event, and answers 201"
+        },
+        {
+          "actor": "parleyd",
+          "action": "registers the providers and asks for the sandbox with its policy and environment"
+        },
+        {
+          "actor": "OpenShell gateway",
+          "action": "creates the sandbox and runs the commands the hub sends"
+        },
+        {
+          "actor": "parleyd",
+          "action": "clones the fork into the working directory, checks out the work branch, starts the command and marks the sandbox `ready` with its event"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "polls the sandbox, prints it in state `ready` and exits 0"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parley CLI",
+          "HTTP router and middleware",
+          "sandbox route guard",
+          "sandbox create operation",
+          "quota check",
+          "secret store and resolver",
+          "minting component",
+          "event log",
+          "store",
+          "provisioner",
+          "git"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with sandboxes enabled and the fake runtime of package 44 standing in for the OpenShell gateway",
+          "a profile `full` marked default with `credentials` `[\"model\"]` and `expose_secrets` `[\"NPM_TOKEN\"]`; secrets `MODEL_KEY` on the organization and `NPM_TOKEN` on the fork",
+          "a `ready` workspace `demo` with a fork `demo--t1`, both owned by the developer whose API key the CLI uses"
+        ],
+        "end_state": [
+          "the CLI exited 0 and printed one sandbox object in state `ready` with `credentials` `[\"model\"]`, `exposed_secrets` `[\"NPM_TOKEN\"]` and `checkout.branch` `t1`",
+          "the event log holds one `parley.sandbox.create` and one `parley.sandbox.ready` for the sandbox and one `parley.token.bind` for its hub credential, with `parley.sandbox.ready` last",
+          "the fake runtime holds one sandbox for the id with main process `make test`, whose environment has `PARLEY_WORKSPACE` `demo--t1` and the real value of `NPM_TOKEN`",
+          "`parley sandbox list demo --include-forks` and `parley sandbox get demo--t1 <id>` print that sandbox"
+        ],
+        "pseudocode": "in test/e2e/sandbox_create_test.go, TestSandboxCreateAndWait: hub = startHub(sandbox: enabled, runtime: fake); out, code = parley('sandbox', 'create', 'demo--t1', '--wait', '--poll-interval', '50ms', '--', 'make', 'test'); assert code == 0; s = json(out); assert s.state == 'ready' and s.credentials == ['model'] and s.exposed_secrets == ['NPM_TOKEN'] and s.checkout.branch == 't1'; ev = types(events for s.id and for its hub credential's token); assert sorted(ev) == ['parley.sandbox.create', 'parley.sandbox.ready', 'parley.token.bind'] and ev[-1] == 'parley.sandbox.ready'; rt = fake.sandbox(s.id); assert rt.main == ['make', 'test'] and rt.env.PARLEY_WORKSPACE == 'demo--t1' and rt.env.NPM_TOKEN == the secret's value; assert s.id in ids(json(parley('sandbox', 'list', 'demo', '--include-forks')).items); assert json(parley('sandbox', 'get', 'demo--t1', s.id)).id == s.id"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "An agent creates a fork and its sandbox in one call",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "sends `POST /api/v1/workspaces/demo/forks` with `{\"name\": \"task2\", \"sandbox\": {}}`"
+        },
+        {
+          "actor": "parleyd",
+          "action": "creates the fork and, in the same transaction, hands the `sandbox` object to the sandbox component, which stores the sandbox on the fork with its hub credential and the create event"
+        },
+        {
+          "actor": "parleyd",
+          "action": "commits and answers 201 with the fork and the sandbox in state `provisioning`"
+        },
+        {
+          "actor": "parleyd",
+          "action": "provisions the sandbox after the commit"
+        },
+        {
+          "actor": "OpenShell gateway",
+          "action": "creates the sandbox and runs the checkout commands"
+        },
+        {
+          "actor": "agent",
+          "action": "reads `GET /api/v1/workspaces/demo--task2/sandboxes/<id>?wait_for=ready&wait=30` and receives the sandbox in state `ready`"
+        },
+        {
+          "actor": "agent",
+          "action": "repeats the fork request with a profile whose required secret is missing and receives 422 `credential_missing`"
+        },
+        {
+          "actor": "parleyd",
+          "action": "rolls the fork's transaction back, so that neither the second fork nor a sandbox exists"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "HTTP router and middleware",
+          "fork component",
+          "sandbox component",
+          "secret store and resolver",
+          "minting component",
+          "event log",
+          "store",
+          "provisioner",
+          "git"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with sandboxes enabled and the fake runtime of package 44 standing in for the OpenShell gateway",
+          "a profile `agent` marked default without credentials, and a profile `needs` with `credentials` `[\"model\"]` whose secret is set nowhere",
+          "a `ready` workspace `demo` owned by the user whose API key the agent uses"
+        ],
+        "end_state": [
+          "the fork `demo--task2` exists with one sandbox in state `ready` whose `checkout.branch` is `task2` and whose `hub_access.scopes` holds the six scopes",
+          "one live token is bound to `demo--task2` and expires at the sandbox's `expires_at`",
+          "the request with profile `needs` answered 422 `credential_missing`, `GET /api/v1/workspaces/demo--task3` answers 404, and the fake runtime holds exactly one sandbox"
+        ],
+        "pseudocode": "in test/e2e/sandbox_create_test.go, TestForkAndSandboxInOneCall: r = post('/api/v1/workspaces/demo/forks', {name: 'task2', sandbox: {}}); assert r.status == 201 and r.json.sandbox.state == 'provisioning'; s = get('/api/v1/workspaces/demo--task2/sandboxes/' + r.json.sandbox.id + '?wait_for=ready&wait=30').json; assert s.state == 'ready' and s.checkout.branch == 'task2' and len(s.hub_access.scopes) == 6; assert len(live tokens bound to demo--task2) == 1; r2 = post('/api/v1/workspaces/demo/forks', {name: 'task3', sandbox: {profile: 'needs'}}); assert r2.status == 422 and r2.json.error.error_type == 'credential_missing' and r2.json.error.credentials == ['model']; assert get('/api/v1/workspaces/demo--task3').status == 404; assert len(fake.sandboxes()) == 1"
+      }
+    }
+  ],
+  "external_apis": [
+    {
+      "package": "github.com/spf13/cobra",
+      "version": "v1.10.2",
+      "verified": true,
+      "symbols": [
+        {
+          "name": "Command.Flags",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) Flags() *pflag.FlagSet"
+        },
+        {
+          "name": "Command.ArgsLenAtDash",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) ArgsLenAtDash() int"
+        },
+        {
+          "name": "MinimumNArgs",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func MinimumNArgs(n int) PositionalArgs"
+        }
+      ]
+    },
+    {
+      "package": "github.com/spf13/pflag",
+      "version": "v1.0.10",
+      "verified": true,
+      "symbols": [
+        {
+          "name": "FlagSet.StringArray",
+          "import_path": "github.com/spf13/pflag",
+          "signature": "func (f *FlagSet) StringArray(name string, value []string, usage string) *[]string"
+        },
+        {
+          "name": "FlagSet.Changed",
+          "import_path": "github.com/spf13/pflag",
+          "signature": "func (f *FlagSet) Changed(name string) bool"
+        }
+      ]
+    }
+  ]
+}

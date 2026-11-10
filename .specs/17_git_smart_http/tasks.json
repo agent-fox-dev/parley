@@ -1,0 +1,316 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "17",
+  "spec_name": "git_smart_http",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/gitserver/... ./internal/gitrepo/... ./internal/cli/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "06",
+      "reason": "uses the PAT with its scopes and workspace binding and the scope check in which git:write implies git:read"
+    },
+    {
+      "spec": "07",
+      "reason": "asks the access component for the read or write decision without an HTTP response and reads the record's kind, parent and organization"
+    },
+    {
+      "spec": "08",
+      "reason": "the binding guard runs on git routes"
+    },
+    {
+      "spec": "09",
+      "reason": "builds its CLI commands on the client, output and exit-code helpers of the CLI foundation"
+    },
+    {
+      "spec": "10",
+      "reason": "uses the workspace record with its status, organization and settings document, the state guard, the place of each bare repository and the git wrapper in internal/gitrepo"
+    },
+    {
+      "spec": "52",
+      "reason": "emits its hub events through the event log component"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Authenticate git requests with HTTP Basic and apply the rate limit",
+      "criteria": [
+        "REQ-2"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/gitserver/auth_test.go as table-driven tests over a handler served through net/http/httptest with a real store, and confirm they fail",
+        "Create internal/gitserver with a handler type built from options: the credential check of internal/identity, the limiter of internal/server, the scope check, the access component of internal/access, the workspace reader of internal/workspace, a logger, and the git guard of package 08 (GuardGit), and the interfaces this package declares for the fork view (ForkView), the push processor (PushProcessor) and the event sink, each of which may be nil; the request counter is this package's own",
+        "Declare the service interface that runs after all checks and receives the caller, the credential, the workspace record, the route's service and the request; tests of the checks pass a recorder",
+        "Give the handler a function that registers three patterns on the router of internal/server: GET /git/{org}/{repo}/info/refs, POST /git/{org}/{repo}/git-upload-pack and POST /git/{org}/{repo}/git-receive-pack, outside /api/v1 and outside the REST middleware for body size, content type and the JSON error envelope; every other path and method under /git keeps the server's general answers",
+        "Write one refusal helper that sets the status and Content-Type text/plain; charset=utf-8 and writes the message followed by one newline; every refusal of this package goes through it",
+        "Read the Authorization header: accept only the scheme Basic (matched without regard to case), decode the base64 data, split at the first colon, ignore the user name and take the password as the credential",
+        "Pass the password to the credential check of internal/identity; answer 401 with WWW-Authenticate: Basic realm=\"parley\" and the message authentication required for a missing or malformed header, an empty password and the check's outcomes unknown, revoked and expired; answer 403 user is blocked, without the challenge header, for a blocked user",
+        "Count a request that failed authentication against its client address and an authenticated request against its credential with the limiter of internal/server; when the limiter refuses an authenticated request answer 429 with its Retry-After value and the message rate limit exceeded, before any later check"
+      ],
+      "touches": [
+        "internal/gitserver/handler.go",
+        "internal/gitserver/auth.go",
+        "internal/gitserver/refusal.go",
+        "internal/gitserver/auth_test.go",
+        "internal/gitserver/testhub_test.go"
+      ],
+      "done_when": [
+        "`go test ./internal/gitserver/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Authorize git requests and resolve the repository without revealing what exists",
+      "criteria": [
+        "REQ-3.1",
+        "REQ-3.2",
+        "REQ-3.3",
+        "REQ-3.4",
+        "REQ-3.5",
+        "REQ-3.6",
+        "REQ-3.7",
+        "REQ-1.3"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/gitserver/authorize_test.go and internal/gitserver/routes_test.go and confirm they fail; the fixtures hold an owner, an org member, a stranger, the admin token, a workspace without an organization and a workspace of another org",
+        "Derive the need from the route before any lookup: POST git-receive-pack, and info/refs whose first service value is git-receive-pack, need write access and the scope git:write; every other request needs read access and git:read",
+        "For a bound PAT, ask GuardGit of package 08 with the authenticated caller, the slug as typed (the repository segment without .git), the method and the matched git route pattern; keep the Binding of a pass for the push hand-over; on a refusal, and for every bound PAT when no guard is installed, answer 404 repository not found (package 08 reports the refusal with surface git)",
+        "For a PAT, run the scope check of package 06 with the needed scope (git:write satisfies git:read through the registry's implication); on failure answer 403 token lacks scope git:read or token lacks scope git:write; API keys and the admin token skip this check",
+        "Resolve the repository: the segment must end in .git, the slug must name a workspace through the access component's decision without an HTTP response, the workspace must have an organization, and the org segment must equal that organization's slug exactly; ask the access component with the route's need",
+        "Answer 404 repository not found, through the one refusal helper and with no difference in headers or body, for a segment without .git, a not-found decision, a workspace without an organization and a wrong org segment, in every workspace status",
+        "Answer 403 with the read-only member message when the access component refuses a member on a push request",
+        "After access, validate info/refs: the first value of the query parameter service must be git-upload-pack or git-receive-pack, otherwise 400 invalid or missing service parameter; later values are ignored",
+        "Read membership and bindings from the store on every request; keep no cache between requests",
+        "Keep the checks in one ordered chain (authenticate, rate limit, binding guard, scope, resolution and access, validation, state, service) so that the first failure decides the answer"
+      ],
+      "touches": [
+        "internal/gitserver/authorize.go",
+        "internal/gitserver/resolve.go",
+        "internal/gitserver/authorize_test.go",
+        "internal/gitserver/routes_test.go",
+        "internal/gitserver/handler.go"
+      ],
+      "done_when": [
+        "`go test ./internal/gitserver/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Refuse git requests by workspace state and report every early refusal as one line of text",
+      "criteria": [
+        "REQ-4.1",
+        "REQ-4.2",
+        "REQ-4.3",
+        "REQ-1.5",
+        "REQ-1.6"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/gitserver/state_test.go and internal/gitserver/routes_test.go and confirm they fail; the fixtures add a task fork of the workspace owned by the org member",
+        "After validation, refuse a workspace whose status is not ready with 409 repository not available: workspace is <status>",
+        "For a ready task fork, read the parent's record and ask the state guard of internal/workspace whether the parent is in exclusive maintenance; if so answer 409 repository not available: parent workspace is busy on all three routes",
+        "For a ready task fork whose parent's status is archived, answer 409 repository is read-only: parent workspace is archived on the two push requests and let fetch requests pass",
+        "Check that the repository directory internal/workspace names for the workspace opens as a repository before the service runs",
+        "Answer 500 internal error for every failure of a lookup, of the access decision or of opening the repository before the exchange starts; log the cause with the request's route and slug and put none of it in the body",
+        "Add the table test that sends one request per early refusal of this package and asserts status, content type, the exact one-line body and that the body is not JSON"
+      ],
+      "touches": [
+        "internal/gitserver/state.go",
+        "internal/gitserver/state_test.go",
+        "internal/gitserver/routes_test.go",
+        "internal/gitserver/handler.go"
+      ],
+      "done_when": [
+        "`go test ./internal/gitserver/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Serve ref discovery and fetch by running git in stateless mode",
+      "criteria": [
+        "REQ-1.1",
+        "REQ-1.2",
+        "REQ-1.4",
+        "REQ-5.1",
+        "REQ-5.2",
+        "REQ-5.5",
+        "REQ-5.7",
+        "REQ-5.8",
+        "REQ-3.8",
+        "REQ-4.4"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/gitserver/fetch_test.go, internal/gitserver/state_test.go and internal/gitserver/routes_test.go and confirm they fail; the tests build repositories with git init in t.TempDir(), send hand-built pkt-line requests and run stock git with an empty HOME, GIT_CONFIG_NOSYSTEM=1 and GIT_TERMINAL_PROMPT=0",
+        "Add to internal/gitrepo a function that runs git upload-pack in stateless mode on a bare repository, with or without the advertise-refs flag, taking the request body as stdin and a writer as stdout, bound to a context; it passes configuration on the command line, ignores the system and global configuration, sets GIT_PROTOCOL only when asked to, and kills the process when the context ends",
+        "Serve info/refs for git-upload-pack: status 200, Content-Type application/x-git-upload-pack-advertisement, Cache-Control no-cache; under version 0 write the pkt-line '# service=git-upload-pack' and a flush packet before git's advertisement; under version 2 write git's capability advertisement alone",
+        "Select version 2 only when the Git-Protocol header, split at colons, has the entry version=2; every other value, and no header, is version 0",
+        "Serve POST git-upload-pack: status 200, Content-Type application/x-git-upload-pack-result, Cache-Control no-cache; copy git's output to the client as it is produced and flush after each write",
+        "Decompress a body with Content-Encoding gzip before git reads it; answer an empty body with the one pkt-line ERR empty request and an invalid gzip body with ERR invalid gzip body, both with status 200 and without running git; let git answer a body it cannot parse",
+        "Register the configuration key [git].timeout with the loader of package 03 (duration, default 30m, must be positive) and bound each upload-pack request by it: on expiry kill the git process, write the pkt-line ERR request timed out when no pack data was written yet, end the response and wait for the process to exit",
+        "Do not read the paths of a PAT anywhere on the fetch side",
+        "Wire the handler into cmd/parleyd: build it from the hub's store, credential check, limiter, scope check, access component and workspace reader, pass the guard, fork view, push processor and event sink of the packages that provide them where they exist, and register the three routes",
+        "Cover with a test that a fetch body larger than [server].max_body_size is served on the real server of internal/server, and that a ready fork with an archived parent is cloned"
+      ],
+      "touches": [
+        "internal/gitserver/fetch.go",
+        "internal/gitserver/pktline.go",
+        "internal/gitserver/fetch_test.go",
+        "internal/gitserver/state_test.go",
+        "internal/gitserver/routes_test.go",
+        "internal/gitrepo/serve.go",
+        "internal/gitrepo/serve_test.go",
+        "cmd/parleyd/main.go"
+      ],
+      "done_when": [
+        "`go test ./internal/gitserver/... ./internal/gitrepo/... -count=1` passes with git 2.38 or later on PATH"
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Serve shallow, incremental and partial fetches and advertise every ref",
+      "criteria": [
+        "REQ-5.3",
+        "REQ-5.4",
+        "REQ-5.6",
+        "REQ-6",
+        "REQ-7.1",
+        "REQ-7.2",
+        "REQ-7.3",
+        "REQ-7.4",
+        "REQ-7.5"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/gitserver/fetch_test.go, internal/gitserver/partial_test.go and internal/gitserver/refs_test.go, each run under protocol versions 0 and 2 with stock git, and confirm which fail",
+        "Pass these settings to every upload-pack run: uploadpack.allowFilter true; uploadpackfilter.allow false with uploadpackfilter.blob:none.allow, uploadpackfilter.blob:limit.allow and uploadpackfilter.tree.allow true; uploadpack.allowReachableSHA1InWant true; no hidden refs",
+        "Confirm against the installed git that the filters blob:none, blob:limit=<n> and tree:<n> are served, that a blob-less clone fetches a missing blob on checkout, and that object:type, sparse:oid and combine filters end with a remote error and status 200",
+        "Confirm that --depth, --deepen, --shallow-since, --shallow-exclude and --unshallow give the commit counts of the criteria and that an incremental fetch after one new commit receives three objects",
+        "Confirm that progress lines reach the client's stderr during a clone; the response writer must not buffer side-band data",
+        "Confirm that ls-remote lists HEAD as a symbolic ref to the default branch and every branch, tag, note and refs/parley/ ref; that a default clone has no refs/parley/ ref and a fetch by name gets one; that a version 2 ls-refs with a ref-prefix lists only matching refs",
+        "Confirm that a fetch by the id of a commit that is reachable from a ref and is no ref's tip succeeds, and that the id of a commit no ref reaches is refused in-band with status 200"
+      ],
+      "touches": [
+        "internal/gitserver/fetch.go",
+        "internal/gitserver/fetch_test.go",
+        "internal/gitserver/partial_test.go",
+        "internal/gitserver/refs_test.go",
+        "internal/gitrepo/serve.go"
+      ],
+      "done_when": [
+        "`go test ./internal/gitserver/... -count=1` passes with git 2.38 or later on PATH"
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Advertise a task fork's tracking refs and its own version refs",
+      "criteria": [
+        "REQ-7.6",
+        "REQ-7.7",
+        "REQ-7.8"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/gitserver/forkview_test.go and confirm they fail; the fork's test repository is a bare repository whose objects/info/alternates names the parent's object directory, and the fork view is a fake",
+        "Declare the interface ForkView in internal/gitserver/forkview.go: for a fork's slug it returns the full names of the fork's tracking refs (the branch and tag names package 15 recorded on the fork at creation) and the numbers of the changes, in any state, whose source workspace is the fork (the lookup of package 22), or an error",
+        "Add to internal/gitrepo a function that copies named refs from one local repository into another with a forced local fetch, deletes in the destination each named ref the source no longer has, and reports the refs it set and deleted",
+        "Before git runs on a fork's repository for any of the three routes, ask the fork view, copy the tracking refs from the parent's repository at their current values, copy every refs/parley/changes/<number>/* of the named changes, and delete from the fork's repository every ref under refs/parley/changes/ that belongs to no named change; the version refs are read from the parent because package 22 writes refs/parley/changes/<number>/<version> in the target workspace, which for a fork source is the fork's parent",
+        "Never copy a parent ref that is not a tracking ref or a version ref of a named change, and never touch the fork's own branches",
+        "When no fork view is installed, serve the fork with the refs its repository holds",
+        "When the fork view or the copy fails, answer 500 internal error before git runs and log the cause",
+        "In internal/hub/gitserver.go, not in cmd/parleyd, pass one ForkView built from the tracking names of package 15 (internal/fork) and the source-workspace lookup of package 22 (internal/change) where those packages exist; the copied refs are a cache for stock git only, and the ref view of package 15 stays the one answer to which refs a fork has"
+      ],
+      "touches": [
+        "internal/gitserver/forkview.go",
+        "internal/gitserver/forkview_test.go",
+        "internal/gitrepo/copyrefs.go",
+        "internal/gitrepo/copyrefs_test.go",
+        "internal/hub/gitserver.go"
+      ],
+      "done_when": [
+        "`go test ./internal/gitserver/... ./internal/gitrepo/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Advertise refs for push and hand a checked push to the push processor",
+      "criteria": [
+        "REQ-8"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/gitserver/push_test.go and confirm they fail",
+        "Add to internal/gitrepo a function that runs git receive-pack in stateless mode with the advertise-refs flag on a bare repository, with receive.advertisePushOptions and receive.advertiseAtomic true, ignoring the system and global configuration",
+        "Serve info/refs for git-receive-pack: status 200, Content-Type application/x-git-receive-pack-advertisement, Cache-Control no-cache, the pkt-line '# service=git-receive-pack', a flush packet, then git's advertisement; the push side always uses version 0",
+        "Declare the interface PushProcessor in internal/gitserver/push.go, the one hand-off package 18 implements: it receives the response writer, the request with its unread body, the caller facts (credential type pat, api_key or admin_token, credential id, user, access level owner or admin from the access decision, the Binding the guard returned, and the PAT record with its paths for a PAT) and the workspace record, writes the whole response, and returns the metric result ok, refused or error",
+        "For a POST git-receive-pack that passed every check, call the installed processor once and write nothing else to the response",
+        "When no processor is installed, answer 500 internal error without reading the body and without running git",
+        "Pass the push processor of package 18 in cmd/parleyd where that package exists; this package, not the processor, counts the handed-over request with the result the processor returned"
+      ],
+      "touches": [
+        "internal/gitserver/push.go",
+        "internal/gitserver/push_test.go",
+        "internal/gitrepo/serve.go",
+        "internal/gitrepo/serve_test.go",
+        "cmd/parleyd/main.go"
+      ],
+      "done_when": [
+        "`go test ./internal/gitserver/... ./internal/gitrepo/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Count git requests and record audited fetches",
+      "criteria": [
+        "REQ-9"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/gitserver/metrics_test.go and internal/gitserver/event_test.go and confirm they fail",
+        "Add the request counter of internal/gitserver: a concurrency-safe counter keyed by service (info-refs, upload-pack, receive-pack) and result (ok, refused, error) under the metric name parley_git_requests_total, with a snapshot read for package 51 and for tests; no other package increments it",
+        "Count every request to the three routes exactly once when its answer is complete: refused for 401, 403 and 404; error for 400, 409, 429 and 500, for a hub ERR packet, for a git process that failed and for a timeout; ok for a served exchange; for a handed-over push the result the processor returned",
+        "While a POST git-upload-pack request is read, note whether it carries a deepen, deepen-since or deepen-not line and the text of its filter line, under version 0 and version 2",
+        "While the response is written, note whether it carries pack data: under version 2 a packfile section, under version 0 a payload that starts with PACK, inside or outside the side band",
+        "Read the effective value of the setting audit_fetches from the workspace's settings document; an unregistered key is false",
+        "After a served upload-pack request that sent a pack on a workspace with audit_fetches true, write one parley.git.fetch event through the event sink: workspace and resource id the addressed slug, resource type workspace, action fetch, the caller as actor with actor type pat, api_key or admin_token, metadata shallow and filter (null when the request had none)",
+        "When the sink is nil write nothing; when it returns an error log one record naming parley.git.fetch; in both cases the fetch and its count are unaffected",
+        "Pass the event log of package 52 as the sink in cmd/parleyd"
+      ],
+      "touches": [
+        "internal/gitserver/metrics.go",
+        "internal/gitserver/metrics_test.go",
+        "internal/gitserver/event.go",
+        "internal/gitserver/event_test.go",
+        "internal/gitserver/fetch.go",
+        "cmd/parleyd/main.go"
+      ],
+      "done_when": [
+        "`go test ./internal/gitserver/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Add the parley credential-helper command",
+      "criteria": [
+        "REQ-10"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/cli/credential_helper_test.go as table-driven tests that run the command through cli.Run with buffers for stdin, stdout and stderr and a temporary PARLEY_CONFIG_DIR, and confirm they fail",
+        "Register the command credential-helper on the root command of internal/cli with exactly one positional argument and no flags of its own, declared as needing no hub URL and no credential so that the shared settings check does not fail it; a wrong argument count is the CLI's usage_error with exit status 2",
+        "For a verb other than get, return at once: no output, no read of the configuration file, exit status 0",
+        "For get, resolve the hub URL and the credential with the settings code of package 09 (flag, environment, config.toml); treat a missing value, a read error, a URL without a host and a scheme other than http and https as no answer: no output, exit status 0",
+        "Read stdin line by line up to the first empty line or the end of input; split each line at its first '='; keep protocol and host; ignore every other key and every line without '='",
+        "Split the request's host and the hub URL's host into name and port; a missing port is 443 for https and 80 for http; answer only when the protocol equals the hub URL's scheme, the names are equal without regard to case and the ports are equal; never look at a path",
+        "On a match print protocol, host (both as given in the request), username=x-token-auth and password=<credential>, one per line; print nothing otherwise; open no network connection in any case",
+        "Add to test/e2e/git_test.go the helpers the end-to-end git tests share: build the parley binary into a temporary directory, and run stock git with an empty HOME, GIT_CONFIG_NOSYSTEM=1, GIT_TERMINAL_PROMPT=0 and the helper configured for the hub's URL"
+      ],
+      "touches": [
+        "internal/cli/credential_helper.go",
+        "internal/cli/credential_helper_test.go",
+        "internal/cli/root.go",
+        "test/e2e/git_test.go"
+      ],
+      "done_when": [
+        "`go test ./internal/cli/... -count=1` passes"
+      ]
+    }
+  ]
+}

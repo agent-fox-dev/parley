@@ -1,0 +1,989 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "42",
+  "spec_name": "forge_writes",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Access and order of checks on a write route",
+      "rationale": "A caller must get the same refusal, for the same reason, on every write route, and a refused write must leave no trace on the forge or in the event log.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "unwanted",
+          "condition": "a write route is called with a PAT that lacks the scope `forge:write`, or by a caller whose access to the workspace is below write",
+          "action": "refuse the request before it reads the body or the workspace state",
+          "contract": "HTTP 403 with `error_type` `insufficient_scope` for a PAT without `forge:write`, also when the slug names no workspace; HTTP 403 with `error_type` `forbidden` for a caller with read access only, also when the workspace is archived; HTTP 404 with `error_type` `not_found` for a caller with no access; the forge receives no request and no event is recorded",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a GitHub workspace `demo` (remote `https://github.com/acme/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "an org workspace that a second user can read but not write, and an archived copy of it",
+              "a test forge (`httptest` TLS server) that records every request it receives and answers as GitHub or GitLab would",
+              "an event recorder in place of the event log",
+              "the write routes {POST issues, PATCH issues/7, POST issues/7/close, POST issues/7/comments, POST issues/7/labels, DELETE issues/7/labels/bug, POST labels, POST pulls, POST pulls/7/comments}, each with a valid body"
+            ],
+            "pseudocode": "in internal/forge/write_test.go, a table over every write route x the callers {PAT with `forge:read` only on `demo`, the same PAT on the unknown slug `nope`, a read-only org member on `demo`, the same member on an archived workspace, a user with no access}: r = call(route, caller); assert (r.status, r.json.error.error_type) == (403, 'insufficient_scope') for the two PAT rows, (403, 'forbidden') for the two member rows, (404, 'not_found') for the last; assert forge.requests == 0 and events.count == 0"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "unwanted",
+          "condition": "a write route is called by a caller with write access on a workspace whose status is `archived`",
+          "action": "refuse the request",
+          "contract": "HTTP 409 with `error_type` `workspace_archived`; the forge receives no request and no event is recorded",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an archived GitHub workspace `old` with credential kind `pat` and the caller as its owner",
+              "a test forge (`httptest` TLS server) that records every request it receives and answers as GitHub or GitLab would",
+              "an event recorder in place of the event log",
+              "the write routes {POST issues, PATCH issues/7, POST issues/7/close, POST issues/7/comments, POST issues/7/labels, DELETE issues/7/labels/bug, POST labels, POST pulls, POST pulls/7/comments}, each with a valid body"
+            ],
+            "pseudocode": "in internal/forge/write_test.go, a table over every write route: r = call(route, owner, slug='old'); assert r.status == 409 and r.json.error.error_type == 'workspace_archived'; assert forge.requests == 0 and events.count == 0"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "event_driven",
+          "condition": "a write route is called with the slug of a task fork by a caller who has write access on the fork's parent",
+          "action": "carry out the write on the parent's forge repository, with the parent's stored credential and the parent's forge settings, including `target=upstream` when the parent is a carry-patch workspace with an `upstream_url`",
+          "contract": "the answer is the one the same request gives on the parent's slug; the forge request names the parent's repository and carries the parent's token",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a GitHub workspace `demo` (remote `https://github.com/acme/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a task fork `demo-fork` of `demo` owned by the caller, with no credential and no forge settings of its own",
+              "a test forge (`httptest` TLS server) that records every request it receives and answers as GitHub or GitLab would",
+              "an event recorder in place of the event log"
+            ],
+            "pseudocode": "in internal/forge/write_test.go: r = post('/workspaces/demo-fork/issues', {title:'t'}); assert r.status == 201; assert forge.last.path == '/repos/acme/widgets/issues' and forge.last.header('Authorization') carries the token of `demo`; repeat with a fork-bound PAT of the same user and assert 201"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "unwanted",
+          "condition": "a write route is called with the slug of a task fork and the caller has less than write access on the fork's parent, or the parent's status is `archived`",
+          "action": "refuse the request",
+          "contract": "HTTP 403 with `error_type` `forbidden` when the caller lacks write access on the parent; HTTP 409 with `error_type` `parent_archived` when the parent is archived and the caller has write access on it; the forge receives no request and no event is recorded",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an org workspace with a task fork owned by a member whose access to the parent is read only",
+              "an archived workspace with a task fork owned by the parent's owner",
+              "a test forge (`httptest` TLS server) that records every request it receives and answers as GitHub or GitLab would",
+              "an event recorder in place of the event log"
+            ],
+            "pseudocode": "in internal/forge/write_test.go, a table over {fork owned by an org member who can only read the parent -> (403, 'forbidden'); fork of an archived parent, caller owns both -> (409, 'parent_archived'); fork of an archived parent, caller can only read the parent -> (403, 'forbidden')}: r = post('/workspaces/<fork>/issues', {title:'t'}); assert status and error_type; assert forge.requests == 0 and events.count == 0"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "unwanted",
+          "condition": "a write route passes every earlier check and the credential kind for the target is `none`",
+          "action": "refuse the request without sending anything to the forge, including the lookup a label removal or a label ensure would begin with",
+          "contract": "HTTP 422 with `error_type` `forge_credential_missing`; the forge receives no request and no event is recorded",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a GitHub workspace `anon` with no stored git credential and the caller as its owner",
+              "a GitHub workspace `basic` whose stored credential is a username and a password",
+              "a test forge (`httptest` TLS server) that records every request it receives and answers as GitHub or GitLab would",
+              "an event recorder in place of the event log",
+              "the write routes {POST issues, PATCH issues/7, POST issues/7/close, POST issues/7/comments, POST issues/7/labels, DELETE issues/7/labels/bug, POST labels, POST pulls, POST pulls/7/comments}, each with a valid body"
+            ],
+            "pseudocode": "in internal/forge/write_test.go, a table over every write route: r = call(route, owner, slug='anon'); assert r.status == 422 and r.json.error.error_type == 'forge_credential_missing'; assert forge.requests == 0 and events.count == 0; then the same table with a workspace whose credential kind is `basic`: assert the forge request carries the stored password as the token"
+          }
+        },
+        {
+          "id": "REQ-1.6",
+          "pattern": "ubiquitous",
+          "action": "for any write request that fails more than one check, answer with the failure that comes first in this order: `target`; path parameters and body rules that do not depend on the forge kind; archived workspace or archived parent; forge configuration; GitLab assignees rule and text limits; missing credential",
+          "contract": "one error envelope whose status and `error_type` are those of the first failing check; the forge receives no request and no event is recorded",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "workspaces owned by the caller for each row: archived, unknown forge (remote host `code.example.com`, no `forge_api_url`), a stored `forge_api_url` that is not a valid URL, GitHub without credential, GitLab without credential",
+              "a test forge (`httptest` TLS server) that records every request it receives and answers as GitHub or GitLab would",
+              "an event recorder in place of the event log"
+            ],
+            "pseudocode": "in internal/forge/write_test.go, a table of requests that each fail two checks, with the expected first: {target=bogus + malformed JSON -> (400, 'invalid_request') naming target; target=upstream on a non-carry-patch workspace + number '07' -> (400, 'workspace_mode_mismatch'); number '0' on an archived workspace -> (400, 'invalid_request') with message 'number must be a positive decimal integer'; malformed JSON on a workspace with an unknown forge -> (400, 'invalid_request'); blank title on an archived workspace -> (400, 'invalid_request'); archived workspace with an unknown forge -> (409, 'workspace_archived'); body of 65,537 characters on a workspace with an unknown forge -> (422, 'forge_unknown'); invalid `forge_api_url` + no credential -> (422, 'forge_api_url_invalid'); GitLab update with only `assignees` + no credential -> (400, 'invalid_request'); GitHub body of 65,537 characters + no credential -> (413, 'payload_too_large'); target given twice -> (400, 'invalid_request')}: assert status and error_type per row; assert forge.requests == 0 and events.count == 0"
+          }
+        },
+        {
+          "id": "REQ-1.7",
+          "pattern": "event_driven",
+          "condition": "a write route is called with `target=upstream` on a carry-patch workspace that has an `upstream_url`",
+          "action": "carry out the write on the upstream repository, through the API URL of `upstream_forge_api_url` or the default of the upstream host, with the upstream git credential or, when none is stored, the origin credential",
+          "contract": "the forge request names the upstream repository and carries the upstream token; the recorded event has metadata `target` `upstream`; without `target`, or with `target=origin`, the request names the origin repository and the event has `target` `origin`",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a carry-patch GitHub workspace `cp` with origin `acme/widgets`, upstream `upstream/project`, both API URL settings pointing at the test forge and the caller as its owner",
+              "a test forge (`httptest` TLS server) that records every request it receives and answers as GitHub or GitLab would",
+              "an event recorder in place of the event log"
+            ],
+            "pseudocode": "in internal/forge/write_test.go, a table over {target absent, target=origin, target=upstream with an upstream credential, target=upstream with only the origin credential}: r = post('/workspaces/cp/issues' + query, {title:'t'}); assert r.status == 201; assert forge.last.path names `acme/widgets` for the origin rows and `upstream/project` for the upstream rows; assert the token sent is the upstream one, or the origin one in the last row; assert events.last.metadata.target equals the target of the row"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Write bodies and text limits",
+      "rationale": "A body the forge would reject or truncate is refused by the hub with a message that names the field, before any request leaves.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "unwanted",
+          "condition": "the body of a write route is not valid JSON, is not a JSON object on a route that takes an object, or is not a JSON array on the add-labels route",
+          "action": "refuse the request",
+          "contract": "HTTP 400 with `error_type` `invalid_request`; the forge receives no request and no event is recorded",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a GitHub workspace `demo` (remote `https://github.com/acme/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a test forge (`httptest` TLS server) that records every request it receives and answers as GitHub or GitLab would",
+              "an event recorder in place of the event log"
+            ],
+            "pseudocode": "in internal/forge/write_test.go, a table over the routes that require a body {POST issues, PATCH issues/7, POST issues/7/comments, POST labels, POST pulls, POST pulls/7/comments} x the bodies {`{` (malformed), `[]`, `\"x\"`, `5`, none}, plus POST issues/7/labels x {`{`, `{}`, `\"bug\"`, none} and POST issues/7/close x {`{`, `[]`, `5`}: assert r.status == 400 and r.json.error.error_type == 'invalid_request'; assert forge.requests == 0 and events.count == 0"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "unwanted",
+          "condition": "a field of a write body breaks its rule: a required string is absent, null or blank; a field has the wrong JSON type; a list of names has more than 100 entries, a blank entry or an entry that is not a string; the add-labels array is empty; `state` is neither `open` nor `closed`; `color` is not six hex digits with or without a leading `#`",
+          "action": "refuse the request and name the offending field in the message",
+          "contract": "HTTP 400 with `error_type` `invalid_request` and a `message` that contains the field's name; the forge receives no request and no event is recorded",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a GitHub workspace `demo` (remote `https://github.com/acme/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a test forge (`httptest` TLS server) that records every request it receives and answers as GitHub or GitLab would",
+              "an event recorder in place of the event log"
+            ],
+            "pseudocode": "in internal/forge/write_test.go, a table of (route, body, field): {POST issues: no title, title null, title '  ', title 5, labels 'bug', labels of 101 names, labels ['a',''], labels ['a',5], assignees of 101 names, body 5}; {PATCH issues/7: title '', title ' \\t', state 'merged', state 5, labels [' ']}; {POST issues/7/close: comment 5}; {POST issues/7/comments and POST pulls/7/comments: no body, body '', body ' ', body null}; {POST issues/7/labels: [], 101 names, ['a',' '], ['a',5]}; {POST labels: no name, name ' ', color 'red', color '#12345', color 'ededed0', color 5, description 5}; {POST pulls: no title, no head, no base, head ' ', draft 'yes'}: assert r.status == 400 and r.json.error.error_type == 'invalid_request' and r.json.error.message contains field; assert forge.requests == 0 and events.count == 0. Boundary rows that must pass validation: labels of exactly 100 names, a 100-name add-labels array, color '#EDEDED', color 'abcdef'"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "ubiquitous",
+          "action": "for any write body, treat a member whose value is `null` exactly as an absent member and ignore members it does not know",
+          "contract": "the forge request and the answer are the same as for the body without those members",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a GitHub workspace `demo` (remote `https://github.com/acme/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a test forge (`httptest` TLS server) that records every request it receives and answers as GitHub or GitLab would",
+              "an event recorder in place of the event log"
+            ],
+            "pseudocode": "in internal/forge/write_test.go, a table of body pairs (plain, decorated): POST issues {title:'t'} vs {title:'t', body:null, labels:null, assignees:null, extra:1}; POST pulls {title,head,base} vs the same with body:null, draft:null, extra:{}; POST labels {name:'n'} vs {name:'n', color:null, description:null, x:1}; PATCH issues/7 {title:'t'} vs {title:'t', body:null, state:null, labels:null}: send each, assert both answers have the same status and that the two recorded forge request bodies are equal"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "unwanted",
+          "condition": "a measured text (the `body` of an issue create or update, of a comment or of a pull request, or the `comment` of a close) has more Unicode code points than the forge's limit: 65,536 on GitHub, 1,000,000 on GitLab",
+          "action": "refuse the request before anything is sent",
+          "contract": "HTTP 413 with `error_type` `payload_too_large` and a `message` that contains the field's name, the text's length in characters and the limit; the forge receives no request and no event is recorded; a text of exactly the limit is accepted and sent",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a GitHub workspace `demo` (remote `https://github.com/acme/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a GitLab workspace `gl` (remote `https://gitlab.com/group/sub/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a test forge (`httptest` TLS server) that records every request it receives and answers as GitHub or GitLab would",
+              "an event recorder in place of the event log"
+            ],
+            "pseudocode": "in internal/forge/write_test.go, a table over the measured fields {POST issues body, PATCH issues/7 body, POST issues/7/comments body, POST pulls/7/comments body, POST pulls body, POST issues/7/close comment} x {GitHub with 65,536 ASCII characters -> success, GitHub with 65,537 -> 413, GitHub with 65,536 two-byte characters -> success, GitLab with 65,537 -> success}, plus GitLab POST issues body with 1,000,000 ASCII characters -> success and 1,000,001 -> 413: for the 413 rows assert error_type == 'payload_too_large', message contains the field name, the length ('65537' or '1000001') and the limit ('65536' or '1000000'), forge.requests == 0 and events.count == 0; for the success rows assert a 2xx status and that the forge received the text unchanged"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Create and update an issue",
+      "rationale": "An agent files and maintains issues without a forge credential (FRG-US-02).",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "a caller with write access submits POST /api/v1/workspaces/:slug/issues with a non-blank `title` and optional `body`, `labels` and `assignees`",
+          "action": "create the issue on the forge with the fields that are set and answer with the issue the forge returns",
+          "contract": "HTTP 201 with the issue (`number`, `title`, `body`, `state`, `url`, `author`, `labels`, `created_at`, `updated_at`, `closed_at`, `is_pr`); the forge received one create request carrying the stored token",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a GitHub workspace `demo` (remote `https://github.com/acme/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a GitLab workspace `gl` (remote `https://gitlab.com/group/sub/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a test forge (`httptest` TLS server) that records every request it receives and answers as GitHub or GitLab would",
+              "an event recorder in place of the event log"
+            ],
+            "pseudocode": "in internal/forge/issue_write_test.go, a table over {GitHub, GitLab} x the bodies {{title}, {title, body, labels:['bug','p1'], assignees:['ann']}}: r = post('/workspaces/<slug>/issues', body); assert r.status == 201 and r.json.number == 7 and r.json.title == body.title and r.json.state == 'open' and r.json.is_pr == false; assert forge.requests == 1; on GitHub assert the request is POST /repos/acme/widgets/issues with exactly the set fields; on GitLab assert it is POST /projects/group%2Fsub%2Fwidgets/issues with `description` for body and `labels` 'bug,p1'"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "event_driven",
+          "condition": "a caller with write access submits PATCH /api/v1/workspaces/:slug/issues/:number with at least one of `title`, `body`, `state`, `labels` and `assignees` set",
+          "action": "send only the set fields to the forge, where `body` `\"\"` clears the body, `labels` and `assignees` each replace the whole set and `[]` clears it, and `state` is `open` or `closed`, and answer with the issue as the forge returns it",
+          "contract": "HTTP 200 with the issue; the forge received one update request holding the set fields and no others",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a GitHub workspace `demo` (remote `https://github.com/acme/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a GitLab workspace `gl` (remote `https://gitlab.com/group/sub/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a test forge (`httptest` TLS server) that records every request it receives and answers as GitHub or GitLab would",
+              "an event recorder in place of the event log"
+            ],
+            "pseudocode": "in internal/forge/issue_write_test.go, a table over {GitHub, GitLab} x the bodies {{title:'new'}, {body:''}, {state:'closed'}, {state:'open'}, {labels:[]}, {labels:['a','b']}, {assignees:[]} (GitHub only), {title:'new', body:'b', state:'closed', labels:['a'], assignees:['ann']}}: r = patch('/workspaces/<slug>/issues/7', body); assert r.status == 200 and r.json equals the issue the test forge returned; assert forge.requests == 1; on GitHub assert PATCH /repos/acme/widgets/issues/7 whose JSON members are exactly the set fields (body '' and labels [] present, not dropped); on GitLab assert PUT /projects/group%2Fsub%2Fwidgets/issues/7 with `description`, `state_event` 'close' or 'reopen', and `labels` as one comma-separated string ('' for [])"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "unwanted",
+          "condition": "an update's body sets none of `title`, `body`, `state`, `labels` and `assignees`",
+          "action": "refuse the request",
+          "contract": "HTTP 400 with `error_type` `invalid_request`; the forge receives no request and no event is recorded",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a GitHub workspace `demo` (remote `https://github.com/acme/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a test forge (`httptest` TLS server) that records every request it receives and answers as GitHub or GitLab would",
+              "an event recorder in place of the event log"
+            ],
+            "pseudocode": "in internal/forge/issue_write_test.go, a table over the bodies {`{}`, {title:null}, {title:null, body:null, state:null, labels:null, assignees:null}, {unknown:1}}: r = patch('/workspaces/demo/issues/7', body); assert r.status == 400 and r.json.error.error_type == 'invalid_request'; assert forge.requests == 0 and events.count == 0"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "optional",
+          "condition": "the forge kind of the target is `gitlab`",
+          "action": "leave `assignees` out of the request it sends for an issue create or update and send the other set fields",
+          "contract": "the answer is the one the same request without `assignees` gives; the forge request has no assignee member; the `fields` metadata of the update event does not name `assignees`",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a GitLab workspace `gl` (remote `https://gitlab.com/group/sub/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a test forge (`httptest` TLS server) that records every request it receives and answers as GitHub or GitLab would",
+              "an event recorder in place of the event log"
+            ],
+            "pseudocode": "in internal/forge/issue_write_test.go: r1 = post('/workspaces/gl/issues', {title:'t', assignees:['ann']}); assert r1.status == 201 and the forge request body has none of `assignees`, `assignee_ids`, `assignee_id`; r2 = patch('/workspaces/gl/issues/7', {title:'n', assignees:['ann']}); assert r2.status == 200, the forge request has `title` and no assignee member, and events.last.metadata.fields == ['title']"
+          }
+        },
+        {
+          "id": "REQ-3.5",
+          "pattern": "unwanted",
+          "condition": "the forge kind of the target is `gitlab` and the only field an update sets is `assignees`",
+          "action": "refuse the request",
+          "contract": "HTTP 400 with `error_type` `invalid_request`; the forge receives no request and no event is recorded",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a GitHub workspace `demo` (remote `https://github.com/acme/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a GitLab workspace `gl` (remote `https://gitlab.com/group/sub/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a test forge (`httptest` TLS server) that records every request it receives and answers as GitHub or GitLab would",
+              "an event recorder in place of the event log"
+            ],
+            "pseudocode": "in internal/forge/issue_write_test.go, a table over the bodies {{assignees:['ann']}, {assignees:[]}, {assignees:['ann'], title:null}}: r = patch('/workspaces/gl/issues/7', body); assert r.status == 400 and r.json.error.error_type == 'invalid_request'; assert forge.requests == 0 and events.count == 0; the same bodies on the GitHub workspace answer 200"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Close an issue",
+      "rationale": "Closing with a reason is one call, and a failure half way leaves a record of what was already posted.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "a caller with write access submits POST /api/v1/workspaces/:slug/issues/:number/close with no body, an empty body, `{}`, `{\"comment\": null}` or a blank `comment`",
+          "action": "close the issue on the forge without posting a comment, also when the issue is already closed, and answer with the issue",
+          "contract": "HTTP 200 with the issue, whose `state` is `closed`; the forge received exactly one request, the close",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a GitHub workspace `demo` (remote `https://github.com/acme/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a GitLab workspace `gl` (remote `https://gitlab.com/group/sub/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a test forge (`httptest` TLS server) that records every request it receives and answers as GitHub or GitLab would",
+              "an event recorder in place of the event log"
+            ],
+            "pseudocode": "in internal/forge/issue_write_test.go, a table over {GitHub, GitLab} x the bodies {none, empty, `{}`, `{\"comment\":null}`, `{\"comment\":\"  \"}`} x {issue open, issue already closed}: r = post('/workspaces/<slug>/issues/7/close', body); assert r.status == 200 and r.json.state == 'closed'; assert forge.requests == 1 and it is the close (GitHub PATCH issues/7 {state:'closed'}; GitLab PUT issues/7 {state_event:'close'}); assert events.last has no `comment_url`"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "event_driven",
+          "condition": "a caller with write access submits the close route with a non-blank `comment`",
+          "action": "post the comment on the issue first and, after the forge accepted it, close the issue and answer with the issue",
+          "contract": "HTTP 200 with the closed issue; the forge received the comment request and then the close request, in that order; the `parley.forge.issue.close` event has `ok` true and `comment_url` equal to the comment's web URL",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a GitHub workspace `demo` (remote `https://github.com/acme/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a GitLab workspace `gl` (remote `https://gitlab.com/group/sub/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a test forge (`httptest` TLS server) that records every request it receives and answers as GitHub or GitLab would",
+              "an event recorder in place of the event log"
+            ],
+            "pseudocode": "in internal/forge/issue_write_test.go, over {GitHub, GitLab}: r = post('/workspaces/<slug>/issues/7/close', {comment:'done in v2'}); assert r.status == 200 and r.json.state == 'closed'; assert forge.requests == 2, the first creates a comment with body 'done in v2' and the second closes; assert events.count == 1 and events.last.type == 'parley.forge.issue.close' and events.last.metadata.ok == true and events.last.metadata.comment_url == the URL of the comment the test forge created"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "unwanted",
+          "condition": "the forge refuses or fails the comment of a close",
+          "action": "answer with the comment's failure and send no close request",
+          "contract": "the status and `error_type` that the comment's failure maps to; the issue's state on the forge is unchanged; exactly one `parley.forge.issue.close` event is recorded with `ok` false, that `error_type` and no `comment_url`",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a GitHub workspace `demo` (remote `https://github.com/acme/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "the test forge fails the comment request with the status of the row",
+              "an event recorder in place of the event log"
+            ],
+            "pseudocode": "in internal/forge/issue_write_test.go, a table over the comment answers {404 -> (404, 'forge_not_found'), 422 -> (422, 'forge_rejected'), 500 -> (502, 'forge_error')}: r = post('/workspaces/demo/issues/7/close', {comment:'c'}); assert status and error_type; assert forge.requests == 1 (no close was sent); assert events.count == 1 and events.last.metadata.ok == false and events.last.metadata.error_type == error_type and 'comment_url' not in events.last.metadata"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "unwanted",
+          "condition": "the comment of a close was posted and the forge then refuses or fails the close",
+          "action": "answer with the close's failure",
+          "contract": "the status and `error_type` that the close's failure maps to; exactly one `parley.forge.issue.close` event is recorded with `ok` false, that `error_type` and `comment_url` equal to the posted comment's web URL",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a GitHub workspace `demo` (remote `https://github.com/acme/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "the test forge accepts the comment and fails the close request with the status of the row",
+              "an event recorder in place of the event log"
+            ],
+            "pseudocode": "in internal/forge/issue_write_test.go, a table over the close answers {403 -> (502, 'forge_forbidden'), 500 -> (502, 'forge_error')}: r = post('/workspaces/demo/issues/7/close', {comment:'c'}); assert status and error_type; assert forge.requests == 2; assert events.count == 1 and events.last.metadata.ok == false and events.last.metadata.error_type == error_type and events.last.metadata.comment_url == the posted comment's URL"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Comment on an issue or a pull request",
+      "rationale": "An agent reports progress where people read it.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "a caller with write access submits POST /api/v1/workspaces/:slug/issues/:number/comments with a non-blank `body`",
+          "action": "post the text, exactly as given, as a comment on that issue",
+          "contract": "HTTP 201 with the body `{\"url\": \"<web URL of the comment>\"}` and no other member; the forge received one comment request for the issue",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a GitHub workspace `demo` (remote `https://github.com/acme/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a GitLab workspace `gl` (remote `https://gitlab.com/group/sub/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a test forge (`httptest` TLS server) that records every request it receives and answers as GitHub or GitLab would",
+              "an event recorder in place of the event log"
+            ],
+            "pseudocode": "in internal/forge/issue_write_test.go, over {GitHub, GitLab} with the text '  line one\\n\\nline two \\n': r = post('/workspaces/<slug>/issues/7/comments', {body:text}); assert r.status == 201 and keys(r.json) == ['url'] and r.json.url == the web URL of the comment the test forge created; assert forge.requests == 1, on GitHub POST /repos/acme/widgets/issues/7/comments, on GitLab POST /projects/group%2Fsub%2Fwidgets/issues/7/notes, and that the forge received the text byte for byte"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "event_driven",
+          "condition": "a caller with write access submits POST /api/v1/workspaces/:slug/pulls/:number/comments with a non-blank `body`",
+          "action": "post the text, exactly as given, as a comment in the conversation of that pull request",
+          "contract": "HTTP 201 with the body `{\"url\": \"<web URL of the comment>\"}` and no other member; the forge received one comment request for the pull request",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a GitHub workspace `demo` (remote `https://github.com/acme/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a GitLab workspace `gl` (remote `https://gitlab.com/group/sub/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a test forge (`httptest` TLS server) that records every request it receives and answers as GitHub or GitLab would",
+              "an event recorder in place of the event log"
+            ],
+            "pseudocode": "in internal/forge/pull_write_test.go, over {GitHub, GitLab}: r = post('/workspaces/<slug>/pulls/12/comments', {body:'LGTM'}); assert r.status == 201 and keys(r.json) == ['url'] and r.json.url == the web URL of the comment the test forge created; assert forge.requests == 1, on GitHub POST /repos/acme/widgets/issues/12/comments, on GitLab POST /projects/group%2Fsub%2Fwidgets/merge_requests/12/notes"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Labels",
+      "rationale": "Triage is done with labels; adding, removing and ensuring one must be safe to repeat.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "a caller with write access submits POST /api/v1/workspaces/:slug/issues/:number/labels with a bare JSON array of 1 to 100 non-blank names",
+          "action": "add those labels to the issue and leave the labels the issue already carries in place",
+          "contract": "HTTP 204 with an empty body; the forge received one request that adds the names and replaces nothing",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a GitHub workspace `demo` (remote `https://github.com/acme/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a GitLab workspace `gl` (remote `https://gitlab.com/group/sub/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a test forge (`httptest` TLS server) that records every request it receives and answers as GitHub or GitLab would, holding issue 7 with the label `old`",
+              "an event recorder in place of the event log"
+            ],
+            "pseudocode": "in internal/forge/label_write_test.go, over {GitHub, GitLab}: r = post('/workspaces/<slug>/issues/7/labels', ['triage','type/bug']); assert r.status == 204 and r.body is empty; assert forge.requests == 1, on GitHub POST /repos/acme/widgets/issues/7/labels with {labels:['triage','type/bug']}, on GitLab PUT /projects/group%2Fsub%2Fwidgets/issues/7 with `add_labels` 'triage,type/bug' and no `labels` member; assert the test forge's issue 7, which carried 'old', now carries 'old', 'triage' and 'type/bug'"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "event_driven",
+          "condition": "a caller with write access submits DELETE /api/v1/workspaces/:slug/issues/:number/labels/:name for an issue that exists on the forge",
+          "action": "take the label name from the last path segment, percent-decoded once, and remove that label from the issue, treating an issue that does not carry it as already done",
+          "contract": "HTTP 204 with an empty body, whether or not the issue carried the label; `type%2Fbug` removes the label `type/bug` and `%252F` names the label `%2F`",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a GitHub workspace `demo` (remote `https://github.com/acme/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a GitLab workspace `gl` (remote `https://gitlab.com/group/sub/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a test forge (`httptest` TLS server) that records every request it receives and answers as GitHub or GitLab would, holding issue 7 with the labels `old` and `type/bug`",
+              "an event recorder in place of the event log"
+            ],
+            "pseudocode": "in internal/forge/label_write_test.go, a table over {GitHub, GitLab} x the path segments {'old' (carried), 'type%2Fbug' (carried, name 'type/bug'), 'absent' (not carried), '%252F' (not carried, name '%2F')}: r = delete('/workspaces/<slug>/issues/7/labels/' + segment); assert r.status == 204 and r.body is empty; assert the name the forge was asked to remove equals the decoded name; assert the test forge's issue 7 no longer carries a removed label and keeps its others; on GitHub, for the not-carried rows the forge answers 404 to the delete and the hub then reads issue 7 (forge.requests == 2)"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "unwanted",
+          "condition": "the label removal names an issue that does not exist on the forge",
+          "action": "answer that the issue was not found",
+          "contract": "HTTP 404 with `error_type` `forge_not_found`; exactly one `parley.forge.label.remove` event is recorded, with `ok` false and `error_type` `forge_not_found`",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a GitHub workspace `demo` (remote `https://github.com/acme/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a GitLab workspace `gl` (remote `https://gitlab.com/group/sub/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a test forge (`httptest` TLS server) that records every request it receives and answers as GitHub or GitLab would, holding no issue 999",
+              "an event recorder in place of the event log"
+            ],
+            "pseudocode": "in internal/forge/label_write_test.go, over {GitHub, GitLab}: r = delete('/workspaces/<slug>/issues/999/labels/old'); assert r.status == 404 and r.json.error.error_type == 'forge_not_found'; assert events.count == 1 and events.last.type == 'parley.forge.label.remove' and events.last.metadata.ok == false and events.last.metadata.error_type == 'forge_not_found'"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "unwanted",
+          "condition": "the label segment of a label removal decodes to a blank name",
+          "action": "refuse the request",
+          "contract": "HTTP 400 with `error_type` `invalid_request`; the forge receives no request and no event is recorded",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a GitHub workspace `demo` (remote `https://github.com/acme/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a test forge (`httptest` TLS server) that records every request it receives and answers as GitHub or GitLab would",
+              "an event recorder in place of the event log"
+            ],
+            "pseudocode": "in internal/forge/label_write_test.go, a table over the segments {'%20', '%09%20'}: r = delete('/workspaces/demo/issues/7/labels/' + segment); assert r.status == 400 and r.json.error.error_type == 'invalid_request'; assert forge.requests == 0 and events.count == 0"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "event_driven",
+          "condition": "a caller with write access submits POST /api/v1/workspaces/:slug/labels with a `name` that a label of the repository already has",
+          "action": "answer with that label as the forge holds it and change nothing on the forge, also when the request's `color` or `description` differ from the label's",
+          "contract": "HTTP 200 with the label (`name`, `color` as six lower-case hex digits without `#`, `description`); the forge received the lookup and no create or update request; the `parley.forge.label.create` event has `created` false",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a GitHub workspace `demo` (remote `https://github.com/acme/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a GitLab workspace `gl` (remote `https://gitlab.com/group/sub/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a test forge (`httptest` TLS server) that records every request it receives and answers as GitHub or GitLab would, holding the label `type/bug` with colour `d73a4a` and description `Something is broken`",
+              "an event recorder in place of the event log"
+            ],
+            "pseudocode": "in internal/forge/label_write_test.go, over {GitHub, GitLab}: r = post('/workspaces/<slug>/labels', {name:'type/bug', color:'#00FF00', description:'other'}); assert r.status == 200 and r.json == {name:'type/bug', color:'d73a4a', description:'Something is broken'}; assert every forge request was a GET and the lookup path holds the name as one percent-encoded segment ('type%2Fbug'); assert events.count == 1 and events.last.type == 'parley.forge.label.create' and events.last.metadata.created == false"
+          }
+        },
+        {
+          "id": "REQ-6.6",
+          "pattern": "event_driven",
+          "condition": "a caller with write access submits the label route with a `name` that no label of the repository has",
+          "action": "create the label with the name, the `color` in lower case (default `ededed`, a leading `#` dropped) and the `description`, and answer with the created label",
+          "contract": "HTTP 201 with the label; the forge received the lookup and then one create request; the `parley.forge.label.create` event has `created` true",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a GitHub workspace `demo` (remote `https://github.com/acme/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a GitLab workspace `gl` (remote `https://gitlab.com/group/sub/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a test forge (`httptest` TLS server) that records every request it receives and answers as GitHub or GitLab would, holding no label `new`",
+              "an event recorder in place of the event log"
+            ],
+            "pseudocode": "in internal/forge/label_write_test.go, a table over {GitHub, GitLab} x the bodies {{name:'new'} -> colour 'ededed', {name:'new', color:'#A1B2C3', description:'d'} -> 'a1b2c3', {name:'new', color:'00ff00'} -> '00ff00'}: r = post('/workspaces/<slug>/labels', body); assert r.status == 201 and r.json.name == 'new' and r.json.color == expected; assert the create request carried the colour as `<hex>` on GitHub and `#<hex>` on GitLab, in lower case; assert events.last.metadata.created == true and events.last.metadata.label == 'new'"
+          }
+        },
+        {
+          "id": "REQ-6.7",
+          "pattern": "unwanted",
+          "condition": "the lookup of a label ensure finds no label and the forge then refuses the create because a label of that name now exists",
+          "action": "read the label again and answer with it",
+          "contract": "HTTP 200 with the label the other caller created; exactly one `parley.forge.label.create` event is recorded, with `ok` true and `created` false; of two concurrent ensures of one new name, one answers 201 and the other 200, with equal labels",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a GitHub workspace `demo` (remote `https://github.com/acme/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a GitLab workspace `gl` (remote `https://gitlab.com/group/sub/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a test forge (`httptest` TLS server) that records every request it receives and answers as GitHub or GitLab would",
+              "an event recorder in place of the event log"
+            ],
+            "pseudocode": "in internal/forge/label_write_test.go: (a) over {GitHub answering 422 already_exists, GitLab answering 409}: the test forge answers 404 to the first lookup, the refusal to the create, and the label to the second lookup; r = post('/workspaces/<slug>/labels', {name:'race'}); assert r.status == 200 and r.json.name == 'race'; assert events.count == 1 and events.last.metadata.ok == true and events.last.metadata.created == false. (b) against a test forge that creates a label once and refuses the second create: send two ensures of 'both' concurrently; assert the sorted statuses == [200, 201] and both bodies are equal"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "Open a pull request",
+      "rationale": "A team that reviews on the forge gets its pull request from the agent that did the work.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "event_driven",
+          "condition": "a caller with write access submits POST /api/v1/workspaces/:slug/pulls with non-blank `title`, `head` and `base` and optional `body` and `draft`",
+          "action": "open the pull request on the forge with `head` sent as given, `draft` false unless the body sets it to true, and answer with the pull request the forge returns",
+          "contract": "HTTP 201 with the pull request (`number`, `title`, `body`, `state`, `url`, `draft`, `merged`, `head_sha`, `head_branch`, `base_branch`, `author`, `created_at`, `updated_at`, `closed_at`, `merged_at`); the forge received one create request",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a GitHub workspace `demo` (remote `https://github.com/acme/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a test forge (`httptest` TLS server) that records every request it receives and answers as GitHub or GitLab would",
+              "an event recorder in place of the event log"
+            ],
+            "pseudocode": "in internal/forge/pull_write_test.go, a table over the bodies {{title:'T', head:'feature', base:'main'} -> draft false, {title:'T', head:'bob:feature', base:'main', body:'why', draft:true} -> draft true, {title:'T', head:'feature', base:'main', draft:false} -> draft false}: r = post('/workspaces/demo/pulls', body); assert r.status == 201 and r.json.number == 12 and r.json.state == 'open' and r.json.draft == expected and r.json.base_branch == 'main'; assert forge.requests == 1 and it is POST /repos/acme/widgets/pulls with `head` equal to the given string ('bob:feature' unchanged), `base`, `title`, `draft` equal to expected, and `body` only when set"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "optional",
+          "condition": "the forge kind of the target is `gitlab`",
+          "action": "open a merge request with `head` as the source branch and `base` as the target branch, mark it as a draft when `draft` is true, and answer with it as a pull request whose `number` is the merge request's project-level `iid`",
+          "contract": "HTTP 201 with the pull request; `draft` in the answer equals the requested value; the forge received one request, POST merge_requests, with `source_branch`, `target_branch`, `title` and, when set, `description`",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a GitLab workspace `gl` (remote `https://gitlab.com/group/sub/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a test forge (`httptest` TLS server) that records every request it receives and answers as GitHub or GitLab would; as GitLab it reports a merge request as a draft when its title begins with `Draft: `",
+              "an event recorder in place of the event log"
+            ],
+            "pseudocode": "in internal/forge/pull_write_test.go, a table over {draft absent, draft:true, draft:true with the title 'Draft: T'}: r = post('/workspaces/gl/pulls', {title, head:'feature', base:'main', body:'why', draft}); assert r.status == 201 and r.json.number == the iid the test forge assigned (not its global id) and r.json.draft == (draft == true); assert the forge request is POST /projects/group%2Fsub%2Fwidgets/merge_requests with source_branch 'feature', target_branch 'main', description 'why', and a title that is 'T' without draft and 'Draft: T' (prefix once) with it"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "unwanted",
+          "condition": "the forge refuses to open the pull request, because one already exists for the same head and base or because a branch does not exist on the forge",
+          "action": "answer with the forge's refusal",
+          "contract": "HTTP 422 with `error_type` `forge_rejected` and a `message` of the form `the forge answered <status>: <the forge's message>`; exactly one `parley.forge.pull_request.create` event is recorded, with `ok` false, `error_type` `forge_rejected`, `resource_id` `none` and no `number`",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a GitHub workspace `demo` (remote `https://github.com/acme/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a GitLab workspace `gl` (remote `https://gitlab.com/group/sub/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a test forge (`httptest` TLS server) that records every request it receives and answers as GitHub or GitLab would",
+              "an event recorder in place of the event log"
+            ],
+            "pseudocode": "in internal/forge/pull_write_test.go, a table over {GitHub answering 422 'A pull request already exists for acme:feature.', GitLab answering 409 'Another open merge request already exists for this source branch', GitHub answering 422 for an unknown head}: r = post('/workspaces/<slug>/pulls', {title:'T', head:'feature', base:'main'}); assert r.status == 422 and r.json.error.error_type == 'forge_rejected' and r.json.error.message starts with 'the forge answered ' + forge status; assert events.count == 1 and events.last.type == 'parley.forge.pull_request.create' and events.last.resource_id == 'none' and events.last.metadata.ok == false and events.last.metadata.error_type == 'forge_rejected' and 'number' not in events.last.metadata"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "Forge failures, disconnects and replays",
+      "rationale": "A caller can tell a forge failure from its own mistake, can retry a create safely, and cannot leave a write half recorded by going away.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "unwanted",
+          "condition": "a forge call of a write route fails",
+          "action": "answer with the status and `error_type` that package 41's mapping gives the failure, with a message from which the workspace's token and URL userinfo are removed",
+          "contract": "forge 404 -> HTTP 404 `forge_not_found`; forge 401 -> 502 `forge_unauthenticated`; forge 403 that is not a rate limit -> 502 `forge_forbidden`; any other forge 4xx -> 422 `forge_rejected`; forge 5xx or an unreadable answer -> 502 `forge_error`; a rate limit that package 41's retry rule does not clear -> 429 `forge_rate_limited` with a `Retry-After` header in whole seconds when the forge stated a wait; no answer within the deadline -> 504 `forge_timeout`; a failed connection -> 502 `forge_unreachable`; the response contains the stored token nowhere",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a GitHub workspace `demo` (remote `https://github.com/acme/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "the test forge is set to the behaviour of the row for every request; the forge client is built with a deadline of 200 ms for the timeout row",
+              "an event recorder in place of the event log",
+              "the write routes {POST issues, PATCH issues/7, POST issues/7/close, POST issues/7/comments, POST issues/7/labels, DELETE issues/7/labels/bug, POST labels, POST pulls, POST pulls/7/comments}, each with a valid body"
+            ],
+            "pseudocode": "in internal/forge/write_test.go, a table over every write route x the forge behaviours {404, 401, 403, 410, 422 whose message echoes the Authorization token, 500, a body that is not JSON on a 2xx, 429 with Retry-After 120, no answer before the deadline, a closed listener}: r = call(route); assert (r.status, r.json.error.error_type) equals the pair of the contract; for the 429 row assert r.header('Retry-After') == '120'; for the echo row assert the response text does not contain the token and contains '[redacted]'; for every row assert events.count == 1 and events.last.metadata.ok == false and events.last.metadata.error_type == r.json.error.error_type"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "event_driven",
+          "condition": "the caller closes its connection after a write route has passed its checks and before the forge has answered",
+          "action": "carry the write out to its end and record its event as if the caller had stayed",
+          "contract": "the forge holds the result of the write; exactly one event of the route's type is recorded with `ok` true; no forge request is cancelled",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a GitHub workspace `demo` (remote `https://github.com/acme/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "the test forge holds each request until the test releases it",
+              "an event recorder in place of the event log"
+            ],
+            "pseudocode": "in internal/forge/write_test.go: start post('/workspaces/demo/issues', {title:'t'}) with a cancellable request context; when the test forge has received the create request, cancel the context, then release the forge's answer; wait for the handler to return; assert the test forge holds the issue, events.count == 1, events.last.type == 'parley.forge.issue.create', events.last.metadata.ok == true and events.last.metadata.number == 7. Repeat with the close route and a comment: cancel after the comment request arrived; assert the close request was still sent and the event has `comment_url`"
+          }
+        },
+        {
+          "id": "REQ-8.3",
+          "pattern": "event_driven",
+          "condition": "one of the five creating routes (POST issues, POST issues/:number/comments, POST pulls/:number/comments, POST labels, POST pulls) receives a request whose `Idempotency-Key`, caller, route and body equal those of an earlier successful request of the last 24 hours",
+          "action": "answer with the recorded answer of the first request without contacting the forge",
+          "contract": "HTTP 200 with the body of the first answer; the forge receives no further request; no further event is recorded; the same key with a different body is HTTP 409 with `error_type` `conflict`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a GitHub workspace `demo` (remote `https://github.com/acme/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a test forge (`httptest` TLS server) that records every request it receives and answers as GitHub or GitLab would",
+              "an event recorder in place of the event log",
+              "the handlers are mounted through the create-route helper of package 02"
+            ],
+            "pseudocode": "in internal/forge/write_test.go, with the real idempotency helper of internal/server, a table over the five creating routes: r1 = call(route, header Idempotency-Key 'k1'); n = forge.requests; r2 = the same request again; assert r1.status in {200, 201} and r2.status == 200 and r2.body == r1.body; assert forge.requests == n and events.count == 1; r3 = the same key with another body; assert r3.status == 409 and r3.json.error.error_type == 'conflict' and forge.requests == n. One more row: a first request that the forge fails with 500 is not recorded: the retry with the same key reaches the forge again and events.count == 2"
+          }
+        },
+        {
+          "id": "REQ-8.4",
+          "pattern": "ubiquitous",
+          "action": "for any request to the close route or the add-labels route, carry the request out whether or not it has an `Idempotency-Key` header and whether or not the key was used before",
+          "contract": "two requests with the same key and body each reach the forge and each record one event",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a GitHub workspace `demo` (remote `https://github.com/acme/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a test forge (`httptest` TLS server) that records every request it receives and answers as GitHub or GitLab would",
+              "an event recorder in place of the event log",
+              "the handlers are mounted as the hub mounts them"
+            ],
+            "pseudocode": "in internal/forge/write_test.go, a table over {POST issues/7/close with {}, POST issues/7/labels with ['a']}: send the request twice with Idempotency-Key 'k2'; assert both answers have the route's success status (200, 204); assert the forge received the write twice and events.count == 2"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-9",
+      "title": "Write events",
+      "rationale": "Every write that reached the forge is auditable, and the audit record holds no user text and no secret (FRG-US-02).",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-9.1",
+          "pattern": "event_driven",
+          "condition": "a write route sent at least one request to the forge and the write succeeded",
+          "action": "record exactly one hub event before it sends the response, with the caller as actor, the written workspace as `workspace`, and the type, `resource_type`, `resource_id`, `action` and metadata of the route",
+          "contract": "per route: issue create -> `parley.forge.issue.create`, `issue`, the new number, `create`; issue update -> `parley.forge.issue.update`, `issue`, the number, `update`, metadata `fields` (names of the fields sent, sorted); close -> `parley.forge.issue.close`, `issue`, the number, `close`, `comment_url` when a comment was posted; issue comment -> `parley.forge.comment.create`, `comment`, the issue number, `create`; add labels -> `parley.forge.label.add`, `label`, the issue number, `add`, `labels`; remove label -> `parley.forge.label.remove`, `label`, the issue number, `remove`, `label`; ensure label -> `parley.forge.label.create`, `label`, the label name, `create`, `label` and `created`; open pull request -> `parley.forge.pull_request.create`, `pull_request`, the new number, `create`, `head`, `base`, `draft`; pull-request comment -> `parley.forge.pull_request.comment`, `pull_request`, the number, `comment`. Every event has metadata `target` and `ok` true, `number` except on the label ensure, and `url` (the web URL of the issue, pull request or comment) except on the three label events; `resource_id` is a string",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a GitHub workspace `demo` (remote `https://github.com/acme/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a test forge (`httptest` TLS server) that records every request it receives and answers as GitHub or GitLab would",
+              "an event recorder in place of the event log"
+            ],
+            "pseudocode": "in internal/forge/write_test.go, a table with one row per write route (valid request, expected type, resource_type, resource_id, action, exact metadata): call the route against the test forge; assert events.count == 1 and that the event was recorded before the response was written (the recorder notes whether the response writer had been written to); assert type, resource_type, resource_id, action and actor (the caller) and workspace ('demo'); assert the metadata equals the row's, for example update with {state:'closed', title:'n'} -> {target:'origin', ok:true, number:7, url:<issue url>, fields:['state','title']}, ensure of a new label -> {target:'origin', ok:true, label:'new', created:true}, pull request -> {target:'origin', ok:true, number:12, url:<pr url>, head:'feature', base:'main', draft:false}"
+          }
+        },
+        {
+          "id": "REQ-9.2",
+          "pattern": "unwanted",
+          "condition": "a write route sent at least one request to the forge, counting a request whose connection failed or whose deadline passed, and the write failed",
+          "action": "record exactly one hub event of the route's type before it sends the error response",
+          "contract": "the event has metadata `ok` false and `error_type` equal to the `error_type` of the response, `target`, and the route's extra metadata as far as it is known; `resource_id` is `none` for a failed issue create and a failed pull-request open and the number or label name of the request otherwise; `number` and `url` are absent when the write produced no object",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a GitHub workspace `demo` (remote `https://github.com/acme/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "the test forge fails every request",
+              "an event recorder in place of the event log"
+            ],
+            "pseudocode": "in internal/forge/write_test.go, a table with one row per write route against a test forge that answers 500, and one row with a closed listener: call the route; assert events.count == 1 and events.last.type == the route's type; assert events.last.metadata.ok == false and events.last.metadata.error_type == r.json.error.error_type; assert resource_id == 'none' for POST issues and POST pulls, '7' or '12' for the numbered routes and the label name for POST labels; assert 'url' not in metadata; assert 'number' not in metadata for POST issues, POST pulls and POST labels; assert the pull-request row still has head, base and draft and the add-labels row still has labels"
+          }
+        },
+        {
+          "id": "REQ-9.3",
+          "pattern": "ubiquitous",
+          "action": "for any write event, leave out the title, the body, the comment text, the label description, the stored credential and the forge's error message",
+          "contract": "the serialised event contains none of those strings; a failed write's event carries the `error_type` only",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a GitHub workspace `demo` (remote `https://github.com/acme/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner, whose stored token is `TOKEN-MARKER`",
+              "a test forge (`httptest` TLS server) that records every request it receives and answers as GitHub or GitLab would",
+              "an event recorder in place of the event log"
+            ],
+            "pseudocode": "in internal/forge/write_test.go, a table with one succeeding and one failing row per write route, where the title is 'TITLE-MARKER', every text is 'TEXT-MARKER', the description is 'DESC-MARKER', the token is 'TOKEN-MARKER' and the failing forge answers 422 with the message 'FORGE-MARKER': after each call serialise events.last to JSON; assert it contains none of the five markers"
+          }
+        },
+        {
+          "id": "REQ-9.4",
+          "pattern": "event_driven",
+          "condition": "a write route called with the slug of a task fork sent at least one request to the forge",
+          "action": "record the event on the parent workspace with the fork's slug in metadata `fork`",
+          "contract": "the event's `workspace` is the parent's slug and `metadata.fork` is the fork's slug; an event of a write called with the workspace's own slug has no `fork` member",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a GitHub workspace `demo` (remote `https://github.com/acme/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a task fork `demo-fork` of `demo` owned by the caller",
+              "a test forge (`httptest` TLS server) that records every request it receives and answers as GitHub or GitLab would",
+              "an event recorder in place of the event log"
+            ],
+            "pseudocode": "in internal/forge/write_test.go: post('/workspaces/demo-fork/issues', {title:'t'}); assert events.last.workspace == 'demo' and events.last.metadata.fork == 'demo-fork' and events.last.actor is the caller; post('/workspaces/demo/issues', {title:'t'}); assert 'fork' not in events.last.metadata"
+          }
+        },
+        {
+          "id": "REQ-9.5",
+          "pattern": "unwanted",
+          "condition": "the event of a write that reached the forge cannot be recorded",
+          "action": "answer with an internal error instead of the write's own answer",
+          "contract": "HTTP 500 with `error_type` `internal`; what the forge did is not undone; the response contains neither the stored token nor the forge's answer",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a GitHub workspace `demo` (remote `https://github.com/acme/widgets.git`, credential kind `pat`, `forge_api_url` pointing at the test forge) with the caller as its owner",
+              "a test forge (`httptest` TLS server) that records every request it receives and answers as GitHub or GitLab would",
+              "an event recorder that returns an error"
+            ],
+            "pseudocode": "in internal/forge/write_test.go: r = post('/workspaces/demo/issues', {title:'t'}); assert r.status == 500 and r.json.error.error_type == 'internal'; assert the test forge holds the issue and received no delete or update; assert the response text does not contain the token"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-10",
+      "title": "CLI commands for forge writes",
+      "rationale": "The CLI is how most agents reach the hub; every write route has one command.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-10.1",
+          "pattern": "event_driven",
+          "condition": "a user runs one of `parley issue create`, `parley issue update`, `parley issue close`, `parley issue comment`, `parley label create`, `parley pr create` and `parley pr comment` with valid arguments",
+          "action": "send the command's route once with a JSON body holding only the fields whose flags were given and with `target` in the query only when `--target` was given, and print the hub's answer",
+          "contract": "stdout is the hub's answer as one JSON document; exit status 0, for `parley label create` both when the hub answers 200 and when it answers 201; the request is: issue create -> POST /api/v1/workspaces/<slug>/issues {title, body, labels, assignees}; issue update -> PATCH …/issues/<number> {title, body, state, labels, assignees}; issue close -> POST …/issues/<number>/close with no body, or {comment} with `--comment`; issue comment -> POST …/issues/<number>/comments {body}; label create -> POST …/labels {name, color, description}; pr create -> POST …/pulls {title, head, base, body, draft}; pr comment -> POST …/pulls/<number>/comments {body}; no `Idempotency-Key` header is sent",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub (`httptest` server) that records each request and answers the route's success status with a fixed body"
+            ],
+            "pseudocode": "in internal/cli/issue_test.go, internal/cli/label_test.go and internal/cli/pr_test.go, a table of (argv, method, path, query, body): {issue create demo --title T -> POST /api/v1/workspaces/demo/issues, {title:'T'}}; {issue create demo --title T --body B --label a --label b --assignee ann --target upstream -> query target=upstream, {title:'T', body:'B', labels:['a','b'], assignees:['ann']}}; {issue update demo 7 --state closed -> PATCH …/issues/7 {state:'closed'}}; {issue update demo 7 --body '' -> {body:''}}; {issue update demo 7 --title N --label x -> {title:'N', labels:['x']}}; {issue close demo 7 -> POST …/issues/7/close, no body}; {issue close demo 7 --comment done -> {comment:'done'}}; {issue comment demo 7 --body hi -> POST …/issues/7/comments {body:'hi'}}; {label create demo type/bug -> POST …/labels {name:'type/bug'}}; {label create demo n --color '#00ff00' --description d -> {name:'n', color:'#00ff00', description:'d'}}; {pr create demo --title T --head f --base main -> POST …/pulls {title:'T', head:'f', base:'main'}}; {pr create demo --title T --head bob:f --base main --body B --draft -> {…, body:'B', draft:true}}; {pr comment demo 12 --body ok -> POST …/pulls/12/comments {body:'ok'}}: run the command against the stub hub; assert exactly one request with that method, path, query and JSON body and without an Idempotency-Key header; assert exit 0 and that stdout decodes to the stub's answer; for label create run once with the stub answering 200 and once 201 and assert exit 0 both times"
+          }
+        },
+        {
+          "id": "REQ-10.2",
+          "pattern": "event_driven",
+          "condition": "a user runs `parley issue label <workspace-slug> <number> <label>...` with one or more labels, or `parley issue unlabel <workspace-slug> <number> <label>`, and the hub answers 204",
+          "action": "send the labels as a bare JSON array to the add-labels route, or the label as one percent-encoded path segment to the remove-label route, and print a confirmation document",
+          "contract": "`issue label` prints `{\"status\":\"labeled\",\"number\":<n>,\"labels\":[…]}` with the labels in the order given; `issue unlabel` prints `{\"status\":\"unlabeled\",\"number\":<n>,\"label\":\"<label>\"}`; `number` is a JSON number; exit status 0",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub (`httptest` server) that records each request and answers the route's success status with a fixed body"
+            ],
+            "pseudocode": "in internal/cli/issue_test.go: run `issue label demo 7 triage type/bug`; assert the stub received POST /api/v1/workspaces/demo/issues/7/labels with the body ['triage','type/bug']; assert stdout decodes to {status:'labeled', number:7, labels:['triage','type/bug']} and exit 0. Run `issue unlabel demo 7 type/bug --target upstream`; assert the stub received DELETE with the escaped path /api/v1/workspaces/demo/issues/7/labels/type%2Fbug and the query target=upstream; assert stdout decodes to {status:'unlabeled', number:7, label:'type/bug'} and exit 0"
+          }
+        },
+        {
+          "id": "REQ-10.3",
+          "pattern": "event_driven",
+          "condition": "a user gives the text of `issue create`, `issue update`, `issue comment`, `pr create` or `pr comment` with `--body-file <path>`, or with `--body-file -`",
+          "action": "read the text from the file, or from standard input when the path is `-`, and send it exactly as read, with no character added, removed or changed",
+          "contract": "the `body` member of the request equals the bytes of the file or of standard input, including leading white space and trailing line breaks",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub (`httptest` server) that records each request and answers the route's success status with a fixed body"
+            ],
+            "pseudocode": "in internal/cli/issue_test.go and internal/cli/pr_test.go, a table over the five commands x {a file in t.TempDir(), stdin} with the text '  first\\r\\nsecond\\n\\n': run the command with --body-file <path> or --body-file - and that stdin; assert the stub hub received a `body` equal to the text byte for byte and exit 0"
+          }
+        },
+        {
+          "id": "REQ-10.4",
+          "pattern": "unwanted",
+          "condition": "a write command is run with a `<number>` that is not a positive decimal integer without sign or leading zero of at most 2,147,483,647, with both `--body` and `--body-file`, with a `--body-file` that cannot be read, without a flag it requires (`--title` on `issue create`; `--title`, `--head` or `--base` on `pr create`; one of `--body` and `--body-file` on `issue comment` and `pr comment`), with `issue update` and no field flag, or with `issue label` and no label",
+          "action": "report a usage error and send no request",
+          "contract": "exit status 2; stderr holds one error envelope with `code` 0 and `error_type` `usage_error`; stdout is empty; the hub receives no request",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub (`httptest` server) that records each request and answers the route's success status with a fixed body"
+            ],
+            "pseudocode": "in internal/cli/issue_test.go, internal/cli/label_test.go and internal/cli/pr_test.go, a table of argv: {issue update demo 0 --title x}, {issue close demo 07}, {issue close demo +7}, {issue comment demo 2147483648 --body x}, {pr comment demo abc --body x}, {issue unlabel demo -1 bug}, {issue create demo --title T --body a --body-file f}, {pr create demo --title T --head f --base main --body-file /nonexistent}, {issue create demo}, {pr create demo --title T --head f}, {pr create demo --head f --base main}, {issue comment demo 7}, {pr comment demo 12}, {issue update demo 7}, {issue update demo 7 --target upstream}, {issue label demo 7}, {label create demo}: run each against the stub hub; assert exit 2, stdout empty, stderr decodes to an envelope with code 0 and error_type 'usage_error'; assert the stub received no request. One row that must pass: {issue close demo 2147483647}"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "An agent files, labels and comments on an issue from the shell",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "runs `parley issue create demo --title \"Flaky test\" --label bug` with a PAT that has `forge:write`"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends POST /api/v1/workspaces/demo/issues with the body {\"title\": \"Flaky test\", \"labels\": [\"bug\"]}"
+        },
+        {
+          "actor": "parleyd",
+          "action": "checks the scope, write access, the body, the workspace state, the forge configuration, the text limit and the credential kind"
+        },
+        {
+          "actor": "parleyd",
+          "action": "sends the create request to the forge's API with the workspace's stored token"
+        },
+        {
+          "actor": "forge",
+          "action": "creates issue 1 and returns it"
+        },
+        {
+          "actor": "parleyd",
+          "action": "records `parley.forge.issue.create` with `ok` true and answers 201 with the issue"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints the issue on stdout and exits 0"
+        },
+        {
+          "actor": "agent",
+          "action": "runs `parley issue label demo 1 triage` and `parley issue comment demo 1 --body-file -` with the text on standard input"
+        },
+        {
+          "actor": "parleyd",
+          "action": "adds the label and posts the comment on the forge, records `parley.forge.label.add` and `parley.forge.comment.create`, and answers 204 and 201"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints the `labeled` confirmation and the comment's `url`, and exits 0 each time"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parley CLI commands `issue create`, `issue label` and `issue comment`",
+          "parleyd HTTP server with authentication, the scope check and the workspace access rule",
+          "forge configuration and forge client of package 41",
+          "write handlers",
+          "transactional store and secrets store",
+          "event log"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with a secrets key and a forge transport that trusts the test forge",
+          "a test forge (`httptest` TLS server) that plays GitHub's REST API for one repository and requires the token",
+          "a test origin whose URL path is `/acme/widgets.git`, and the workspace `demo` created through POST /workspaces with `git_pat` and waited for until `ready`",
+          "the workspace setting `forge_api_url` set to the test forge's URL followed by `/github`",
+          "a PAT of the workspace's owner with the scope `forge:write`"
+        ],
+        "end_state": [
+          "the three commands exit 0; the first prints an issue with number 1, the second `{\"status\":\"labeled\",\"number\":1,\"labels\":[\"triage\"]}`, the third an object with a `url`",
+          "the test forge holds issue 1 with the labels `bug` and `triage` and one comment whose text equals standard input",
+          "every request the test forge received carried the stored token",
+          "the event log holds exactly three forge events for `demo`, of the types `parley.forge.issue.create`, `parley.forge.label.add` and `parley.forge.comment.create`, each with `ok` true",
+          "no command output and no event contains the stored token or the comment text"
+        ],
+        "pseudocode": "in test/e2e/forge_write_test.go: forge = newGitHubForge(token); hub = startHub(forgeTransport: forge.client); create workspace demo with git_pat = token; waitReady; patch settings forge_api_url = forge.url + '/github'; out1, c1 = runCLI('issue', 'create', 'demo', '--title', 'Flaky test', '--label', 'bug'); out2, c2 = runCLI('issue', 'label', 'demo', '1', 'triage'); out3, c3 = runCLIStdin(text, 'issue', 'comment', 'demo', '1', '--body-file', '-'); assert c1 == c2 == c3 == 0; assert out1.number == 1 and out2 == {status:'labeled', number:1, labels:['triage']} and out3.url != ''; assert forge.issue(1).labels == ['bug','triage'] and forge.comments(1) == [text]; ev = eventsOf('demo', prefix 'parley.forge.'); assert types(ev) == ['parley.forge.issue.create','parley.forge.label.add','parley.forge.comment.create'] and all ok; assert token and text appear in none of out1..3 and no event"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "An agent retries opening a pull request and gets one pull request",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "sends POST /api/v1/workspaces/demo/pulls with `title`, `head`, `base` and the header `Idempotency-Key: pr-1`"
+        },
+        {
+          "actor": "parleyd",
+          "action": "runs the checks, finds no record for the key and sends the create request to the forge with the workspace's stored token"
+        },
+        {
+          "actor": "forge",
+          "action": "opens pull request 1 and returns it"
+        },
+        {
+          "actor": "parleyd",
+          "action": "records `parley.forge.pull_request.create` with `head`, `base`, `draft` and `ok` true, stores the answer under the key and answers 201"
+        },
+        {
+          "actor": "agent",
+          "action": "does not receive the answer and sends the same request with the same key again"
+        },
+        {
+          "actor": "parleyd",
+          "action": "finds the record and answers 200 with the first answer, without contacting the forge and without recording an event"
+        },
+        {
+          "actor": "agent",
+          "action": "sends POST /api/v1/workspaces/demo/pulls/1/comments with a `body`"
+        },
+        {
+          "actor": "parleyd",
+          "action": "posts the comment in the pull request's conversation, records `parley.forge.pull_request.comment` and answers 201 with the comment's `url`"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parleyd HTTP server with authentication, the scope check, the workspace access rule and the idempotency records",
+          "forge configuration and forge client of package 41",
+          "write handlers",
+          "transactional store and secrets store",
+          "event log"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with a secrets key and a forge transport that trusts the test forge",
+          "a test forge (`httptest` TLS server) that plays GitHub's REST API for one repository, holds the branches `main` and `feature`, and counts the requests it receives",
+          "the workspace `demo` created through POST /workspaces with `git_pat`, waited for until `ready`, with `forge_api_url` set to the test forge's URL followed by `/github`",
+          "a PAT of the workspace's owner with the scope `forge:write`"
+        ],
+        "end_state": [
+          "the first answer is 201 and the second 200, with equal bodies whose `number` is 1",
+          "the test forge holds exactly one pull request, from `feature` to `main`, and received exactly one create request for it",
+          "the test forge holds one comment on pull request 1",
+          "the event log holds exactly one `parley.forge.pull_request.create` event and one `parley.forge.pull_request.comment` event for `demo`, both with `ok` true"
+        ],
+        "pseudocode": "in test/e2e/forge_write_test.go: forge = newGitHubForge(token, branches: ['main','feature']); hub = startHub(forgeTransport: forge.client); create workspace demo; waitReady; set forge_api_url; body = {title:'Add feature', head:'feature', base:'main'}; r1 = post('/workspaces/demo/pulls', body, header Idempotency-Key 'pr-1'); r2 = the same again; assert r1.status == 201 and r2.status == 200 and r2.json == r1.json and r1.json.number == 1; assert len(forge.pulls) == 1 and forge.count('POST', '/repos/acme/widgets/pulls') == 1; r3 = post('/workspaces/demo/pulls/1/comments', {body:'ready for review'}); assert r3.status == 201 and r3.json.url != ''; assert forge.comments(1) == ['ready for review']; ev = eventsOf('demo', prefix 'parley.forge.'); assert types(ev) == ['parley.forge.pull_request.create','parley.forge.pull_request.comment'] and all ok"
+      }
+    }
+  ],
+  "external_apis": [
+    {
+      "package": "github.com/spf13/cobra",
+      "version": "v1",
+      "verified": false,
+      "symbols": [
+        {
+          "name": "Command",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "type Command struct { Use string; Short string; Args PositionalArgs; RunE func(cmd *Command, args []string) error }"
+        },
+        {
+          "name": "ExactArgs",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func ExactArgs(n int) PositionalArgs"
+        },
+        {
+          "name": "MinimumNArgs",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func MinimumNArgs(n int) PositionalArgs"
+        },
+        {
+          "name": "Command.AddCommand",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) AddCommand(cmds ...*Command)"
+        },
+        {
+          "name": "Command.Flags",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) Flags() *pflag.FlagSet"
+        }
+      ]
+    }
+  ]
+}

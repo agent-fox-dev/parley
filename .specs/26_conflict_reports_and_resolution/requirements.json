@@ -1,0 +1,525 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "26",
+  "spec_name": "conflict_reports_and_resolution",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "One conflict report for every failed replay",
+      "rationale": "An agent can only fix a conflict it can read as data, and it should not have to learn a different shape for landing, restack, rebase and comparison.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "a replay of the commits of some work onto an onto commit stops at a commit that does not apply",
+          "action": "build a conflict report whose target_sha is the onto commit, head_sha the head that was replayed, base_sha the commit the work was based on before, commit_sha the first commit that did not apply, files one entry per conflicted path of that commit ordered by path, and change null, with every commit id written as its full 40-character id",
+          "contract": "a JSON object with exactly the seven members {target_sha, head_sha, base_sha, commit_sha, files: [{path, kind, base, ours, theirs, landed_by}], landed_changes: [{number, title, landed_sha, session_id}], change}; every sha is 40 lowercase hexadecimal characters; change is null",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a repository made with git init in a temporary directory",
+              "the real git command"
+            ],
+            "pseudocode": "in internal/land/conflict_test.go: repo with main at B; work = three commits W1, W2, W3 on B where W2 edits line 1 of a.txt and b.txt; target = one commit T on B that edits line 1 of a.txt and b.txt differently; rep = BuildReport(repo, onto=T, head=W3, base=B); assert rep.target_sha == T; assert rep.head_sha == W3; assert rep.base_sha == B; assert rep.commit_sha == W2; assert paths(rep.files) == ['a.txt', 'b.txt']; assert rep.change == null; assert keys(json(rep)) == the seven members; assert every sha matches ^[0-9a-f]{40}$; a second case where the work applies: assert the replay reports no conflict and no report is built"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "ubiquitous",
+          "action": "for any conflicted path, report exactly one kind, the first that applies in this order: submodule (mode 160000 on any side), binary (both sides changed a file git treats as binary), rename (one side renamed the file and the other renamed it elsewhere, deleted it or added a file at the new path), add_add (no common ancestor and different content on both sides, or a file on one side and a directory on the other), modify_delete (the target changed it, the change deleted it), delete_modify (the target deleted it, the change changed it), mode (different modes and content that merges), content (overlapping text changes)",
+          "contract": "files[].kind is one of content, add_add, modify_delete, delete_modify, rename, mode, binary, submodule",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "repositories made with git init in temporary directories",
+              "the real git command"
+            ],
+            "pseudocode": "in internal/land/conflict_test.go, a table of nine repositories, each with one conflicting commit, and the kind expected for its path: {both edit line 1 of a text file -> content; both add f.txt with different text -> add_add; target edits f.txt, change deletes it -> modify_delete; target deletes f.txt, change edits it -> delete_modify; target renames f.txt to g.txt, change renames it to h.txt -> rename; both add f.sh with the same content, the target with mode 100755 and the change with mode 100644 -> mode; both replace a file holding NUL bytes with different bytes -> binary; both move a 160000 entry to different commits -> submodule; target adds file d, change adds file d/x -> add_add}: rep = BuildReport(...); assert kind of the path == expected; assert each path appears once"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "ubiquitous",
+          "action": "for any conflicted path, report base, ours and theirs as {sha, mode, path} of the file in the parent of commit_sha, in the target as replayed so far, and in commit_sha, and report null for a side on which the file does not exist",
+          "contract": "files[].base, files[].ours, files[].theirs: {sha: 40 hexadecimal characters, mode: string such as 100644, path: string} or null",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/land/conflict_test.go, over the same repositories as the kind table: content case: assert base.sha, ours.sha and theirs.sha equal git rev-parse of B:a.txt, T:a.txt and W:a.txt and all modes == '100644'; add_add case: assert base == null and ours != null and theirs != null; modify_delete case: assert theirs == null and ours.sha == rev-parse(T:f.txt); delete_modify case: assert ours == null; rename case: assert ours.path == 'g.txt' and theirs.path == 'h.txt' and base.path == 'f.txt'"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "state_driven",
+          "condition": "base_sha is an ancestor of target_sha",
+          "action": "list in landed_changes, ordered by number, every landed change that has a commit between base_sha and target_sha touching a conflicted path, each as {number, title, landed_sha, session_id}, and list in each file entry's landed_by the numbers, ascending, of the landed changes that touched that path, counting no commit that belongs to no change",
+          "contract": "landed_changes: [{number: int, title: string, landed_sha: 40 hexadecimal characters, session_id: string or null}]; files[].landed_by: int[]",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a landed-change lookup backed by a table of commit id to change, standing in for the commit mapping of package 25"
+            ],
+            "pseudocode": "in internal/land/conflict_test.go: target history after B: commit L1 mapped to landed change 7 (title 'seven', session s-1) edits a.txt; commit L2 mapped to landed change 8 edits other.txt; commit D mapped to no change (a direct push) edits b.txt; work edits a.txt and b.txt on B; rep = BuildReport(repo, onto=target, head, base=B, lookup); assert rep.landed_changes == [{number: 7, title: 'seven', landed_sha: L1, session_id: 's-1'}]; assert landed_by('a.txt') == [7]; assert landed_by('b.txt') == []"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "unwanted",
+          "condition": "base_sha is not an ancestor of target_sha, or the landed-change lookup returns an error",
+          "action": "produce the report with landed_changes empty and every landed_by empty",
+          "contract": "the report is returned without error; landed_changes == [] and every files[].landed_by == []; neither member is null",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/land/conflict_test.go, a table over {base on a branch unrelated to the target, a lookup that returns an error}: rep, err = BuildReport(...); assert err == nil; assert json(rep).landed_changes == []; assert every json(rep).files[i].landed_by == []; assert len(rep.files) > 0"
+          }
+        },
+        {
+          "id": "REQ-1.6",
+          "pattern": "ubiquitous",
+          "action": "for any replay it runs to build a report or a trial result, leave every ref of the repository at the commit it had before and leave no working directory or temporary index behind, whether the replay conflicts, applies or fails",
+          "contract": "git for-each-ref prints the same lines before and after; the temporary directory of the hub holds no entry created by the call",
+          "check": {
+            "kind": "property",
+            "pseudocode": "in internal/land/conflict_test.go, over the nine repositories of the kind table plus one clean replay and one replay with an unknown head sha: before = git for-each-ref; files = list(scratch dir); BuildReport or TrialReplay(...); assert git for-each-ref == before; assert list(scratch dir) == files"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Read a change's current conflict report",
+      "rationale": "An agent that is told its change conflicts needs the report as it is now, not as it was when the last background check ran.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "a caller with changes:read and read access requests GET /workspaces/:slug/changes/:number/conflict for a draft or open change whose mergeable is conflict and whose stored report has target_sha equal to the present onto commit and head_sha equal to the change's present head",
+          "action": "answer with the stored report without running a replay, where the onto commit is the head of the change below for a change with depends_on and the head of the target branch otherwise",
+          "contract": "HTTP 200 with body {mergeable: \"conflict\", conflict: <the stored conflict report>}",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "an httptest server with the route, a change store holding open change 2 with mergeable conflict and a stored report for the present pair of commits",
+              "a counter around the trial replay"
+            ],
+            "pseudocode": "in internal/land/conflict_handlers_test.go: r = GET /api/v1/workspaces/demo/changes/2/conflict as U; assert r.status == 200; assert r.json.mergeable == 'conflict'; assert r.json.conflict == stored report; assert the replay counter of the test double around gitrepo == 0"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "event_driven",
+          "condition": "the same request arrives for a draft or open change whose mergeable is unknown or clean, or whose stored report names another target_sha or head_sha than the present pair",
+          "action": "run a trial replay of the change's own commits onto the present onto commit and answer from its result, storing nothing on the change and emitting no event",
+          "contract": "HTTP 200 with body {mergeable: \"clean\", conflict: null} when the replay applies, or {mergeable: \"conflict\", conflict: <report with target_sha equal to the present onto commit>} when it does not; the stored change and the event log are unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub with real repositories made with git init",
+              "the change store and event log of the packages this one depends on"
+            ],
+            "pseudocode": "in internal/land/conflict_handlers_test.go, a table over {stored clean, then the target gets a commit that conflicts -> conflict with target_sha == new head; stored conflict, then the target gets a commit that removes the conflict -> clean and null; stored unknown and no conflict -> clean; stored conflict, then a new version without the conflict -> clean; change 3 depends on change 2 and conflicts with change 2's head but not with the target -> conflict with target_sha == head of change 2}: before = stored change, count(events); r = GET .../conflict; assert r.status == 200 and r.json == expected; assert stored change == before; assert count(events) == before count"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "state_driven",
+          "condition": "the change is landed or abandoned",
+          "action": "answer GET …/conflict from what is stored without running a replay: conflict with the stored report when the change holds one, clean otherwise",
+          "contract": "HTTP 200 with body {mergeable: \"conflict\", conflict: <stored report>} or {mergeable: \"clean\", conflict: null}",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/land/conflict_handlers_test.go, a table over {landed change with no report -> clean, abandoned change with a stored report -> conflict and that report}: r = GET .../conflict; assert r.status == 200; assert r.json == expected; assert replay counter == 0"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "unwanted",
+          "condition": "a caller requests GET …/conflict or GET …/conflict/file without the scope, the access or an existing change",
+          "action": "refuse the request without running a replay",
+          "contract": "HTTP 403 with error_type insufficient_scope for a PAT without changes:read; HTTP 404 with error_type not_found for a workspace that does not exist or that the caller cannot read; HTTP 404 with error_type change_not_found for a number that names no change of the workspace",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub with workspace demo owned by user U, an organization member M, a user X outside the organization, and change 2 of demo that conflicts with the target head"
+            ],
+            "pseudocode": "in internal/land/conflict_handlers_test.go, a table over both routes and the callers {PAT of U with only workspaces:read -> 403 insufficient_scope; the same PAT on slug nosuch -> 403 insufficient_scope; X on demo -> 404 not_found; U on slug nosuch -> 404 not_found; U on change 999 -> 404 change_not_found; M on change 2 -> 200}: r = GET route; assert r.status and r.json.error.error_type == expected; assert r.json.error.code == r.status"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "unwanted",
+          "condition": "a token bound to a fork F requests GET …/conflict or GET …/conflict/file on F's parent for a change whose source workspace is not F",
+          "action": "refuse the request as if the change did not exist, and serve the same routes for a change whose source workspace is F",
+          "contract": "HTTP 404 with error_type change_not_found for the foreign change; HTTP 200 for a change whose source workspace is F",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "workspace demo with two forks demo-f1 and demo-f2, each the source of one conflicting change on demo",
+              "the binding guard of package 08 with both routes on its allowlist"
+            ],
+            "pseudocode": "in internal/land/conflict_handlers_test.go, a table over both routes: tok = PAT bound to fork demo-f1 with changes:read; change 2 has source demo-f1, change 4 has source demo-f2; assert GET on change 2 as tok has status 200; r = GET on change 4 as tok; assert r.status == 404 and r.json.error.error_type == 'change_not_found'"
+          }
+        },
+        {
+          "id": "REQ-2.6",
+          "pattern": "unwanted",
+          "condition": "the target branch of a draft or open change no longer exists when GET …/conflict or GET …/conflict/file is requested",
+          "action": "refuse the request",
+          "contract": "HTTP 409 with error_type conflict",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/land/conflict_handlers_test.go: open change 5 targets branch release; delete refs/heads/release in the repository; for each of the two routes: r = GET route; assert r.status == 409; assert r.json.error.error_type == 'conflict'"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Read a conflicted file with markers",
+      "rationale": "An agent without a clone has no other way to see both sides of a conflict in the form every tool and model already understands.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "a caller with changes:read and read access requests GET /workspaces/:slug/changes/:number/conflict/file with a path that is a content entry of the change's current report",
+          "action": "answer with the merged text of the file in which each overlapping region is written as a line <<<<<<< target, the lines of the target as replayed so far, a line =======, the lines of the file in commit_sha, and a line >>>>>>> change, and every other line appears once",
+          "contract": "HTTP 200 with Content-Type text/plain; charset=utf-8 and the marked text as the body",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub with a real repository made with git init and open change 2 that conflicts in app.txt"
+            ],
+            "pseudocode": "in internal/land/conflict_handlers_test.go: base app.txt = 'one\\ntwo\\nthree\\n'; target changes line 2 to 'TARGET'; the change changes line 2 to 'CHANGE' and appends 'four'; r = GET /api/v1/workspaces/demo/changes/2/conflict/file?path=app.txt; assert r.status == 200; assert r.header['Content-Type'] == 'text/plain; charset=utf-8'; assert r.body == 'one\\n<<<<<<< target\\nTARGET\\n=======\\nCHANGE\\n>>>>>>> change\\nthree\\nfour\\n'; a second case with path 'dir/a b.txt' sent percent-encoded: assert status 200"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "ubiquitous",
+          "action": "for any request to GET …/conflict/file, take the current report by the rule of GET …/conflict: the stored report when it matches the present onto commit and head, a trial replay otherwise",
+          "contract": "the body reflects the present target head, not the head the stored report was computed for",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/land/conflict_handlers_test.go: stored report says app.txt conflicts with target line 'TARGET'; add a commit to the target that sets the line to 'TARGET2'; r = GET .../conflict/file?path=app.txt; assert r.status == 200; assert r.body contains 'TARGET2\\n=======' and does not contain 'TARGET\\n======='"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "unwanted",
+          "condition": "GET …/conflict/file is requested without a path parameter or with an empty one",
+          "action": "refuse the request",
+          "contract": "HTTP 400 with error_type invalid_request",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/land/conflict_handlers_test.go, a table over the queries {'', '?path='}: r = GET .../conflict/file + query; assert r.status == 400; assert r.json.error.error_type == 'invalid_request'"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "unwanted",
+          "condition": "the path given to GET …/conflict/file is not an entry of the change's current report, which includes every path of a change that is clean",
+          "action": "refuse the request",
+          "contract": "HTTP 404 with error_type path_not_found",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/land/conflict_handlers_test.go, a table over {a conflicting change and a path it changed without conflict, a conflicting change and a path that exists nowhere, a clean change and a path it changed}: r = GET .../conflict/file?path=p; assert r.status == 404; assert r.json.error.error_type == 'path_not_found'"
+          }
+        },
+        {
+          "id": "REQ-3.5",
+          "pattern": "unwanted",
+          "condition": "the path given to GET …/conflict/file is an entry of the current report whose kind is not content",
+          "action": "refuse the request",
+          "contract": "HTTP 409 with error_type not_text_conflict",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/land/conflict_handlers_test.go, a table over changes whose only conflict has kind {add_add, modify_delete, delete_modify, rename, mode, binary, submodule}: r = GET .../conflict/file?path=<entry path>; assert r.status == 409; assert r.json.error.error_type == 'not_text_conflict'"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Restack with resolutions",
+      "rationale": "Reading a conflict is only half of working without a clone; the agent must also be able to hand the fixed file back and get a version that applies.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "a caller who may restack the change sends POST /workspaces/:slug/changes/:number/restack with resolutions that list every path that conflicts during the replay",
+          "action": "replay the change's own commits onto the onto commit, taking at each commit that does not apply the listed bytes for a path given with content or content_base64 and no file for a path given with delete: true, move the source branch to the result by compare-and-swap, and record a new version of kind restack whose created_by is the caller",
+          "contract": "HTTP 200 with body {status: \"restacked\", change: <change object>}; change.version is one higher than before; the new version has kind restack and created_by.actor_id equal to the caller's id; the file at the listed path in change.head_sha has exactly the given bytes, or does not exist for delete",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub with real repositories made with git init, the restack route of package 24 and open change 2 authored by agent A"
+            ],
+            "pseudocode": "in internal/change/resolutions_test.go, a table over {content: 'one\\nMERGED\\nthree\\n' for a content conflict in app.txt; content_base64 of bytes 00 01 02 for a binary conflict in logo.bin; delete: true for a modify_delete conflict in old.txt}: v0 = change.version; r = POST /api/v1/workspaces/demo/changes/2/restack {resolutions: [entry]} as agent A; assert r.status == 200; assert r.json.status == 'restacked'; assert r.json.change.version == v0 + 1; ver = GET .../versions/<v0+1>; assert ver.kind == 'restack'; assert ver.created_by.actor_id == A.id and ver.created_by.actor_type != 'system'; assert git rev-parse refs/heads/<source branch> == r.json.change.head_sha; assert git cat-file blob <head>:<path> == given bytes, or for delete that git cat-file -e <head>:old.txt fails; assert git merge-base --is-ancestor <target head> <head>"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "ubiquitous",
+          "action": "for any path that conflicts in more than one commit of one replay, use the path's resolution at each of those commits, and give a resolved file the mode it has in the change, else the mode it has in the target, else 100644",
+          "contract": "the restack answers HTTP 200 with status restacked; the path has the given bytes in every replayed commit from the first conflicting one on; its mode in change.head_sha equals its mode in the version that was restacked",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/change/resolutions_test.go: the change has two commits that each edit line 1 of run.sh (mode 100755); the target edits line 1 too; r = POST .../restack {resolutions: [{path: 'run.sh', content: 'final\\n'}]}; assert r.status == 200; for each of the two new commits c: assert git cat-file blob c:run.sh == 'final\\n'; assert mode of run.sh in git ls-tree <head> == '100755'"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "state_driven",
+          "condition": "a path listed in resolutions does not conflict at a commit of the replay, or the change is already built on its onto commit",
+          "action": "leave that path as the replay produced it and ignore its resolution",
+          "contract": "HTTP 200; the content of the non-conflicting listed path in change.head_sha is the replay's own result, not the listed bytes; an already current change answers {status: \"up_to_date\"} with change.version unchanged",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/change/resolutions_test.go: case 1: the change edits app.txt (conflicts) and adds notes.txt = 'mine\\n' (no conflict); r = POST .../restack {resolutions: [{path: 'app.txt', content: ok}, {path: 'notes.txt', content: 'IGNORED\\n'}, {path: 'ghost.txt', delete: true}]}; assert r.status == 200; assert blob <head>:notes.txt == 'mine\\n'; case 2: a change already on the target head: r = POST .../restack {resolutions: [{path: 'app.txt', content: 'x'}]}; assert r.json.status == 'up_to_date'; assert r.json.change.version unchanged; assert the source branch did not move"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "unwanted",
+          "condition": "a commit of the replay conflicts on at least one path that resolutions does not list",
+          "action": "fail the restack, move no branch and record no version",
+          "contract": "HTTP 409 with error_type rebase_conflict and the conflict report as error.details, whose files include the unlisted path; the source branch, change.version and change.head_sha are as before",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/change/resolutions_test.go: the change conflicts in a.txt and b.txt; head0 = rev-parse source branch; v0 = change.version; r = POST .../restack {resolutions: [{path: 'a.txt', content: 'x\\n'}]}; assert r.status == 409; assert r.json.error.error_type == 'rebase_conflict'; assert 'b.txt' in paths(r.json.error.details.files); assert r.json.error.details.commit_sha matches ^[0-9a-f]{40}$; assert rev-parse source branch == head0; assert GET change .version == v0"
+          }
+        },
+        {
+          "id": "REQ-4.5",
+          "pattern": "unwanted",
+          "condition": "the resolutions member of a restack body is not a list, or an entry has a missing or empty path, a path that starts with / or has an empty, . or .. segment, none or more than one of content, content_base64 and delete, delete set to false, a content_base64 that is not valid standard base64, or a path that another entry also names",
+          "action": "refuse the request before any replay, move no branch and record no version",
+          "contract": "HTTP 400 with error_type invalid_request; the source branch and change.version are as before",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/change/resolutions_test.go, a table over the bodies {resolutions: 'x'; [{content: 'a'}]; [{path: '', content: 'a'}]; [{path: '/a.txt', content: 'a'}]; [{path: 'a/../b', content: 'a'}]; [{path: 'a//b', content: 'a'}]; [{path: './a', content: 'a'}]; [{path: 'a.txt'}]; [{path: 'a.txt', content: 'a', delete: true}]; [{path: 'a.txt', content: 'a', content_base64: 'YQ=='}]; [{path: 'a.txt', delete: false}]; [{path: 'a.txt', content_base64: '***'}]; [{path: 'a.txt', content: 'a'}, {path: 'a.txt', delete: true}]} against a change that conflicts in a.txt: r = POST .../restack body; assert r.status == 400; assert r.json.error.error_type == 'invalid_request'; assert the source branch and change.version are unchanged; and one accepted body [{path: 'a.txt', content: ''}] (an empty file): assert r.status == 200"
+          }
+        },
+        {
+          "id": "REQ-4.6",
+          "pattern": "ubiquitous",
+          "action": "for any restack that succeeds with resolutions, pass the new version through the version recording that every version passes, so that the change's landing is evaluated again for the new head and its mergeable is no longer conflict",
+          "contract": "the change read after the restack has landing.status computed for the new head_sha, needs_restack false, and GET …/conflict answers {mergeable: \"clean\", conflict: null}",
+          "check": {
+            "same_as": "PATH-1"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "parley change conflict",
+      "rationale": "Agents and scripts ask for the report and the marked file from the shell and branch on the exit status.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "a user runs parley change conflict <slug> <number> without --file",
+          "action": "send GET /api/v1/workspaces/<slug>/changes/<number>/conflict and print the response body",
+          "contract": "exit status 0; stdout is the JSON document {mergeable, conflict}; stderr is empty",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest hub that records method, raw path and query and returns a canned answer"
+            ],
+            "pseudocode": "in internal/cli/change_test.go, a table over hub answers {clean, conflict with a report}: out = run('change', 'conflict', 'demo', '2'); assert the recorded request is GET /api/v1/workspaces/demo/changes/2/conflict; assert out.exit == 0; assert json(out.stdout) == hub body; assert out.stderr == ''"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "optional",
+          "condition": "--fail-on-conflict is given and the hub answers mergeable conflict",
+          "action": "print the response body on stdout and report the unmet condition",
+          "contract": "exit status 3; stdout is the JSON document with the report; stderr is the error envelope with code 0 and error_type condition_not_met; with a clean answer the exit status is 0 and stderr is empty",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/change_test.go: hub answers conflict: out = run('change', 'conflict', 'demo', '2', '--fail-on-conflict'); assert out.exit == 3; assert json(out.stdout).mergeable == 'conflict'; assert json(out.stderr).error.error_type == 'condition_not_met' and .error.code == 0; hub answers clean: assert out.exit == 0 and out.stderr == ''"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "optional",
+          "condition": "--file <path> is given",
+          "action": "send GET /api/v1/workspaces/<slug>/changes/<number>/conflict/file with the path as the percent-encoded query parameter path and write the response body to stdout byte for byte, not wrapped in JSON",
+          "contract": "exit status 0; stdout equals the text the hub returned, including its final newline or the lack of one",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/change_test.go: hub answers 200 text/plain with body 'a\\n<<<<<<< target\\nb\\n=======\\nc\\n>>>>>>> change'; out = run('change', 'conflict', 'demo', '2', '--file', 'dir/a b&c.txt'); assert recorded path == '/api/v1/workspaces/demo/changes/2/conflict/file'; assert the decoded query parameter path == 'dir/a b&c.txt' and the query has no other parameter; assert out.exit == 0; assert out.stdout == hub body exactly"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "unwanted",
+          "condition": "parley change conflict is run with --file and --fail-on-conflict together, with an argument count other than two, or the hub answers an error",
+          "action": "fail without printing a result on stdout, and for the two usage cases without sending a request",
+          "contract": "exit status 2 with error_type usage_error and code 0 on stderr and no request for the usage cases; exit status 1 with the hub's error envelope on stderr, as received, for a hub error; stdout is empty in all three",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/change_test.go, a table over {args ['demo', '2', '--file', 'a', '--fail-on-conflict'] -> exit 2, usage_error, 0 requests; args ['demo'] -> exit 2, usage_error, 0 requests; hub answers 409 not_text_conflict to --file -> exit 1, stderr error_type not_text_conflict; hub answers 404 change_not_found -> exit 1}: out = run('change', 'conflict', ...args); assert out.exit, json(out.stderr).error.error_type and the request count == expected; assert out.stdout == ''"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "parley change resolve",
+      "rationale": "The resolved file is on the agent's disk; one command has to carry it to the hub and say whether the change now applies.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "a user runs parley change resolve <slug> <number> with at least one --file <repo-path>=<local-file> or --delete <repo-path>",
+          "action": "read each local file and send POST /api/v1/workspaces/<slug>/changes/<number>/restack with a resolutions list holding {path, content_base64} for each --file, with the value split at its first =, and {path, delete: true} for each --delete, then print the response body",
+          "contract": "exit status 0; stdout is the JSON document {status, change}; the request body has one resolutions entry per flag and no content member",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest hub that records the request body and answers 200 {status: 'restacked', change: {...}}",
+              "local files in a temporary directory"
+            ],
+            "pseudocode": "in internal/cli/change_test.go: in a temporary directory write m.txt = 'merged\\n' and a file named 'v=1.bin' holding the bytes ff 00; out = run('change', 'resolve', 'demo', '2', '--file', 'app.txt=' + dir + '/m.txt', '--file', 'logo.bin=' + dir + '/v=1.bin', '--delete', 'old.txt'); assert the recorded request is POST /api/v1/workspaces/demo/changes/2/restack; body = recorded JSON; assert body.resolutions holds exactly {path: 'app.txt', content_base64: 'bWVyZ2VkCg=='}, {path: 'logo.bin', content_base64: '/wA='} and {path: 'old.txt', delete: true}; assert no entry has a content member; assert out.exit == 0; assert json(out.stdout) == hub body"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "unwanted",
+          "condition": "the hub answers the restack of parley change resolve with HTTP 409 and error_type rebase_conflict",
+          "action": "print the envelope with its conflict report and fail",
+          "contract": "exit status 1; stderr is the hub's error envelope as received, with error.details holding the report; stdout is empty",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/change_test.go: hub answers 409 {error: {code: 409, error_type: 'rebase_conflict', message: m, details: report}}; out = run('change', 'resolve', 'demo', '2', '--file', 'a.txt=' + local); assert out.exit == 1; assert json(out.stderr).error.details == report; assert out.stdout == ''"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "unwanted",
+          "condition": "parley change resolve is run with neither --file nor --delete, with a --file value that has no =, an empty repository path or an empty local path, with a local file that cannot be read, with the same repository path named twice across --file and --delete, or with an argument count other than two",
+          "action": "fail before sending any request",
+          "contract": "exit status 2; stderr is the error envelope with code 0 and error_type usage_error; stdout is empty; the hub receives no request",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/change_test.go, a table over the argument lists {['demo', '2']; ['demo', '2', '--file', 'a.txt']; ['demo', '2', '--file', '=x']; ['demo', '2', '--file', 'a.txt=']; ['demo', '2', '--file', 'a.txt=/no/such/file']; ['demo', '2', '--file', 'a.txt=' + local, '--delete', 'a.txt']; ['demo', '2', '--delete', 'a.txt', '--delete', 'a.txt']; ['demo', '--delete', 'a.txt']}: out = run('change', 'resolve', ...args); assert out.exit == 2; assert json(out.stderr).error.error_type == 'usage_error' and .error.code == 0; assert out.stdout == ''; assert the hub's request count == 0"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "An agent without a clone reads a conflict and resolves it",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "runs parley change conflict demo 2 --fail-on-conflict after another change landed on the same lines of app.txt"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends GET /api/v1/workspaces/demo/changes/2/conflict"
+        },
+        {
+          "actor": "parleyd",
+          "action": "runs a trial replay of change 2 onto the present head of main, builds the conflict report naming app.txt as content and the landed change in landed_by, and answers 200"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints the report on stdout and exits 3"
+        },
+        {
+          "actor": "agent",
+          "action": "runs parley change conflict demo 2 --file app.txt and saves the output"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers the file as text/plain with the markers <<<<<<< target, ======= and >>>>>>> change"
+        },
+        {
+          "actor": "agent",
+          "action": "writes the resolved app.txt locally and runs parley change resolve demo 2 --file app.txt=./app.txt"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "reads the local file and sends POST /api/v1/workspaces/demo/changes/2/restack with one resolution"
+        },
+        {
+          "actor": "parleyd",
+          "action": "replays change 2 onto the head of main with the resolution, moves the source branch by compare-and-swap, records a restack version authored by the agent, evaluates policy for it and answers 200 with status restacked"
+        },
+        {
+          "actor": "agent",
+          "action": "runs parley change conflict demo 2 --fail-on-conflict again and gets mergeable clean with exit status 0"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parley CLI command tree",
+          "parleyd HTTP server with its middleware",
+          "access component",
+          "change store on SQLite",
+          "restack operation",
+          "conflict report component",
+          "the git command on a bare repository on disk"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with an empty data directory",
+          "workspace demo created from a local repository made with git init whose main holds app.txt = 'one\\ntwo\\nthree\\n'",
+          "change 1 (line 2 becomes 'TARGET') and change 2 (line 2 becomes 'CHANGE'), both opened by pushes of an agent's token; change 1 is landed"
+        ],
+        "end_state": [
+          "the first parley change conflict exits 3 and its report has one file, app.txt, kind content, landed_by [1], and landed_changes with number 1",
+          "the --file output is 'one\\n<<<<<<< target\\nTARGET\\n=======\\nCHANGE\\n>>>>>>> change\\nthree\\n'",
+          "parley change resolve exits 0 with status restacked; change 2 has one more version, of kind restack, created_by the agent's user",
+          "the source branch of change 2 points at a commit whose parent is the head of main and whose app.txt is the resolved text",
+          "the last parley change conflict exits 0 and prints mergeable clean with conflict null",
+          "the head of main did not move after change 1 landed"
+        ],
+        "pseudocode": "in test/e2e/conflict_resolution_test.go: hub = startHub(t); create demo; push and open changes 1 and 2; land change 1; c = runCLI('change', 'conflict', 'demo', '2', '--fail-on-conflict'); assert c.exit == 3; rep = json(c.stdout).conflict; assert paths(rep.files) == ['app.txt'] and rep.files[0].kind == 'content' and rep.files[0].landed_by == [1]; f = runCLI('change', 'conflict', 'demo', '2', '--file', 'app.txt'); assert f.stdout == expected marked text; write 'one\\nBOTH\\nthree\\n' to local app.txt; main0 = rev-parse main; r = runCLI('change', 'resolve', 'demo', '2', '--file', 'app.txt=' + local); assert r.exit == 0 and json(r.stdout).status == 'restacked'; head = json(r.stdout).change.head_sha; assert git rev-parse head^ == main0; assert git cat-file blob head:app.txt == 'one\\nBOTH\\nthree\\n'; v = last of GET .../changes/2/versions; assert v.kind == 'restack' and v.created_by.username == agent user; c2 = runCLI('change', 'conflict', 'demo', '2', '--fail-on-conflict'); assert c2.exit == 0 and json(c2.stdout) == {mergeable: 'clean', conflict: null}; assert rev-parse main == main0"
+      }
+    }
+  ],
+  "external_apis": [
+    {
+      "package": "github.com/spf13/cobra",
+      "version": "v1",
+      "verified": false,
+      "symbols": [
+        {
+          "name": "Command",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "type Command struct { Use string; Short string; Args PositionalArgs; RunE func(cmd *Command, args []string) error; ... }"
+        },
+        {
+          "name": "Command.Flags",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) Flags() *pflag.FlagSet"
+        },
+        {
+          "name": "FlagSet.StringArray",
+          "import_path": "github.com/spf13/pflag",
+          "signature": "func (f *FlagSet) StringArray(name string, value []string, usage string) *[]string"
+        },
+        {
+          "name": "FlagSet.String",
+          "import_path": "github.com/spf13/pflag",
+          "signature": "func (f *FlagSet) String(name string, value string, usage string) *string"
+        },
+        {
+          "name": "FlagSet.Bool",
+          "import_path": "github.com/spf13/pflag",
+          "signature": "func (f *FlagSet) Bool(name string, value bool, usage string) *bool"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,983 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "52",
+  "spec_name": "durable_event_log_and_stream",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Writing an event with its state change",
+      "rationale": "A consumer can only trust the feed if no state change exists without its event and no event without its state change.",
+      "system": "event component",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "a caller emits an event inside a store transaction and that transaction commits",
+          "action": "store exactly one event for the call, with seq equal to the last seq written plus 1 (1 for the first event of a hub), a new version 4 UUID as id, time set to the clock's current time in UTC at whole seconds, action set to the last dot-separated segment of type, and every supplied field unchanged",
+          "contract": "the emit call returns the stored record (seq, id, time, action filled in) and a nil error; after the commit the record is returned by a read of the log at position seq-1; the state change made in the same transaction is present",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a real transactional store opened in t.TempDir() with the event schema step applied, and a fake clock"
+            ],
+            "pseudocode": "in internal/event/emit_test.go, TestEmit_CommitsWithStateChange: in one store transaction insert a row into a test table and call Emit(tx, {type:'parley.change.land', workspace:'api', actor_type:'pat', actor_id:'u_1', resource_type:'change', resource_id:'42'}); commit; assert returned seq == 1, id matches the lower-case v4 UUID pattern, time == fake clock truncated to seconds in UTC, action == 'land'; assert ReadAfter(0) returns exactly that record and the test row exists; emit a second event in a second transaction and assert its seq == 2 and its id differs"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "unwanted",
+          "condition": "the transaction in which an event was emitted rolls back because its function returns an error or panics",
+          "action": "leave no event and give the seq of the rolled-back call to the next committed event",
+          "contract": "a read of the log returns no record for the rolled-back call; last_seq is unchanged; the next committed emit returns the seq that follows the last committed one; the state change of the rolled-back transaction is absent",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a real transactional store opened in t.TempDir() with the event schema step applied, and a fake clock"
+            ],
+            "pseudocode": "in internal/event/emit_test.go, TestEmit_RollbackLeavesNoEvent, a table over {function returns an error, function panics}: emit one committed event (seq 1); in a second transaction insert a test row, call Emit, then fail the transaction as the case says; assert ReadAfter(0) has one record, Bounds().last_seq == 1 and the test row is absent; emit in a third, committed transaction and assert seq == 2"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "unwanted",
+          "condition": "the event cannot be written to the store during an emit",
+          "action": "return an error from the emit call and write nothing, so that the caller's transaction rolls back",
+          "contract": "the emit call returns a non-nil error that is not the invalid-event error; when the caller returns it from its transaction the state change is absent; a REST route that returns it answers HTTP 500 with error_type internal",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a real transactional store opened in t.TempDir() with the event schema step applied, and a fake clock",
+              "a test route on the real router of internal/server"
+            ],
+            "pseudocode": "in internal/event/emit_test.go, TestEmit_StoreFailureFailsTheRequest: drop the event table behind the component, then run a handler registered on the real router that inserts a test row and calls Emit in one transaction and returns Emit's error; assert the response is 500 with error.error_type == 'internal', errors.Is(err, ErrInvalidEvent) is false, and the test row is absent"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "event_driven",
+          "condition": "a caller emits an event through the emit call that takes no transaction, including from a start hook before the listener is bound",
+          "action": "write the event in a transaction of its own with the next seq and with time set to the time of writing",
+          "contract": "the call returns the stored record and a nil error; the record is returned by a read of the log",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a real transactional store opened in t.TempDir() with the event schema step applied, and a fake clock"
+            ],
+            "pseudocode": "in internal/event/emit_test.go, TestEmitNow_WritesInOwnTransaction: set the fake clock to T; call EmitNow(ctx, {type:'parley.git.fetch', workspace:'api', actor_type:'pat', actor_id:'u_1', resource_type:'workspace', resource_id:'api'}); assert seq == 1 and time == T; assert ReadAfter(0) returns it. In internal/hub/events_test.go, TestStartHook_MayEmitBeforeListening: start the hub in-process with an extra start hook that calls EmitNow; once the listening line is logged, read the log through the hub's event component and assert the event is there with seq 1"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "event_driven",
+          "condition": "a caller emits several events in one transaction that commits",
+          "action": "give them consecutive seq values in the order of the emit calls",
+          "contract": "for n calls the returned seq values are s, s+1, …, s+n-1 in call order, where s is the last seq written plus 1",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a real transactional store opened in t.TempDir() with the event schema step applied, and a fake clock"
+            ],
+            "pseudocode": "in internal/event/emit_test.go, TestEmit_SeveralInOneTransactionAreConsecutive: after one committed event, emit three events of type parley.git.push for three refs in one transaction; assert the returned seqs are 2, 3, 4 in call order and ReadAfter(1) returns them in that order"
+          }
+        },
+        {
+          "id": "REQ-1.6",
+          "pattern": "ubiquitous",
+          "action": "for any restart of the hub, assign as the next seq the highest seq ever assigned plus 1, also when the events that carried the highest values are no longer stored",
+          "contract": "after the store is closed and opened again the next committed emit returns the highest seq ever assigned plus 1; no seq is assigned twice",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a real transactional store on a file in t.TempDir()"
+            ],
+            "pseudocode": "in internal/event/emit_test.go, TestSeq_SurvivesRestartAndIsNeverReused: emit three events (seq 1..3); close the store and open it again on the same file; emit and assert seq == 4; delete every event row with SQL in the test, close and reopen; emit and assert seq == 5 and Bounds().last_seq == 5"
+          }
+        },
+        {
+          "id": "REQ-1.7",
+          "pattern": "ubiquitous",
+          "action": "for any number of transactions that emit at the same time, assign distinct seq values and never let an event become readable while an event with a lower seq is still uncommitted",
+          "contract": "every read of the log returns the committed events as a prefix 1..n of the seq order without a hole; a later read returns a prefix that is at least as long; no emit fails because another transaction is running",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a real transactional store opened in t.TempDir() with the event schema step applied, and a fake clock"
+            ],
+            "pseudocode": "in internal/event/emit_test.go, TestEmit_ConcurrentWritersStayOrdered: start 20 goroutines that each commit 25 transactions with one Emit, some sleeping between Emit and commit; meanwhile a reader calls ReadAfter(0) in a loop and asserts each result has seqs exactly 1..n with n never smaller than in the previous read; at the end assert no emit returned an error and the log holds seqs 1..500 with 500 distinct ids"
+          }
+        },
+        {
+          "id": "REQ-1.8",
+          "pattern": "ubiquitous",
+          "action": "report on request the last seq written, the number of open event streams, and the number of events written since start for each type",
+          "contract": "the counters call returns {last_seq, open_streams, written_by_type}; written_by_type counts committed events only",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a real transactional store opened in t.TempDir() with the event schema step applied, and a fake clock"
+            ],
+            "pseudocode": "in internal/event/emit_test.go, TestCounters_ReportSeqStreamsAndTypes: commit two parley.change.open events and one parley.claim.create, roll one emit back, and take one stream place through the component as the stream handler does; assert Counters() == {last_seq: 3, open_streams: 1, written_by_type: {'parley.change.open': 2, 'parley.claim.create': 1}}; give the place back and assert open_streams == 0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "The event record",
+      "rationale": "Fifty packages emit events and three surfaces serve them; one record shape lets a consumer parse every event the same way.",
+      "system": "event component",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "ubiquitous",
+          "action": "serialise every event as one JSON object with exactly the members seq, id, type, time, workspace, actor_type, actor_id, resource_type, resource_id, action, session_id and metadata, in that order, with null for an absent workspace, actor_id or session_id, an object for metadata ({} when none was supplied), time as RFC 3339 UTC at whole seconds, and id and session_id in lower case",
+          "contract": "the JSON form of a record is one line; the same bytes are produced for a hub_event frame of the stream and for an item of the log",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a real transactional store opened in t.TempDir() with the event schema step applied, and a fake clock"
+            ],
+            "pseudocode": "in internal/event/record_test.go, TestRecord_JSONForm, a table over {every field set with session_id given in upper case; workspace, actor_id and session_id absent and no metadata; nested metadata object}: emit, read back, marshal; assert the member names and their order, that absent values are JSON null, that metadata is {} or the supplied object (never a string), that time matches ^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$, that session_id is lower case, and that the output has no newline"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "ubiquitous",
+          "action": "for any event of each resource_type family of the catalogue (workspace, branch, session, token, ref, commit, change, policy, claim, patch, rebuild, secret, variable, issue, comment, label, pull_request, webhook, sandbox, sandbox_rule, event_webhook), store and return the supplied type, workspace, actor_type, actor_id, resource_type, resource_id, session_id and metadata unchanged",
+          "contract": "the record read back equals the input in those eight fields, and action equals the last segment of type",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a real transactional store opened in t.TempDir() with the event schema step applied, and a fake clock"
+            ],
+            "pseudocode": "in internal/event/record_test.go, TestRecord_EveryResourceFamilyPassesThrough, a table with one representative event per family, taken from the catalogue: e.g. {parley.workspace.create, workspace/api}, {parley.workspace.push, branch/main}, {parley.session.force_closed, session/<uuid>, actor system}, {parley.token.bind, token/tok_1}, {parley.git.push, ref/refs/heads/main}, {parley.scm.commit, commit/<40 hex>}, {parley.change.land, change/42}, {parley.policy.update, policy/api}, {parley.claim.create, claim/c1}, {parley.patch.create, patch/p1}, {parley.rebuild.complete, rebuild/j1, actor system}, {parley.secret.create, secret/KEY, workspace null, metadata scope user}, {parley.variable.update, variable/KEY}, {parley.forge.issue.opened, issue/7, actor forge}, {parley.forge.comment.create, comment/7}, {parley.forge.label.create, label/bug}, {parley.forge.pull_request.create, pull_request/9}, {parley.forge.webhook.set, webhook/api}, {parley.sandbox.create, sandbox/s1, with session_id}, {parley.sandbox.rule_add, sandbox_rule/r1}, {parley.webhook.create, event_webhook/w1}: emit, read back through ReadAfter, assert the eight supplied fields are equal to the input (metadata compared as JSON) and action is the last segment of type"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "unwanted",
+          "condition": "an emit is given a type that does not start with 'parley.', has fewer than three dot-separated segments or has an empty segment, an empty resource_type, an empty resource_id, an actor_type outside admin_token, api_key, pat, forge and system, an actor_id for admin_token, forge or system, no actor_id for api_key or pat, a session_id that is not a UUID in the 8-4-4-4-12 form, a workspace that is an empty string, or metadata that is not a JSON object",
+          "action": "refuse the emit and write nothing",
+          "contract": "the emit call returns the invalid-event error naming the offending field; no record is written and last_seq is unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a real transactional store opened in t.TempDir() with the event schema step applied, and a fake clock"
+            ],
+            "pseudocode": "in internal/event/record_test.go, TestEmit_RejectsInvalidInput, a table with one row per case of the condition (type 'change.land', 'parley.land', 'parley..land', 'parley.change.'; resource_type ''; resource_id ''; actor_type 'user'; actor_type system with actor_id 'u_1'; actor_type pat with actor_id ''; session_id 'abc'; workspace ''; metadata a JSON array): assert errors.Is(err, ErrInvalidEvent), the error text names the field, and Bounds().last_seq == 0"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "event_driven",
+          "condition": "an emitting package builds a metadata list of paths with the path-list helper",
+          "action": "keep the first 100 paths in the given order and set truncated to true in the metadata when more than 100 were given, and keep all paths and add no truncated member when 100 or fewer were given",
+          "contract": "the stored metadata holds at most 100 entries under the list's key; truncated is true exactly when entries were cut",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/event/record_test.go, TestPathList_CutsAtOneHundred, a table over {0 paths, 100 paths, 101 paths, 250 paths}: build metadata with the helper under key 'files', emit and read back; assert len(files) == min(n, 100), that the kept entries are the first ones in order, and that metadata.truncated is true for 101 and 250 and absent for 0 and 100"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "ubiquitous",
+          "action": "pass every string in an event's metadata, at any depth, through the credential scrubber of package 03 before the event is stored",
+          "contract": "a stored metadata string holds no URL user information and no value registered with the scrubber as a secret; such a value reads [redacted]",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a real transactional store opened in t.TempDir() with the event schema step applied, and a fake clock",
+              "the real scrubber of internal/scrub"
+            ],
+            "pseudocode": "in internal/event/record_test.go, TestEmit_ScrubsMetadataStrings: register the value 's3cr3t-value' with the real scrubber; emit with metadata {git_url:'https://bob:pw@example.com/r.git', nested:{note:'token s3cr3t-value here'}, list:['https://x:y@h/p']}; read back and assert git_url == 'https://example.com/r.git', nested.note contains '[redacted]' and not 's3cr3t-value', and list[0] == 'https://h/p'"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "The event log and its bounds",
+      "rationale": "A resume position only means something against a log whose oldest and newest positions are known, and retention needs one way to shorten it.",
+      "system": "event component",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "ubiquitous",
+          "action": "report the bounds of the event log as oldest_seq, the lowest seq still in the log, and last_seq, the last seq written, both 0 on a hub that has written no event",
+          "contract": "Bounds() returns {oldest_seq, last_seq}: {0, 0} before any event, {1, n} after n events with nothing expired",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a real transactional store opened in t.TempDir() with the event schema step applied, and a fake clock"
+            ],
+            "pseudocode": "in internal/event/log_test.go, TestBounds_EmptyAndFilled: on a new store assert Bounds() == {0, 0}; emit 5 events and assert Bounds() == {1, 5}"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "event_driven",
+          "condition": "the expire operation is called with a cutoff time",
+          "action": "make every event older than the cutoff leave the event log, keep the newest event in the log whatever its age, move oldest_seq forward to the lowest seq that stayed, and keep the events that left stored",
+          "contract": "the call returns the new oldest_seq; reads of the log by position no longer return events below it; oldest_seq never moves backwards; the rows of the events that left are still in the store",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a real transactional store opened in t.TempDir() with the event schema step applied, and a fake clock"
+            ],
+            "pseudocode": "in internal/event/log_test.go, TestExpire_MovesOldestSeq: with the fake clock emit seq 1..3 at T, 4..6 at T+2h, 7 at T+4h. Table: Expire(T-1h) -> oldest 1; Expire(T+1h) -> oldest 4 and ReadAfter(3) starts at 4; Expire(T+1h) again -> 4; Expire(T) after that -> still 4; Expire(T+10h) -> oldest 7 (the newest stays) and Bounds() == {7, 7}. After each step count the event rows with SQL and assert 7"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "event_driven",
+          "condition": "a reader asks for the events after a position with a limit",
+          "action": "return the events of the event log with a higher seq in ascending seq order, at most the limit, together with the position up to which the log was examined",
+          "contract": "ReadAfter(position, limit) returns (records, examined): records ascending by seq, len <= limit, examined == seq of the last record when the limit was reached and == last_seq otherwise",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a real transactional store opened in t.TempDir() with the event schema step applied, and a fake clock"
+            ],
+            "pseudocode": "in internal/event/log_test.go, TestReadAfter_PagesInSeqOrder: emit 5 events; assert ReadAfter(0, 2) == (seq 1,2; examined 2), ReadAfter(2, 10) == (seq 3,4,5; examined 5), ReadAfter(5, 10) == (none; examined 5)"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Visibility",
+      "rationale": "The feed crosses every workspace of the hub, so one rule must decide who sees an event, the same on every way of reading it.",
+      "system": "event component",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "ubiquitous",
+          "action": "for any event whose workspace is set and whose type is not parley.secret.*, parley.token.* or parley.webhook.*, decide it visible to a caller exactly when the caller has level admin, owner or member on that workspace, and to the admin token always, including when the workspace no longer exists",
+          "contract": "Visible(caller, event) returns true for the admin token, the owner and an org member, and false for a user with level none; for an event of a deleted repository workspace it returns true for the admin token only",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a real store with workspace records created through the access component: repository 'api' (owner dev, org acme), task fork 'api-f1' of it (owner mem); users dev (owner of 'api' and of a second repository 'web' in another org, member of acme), mem (member of acme), out (no relation); the admin token"
+            ],
+            "pseudocode": "in internal/event/visibility_test.go, TestVisible_WorkspaceEvents, a table over callers {admin token, dev, mem, out} and events {parley.change.open on 'api'; parley.change.open on 'gone', a slug with no record}: assert Visible is {true,true,true,false} for 'api' and {true,false,false,false} for 'gone'"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "ubiquitous",
+          "action": "for any event whose workspace is a task fork, decide it visible also to callers with read access to the fork's parent, and keep deciding so after the fork's record is deleted",
+          "contract": "Visible returns true for a reader of the parent before and after the fork is deleted, and false for a user with level none on the parent",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a real store with workspace records created through the access component: repository 'api' (owner dev, org acme), task fork 'api-f1' of it (owner mem); users dev (owner of 'api' and of a second repository 'web' in another org, member of acme), mem (member of acme), out (no relation); the admin token"
+            ],
+            "pseudocode": "in internal/event/visibility_test.go, TestVisible_ForkEventsFollowTheParent: emit parley.workspace.fork with workspace 'api-f1'; assert Visible is true for dev (owner of the parent), mem and the admin token, false for out; delete the fork's workspace record in the test; assert the same four answers; also emit an event for a fork whose record was deleted before the emit with the parent passed explicitly and assert the same answers"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "ubiquitous",
+          "action": "for any event whose workspace is set and whose type starts with parley.secret., parley.token. or parley.webhook., decide it visible only to callers with level owner or admin on that workspace, or, for a task fork, on the fork or on its parent",
+          "contract": "Visible returns false for an org member who is not owner of the workspace (or of the fork and its parent) and true for the owner and the admin token; a type such as parley.forge.webhook.set is not owner-only",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a real store with workspace records created through the access component: repository 'api' (owner dev, org acme), task fork 'api-f1' of it (owner mem); users dev (owner of 'api' and of a second repository 'web' in another org, member of acme), mem (member of acme), out (no relation); the admin token"
+            ],
+            "pseudocode": "in internal/event/visibility_test.go, TestVisible_OwnerOnlyTypes, a table over types {parley.secret.create, parley.token.bind, parley.webhook.create, parley.forge.webhook.set} on 'api' and callers {admin, dev, mem, out}: the first three give {true,true,false,false}, the fourth {true,true,true,false}; for parley.token.bind on fork 'api-f1': mem (the fork's owner) true, dev (the parent's owner) true, a second org member false"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "ubiquitous",
+          "action": "for any event whose workspace is null, decide it visible to the user named in metadata.scope_id when metadata.scope is user, to the members of the active org named in metadata.scope_id when metadata.scope is org, and otherwise to admin tokens only",
+          "contract": "Visible returns true for the named user or a member of the named org and for the admin token, and false for every other caller",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a real store with workspace records created through the access component: repository 'api' (owner dev, org acme), task fork 'api-f1' of it (owner mem); users dev (owner of 'api' and of a second repository 'web' in another org, member of acme), mem (member of acme), out (no relation); the admin token"
+            ],
+            "pseudocode": "in internal/event/visibility_test.go, TestVisible_EventsWithoutWorkspace, a table: {parley.secret.create, scope user, scope_id dev} -> dev true, mem false, admin true; {parley.variable.update, scope org, scope_id acme} -> dev true, mem true, out false, admin true; the same org event after the org is blocked -> mem false, admin true; {workspace null, no scope} -> only admin true"
+          }
+        },
+        {
+          "id": "REQ-4.5",
+          "pattern": "state_driven",
+          "condition": "the caller is a workspace-bound token",
+          "action": "decide visible only events of the workspaces the token's binding covers, under the rules for its user's level, plus, for a token bound to a task fork, the events of the fork's parent whose resource_type is change and whose change has that fork as its source; and never an event without a workspace",
+          "contract": "Visible returns false for every event of an uncovered workspace even when the token's user owns it, false for every event with a null workspace, true for the parent's change events of the fork's own changes; with no covered-set provider wired it returns false for every event",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a real store with workspace records created through the access component: repository 'api' (owner dev, org acme), task fork 'api-f1' of it (owner mem); users dev (owner of 'api' and of a second repository 'web' in another org, member of acme), mem (member of acme), out (no relation); the admin token"
+            ],
+            "pseudocode": "in internal/event/visibility_test.go, TestVisible_BoundTokens, with a stub covered-set provider and a stub change lookup: a PAT of dev bound to 'api' sees parley.change.open on 'api', not the same type on dev's other workspace 'web', not a user-scoped parley.secret.create for dev; a PAT of mem bound to fork 'api-f1' sees events on 'api-f1', sees parley.change.version on 'api' with resource_id '42' (source fork 'api-f1'), does not see change '43' on 'api' (another source) nor parley.git.push on 'api'; with the provider set to nil every case is false"
+          }
+        },
+        {
+          "id": "REQ-4.6",
+          "pattern": "event_driven",
+          "condition": "the decision is asked for an owner of workspace W, the form event webhooks use",
+          "action": "decide visible the events of W and of W's task forks, the owner-only types included, and no other event",
+          "contract": "VisibleToOwnerOf(W, event) returns true for events whose workspace is W or a fork of W (also a deleted fork), false for events of other workspaces and for events without a workspace",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a real store with workspace records created through the access component: repository 'api' (owner dev, org acme), task fork 'api-f1' of it (owner mem); users dev (owner of 'api' and of a second repository 'web' in another org, member of acme), mem (member of acme), out (no relation); the admin token"
+            ],
+            "pseudocode": "in internal/event/visibility_test.go, TestVisibleToOwnerOf: for W 'api' assert true for parley.change.land on 'api', parley.token.bind on 'api', parley.fork.expire on 'api-f1' after the fork's record is deleted; false for an event on 'web' and for a user-scoped secret event"
+          }
+        },
+        {
+          "id": "REQ-4.7",
+          "pattern": "ubiquitous",
+          "action": "for any event, decide its visibility from the caller's access at the moment the event is delivered, not from the access at the time the event was written or the stream was opened",
+          "contract": "after a caller gains access, earlier events of that workspace are returned by a replay and later ones are delivered live; after a caller loses access, neither earlier nor later events of that workspace are delivered",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the two event routes mounted on the real router of internal/server with the real check order, a real store in t.TempDir(), a fake clock, and callers created through the identity and access components"
+            ],
+            "pseudocode": "in internal/event/poll_test.go, TestLog_UsesCurrentAccess: emit E1 on 'api'; GET /events/log as out -> no items; add out to org acme; emit E2; GET /events/log?after=0 as out -> E1 and E2; remove out from the org; emit E3; GET /events/log?after=0 as out -> no items. In internal/event/stream_test.go, TestStream_AccessChangeWhileOpen: mem holds an open stream, receives E1; remove mem from the org; emit E2; advance the clock 30 s and assert the next frame is a heartbeat whose seq >= E2.seq and E2 was not sent"
+          }
+        },
+        {
+          "id": "REQ-4.8",
+          "pattern": "unwanted",
+          "condition": "the workspace record or the memberships needed for a visibility decision cannot be read",
+          "action": "not deliver the event",
+          "contract": "Visible returns an error; GET /events/log answers HTTP 500 with error_type internal and no items; an open stream is closed without a frame for that event",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the two event routes mounted on the real router of internal/server with the real check order, a real store in t.TempDir(), a fake clock, and callers created through the identity and access components"
+            ],
+            "pseudocode": "in internal/event/visibility_test.go, TestVisible_FailureIsNeverAGrant: with a membership reader that returns an error, assert Visible(mem, event on 'api') returns (false, err); GET /events/log as mem answers 500 with error.error_type == 'internal'; a stream opened by mem before the failure ends (EOF) after an emit, and the bytes read hold no hub_event frame"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Access, filters and resume positions of the two routes",
+      "rationale": "The stream and the log are two windows on one log; a consumer must be able to move between them with the same filters and the same position.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "GET /events or GET /events/log is called with any of the filters workspace (one slug), types (a comma-separated list of at most 20 entries, each an exact type or a prefix ending in *) and session_id (one UUID in any letter case)",
+          "action": "serve only events that match every given filter, where an event matches types when it matches at least one entry, an entry ending in * matches every type that starts with the text before it, and * alone matches every type",
+          "contract": "both routes return the same set of events for the same filters and position; a types entry that no event has yields no events and no error",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the two event routes mounted on the real router of internal/server with the real check order, a real store in t.TempDir(), a fake clock, and callers created through the identity and access components"
+            ],
+            "pseudocode": "in internal/event/filter_test.go, TestFilters_SameOnStreamAndLog: as the admin token, with events {1: parley.change.open on api, session S; 2: parley.change.land on api; 3: parley.claim.create on web; 4: parley.changeset.x on api}, a table of queries -> expected seqs: workspace=api -> 1,2,4; types=parley.change.* -> 1,2; types=parley.change.land,parley.claim.* -> 2,3; types=* -> 1,2,3,4; types=parley.nothing.here -> none; session_id=<S in upper case> -> 1; workspace=api&types=parley.change.*&session_id=S -> 1. Run each against GET /events/log?after=0 and against GET /events?after=0 (reading frames up to the first heartbeat after the replay) and assert both return the expected seqs"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "unwanted",
+          "condition": "a filter is malformed: types has more than 20 entries, has an empty entry or an empty value, or has an entry with * anywhere but as its last character; or session_id is not a UUID",
+          "action": "refuse the request before any event is read",
+          "contract": "HTTP 400 with error_type invalid_request in the JSON error envelope, on both routes; no stream is started",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the two event routes mounted on the real router of internal/server with the real check order, a real store in t.TempDir(), a fake clock, and callers created through the identity and access components"
+            ],
+            "pseudocode": "in internal/event/filter_test.go, TestFilters_RejectMalformed, a table over {types with 21 entries, types='', types='a,,b', types='parley.*.land', types='*x', session_id='nope'} and both routes: assert status 400, Content-Type application/json, error.error_type == 'invalid_request'; assert types with exactly 20 entries is accepted (200)"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "unwanted",
+          "condition": "the workspace filter names a workspace on which the caller has level none, a slug with no workspace (for any caller but the admin token), or, for a bound token, a workspace its binding does not cover",
+          "action": "refuse the request",
+          "contract": "HTTP 404 with error_type not_found and message 'workspace not found', identical for an existing unreadable workspace and a slug with no workspace; no stream is started. The admin token is not refused and reads the events stored under a deleted workspace's slug",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the two event routes mounted on the real router of internal/server with the real check order, a real store in t.TempDir(), a fake clock, and callers created through the identity and access components",
+              "a stub covered-set provider for the bound PAT"
+            ],
+            "pseudocode": "in internal/event/filter_test.go, TestFilters_WorkspaceNotReadable, a table on both routes: out with workspace=api -> 404 not_found 'workspace not found'; out with workspace=nosuch -> a response with the same status and body; a PAT of dev bound to 'api' with workspace=web (dev owns web) -> 404; mem with workspace=api -> 200; the admin token with workspace=gone (events stored, record deleted) -> 200 with those events"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "unwanted",
+          "condition": "the resume position (after or cursor on the log; after or Last-Event-ID on the stream) is lower than oldest_seq minus 1, so that at least one event after it has left the event log",
+          "action": "refuse the request, whether or not the caller could have seen the event that left",
+          "contract": "HTTP 410 with error_type cursor_expired, message 'event cursor expired' and the integer member oldest_seq inside the error object, in the JSON error envelope on both routes; no stream is started",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the two event routes mounted on the real router of internal/server with the real check order, a real store in t.TempDir(), a fake clock, and callers created through the identity and access components"
+            ],
+            "pseudocode": "in internal/event/filter_test.go, TestPosition_Expired: emit 10 events on 'web' (which mem cannot read) and expire so that oldest_seq == 6; as mem, a table over {GET /events/log?after=4, GET /events/log?cursor=0, GET /events?after=4, GET /events with Last-Event-ID: 4}: assert status 410, error.error_type == 'cursor_expired', error.message == 'event cursor expired', error.oldest_seq == 6 (a JSON number)"
+          }
+        },
+        {
+          "id": "REQ-5.5",
+          "pattern": "unwanted",
+          "condition": "the resume position is not a non-negative integer or is higher than last_seq, or a Last-Event-ID header is not a non-negative integer",
+          "action": "refuse the request",
+          "contract": "HTTP 400 with error_type invalid_request in the JSON error envelope on both routes; no stream is started",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the two event routes mounted on the real router of internal/server with the real check order, a real store in t.TempDir(), a fake clock, and callers created through the identity and access components"
+            ],
+            "pseudocode": "in internal/event/filter_test.go, TestPosition_Invalid: with last_seq == 10, a table over {after=-1, after=abc, after=1.5, after=11, Last-Event-ID: x, Last-Event-ID: -3, Last-Event-ID: 11} on the routes each applies to: assert 400 and error.error_type == 'invalid_request'; on an empty hub assert after=1 is 400"
+          }
+        },
+        {
+          "id": "REQ-5.6",
+          "pattern": "event_driven",
+          "condition": "the resume position is a boundary value that is still valid: equal to last_seq, equal to oldest_seq minus 1, or 0 on a hub that has written no event; or both Last-Event-ID and after are given on the stream",
+          "action": "accept the position, and on the stream use Last-Event-ID in place of after",
+          "contract": "HTTP 200; after == last_seq yields no replayed event; after == oldest_seq-1 yields the events from oldest_seq on; with Last-Event-ID: 8 and after=2 the first replayed event has seq 9",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the two event routes mounted on the real router of internal/server with the real check order, a real store in t.TempDir(), a fake clock, and callers created through the identity and access components"
+            ],
+            "pseudocode": "in internal/event/filter_test.go, TestPosition_ValidBoundaries: with events 1..10 and oldest_seq == 6, as the admin token: GET /events/log?after=10 -> 200, no items; GET /events/log?after=5 -> 200, items 6..10; GET /events?after=2 with Last-Event-ID: 8 -> 200 and the hub_event frames before the next heartbeat are 9 and 10; on an empty hub GET /events/log?after=0 -> 200 with no items"
+          }
+        },
+        {
+          "id": "REQ-5.7",
+          "pattern": "unwanted",
+          "condition": "a PAT that holds neither audit:read nor audit:write calls GET /events or GET /events/log",
+          "action": "refuse the request before validating any parameter",
+          "contract": "HTTP 403 with error_type insufficient_scope, also when the request carries a malformed filter or names an unreadable workspace; a PAT with audit:read or audit:write, an API key, the admin token and a workspace-bound PAT with the scope are answered 200",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the two event routes mounted on the real router of internal/server with the real check order, a real store in t.TempDir(), a fake clock, and callers created through the identity and access components",
+              "a stub covered-set provider for the bound PAT"
+            ],
+            "pseudocode": "in internal/event/filter_test.go, TestRoutes_ScopeAndCallers, a table on both routes: PAT with only changes:read -> 403 insufficient_scope; the same PAT with types='*x' -> 403; PAT with audit:read -> 200; PAT with audit:write -> 200; API key -> 200; admin token -> 200; PAT with audit:read bound to 'api' -> 200"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "The event stream GET /events",
+      "rationale": "An integrator that holds a connection gets every event once, in order, across disconnects and restarts, without rescanning state.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "GET /events is accepted",
+          "action": "answer with a Server-Sent Events stream and send a heartbeat frame at once",
+          "contract": "HTTP 200 with Content-Type text/event-stream and Cache-Control no-cache; the first frame is 'id: <seq>', 'event: heartbeat', 'data: {\"time\":<RFC 3339 UTC>,\"seq\":<seq>}' followed by an empty line; without a resume position that seq is last_seq at the time the stream opened",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the two event routes mounted on the real router of internal/server with the real check order, a real store in t.TempDir(), a fake clock, and callers created through the identity and access components"
+            ],
+            "pseudocode": "in internal/event/stream_test.go, TestStream_OpensWithHeartbeat: with last_seq == 3, GET /events as the admin token; assert status 200 and the two headers; read the first frame and assert its lines are id: 3, event: heartbeat and a single data line whose JSON is {time: fake clock, seq: 3}"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "event_driven",
+          "condition": "a stream was opened with a resume position",
+          "action": "send every visible, matching event with a higher seq in ascending seq order, then continue on the same connection with events committed afterwards, with no gap, no reordering and no repeated event between the two phases",
+          "contract": "each event is one frame 'id: <seq>', 'event: hub_event', 'data: <the record as one line of JSON>' followed by an empty line; the seqs of the hub_event frames of one connection are strictly increasing and are exactly the visible, matching seqs above the position",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the two event routes mounted on the real router of internal/server with the real check order, a real store in t.TempDir(), a fake clock, and callers created through the identity and access components"
+            ],
+            "pseudocode": "in internal/event/stream_test.go, TestStream_ReplayThenLiveWithoutGap: emit 300 events; open GET /events?after=100 as the admin token while a writer goroutine keeps committing 200 more events during the replay; read frames until seq 500 has arrived; assert the hub_event ids are exactly 101..500 in order with no repeat, and each data line parses to the record whose seq equals the frame id"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "event_driven",
+          "condition": "a stream was opened without a resume position",
+          "action": "send only events committed after the stream opened, each within 1 second of its commit",
+          "contract": "no hub_event frame carries a seq at or below last_seq at open; an event committed while the stream is open arrives as a hub_event frame within 1 second",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the two event routes mounted on the real router of internal/server with the real check order, a real store in t.TempDir(), a fake clock, and callers created through the identity and access components"
+            ],
+            "pseudocode": "in internal/event/stream_test.go, TestStream_LiveOnlyWithoutPosition: emit 3 events; open GET /events; emit a fourth; assert the first hub_event frame has id 4 and arrives within 1 s of the commit (real time), and no frame has id 1, 2 or 3"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "state_driven",
+          "condition": "a stream is open",
+          "action": "send a heartbeat every 30 seconds whose seq, also sent as the frame's id, is the position up to which the log has been examined for this client",
+          "contract": "every visible, matching event with a seq at or below a heartbeat's seq was sent before that heartbeat; a client whose filters match nothing still receives heartbeats whose seq rises with last_seq, and a reconnect with that seq as Last-Event-ID is answered 200, not 410",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the two event routes mounted on the real router of internal/server with the real check order, a real store in t.TempDir(), a fake clock, and callers created through the identity and access components"
+            ],
+            "pseudocode": "in internal/event/stream_test.go, TestStream_HeartbeatAdvancesPosition: open GET /events?types=parley.nothing.* at last_seq 0; emit 10 events at T, advance the fake clock 30 s; assert a heartbeat with id 10 and no hub_event frame; emit 5 more at T+3h, advance 30 s, assert heartbeat id 15; expire the log with cutoff T+1h (oldest_seq 11); reconnect with Last-Event-ID: 15 and assert 200; assert that no heartbeat is sent before 30 s have passed since the previous one"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "unwanted",
+          "condition": "256 events are waiting undelivered for one stream and another event is due for it, or the client accepts no data for 60 seconds",
+          "action": "close that stream without dropping any event from it while it was open",
+          "contract": "the connection ends; the hub_event frames received before the end are a gap-free prefix of the visible, matching events; a reconnect with the last received seq returns every later event",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the two event routes mounted on the real router of internal/server with the real check order, a real store in t.TempDir(), a fake clock, and callers created through the identity and access components"
+            ],
+            "pseudocode": "in internal/event/stream_test.go, TestStream_SlowConsumerIsClosedNotSkipped, two cases with a response writer that blocks after the opening heartbeat: (a) emit 300 events: assert the stream handler returned with fewer than 300 events written, the hub_event ids written are a contiguous run starting at the first event, and GET /events/log?after=<last id written> returns every later event up to 300; assert that with exactly 256 events waiting the stream is still open; (b) emit one event and advance the fake clock 60 s: assert the handler returned and the counters report open_streams == 0"
+          }
+        },
+        {
+          "id": "REQ-6.6",
+          "pattern": "unwanted",
+          "condition": "GET /events is called while [events].max_sse_connections streams are open",
+          "action": "refuse the request, without counting held long-polls of GET /events/log toward the limit",
+          "contract": "HTTP 503 with error_type unavailable in the JSON error envelope and the header Retry-After: 5; after one of the open streams ends, the next GET /events is answered 200",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the two event routes mounted on the real router of internal/server with the real check order, a real store in t.TempDir(), a fake clock, and callers created through the identity and access components"
+            ],
+            "pseudocode": "in internal/event/stream_test.go, TestStream_ConnectionLimit: with max_sse_connections = 2, hold three long-polls (GET /events/log?wait=60&after=<last_seq>) and open two streams (both 200); a third GET /events answers 503 with error.error_type == 'unavailable' and Retry-After == '5'; close one stream, wait for open_streams == 1, and assert a new GET /events answers 200"
+          }
+        },
+        {
+          "id": "REQ-6.7",
+          "pattern": "unwanted",
+          "condition": "the credential of an open stream is revoked, expires, or no longer authenticates",
+          "action": "close the stream at most 30 seconds later",
+          "contract": "the connection ends no later than the next heartbeat time; no hub_event frame is sent after the check that found the credential invalid",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the two event routes mounted on the real router of internal/server with the real check order, a real store in t.TempDir(), a fake clock, and callers created through the identity and access components"
+            ],
+            "pseudocode": "in internal/event/stream_test.go, TestStream_ClosesWhenCredentialEnds, a table over {the PAT is revoked, the PAT's expires_at passes on the fake clock, the PAT's user is blocked}: open a stream with the PAT, apply the case, advance the fake clock 30 s; assert the stream reaches EOF and open_streams == 0"
+          }
+        },
+        {
+          "id": "REQ-6.8",
+          "pattern": "event_driven",
+          "condition": "the hub's shutdown notification fires",
+          "action": "close every open stream at once, without waiting for clients",
+          "contract": "every stream connection ends within 1 second of the notification, also one whose client is not reading",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the two event routes mounted on the real router of internal/server with the real check order, a real store in t.TempDir(), a fake clock, and callers created through the identity and access components"
+            ],
+            "pseudocode": "in internal/event/stream_test.go, TestStream_ShutdownClosesStreams: open three streams, one of which never reads; fire the shutdown notification; assert all three handlers return within 1 s and open_streams == 0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "The event log route GET /events/log",
+      "rationale": "A consumer that cannot hold a stream open gets the same guarantees from a simple polling loop.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "event_driven",
+          "condition": "GET /events/log is accepted",
+          "action": "answer with the visible, matching events whose seq is higher than the position, in ascending seq, at most limit of them (default 50), starting at the oldest event in the log when no position is given",
+          "contract": "HTTP 200 with body {items: [hub event…], next_cursor: string or null, next_after: integer, oldest_seq: integer, last_seq: integer}; items is an array, [] when empty; oldest_seq and last_seq are the log's bounds at the time of the answer",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the two event routes mounted on the real router of internal/server with the real check order, a real store in t.TempDir(), a fake clock, and callers created through the identity and access components"
+            ],
+            "pseudocode": "in internal/event/poll_test.go, TestLog_ReturnsAPage: emit 120 events on 'api' and expire so that oldest_seq == 11; as dev: GET /events/log -> 200, 50 items with seqs 11..60, oldest_seq 11, last_seq 120; GET /events/log?after=118 -> items 119,120; GET /events/log?after=120 -> items == [] (not null); each item equals the stored record member for member"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "ubiquitous",
+          "action": "for any page, set next_after to the seq of the last item when the page holds limit items and otherwise to the position up to which the log was examined, and set next_cursor to next_after as a string when the page holds limit items and to null otherwise",
+          "contract": "next_after is always present; following next_after from any valid position returns every visible, matching event exactly once; for a page that is not full next_after equals last_seq of the answer",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the two event routes mounted on the real router of internal/server with the real check order, a real store in t.TempDir(), a fake clock, and callers created through the identity and access components"
+            ],
+            "pseudocode": "in internal/event/poll_test.go, TestLog_NextAfterNeverSkipsOrRepeats: emit 26 events alternating between 'api' (odd seqs, visible to mem) and 'web' (even seqs, not visible); as mem page with limit=5 from after=0 following next_after until a page is not full; assert the collected seqs are exactly the 13 'api' events once each in order, every full page has next_cursor == strconv(next_after) == seq of its last item, and the last page has next_cursor == null and next_after == 26 although its last item has seq 25; with types=parley.nothing.* assert items == [] and next_after == 26"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "event_driven",
+          "condition": "the position is given as cursor in place of after, or as both with equal values",
+          "action": "treat cursor as another name for after",
+          "contract": "GET /events/log?cursor=N returns the same body as GET /events/log?after=N",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the two event routes mounted on the real router of internal/server with the real check order, a real store in t.TempDir(), a fake clock, and callers created through the identity and access components"
+            ],
+            "pseudocode": "in internal/event/poll_test.go, TestLog_CursorIsAnotherNameForAfter: with 10 events, assert the bodies of ?cursor=4, ?after=4 and ?after=4&cursor=4 are equal and start at seq 5"
+          }
+        },
+        {
+          "id": "REQ-7.4",
+          "pattern": "unwanted",
+          "condition": "limit is not an integer from 1 to 200, wait is not a whole number of seconds from 0 to 60, or after and cursor are both given with different values",
+          "action": "refuse the request",
+          "contract": "HTTP 400 with error_type invalid_request; nothing is held",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "the two event routes mounted on the real router of internal/server with the real check order, a real store in t.TempDir(), a fake clock, and callers created through the identity and access components"
+            ],
+            "pseudocode": "in internal/event/poll_test.go, TestLog_RejectsBadParameters, a table over {limit=0, limit=201, limit=x, wait=-1, wait=61, wait=1.5, wait=x, after=3&cursor=4}: assert 400 and error.error_type == 'invalid_request' and that the answer arrives without waiting; assert limit=1, limit=200, wait=0 and wait=60 are accepted"
+          }
+        },
+        {
+          "id": "REQ-7.5",
+          "pattern": "event_driven",
+          "condition": "GET /events/log is called with wait above 0 and there is no visible, matching event after the position",
+          "action": "hold the request until a visible, matching event is committed or the wait ends, then answer",
+          "contract": "HTTP 200: within 1 second of the commit of a visible, matching event, with that event in items; or when wait seconds have passed, with items == [] and next_after equal to the position examined (last_seq at that time). An event the caller may not see or that the filters exclude does not end the wait",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the two event routes mounted on the real router of internal/server with the real check order, a real store in t.TempDir(), a fake clock, and callers created through the identity and access components"
+            ],
+            "pseudocode": "in internal/event/poll_test.go, TestLog_LongPoll, as mem with after=last_seq: (a) wait=30, emit an event on 'api' after the request is held: the answer arrives within 1 s (real time) with that one item; (b) wait=30, emit an event on 'web' (not visible) and one on 'api' excluded by types=parley.claim.*: the request stays held; advance the fake clock 30 s: 200 with items == [] and next_after == last_seq; (c) wait=0 with nothing to return answers at once with items == []"
+          }
+        },
+        {
+          "id": "REQ-7.6",
+          "pattern": "event_driven",
+          "condition": "the hub's shutdown notification fires while requests to GET /events/log are held",
+          "action": "release every held request at once",
+          "contract": "each held request is answered HTTP 200 with items == [] within 1 second of the notification",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the two event routes mounted on the real router of internal/server with the real check order, a real store in t.TempDir(), a fake clock, and callers created through the identity and access components"
+            ],
+            "pseudocode": "in internal/event/poll_test.go, TestLog_ShutdownReleasesLongPolls: hold two requests with wait=60; fire the shutdown notification; assert both answer 200 with items == [] within 1 s"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "Event configuration",
+      "rationale": "The operator bounds how long a consumer may stay away and how many streams the hub holds open.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "ubiquitous",
+          "action": "read [events].retention (a duration, default 30d) and [events].max_sse_connections (an integer, default 500) from the configuration file and apply max_sse_connections as the limit of open streams",
+          "contract": "with no [events] section the loaded values are 30d and 500; with max_sse_connections = 1 a second concurrent GET /events is answered 503; the loaded retention is available to package 51's retention run",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the configuration loader and key registry of internal/config"
+            ],
+            "pseudocode": "in internal/event/config_test.go, TestConfig_DefaultsAndValues: load an empty configuration through the real loader with the event keys registered and assert retention == 720h and max_sse_connections == 500; load '[events]\\nretention = \"1h\"\\nmax_sse_connections = 1' and assert 1h and 1. In internal/hub/events_test.go, TestHub_AppliesStreamLimit: start the hub in-process with max_sse_connections = 1, open one stream, assert a second GET /api/v1/events is 503"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "unwanted",
+          "condition": "[events].retention is not a duration with a unit of s, m, h or d or is below 1h, or [events].max_sse_connections is not an integer or is below 1",
+          "action": "stop the start",
+          "contract": "the hub exits with status 1 before listening, with one error line on stderr that names the key (events.retention or events.max_sse_connections)",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the configuration loader and key registry of internal/config"
+            ],
+            "pseudocode": "in internal/event/config_test.go, TestConfig_RejectsInvalidValues, a table over {retention='59m', retention='0h', retention='soon', retention=30, max_sse_connections=0, max_sse_connections=-1, max_sse_connections='many'}: assert the loader returns an error whose text names the key. In internal/hub/events_test.go, TestHub_RefusesInvalidEventConfig: run the hub's run function with retention='10m' and assert exit status 1, stderr names events.retention and no listening line was logged"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-9",
+      "title": "parley events tail",
+      "rationale": "A person or a script follows the hub from a shell and trusts that every event is printed once, whatever happens to the connection.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-9.1",
+          "pattern": "event_driven",
+          "condition": "parley events tail is run with any of --workspace, --types, --session and --after",
+          "action": "open GET /events with the flags as the query parameters workspace, types, session_id and after, with no request timeout, and print the data of every hub_event frame as one line of compact JSON on stdout, printing nothing for heartbeats",
+          "contract": "stdout holds one line per event, byte-equal to the frame's data, in the order received; nothing else is written to stdout; without --after the request has no after parameter",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server that plays the hub for /api/v1/events, scripted per case; the command run through cli.Run with stdout and stderr captured and the reconnect wait driven by a fake clock"
+            ],
+            "pseudocode": "in internal/cli/events_test.go, TestEventsTail_PrintsOneLinePerEvent: the fake hub sends heartbeat, hub_event 5, heartbeat, hub_event 6, then holds the connection open longer than 30 s of fake time; run 'events tail --workspace api --types parley.change.* --session <uuid> --after 4' and cancel after the second event; assert the request query is workspace=api&types=parley.change.*&session_id=<uuid>&after=4, stdout is exactly the two data lines each ending in a newline, and the command did not time out; run without --after and assert the query has no after"
+          }
+        },
+        {
+          "id": "REQ-9.2",
+          "pattern": "event_driven",
+          "condition": "the user interrupts parley events tail",
+          "action": "end the stream and exit",
+          "contract": "exit status 0; nothing is written to stderr about an error",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server that plays the hub for /api/v1/events, scripted per case; the command run through cli.Run with stdout and stderr captured and the reconnect wait driven by a fake clock"
+            ],
+            "pseudocode": "in internal/cli/events_test.go, TestEventsTail_InterruptExitsZero: while the fake hub holds a stream open, cancel the command's context as an interrupt does; assert cli.Run returns 0 and stderr holds no error envelope"
+          }
+        },
+        {
+          "id": "REQ-9.3",
+          "pattern": "event_driven",
+          "condition": "the stream of parley events tail ends for a reason other than an interrupt: the connection closes or fails, a connection attempt fails, or the hub answers 503, 429 or another status not among 400, 401, 403, 404 and 410",
+          "action": "reconnect by itself, waiting 1 second before the first attempt and twice as long before each further attempt up to 30 seconds, resuming with after set to the id of the last frame received, and print no event twice",
+          "contract": "the reconnect request carries after=<last frame id>; the waits before consecutive failed attempts are 1, 2, 4, 8, 16, 30, 30, … seconds and return to 1 after a connection that delivered a frame; stdout holds every event of the scripted log exactly once in seq order; the command keeps running",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server that plays the hub for /api/v1/events, scripted per case; the command run through cli.Run with stdout and stderr captured and the reconnect wait driven by a fake clock"
+            ],
+            "pseudocode": "in internal/cli/events_test.go, TestEventsTail_ReconnectsAndResumes: script the fake hub: connection 1 sends events 1,2 and heartbeat id 7 then closes; attempts 2..8 answer 503 with Retry-After or refuse the connection or answer 429; connection 9 expects after=7, resends nothing, sends 8, 9, then closes; connection 10 expects after=9 and sends event 9 again and 10; assert the after values seen by the hub, the fake-clock waits 1,2,4,8,16,30,30,30 before attempts 2 to 9 and 1 before connection 10, and stdout == lines for 1,2,8,9,10 once each"
+          }
+        },
+        {
+          "id": "REQ-9.4",
+          "pattern": "unwanted",
+          "condition": "the hub answers a request of parley events tail with 400, 401, 403, 404 or 410",
+          "action": "stop without retrying and without skipping events",
+          "contract": "exit status 1; the hub's error envelope is printed on stderr as received, including oldest_seq on 410 cursor_expired; exactly one request was sent for that answer",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server that plays the hub for /api/v1/events, scripted per case; the command run through cli.Run with stdout and stderr captured and the reconnect wait driven by a fake clock"
+            ],
+            "pseudocode": "in internal/cli/events_test.go, TestEventsTail_StopsOnPermanentErrors, a table over the hub answers {400 invalid_request, 401 unauthenticated, 403 insufficient_scope, 404 not_found, 410 cursor_expired with oldest_seq 31007}, each as the first answer and as the answer to a reconnect: assert exit status 1, stderr parses to the same envelope (error.oldest_seq == 31007 for the 410), no further request follows, and stdout holds only the events received before"
+          }
+        },
+        {
+          "id": "REQ-9.5",
+          "pattern": "unwanted",
+          "condition": "parley events tail or parley events list is given an --after value that is not a non-negative integer",
+          "action": "fail before sending any request",
+          "contract": "exit status 2; stderr holds the error envelope with code 0 and error_type usage_error; the hub receives no request",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server that plays the hub for /api/v1/events, scripted per case; the command run through cli.Run with stdout and stderr captured and the reconnect wait driven by a fake clock"
+            ],
+            "pseudocode": "in internal/cli/events_test.go, TestEvents_RejectsBadAfter, a table over {--after -1, --after x, --after 1.5} and both commands: assert exit status 2, stderr envelope error_type == 'usage_error', and the fake hub's request count is 0"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-10",
+      "title": "parley events list",
+      "rationale": "A script reads one page of the log, optionally waiting for the next event, with one command.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-10.1",
+          "pattern": "event_driven",
+          "condition": "parley events list is run with any of --workspace, --types, --session, --after, --limit and --wait",
+          "action": "call GET /events/log once with the flags as the query parameters workspace, types, session_id, after, limit and wait, with a request timeout of 30 seconds plus the wait, and print the response body on stdout as one JSON document",
+          "contract": "exit status 0; stdout is the response as JSON indented by 2 spaces; exactly one request is sent; with --wait 45 a response that arrives after 40 seconds is still printed",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server that plays the hub; the command run through cli.Run with stdout and stderr captured"
+            ],
+            "pseudocode": "in internal/cli/events_test.go, TestEventsList_CallsLogOnce: the fake hub answers /api/v1/events/log with a page; run 'events list --workspace api --types parley.change.* --session <uuid> --after 4 --limit 10 --wait 45'; assert one request with query workspace=api&types=parley.change.*&session_id=<uuid>&after=4&limit=10&wait=45, that the request timeout handed to the client is 75 s, stdout equals the body re-indented by 2 spaces, exit 0; run without flags and assert the query is empty and the timeout is 30 s"
+          }
+        },
+        {
+          "id": "REQ-10.2",
+          "pattern": "unwanted",
+          "condition": "the hub answers parley events list with an error",
+          "action": "print the hub's error envelope on stderr as received and nothing on stdout",
+          "contract": "exit status 1; stderr holds the envelope, with oldest_seq on 410 cursor_expired; stdout is empty",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server that plays the hub; the command run through cli.Run with stdout and stderr captured"
+            ],
+            "pseudocode": "in internal/cli/events_test.go, TestEventsList_PrintsHubErrors, a table over {400 invalid_request for --wait 61, 404 not_found, 410 cursor_expired with oldest_seq 31007}: assert exit status 1, stdout empty, stderr parses to the same envelope and for the 410 error.oldest_seq == 31007"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "A review agent follows the stream and resumes after a disconnect",
+      "steps": [
+        {
+          "actor": "review agent",
+          "action": "opens GET /api/v1/events?types=parley.change.* with a PAT that holds audit:read"
+        },
+        {
+          "actor": "parleyd",
+          "action": "authenticates the caller, checks the scope and the filters, and answers 200 with a heartbeat frame"
+        },
+        {
+          "actor": "developer",
+          "action": "sends a request that changes state in a workspace the review agent can read"
+        },
+        {
+          "actor": "parleyd",
+          "action": "commits the state change and its event in one store transaction with the next seq and sends the event on the stream"
+        },
+        {
+          "actor": "review agent",
+          "action": "loses the connection while two more events are committed, then reconnects with Last-Event-ID set to the last seq it received"
+        },
+        {
+          "actor": "parleyd",
+          "action": "replays the two events in seq order and continues with live events on the same connection"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parleyd started in-process on 127.0.0.1:0",
+          "the HTTP router and check order",
+          "authentication and the scope check",
+          "the access component",
+          "the event component",
+          "the transactional store on disk"
+        ],
+        "setup": [
+          "a hub with a developer who owns workspace 'api', a review agent user in the same org with a PAT holding audit:read",
+          "a test route registered on the hub that changes a row and emits parley.change.open in one transaction, standing in for the change routes of package 22"
+        ],
+        "end_state": [
+          "the review agent received the three events exactly once each, in seq order, over the two connections",
+          "the row written by each request exists together with its event"
+        ],
+        "pseudocode": "in test/e2e/events_test.go, TestEvents_StreamResumesWithoutLoss: open the stream over real HTTP, read the heartbeat; call the test route as the developer; read hub_event seq s; close the connection; call the test route twice; reopen with Last-Event-ID: s; read two hub_event frames and assert their ids are s+1 and s+2; call the route once more and assert a live frame s+3"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "A polling agent long-polls the log and recovers from an expired position",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "calls GET /api/v1/events/log?wait=30 with after set to last_seq"
+        },
+        {
+          "actor": "parleyd",
+          "action": "holds the request, and when a visible event is committed answers 200 with that event and next_after"
+        },
+        {
+          "actor": "operator",
+          "action": "lets retention run, so that old events leave the event log"
+        },
+        {
+          "actor": "agent",
+          "action": "comes back with its old position"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers 410 cursor_expired with oldest_seq"
+        },
+        {
+          "actor": "agent",
+          "action": "calls again with after = oldest_seq - 1 and receives the events still in the log"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parleyd started in-process on 127.0.0.1:0",
+          "the HTTP router and check order",
+          "the access component",
+          "the event component with its expire operation",
+          "the transactional store on disk"
+        ],
+        "setup": [
+          "a hub with an agent's PAT holding audit:read and read access to workspace 'api'",
+          "the hub's clock replaced by a fake clock",
+          "the test emit route of PATH-1"
+        ],
+        "end_state": [
+          "the long-poll returned the event committed while it was held",
+          "the stale position was answered 410 with oldest_seq, and the request with oldest_seq - 1 returned exactly the events from oldest_seq to last_seq"
+        ],
+        "pseudocode": "in test/e2e/events_test.go, TestEvents_LongPollAndExpiredCursor: emit 5 events at T; start GET /events/log?wait=30&after=5 in a goroutine; emit one event; assert the answer holds seq 6; advance the clock 3 h, emit seq 7, call the event component's expire operation with cutoff T+1h as package 51's retention step does; GET /events/log?after=2 -> 410 with error.oldest_seq == 7; GET /events/log?after=6 -> 200 with item seq 7"
+      }
+    },
+    {
+      "id": "PATH-3",
+      "title": "A developer tails events from the shell across a hub restart",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "runs parley events tail --workspace api"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "opens GET /api/v1/events?workspace=api with the stored credential and no request timeout"
+        },
+        {
+          "actor": "parleyd",
+          "action": "sends a heartbeat and then each event of the workspace as it is committed"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints each event as one line of compact JSON on stdout"
+        },
+        {
+          "actor": "operator",
+          "action": "restarts parleyd while events keep being written after the restart"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sees the stream end, waits, reconnects with after set to the last position it received and prints the events written meanwhile once each"
+        },
+        {
+          "actor": "developer",
+          "action": "interrupts the command, which exits with status 0"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the parley CLI run through cli.Run",
+          "parleyd started in-process, stopped and started again on the same data directory and port",
+          "the event component",
+          "the transactional store on disk"
+        ],
+        "setup": [
+          "a hub with a developer who owns workspace 'api' and an API key in the client configuration",
+          "the test emit route of PATH-1"
+        ],
+        "end_state": [
+          "stdout of the command holds one line for every event of 'api', before and after the restart, each exactly once and in seq order",
+          "the seq of the first event after the restart is the last seq before it plus 1",
+          "the command exited with status 0 after the interrupt"
+        ],
+        "pseudocode": "in test/e2e/events_test.go, TestEvents_TailSurvivesRestart: start the hub; run 'events tail --workspace api' in a goroutine; emit 2 events and wait for 2 lines; stop the hub; start it again on the same data directory and address; emit 2 events; wait for 4 lines in total; cancel the command; assert exit status 0 and that the seqs of the lines are 4 consecutive numbers"
+      }
+    }
+  ]
+}

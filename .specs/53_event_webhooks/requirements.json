@@ -1,0 +1,1049 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "53",
+  "spec_name": "event_webhooks",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Owner-only access to the webhook routes",
+      "rationale": "A subscription sends the owner-only events of a workspace to a URL, so only the owner may configure one, and a task fork has none of its own.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "the owner of a repository workspace or the admin token calls one of the nine routes under /api/v1/workspaces/:slug/webhooks with a credential that is not a workspace-bound token and that, when it is a PAT, carries workspaces:write for the writing routes (create, update, delete, rotate-secret, ping, redeliver) or workspaces:read or workspaces:write for the reading routes (list, get, deliveries)",
+          "action": "run the route's handler",
+          "contract": "the route's success status: 201 for create, 204 for delete, 200 for the other seven",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock",
+              "one subscription of demo with one succeeded delivery, so that every route has something to address"
+            ],
+            "pseudocode": "in internal/webhook/routes_test.go with httptest and a stub sender that answers 200, a table over the nine routes x {owner API key, admin token, owner PAT with workspaces:write}, plus the three reading routes x {owner PAT with only workspaces:read}: assert the success status of each route"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "unwanted",
+          "condition": "one of the nine routes is called by an org member of the workspace, by a user with no access to it, by a workspace-bound token, or by a PAT without the scope the route needs",
+          "action": "refuse the request before its handler runs and change nothing",
+          "contract": "org member: HTTP 403 with error_type forbidden; no access: HTTP 404 with error_type not_found; workspace-bound token of the owner bound to this workspace: HTTP 403 with error_type token_bound; owner PAT with only workspaces:read on a writing route, or with neither scope on any route: HTTP 403 with error_type insufficient_scope; in every case no subscription or delivery row changes, no event is written and no outbound request is made",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock",
+              "the binding guard, scope check and access rule installed in the router as the packages that own them install them",
+              "one subscription of demo with one succeeded delivery"
+            ],
+            "pseudocode": "in internal/webhook/routes_test.go, a table over the nine routes x {org member API key -> 403 forbidden; outsider API key -> 404 not_found; owner's PAT bound to demo with workspaces:write -> 403 token_bound; owner PAT with only workspaces:read on the six writing routes -> 403 insufficient_scope; owner PAT with only changes:read -> 403 insufficient_scope}: assert status and error.error_type; assert the subscription and delivery rows are equal to their snapshot, the event log's last seq is unchanged and the stub sender recorded no call"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "unwanted",
+          "condition": "one of the nine routes is called with the slug of a task fork by a caller with level owner or admin on the fork",
+          "action": "refuse the request whatever its body is",
+          "contract": "HTTP 400 with error_type not_supported_on_fork; nothing is stored and no event is written",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock",
+              "the fork record 'demo--t1' with parent demo"
+            ],
+            "pseudocode": "in internal/webhook/routes_test.go, a table over the nine routes with the slug 'demo--t1' (kind fork, parent demo) called by the fork's owner and by the admin token, the create carrying an invalid body {url: 'ftp://x'}: assert status == 400 and error.error_type == 'not_supported_on_fork'; assert no subscription row has workspace 'demo--t1'"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "unwanted",
+          "condition": "a route with :id is called with an :id that is not a UUID, or with a UUID that names no subscription of the addressed workspace",
+          "action": "refuse the request and change nothing",
+          "contract": "not a UUID: HTTP 400 with error_type invalid_request; a UUID naming no subscription, or naming a subscription of another workspace: HTTP 404 with error_type webhook_not_found, the two 404 bodies being byte-equal",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock",
+              "a second workspace 'other' owned by u_1 with one subscription"
+            ],
+            "pseudocode": "in internal/webhook/routes_test.go, a table over the seven routes with :id x {'abc' -> 400 invalid_request; a random UUID -> 404 webhook_not_found; the id of a subscription of the workspace 'other', called on demo by a user who owns both -> 404 webhook_not_found}: assert status and error.error_type; assert the two 404 bodies are byte-equal; assert the subscription of 'other' is unchanged"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Creating a subscription with a signing secret shown once",
+      "rationale": "The receiver needs a secret to tell the hub's deliveries from anyone else's, and the hub must not be able to leak it afterwards.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "an owner or the admin token sends POST /api/v1/workspaces/:slug/webhooks with a valid url and optionally types, include_forks and description",
+          "action": "store the subscription with a newly generated signing secret, write parley.webhook.create in the same transaction, set the subscription's position to the seq of that event, and answer with the subscription plus secret",
+          "contract": "HTTP 201 with body {id: UUID, workspace: the slug, url, types (default ['*']), include_forks (default true), description (default ''), state: 'active', created_by: the caller's user id or null for the admin token, created_at, updated_at, last_delivery_at: null, last_status: null, failing_since: null, secret: 'whsec_' followed by 64 lower-case hexadecimal characters}; one event parley.webhook.create with workspace the slug, the caller as actor, resource_type 'event_webhook', resource_id the id and metadata {webhook_id, host, types, include_forks}",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock",
+              "a stub resolver that resolves ci.example to 203.0.113.10"
+            ],
+            "pseudocode": "in internal/webhook/subscription_test.go, a table {body {url: 'https://ci.example/hooks/parley?t=1'} by the owner -> defaults, created_by 'u_1'; body with types ['parley.change.*', 'parley.git.push'], include_forks false, description 'CI' by the admin token -> those values, created_by null}: assert status == 201 and every member of the contract; assert secret matches ^whsec_[0-9a-f]{64}$ and two creates return different secrets; assert the event log gained exactly one parley.webhook.create whose metadata.host == 'ci.example' and whose metadata has no member holding the url's path or query; assert the stored position equals that event's seq"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "unwanted",
+          "condition": "the create body violates a field rule: url missing, not absolute, not https, without a host, with userinfo, with a fragment or longer than 2,048 characters; types not a list of strings, empty, longer than 20 entries, or holding an entry that is empty or has '*' anywhere but as its last character; include_forks not a bool; description not a string or longer than 1,024 characters",
+          "action": "refuse the create and store nothing",
+          "contract": "HTTP 400 with error_type invalid_request and a message that names the violating field (url, types, include_forks or description); no subscription row, no event",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock"
+            ],
+            "pseudocode": "in internal/webhook/subscription_test.go, a table of bodies -> field {no url -> url; url 'ci.example/x' -> url; 'http://ci.example/x' with allow_insecure false -> url; 'http://ci.example/x' with allow_insecure true -> url; 'https:///x' -> url; 'https://u:p@ci.example/' -> url; 'https://ci.example/#f' -> url; an https url of 2,049 characters -> url; types 'x' -> types; types [] -> types; 21 entries -> types; ['parley.*.land'] -> types; [''] -> types; include_forks 'yes' -> include_forks; description 7 -> description; a description of 1,025 characters -> description}: assert status == 400, error.error_type == 'invalid_request' and the field's name is in error.message; assert count(subscriptions) == 0 and the event log is unchanged; and the boundary rows {an https url of exactly 2,048 characters, 20 types entries, a description of 1,024 characters, an unknown member 'color'} -> 201"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "unwanted",
+          "condition": "a create arrives while the workspace already has [webhooks].max_per_workspace subscriptions in whatever state",
+          "action": "refuse the create and store nothing",
+          "contract": "HTTP 429 with error_type webhook_limit_reached; the count of the workspace's subscriptions is unchanged and no event is written",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock"
+            ],
+            "pseudocode": "in internal/webhook/subscription_test.go, a table {max 2 with one active and one disabled subscription -> 429; max 2 with one subscription -> 201 and then 429; max 0 with none -> 429; max 2 on demo full while 'other' has none: create on 'other' -> 201}: assert status and error.error_type == 'webhook_limit_reached'; assert the count is unchanged after each 429"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "unwanted",
+          "condition": "a create, an update or a rotate-secret arrives for a workspace whose status is archived",
+          "action": "refuse the request and change nothing",
+          "contract": "HTTP 409 with error_type workspace_archived; the subscription rows and the stored secrets are unchanged and no event is written",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock",
+              "one subscription of demo, then demo's status set to archived"
+            ],
+            "pseudocode": "in internal/webhook/subscription_test.go, a table {POST …/webhooks with a valid body, PATCH …/webhooks/ID {description: 'x'}, PATCH …/webhooks/ID {active: false}, POST …/webhooks/ID/rotate-secret} by the owner: assert status == 409 and error.error_type == 'workspace_archived'; assert the rows and the stored ciphertext equal their snapshot"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "unwanted",
+          "condition": "a create or a rotate-secret arrives while no encryption key is configured",
+          "action": "refuse the request and store nothing",
+          "contract": "HTTP 503 with error_type secrets_unavailable; no subscription is created, a stored secret is unchanged and no event is written",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "as the other create checks, but without an encryption key for the request under test"
+            ],
+            "pseudocode": "in internal/webhook/subscription_test.go with the secret component constructed without a key, a table {POST …/webhooks with a valid body; POST …/webhooks/ID/rotate-secret on a subscription stored earlier with a key}: assert status == 503 and error.error_type == 'secrets_unavailable'; assert count(subscriptions) and the stored ciphertext are unchanged"
+          }
+        },
+        {
+          "id": "REQ-2.6",
+          "pattern": "event_driven",
+          "condition": "a create is repeated with the same Idempotency-Key, caller and body within 24 hours",
+          "action": "create nothing and answer with the subscription of the first request without its secret",
+          "contract": "HTTP 200 with the body of the first answer minus the member secret; one subscription and one parley.webhook.create event exist",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock"
+            ],
+            "pseudocode": "in internal/webhook/subscription_test.go through the router with the idempotency middleware of internal/server: r1 = POST with Idempotency-Key 'k1'; r2 = the same request again; assert r1.status == 201 and r2.status == 200; assert r2.json == r1.json without 'secret' and 'secret' is absent from r2.json; assert count(subscriptions) == 1 and the event log holds one parley.webhook.create"
+          }
+        },
+        {
+          "id": "REQ-2.7",
+          "pattern": "ubiquitous",
+          "action": "for any subscription, store the signing secret only encrypted with the key that encrypts secrets, and return or write it nowhere but in the member secret of the 201 create response and of the 200 rotate-secret response",
+          "contract": "the store holds no plaintext secret; the bodies of list, get, update, ping, deliveries, redeliver and an idempotent replay, every parley.webhook.* event and every log line contain neither the secret nor a member named secret",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock",
+              "a stub sender that answers 200"
+            ],
+            "pseudocode": "in internal/webhook/subscription_test.go with the logger writing to a buffer: create (secret s1), rotate (secret s2), then call list, get, PATCH {description}, ping, deliveries and redeliver and let one event be delivered; assert no response body of those six routes contains s1, s2 or a key 'secret'; assert no event of the log and no byte of the log buffer contains s1 or s2; assert a scan of every column of the webhook tables finds neither s1 nor s2 as text; assert decrypting the stored ciphertext with the secret component gives s2"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Destination safety",
+      "rationale": "Without it a subscription would let any workspace owner make the hub send requests into the hub's own network.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "unwanted",
+          "condition": "a create, or an update that gives url, names a host that is, or that resolves to, a loopback, link-local, private, unique-local, unspecified, multicast or cloud-metadata address, over IPv4 or IPv6, while [webhooks].allow_private is false",
+          "action": "refuse the request and leave the stored url as it was",
+          "contract": "HTTP 400 with error_type webhook_destination_refused; no subscription is created, an existing subscription keeps its url, and no event is written",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock",
+              "a stub resolver"
+            ],
+            "pseudocode": "in internal/webhook/destination_test.go, a table of https urls over the hosts {127.0.0.1, 127.8.9.10, localhost, 169.254.1.1, 169.254.169.254, 10.0.0.1, 172.16.0.1, 172.31.255.255, 192.168.1.1, 0.0.0.0, 224.0.0.1, [::1], [fe80::1], [fc00::1], [fd00:ec2::254], [::], [ff02::1], [::ffff:10.0.0.1], the name 'inside.example' resolved by the stub to 10.0.0.5, the name 'mixed.example' resolved to 203.0.113.10 and 10.0.0.5} x {create, PATCH {url}}: assert status == 400 and error.error_type == 'webhook_destination_refused'; assert the stored url is unchanged; and the accepted rows {203.0.113.10, 172.32.0.1, [2001:db8::1], 'ci.example' resolved to 203.0.113.10, 'nowhere.example' that the stub fails to resolve} -> 201 for create and 200 for PATCH"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "optional",
+          "condition": "[webhooks].allow_private is true",
+          "action": "accept https destinations on loopback, link-local, private, unique-local, unspecified, multicast and cloud-metadata addresses at create, at update and at every delivery attempt",
+          "contract": "HTTP 201 for the create and 200 for the update; an attempt to such an address is connected and not failed with destination_refused",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock"
+            ],
+            "pseudocode": "in internal/webhook/destination_test.go with allow_private true, a table over https urls with the hosts {127.0.0.1, 10.0.0.1, 169.254.169.254, [::1], [fc00::1]}: assert create answers 201 and PATCH {url} answers 200; assert the connection check of the sender returns no refusal for each address; assert 'http://10.0.0.1/x' still answers 400 invalid_request"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "optional",
+          "condition": "[webhooks].allow_insecure is true",
+          "action": "accept http:// urls whose host is a loopback address (a literal address in 127.0.0.0/8, ::1, or the name localhost) and lift the destination refusal for exactly those urls",
+          "contract": "HTTP 201 for a create with such a url; an http url with any other host answers 400 invalid_request; an https url to a loopback address still answers 400 webhook_destination_refused while allow_private is false",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock"
+            ],
+            "pseudocode": "in internal/webhook/destination_test.go with allow_insecure true and allow_private false, a table {'http://127.0.0.1:8080/h' -> 201; 'http://[::1]:8080/h' -> 201; 'http://localhost:8080/h' -> 201; 'http://ci.example/h' -> 400 invalid_request; 'http://10.0.0.1/h' -> 400 invalid_request; 'https://127.0.0.1/h' -> 400 webhook_destination_refused}: assert status and error.error_type; assert the connection check of the sender allows 127.0.0.1 for the http subscription and refuses it for an https one"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "unwanted",
+          "condition": "a delivery attempt, a ping or a redelivery is about to connect to an address that the destination rules refuse, for example because the name now resolves to another address than at creation",
+          "action": "fail the attempt without opening the connection and treat it as any failed attempt",
+          "contract": "the attempt's outcome is a failure with error 'destination_refused' and response_code null; no TCP connection to the refused address is opened",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock",
+              "a stub resolver whose answers the test changes",
+              "a TCP listener on 127.0.0.1"
+            ],
+            "pseudocode": "in internal/webhook/sender_test.go with the real sender and dialer, a table over the address the stub resolver gives for 'moved.example' at the time of the attempt {the 127.0.0.1 address of the local listener; 10.0.0.5; ::1; two addresses of which the dialer is handed the listener's first}, the subscription having been created while the name resolved to 203.0.113.10: send one attempt for 'https://moved.example:<port>/h'; assert the outcome is a failure with error 'destination_refused' and response_code null; assert the listener accepted 0 connections; with allow_private true assert the same attempt reaches the listener"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Reading, changing, switching, deleting and rotating a subscription",
+      "rationale": "An owner must be able to see what is configured, repair a URL or a filter, switch a subscription off and on, and replace a secret that leaked.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "an owner sends GET /api/v1/workspaces/:slug/webhooks, optionally with state, limit and cursor",
+          "action": "answer the workspace's subscriptions in (created_at, id) ascending order, only those in the given state when state is given",
+          "contract": "HTTP 200 with the list envelope {items, next_cursor}; every item is a subscription object without secret; a state outside active, failing and disabled answers HTTP 400 with error_type invalid_request",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock",
+              "five subscriptions of demo, two with the same created_at, one of them disabled, and one subscription of the workspace 'other'"
+            ],
+            "pseudocode": "in internal/webhook/routes_test.go: assert GET returns the five ids in (created_at, id) order, the two that share a created_at ordered by id; assert ?limit=2 pages 2, 2, 1 with next_cursor null on the last page and no id repeated; assert ?state=disabled returns the one disabled subscription and ?state=failing an empty items array; assert ?state=paused answers 400 invalid_request; assert no item has a member 'secret'; assert the subscription of 'other' is in no page"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "event_driven",
+          "condition": "an owner sends GET /api/v1/workspaces/:slug/webhooks/:id",
+          "action": "answer the subscription plus pending, the number of events after its position that it may receive and that match its types, the event of a pending delivery included, and 0 for a disabled subscription",
+          "contract": "HTTP 200 with the subscription object and the integer member pending; no member secret",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock"
+            ],
+            "pseudocode": "in internal/webhook/routes_test.go with the delivery loop not running: assert pending == 0 right after create; write three events of demo of type parley.change.open, one of type parley.git.push and one of the workspace 'other'; with types ['parley.change.*'] assert pending == 3; PATCH {active: false} and assert pending == 0"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "event_driven",
+          "condition": "an owner sends PATCH /api/v1/workspaces/:slug/webhooks/:id with at least one of url, types, include_forks, description and active, all valid",
+          "action": "change exactly the fields given, keep the pending delivery, use a changed url for the next attempt and a changed filter for every event not yet examined, and write parley.webhook.update in the same transaction",
+          "contract": "HTTP 200 with the subscription, updated_at set to now and fields not given unchanged; one event parley.webhook.update with metadata {webhook_id, fields: the names of the fields given, state: the state after the change}",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock",
+              "allow_insecure true so that the httptest receivers on 127.0.0.1 are accepted"
+            ],
+            "pseudocode": "in internal/webhook/subscription_test.go with two httptest receivers A (answers 500) and B (answers 200) and the real loop: create for A with types ['*']; write event e1; run the loop until the delivery of e1 is pending with attempts 1; write e2 of type parley.git.push and e3 of type parley.change.open; PATCH {url: B, types: ['parley.change.*'], description: 'd'}; assert 200, description 'd', include_forks unchanged; assert the update event's metadata.fields == ['url', 'types', 'description'] and metadata.state == 'active'; advance the clock 10s; assert B received e1 under the delivery id A saw, then e3, and never e2; assert A received nothing after the PATCH"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "unwanted",
+          "condition": "a PATCH body has none of the five fields, has a member that is none of them, or gives one of them a value that the field rules of the create refuse or an active that is not a bool",
+          "action": "refuse the update and change nothing",
+          "contract": "HTTP 400 with error_type invalid_request; the subscription row is unchanged and no event is written",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock",
+              "one subscription of demo"
+            ],
+            "pseudocode": "in internal/webhook/subscription_test.go, a table of bodies {{} ; {color: 'red'}; {description: 'x', color: 'red'}; {active: 'yes'}; {url: 'http://ci.example/x'}; {types: []}; {include_forks: 1}; a description of 1,025 characters}: assert status == 400 and error.error_type == 'invalid_request'; assert the row equals its snapshot and the event log is unchanged"
+          }
+        },
+        {
+          "id": "REQ-4.5",
+          "pattern": "event_driven",
+          "condition": "an owner sends PATCH with active: true for a subscription that is disabled or failing",
+          "action": "set the state to active and clear failing_since; for a subscription that was disabled, set its position to the seq of the parley.webhook.update event of this request, so that it resumes with the first event written afterwards and sends none written while it was disabled; for a subscription that was failing, keep its position and its pending delivery",
+          "contract": "HTTP 200 with state 'active' and failing_since null; one parley.webhook.update event with fields ['active'] and state 'active'; a receiver of a re-enabled disabled subscription gets no event whose seq is at or below that of the update event",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock",
+              "allow_insecure true"
+            ],
+            "pseudocode": "in internal/webhook/state_test.go with an httptest receiver and the real loop: (a) disable with PATCH {active: false}; write events e1 and e2; PATCH {active: true}; write e3; run the loop; assert the receiver got exactly e3; assert GET shows state 'active', failing_since null. (b) a subscription made failing by a receiver that answers 500 for 24h, with a pending delivery of the next event: PATCH {active: true}; assert state 'active', failing_since null, the pending delivery still pending with the same id and the position unchanged"
+          }
+        },
+        {
+          "id": "REQ-4.6",
+          "pattern": "event_driven",
+          "condition": "an owner sends PATCH with active: false",
+          "action": "set the state to disabled, mark the pending delivery failed with next_attempt_at null, and send nothing further for the subscription",
+          "contract": "HTTP 200 with state 'disabled'; one parley.webhook.update event with fields ['active'] and state 'disabled'; the former pending delivery is listed with status 'failed'; no request reaches the receiver while the subscription is disabled",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock",
+              "allow_insecure true"
+            ],
+            "pseudocode": "in internal/webhook/state_test.go with a receiver that answers 500: write e1, run the loop until its delivery is pending with attempts 1; PATCH {active: false}; assert 200 and state 'disabled'; assert the delivery has status 'failed' and next_attempt_at null; write e2 and advance the clock 2h; assert the receiver's request count is still 1 and no delivery record exists for e2"
+          }
+        },
+        {
+          "id": "REQ-4.7",
+          "pattern": "event_driven",
+          "condition": "an owner sends DELETE /api/v1/workspaces/:slug/webhooks/:id, in any workspace status",
+          "action": "remove the subscription with its pending delivery, its delivery log and its signing secret, stop its deliveries, and write parley.webhook.delete in the same transaction",
+          "contract": "HTTP 204 with no body; a later GET of the id answers 404 webhook_not_found; no delivery row and no ciphertext of the subscription remains; one event parley.webhook.delete with metadata {webhook_id, host}",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock",
+              "a stub sender"
+            ],
+            "pseudocode": "in internal/webhook/subscription_test.go, a table over the workspace status {ready, archived}: a subscription with one succeeded and one pending delivery; DELETE; assert 204 and an empty body; assert GET answers 404 webhook_not_found; assert count(deliveries of the id) == 0 and no row holds its ciphertext; assert the delete event's metadata == {webhook_id, host: 'ci.example'}; advance the clock 1h and assert the stub sender recorded no call after the delete"
+          }
+        },
+        {
+          "id": "REQ-4.8",
+          "pattern": "event_driven",
+          "condition": "an owner sends POST /api/v1/workspaces/:slug/webhooks/:id/rotate-secret",
+          "action": "replace the signing secret with a newly generated one, sign every attempt that starts afterwards with it, also for a delivery that is being retried, and write parley.webhook.update with fields ['secret'] in the same transaction",
+          "contract": "HTTP 200 with the subscription plus secret, a new value of the form whsec_ and 64 lower-case hexadecimal characters that differs from the old one; the next request the receiver gets verifies with the new secret and not with the old one; the update event's metadata is {webhook_id, fields: ['secret'], state}",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock",
+              "allow_insecure true"
+            ],
+            "pseudocode": "in internal/webhook/subscription_test.go with a receiver that answers 500 and records its requests: create (s1); write e1; run the loop (attempt 1); rotate (s2); assert 200, s2 matches ^whsec_[0-9a-f]{64}$ and s2 != s1; advance the clock 10s (attempt 2); assert hmac(s1) verifies request 1 and not request 2, and hmac(s2) verifies request 2; assert both requests carry the same Parley-Delivery; assert the update event's metadata.fields == ['secret']"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "The signed delivery request and the outcome of an attempt",
+      "rationale": "A receiver must be able to verify where a delivery came from and drop duplicates, and the hub must judge every attempt by one rule.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "the hub makes a delivery attempt for an event",
+          "action": "send one HTTP POST to the subscription's url whose body is the event record as one JSON object, byte for byte as the event log returns it, with the headers Content-Type application/json, Parley-Event (the type), Parley-Delivery (the delivery id), Parley-Seq (the seq), Parley-Timestamp (Unix seconds at which this attempt is sent), Parley-Signature and User-Agent parley-webhook/<hub version>, and with no Authorization header, no cookie and no other header that identifies a user",
+          "contract": "the receiver gets method POST on the url's path and query; the body equals the JSON object GET /events/log returns for that seq; the six Parley and User-Agent headers have the values named; Authorization and Cookie are absent",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock",
+              "allow_private true so that the TLS receiver on 127.0.0.1 is accepted"
+            ],
+            "pseudocode": "in internal/webhook/sender_test.go with an httptest TLS receiver whose certificate pool is given to the sender as trust roots, and the real event component: write an event of demo with metadata {a: 1}; send one attempt; assert method == 'POST' and the request URI == '/h?t=1'; assert the body bytes == the JSON of the same event from the event component's log read; assert Content-Type == 'application/json', Parley-Event == the type, Parley-Seq == the decimal seq, Parley-Delivery == the delivery id, Parley-Timestamp == the decimal Unix seconds of the controlled clock, User-Agent == 'parley-webhook/' + buildinfo version; assert the headers Authorization and Cookie are absent and the header set is a subset of {the seven named, Host, Content-Length, Accept-Encoding}"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "ubiquitous",
+          "action": "for any attempt, set Parley-Signature to 'sha256=' followed by the lower-case hexadecimal HMAC-SHA256, keyed with the signing secret as shown to the owner (the ASCII bytes of whsec_ and its 64 hexadecimal characters), of the Parley-Timestamp value, a dot and the exact bytes of the body, with a new timestamp and signature on every attempt",
+          "contract": "a receiver that computes HMAC-SHA256 over '<Parley-Timestamp>.<body>' with the secret from the create response obtains the header value; two attempts of one delivery made at different seconds carry different timestamps and different signatures and the same Parley-Delivery",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock",
+              "a recording stub transport"
+            ],
+            "pseudocode": "in internal/webhook/sender_test.go, a table over bodies {an event with empty metadata, an event whose metadata holds non-ASCII text, a ping}: verify = 'sha256=' + hex(hmac_sha256(key = secret string, msg = ts + '.' + body)); assert the header == verify and matches ^sha256=[0-9a-f]{64}$; assert a body with one byte changed, or the timestamp plus one, does not verify; make a second attempt of the same delivery with the clock 3600s later; assert its timestamp is 3600 greater, its signature differs and verifies, and Parley-Delivery is equal"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "event_driven",
+          "condition": "a response with a status from 200 to 299 arrives within [webhooks].timeout",
+          "action": "count the attempt as succeeded without storing the response body",
+          "contract": "the delivery record has response_code the status, error null and duration_ms >= 0; no stored column holds the response body",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock"
+            ],
+            "pseudocode": "in internal/webhook/sender_test.go, a table over receiver statuses {200, 201, 204, 299} with a response body that starts with 'RESPONSE-MARKER': assert the outcome is success, response_code == the status, error == null; assert a scan of the webhook tables finds no 'RESPONSE-MARKER'; and with [webhooks].timeout 1s and a receiver that sends status 200 at once and then keeps the body open for 5s: assert the outcome is success and is returned within 2s"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "unwanted",
+          "condition": "an attempt ends in anything but a 2xx response within [webhooks].timeout: another status, a 3xx status, no response status within the timeout, a connection that cannot be opened, or a TLS handshake that fails, an untrusted certificate included",
+          "action": "count the attempt as failed, not follow a redirect, and record why",
+          "contract": "status 400 to 599 or 100-class: response_code the status and error null; status 300 to 399: response_code the status, error 'redirect', and no request is sent to the Location; timeout: response_code null and error 'timeout', the attempt ending no later than the timeout; connection failure: response_code null and error 'connection_failed'; TLS failure: response_code null and error 'tls_error'",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock",
+              "allow_private true and allow_insecure true"
+            ],
+            "pseudocode": "in internal/webhook/sender_test.go with the real sender and [webhooks].timeout 1s, a table {receiver answers 404 -> (404, null); 500 -> (500, null); 302 with Location to a second receiver -> (302, 'redirect') and the second receiver's request count == 0; a receiver that accepts and sends no status for 3s -> (null, 'timeout') and the attempt returns within 2s; a receiver that sends its status after 3s -> (null, 'timeout'); a closed port -> (null, 'connection_failed'); a name the stub resolver fails -> (null, 'connection_failed'); a TLS receiver whose certificate is not in the sender's trust roots -> (null, 'tls_error'); a plain-HTTP listener behind an https url -> (null, 'tls_error')}: assert the outcome is failure and (response_code, error) of the delivery record"
+          }
+        },
+        {
+          "id": "REQ-5.5",
+          "pattern": "unwanted",
+          "condition": "the signing secret of a subscription cannot be decrypted, because no encryption key is configured or the stored value matches neither configured key",
+          "action": "send nothing unsigned: refuse a ping and a redelivery, and in the delivery loop make no attempt, leave the delivery and the position as they are, and try again within one minute",
+          "contract": "ping and redeliver answer HTTP 503 with error_type secrets_unavailable and create or change no delivery record; the receiver gets no request; the pending delivery keeps its attempts count; once the key is back the event is delivered",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock",
+              "a stub sender",
+              "one succeeded delivery made before decryption was switched off"
+            ],
+            "pseudocode": "in internal/webhook/sender_test.go with a secret component whose decryption the test switches off: write e1 and run the loop; assert the receiver's request count == 0 and no delivery has attempts > 0; assert POST …/ping and POST …/redeliver of an older succeeded delivery answer 503 secrets_unavailable and the delivery rows equal their snapshot; switch decryption on and advance the clock 60s; assert the receiver got e1 once"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Ordered, at-least-once delivery of the events a subscription may receive",
+      "rationale": "A consumer that reacts to events needs them in the order they happened, and must not get events of workspaces it has no right to see.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "an event is written that an active or failing subscription may receive and that matches its types, and no earlier event of the subscription is undelivered",
+          "action": "record a pending delivery with a new id, make the first attempt without waiting for a timer, and on success mark the delivery succeeded, move the position past the event, set last_status to succeeded and last_delivery_at to the attempt's time and clear failing_since",
+          "contract": "the receiver gets the event once; the delivery record is {seq, type, status: 'succeeded', attempts: 1, response_code: 200, error: null, next_attempt_at: null}; the subscription reads last_status 'succeeded', last_delivery_at set, failing_since null; GET of the subscription shows pending 0",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock",
+              "allow_insecure true",
+              "one active subscription of demo with types ['*']"
+            ],
+            "pseudocode": "in internal/webhook/loop_test.go with the real loop, the real event component and an httptest receiver answering 200: write one event of demo through the event component without advancing the clock; wait for the receiver's first request; assert its Parley-Seq == the event's seq; assert the delivery record and the subscription fields of the contract; assert the stored position == the event's seq and pending == 0"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "ubiquitous",
+          "action": "for any subscription, send its events in ascending seq order with at most one attempt in flight, and send the next event only after the current one has succeeded or been given up",
+          "contract": "over any run, the first-attempt requests a receiver gets through the loop have strictly ascending Parley-Seq; while an event's delivery is pending no request carries a higher Parley-Seq; a repeated event carries the Parley-Delivery of its first attempt",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock",
+              "allow_insecure true"
+            ],
+            "pseudocode": "in internal/webhook/loop_test.go with a receiver that answers by script and records (seq, delivery id, time): write 20 events at once; script {fail e3 twice, then 200; all others 200}; drive the clock until pending == 0; assert the sequence of distinct seqs in arrival order is ascending and complete; assert between the first and the last request for e3 no request has another seq; assert the three requests for e3 share one delivery id; assert the receiver's maximum number of concurrent requests == 1"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "ubiquitous",
+          "action": "for any subscription, deliver exactly the events that an owner of its workspace may see and that match its types: every event whose workspace is the subscription's workspace, the types parley.secret.*, parley.token.* and parley.webhook.* included; with include_forks true every event whose workspace is a task fork of that workspace, also after the fork's record is gone; never an event without a workspace or of another workspace; and move the position past an event that is not delivered without recording a delivery",
+          "contract": "the receiver gets the events of the matching rows and no others; no delivery record exists for a skipped event; after the run the position is the seq of the last event written",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock",
+              "allow_insecure true",
+              "the fork record 'demo--t1' with parent demo and a workspace 'other' of the same owner"
+            ],
+            "pseudocode": "in internal/webhook/loop_test.go with the real event component and its visibility rule, a table of written events -> delivered, for a subscription of demo with types ['parley.change.*', 'parley.secret.set', 'parley.webhook.*', 'parley.fork.expire'] and include_forks true: {parley.change.open of demo -> yes; parley.git.push of demo -> no; parley.secret.set of demo -> yes; parley.token.bind of demo -> no (type); parley.webhook.update of demo -> yes; parley.change.open of fork demo--t1 -> yes; parley.fork.expire of demo--t1 written after the fork record was deleted -> yes; parley.change.open of 'other' -> no; parley.secret.set with workspace null and metadata.scope 'user' of the owner -> no}; the same events with include_forks false -> the two fork rows become no; assert the set of delivered seqs; assert count(delivery records) == count(delivered); assert position == last seq"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "ubiquitous",
+          "action": "for any subscription, send no event written before the subscription was created",
+          "contract": "events with a seq at or below that of the subscription's parley.webhook.create event never reach its receiver, whatever its types; the first event it can receive is the next one written",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock",
+              "allow_insecure true"
+            ],
+            "pseudocode": "in internal/webhook/loop_test.go: write three events of demo; create the subscription with types ['*']; write one more event e4; run the loop until pending == 0; assert the receiver got exactly e4 and neither the three older events nor the subscription's own parley.webhook.create"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "state_driven",
+          "condition": "the receiver of one subscription does not answer or fails",
+          "action": "keep delivering to every other subscription without waiting for it",
+          "contract": "a second subscription of the same workspace receives each event while the first subscription's delivery of an earlier event is still pending",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock",
+              "allow_insecure true",
+              "[webhooks].timeout 60s"
+            ],
+            "pseudocode": "in internal/webhook/loop_test.go with receiver A that blocks until the test releases it and receiver B answering 200, both subscribed to demo: write e1, e2, e3; assert B received e1, e2 and e3 while A's handler is still blocked in e1; assert A's delivery of e1 is pending and A has no delivery record for e2; release A"
+          }
+        },
+        {
+          "id": "REQ-6.6",
+          "pattern": "unwanted",
+          "condition": "the event a subscription would send next has left the event log before its turn came, either because the stored position is older than the oldest event of the log or because the event of a pending delivery is gone",
+          "action": "skip what can no longer be read, count it as failed, and go on with the oldest event the log still holds, without making the subscription failing",
+          "contract": "the position moves to just before the oldest event of the log, or past the vanished event; a pending delivery of a vanished event becomes status 'failed' with next_attempt_at null; the recorder's count for result 'failed' grows by one; state and failing_since are unchanged; the next readable event is delivered",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock",
+              "a stub sender answering 200 and a recording metrics recorder"
+            ],
+            "pseudocode": "in internal/webhook/loop_test.go with a stub event log, a table {position 10 while the log's oldest seq is 50 and e50 matches -> position passes 49, recorder.failed == 1, the receiver gets e50; a pending delivery of e12 whose read now reports the event gone -> the delivery is 'failed', recorder.failed == 1, the receiver gets e50}: assert state == 'active' and failing_since is what it was; assert no parley.webhook.failing event was written"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "Retries, the failing state and disabling",
+      "rationale": "A receiver that is briefly down must lose nothing, and one that is gone for good must not be retried for ever.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "event_driven",
+          "condition": "an attempt of the delivery loop fails less than 24 hours after the first attempt of its event",
+          "action": "keep the delivery pending, add one to attempts, set last_status to failed, last_delivery_at to the attempt's time and failing_since to the attempt's time when it is null, and schedule the next attempt 10 seconds after the first failure and twice as long after each further failure, at most 1 hour, and never later than 24 hours after the first attempt",
+          "contract": "after failures 1 to 12 the waits are 10, 20, 40, 80, 160, 320, 640, 1280, 2560, 3600, 3600 and 3600 seconds; next_attempt_at == min(last_attempt_at + wait, first attempt + 24h); no request is sent before next_attempt_at; the recorder counts result 'retry' once per such attempt; the state stays what it was",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock",
+              "a recording metrics recorder"
+            ],
+            "pseudocode": "in internal/webhook/state_test.go with a stub sender answering 500 and the controlled clock: write e1; for n in 1..12: assert attempts == n and next_attempt_at - last_attempt_at == the n-th wait of the contract; advance the clock to one second before next_attempt_at and assert no new call; advance one second and assert one new call; assert failing_since == the time of attempt 1 throughout, last_status == 'failed', state == 'active' and recorder.retry == 12; then keep driving the clock from attempt to attempt until an attempt fails at a time T with T + 3600s later than first attempt + 24h, and assert its next_attempt_at == first attempt + 24h"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "event_driven",
+          "condition": "an attempt of the delivery loop fails 24 hours or more after the first attempt of its event",
+          "action": "give the event up: mark the delivery failed, move the position past the event, set the subscription to failing if it is not already, write parley.webhook.failing with actor system in the same transaction only on that transition, and go on with the next event, which gets its own 24 hours",
+          "contract": "the delivery record has status 'failed' and next_attempt_at null; state == 'failing'; exactly one parley.webhook.failing event per transition into failing, with metadata {webhook_id, host, seq: the event given up, failing_since, response_code, error}; the recorder counts result 'failed' once; the next event's first attempt is made at once",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock",
+              "a recording metrics recorder"
+            ],
+            "pseudocode": "in internal/webhook/state_test.go with a stub sender answering 503: write e1 and e2; drive the clock to first attempt + 24h; assert the delivery of e1 is 'failed', state == 'failing', one parley.webhook.failing event exists with actor_type 'system', metadata.seq == e1.seq, metadata.response_code == 503, metadata.error == null and metadata.host == 'ci.example'; assert the first attempt of e2 happened at that instant; drive a further 24h; assert the delivery of e2 is 'failed' and the log still holds exactly one parley.webhook.failing; assert recorder.failed == 2"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "event_driven",
+          "condition": "an attempt of the delivery loop succeeds for a subscription whose failing_since is set",
+          "action": "clear failing_since and return a failing subscription to active",
+          "contract": "state == 'active', failing_since == null and last_status == 'succeeded'; no parley.webhook.* event is written for this change",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock"
+            ],
+            "pseudocode": "in internal/webhook/state_test.go, a table {a subscription with two failed attempts of e1 and state active; a subscription in state failing with a pending e2}: switch the stub sender to 200 and advance to next_attempt_at; assert state == 'active', failing_since == null, last_status == 'succeeded'; assert the event log gained no parley.webhook.* event"
+          }
+        },
+        {
+          "id": "REQ-7.4",
+          "pattern": "event_driven",
+          "condition": "a subscription that is active or failing has a failing_since 72 hours or more in the past",
+          "action": "set the subscription to disabled, mark its pending delivery failed, and write parley.webhook.disabled with actor system in the same transaction, checking for such subscriptions at least once a minute",
+          "contract": "no later than 72 hours and 1 minute after failing_since: state == 'disabled'; the pending delivery has status 'failed' and next_attempt_at null; one event parley.webhook.disabled with metadata {webhook_id, host, failing_since}; no further request reaches the receiver",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock"
+            ],
+            "pseudocode": "in internal/webhook/state_test.go with a stub sender answering 500: write e1, e2, e3, e4; drive the clock to failing_since + 72h - 1s and assert state == 'failing'; advance 61s; assert state == 'disabled', the pending delivery is 'failed', exactly one parley.webhook.disabled event exists with actor_type 'system' and metadata.failing_since == the first failure's time; advance 3h and assert the sender recorded no call after the disabling; and the row {a subscription whose single event was given up at 24h and that has had no event since} -> also disabled at failing_since + 72h"
+          }
+        },
+        {
+          "id": "REQ-7.5",
+          "pattern": "state_driven",
+          "condition": "a subscription is disabled",
+          "action": "send it nothing and keep no event for it",
+          "contract": "no delivery record is created and no request is sent for events written while it is disabled; the events are not sent after a re-enable either",
+          "check": {
+            "same_as": "REQ-4.5"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "Durability, the workspace's life, configuration and metrics",
+      "rationale": "A restart must lose no delivery, a deleted workspace must leave nothing behind, and an operator must be able to see and bound what the hub sends.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "the hub starts with stored subscriptions",
+          "action": "resume the delivery loop of every active and failing subscription from its stored position, make again an attempt that was in flight when the hub stopped, under the same delivery id, honour a stored next_attempt_at, and start no loop for a disabled subscription",
+          "contract": "after a restart the receiver gets every event after the stored position in seq order; a delivery that was pending before the stop keeps its id and its attempts count; a pending delivery whose next_attempt_at is in the future is not attempted before it; a disabled subscription gets nothing",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock",
+              "allow_insecure true"
+            ],
+            "pseudocode": "in internal/webhook/lifecycle_test.go on a store file kept across two component instances: instance 1 with a receiver that blocks: write e1 and e2, wait until the attempt of e1 is in flight, stop instance 1; start instance 2 on the same file with the receiver answering 200; assert the receiver gets e1 with the delivery id of the blocked request, then e2; and a second run {e1 failed once, next_attempt_at = now + 10s, stop, start}: assert no request before the clock passes next_attempt_at and attempts == 2 after it; assert a disabled subscription on the same store receives nothing"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "event_driven",
+          "condition": "the hub shuts down while delivery attempts are in flight",
+          "action": "abandon the attempts without waiting for their responses and leave their deliveries pending",
+          "contract": "the component's stop returns within 1 second although a receiver has not answered; the delivery stays status 'pending' with its position unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock",
+              "allow_insecure true"
+            ],
+            "pseudocode": "in internal/webhook/lifecycle_test.go with a receiver that blocks for 30s and [webhooks].timeout 60s: write e1; wait until the request is in flight; cancel the background context; assert the stop returns within 1s; assert the delivery of e1 is 'pending' and the position is before e1"
+          }
+        },
+        {
+          "id": "REQ-8.3",
+          "pattern": "event_driven",
+          "condition": "the workspace of a subscription is deleted and the removal step calls the webhook remover inside its transaction",
+          "action": "remove the workspace's subscriptions, their delivery records and their signing secrets in that transaction, stop their loops, and write no parley.webhook.* event",
+          "contract": "after the commit no subscription, delivery or ciphertext row of the workspace exists and no further request is sent for it; when the transaction is rolled back every row is as before; the subscriptions of other workspaces are untouched",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock",
+              "two subscriptions of demo with deliveries, one of them pending, and one subscription of 'other'",
+              "a stub sender"
+            ],
+            "pseudocode": "in internal/webhook/lifecycle_test.go: call the remover for demo inside a store transaction, a table {commit, rollback}: after commit assert count(subscriptions of demo) == 0, count(deliveries of demo's subscriptions) == 0, the subscription of 'other' is unchanged, the event log gained no parley.webhook.* event; write an event of demo and assert the stub sender records no call; after rollback assert the rows equal their snapshot"
+          }
+        },
+        {
+          "id": "REQ-8.4",
+          "pattern": "state_driven",
+          "condition": "the workspace of a subscription is archived",
+          "action": "keep delivering its events and keep answering the list, get, deliveries, ping, redeliver and delete routes",
+          "contract": "an event of the archived workspace, for example parley.workspace.reactivate, reaches the receiver; list, get and deliveries answer 200, ping and redeliver answer 200, delete answers 204",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock",
+              "allow_insecure true",
+              "one subscription of demo and a receiver answering 200"
+            ],
+            "pseudocode": "in internal/webhook/lifecycle_test.go: set demo's status to archived; write the event parley.workspace.reactivate of demo; assert the receiver gets it; assert GET …/webhooks, GET …/webhooks/ID and GET …/deliveries answer 200, POST …/ping answers 200 with status 'succeeded', POST …/redeliver of the delivery answers 200, and DELETE answers 204"
+          }
+        },
+        {
+          "id": "REQ-8.5",
+          "pattern": "event_driven",
+          "condition": "the hub starts",
+          "action": "register the keys [webhooks].max_per_workspace (integer, default 20, at least 0), [webhooks].timeout (duration, default 10s, from 1s to 60s), [webhooks].allow_private (bool, default false) and [webhooks].allow_insecure (bool, default false) with the configuration loader, and refuse a value outside these rules",
+          "contract": "a configuration without a [webhooks] section loads with the four defaults; max_per_workspace -1, timeout 999ms, timeout 61s, allow_private 'yes' and an unknown key [webhooks].retries each make the load return an error that names the key, so that the hub does not start",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/webhook/config_test.go with the key registry of internal/config, a table {no section -> (20, 10s, false, false); max_per_workspace 0 -> ok; timeout '1s' -> ok; timeout '60s' -> ok; max_per_workspace -1 -> error naming webhooks.max_per_workspace; timeout '999ms' -> error; timeout '61s' -> error naming webhooks.timeout; allow_private 'yes' -> error; retries 3 -> error naming webhooks.retries}: assert the loaded values or the error text"
+          }
+        },
+        {
+          "id": "REQ-8.6",
+          "pattern": "ubiquitous",
+          "action": "for any attempt, report exactly one result to the metrics recorder of package 51, as one Add on parley_webhook_deliveries_total with the label result: ok for a successful attempt, a successful ping or redelivery included; retry for a failed attempt of the loop that will be retried; failed for a failed attempt after which the event was given up, for a failed ping, for a failed redelivery and for an event skipped because it left the log; and report as queue depth the number of events written and not yet delivered or given up, summed over all active and failing subscriptions",
+          "contract": "the recorder's three counts equal the numbers of such attempts; the queue-depth function returns the sum of the pending counts of the active and failing subscriptions and counts nothing for a disabled one",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock"
+            ],
+            "pseudocode": "in internal/webhook/metrics_test.go with a recording recorder and a scripted stub sender: run {one event delivered at once; one event failing twice then delivered; one event given up at 24h; a successful ping; a failed ping; a failed redelivery}; assert recorder == {ok: 3, retry: 2 plus the retries of the given-up event, failed: 3}; with the loop stopped write 4 matching events for an active subscription, 2 for a failing one and 5 for a disabled one; assert QueueDepth() == 6"
+          }
+        },
+        {
+          "id": "REQ-8.7",
+          "pattern": "event_driven",
+          "condition": "the secret re-encryption task of package 39 runs the converter this package registered, with a current and a previous encryption key configured",
+          "action": "re-seal under the current key every signing secret that is still sealed under the previous key, leave every other ciphertext as it is, change no other member of any subscription and write no event",
+          "contract": "the converter returns (converted, remaining): converted is the number of signing secrets re-sealed in this run and remaining the number still not sealed under the current key; afterwards a delivery signed with a converted subscription's secret verifies with the secret shown at creation, also when the hub runs without the previous key; a second run returns converted 0",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied and a controlled clock",
+              "three subscriptions created under key K1 and one under K2; one further ciphertext overwritten with bytes that open under no key"
+            ],
+            "pseudocode": "in internal/webhook/reencrypt_test.go: build the secret component with current K2 and previous K1; c, r, err = converter(ctx); assert err == nil and c == 3 and r == 1; assert updated_at and every other member of the subscriptions are unchanged and the event log has no new event; rebuild the secret component with K2 only; for each of the three: sign a body through the sender and assert the HMAC equals the one computed with the whsec_ value shown at creation; run the converter again: assert c == 0 and r == 1"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-9",
+      "title": "Ping, the delivery log and redelivery",
+      "rationale": "An owner setting up a receiver needs to test it, to see what was sent with what outcome, and to send one event again after fixing the receiver.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-9.1",
+          "pattern": "event_driven",
+          "condition": "an owner sends POST /api/v1/workspaces/:slug/webhooks/:id/ping, in any subscription state and any workspace status",
+          "action": "send one signed test delivery at once, outside the order of the subscription and without a retry, whose body has the shape of an event record with type parley.webhook.ping, seq 0, a new id, the workspace, the caller as actor, resource_type event_webhook, resource_id the subscription id, action ping, session_id null and metadata {}; record it as a delivery; write nothing to the event log; and answer when the attempt has ended",
+          "contract": "HTTP 200 with the delivery record {id, seq: 0, type: 'parley.webhook.ping', status: 'succeeded' or 'failed', attempts: 1, response_code, error, duration_ms, created_at, last_attempt_at, next_attempt_at: null}, also when the attempt failed; the subscription's state, last_status, last_delivery_at, failing_since and position are unchanged; the event log's last seq is unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock",
+              "allow_insecure true"
+            ],
+            "pseudocode": "in internal/webhook/ping_test.go with an httptest receiver, a table over the subscription state {active, failing, disabled} x the receiver's answer {200 -> 'succeeded' with response_code 200; 500 -> 'failed' with response_code 500; closed port -> 'failed' with error 'connection_failed'}: assert status == 200 and the record of the contract; for the answering rows assert the received body has type 'parley.webhook.ping', seq 0, resource_id == the subscription id, actor_id == 'u_1', metadata == {} and the signature verifies with the secret; assert Parley-Seq == '0' and Parley-Event == 'parley.webhook.ping'; assert the receiver's request count is 1 after advancing the clock 1h; assert the subscription row and the event log's last seq equal their snapshot; assert a pending delivery of the loop is untouched"
+          }
+        },
+        {
+          "id": "REQ-9.2",
+          "pattern": "event_driven",
+          "condition": "an owner sends GET /api/v1/workspaces/:slug/webhooks/:id/deliveries, optionally with status, limit and cursor",
+          "action": "answer the subscription's delivery records, pings included, in (created_at, id) descending order, only those with the given status when status is given, each without payload and without response body",
+          "contract": "HTTP 200 with the list envelope; every item has exactly the members id, seq, type, status, attempts, response_code, error, duration_ms, created_at, last_attempt_at and next_attempt_at, the last one null unless status is 'pending'; a status outside pending, succeeded and failed answers HTTP 400 with error_type invalid_request",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock",
+              "a subscription with five deliveries: two succeeded, two failed (one a ping), one pending, two of them with the same created_at",
+              "a second subscription with one delivery"
+            ],
+            "pseudocode": "in internal/webhook/deliveries_test.go: assert the items come newest first, two with the same created_at ordered by id descending; assert ?limit=2 pages without repeating an id and ends with next_cursor null; assert ?status=failed returns the two failed records and ?status=pending the one pending record with a non-null next_attempt_at; assert ?status=lost answers 400 invalid_request; assert the key set of every item equals the eleven members; assert no delivery of the other subscription appears"
+          }
+        },
+        {
+          "id": "REQ-9.3",
+          "pattern": "event_driven",
+          "condition": "an owner sends POST /api/v1/workspaces/:slug/webhooks/:id/deliveries/:delivery_id/redeliver for a succeeded or failed delivery whose event is still in the event log, in any subscription state",
+          "action": "send that event once more at once, outside the order, under the same delivery id and to the subscription's current url, without a retry, and update the record with the outcome",
+          "contract": "HTTP 200 with the delivery record: the same id, attempts one higher, status the outcome of this attempt, response_code, error, duration_ms and last_attempt_at of this attempt, next_attempt_at null; the receiver gets the event with the Parley-Delivery and Parley-Seq of the original; the subscription's position, state, last_status, last_delivery_at and failing_since are unchanged",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock",
+              "allow_insecure true"
+            ],
+            "pseudocode": "in internal/webhook/deliveries_test.go, a table {a failed delivery, receiver now 200 -> status 'succeeded'; a succeeded delivery, receiver now 500 -> status 'failed' with response_code 500; a failed delivery of a disabled subscription, receiver 200 -> 'succeeded'}: assert 200, the same id, attempts == previous + 1, last_attempt_at == now, next_attempt_at == null; assert the request's Parley-Delivery and Parley-Seq equal the original's and its body equals the event's JSON; assert the subscription row equals its snapshot; advance the clock 1h and assert no further request for that delivery"
+          }
+        },
+        {
+          "id": "REQ-9.4",
+          "pattern": "unwanted",
+          "condition": "a redeliver names a :delivery_id that is not a UUID, a delivery that is not one of the subscription's, a pending delivery, a ping, or a delivery whose event has left the event log",
+          "action": "refuse the request, send nothing and leave the record unchanged",
+          "contract": "not a UUID: HTTP 400 invalid_request; unknown, or a delivery of another subscription: HTTP 404 with error_type delivery_not_found; pending: HTTP 409 with error_type delivery_pending; a ping: HTTP 400 with error_type invalid_request; event gone: HTTP 410 with error_type event_expired; in every case the receiver gets no request and the delivery row is unchanged",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock"
+            ],
+            "pseudocode": "in internal/webhook/deliveries_test.go with a stub sender and a stub event log, a table {'abc' -> 400 invalid_request; a random UUID -> 404 delivery_not_found; the id of a delivery of another subscription of demo -> 404 delivery_not_found; a pending delivery -> 409 delivery_pending; a ping's delivery -> 400 invalid_request; a failed delivery whose seq is below the log's oldest seq -> 410 event_expired}: assert status and error.error_type; assert the sender recorded no call and the delivery rows equal their snapshot"
+          }
+        },
+        {
+          "id": "REQ-9.5",
+          "pattern": "event_driven",
+          "condition": "the retention step webhook_deliveries of package 51 calls PruneDeliveries with a time 7 days before now",
+          "action": "delete every delivery record that is not pending and whose last attempt is before the given time, and keep every pending record whatever its age",
+          "contract": "records with last_attempt_at before the given time and status succeeded or failed are gone from the deliveries list; a record whose last attempt is exactly at the given time, younger records and every pending record remain; the call returns the number deleted and a nil error",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub store in t.TempDir() with the schema steps applied, an encryption key configured, the workspace record 'demo' (kind repository, status ready, owner u_1) inserted through internal/access, and a controlled clock"
+            ],
+            "pseudocode": "in internal/webhook/deliveries_test.go, a table of records (status, age of last_attempt_at) -> kept {succeeded, 7d + 1s -> no; failed, 8d -> no; a ping, 9d -> no; succeeded, exactly 7d -> yes; failed, 1h -> yes; pending, 9d -> yes; a succeeded record created 10d ago and redelivered 1d ago -> yes}: call PruneDeliveries(ctx, clock.Now() - 168h) on the delivery store; assert the surviving ids and the returned count == 3"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-10",
+      "title": "The parley webhook commands",
+      "rationale": "Owners and scripts configure and inspect subscriptions from the shell, and a test delivery must tell a script by its exit status whether the receiver works.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-10.1",
+          "pattern": "event_driven",
+          "condition": "a user runs parley webhook create, list, get, update, rotate-secret, deliveries, ping or redeliver with valid arguments and flags",
+          "action": "send the command's request under /api/v1/workspaces/<workspace-slug>/webhooks and print the response body: create sends POST with url from --url, types from --types split at commas, include_forks false for --no-forks and description from --description, a member only for a flag that was given; list sends GET with state, limit and cursor; get sends GET …/<id>; update sends PATCH …/<id> with url, types, include_forks (true for --forks, false for --no-forks), description and active (true for --enable, false for --disable); rotate-secret sends POST …/<id>/rotate-secret; deliveries sends GET …/<id>/deliveries with status, limit and cursor; ping sends POST …/<id>/ping; redeliver sends POST …/<id>/deliveries/<delivery-id>/redeliver",
+          "contract": "one JSON document on stdout, the response body indented by 2 spaces, and exit status 0; a hub error is printed on stderr as received with nothing on stdout and exit status 1",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server standing in for the hub that records method, path, query and body and answers by script",
+              "the CLI run through cli.Run with --endpoint-url and --api-key"
+            ],
+            "pseudocode": "in internal/cli/webhook_test.go, a table {['webhook', 'create', 'demo', '--url', 'https://ci.example/h'] -> POST /api/v1/workspaces/demo/webhooks with body {url} and no other member; the same with --types 'parley.change.*,parley.git.push' --no-forks --description CI -> also types as a two-element array, include_forks false, description; ['webhook', 'list', 'demo', '--state', 'failing', '--limit', '10', '--cursor', 'c'] -> GET with the three parameters; ['webhook', 'get', 'demo', ID] -> GET …/ID; ['webhook', 'update', 'demo', ID, '--forks', '--disable'] -> PATCH with body {include_forks: true, active: false}; ['webhook', 'update', 'demo', ID, '--url', U, '--types', 'a,b', '--description', '', '--enable'] -> {url, types: ['a', 'b'], description: '', active: true}; ['webhook', 'rotate-secret', 'demo', ID] -> POST …/ID/rotate-secret without a body; ['webhook', 'deliveries', 'demo', ID, '--status', 'failed'] -> GET …/ID/deliveries?status=failed; ['webhook', 'ping', 'demo', ID] -> POST …/ID/ping; ['webhook', 'redeliver', 'demo', ID, DID] -> POST …/ID/deliveries/DID/redeliver}: assert method, path, query and body; assert stdout is the served body indented by 2 spaces and exit == 0; with the server answering 404 webhook_not_found assert exit == 1, stdout empty and the envelope on stderr"
+          }
+        },
+        {
+          "id": "REQ-10.2",
+          "pattern": "event_driven",
+          "condition": "parley webhook create or parley webhook rotate-secret receives a response that carries secret",
+          "action": "print the response with the secret on stdout and write a note on stderr that the secret is shown only once",
+          "contract": "stdout is the response document including the member secret; stderr is not empty and holds no copy of the secret; exit status 0",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server standing in for the hub that records method, path, query and body and answers by script",
+              "the CLI run through cli.Run with --endpoint-url and --api-key"
+            ],
+            "pseudocode": "in internal/cli/webhook_test.go, a table over {create, rotate-secret} with the server answering a subscription with secret 'whsec_' + 64 hex: assert stdout.json.secret == the served secret; assert stderr contains 'only once' and does not contain the secret; assert exit == 0"
+          }
+        },
+        {
+          "id": "REQ-10.3",
+          "pattern": "event_driven",
+          "condition": "parley webhook ping or parley webhook redeliver receives a 200 response",
+          "action": "print the delivery record, and exit with status 0 when its status is succeeded and with status 1 when it is failed, reporting the failure on stderr",
+          "contract": "status succeeded: the record on stdout, nothing on stderr, exit status 0; status failed: the record on stdout, an envelope with code 0 and error_type delivery_failed on stderr, exit status 1",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server standing in for the hub that records method, path, query and body and answers by script",
+              "the CLI run through cli.Run with --endpoint-url and --api-key"
+            ],
+            "pseudocode": "in internal/cli/webhook_test.go, a table over {ping, redeliver} x the served record {status 'succeeded' -> exit 0 and empty stderr; status 'failed' with response_code 500 -> exit 1 and stderr.json.error.error_type == 'delivery_failed' with stderr.json.error.code == 0}: assert stdout.json == the served record in every row"
+          }
+        },
+        {
+          "id": "REQ-10.4",
+          "pattern": "event_driven",
+          "condition": "a user runs parley webhook delete <workspace-slug> <webhook-id> and the hub answers 204",
+          "action": "print the confirmation document",
+          "contract": "stdout is {\"status\":\"deleted\",\"id\":\"<webhook-id>\"} indented by 2 spaces; exit status 0; the request was DELETE /api/v1/workspaces/<workspace-slug>/webhooks/<webhook-id>",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server standing in for the hub that records method, path, query and body and answers by script",
+              "the CLI run through cli.Run with --endpoint-url and --api-key"
+            ],
+            "pseudocode": "in internal/cli/webhook_test.go: run ['webhook', 'delete', 'demo', ID] against a server answering 204; assert the recorded request is DELETE /api/v1/workspaces/demo/webhooks/ID; assert stdout.json == {status: 'deleted', id: ID} and exit == 0"
+          }
+        },
+        {
+          "id": "REQ-10.5",
+          "pattern": "unwanted",
+          "condition": "parley webhook create is run without --url, parley webhook update without any of its flags, with both --forks and --no-forks or with both --enable and --disable, or any of the nine commands with a wrong number of arguments or an unknown flag",
+          "action": "fail before sending any request",
+          "contract": "exit status 2, nothing on stdout, an envelope with code 0 and error_type usage_error on stderr, and no HTTP request",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "an httptest server standing in for the hub that records method, path, query and body and answers by script",
+              "the CLI run through cli.Run with --endpoint-url and --api-key"
+            ],
+            "pseudocode": "in internal/cli/webhook_test.go, a table {['webhook', 'create', 'demo']; ['webhook', 'update', 'demo', ID]; ['webhook', 'update', 'demo', ID, '--forks', '--no-forks']; ['webhook', 'update', 'demo', ID, '--enable', '--disable']; ['webhook', 'get', 'demo']; ['webhook', 'redeliver', 'demo', ID]; ['webhook', 'ping', 'demo', ID, 'extra']; ['webhook', 'list', 'demo', '--color']}: assert exit == 2, stdout == '', stderr.json.error.error_type == 'usage_error' and stderr.json.error.code == 0; assert the server recorded 0 requests"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "A developer subscribes a receiver, gets a signed event and inspects the deliveries",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "runs parley webhook create demo --url http://127.0.0.1:<port>/hook"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends POST /api/v1/workspaces/demo/webhooks and prints the answer with the secret, noting on stderr that it is shown only once"
+        },
+        {
+          "actor": "parleyd",
+          "action": "checks the caller and the destination, stores the subscription with its encrypted secret, writes parley.webhook.create and answers 201"
+        },
+        {
+          "actor": "developer",
+          "action": "runs parley webhook update demo <id> --description 'CI trigger'"
+        },
+        {
+          "actor": "parleyd",
+          "action": "writes parley.webhook.update, and its delivery loop posts that event to the receiver with the Parley headers and the signature"
+        },
+        {
+          "actor": "webhook receiver",
+          "action": "verifies Parley-Signature with the secret, records the event and answers 200"
+        },
+        {
+          "actor": "parleyd",
+          "action": "marks the delivery succeeded and moves the subscription's position past the event"
+        },
+        {
+          "actor": "developer",
+          "action": "runs parley webhook ping demo <id> and then parley webhook deliveries demo <id>"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints the ping's delivery record with exit status 0, then the list holding the ping and the event's delivery, both succeeded"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parley CLI command tree",
+          "parleyd HTTP server with its middleware, authentication, scope check and access rule",
+          "webhook routes, delivery loop and sender with the real dialer",
+          "event log of the event component",
+          "secret encryption of the secret component",
+          "transactional store on SQLite",
+          "a real HTTP receiver on a loopback port"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with an empty data directory, an encryption key, [webhooks].allow_insecure true and a controlled clock",
+          "a user u_1 with an API key and the workspace record demo (kind repository, status ready, owner u_1) inserted through internal/access",
+          "an httptest server on 127.0.0.1 acting as the webhook receiver, which records its requests and answers by script",
+          "the receiver answers 200"
+        ],
+        "end_state": [
+          "the receiver holds exactly two requests: one with Parley-Event parley.webhook.update whose body is the event that GET /api/v1/events/log returns for its Parley-Seq, and one with Parley-Event parley.webhook.ping and Parley-Seq 0",
+          "both requests verify with HMAC-SHA256 over '<Parley-Timestamp>.<body>' keyed with the secret that parley webhook create printed",
+          "parley webhook deliveries prints two records, newest first, both with status succeeded and attempts 1",
+          "parley webhook get shows state active, last_status succeeded and pending 0",
+          "the event log holds no event of type parley.webhook.ping"
+        ],
+        "pseudocode": "in test/e2e/webhook_test.go: out = cli('webhook', 'create', 'demo', '--url', receiver.URL + '/hook'); secret = out.json.secret; id = out.json.id; cli('webhook', 'update', 'demo', id, '--description', 'CI trigger'); wait for receiver.count == 1; assert verify(secret, receiver.requests[0]); assert cli('webhook', 'ping', 'demo', id).exit == 0; d = cli('webhook', 'deliveries', 'demo', id).json.items; assert [x.type for x in d] == ['parley.webhook.ping', 'parley.webhook.update'] and all status == 'succeeded'; assert cli('webhook', 'get', 'demo', id).json.pending == 0"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "A receiver stays down, the subscription is disabled, and the developer brings it back",
+      "steps": [
+        {
+          "actor": "webhook receiver",
+          "action": "answers 500 to every request"
+        },
+        {
+          "actor": "developer",
+          "action": "changes the subscription's description twice with parley webhook update, which writes the events e1 and e2"
+        },
+        {
+          "actor": "parleyd",
+          "action": "attempts e1, retries it after 10 s and with doubling waits up to 1 h, gives it up after 24 hours, sets the subscription failing and writes parley.webhook.failing"
+        },
+        {
+          "actor": "parleyd",
+          "action": "goes on with e2 and the events behind it, and 72 hours after the first failure sets the subscription disabled and writes parley.webhook.disabled"
+        },
+        {
+          "actor": "developer",
+          "action": "repairs the receiver and runs parley webhook update demo <id> --enable"
+        },
+        {
+          "actor": "parleyd",
+          "action": "sets the subscription active, clears failing_since and takes the event log's position of the re-enable as the new start"
+        },
+        {
+          "actor": "developer",
+          "action": "changes the description once more, which writes the event e9"
+        },
+        {
+          "actor": "parleyd",
+          "action": "delivers e9 to the receiver and none of the events written before the re-enable"
+        },
+        {
+          "actor": "developer",
+          "action": "runs parley webhook redeliver demo <id> <delivery id of e1>"
+        },
+        {
+          "actor": "parleyd",
+          "action": "sends e1 once more under its original delivery id and answers with the record, now succeeded"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parley CLI command tree",
+          "parleyd HTTP server with its middleware, authentication, scope check and access rule",
+          "webhook routes, delivery loop and sender with the real dialer",
+          "event log of the event component",
+          "secret encryption of the secret component",
+          "transactional store on SQLite",
+          "a real HTTP receiver on a loopback port"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with an empty data directory, an encryption key, [webhooks].allow_insecure true and a controlled clock",
+          "a user u_1 with an API key and the workspace record demo (kind repository, status ready, owner u_1) inserted through internal/access",
+          "an httptest server on 127.0.0.1 acting as the webhook receiver, which records its requests and answers by script",
+          "one subscription of demo for the receiver, which answers 500 until the test repairs it"
+        ],
+        "end_state": [
+          "after 24 hours of the controlled clock the delivery of e1 is failed and parley webhook get shows state failing",
+          "after 72 hours and 1 minute the state is disabled, and the event log holds exactly one parley.webhook.failing and one parley.webhook.disabled for the subscription, both with actor_type system",
+          "after the re-enable the receiver's first successful request is e9; no request with a 200 answer carries the seq of an event written before the re-enable, except the redelivery of e1",
+          "the redelivery reaches the receiver with the Parley-Delivery of e1's first attempt, and parley webhook redeliver exits 0 and prints status succeeded",
+          "parley webhook get shows state active, failing_since null and last_status succeeded"
+        ],
+        "pseudocode": "in test/e2e/webhook_test.go with the controlled clock: receiver.answer(500); cli update twice; step the clock through the retry schedule to +24h; assert state == 'failing'; step to +72h1m; assert state == 'disabled'; receiver.answer(200); cli('webhook', 'update', 'demo', id, '--enable'); cli update once more; wait for a 200-answered request and assert its seq is e9's; did = the delivery id of e1 from cli('webhook', 'deliveries', 'demo', id, '--status', 'failed'); r = cli('webhook', 'redeliver', 'demo', id, did); assert r.exit == 0 and r.json.status == 'succeeded' and receiver.last.header('Parley-Delivery') == did"
+      }
+    }
+  ]
+}

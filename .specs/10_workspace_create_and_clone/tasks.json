@@ -1,0 +1,260 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "10",
+  "spec_name": "workspace_create_and_clone",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/workspace/... ./internal/gitrepo/... ./internal/cli/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "07",
+      "reason": "extends the minimal workspace record of the access rule and uses its caller identity and access levels"
+    },
+    {
+      "spec": "09",
+      "reason": "builds its CLI commands on the client, output and exit-code helpers of the CLI foundation"
+    },
+    {
+      "spec": "39",
+      "reason": "stores the origin credential as workspace secrets inside the create transaction and reads it back for every clone"
+    },
+    {
+      "spec": "52",
+      "reason": "writes the event parley.workspace.create in the same transaction as the workspace"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Validate slugs, git URLs, branch names, fork names and durations",
+      "criteria": [
+        "REQ-1"
+      ],
+      "steps": [
+        "Add the task's behaviours as table-driven tests to internal/workspace/validate_test.go and confirm they fail",
+        "Create the package internal/workspace with the exported validators ValidateSlug, ValidateGitURL, ValidateBranchName and ValidateForkName, each returning nil or an error whose text says which rule the value breaks, and ParseDuration returning a time.Duration or an error",
+        "ValidateSlug: 3 to 64 characters, only a to z, digits and hyphens, first character a letter, last a letter or digit, no two hyphens in a row",
+        "ValidateGitURL: accept https://<host>/<path> with a non-empty host and a non-empty path after the slash and no userinfo, and git@<host>:<path> with a non-empty host and path; refuse every other scheme and form; decide on the text alone, without a DNS lookup or a connection",
+        "ValidateBranchName: apply every clause of the branch-name rule of the PRD's Validation rules section, including control characters, the forbidden characters and sequences, the single character @, the start and end rules and the rule for each path component",
+        "ValidateForkName: 1 to 32 characters, only a to z, digits and hyphens, first and last character a letter or digit, no two hyphens in a row",
+        "ParseDuration: decimal digits naming a whole number above zero, then exactly one of m, h or d, where d is 24 hours; refuse signs, fractions, spaces, upper-case units, other units and compound values",
+        "Count lengths in Unicode code points and refuse any character outside the allowed set, non-ASCII letters included"
+      ],
+      "touches": [
+        "internal/workspace/validate.go",
+        "internal/workspace/validate_test.go"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Hold the full workspace record and guard routes by its state",
+      "criteria": [
+        "REQ-2"
+      ],
+      "steps": [
+        "Add the task's behaviours as table-driven tests to internal/workspace/guard_test.go and confirm they fail",
+        "Extend the workspace record that package 07 delivers to every field of the PRD's workspace data model: workspace_mode, git_url, default_branch, status, display_name, description, head_sha, origin_head_sha, clone_error, last_sync_at, sync_error, upstream_url, integration_branch, upstream_head_sha, fork_point, expires_at, auto_change, purpose, session_id, the stored settings document, created_at and updated_at, plus two fields no response shows: a random instance id set at creation and a maintenance marker that is empty or names the running operation (reclone, archive, delete)",
+        "Add the columns through a schema migration registered with internal/store, with slug unique across all workspaces; the stored settings document is one JSON column of the record; origin heads get no table, they are refs of the copy (task 5)",
+        "Add the status type with the values pending, cloning, ready, failed and archived, and store functions to insert a workspace, read one by slug, and update its clone fields, each usable inside a caller's store transaction",
+        "Add RequireReady(workspace): return the error for HTTP 409 workspace_busy when the maintenance marker is set or the status is pending or cloning, 409 workspace_not_ready when the status is failed, 409 workspace_archived when it is archived, and nil when it is ready with no marker; check the marker first",
+        "Raise the three errors through the error helper of internal/server so that they leave the hub as the error envelope",
+        "Take no lock in the guard and keep no per-workspace mutex anywhere in the package: a ready workspace passes however many requests run on it"
+      ],
+      "touches": [
+        "internal/workspace/record.go",
+        "internal/workspace/store.go",
+        "internal/workspace/guard.go",
+        "internal/workspace/guard_test.go"
+      ],
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Register a repository workspace with POST /workspaces",
+      "criteria": [
+        "REQ-3",
+        "REQ-6.1",
+        "REQ-6.2",
+        "REQ-6.4",
+        "REQ-6.5",
+        "REQ-6.6"
+      ],
+      "steps": [
+        "Add the task's behaviours as table-driven tests to internal/workspace/create_test.go and confirm they fail, with a helper that builds the service on a temporary store with the real access, secret and event components and a user with an API key",
+        "Add the workspace service, built from the store, the organization lookup, the secret component, the event component, the configured external URL and an origin lister, and register POST /workspaces with internal/server as a route that needs the scope workspaces:write, creates a resource (so it takes Idempotency-Key) and is not workspace-scoped",
+        "Refuse a caller that is the admin token with 403 forbidden after the scope check and before the body is validated",
+        "Read slug and git_url from the body and validate them with the validators of task 1; ignore members the route does not define",
+        "Resolve the organization: without org_id the caller's personal organization",
+        "In one store transaction insert the workspace (kind repository, status pending, owner the caller, display_name the slug when absent, null or empty, description the empty string when absent or null, a fresh instance id) and write the event parley.workspace.create through the event component with the slug as workspace and resource, the caller as actor and the metadata kind, git_url, workspace_mode and default_branch; the pending row is the clone work, there is no separate queue record",
+        "Answer a slug that is in use with 409 conflict: look it up before the transaction, and map the unique-key violation of a racing insert to the same 409",
+        "Answer any other storage failure with 500 internal after rolling the transaction back, so that no workspace, secret or event remains",
+        "Build the workspace response object in one encoder, RenderWorkspace(record, access level) in internal/workspace/response.go, which every later package returns a workspace through and which calls a fork view registered with RegisterForkView (package 15) for a record of kind fork: every record field with nullable ones written as null, org_slug, hub_url as <external URL without one trailing slash>/git/<org_slug>/<slug>.git or null when no external URL is configured, access as the caller's level, and settings as the result of EffectiveSettings",
+        "Declare the settings mechanism in internal/workspace/settings.go as a SettingsRegistry value the workspace service is built with, holding no key: RegisterSetting(SettingKey), where a SettingKey has a name, a default function of the workspace's default_branch and a Validate function for a non-null JSON value; ApplySettings(stored document, raw JSON value) returning the new stored document or an invalid-request error; and EffectiveSettings(stored document, default_branch) returning every registered key with its stored value or its default. Package 11 registers the 21 keys through RegisterSetting and owns their validation rules; the tests of this package build the service with an empty registry",
+        "After the transaction commits, tell the clone workers about the slug through an interface that task 7 implements; answer 201 with the object"
+      ],
+      "touches": [
+        "internal/workspace/service.go",
+        "internal/workspace/create.go",
+        "internal/workspace/response.go",
+        "internal/workspace/settings.go",
+        "internal/workspace/create_test.go"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Refuse invalid create requests",
+      "criteria": [
+        "REQ-4"
+      ],
+      "steps": [
+        "Add the task's behaviours as table-driven tests to internal/workspace/create_test.go and confirm they fail",
+        "Validate the body members in the order slug, git_url, default_branch, org_id, display_name, description, workspace_mode, upstream_url, integration_branch, settings, git_pat, git_username, git_password; answer the first invalid one with 400 invalid_request and a message that names the member",
+        "Refuse a member whose JSON type is not the one the PRD's request table gives; accept null wherever the table says 'or null' and treat it as absent",
+        "default_branch: the branch-name rule; display_name at most 128 and description at most 1024 Unicode code points",
+        "workspace_mode: absent, null or empty means standard; any other string than standard and carry_patch is refused; with standard a non-null upstream_url or integration_branch is refused; with carry_patch upstream_url is required and follows the git_url rule and integration_branch, when given, follows the branch-name rule and is stored as given, null when absent",
+        "org_id: look the value up as an organization id, then as a slug; unknown is 400 invalid_request; an organization the caller is not an active member of is 403 forbidden",
+        "settings: null and absent mean defaults; any other non-object value is 400; apply any other value with ApplySettings starting from the empty stored document, all-or-nothing: an unregistered key is 400 with the message unknown setting \"<key>\", a key with value null is removed from the stored document, and every other value must pass the Validate function its key was registered with; store only the keys that were set. Create calls no other settings rule, so the rules package 11 registers apply to create without a change here",
+        "Credential members: git_pat excludes git_username and git_password; user name and password come together; an empty string is refused; any credential with a git_url of the git@ form is refused",
+        "Run every one of these checks before the slug-in-use check and before any call to origin, and leave the store, the secret component and the event log untouched on a refusal"
+      ],
+      "touches": [
+        "internal/workspace/create.go",
+        "internal/workspace/settings.go",
+        "internal/workspace/create_test.go"
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Run git against origin and resolve the origin credential",
+      "criteria": [
+        "REQ-7"
+      ],
+      "steps": [
+        "Add the task's behaviours as table-driven tests to internal/gitrepo/gitrepo_test.go and confirm they fail and to internal/workspace/credential_test.go",
+        "Create internal/gitrepo: a runner that executes the git command as a subprocess under a context, with a fixed minimal environment plus extra variables given as an option, terminal prompts disabled, and stderr captured into the returned error; when the context ends it kills the process and its children and waits for them",
+        "Hand a credential to git only through the process environment: an askpass program (the parleyd binary itself or a script written to a private temporary file) that prints the user name and the password it reads from environment variables; never place the credential in the URL, in an argument or in the repository's configuration",
+        "Add ListRemote(ctx, url, credential) returning origin's branches, tags and default branch, Clone(ctx, url, credential, directory) making a bare clone with all branches and tags and full history, and on an opened copy: the default branch, the commit a branch resolves to, the list of branches with their heads, the origin URL, reading and writing one configuration value, and the origin heads as the refs refs/remotes/origin/<name>: OriginHeads (every branch with its commit id), OriginHead(branch), SetOriginHead(branch, commit id) and DeleteOriginHead(branch); add Remove(directory)",
+        "Add the test helper package internal/gitrepo/gitrepotest: NewOrigin(t) builds a bare repository with git init in t.TempDir(), lets the test add branches, tags and commits, runs git update-server-info and serves the directory over TLS with net/http/httptest, with optional Basic authentication, a request counter and a handler gate that can block; this helper is the one test origin of the repository, which package 13 extends with a mode that accepts pushes; it returns the URL and the environment variables (the certificate file for GIT_SSL_CAINFO) that make the hub's git trust it",
+        "In internal/workspace add ResolveOriginCredential(ctx, workspace): read the workspace's secrets on every call with Get(workspace scope, slug, name) of internal/secret (package 39), one call per name; a non-empty GIT_PAT gives user name x-token-auth with the token; otherwise GIT_USERNAME with GIT_PASSWORD when both are set; otherwise no credential; a read error is returned as an error and never turned into 'no credential'"
+      ],
+      "touches": [
+        "internal/gitrepo/gitrepo.go",
+        "internal/gitrepo/credential.go",
+        "internal/gitrepo/gitrepo_test.go",
+        "internal/gitrepo/gitrepotest/origin.go",
+        "internal/workspace/credential.go",
+        "internal/workspace/credential_test.go"
+      ],
+      "depends_on": [
+        2
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Check a given credential against origin and store it as workspace secrets",
+      "criteria": [
+        "REQ-5",
+        "REQ-6.3",
+        "REQ-6.7"
+      ],
+      "steps": [
+        "Add the task's behaviours as table-driven tests to internal/workspace/credential_test.go and confirm they fail",
+        "Make the origin lister of the workspace service an interface with gitrepo's ListRemote as the production implementation, so tests can count and script it",
+        "After body validation, the organization check and the slug-in-use check, and only when the body carries a credential: answer 503 secrets_unavailable when Available() of the secret component (package 39) reports false, that is, no encryption key is configured, without calling the lister",
+        "Then call the lister with the git_url and the credential (git_pat as user name x-token-auth) under a context with a 10-second deadline; on any error answer 400 with error_type credential_check_failed and a fixed message that does not include the error text of git, the token or the password",
+        "Without a credential call neither the secret component nor the lister",
+        "Inside the create transaction of task 3 write GIT_PAT, or GIT_USERNAME and GIT_PASSWORD, as workspace secrets of the new slug with Put of the secret component (package 39), given the create transaction; any error Put returns rolls the transaction back and answers 500 internal",
+        "Prove the all-or-nothing rule with a fault in each of the three writes (workspace, secret, event): each answers 500 internal and leaves no workspace, no secret and no event, and the same slug can be created afterwards",
+        "Keep the credential out of the response object, the event metadata and every log line of the request; log the refusal of a credential check without the lister's error text unless it passed the text scrubber of package 03"
+      ],
+      "touches": [
+        "internal/workspace/create.go",
+        "internal/workspace/credential.go",
+        "internal/workspace/credential_test.go",
+        "internal/workspace/create_test.go"
+      ],
+      "depends_on": [
+        4,
+        5
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Clone a pending workspace to ready or failed",
+      "criteria": [
+        "REQ-8"
+      ],
+      "steps": [
+        "Add the task's behaviours as table-driven tests to internal/workspace/clone_test.go and confirm they fail",
+        "Add RepoPath(workspace) returning <repository root>/<slug>.git; no other package builds this path",
+        "Add the clone work function for one slug: in one store write move the workspace from pending to cloning and clear clone_error; do nothing for a workspace in any other status than pending or cloning",
+        "Resolve the origin credential (task 5); a resolution error fails the clone without running git",
+        "Clone origin into a temporary directory inside the repository root whose name carries a fixed prefix that no slug can have, then read the copy's branches: fail with clone_error 'origin has no branches' when there is none, and with a clone_error that names the branch when a default_branch was given at creation and the copy has no such branch",
+        "On success write refs/remotes/origin/<name> at the head of every branch of the copy with SetOriginHead and the workspace's instance id into the copy's configuration under the key parley.workspace, rename the temporary directory to RepoPath, and in one store transaction record default_branch (the given one, else origin's default branch), head_sha and origin_head_sha",
+        "When a post-clone step is registered for the workspace's mode (a registry keyed by workspace_mode that package 31 fills), run it now with the workspace still in cloning; log an error it returns and continue",
+        "Set the status to ready",
+        "On any failure remove the temporary directory and anything at RepoPath, pass the error text through the text scrubber of package 03 (secret values to [redacted], userinfo removed from URLs, at most 1024 bytes) with the resolved credential registered as a secret value, and set status failed with that clone_error; write no event and schedule no retry"
+      ],
+      "touches": [
+        "internal/workspace/clone.go",
+        "internal/workspace/clone_test.go",
+        "internal/workspace/store.go"
+      ],
+      "depends_on": [
+        3,
+        5
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Run clone work durably with a bounded number of workers",
+      "criteria": [
+        "REQ-9"
+      ],
+      "steps": [
+        "Add the task's behaviours as table-driven tests to internal/workspace/worker_test.go and confirm they fail",
+        "Add the clone workers: a constructor that takes the number of workers and returns an error containing '[workspace].workers' when it is below 1; an Enqueue(slug) that appends to a first-in-first-out queue; exactly that many goroutines that take slugs from the queue and run the clone work function of task 7",
+        "Add Start: delete every temporary clone directory in the repository root, then read all workspaces in status pending or cloning ordered by created_at and then slug and enqueue them, and only then return",
+        "Before cloning, check what lies at RepoPath: keep it when it opens as a repository, the workspace's default branch (the copy's own default branch while the record has none) resolves to a commit, its origin URL equals git_url and its parley.workspace value equals the workspace's instance id; then record head_sha from the copy, record default_branch when the record has none, set ready, and contact origin not at all; the post-clone step does not run for a kept copy",
+        "Discard anything else found at RepoPath (a file, an empty directory, a repository that fails one of the four tests) and clone fresh",
+        "Add Stop(ctx): stop taking work, cancel the context of every running clone so that git is killed, remove the temporary directories, leave the status of interrupted workspaces as it is, and return when the goroutines have ended or the context is done",
+        "Implement the notification interface of task 3 with Enqueue, and export Enqueue for the packages that put a workspace back to pending",
+        "On the composition value of internal/hub (package 03) build the workers from the configured [workspace].workers and repository root, fail the start with exit status 1 and one error line when the constructor refuses, register Start as a start hook, which runs after the store is open and before the listener starts, and call Stop during shutdown"
+      ],
+      "touches": [
+        "internal/workspace/worker.go",
+        "internal/workspace/worker_test.go",
+        "internal/workspace/clone.go",
+        "internal/hub/workspace.go"
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Add the command parley workspace create",
+      "criteria": [
+        "REQ-10"
+      ],
+      "steps": [
+        "Add the task's behaviours as table-driven tests to internal/cli/workspace_test.go and confirm they fail, driving the command against a net/http/httptest server that records requests and answers from a script",
+        "Add the command group workspace to the CLI root and the command create with the flags --slug, --git-url, --default-branch, --org, --display-name, --description, --workspace-mode, --upstream-url, --integration-branch, --git-pat, --git-username, --git-password, the repeatable --setting, and the shared --wait, --timeout and --poll-interval of the CLI foundation",
+        "Before any request, fail with the CLI's usage error (exit 2, error_type usage_error) when --slug or --git-url is missing, --git-pat is combined with --git-username or --git-password, one of --git-username and --git-password is given without the other, a credential flag was given with an empty value, or a --setting has no '=' or an empty key; tell a flag that was given empty from one that was not given",
+        "Add the one --setting parser of the CLI, ParseSettingFlags in internal/cli/workspace.go, which the update command of package 11 calls: split at the first '='; an empty value becomes null; otherwise the value of protected_branches is split at commas into a list of strings; otherwise true and false become booleans; anything else is a string; the last occurrence of a key wins",
+        "Build the body with a member only for each flag that was given (--org as org_id, the parsed settings as settings) and send POST /workspaces through the CLI's HTTP client; print the response on stdout and exit 0; leave hub errors to the client's common handling (envelope on stderr, exit 1)",
+        "With --wait, after a 201 use the CLI foundation's wait helper to poll GET /workspaces/<slug>, the slug percent-encoded as one path segment, with ready as the successful terminal state and failed as the unsuccessful one; every other status keeps the wait going; the tests of this task script the answers of that route on the httptest server, because the route itself is package 11's, and package 11 runs the command with --wait against a real hub in its end-to-end test"
+      ],
+      "touches": [
+        "internal/cli/workspace.go",
+        "internal/cli/workspace_test.go",
+        "test/e2e/workspace_create_test.go"
+      ],
+      "depends_on": [
+        3
+      ]
+    }
+  ]
+}

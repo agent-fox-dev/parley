@@ -1,0 +1,279 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "48",
+  "spec_name": "sandbox_network_policy",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/sandbox/... ./internal/cli/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "45",
+      "reason": "uses the sandbox record with policy_revision and workspace_rules, the workspace rule provider and policy composer it registers with, the delete and purge hook lists, the protected rules (hub rule and credential rules), the profile snapshot, the scrubbing function, and through it the runtime client and fake of package 44, the binding guard, the access rule and the store"
+    },
+    {
+      "spec": "52",
+      "reason": "writes parley.sandbox.deny, proposal, proposal_decided, rule_add and rule_remove through the event component, each in the transaction of its state change"
+    },
+    {
+      "spec": "09",
+      "reason": "builds the five parley sandbox commands on the CLI root, HTTP client, output and exit codes"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Record workspace sandbox rules on new sandboxes and compose the effective policy",
+      "criteria": [
+        "REQ-1"
+      ],
+      "steps": [
+        "Add the policy behaviours to internal/sandbox/policy_test.go on a real SQLite store in t.TempDir() and the fake runtime client of package 44, and confirm they fail",
+        "Register this package's schema steps with the store of package 03: workspace sandbox rules (id, workspace slug, rule as JSON, a canonical form of the rule for comparison, summary, findings, from_proposal, created_by, created_at) and rules approved for a sandbox (sandbox id, proposal id, rule body, decided_at); the copies of a sandbox's workspace rules and its allow_proposals value are fields of package 45's record and get no table here",
+        "Add the rule store in internal/sandbox/rule.go: save a rule, list a workspace's rules by created_at then id, delete one, count them, and resolve the holding workspace of a slug (the workspace itself, or the parent of a task fork, through the workspace record of package 07)",
+        "Use the policy value of package 44's runtime client (base document, protected rules, added rules), which CreateSandbox and StartSandbox take and which the fake records and can reject on a predicate; define no second policy type and add nothing to the interface or the fake",
+        "Register the workspace rule provider of package 45 in internal/sandbox/policy.go: called in the creating transaction with the family root slug, it returns the holding workspace's rules with id and body, oldest first; package 45 records the ids in workspace_rules and in the create event's metadata, and the bodies with the record; the value of allow_workspace_rules and the profile play no part",
+        "Add ComposePolicy(sandbox): base from the profile snapshot of package 45's record; protected = the protected rules package 45 exports (the hub rule when the sandbox has a hub credential, then each credential rule in the order of the sandbox's credentials list), unchanged; added = the copies recorded with the sandbox in order, then the sandbox's approved rules by decision time, leaving out an approved rule whose body equals a recorded copy",
+        "Register ComposePolicy as the Compose of package 45's policy composer, which that package's provisioning calls before CreateSandbox for a create and before StartSandbox for a start of package 47; a restored sandbox is composed like any new sandbox and takes nothing from its source's approved rules",
+        "In Compose, call ValidatePolicy for the base document of a profile that names a policy file; when the result lists the hub credential's provider among the providers the document refers to, return an error naming the profile and the hub credential, on which package 45 ends the sandbox failed with provision_failed without a create call",
+        "Register the composer's Explain: when the runtime refused the composed policy, call ValidatePolicy without workspace rules and then with the copies added one at a time; name the first rule id that makes it reject, or the profile when the policy is rejected without any; cut the error text to 1,024 bytes and pass it through package 45's scrubbing function"
+      ],
+      "touches": [
+        "internal/sandbox/schema.go",
+        "internal/sandbox/rule.go",
+        "internal/sandbox/policy.go",
+        "internal/sandbox/policy_test.go"
+      ],
+      "done_when": [
+        "`go test ./internal/sandbox/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Report each sandbox's denials once per destination and count all of them",
+      "criteria": [
+        "REQ-2"
+      ],
+      "steps": [
+        "Add the denial behaviours to internal/sandbox/collector_test.go with the fake runtime, a real store, the event component of package 52 and a controlled clock, and confirm they fail",
+        "Follow each sandbox with Logs of package 44's runtime client (source policy, follow) and take the entries whose action is deny, each with program, host, port, method and path; the fake emits the entries a test gives it, can break a stream and reports its open streams; add nothing to the interface, its OpenShell implementation or its fake",
+        "Add the schema step for reported denial triples (sandbox id, program, host, port), unique per sandbox",
+        "Add the collector in internal/sandbox/collector.go with a pass function that tests drive without timers: open one stream for each sandbox in state ready that has none, and close the stream of a sandbox that left ready",
+        "For each denial add 1 to parley_sandbox_denials_total through the metrics recorder of package 44; then, in one store transaction, insert the triple and, only when the insert was new, write parley.sandbox.deny with actor system, the sandbox as resource, its workspace and session, and the five metadata values, with null method and path for a blocked connection and the path passed through package 45's scrubbing function",
+        "On a stream error or an unreachable runtime, log it, close the stream and open it again no sooner than the retry delay (a parameter, 5 seconds in production) on the collector's clock; the pass never returns the error and the collector ends only when its context is cancelled",
+        "Register the collector in internal/hub as background work of package 03 that runs only when sandboxes are enabled"
+      ],
+      "touches": [
+        "internal/sandbox/collector.go",
+        "internal/sandbox/collector_test.go",
+        "internal/sandbox/schema.go",
+        "internal/hub/"
+      ],
+      "done_when": [
+        "`go test ./internal/sandbox/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Collect proposals from the runtime and clean up after removed sandboxes",
+      "criteria": [
+        "REQ-3.1",
+        "REQ-3.2",
+        "REQ-3.3",
+        "REQ-3.5",
+        "REQ-3.6"
+      ],
+      "steps": [
+        "Add the proposal collection behaviours to internal/sandbox/collector_test.go and the cleanup behaviour to internal/sandbox/proposal_test.go, and confirm they fail",
+        "List the pending proposals of the hub's OpenShell workspace with ListProposals of package 44's runtime client ({runtime proposal id, sandbox, rule, summary, findings}) and reject one with RejectProposal; add nothing to the interface, its OpenShell implementation or its fake",
+        "Add the schema step and the proposal store in internal/sandbox/proposal.go: id sbp_ plus 32 lowercase hex characters from crypto/rand, sandbox id, runtime proposal id (unique per sandbox), rule, summary, findings, state, scope, workspace_rule_id, decided_by, decided_at, comment, created_at",
+        "Add a max-severity function over findings with the order low < medium < high, null for no finding, and any other severity ranking below low",
+        "In each collector pass, at most once per poll interval (a parameter, 5 seconds in production), list the pending proposals; for one the store already holds do nothing; for a sandbox whose recorded allow_proposals is true insert it as open and write parley.sandbox.proposal with actor system and the metadata proposal_id, summary and max_severity in the same transaction; for a sandbox whose recorded value is false call the runtime's reject and store nothing; for a sandbox id the store does not hold do nothing",
+        "When the listing fails, log it and end that part of the pass without changing a record",
+        "Register a delete hook with the list of package 45 that sets the open proposals of the given sandbox to withdrawn with one conditional update in the given transaction, writing no event",
+        "Register a purge hook with the list of package 45 that deletes the proposals, denial triples and approved rules of the given sandbox in the given transaction"
+      ],
+      "touches": [
+        "internal/sandbox/proposal.go",
+        "internal/sandbox/proposal_test.go",
+        "internal/sandbox/collector.go",
+        "internal/sandbox/collector_test.go",
+        "internal/sandbox/schema.go",
+        "internal/hub/"
+      ],
+      "done_when": [
+        "`go test ./internal/sandbox/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Serve the proposals list with the checks every route of this package shares",
+      "criteria": [
+        "REQ-4"
+      ],
+      "steps": [
+        "Add the list behaviours to internal/sandbox/proposal_routes_test.go, against an httptest server with the middleware of package 02, the access component and the binding guard, and confirm they fail",
+        "Register GET /api/v1/workspaces/{slug}/sandboxes/{id}/proposals in internal/sandbox/proposal_routes.go behind the feature check of package 44, so that a hub without a [sandbox] section answers 404 sandboxes_disabled before the binding guard; declare the scope sandboxes:read and the need read",
+        "Resolve the sandbox by id within the workspace of the slug through the record store of package 45; an unknown id, an id of another workspace and a removed record answer 404 sandbox_not_found; a record in state deleted is served",
+        "Validate state as exactly one of open, approved, rejected, withdrawn, defaulting to open; anything else is 400 invalid_request",
+        "Answer with the list helper of package 02 ordered by created_at then id, oldest first, each item with the twelve proposal members, null where unset"
+      ],
+      "touches": [
+        "internal/sandbox/proposal_routes.go",
+        "internal/sandbox/proposal_routes_test.go",
+        "internal/hub/"
+      ],
+      "done_when": [
+        "`go test ./internal/sandbox/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Approve a proposal for its sandbox",
+      "criteria": [
+        "REQ-5.1",
+        "REQ-5.2",
+        "REQ-5.3",
+        "REQ-5.6",
+        "REQ-5.8"
+      ],
+      "steps": [
+        "Add the approve behaviours to internal/sandbox/proposal_routes_test.go with a controlled clock and confirm they fail",
+        "Add the rule with AddPolicyRule of package 44's runtime client: a result of kind invalid is a rejection with the runtime's reason, a result of kind unavailable or unsupported a runtime that cannot be reached; add nothing to the interface, its OpenShell implementation or its fake",
+        "Register POST /api/v1/workspaces/{slug}/sandboxes/{id}/proposals/{proposal_id}/approve behind the feature check, declared with package 08 at registration as a route that refuses every workspace-bound token, so that its binding guard answers 403 token_bound before the scope check and the handler adds no check of its own, with the scope sandboxes:write and the need write",
+        "Write the decision as one function that both decisions and both scopes use, running one decision at a time per sandbox (an in-process lock keyed by sandbox id, held from the first proposal read to the commit), with its checks in this order: body is an object whose comment is a string, acknowledge_findings a boolean and scope sandbox or workspace (400 invalid_request); the sandbox exists in the workspace (404 sandbox_not_found); the proposal exists for this sandbox (404 not_found); the proposal is open (409 proposal_decided); for an approval, a finding of severity high needs acknowledge_findings true (409 findings_not_acknowledged)",
+        "For an approval of a sandbox in state provisioning or ready call the runtime's add-rule: a rejection answers 409 conflict with the reason, redacted by package 45 and cut to 1,024 bytes; a failure to reach it answers 502 sandbox_runtime_error; in both nothing is stored. In stopped, completed and failed make no runtime call",
+        "Commit in one transaction: update the proposal to approved with scope, decided_by, decided_at from the clock and comment, conditional on state open; insert the approved rule for the sandbox; add one to policy_revision through the record store of package 45; write parley.sandbox.proposal_decided with the caller as actor, the sandbox as resource and the metadata proposal_id, decision, acknowledged_findings, scope and rule_id null. When the conditional update changes no row, roll back and answer 409 proposal_decided",
+        "Answer 200 with the proposal as stored"
+      ],
+      "touches": [
+        "internal/sandbox/proposal_routes.go",
+        "internal/sandbox/proposal_routes_test.go",
+        "internal/sandbox/proposal.go"
+      ],
+      "done_when": [
+        "`go test ./internal/sandbox/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Reject a proposal and refuse what neither decision allows",
+      "criteria": [
+        "REQ-6",
+        "REQ-5.4",
+        "REQ-5.5",
+        "REQ-5.7",
+        "REQ-3.4"
+      ],
+      "steps": [
+        "Add the reject behaviours and the refusal and race tables over both decisions to internal/sandbox/proposal_routes_test.go, and the withdrawn behaviour of a deleted sandbox (list, then approve and reject) to internal/sandbox/proposal_test.go, and confirm they fail",
+        "Register POST /api/v1/workspaces/{slug}/sandboxes/{id}/proposals/{proposal_id}/reject like the approve route: feature check, refused for every workspace-bound token, scope sandboxes:write, need write; its body takes comment only",
+        "Run the shared decision function with the decision rejected: no findings check, no runtime call before the commit, policy_revision untouched, scope and workspace_rule_id null, and the event metadata decision rejected, acknowledged_findings false, scope null, rule_id null",
+        "After the commit tell the runtime that the proposal is rejected; on any error log one line with the sandbox id and the proposal id, with the error text passed through package 45's redaction, and still answer 200",
+        "Confirm over both routes that a bound token is refused with 403 token_bound before the scope, the access and the body are looked at, including the sandbox's own hub credential, and that an unknown proposal and a proposal of another sandbox answer 404 not_found",
+        "Confirm that of two decisions released together exactly one commits: the loser gets 409 proposal_decided from the conditional update, one event exists, and policy_revision rises only for a committed approval"
+      ],
+      "touches": [
+        "internal/sandbox/proposal_routes.go",
+        "internal/sandbox/proposal_routes_test.go",
+        "internal/sandbox/proposal.go",
+        "internal/sandbox/proposal_test.go"
+      ],
+      "done_when": [
+        "`go test ./internal/sandbox/... -count=1` passes",
+        "`go test ./internal/sandbox/... -count=1 -race` passes for the race tables"
+      ]
+    },
+    {
+      "id": 7,
+      "title": "List and delete workspace sandbox rules and remove them with their workspace",
+      "criteria": [
+        "REQ-8"
+      ],
+      "steps": [
+        "Add the rule route behaviours to internal/sandbox/rule_routes_test.go and the remover behaviour to internal/sandbox/rule_test.go, and confirm they fail",
+        "Register GET /api/v1/workspaces/{slug}/sandbox-rules in internal/sandbox/rule_routes.go behind the feature check with the scope sandboxes:read and the need read; list the rules of the holding workspace, which is the parent when the slug names a task fork, with the list helper of package 02 ordered by created_at then id, each item with id, rule, summary, findings, from_proposal, created_by and created_at",
+        "Register DELETE /api/v1/workspaces/{slug}/sandbox-rules/{rule_id} behind the feature check, refused for every workspace-bound token, with the scope sandboxes:write and the need write, and with no workspace state precondition so that it works on an archived workspace",
+        "In the delete answer 400 not_supported_on_fork when the slug names a task fork, then 404 sandbox_rule_not_found when the workspace holds no rule of that id",
+        "Delete the rule row and write parley.sandbox.rule_remove in one transaction, with the caller as actor, resource_type sandbox_rule, the rule id as resource, the workspace's slug, session_id null and the metadata rule_id and summary; leave the per-sandbox copies alone; answer 204",
+        "Add RemoveWorkspaceRules(tx, slug), a remover of owned data in the terms of package 14 (it takes the transaction and one slug and returns the ids of tokens it revoked, here none): it deletes the rules of the slug through the caller's transaction and writes no event; register it in internal/hub with the collaborator set of internal/workspace when that set is present in the build"
+      ],
+      "touches": [
+        "internal/sandbox/rule_routes.go",
+        "internal/sandbox/rule_routes_test.go",
+        "internal/sandbox/rule.go",
+        "internal/sandbox/rule_test.go",
+        "internal/hub/"
+      ],
+      "depends_on": [
+        1,
+        4
+      ],
+      "done_when": [
+        "`go test ./internal/sandbox/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Promote an approved rule to the workspace",
+      "criteria": [
+        "REQ-7"
+      ],
+      "steps": [
+        "Add the promotion behaviours to internal/sandbox/rule_test.go, driving the approve route over HTTP, and confirm they fail",
+        "Read allow_workspace_rules from the loaded [sandbox] configuration of package 44, which validates the key and defaults it to true, and give the sandbox component its value; register no configuration key",
+        "Extend the shared decision function for scope workspace, after body validation and before the proposal is looked up: when the switch is false answer 403 workspace_rules_disabled; resolve the holding workspace (the sandbox's workspace, or its parent for a task fork); when the caller lacks write access to it by the access rule of package 07 answer 403 forbidden; when it is a parent and archived answer 409 parent_archived",
+        "Compute the canonical form of the proposal's rule (JSON with sorted keys and no insignificant whitespace) and look for a rule of the holding workspace with the same form",
+        "When no identical rule exists, count the holding workspace's rules and answer 429 sandbox_rule_limit_reached at 50; else, inside the commit transaction, insert the rule with a new id sbr_ plus 32 lowercase hex characters, the proposal's rule, summary and findings, from_proposal {sandbox_id, proposal_id, workspace: the sandbox's workspace slug}, created_by and created_at",
+        "Run one promotion at a time per holding workspace (an in-process lock keyed by its slug, taken before the identical-rule lookup and the limit check and held to the commit), and make the identical-rule lookup and the limit check before the runtime call, so that a refusal at 50 rules makes no runtime call and two promotions that race at 49 rules end as one saved rule and one 429",
+        "Record scope workspace and workspace_rule_id (the new or the identical rule's id) on the proposal, put that id in rule_id of parley.sandbox.proposal_decided, and, only when a rule was inserted, write parley.sandbox.rule_add in the same transaction with the caller as actor, resource_type sandbox_rule, the rule id as resource, the holding workspace's slug, the sandbox's session_id and the metadata rule_id, summary, max_severity and from_proposal",
+        "Confirm that with the switch false earlier rules are still listed, deletable and copied to new sandboxes, and that an approval with scope sandbox is unaffected"
+      ],
+      "touches": [
+        "internal/sandbox/rule.go",
+        "internal/sandbox/rule_test.go",
+        "internal/sandbox/proposal_routes.go",
+        "internal/sandbox/proposal.go",
+        "internal/hub/"
+      ],
+      "depends_on": [
+        6,
+        7
+      ],
+      "done_when": [
+        "`go test ./internal/sandbox/... -count=1` passes",
+        "`go test ./internal/sandbox/... -count=1 -race` passes for the limit race"
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Add parley sandbox proposals, approve, reject, rules and rule-delete",
+      "criteria": [
+        "REQ-9"
+      ],
+      "steps": [
+        "Add the command behaviours to internal/cli/sandbox_policy_test.go against an httptest server that records method, path, query and body, and confirm they fail",
+        "Add the five subcommands in internal/cli/sandbox_policy.go to the sandbox command group of package 44, creating the group there only if it is not registered yet, on the HTTP client, output and exit-code helpers of package 09",
+        "proposals <workspace-slug> <id> takes --state; rules <workspace-slug> takes --limit and --cursor; each sends a query parameter only for a flag that was given and prints the response body",
+        "approve <workspace-slug> <id> <proposal-id> takes --comment, --acknowledge-findings and --scope; reject takes --comment; each posts a JSON object that holds a member only for a flag that was given, {} when none was, and prints the returned proposal",
+        "rule-delete <workspace-slug> <rule-id> sends the DELETE and on 204 prints the document with id the rule id and status deleted",
+        "Make a wrong argument count and a --scope value other than sandbox or workspace a usage error of package 09 before any request",
+        "Add test/e2e/sandbox_policy_test.go with the two end-to-end flows of the PRD: start the hub in-process on a loopback port the system picks with the fake runtime client as the only stand-in, run the CLI command tree against it, and assert the end states of both flows"
+      ],
+      "touches": [
+        "internal/cli/sandbox_policy.go",
+        "internal/cli/sandbox_policy_test.go",
+        "test/e2e/sandbox_policy_test.go"
+      ],
+      "depends_on": [
+        6,
+        8
+      ],
+      "done_when": [
+        "`go test ./internal/cli/... ./test/e2e/... -count=1` passes"
+      ]
+    }
+  ]
+}

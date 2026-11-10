@@ -1,0 +1,243 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "29",
+  "spec_name": "auto_land_revert_and_path_limits",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/land/... ./internal/cli/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "09",
+      "reason": "parley change revert is declared through its command helper and uses its HTTP client, output and exit codes"
+    },
+    {
+      "spec": "24",
+      "reason": "registers the version guard that its manual restack calls before it moves the source branch"
+    },
+    {
+      "spec": "25",
+      "reason": "starts land attempts through its start function, reads the landed commits of a change, and registers the override rule, the request guards and a final observer that internal/land declares"
+    },
+    {
+      "spec": "27",
+      "reason": "reads the landing status it evaluates for each change, which the automatic lander acts on and the override rule judges"
+    },
+    {
+      "spec": "52",
+      "reason": "writes parley.change.revert and parley.change.land_fail through its event component and reads parley.change.ready events after a position through ReadAfter"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Check a version's files against a token's globs and answer the push rules' lookup",
+      "criteria": [
+        "REQ-7.1",
+        "REQ-7.2",
+        "REQ-7.3",
+        "REQ-7.4"
+      ],
+      "steps": [
+        "Add the behaviours to internal/land/pathlimit_test.go (the glob and version table, the unrestricted and hub-made cases, the ref move onto existing commits, the lookup table) and the git push case to test/e2e/path_limits_test.go, and confirm they fail",
+        "Create internal/land/pathlimit.go with the path-limit check: given a credential's globs, a repository, a base commit and a head commit, list the paths that differ between base and head through internal/gitrepo with rename detection, counting a rename with both paths, sort them in byte order and return allowed, or refused with the first path that matches no glob; use the glob matcher package 06 exports from internal/identity ('?' literal), write no second matcher and never use the policy path matcher of package 27 here",
+        "Read the files from the repository on every call; never use the paths list stored on the change, which stops at 2,000",
+        "Answer allowed without reading the repository when the credential has no paths or the version is made by the hub with actor system",
+        "Return an error, not a refusal, when git fails, so that the caller answers an internal error instead of allowing or naming a path",
+        "Implement the version-files lookup the push-rule engine of package 18 declares in internal/gitserver/pushrule, with the arguments the engine passes (the slug, the branch, the new head and the opens-change flag): answer no version when the branch is not the source of a draft or open change and the flag is not set; otherwise answer the files between the merge base of the target head and the new head, the target being the change's, or for an update that opens a change the branch package 22's open defaults to",
+        "Register the lookup with the engine where parleyd wires its collaborators, so that a push or an API ref move that adds no new commit is refused by rule 5 with the first offending path"
+      ],
+      "touches": [
+        "internal/land/pathlimit.go",
+        "internal/land/pathlimit_test.go",
+        "internal/gitserver/pushrule",
+        "cmd/parleyd",
+        "test/e2e/path_limits_test.go"
+      ],
+      "done_when": [
+        "`go test ./internal/land/... -run PathLimit -count=1` passes against a repository created with git init"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Refuse a restack and a land outside a token's paths",
+      "criteria": [
+        "REQ-7.5",
+        "REQ-8.1",
+        "REQ-8.6"
+      ],
+      "steps": [
+        "Add the restack table, the land table and the policy-independence case to internal/land/pathlimit_test.go and confirm they fail",
+        "Offer a version guard from internal/land: given the caller's credential and the base and head of a version about to be recorded, run the path-limit check and return the path_not_allowed refusal with the path",
+        "Register the guard through RegisterVersionGuard as the VersionGuard that package 24 declares in internal/change/restack_handler.go for its manual restack, which calls it with the caller's credential and the base and head of the version to record after the replay is computed (with or without resolutions) and before the source branch moves; a restack the hub makes on its own does not call it",
+        "On a refusal answer HTTP 403 with error_type path_not_allowed and the path as the member path of the error object, as the source control API does; move no branch and record no version",
+        "Register the check as a request guard of package 25 in internal/land, which the land route asks after authentication, scope, access, the lookup of the change and the body validation and before the preconditions of landing: run it for the current version of every change the attempt would cover, bottom first; on a refusal answer 403 path_not_allowed with the path, so that no land attempt is created",
+        "Leave the policy gate untouched by the path check: a token whose globs cover the change gets the answer any other credential of that user would get"
+      ],
+      "touches": [
+        "internal/land/pathlimit.go",
+        "internal/land/pathlimit_test.go",
+        "internal/land",
+        "internal/change",
+        "cmd/parleyd"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Gate the override of a land call",
+      "criteria": [
+        "REQ-9"
+      ],
+      "steps": [
+        "Add the accepted-override table, the block case, the refusal table crossed with policy status, the malformed table and the ready case to internal/land/override_test.go and confirm they fail",
+        "Create internal/land/override.go with the two things package 25 declares registration points for: a request guard and the override rule; the shape of the override member (an object whose reason is a string that is not empty after trimming white space, else 400 invalid_request) is validated by the land route of package 25 and not again here",
+        "In the request guard, for a request that carries override, refuse with 403 override_not_allowed, in this order: a PAT bound to the workspace or to a fork; a caller whose access level is not owner and who is not the admin token; the workspace setting land.allow_override false, for every caller",
+        "Register the guard with internal/land so that the land route asks it before a land attempt is created, whatever the landing status of the change, and a refusal leaves no attempt",
+        "Register the override rule with internal/land: asked by the engine for a gate answer that is not ready on a request with override, it lets status pending pass and never status blocked, for every change of a stack; the policy gate of package 27 is not changed",
+        "Confirm that package 25 records the override on the land attempt and in the metadata of each parley.change.land event only when the rule let at least one change pass, and null otherwise"
+      ],
+      "touches": [
+        "internal/land/override.go",
+        "internal/land/override_test.go",
+        "internal/land"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Start an automatic land when a change with auto_land becomes landable",
+      "criteria": [
+        "REQ-1",
+        "REQ-8.3",
+        "REQ-8.4",
+        "REQ-8.5"
+      ],
+      "steps": [
+        "Add the start table, the not-permitted table, the nothing-to-start table, the set-while-landable case, the start-up case and the stored-globs cases to internal/land/autoland_test.go, and the PATCH cases to internal/land/pathlimit_test.go, and confirm they fail",
+        "Create internal/land/autoland.go with the automatic lander and a store table keyed by workspace and change number that holds, for a flag that is on, the retry count and the due time of a pending retry; the user who set the flag, the credential type and the credential's globs or null are not stored here: read them through the accessor AutoLandSetter of package 23, the one store of the setter",
+        "Register an auto_land guard with internal/change through RegisterAutoLandGuard, as the AutoLandGuard that package 22 declares and that the open of package 22 and the PATCH of package 23 call with the caller's credential and the change before they store auto_land true (revert reaches it through the open): for a path-scoped credential run the path-limit check on the change's current version and refuse with 403 path_not_allowed and the path, so that no member of the request is applied; otherwise accept, and record no setter: the caller stores the flag and its setter through SetAutoLand of internal/change (packages 22 and 23); setting false is never refused and deletes this package's retry row",
+        "Follow parley.change.ready, whose one writer is the landable announcement of package 23: read the events after a stored position with ReadAfter of the event component of package 52, run the start procedure for the change of each parley.change.ready event, and store the new position in the same transaction as the work it caused; a pass runs every second (the interval is a parameter) and is callable from tests; also run the start procedure when the guard has just accepted the flag on a change that is already landable",
+        "Start procedure: do nothing when the change is not open, the flag is off, the change is not landable, a land attempt for it is running, or its depends_on names a change that is not landed",
+        "Then check permission as the setter: the admin token passes; a user must exist, not be blocked, and have write access to the target workspace or be the change's author while land.by_author is true; scopes are not examined",
+        "Then, when the setter read through AutoLandSetter has globs, run the path-limit check on the change's current version against them, whether or not the token still exists",
+        "When either check fails, create no attempt, clear the flag through SetAutoLand of internal/change (which clears the stored setter), delete the retry row, and emit parley.change.land_fail on the change through the event component with actor system and metadata land_id null, status blocked, reason not_permitted",
+        "Otherwise start a land attempt for the one change through the start function package 25 exports for trigger auto_land, with no stack, no override, session_id null, requested_by built from the credential type and the user that AutoLandSetter returns, and system as the actor of its events",
+        "At start-up, after the land component has recovered its running attempts, run the start procedure for every open change with the flag on",
+        "Run the lander's work off the request path, stop it with the server's shutdown, and take the clock as a parameter"
+      ],
+      "touches": [
+        "internal/land/autoland.go",
+        "internal/land/autoland_test.go",
+        "internal/land/pathlimit_test.go",
+        "internal/change",
+        "cmd/parleyd",
+        "internal/event"
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Keep, retry or clear auto_land by the outcome of the attempt",
+      "criteria": [
+        "REQ-2"
+      ],
+      "steps": [
+        "Add the conflict and blocked case, the delay sequence with its exhaustion, the dropped-retry table, the count reset and the restart case to internal/land/autoland_test.go with a fake clock and confirm they fail",
+        "Register a final observer with internal/land (package 25), which reports every final attempt with its trigger, changes and status, and act on those whose trigger is auto_land",
+        "On landed, conflict or blocked set the retry count to zero and schedule nothing; the flag stays as it is",
+        "On failed with a count below 10, add one to the count and store the due time: now plus 2 seconds doubled for each earlier retry of the series and capped at 300 seconds; write count and due time in one store transaction",
+        "On failed with a count of 10, clear the flag through SetAutoLand of internal/change, delete the retry row and schedule nothing",
+        "When a retry comes due run the start procedure of the automatic lander; when it starts nothing because the change is not open, the flag is off or the change is not landable, clear the due time and set the count to zero",
+        "At start-up load every stored due time and make each retry at its time, or at once when the time has passed, keeping the stored count",
+        "Hold pending retries in one timer loop driven by the replaceable clock; the loop ends with the server's shutdown and leaves the stored due times in place"
+      ],
+      "touches": [
+        "internal/land/autoland.go",
+        "internal/land/autoland_test.go",
+        "internal/land"
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Land a stack automatically from the bottom up",
+      "criteria": [
+        "REQ-3"
+      ],
+      "steps": [
+        "Add the waiting-dependant case and the two-change stack case to internal/land/autoland_test.go and confirm they fail",
+        "Confirm the start procedure starts nothing and keeps the flag while depends_on names a change that is not landed, and emits no event for it",
+        "Confirm that after the lower change lands and the hub restacks the dependant, the landable announcement of the dependant's new version starts its attempt; if the announcement can arrive before the restack clears depends_on, run the start procedure for each dependant with the flag on once more when its restack version is recorded",
+        "Assert in the stack test that every automatic attempt names exactly one change and that the lower attempt finished before the upper was created"
+      ],
+      "touches": [
+        "internal/land/autoland.go",
+        "internal/land/autoland_test.go"
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Revert a landed change with one call",
+      "criteria": [
+        "REQ-4"
+      ],
+      "steps": [
+        "Add the revert behaviours to internal/land/revert_test.go (rebase and squash originals, body options, branch suffix, events and reverted_by, the refusal table, the conflict, the abandoned reverter, the revert of a revert) and confirm they fail",
+        "Create internal/land/revert.go and register POST /api/v1/workspaces/:slug/changes/:number/revert with the conventions of package 02, Idempotency-Key included",
+        "Validate the body (types; title 1 to 200 characters without a line break; intent at most 16,000 characters; the session-linking rule), then refuse in this order: archived workspace 409 workspace_archived; change not landed 409 change_not_landed; a draft, open or landed change with reverts equal to this number 409 already_reverted with details.reverted_by; target branch missing 400 target_not_found; original landed with noop true 400 nothing_to_land",
+        "Read the target head and the landed commits of the original from the land component; in a temporary worktree or index of internal/gitrepo undo them newest first, one commit each, with the subject Revert \"<subject>\", the body This reverts commit <id>., and the hub's landing identity as author and committer; skip a commit whose undo changes nothing and answer 400 nothing_to_land when all are skipped",
+        "When an undo does not apply, return a ConflictReport, the one conflict report type (declared by package 20 in internal/gitrepo/conflictreport.go, used by landing), with target_sha the target head, commit_sha the landed commit, the conflicted files, landed_changes and every landed_by empty and change null, and answer 409 revert_conflict with it in details.conflict; remove the temporary state and create no ref",
+        "Pick the branch name revert/<number>, or the first free one of revert/<number>-2, -3 and so on, and create it as package 21 creates a ref: Evaluate of the push rule engine of package 18 with the caller's facts, then Apply, its ref writer, with via api and compare-and-swap against absent; on a lost race take the next name; a refusal by a push rule is answered 403 with the rule's error_type and nothing is created",
+        "Open the change through the opening operation of internal/change with the branch as source, the original's target, reverts set, version kind revert, the caller as author, the default or given title and intent, draft, session_id, and auto_land through the auto_land guard; if opening fails delete the branch just created and return that error",
+        "Emit parley.change.revert on the original with the caller as actor and metadata reverted_by, and answer 201 with the new change",
+        "Derive reverted_by of a change as the highest-numbered change with reverts equal to its number whose state is draft, open or landed, through the setter package 22 offers, and update it when a reverting change is opened, abandoned or restored"
+      ],
+      "touches": [
+        "internal/land/revert.go",
+        "internal/land/revert_test.go",
+        "internal/change",
+        "internal/server",
+        "cmd/parleyd",
+        "internal/gitserver/pushrule"
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Decide who may revert, and hold a path-scoped token to its paths",
+      "criteria": [
+        "REQ-5",
+        "REQ-8.2"
+      ],
+      "steps": [
+        "Add the permission tables and the path-scoped rows (with and without auto_land true) to internal/land/revert_test.go and confirm they fail",
+        "On the revert route require changes:write of a PAT (403 insufficient_scope) and resolve access with the access rule of package 07: no read access is 404 not_found; an unknown number is 404 change_not_found",
+        "Allow a caller with write access to the target workspace, the admin token, and the author of the original change while land.by_author is true; answer every other reader 403 forbidden",
+        "Confirm the binding guard of package 08 answers a token bound to a fork 403 token_bound on this route, and do not add the route to its table of routes a fork token reaches",
+        "After the target_not_found check and before the nothing-to-undo check and any commit is built, run the path-limit check for a path-scoped caller on the landed version of the original (its base and head as recorded); on a refusal answer 403 path_not_allowed with the path and create nothing"
+      ],
+      "touches": [
+        "internal/land/revert.go",
+        "internal/land/revert_test.go"
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Add parley change revert",
+      "criteria": [
+        "REQ-6"
+      ],
+      "steps": [
+        "Add the flag table, the hub-error table and the usage table to internal/cli/change_test.go against an httptest server and confirm they fail",
+        "Declare parley change revert <slug> <number> in internal/cli/change.go through the command helper of package 09: method POST, path /workspaces/:slug/changes/:number/revert, two required arguments, auth user",
+        "Add the flags --title, --intent, --draft, --auto-land and --session; build the body from the flags that were given and from nothing else, so that no flag sends {}",
+        "Refuse a number that is not a positive integer as a usage error before any request",
+        "Print the answer through the shared result printer and leave errors and exit statuses to the shared client",
+        "Add the two end-to-end flows to test/e2e/autoland_revert_test.go: automatic landing after a check passes, and revert from the CLI followed by landing the revert"
+      ],
+      "touches": [
+        "internal/cli/change.go",
+        "internal/cli/change_test.go",
+        "test/e2e/autoland_revert_test.go"
+      ]
+    }
+  ]
+}

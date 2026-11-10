@@ -1,0 +1,279 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "49",
+  "spec_name": "agent_sessions_and_usage",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/session/... ./internal/cli/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "07",
+      "reason": "the access component decides read and write access to a session's workspace and supplies the readable set and the minimal workspace record (kind, parent, status)"
+    },
+    {
+      "spec": "09",
+      "reason": "the `parley session` commands are built on the CLI's shared HTTP client, output and exit codes"
+    },
+    {
+      "spec": "52",
+      "reason": "the forced close writes `parley.session.force_closed` through the event component in the caller's transaction"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Open sessions with POST /sessions",
+      "criteria": [
+        "REQ-1"
+      ],
+      "steps": [
+        "Add the behaviours of opening a session to internal/session/create_test.go (valid create per credential type, validation table, access table, archived refusal, replay, conflict, concurrent creates) and confirm they fail",
+        "Add a store migration, registered with the migrations of internal/store, for three tables: sessions (id, workspace slug, parent slug, labels, status, user id, credential type, started_at, ended_at, duration_ms, error_message, cache_creation_input_tokens, metadata as JSON text), usage records (unique id, session id, workspace slug, model, three counts, reported_at) and session links (session id, kind, workspace, key, extra, created_at, unique on session, kind, workspace and key)",
+        "Define in internal/session the session component: it is constructed from the store, a clock, the access component of internal/access, and two narrow interfaces declared here: a workspace reader (kind, parent slug and status of a slug, from the minimal workspace record of internal/access) and a coverage question (is this caller's credential bound, and does its binding cover this slug). With no coverage implementation installed no caller counts as bound",
+        "Add the validators for a UUID in the 8-4-4-4-12 form (any case, stored lower case), the run id form YYYYMMDD_HHMMSS_ plus six lower-case hexadecimal digits, and a label of at most 255 characters; generate a version 4 UUID from crypto/rand when no id is sent",
+        "Add the one function that builds the session object with all seventeen members from a session row, computing token_summary, forks, changes, sandboxes and counts from the usage and link tables at call time; every route uses it",
+        "Register POST /api/v1/sessions through internal/server as a create route with scope sessions:write. Decide in this order: workspace_slug present and a non-empty string (400), coverage for a bound caller (404 workspace not found), write access through the access component (404 or 403), the other members (400 naming the member), the id lookup (same creator and same workspace: 200 with the stored session; otherwise 409 conflict), the archived status (409 workspace_archived), then the insert",
+        "Store the caller's user id (null for the admin token) and credential type (admin_token, api_key, pat), started_at from the clock, and the parent slug when the workspace is a task fork",
+        "Make the insert safe under concurrency: a create that loses the race on the id's uniqueness answers as a replay (200) or a conflict (409) by the same rule, never 500",
+        "Add internal/hub/session.go, which constructs the session component with the real store, clock and access component, installs the coverage component of internal/access when the repository has one, and registers the session routes"
+      ],
+      "touches": [
+        "internal/session/session.go",
+        "internal/session/store.go",
+        "internal/session/validate.go",
+        "internal/session/create.go",
+        "internal/session/routes.go",
+        "internal/session/create_test.go",
+        "internal/session/testhub_test.go",
+        "internal/hub/session.go"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Read one session under the session visibility rule",
+      "criteria": [
+        "REQ-4.1",
+        "REQ-4.2",
+        "REQ-4.3",
+        "REQ-4.4"
+      ],
+      "steps": [
+        "Add the behaviours of reading a session to internal/session/read_test.go (who reads, removed workspace and removed fork, the 404 that hides existence, malformed id and missing scope) and confirm they fail",
+        "Add the one function that decides whether a caller may read a session: the admin token; the creator by user id; a caller whose level on the session's workspace is not none; for a session with a stored parent slug, a caller whose level on that parent is not none, whether or not the fork's record still exists. For a bound caller the session's workspace must be covered first, also for the creator",
+        "The function reads levels through the access component and ignores the workspace's status; a workspace that has no record grants nothing by itself",
+        "Register GET /api/v1/sessions/{id} with scope sessions:read (either scope of the pair passes). A path id that is not a UUID answers 400 invalid_request; a session the caller may not read and an unknown id answer the same 404 not_found with message `session not found`",
+        "Accept the id in any letter case and look it up in lower case"
+      ],
+      "touches": [
+        "internal/session/read.go",
+        "internal/session/routes.go",
+        "internal/session/read_test.go"
+      ],
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Complete a session exactly once",
+      "criteria": [
+        "REQ-2"
+      ],
+      "steps": [
+        "Add the behaviours of completing a session to internal/session/complete_test.go (the three statuses, computed duration, terminal sessions unchanged, racing completes, validation table, creator rule, 404 rule) and confirm they fail; the usage rows of the shared tables are added by the usage task",
+        "Add the one function that decides whether a caller may change a session: the admin token always; a user when the session's user id is that user; nobody else. A session opened by the admin token has no user id and is changed only by the admin token",
+        "Register POST /api/v1/sessions/{id}/complete with scope sessions:write. Decide in this order: path id is a UUID (400), the caller may read the session (404 session not found), the caller may change it (403 forbidden), the body (400: status one of completed, failed, timeout; duration_ms and cache_creation_input_tokens integers of at least 0; error_message a string), then the transition",
+        "Apply the transition as one conditional update that takes effect only while the status is active: set status, ended_at from the clock, error_message, duration_ms (the milliseconds between started_at and ended_at when none was sent) and cache_creation_input_tokens together",
+        "When the update changed no row the session was already terminal: answer 200 with the stored session unchanged. Every answer is the session object built after the update"
+      ],
+      "touches": [
+        "internal/session/complete.go",
+        "internal/session/routes.go",
+        "internal/session/complete_test.go"
+      ],
+      "depends_on": [
+        2
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Report and list token usage",
+      "criteria": [
+        "REQ-3",
+        "REQ-2.4",
+        "REQ-2.5",
+        "REQ-2.6"
+      ],
+      "steps": [
+        "Add the behaviours of usage reporting to internal/session/usage_test.go (new record, replay, id in another session, session not active, validation table, observers, the usage list with totals) and add the usage rows to the id, creator and 404 tables of internal/session/complete_test.go; confirm they fail",
+        "Register POST /api/v1/sessions/{id}/usage with scope sessions:write as a create route. Decide in this order: path id (400), readable (404), creator or admin token (403), the body (400: model a non-blank string of at most 255 characters, id a UUID, counts integers of at least 0), the usage id lookup (in this session: 200 with the stored record; in another session: 409 conflict), the session is active (409 session_not_active), then the insert",
+        "Store the record with the session's workspace slug, 0 for an absent count and reported_at from the clock, in a transaction that re-checks that the session is still active, so that a report racing with a complete or a forced close is either stored before the end or refused",
+        "Export the registration function for usage observers, OnUsage; an observer takes the workspace slug, the model and the three counts. After the insert has committed, call every observer once with the workspace slug, the model and the three counts; call none on a replay or a refusal",
+        "Register GET /api/v1/sessions/{id}/usage with the read rule of the session: the list envelope ordered by (reported_at, id), descending by default, with order, limit and cursor through the list helpers of internal/server, plus session_id and totals over all records of the session",
+        "Export ActiveCounts, a function that returns the number of active sessions per workspace slug; package 51 connects OnUsage and ActiveCounts to its metrics recorder, and this package imports nothing of internal/metrics"
+      ],
+      "touches": [
+        "internal/session/usage.go",
+        "internal/session/routes.go",
+        "internal/session/usage_test.go",
+        "internal/session/complete_test.go"
+      ],
+      "depends_on": [
+        3
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Record session links and show them in the session object",
+      "criteria": [
+        "REQ-5",
+        "REQ-4.5"
+      ],
+      "steps": [
+        "Add the behaviours of recording links to internal/session/link_test.go (commit and rollback per kind, list order, counts, the 500 cap, repeated links, refused links) and the read-time behaviour to internal/session/read_test.go; confirm they fail",
+        "Export the link type (session id, kind, workspace slug, key, and for a version link the change number and version number) with the seven kinds fork, sandbox, version, push, commit, claim and land, and one constructor per kind so that callers cannot build a malformed key",
+        "Export the recording operation as Record: it takes the caller's store transaction and a link, checks the kind, the workspace and the key, checks that the session exists (the exported unknown-session error otherwise), and inserts the link with the clock's time; a link that already exists is left as it is and the operation returns nil",
+        "The operation never begins, commits or rolls back a transaction, returns every failure as an error, and does not look at the session's status",
+        "Fill the session object from the link table: forks oldest first, sandboxes oldest first, changes as the distinct workspace and change number of version links ordered by the first link of each change, each list cut to its first 500 entries, and counts as the true totals per kind with changes the number of distinct changes",
+        "Keep links when a workspace, fork, sandbox or change is removed: this package registers no remover for them"
+      ],
+      "touches": [
+        "internal/session/link.go",
+        "internal/session/session.go",
+        "internal/session/store.go",
+        "internal/session/link_test.go",
+        "internal/session/read_test.go"
+      ],
+      "depends_on": [
+        4
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Decide the session-linking rule and install it for its callers",
+      "criteria": [
+        "REQ-6"
+      ],
+      "steps": [
+        "Add the behaviours of the linking check to internal/session/link_test.go (accepted table, refused table with one error text, removed fork, store failure, no writes) and confirm they fail",
+        "Export the unknown-session error as ErrUnknownSession and the linking check as Check: given a context, the caller (the authenticated principal of package 04), a session id and the slug of the operation's workspace, it returns the lower-case session id, or the unknown-session error, or another error when the store or the workspace record cannot be read",
+        "Accept when the session exists, its user id is the caller's user or the caller is the admin token, and one of these holds: the session's workspace slug equals the operation's slug; the session's stored parent slug equals the operation's slug; the operation's workspace is a task fork whose parent is the session's workspace slug (read through the workspace reader)",
+        "Do not read the session's status, do not consult the coverage question, and write nothing",
+        "Return the same unknown-session error value for a malformed id, a missing session, a foreign creator and an unrelated workspace, so the caller cannot tell which condition failed",
+        "In internal/hub/session.go, register Check and Record with the session linker interface of every consumer that exists in the repository at this point, as that consumer declares it: internal/fork (package 15, link kind fork; SessionLinker, check taking caller, session id and the parent's slug, and record with the fork's creating transaction and the fork's slug), internal/gitserver (package 19; SessionLinker, check alone, no link), internal/scm (package 21; SessionLinker of session.go through its registration call, check alone, no link), internal/change (package 22, version; SessionLinker of collaborators.go, passed at construction, check and record with the change number and the version number), internal/land (package 25, land; check and record), internal/awareness (package 30, claim; check and record) and internal/sandbox (package 45, sandbox; SessionLinker through its registration function, check and record with the sandbox id). The shapes differ, so write one adapter per consumer to that consumer's declaration; an adapter maps ErrUnknownSession to that consumer's own refusal and every other error to its failure (to a refusal where the interface has none), and builds the link of that consumer's kind for Record. Where a consumer's interface has no record operation, register the check alone. Skip a package that is not in the repository yet: it installs the exported functions itself"
+      ],
+      "touches": [
+        "internal/session/linkcheck.go",
+        "internal/session/link_test.go",
+        "internal/hub/session.go"
+      ],
+      "depends_on": [
+        5
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Close a workspace's active sessions inside the caller's transaction",
+      "criteria": [
+        "REQ-8"
+      ],
+      "steps": [
+        "Add the behaviours of the forced close to internal/session/close_test.go (the three reasons, one event per session, rollback, event failure, nothing to close, refused reason, the race with complete) and confirm they fail",
+        "Export the closing operation as CloseActive: given the caller's store transaction, a workspace slug, a reason and the time of the operation, it sets every active session whose workspace slug is that slug to terminated with ended_at the given time and error_message the reason, leaves duration_ms null, and returns the number closed",
+        "Accept only the reasons `workspace archived`, `workspace deleted` and `fork expired` and a non-empty slug; refuse anything else with an error before touching the store",
+        "For each session closed, write one parley.session.force_closed event in the same transaction through the in-transaction write of internal/event: workspace the session's workspace, resource_type session, resource_id and session_id the session id, action force_closed, actor system, metadata reason. Return an event write failure as the operation's error",
+        "Use the same conditional update as complete (only while the status is active), so that a racing complete and a forced close cannot both take effect; switch the terminated rows of the complete and usage tests from the test helper to this operation",
+        "In internal/hub/session.go, register a session closer as the SessionCloser of the Teardown set of internal/workspace (package 14): it takes the transaction, the slugs and the reason (`workspace archived`, `workspace deleted` or `fork expired`) and calls CloseActive once per slug with that reason and the hub clock's time. Register nothing with internal/fork for removal and no archive observer: package 16 removes a fork's owned data through RemoveOwned of package 14, which calls this closer with the reason"
+      ],
+      "touches": [
+        "internal/session/close.go",
+        "internal/session/close_test.go",
+        "internal/session/complete_test.go",
+        "internal/session/usage_test.go",
+        "internal/hub/session.go"
+      ],
+      "depends_on": [
+        4
+      ]
+    },
+    {
+      "id": 8,
+      "title": "List sessions with filters",
+      "criteria": [
+        "REQ-7"
+      ],
+      "steps": [
+        "Add the behaviours of the session list to internal/session/list_test.go (what each caller sees, order and paging, each filter, include_forks with a removed fork, the 400 table, the 404 for an unreadable workspace filter, bound tokens) and confirm they fail",
+        "Register GET /api/v1/sessions with scope sessions:read. Validate every query parameter first: status, credential_type, order and include_forks against their value sets, run_id against the run id form, since and until as RFC 3339 with any offset, include_forks only together with workspace; a violation answers 400 naming the parameter",
+        "Resolve the workspace filter through the coverage question and the access component with need read; no coverage, no access and no such workspace answer 404 workspace not found",
+        "Select the readable sessions in the query itself, so paging is exact: every session for the admin token; otherwise sessions whose user id is the caller's user, whose workspace slug is in the readable set of the access component, or whose stored parent slug is in that set. For a bound caller keep only sessions whose workspace slug is covered",
+        "Apply the filters with AND: workspace by slug, or by slug and stored parent slug with include_forks=true; run_id, status and credential_type by value; since inclusive and until exclusive on started_at",
+        "Order by (started_at, id) in the chosen direction and page through the list helpers of internal/server; each item is the full session object"
+      ],
+      "touches": [
+        "internal/session/list.go",
+        "internal/session/routes.go",
+        "internal/session/list_test.go"
+      ],
+      "depends_on": [
+        5
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Report the token cost of a workspace",
+      "criteria": [
+        "REQ-9"
+      ],
+      "steps": [
+        "Add the behaviours of the cost report to internal/session/cost_test.go (window bounds, the three groupings, defaults and normalised period, paging with constant totals, the 400 table, access and archived workspaces, the empty window) and confirm they fail",
+        "Register GET /api/v1/workspaces/{slug}/cost as a workspace route with need read and scope sessions:read; the workspace's status is not a precondition",
+        "Parse group_by (day by default, session, model), since (24 hours before the clock's time by default) and until (the clock's time by default); normalise both bounds to UTC truncated to whole seconds; refuse a since that is not before until with 400",
+        "Sum the usage records whose workspace slug is the path's slug and whose reported_at is at or after since and before until: totals with the three sums and the number of distinct sessions, and one item per group with the same four numbers, keyed by the UTC date, the session id or the model name, ordered by key ascending",
+        "Page the items by limit and cursor through the list helpers of internal/server, the cursor continuing after the last key; compute totals over the whole window on every page",
+        "Answer the six members workspace, period, group_by, totals, items and next_cursor; items is an empty array for an empty window"
+      ],
+      "touches": [
+        "internal/session/cost.go",
+        "internal/session/routes.go",
+        "internal/session/cost_test.go"
+      ],
+      "depends_on": [
+        4
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Add the `parley session` commands",
+      "criteria": [
+        "REQ-10"
+      ],
+      "steps": [
+        "Add the behaviours of the five commands to internal/cli/session_test.go (the request each sends, the default status of complete, usage errors that send no request, hub errors with exit status 1) and confirm they fail",
+        "Declare the group `session` and its commands start, usage, complete, get and list in internal/cli/session.go through the command helper of internal/cli, each with its method, path and positional argument, and add the group to the root command",
+        "start: one positional workspace slug; send workspace_slug and one member for each of --id, --run-id, --node-id, --archetype, --model that was given; parse --metadata as JSON before any request and send the parsed value",
+        "usage: one positional session id; --model is required; send input_tokens, output_tokens, cache_read_tokens and id only for the flags given",
+        "complete: one positional session id; --status defaults to completed; send error_message and duration_ms only for the flags given",
+        "get: one positional session id. list: no positional argument; send one query parameter for each of --workspace, --include-forks (as include_forks=true), --run-id, --status, --since, --limit, --cursor that was given",
+        "Use the shared client, output and exit codes of internal/cli for every request: the hub's body on stdout, the error envelope on stderr, exit status 0, 1 or 2; the commands validate nothing else, so the hub's 400 is printed as received",
+        "Add test/e2e/session_test.go with the three end-to-end flows of this package (the CLI flow, the linked thread with the cost report, the forced close)"
+      ],
+      "touches": [
+        "internal/cli/session.go",
+        "internal/cli/session_test.go",
+        "test/e2e/session_test.go"
+      ],
+      "depends_on": [
+        7,
+        8,
+        9
+      ],
+      "done_when": [
+        "`go test ./test/e2e/... -run Session -count=1` passes against a hub started in-process"
+      ]
+    }
+  ]
+}

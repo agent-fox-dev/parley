@@ -1,0 +1,193 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "37",
+  "spec_name": "carry_patch_push_control",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/carrypatch/... ./internal/gitserver/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "18",
+      "reason": "registration only: provides the push rule engine, the controller interface of rule 4, the ref writer that runs forwards and the post-push listeners this package registers with"
+    },
+    {
+      "spec": "31",
+      "reason": "provides the patch list, the integration branch accessor, the RebuildEnqueuer interface, the carry-patch git runner and internal/carrypatch, and through it the workspace record, the settings reader, the origin credential resolver and the recorded origin heads"
+    },
+    {
+      "spec": "52",
+      "reason": "provides the event component through which parley.patch.mirror_failed is written"
+    },
+    {
+      "spec": "13",
+      "reason": "called directly: the forward and the mirror push with the push operation (lease, typed outcomes) it adds to internal/gitrepo, tested against its push-accepting test origin; this package also registers the patch-branch lookup its push route declares"
+    },
+    {
+      "spec": "25",
+      "reason": "registration only, plus the third path: implements the target guard and the after-landing hook it declares in internal/land, and the smoke check of the third path lands a change through its land route"
+    },
+    {
+      "spec": "33",
+      "reason": "the trigger calls the RebuildEnqueuer interface of package 31, whose implementation this package provides; the smoke checks read its rebuild list route and its parley.rebuild.enqueue event"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Decide rule 4 for the integration branch and for patch branches",
+      "criteria": [
+        "REQ-1.1",
+        "REQ-1.2",
+        "REQ-1.3",
+        "REQ-2.1",
+        "REQ-2.2",
+        "REQ-2.3",
+        "REQ-2.4",
+        "REQ-3.1",
+        "REQ-3.2"
+      ],
+      "steps": [
+        "Add the decision tables of this task to internal/carrypatch/pushcontrol_test.go, with in-memory stubs for the workspace record, the settings reader and the patch store, and confirm they fail",
+        "Add a controller type in internal/carrypatch that implements the carry-patch controller interface of internal/gitserver/pushrule: one decision per ref update, answering allow, refuse with a message and an error_type, allow after a forward, or an error",
+        "Decide the integration branch first: when the ref is refs/heads/<name>, with <name> read through IntegrationBranch of package 31 (which holds the deploy fallback), refuse every create, update and delete with 'integration branch <name> is maintained by the hub; push a patch branch and rebuild instead' and error_type integration_branch, before the patch list or the settings are read",
+        "Allow every ref outside refs/heads/ without reading the patch list; for a branch, ask the patch store of package 31 whether it is the branch of a patch whose status is not deleted, and allow it without a forward when it is not",
+        "For a patch branch read patch_branch_source and push_patches_to_origin from the workspace's effective settings on every decision, with hub and false for missing keys",
+        "With hub allow every update; with origin and no forwarding refuse every update with 'branch is synced from origin; push to <git_url> instead' and error_type patch_branch; with origin and forwarding refuse a delete with 'branch is synced from origin; delete it on origin instead' and answer allow after a forward for a create or an update",
+        "Build <git_url> from the workspace's origin URL with user information removed, leaving a git@host:path origin as stored",
+        "Attach to an allow-after-forward answer a function bound to the workspace, the branch and the update's after commit; in this task it may call a forwarder interface that the next task implements, and deciding must never call it",
+        "Return an error, never an allow, when the workspace record, the settings or the patch list cannot be read, and confirm through the real engine that the update is then refused with 'internal error; try again' and error_type internal"
+      ],
+      "touches": [
+        "internal/carrypatch/pushcontrol.go",
+        "internal/carrypatch/pushcontrol_test.go"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Forward a patch branch to origin before the hub accepts it",
+      "criteria": [
+        "REQ-3.3",
+        "REQ-3.4",
+        "REQ-3.5",
+        "REQ-3.6"
+      ],
+      "steps": [
+        "Add the forward cases to internal/carrypatch/forward_test.go against the push-accepting test origin of internal/gitrepo/gitrepotest (accepting, refusing from a hook, answering a fixed status, closed, stalling) and confirm they fail",
+        "Add the forward operation: given a workspace slug, a branch and a commit, resolve the workspace's origin credential at that moment through the resolver of package 10 and push the commit to refs/heads/<branch> on origin with the push operation package 13 adds to internal/gitrepo/push.go, without a lease and without force, run through the carry-patch git runner of package 31",
+        "When the credential cannot be read, fail with 'failed to resolve origin credentials' before origin is contacted; never push anonymously in that case",
+        "On success write the commit as the recorded origin head of the branch and report success; write nothing to the hub's own refs",
+        "Map each typed outcome of the push operation to its reason: origin's own message for a refused update, 'non-fast-forward', 'authentication failed', 'permission denied', 'repository not found', 'origin unreachable', and 'push failed' for anything else; fail with 'origin rejected push: <reason>'",
+        "Pass every failure message through the scrubber of internal/scrub with the resolved credential's value as a secret, so that it holds no credential, no URL user information and at most 1024 bytes",
+        "Bound the push by a limit that is a parameter of the component, 120 seconds as the hub builds it, combined with the caller's context; when either ends the push, end the git process and fail with 'origin rejected push: timed out'",
+        "Leave the recorded origin head untouched on every failure",
+        "Make the controller's allow-after-forward answer call this operation"
+      ],
+      "touches": [
+        "internal/carrypatch/forward.go",
+        "internal/carrypatch/forward_test.go",
+        "internal/carrypatch/pushcontrol.go",
+        "internal/gitrepo"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Register the controller in the hub and hold the rules over git",
+      "criteria": [
+        "REQ-1.4",
+        "REQ-1.5",
+        "REQ-2.5",
+        "REQ-2.6",
+        "REQ-3.7"
+      ],
+      "steps": [
+        "Add to internal/carrypatch/push_integration_test.go, as an external test package, a helper that starts the hub in-process on a loopback port the system chooses, with the test origin as origin and upstream, creates a carry-patch workspace, registers patches through POST /workspaces/:slug/patches and returns a local clone; add the behaviours of this task with a stock git client and confirm they fail",
+        "In internal/hub build the controller with the workspace record, the settings reader, the patch store, the origin credential resolver, the recorded origin heads and the forward limit of 120 seconds, and register it as the carry-patch controller of the push rule engine",
+        "In internal/hub register, with the patch-branch lookup that the push route of package 13 declares, a lookup that reports whether a branch is the branch of a non-deleted patch of the workspace, read from the patch store of package 31, so that POST …/branches/:name/push refuses patch branches with 403 patch_branch",
+        "Confirm that a push of the integration branch together with another branch is refused as a whole, with the integration-branch message on its ref and 'not updated: another ref in this push was refused' on the other, for the admin token too, and that a delete of the integration branch is refused the same way",
+        "Confirm that creates, updates and deletes under refs/parley/replaced/ are refused by the hub-owned refs rule and that the controller is not asked for them",
+        "Confirm that a member's update of a patch branch matched by protected_branches is refused by the protected-branch rule without the controller being asked, that the owner's fast-forward under the owner exemption is accepted with patch_branch_source hub and marked direct, and that the same fast-forward is refused with the patch_branch message once patch_branch_source is origin without forwarding",
+        "Confirm that in a push of two patch branches with forwarding, where origin accepts the first and refuses the second, no ref of the hub moves, the first branch stays on origin as forwarded and no parley.git.push event is written"
+      ],
+      "touches": [
+        "internal/hub",
+        "internal/carrypatch/push_integration_test.go"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Queue a rebuild after an accepted update of a patch branch",
+      "criteria": [
+        "REQ-5"
+      ],
+      "steps": [
+        "Add the trigger tables to internal/carrypatch/trigger_test.go with a recording rebuild queuer, the listener calls for source control API writes to the same file, and the answer-before-trigger case to push_integration_test.go, and confirm they fail",
+        "Add the trigger entry point: given a workspace slug, the accepted ref updates, the source (push or land) and a session id or none, it returns nothing and never panics",
+        "Return at once for a workspace that is not in mode carry_patch, without reading the patch list; otherwise keep the updates that are not deletes and whose ref is, in the patch list as it is now, the branch of a patch whose status is not deleted; return when none is left",
+        "When auto_rebuild_after_push is true or missing, call EnqueueRebuild of the interface RebuildEnqueuer (declared by package 31, implemented and registered by package 33) once for the request, with submitted_by 'system:push' for the source push and 'system:land' for the source land, actor system and the session id",
+        "Treat the enqueue's duplicate result as a silent skip: no event, no log record above debug level",
+        "Recover a panic and log one error record naming the workspace when the settings or the patch list cannot be read or the enqueue fails; after a failed or skipped enqueue still go on to the mirror step, which the next task fills in",
+        "Run the triggers of one workspace one at a time, so that a second request's trigger starts when the first has finished",
+        "In internal/hub register the entry point with source push as a post-push listener of package 18 through pushrule.RegisterPostPushListener, taking the slug, the accepted updates, via and session id from the listener call as package 18 makes it; change no file of internal/gitserver",
+        "Treat a listener call with via api like one with via git: package 18 calls its post-push listeners for every accepted request written through its ref writer, a source control API write included, so this package adds nothing to internal/scm and reaches API writes through the same registration; ignore a listener call with via land and do nothing for it, because a land reaches the triggers through the after-landing hook of package 25 and would otherwise trigger twice"
+      ],
+      "touches": [
+        "internal/carrypatch/trigger.go",
+        "internal/carrypatch/trigger_test.go",
+        "internal/carrypatch/push_integration_test.go",
+        "internal/hub"
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Mirror updated patch branches to origin",
+      "criteria": [
+        "REQ-6"
+      ],
+      "steps": [
+        "Add the mirror cases to internal/carrypatch/mirror_test.go against the push-accepting test origin and the real event log, and confirm they fail",
+        "After the rebuild trigger step, whatever auto_rebuild_after_push is, read patch_branch_source and push_patches_to_origin; go on only when they are hub and true",
+        "For each kept update, in the order of the updates and each branch once, read the head the branch has now in the hub's repository and push it to refs/heads/<branch> on origin with the push operation of internal/gitrepo under a lease: the recorded origin head of the branch, or must-not-exist when none is recorded; resolve the origin credential once per mirror run",
+        "Bound each push by the same limit parameter as the forward, 120 seconds in the hub",
+        "On success write the pushed commit as the recorded origin head; write no event",
+        "On failure write one parley.patch.mirror_failed event through the event component: resource_type patch, resource_id the patch id, the workspace's slug, actor system, metadata branch_name and error; error is the scrubbed reason of the forward's table, 'origin moved' for a stale lease, 'timed out' for the limit, 'failed to resolve origin credentials' when the credential cannot be read; then go on with the next branch",
+        "Skip a branch that no longer exists in the hub's repository when the mirror runs; push nothing but the kept patch branches",
+        "Log and swallow a failure to write the event, so that the remaining branches are still mirrored"
+      ],
+      "touches": [
+        "internal/carrypatch/mirror.go",
+        "internal/carrypatch/mirror_test.go",
+        "internal/carrypatch/trigger.go"
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Apply push control to landing on a patch branch",
+      "criteria": [
+        "REQ-4"
+      ],
+      "steps": [
+        "Add the guard tables to internal/carrypatch/landguard_test.go and the blocked land and the landing path to push_integration_test.go, and confirm they fail",
+        "Add the guard as an implementation of the target guard of package 25 (internal/land/hooks.go): asked with the target workspace, the target branch, the old head and the new head, it answers allow, refuse with a reason, or origin rejected with the forward's message, in package 25's terms; it returns an error when it cannot decide",
+        "Allow when the workspace is not in mode carry_patch, when the target is not the branch of a non-deleted patch, and when patch_branch_source is hub; contact origin in none of these cases",
+        "With origin and no forwarding answer refuse with the reason 'branch is synced from origin; push to <git_url> instead', built as the controller builds it",
+        "With origin and forwarding run the forward operation for the new head and allow when it succeeds; on any failure of the forward, the unreadable credential and the limit included, answer origin rejected with the forward's message",
+        "Return an error, never an allow, when the workspace record, the settings or the patch list cannot be read",
+        "In internal/hub register the guard as a target guard of internal/land, and the trigger entry point with source land as an after-landing hook that reads the target workspace, the update of the target branch and the session id from the landed attempt package 25 hands it",
+        "Confirm in a composed hub that a land onto a patch branch with origin and no forwarding answers 409 with a blocked attempt and an unmoved branch, and that a land with the hub as authority queues one rebuild with submitted_by 'system:land' and the landing's session and mirrors the branch"
+      ],
+      "touches": [
+        "internal/carrypatch/landguard.go",
+        "internal/carrypatch/landguard_test.go",
+        "internal/carrypatch/push_integration_test.go",
+        "internal/hub"
+      ],
+      "depends_on": [
+        2,
+        5
+      ]
+    }
+  ]
+}

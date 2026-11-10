@@ -1,0 +1,297 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "52",
+  "spec_name": "durable_event_log_and_stream",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/event/... ./internal/hub/... ./internal/cli/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "03",
+      "reason": "provides the transactional store and its transactions, schema steps, the configuration key registry, start hooks, the shutdown notification and the credential scrubber"
+    },
+    {
+      "spec": "07",
+      "reason": "provides the workspace record, access levels and the membership question the visibility decision reads, and through it the router, authentication and the scope check the two routes run behind"
+    },
+    {
+      "spec": "09",
+      "reason": "provides the command helper, HTTP client, output and exit codes that parley events tail and parley events list are built on"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Store events and emit them in the caller's transaction",
+      "criteria": [
+        "REQ-1.1",
+        "REQ-1.2",
+        "REQ-1.3",
+        "REQ-1.4",
+        "REQ-1.5",
+        "REQ-1.6",
+        "REQ-2.1",
+        "REQ-2.3"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/event/emit_test.go, internal/event/record_test.go and internal/hub/events_test.go and confirm they fail; the tests open a real store in t.TempDir() through internal/store and use a fake clock",
+        "Create internal/event/record.go: the event record with the twelve fields, and its JSON form with the members in the order seq, id, type, time, workspace, actor_type, actor_id, resource_type, resource_id, action, session_id, metadata, null for absent values, {} for no metadata, one line, time as RFC 3339 UTC at whole seconds through the timestamp helper of internal/server/timefmt",
+        "Add the emit input (type, workspace, actor_type, actor_id, resource_type, resource_id, session_id, metadata and an optional parent workspace) and its validation: every rule of the invalid-event criterion, returned as one exported invalid-event error that names the field; session_id is lower-cased",
+        "Register one schema step with the store of package 03 for the transactional store: an event table keyed by seq holding the record's fields, the metadata as JSON text and the parent workspace's slug; a one-row counter table for the last seq assigned; a one-row table for the log's lower bound; indexes that serve reads by seq, by workspace and by time",
+        "Create internal/event/emit.go: the event component built from the store, a clock and the scrubber; Emit takes the caller's store transaction and the input, validates, increments the counter row inside that transaction, generates a version 4 UUID, sets time from the clock and action from the last segment of type, inserts the row and returns the stored record",
+        "When the event's workspace is a task fork and no parent was passed, read the workspace record of package 07 in the same transaction, through the fork-parent lookup interface declared in internal/event that internal/hub/events.go fills, and store the parent's slug with the event; a workspace with no record stores no parent",
+        "Add EmitNow, the form without a transaction: it runs Emit in a store transaction of its own",
+        "Return every store failure from Emit as an error that is not the invalid-event error, so that a caller returning it from its transaction rolls back and a REST route answers 500 internal through the error handling of package 02",
+        "Wire the component in internal/hub: build it once after the stores are open and before the start hooks run, so that start hooks of other packages can emit before the listener is bound, and make it available to the packages that emit; keep the two emit calls (emit inside a given store transaction, emit now) as the method set that package 08 declares as EventEmitter in internal/access, so that the hub installs this component behind access.EventEmitter without an adapter and internal/access never imports internal/event"
+      ],
+      "touches": [
+        "internal/event/record.go",
+        "internal/event/record_test.go",
+        "internal/event/emit.go",
+        "internal/event/emit_test.go",
+        "internal/event/schema.go",
+        "internal/hub/events.go",
+        "internal/hub/events_test.go"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Read the log by position, bound it, expire it and keep it ordered under concurrent writers",
+      "criteria": [
+        "REQ-1.7",
+        "REQ-1.8",
+        "REQ-3"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/event/log_test.go and internal/event/emit_test.go and confirm they fail",
+        "Create internal/event/log.go: Bounds returns oldest_seq and last_seq, {0, 0} on a hub that has written no event and oldest_seq 1 until something has expired; last_seq comes from the counter row, never from the event rows",
+        "Add ReadAfter(position, limit): the events of the event log with a higher seq, ascending, at most limit, with the position examined (the last record's seq when the limit was reached, otherwise last_seq read in the same store read as the records); events below oldest_seq are never returned",
+        "Add the expire operation, Expire: given a cutoff time, set the stored lower bound to the lowest seq whose time is not older than the cutoff, or to last_seq when every event is older; never lower the bound; delete no event row; return the new oldest_seq. Package 51's retention step calls it",
+        "Make seq assignment safe under concurrent transactions: the counter is incremented inside the write transaction, which the store runs one at a time, so that commit order is seq order; confirm with the concurrent-writers behaviour that every read is a gap-free prefix and no emit fails because another transaction runs",
+        "Add the commit notification with its registration OnCommit, which in-process consumers such as the delivery loops of package 53 use: after a transaction that emitted commits, wake everything that waits for new events (streams and long-polls of later tasks) without holding the writer; a waiter that is woken reads the log by position, so a missed wake-up delays an event and never loses it; waiters also re-read on a timer of at most 1 second",
+        "Add the counters, read through Counters, which package 51 connects to its metrics registry as sources: last seq written, the number of stream places taken, and events committed since start per type (counted at commit, not at emit, so a rolled-back emit is not counted); add the take and give-back of a stream place that the stream handler will use"
+      ],
+      "touches": [
+        "internal/event/log.go",
+        "internal/event/log_test.go",
+        "internal/event/emit.go",
+        "internal/event/emit_test.go",
+        "internal/event/notify.go"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Hold every catalogue family to the record contract and clean metadata",
+      "criteria": [
+        "REQ-2.2",
+        "REQ-2.4",
+        "REQ-2.5"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/event/record_test.go and confirm they fail",
+        "Add the table of one representative event per resource_type family (workspace, branch, session, token, ref, commit, change, policy, claim, patch, rebuild, secret, variable, issue, comment, label, pull_request, webhook, sandbox, sandbox_rule, event_webhook), with three-segment and four-segment types, the actor types system and forge, a null workspace and a session_id among them, and make each pass through emit and read unchanged",
+        "Add the path-list helper to internal/event/record.go: given a metadata object, a key and a list of paths, it stores the first 100 paths in the given order under the key and sets truncated to true only when paths were cut",
+        "Pass every string of the metadata, at any depth (object values and array elements, not member names), through the scrubber of internal/scrub before the row is written; numbers, booleans and null are left as they are"
+      ],
+      "touches": [
+        "internal/event/record.go",
+        "internal/event/record_test.go",
+        "internal/event/emit.go"
+      ],
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Decide who may see an event",
+      "criteria": [
+        "REQ-4.1",
+        "REQ-4.2",
+        "REQ-4.3",
+        "REQ-4.4",
+        "REQ-4.5",
+        "REQ-4.6"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/event/visibility_test.go and confirm they fail; the tests create workspace records, users, orgs and memberships through the real access and identity components on a real store, and stub only the covered-set provider and the change lookup",
+        "Create internal/event/visibility.go: Visible(caller, event) returns (bool, error). The admin token sees every event",
+        "For an event with a workspace: resolve the caller's level on that workspace through the access component of package 07; visible for admin, owner and member. When the event has a stored parent (a task fork, deleted or not), the caller's level on the parent also counts",
+        "For the owner-only types (type begins with parley.secret., parley.token. or parley.webhook.): visible only for level owner or admin on the event's workspace or, for a fork, on its stored parent",
+        "For an event without a workspace: metadata.scope user is visible to the user whose id is metadata.scope_id; metadata.scope org to a user who is a member of that org while it is active, asked through the membership question the access component uses; anything else to the admin token only",
+        "Declare the narrow interfaces the rule is given by injection in internal/event, so that internal/event imports no package that imports it: the fork-parent lookup (the parent slug of a task fork), which internal/hub/events.go fills with the workspace record of package 07, and two that internal/hub passes when it has them: the covered set (does this bound token's binding cover this workspace slug) and the change lookup (the source workspace of change number N in workspace W)",
+        "For a workspace-bound token: an event without a workspace is never visible; an event of a covered workspace follows the rules above with the token user's level; for a token bound to a task fork, an event of the fork's parent is visible when its resource_type is change and the change lookup names that fork as the source of the change whose number is resource_id; with no covered-set provider nothing is visible; with no change lookup no parent event is visible",
+        "Add VisibleToOwnerOf(workspace, event) for package 53: true when the event's workspace is that workspace or its stored parent is that workspace, for every type; false for every other event",
+        "Return an error, and false, whenever a record or membership needed for the decision cannot be read; never decide visible on a failure",
+        "Resolve levels at the time of the call with no cache that outlives one batch of events, so that a change of access takes effect at the next delivery"
+      ],
+      "touches": [
+        "internal/event/visibility.go",
+        "internal/event/visibility_test.go",
+        "internal/hub/events.go"
+      ],
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Serve the event log as JSON pages with a long-poll",
+      "criteria": [
+        "REQ-7"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/event/poll_test.go and confirm they fail; the tests mount the route on the real router of internal/server with the real check order and create callers through the identity and access components",
+        "Create internal/event/filter.go with the request parsing both routes share: workspace (one slug), types (comma-separated entries, each an exact type or a prefix ending in *), session_id (a UUID, any case) and a resume position (a non-negative integer); a matcher that applies the filters with AND and the types entries with OR. Task 8 completes the refusals and proves them on both routes",
+        "Create internal/event/poll.go and register GET /events/log through the route registration of package 02, declaring the scope audit:read for the scope check of package 06 and no workspace in the path",
+        "Parse after, and cursor as another name for it (both given with different values is 400 invalid_request); limit through the list rule of package 02 (integer 1 to 200, default 50); wait as a whole number of seconds 0 to 60, default 0; every violation is 400 invalid_request and is answered at once",
+        "Without a position start at oldest_seq minus 1, the oldest event in the log",
+        "Collect the page: read the log after the position in batches, keep the events that match the filters and that Visible allows for the caller, stop at limit items or at the end of the log; a Visible error answers 500 internal",
+        "Answer 200 with items (always an array), next_after (the last item's seq when the page is full, otherwise the position examined), next_cursor (next_after as a string when the page is full, else null), and oldest_seq and last_seq read at the time of the answer",
+        "Long-poll: when the page is empty and wait is above 0, wait on the commit notification of task 2 and collect again after each wake-up, until an item is found or the wait ends on the component's clock; then answer 200, with empty items and next_after moved to the position examined when nothing was found",
+        "Release every held request at once when the shutdown notification of package 03 fires, answering 200 with empty items; a held request that the client abandons stops waiting",
+        "Register the route and the shutdown behaviour in internal/hub"
+      ],
+      "touches": [
+        "internal/event/filter.go",
+        "internal/event/poll.go",
+        "internal/event/poll_test.go",
+        "internal/hub/events.go"
+      ],
+      "depends_on": [
+        2,
+        4
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Stream events over Server-Sent Events with replay and heartbeats",
+      "criteria": [
+        "REQ-6.1",
+        "REQ-6.2",
+        "REQ-6.3",
+        "REQ-6.4"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/event/stream_test.go and confirm they fail; the tests read frames from a real HTTP connection to an httptest server that mounts the route on the real router, and drive heartbeats with the fake clock",
+        "Create internal/event/stream.go and register GET /events through the route registration of package 02 with the scope audit:read and the route's own Cache-Control: no-cache; parse the filters with the shared parsing of internal/event/filter.go and take the position from Last-Event-ID or, without that header, from after",
+        "Answer 200 with Content-Type text/event-stream, flush the headers, and send a heartbeat frame at once: 'id: <seq>', 'event: heartbeat', 'data: {\"time\":…,\"seq\":…}' and an empty line; without a position the stream's starting position, and that first heartbeat's seq, is last_seq at open",
+        "Run one loop per stream that reads the log after the stream's position in batches, sends each event that matches the filters and that Visible allows as a frame 'id: <seq>', 'event: hub_event', 'data: <the record's one-line JSON>' and an empty line, flushes, and moves the position to the position examined; replay and live are this same loop, so there is no gap, reordering or repeat between them",
+        "When the log has nothing further, wait on the commit notification of task 2 and read again, so that a committed event is sent within 1 second",
+        "Send a heartbeat every 30 seconds on the component's clock, carrying the current time and the stream's position (the position examined, which rises also when no event matched or was visible)",
+        "End the stream when the client disconnects, and give back the stream place taken at open so the counters stay right"
+      ],
+      "touches": [
+        "internal/event/stream.go",
+        "internal/event/stream_test.go",
+        "internal/event/filter.go",
+        "internal/hub/events.go"
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Limit, time out and close event streams, and read the event configuration",
+      "criteria": [
+        "REQ-6.5",
+        "REQ-6.6",
+        "REQ-6.7",
+        "REQ-6.8",
+        "REQ-8"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/event/stream_test.go, internal/event/config_test.go and internal/hub/events_test.go and confirm they fail",
+        "Create internal/event/config.go: register with the configuration key registry of package 03 the keys events.retention (duration with unit s, m, h or d; default 30d; at least 1h) and events.max_sse_connections (integer; default 500; at least 1); an invalid value is the registry's start error naming the key, which stops the hub with exit status 1",
+        "Hand max_sse_connections to the component in internal/hub and expose the loaded retention as Retention for package 51's retention run, which also checks it against audit.max_age",
+        "Refuse GET /events with 503 unavailable and the header Retry-After: 5, in the JSON error envelope, when the number of stream places taken equals the limit; take the place before the stream starts and give it back when the stream ends for any reason; long-polls take no place",
+        "Give each stream a buffer of 256 events between the log reader and the connection writer; when an event is due and 256 are already waiting, close the stream; never discard a buffered or due event while the stream stays open",
+        "Close the stream when a write to the client has not completed for 60 seconds on the component's clock",
+        "At every heartbeat authenticate the stream's credential again through package 04; when it is revoked, expired or no longer authenticates (a blocked user), close the stream and send no further frame",
+        "Close every open stream at once when the shutdown notification of package 03 fires, also a stream blocked in a write, so that shutdown never waits for a client"
+      ],
+      "touches": [
+        "internal/event/config.go",
+        "internal/event/config_test.go",
+        "internal/event/stream.go",
+        "internal/event/stream_test.go",
+        "internal/hub/events.go",
+        "internal/hub/events_test.go"
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Apply one set of access, filter and position rules to both routes",
+      "criteria": [
+        "REQ-5",
+        "REQ-4.7",
+        "REQ-4.8"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/event/filter_test.go, internal/event/poll_test.go, internal/event/stream_test.go and internal/event/visibility_test.go, each table running against GET /events/log and GET /events, and confirm they fail",
+        "Complete the filter refusals in the shared parsing: more than 20 types entries, an empty entry or an empty types value, an entry with * anywhere but last, a session_id that is not a UUID; each is 400 invalid_request; exactly 20 entries are accepted; unknown query parameters are ignored",
+        "Check the workspace filter after parsing: for the admin token no check; for a bound token a slug outside the covered set is 404; for every other caller a slug on which the access component answers not found is 404 with error_type not_found and the message 'workspace not found', the same bytes for an unreadable workspace and for a slug with no workspace",
+        "Validate the position against the log's bounds in one place: not a non-negative integer, or above last_seq, is 400 invalid_request; below oldest_seq minus 1 is 410 with error_type cursor_expired, message 'event cursor expired' and the integer member oldest_seq in the error object, raised as a specific error type through package 02; last_seq, oldest_seq minus 1 and 0 on an empty hub are valid",
+        "On the stream, apply every refusal before the response headers are sent, so that it is JSON in the error envelope and no stream starts; Last-Event-ID wins over after and is validated by the same rules",
+        "Confirm the order: a PAT without audit:read and without audit:write gets 403 insufficient_scope from the scope check before any parameter is looked at; API keys, the admin token and bound PATs with the scope pass",
+        "Confirm that both routes return the same events for the same filters and position, and that a types entry no event has returns nothing without an error",
+        "Confirm access is evaluated at delivery on both routes: gaining access shows earlier events on a replay, losing it hides earlier and later ones, and an open stream stops sending a workspace's events once access is gone while its heartbeats keep advancing",
+        "When Visible returns an error, answer 500 internal on the log and end the stream without a frame for that event",
+        "Start test/e2e/events_test.go with the helper the end-to-end flows share: a hub started in-process on a free loopback port with one extra test route that changes a row and emits parley.change.open in one store transaction, standing in for the routes of the packages that emit"
+      ],
+      "touches": [
+        "internal/event/filter.go",
+        "internal/event/filter_test.go",
+        "internal/event/poll.go",
+        "internal/event/poll_test.go",
+        "internal/event/stream.go",
+        "internal/event/stream_test.go",
+        "internal/event/visibility_test.go",
+        "test/e2e/events_test.go"
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Follow the event stream with parley events tail",
+      "criteria": [
+        "REQ-9.1",
+        "REQ-9.2",
+        "REQ-9.3",
+        "REQ-9.4"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/cli/events_test.go and confirm they fail; the tests run the command through cli.Run against an httptest server that plays the hub, and drive the reconnect wait with a fake clock",
+        "Create internal/cli/events.go: the command group events and the command tail, declared through the command helper of package 09 with method GET, path /events and auth user, with the flags --workspace, --types, --session and --after",
+        "Send the request through the shared client of package 09 with no request timeout and with Accept: text/event-stream; map the flags to the query parameters workspace, types, session_id and after; send no after when the flag is absent",
+        "Read the response as Server-Sent Events frames; for a hub_event frame write its data and a newline to stdout unless its seq is not higher than the last one printed; print nothing for a heartbeat; remember the id of every frame, heartbeats included, as the resume position",
+        "When the context is cancelled by an interrupt, stop reading and return exit status 0",
+        "When the stream ends otherwise, a connection attempt fails, or the hub answers a status other than 400, 401, 403, 404 and 410: wait, then connect again with after set to the remembered position (or to the --after value, or absent, when no frame was received yet); the wait is 1 second, doubles after each failed attempt up to 30 seconds and returns to 1 second after a connection that delivered a frame; say on stderr that the command is reconnecting",
+        "When the hub answers 400, 401, 403, 404 or 410: print the envelope on stderr as received through the error output of package 09 and return exit status 1 without another request"
+      ],
+      "touches": [
+        "internal/cli/events.go",
+        "internal/cli/events_test.go"
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Read one page of the event log with parley events list",
+      "criteria": [
+        "REQ-10",
+        "REQ-9.5"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/cli/events_test.go and confirm they fail",
+        "Add the command list to the events group in internal/cli/events.go, declared through the command helper of package 09 with method GET, path /events/log and auth user, with the flags --workspace, --types, --session, --after, --limit and --wait",
+        "Map the flags to the query parameters workspace, types, session_id, after, limit and wait, sending only the ones given; send one request with a timeout of 30 seconds plus the --wait value in seconds",
+        "Print the response through the output of package 09 (one JSON document indented by 2 spaces) and return 0; a hub error is printed on stderr as received, oldest_seq included, with exit status 1 and nothing on stdout",
+        "For both events commands, refuse an --after value that is not a non-negative integer as a usage error (exit status 2, error_type usage_error) before any request; --limit and --wait values that are integers are passed to the hub unchanged and the hub's 400 is printed"
+      ],
+      "touches": [
+        "internal/cli/events.go",
+        "internal/cli/events_test.go"
+      ]
+    }
+  ]
+}

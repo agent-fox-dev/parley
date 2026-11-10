@@ -1,0 +1,922 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "28",
+  "spec_name": "approvals_and_checks",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Recording a verdict on a version",
+      "rationale": "A developer or a review agent must be able to say approve or reject about one exact version of a change, once per user, so that policy has evidence to count (LAND-FR-050, LAND-FR-051, LAND-FR-053).",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "a user with read access to the workspace sends POST /api/v1/workspaces/:slug/changes/:number/approvals with an API key or with a PAT that holds changes:approve, a valid body {verdict, version?, comment?}, the change is draft or open, and that user has no verdict on the named version",
+          "action": "store the verdict on the version the body names, or on the current version when it names none, and return the approval",
+          "contract": "HTTP 201 with an approval {id (a UUID), change, version, verdict, comment ('' when the body gave none), by {actor_type: api_key or pat, actor_id: the caller's user id, username}, counts_for (an array), carried_from: null, created_at}; the store holds exactly one verdict of that user on that version",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not"
+            ],
+            "pseudocode": "in internal/policy/approval_routes_test.go, a table over callers {alice's API key, bob's API key, bob's PAT with [changes:approve]}, bodies {{verdict:'approve'}, {verdict:'reject', comment:'no tests'}, {verdict:'approve', version:1}, {verdict:'approve', comment: 16000 characters}} and change states {open, draft}: r = post('/api/v1/workspaces/w1/changes/1/approvals', body); assert r.status == 201; a = r.json; assert a.id parses as a UUID; assert a.change == 1 and a.version == 1; assert a.verdict == body.verdict; assert a.comment == (body.comment or ''); assert a.by == {actor_type: 'api_key' or 'pat' per the caller, actor_id: caller.id, username: caller.username}; assert a.counts_for is an array; assert a.carried_from == null; assert a.created_at matches RFC 3339 UTC with whole seconds; assert the store holds one verdict of that user on version 1"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "event_driven",
+          "condition": "a user who already has a verdict on the named version of a draft or open change sends POST /api/v1/workspaces/:slug/changes/:number/approvals with a valid body, with the same or another of that user's credentials",
+          "action": "replace the earlier verdict with the new one, so that the user still has exactly one verdict on that version",
+          "contract": "HTTP 200 with the new approval: a new id, a new created_at, carried_from null and the body's verdict and comment; the earlier id names no verdict afterwards; the list of the change's verdicts holds one entry for that user and version",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not"
+            ],
+            "pseudocode": "in internal/policy/approval_routes_test.go: first = post('/api/v1/workspaces/w1/changes/1/approvals', {verdict:'approve'}) as bob; second = post('/api/v1/workspaces/w1/changes/1/approvals', {verdict:'reject', comment:'broke the build'}) as bob with a different credential of bob (a PAT with changes:approve); assert first.status == 201 and second.status == 200; assert second.json.id != first.json.id; assert second.json.verdict == 'reject' and second.json.carried_from == null; items = get('/api/v1/workspaces/w1/changes/1/approvals').json.items; assert len(items) == 1 and items[0].id == second.json.id; assert delete('/api/v1/workspaces/w1/changes/1/approvals/' + first.json.id).status == 404"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "unwanted",
+          "condition": "the admin token sends POST /api/v1/workspaces/:slug/changes/:number/approvals",
+          "action": "refuse the request, because a verdict needs a user, and store nothing",
+          "contract": "HTTP 403 with error_type forbidden, for a valid body and for an invalid one; no verdict is stored and no event is written",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not"
+            ],
+            "pseudocode": "in internal/policy/approval_routes_test.go, a table over bodies {{verdict:'approve'}, {verdict:'nope'}}: r = post('/api/v1/workspaces/w1/changes/1/approvals', body) with the admin token; assert r.status == 403; assert r.json.error.error_type == 'forbidden'; assert count(verdicts) == 0; assert no parley.change.approve or parley.change.reject event was written"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "unwanted",
+          "condition": "POST /api/v1/workspaces/:slug/changes/:number/approvals comes from a PAT that does not hold changes:approve (whatever else it holds), from a caller without access to the workspace, or from a token bound to a fork of the workspace",
+          "action": "refuse the request before reading the change and store nothing",
+          "contract": "HTTP 403 with error_type insufficient_scope for the PAT without the scope, the same for an existing and an unknown workspace; HTTP 404 with error_type not_found for the caller without access, with a body identical to that of an unknown slug; HTTP 403 with error_type token_bound for the fork-bound token; in each case no verdict is stored and no event is written",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not",
+              "fork f1 of w1 created by alice, with change 2 on w1 whose source workspace is f1"
+            ],
+            "pseudocode": "in internal/policy/approval_routes_test.go, a table: {bob's PAT [changes:read, changes:write] on w1 -> 403 insufficient_scope; the same PAT on slug 'nosuch' -> 403 insufficient_scope; carol's API key on w1 -> 404 not_found; carol's API key on 'nosuch' -> 404 not_found with a body equal byte for byte to the previous row's; a PAT of alice bound to fork f1 of w1 with [changes:approve], on w1, for a change whose source is f1 -> 403 token_bound}: r = post('/api/v1/workspaces/' + slug + '/changes/' + n + '/approvals', {verdict:'approve'}); assert r.status and r.json.error.error_type as listed; assert count(verdicts) == 0; assert the event writer recorded no parley.change.approve"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "unwanted",
+          "condition": "the body of POST /api/v1/workspaces/:slug/changes/:number/approvals is not a JSON object, has no verdict or one other than approve and reject, has a comment of more than 16,000 characters, has a version that is not a positive integer, or has an unknown member",
+          "action": "refuse the request and store nothing",
+          "contract": "HTTP 400 with error_type invalid_request; no verdict is stored and no event is written",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not"
+            ],
+            "pseudocode": "in internal/policy/approval_routes_test.go, a table over bodies {{} (no verdict), {verdict:'maybe'}, {verdict:'approve', comment: 16001 characters}, {verdict:'approve', version:0}, {verdict:'approve', version:-1}, {verdict:'approve', version:'two'}, {verdict:'approve', extra:1}, the JSON array ['approve']}: r = post('/api/v1/workspaces/w1/changes/1/approvals', body) as alice; assert r.status == 400; assert r.json.error.error_type == 'invalid_request'; assert count(verdicts) == 0"
+          }
+        },
+        {
+          "id": "REQ-1.6",
+          "pattern": "unwanted",
+          "condition": "POST /api/v1/workspaces/:slug/changes/:number/approvals names a number that is no change of the workspace or is not a positive integer, or a valid body names a version the change does not have",
+          "action": "refuse the request and store nothing",
+          "contract": "HTTP 404 with error_type change_not_found for the change; HTTP 404 with error_type not_found for the version; no verdict is stored",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not"
+            ],
+            "pseudocode": "in internal/policy/approval_routes_test.go, a table: {change number 99 -> 404 change_not_found; number 'abc' -> 404 change_not_found; number 0 -> 404 change_not_found; change 1 with body version:7 while the change has one version -> 404 not_found}: r = post('/api/v1/workspaces/w1/changes/' + n + '/approvals', body) as alice; assert r.status == 404; assert r.json.error.error_type as listed; assert count(verdicts) == 0"
+          }
+        },
+        {
+          "id": "REQ-1.7",
+          "pattern": "unwanted",
+          "condition": "a valid POST /api/v1/workspaces/:slug/changes/:number/approvals reaches a change that is landed or abandoned, or a workspace that is archived",
+          "action": "refuse the request and leave the stored verdicts as they were",
+          "contract": "HTTP 409 with error_type change_closed for a landed or abandoned change; HTTP 409 with error_type workspace_archived for an archived workspace, which is checked first; the stored verdicts are unchanged and no event is written",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not"
+            ],
+            "pseudocode": "in internal/policy/approval_routes_test.go, a table over {change set to landed, change set to abandoned, an open change in workspace w1 set to archived}: before = count(verdicts); r = post('/api/v1/workspaces/w1/changes/1/approvals', {verdict:'approve'}) as alice; assert r.status == 409; assert r.json.error.error_type == 'change_closed' for the first two and 'workspace_archived' for the third; assert count(verdicts) == before; row order: an archived workspace with a landed change answers workspace_archived; a landed change with body {verdict:'maybe'} answers 400 invalid_request"
+          }
+        },
+        {
+          "id": "REQ-1.8",
+          "pattern": "event_driven",
+          "condition": "a verdict is recorded or replaces an earlier one through POST /api/v1/workspaces/:slug/changes/:number/approvals",
+          "action": "write exactly one hub event for the verdict in the store transaction that stores it",
+          "contract": "one event handed to the event writer with type parley.change.approve for approve and parley.change.reject for reject, workspace the slug, resource_type change, resource_id the change number as a string, action approve or reject, actor_type and actor_id of the caller, session_id null and metadata {version, approval_id, counts_for}, where counts_for equals the counts_for of the returned approval",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not"
+            ],
+            "pseudocode": "in internal/policy/approval_routes_test.go, a table over {verdict 'approve' as alice's API key, verdict 'reject' as bob's PAT, a replacement by alice}: r = post('/api/v1/workspaces/w1/changes/1/approvals', body); evs = writer.events(); assert len(evs) == 1 per request; e = last(evs); assert e.type == 'parley.change.approve' or 'parley.change.reject' per the verdict; assert e.workspace == 'w1' and e.resource_type == 'change' and e.resource_id == '1' and e.action == 'approve' or 'reject'; assert e.actor_type == 'api_key' or 'pat' and e.actor_id == caller.id; assert e.session_id == null; assert e.metadata == {version: 1, approval_id: r.json.id, counts_for: r.json.counts_for}; assert the writer received the event with the transaction the verdict row was written in"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Listing and withdrawing verdicts",
+      "rationale": "Readers need the evidence on a change, and the author of a verdict, the workspace owner and the operator need a way to take one back (§8.5).",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "a caller with read access to the workspace and, for a PAT, the scope changes:read sends GET /api/v1/workspaces/:slug/changes/:number/approvals, with or without the query parameter version",
+          "action": "return the change's verdicts, of every version or of the version the query names, newest first",
+          "contract": "HTTP 200 with {items, next_cursor}: items are approval objects ordered by created_at descending and then id descending, limited to the named version when version is given; items is [] when there are none; limit and cursor page through the same order",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not"
+            ],
+            "pseudocode": "in internal/policy/approval_routes_test.go: with a clock the test advances by one second between writes, bob approves version 1, version 2 (not patch-equivalent) is recorded, alice rejects version 2, bob approves version 2; r = get('/api/v1/workspaces/w1/changes/1/approvals') as bob's PAT with [changes:read]; assert r.status == 200; assert [i.by.username + ':' + i.version for i in r.json.items] == ['bob:2', 'alice:2', 'bob:1']; assert r.json.next_cursor == null; assert every item has the nine members of the approval object; r2 = get('/api/v1/workspaces/w1/changes/1/approvals?version=1'); assert len(r2.json.items) == 1 and r2.json.items[0].version == 1; r3 = get('/api/v1/workspaces/w1/changes/1/approvals?limit=1'); assert len(r3.json.items) == 1 and r3.json.next_cursor != null; assert get('/api/v1/workspaces/w1/changes/1/approvals?limit=1&cursor=' + r3.json.next_cursor).json.items[0].by.username == 'alice'; assert get('/api/v1/workspaces/w1/changes/1/approvals') on a change with no verdict has items == []"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "unwanted",
+          "condition": "GET /api/v1/workspaces/:slug/changes/:number/approvals or GET /api/v1/workspaces/:slug/changes/:number/checks has a version that is not a positive integer, a version the change does not have, a number that names no change, a PAT without changes:read, or a caller without access to the workspace",
+          "action": "refuse the request",
+          "contract": "HTTP 400 with error_type invalid_request for a version that is not a positive integer; HTTP 404 with error_type not_found for a version the change does not have; HTTP 404 with error_type change_not_found for an unknown change; HTTP 403 with error_type insufficient_scope for the PAT without changes:read; HTTP 404 with error_type not_found for the caller without access",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not"
+            ],
+            "pseudocode": "in internal/policy/approval_routes_test.go, a table over the routes {GET /api/v1/workspaces/w1/changes/1/approvals, GET /api/v1/workspaces/w1/changes/1/checks} and cases {?version=0 -> 400 invalid_request; ?version=abc -> 400 invalid_request; ?version=9 on a change with one version -> 404 not_found; change number 99 -> 404 change_not_found; a PAT with only [changes:approve, checks:write] -> 403 insufficient_scope; carol's API key -> 404 not_found}: r = get(url); assert r.status and r.json.error.error_type as listed"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "event_driven",
+          "condition": "a token bound to a task fork sends GET /api/v1/workspaces/:slug/changes/:number/approvals or GET /api/v1/workspaces/:slug/changes/:number/checks on the fork's parent",
+          "action": "serve the request only for a change whose source workspace is that fork and answer for every other change as for an unknown one",
+          "contract": "HTTP 200 with the list for a change whose source workspace is the fork; HTTP 404 with error_type change_not_found for a change with another source, with a body identical to that of a number that names no change",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not",
+              "fork f1 of w1 created by bob; change 2 on w1 has source workspace f1 and one verdict and one check result; change 1 has source workspace w1"
+            ],
+            "pseudocode": "in internal/policy/approval_routes_test.go, a table over the routes {approvals, checks}: tok = a PAT of bob bound to f1 with [changes:read]; r = get('/api/v1/workspaces/w1/changes/2/' + route, tok); assert r.status == 200 and r.json.items is the list alice's API key gets; r = get('/api/v1/workspaces/w1/changes/1/' + route, tok); assert r.status == 404 and r.json.error.error_type == 'change_not_found'; assert r.body == get('/api/v1/workspaces/w1/changes/99/' + route, tok).body"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "event_driven",
+          "condition": "the user who gave a verdict, the workspace's owner or the admin token sends DELETE /api/v1/workspaces/:slug/changes/:number/approvals/:id for a verdict of a draft or open change, a PAT among them holding changes:approve",
+          "action": "remove that verdict and nothing else",
+          "contract": "HTTP 204 with an empty body; the verdict with that id is gone from the list and every other verdict of the change, copies of it on other versions included, is unchanged; no parley.change.approve or parley.change.reject event is written",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not"
+            ],
+            "pseudocode": "in internal/policy/approval_routes_test.go, a table over who withdraws bob's verdict v {bob's API key, bob's PAT with [changes:approve] that did not record it, alice's API key (owner), the admin token}: alice has a verdict too; before = len(writer.events()); r = delete('/api/v1/workspaces/w1/changes/1/approvals/' + v.id); assert r.status == 204 and r.body is empty; ids = [i.id for i in get('/api/v1/workspaces/w1/changes/1/approvals').json.items]; assert v.id not in ids and alice's verdict id in ids; assert no event of type parley.change.approve or parley.change.reject was written after before; assert delete('/api/v1/workspaces/w1/changes/1/approvals/' + v.id).status == 404"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "unwanted",
+          "condition": "DELETE /api/v1/workspaces/:slug/changes/:number/approvals/:id comes from a user who is neither the verdict's author nor the workspace's owner, from a PAT without changes:approve, from a caller without access to the workspace, or from a token bound to a fork of the workspace",
+          "action": "refuse the request and keep the verdict",
+          "contract": "HTTP 403 with error_type forbidden for a user who is neither author nor owner; HTTP 403 with error_type insufficient_scope for the PAT without changes:approve; HTTP 404 with error_type not_found for the caller without access; HTTP 403 with error_type token_bound for the fork-bound token; the verdict is still listed",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not",
+              "dave, a second member of acme, and fork f1 of w1 created by alice"
+            ],
+            "pseudocode": "in internal/policy/approval_routes_test.go, a table over who tries to withdraw alice's verdict v: {bob's API key -> 403 forbidden; dave's API key (a second member of acme) -> 403 forbidden; alice's PAT [changes:read, changes:write] -> 403 insufficient_scope; carol's API key -> 404 not_found; a PAT of alice bound to fork f1 with [changes:approve] -> 403 token_bound}: r = delete('/api/v1/workspaces/w1/changes/1/approvals/' + v.id); assert r.status and r.json.error.error_type as listed; assert v.id in [i.id for i in get('/api/v1/workspaces/w1/changes/1/approvals').json.items]"
+          }
+        },
+        {
+          "id": "REQ-2.6",
+          "pattern": "unwanted",
+          "condition": "DELETE /api/v1/workspaces/:slug/changes/:number/approvals/:id names an id that is no verdict of that change, or a change that is landed, abandoned or unknown, or a workspace that is archived",
+          "action": "refuse the request and remove nothing",
+          "contract": "HTTP 404 with error_type not_found for an id that names no verdict of the change; HTTP 404 with error_type change_not_found for an unknown change; HTTP 409 with error_type change_closed for a landed or abandoned change; HTTP 409 with error_type workspace_archived for an archived workspace; no verdict is removed",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not",
+              "change 2 on w1 with one verdict"
+            ],
+            "pseudocode": "in internal/policy/approval_routes_test.go, a table as alice: {a random UUID -> 404 not_found; 'not-a-uuid' -> 404 not_found; the id of a verdict on change 2 addressed under change 1 -> 404 not_found; a verdict of change 1 after the change is landed -> 409 change_closed; after it is abandoned -> 409 change_closed; a verdict in a workspace that is archived -> 409 workspace_archived; change number 99 -> 404 change_not_found}: before = count(verdicts); r = delete(url); assert r.status and r.json.error.error_type as listed; assert count(verdicts) == before"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "The counting rule",
+      "rationale": "An approval is evidence only when it comes from someone the rule names and not from the credential that produced the work, or an agent could certify its own push (§8.3.5, acceptance criterion 7).",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "ubiquitous",
+          "action": "for any verdict on a version of a change and any requirement of that change, count the verdict toward the requirement exactly when its user is among the requirement's approvers and its credential created no version of the change numbered at or below the verdict's version",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/policy/counting_test.go, a table over the counting function with a requirement whose approvers are [owner] and verdicts on version 3 of a change whose version creators are {1: pat X of alice, 2: none (created_by system), 3: API key K2 of an agent user}: {verdict by alice with API key K1 -> counts; by alice with pat X -> does not count; by alice with pat Y -> counts; by the agent user with K2 -> does not count (not an approver, and creator); by bob with his API key -> does not count (not an approver)}; second table, verdict on version 1 with creators {1: pat X, 2: pat Y}: by alice with pat Y -> counts (Y created only a later version); by alice with pat X -> does not count; third table, a version that is not hub-created and has no recorded credential, created_by user alice: every verdict of alice does not count, a verdict of another approver counts; credentials are equal only when type and id are both equal"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "ubiquitous",
+          "action": "for any requirement, treat the approver owner as the workspace's owner, member as every member of the workspace's organization and user:<username> as the user whose username is exactly that",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/policy/counting_test.go, a table over approvers lists and verdict users, none of whom created a version, in a workspace owned by alice in organization acme with members alice and bob, and carol outside: {[owner]: alice yes, bob no, carol no; [member]: alice yes, bob yes, carol no; [user:carol]: carol yes, alice no; [user:Carol]: carol no; [owner, user:bob]: alice yes, bob yes; []: nobody}: assert counts(verdict, requirement) as listed"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "event_driven",
+          "condition": "the landing evaluator of package 27 evaluates a requirement of a change",
+          "action": "answer with the number of approve verdicts on the change's current version that count toward that requirement and with whether a reject verdict on the current version counts toward it",
+          "contract": "the requirement of the stored landing shows approvals.counted equal to the number of counted approve verdicts on the current version (carried ones included, verdicts on other versions excluded); the requirement is not satisfied while a counted reject verdict is on the current version",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not",
+              "policy of w1 set through PUT /api/v1/workspaces/w1/policy by alice; the change's landing read through GET /api/v1/workspaces/w1/changes/1"
+            ],
+            "pseudocode": "in internal/policy/facts_test.go: policy {default: {approvals: 2, approvers: ['owner','member'], checks: []}}; req = () => get(change 1).json.landing.requirements[0]; assert req().approvals.counted == 0; alice approves with her API key; assert req().approvals.counted == 1 and req().satisfied == false; alice approves again (a replacement); assert req().approvals.counted == 1; bob approves; assert req().approvals.counted == 2 and req().satisfied == true and landing.status == 'ready'; alice approves with pat_push in place of her API key verdict; assert req().approvals.counted == 1; version 2 (not patch-equivalent) is recorded; assert req().approvals.counted == 0"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "state_driven",
+          "condition": "a reject verdict that counts toward a requirement is on the change's current version",
+          "action": "keep that requirement unsatisfied, whatever the number of counted approvals, until the verdict's author replaces it with an approve, the verdict is withdrawn, or a version that is not patch-equivalent becomes current",
+          "contract": "the change's landing.status is pending and the requirement's satisfied is false while the counted reject is there; a reject by a user who is not among the requirement's approvers changes neither",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not",
+              "policy of w1 set through PUT /api/v1/workspaces/w1/policy by alice; the change's landing read through GET /api/v1/workspaces/w1/changes/1"
+            ],
+            "pseudocode": "in internal/policy/facts_test.go, policy {default: {approvals: 1, approvers: ['owner','member'], checks: []}}: alice approves; assert landing.status == 'ready'; bob rejects; assert landing.status == 'pending' and requirements[0].satisfied == false and requirements[0].approvals.counted == 1; table over the way out {bob posts approve, bob deletes his verdict, alice (owner) deletes bob's verdict}: assert landing.status == 'ready' afterwards; fourth way out: version 2 that is not patch-equivalent is recorded, alice approves it; assert landing.status == 'ready'; pure rebase in place of the fourth: assert landing.status stays 'pending'; counter case with policy approvers ['owner']: bob rejects; assert landing.status stays 'ready'"
+          }
+        },
+        {
+          "id": "REQ-3.5",
+          "pattern": "event_driven",
+          "condition": "an approval object is returned by POST or GET /api/v1/workspaces/:slug/changes/:number/approvals",
+          "action": "list in counts_for the rule name of every requirement of the change's current landing toward which the verdict counts, in the order of the requirements, and nothing for a verdict that is not on the current version",
+          "contract": "counts_for is an array of the rule members of the change's stored landing.requirements for which the verdict counts, computed at the time of the read; it is [] for a verdict that counts toward none and for every verdict on a version other than the current one",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not",
+              "policy of w1 set through PUT /api/v1/workspaces/w1/policy by alice; the change's landing read through GET /api/v1/workspaces/w1/changes/1"
+            ],
+            "pseudocode": "in internal/policy/facts_test.go: policy {default: {approvals: 1, approvers: ['member'], checks: []}, rules: [{name: 'billing', paths: ['billing/**'], require: {approvals: 1, approvers: ['owner']}}]} and a change touching billing/a.go and README.md; a = post(approvals, approve) as alice's API key; assert a.json.counts_for == ['billing', 'default']; b = post(approvals, approve) as bob; assert b.json.counts_for == ['default']; c = post(approvals, approve) as alice's pat_push (replacing a); assert c.json.counts_for == []; items = get(approvals).json.items; assert the counts_for of each item equals the values above; alice (API key) replaces again; alice sets the policy to one with approvers ['user:bob'] everywhere; assert get(approvals) shows alice's counts_for == [] and bob's == ['billing', 'default']; version 2 (not patch-equivalent) is recorded; assert every item of get(approvals) has counts_for == []"
+          }
+        },
+        {
+          "id": "REQ-3.6",
+          "pattern": "event_driven",
+          "condition": "a verdict is recorded on a version that is neither the change's current version nor an earlier version to which the current version is patch-equivalent",
+          "action": "record the verdict on the named version and leave the change's landing as it was",
+          "contract": "HTTP 201 (or 200 for a replacement) with the approval on the named version and counts_for []; the change's landing is unchanged; no verdict appears on the current version",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not",
+              "policy of w1 set through PUT /api/v1/workspaces/w1/policy by alice; the change's landing read through GET /api/v1/workspaces/w1/changes/1"
+            ],
+            "pseudocode": "in internal/policy/facts_test.go: policy {default: {approvals: 1, approvers: ['owner'], checks: []}}; version 2 that is not patch-equivalent to version 1 is recorded; before = get(change 1).json.landing; r = post(approvals, {verdict:'approve', version:1}) as alice's API key; assert r.status == 201 and r.json.version == 1 and r.json.counts_for == []; assert get(change 1).json.landing == before and before.status == 'pending'; assert get('/api/v1/workspaces/w1/changes/1/approvals?version=1').json.items[0].id == r.json.id; assert get('/api/v1/workspaces/w1/changes/1/approvals?version=2').json.items == []; the same with verdict 'reject' on version 1 after alice approved version 2: landing.status stays 'ready'"
+          }
+        },
+        {
+          "id": "REQ-3.7",
+          "pattern": "event_driven",
+          "condition": "the change component records a version of a change",
+          "action": "remember the type and id of the credential of the request that created it, and no credential for a version the hub created",
+          "contract": "an approval given with that credential on that version or a later one does not count; an approval by the same user with another credential does; a version whose created_by.actor_type is system adds no credential and leaves the counted approvals as they were",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not",
+              "policy of w1 set through PUT /api/v1/workspaces/w1/policy by alice; the change's landing read through GET /api/v1/workspaces/w1/changes/1"
+            ],
+            "pseudocode": "in internal/policy/carry_test.go: policy {default: {approvals: 1, approvers: ['owner'], checks: []}}; version 1 was created by pat_push; alice approves with pat_push; assert counted == 0; alice approves with a second PAT pat_other; assert counted == 1; the hub records version 2 as a restack (created_by.actor_type system, patch-equivalent); assert counted == 1; alice records version 3 (a pure rebase) with pat_other; assert counted == 0 and the carried verdict's counts_for == []; alice approves with her API key; assert counted == 1; the creator table holds {1: (pat, pat_push's token_id), 3: (pat, pat_other's token_id)} and no row for version 2"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Carrying verdicts to patch-equivalent versions",
+      "rationale": "An approval must survive a pure rebase and must not survive a content change (LAND-US-05, CHG-FR-011).",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "a version of a change is recorded whose patch_equivalent_to names an earlier version",
+          "action": "copy every verdict on that earlier version to the new version in the transaction that records the version, and write no event for the copies",
+          "contract": "the new version has one verdict per verdict of the earlier version, each with a new id, the same verdict, comment, by, credential and created_at, and carried_from equal to the version the verdict was first given on (the source's carried_from when it has one, else the source's version); the verdicts on the earlier version remain; no parley.change.approve or parley.change.reject event is written",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not"
+            ],
+            "pseudocode": "in internal/policy/carry_test.go: bob approves version 1 with comment 'ok', alice rejects version 1; before = len(writer.events('parley.change.approve', 'parley.change.reject')); version 2 is recorded as a pure rebase (patch_equivalent_to 1); v2 = get('/api/v1/workspaces/w1/changes/1/approvals?version=2').json.items; assert len(v2) == 2; for each: assert carried_from == 1 and its id differs from the version 1 verdict's id and verdict, comment, by and created_at equal the original's; assert get('/api/v1/workspaces/w1/changes/1/approvals?version=1') still lists the two originals; version 3 is recorded as another pure rebase (patch_equivalent_to 2); assert every item of ?version=3 has carried_from == 1; assert len(writer.events('parley.change.approve', 'parley.change.reject')) == before"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "event_driven",
+          "condition": "a version of a change is recorded whose patch_equivalent_to is null",
+          "action": "leave the new version without verdicts, so that approvals and rejections given on earlier versions no longer apply",
+          "contract": "the list of verdicts for the new version is empty; the change's landing counts no approval and no rejection from earlier versions; the verdicts on earlier versions stay readable",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not",
+              "policy of w1 set through PUT /api/v1/workspaces/w1/policy by alice; the change's landing read through GET /api/v1/workspaces/w1/changes/1"
+            ],
+            "pseudocode": "in internal/policy/carry_test.go: policy {default: {approvals: 1, approvers: ['owner','member'], checks: []}}; alice approves version 1; assert landing.status == 'ready'; version 2 is recorded with a commit that edits a file; assert get('/api/v1/workspaces/w1/changes/1/approvals?version=2').json.items == []; assert landing.status == 'pending' and requirements[0].approvals.counted == 0; assert get('/api/v1/workspaces/w1/changes/1/approvals?version=1') still lists alice's verdict with counts_for == []; second case: bob's counted reject on version 1, then version 2 not patch-equivalent and alice approves it: landing.status == 'ready'"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "event_driven",
+          "condition": "a verdict is recorded on an earlier version that the change's current version reaches by following patch_equivalent_to",
+          "action": "record the verdict on the named version and, in the same transaction, carry a copy to the current version, replacing a verdict of the same user there",
+          "contract": "HTTP 201 or 200 with the approval on the named version; the current version holds one verdict of that user, with carried_from equal to the named version, and the change's landing is evaluated with it",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not",
+              "policy of w1 set through PUT /api/v1/workspaces/w1/policy by alice; the change's landing read through GET /api/v1/workspaces/w1/changes/1"
+            ],
+            "pseudocode": "in internal/policy/carry_test.go: policy {default: {approvals: 1, approvers: ['owner'], checks: []}}; version 2 is recorded as a pure rebase of version 1 by pat_push; version 3 as a pure rebase of version 2; assert landing.status == 'pending'; r = post(approvals, {verdict:'approve', version:1}) as alice's API key; assert r.status == 201 and r.json.version == 1; cur = get('/api/v1/workspaces/w1/changes/1/approvals?version=3').json.items; assert len(cur) == 1 and cur[0].carried_from == 1 and cur[0].by.username == 'alice' and cur[0].counts_for == ['default']; assert landing.status == 'ready'; alice then posts {verdict:'reject', version:2}; cur = get('/api/v1/workspaces/w1/changes/1/approvals?version=3').json.items; assert len(cur) == 1 and cur[0].verdict == 'reject' and cur[0].carried_from == 2; assert landing.status == 'pending'"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "unwanted",
+          "condition": "copying the verdicts or remembering the creating credential fails while a version is being recorded",
+          "action": "return the error to the change component that is recording the version, so that the version's transaction is rolled back",
+          "contract": "the version observer returns a non-nil error; after the rollback the store holds neither the new version, nor a copied verdict, nor a creator record for it",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not"
+            ],
+            "pseudocode": "in internal/policy/carry_test.go: bob approves version 1; the store is made to fail the insert into the verdict table; err = RecordVersion(tx, pure rebase); assert err != nil; rollback; assert the change still has one version; assert count(verdicts) == 1; assert no creator row exists for version 2; after the fault is removed the same RecordVersion succeeds and version 2 has the carried verdict"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Reporting a check result",
+      "rationale": "A check runner needs one call, usable with a token that can do nothing else, to say what a named check found on one version (LAND-US-06, LAND-FR-052).",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "a caller with write access to the workspace sends PUT /api/v1/workspaces/:slug/changes/:number/checks/:name with an API key, the admin token, or a PAT that holds checks:write, and a valid body {status, version?, summary?, url?, details?} for a draft or open change",
+          "action": "store the result for that version and name, on the current version when the body names none, and return the check",
+          "contract": "HTTP 200 with a check {name, change, version, status, summary ('' when absent), url (null when absent), details (null when absent), reported_by {actor_type, actor_id, username}, updated_at}; the store holds exactly one result for that version and name",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not"
+            ],
+            "pseudocode": "in internal/policy/check_routes_test.go, a table over callers {alice's API key, alice's PAT whose only scope is checks:write, the admin token}, names {'test', 'a', 'billing-e2e', 'lint.go_1', a name of 63 characters} and bodies {{status:'pending'}, {status:'passed', summary:'42 tests', url:'https://ci.example/run/7', details:{duration_ms: 812}}, {status:'failed', version:1}, {status:'passed', summary: 2000 characters}, {status:'passed', details: an object whose JSON text is exactly 16384 bytes}} and change states {open, draft}: r = put('/api/v1/workspaces/w1/changes/1/checks/' + name, body); assert r.status == 200; c = r.json; assert c.name == name and c.change == 1 and c.version == 1 and c.status == body.status; assert c.summary == (body.summary or '') and c.url == (body.url or null) and c.details == (body.details or null); assert c.reported_by == {actor_type, actor_id, username} of the caller (admin_token with null id and username for the admin token); assert c.updated_at matches RFC 3339 UTC; assert the store holds one result for (1, 1, name); with the checks:write-only PAT assert get(change 1).status == 403 and post(approvals).status == 403, both insufficient_scope"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "event_driven",
+          "condition": "a valid PUT /api/v1/workspaces/:slug/changes/:number/checks/:name arrives for a version and name that already have a result",
+          "action": "replace the stored result with the reported one",
+          "contract": "HTTP 200 with the check as reported now: status, summary, url, details, reported_by and updated_at all come from the new report, and members the new report omits are empty; one result exists for that version and name",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not"
+            ],
+            "pseudocode": "in internal/policy/check_routes_test.go: put('/api/v1/workspaces/w1/changes/1/checks/test', {status:'pending', summary:'queued', url:'https://ci.example/1', details:{a:1}}) as alice's PAT; clock.advance(5s); r = put('/api/v1/workspaces/w1/changes/1/checks/test', {status:'passed'}) as the admin token; assert r.status == 200; assert r.json.status == 'passed' and r.json.summary == '' and r.json.url == null and r.json.details == null; assert r.json.reported_by.actor_type == 'admin_token'; assert r.json.updated_at is 5 seconds after the first; items = get('/api/v1/workspaces/w1/changes/1/checks').json.items; assert len(items) == 1 and items[0] == r.json"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "unwanted",
+          "condition": "PUT /api/v1/workspaces/:slug/changes/:number/checks/:name comes from a PAT that does not hold checks:write, from a member with read access only, from a caller without access to the workspace, or from a token bound to a fork of the workspace",
+          "action": "refuse the request before reading the change and store nothing",
+          "contract": "HTTP 403 with error_type insufficient_scope for the PAT without the scope, the same for an existing and an unknown workspace; HTTP 403 with error_type forbidden for the read-only member, with or without the scope; HTTP 404 with error_type not_found for the caller without access; HTTP 403 with error_type token_bound for the fork-bound token; no result is stored and no event is written",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not",
+              "fork f1 of w1 created by alice, with change 2 on w1 whose source workspace is f1"
+            ],
+            "pseudocode": "in internal/policy/check_routes_test.go, a table: {alice's PAT [changes:write, changes:approve] -> 403 insufficient_scope; the same PAT on slug 'nosuch' -> 403 insufficient_scope; bob's API key -> 403 forbidden; bob's PAT [checks:write] -> 403 forbidden; carol's API key -> 404 not_found, body equal to that for slug 'nosuch'; a PAT of alice bound to fork f1 with [checks:write], on w1, for change 2 whose source is f1 -> 403 token_bound}: r = put(url, {status:'passed'}); assert r.status and r.json.error.error_type as listed; assert count(check results) == 0; assert no parley.change.check event was written"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "unwanted",
+          "condition": "the :name of PUT /api/v1/workspaces/:slug/changes/:number/checks/:name does not match ^[a-z0-9][a-z0-9_.-]{0,62}$, or its body is not a JSON object, has no status or one other than pending, passed and failed, a summary of more than 2,000 characters, a url that is not an absolute http or https URL of at most 2,048 characters, details that is not a JSON object or whose JSON text exceeds 16,384 bytes, a version that is not a positive integer, or an unknown member",
+          "action": "refuse the request and store nothing",
+          "contract": "HTTP 400 with error_type invalid_request; no result is stored and no event is written",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not"
+            ],
+            "pseudocode": "in internal/policy/check_routes_test.go, a table as alice over names {'Test', '-test', 'a b', a name of 64 characters, 'x!'} with body {status:'passed'}, and over bodies with name 'test' {{} (no status), {status:'ok'}, {status:'passed', summary: 2001 characters}, {status:'passed', url:'ftp://ci.example/1'}, {status:'passed', url:'/run/7'}, {status:'passed', url: an https URL of 2049 characters}, {status:'passed', details:[1,2]}, {status:'passed', details:'text'}, {status:'passed', details: an object whose JSON text is 16385 bytes}, {status:'passed', version:0}, {status:'passed', version:'one'}, {status:'passed', extra:true}, the JSON string 'passed'}: r = put(url, body); assert r.status == 400; assert r.json.error.error_type == 'invalid_request'; assert count(check results) == 0"
+          }
+        },
+        {
+          "id": "REQ-5.5",
+          "pattern": "unwanted",
+          "condition": "PUT /api/v1/workspaces/:slug/changes/:number/checks/:name names a number that is no change of the workspace, or a valid body names a version the change does not have",
+          "action": "refuse the request and store nothing",
+          "contract": "HTTP 404 with error_type change_not_found for the change; HTTP 404 with error_type not_found for the version; no result is stored",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not"
+            ],
+            "pseudocode": "in internal/policy/check_routes_test.go, a table as alice: {change number 99 -> 404 change_not_found; number 'x' -> 404 change_not_found; change 1 with body {status:'passed', version:5} while the change has one version -> 404 not_found}: r = put(url, body); assert r.status == 404 and r.json.error.error_type as listed; assert count(check results) == 0"
+          }
+        },
+        {
+          "id": "REQ-5.6",
+          "pattern": "unwanted",
+          "condition": "a valid PUT /api/v1/workspaces/:slug/changes/:number/checks/:name reaches a change that is landed or abandoned, or a workspace that is archived",
+          "action": "refuse the request and leave the stored results as they were",
+          "contract": "HTTP 409 with error_type change_closed for a landed or abandoned change; HTTP 409 with error_type workspace_archived for an archived workspace; the stored results are unchanged and no event is written",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not"
+            ],
+            "pseudocode": "in internal/policy/check_routes_test.go, a table over {change set to landed, change set to abandoned, workspace w1 set to archived} with one stored result 'test' = pending: r = put('/api/v1/workspaces/w1/changes/1/checks/test', {status:'passed'}) as alice; assert r.status == 409; assert r.json.error.error_type == 'change_closed', 'change_closed', 'workspace_archived'; assert the stored result is still pending; assert no parley.change.check event was written by the refused request"
+          }
+        },
+        {
+          "id": "REQ-5.7",
+          "pattern": "event_driven",
+          "condition": "a check result is stored through PUT /api/v1/workspaces/:slug/changes/:number/checks/:name, as a first report or a replacement, the status changed or not",
+          "action": "write exactly one hub event for the report in the store transaction that stores it",
+          "contract": "one event handed to the event writer with type parley.change.check, workspace the slug, resource_type change, resource_id the change number as a string, action check, actor_type and actor_id of the caller, session_id null and metadata {version, name, status}",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not"
+            ],
+            "pseudocode": "in internal/policy/check_routes_test.go, a table over {first report pending as alice's PAT, replacement passed as the admin token, the same passed report sent again}: r = put('/api/v1/workspaces/w1/changes/1/checks/test', body); e = last(writer.events()); assert exactly one event was added by the request; assert e.type == 'parley.change.check' and e.workspace == 'w1' and e.resource_type == 'change' and e.resource_id == '1' and e.action == 'check'; assert e.actor_type == 'pat' with actor_id alice.id, or 'admin_token' with actor_id null; assert e.session_id == null; assert e.metadata == {version: 1, name: 'test', status: body.status}; assert the writer received the event with the transaction the result row was written in"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Reading checks and the status policy sees",
+      "rationale": "A check result must follow a pure rebase unless the rule asks for fresh results, and a check nobody reported must hold the change back (§8.3.6).",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "a caller with read access to the workspace and, for a PAT, the scope changes:read sends GET /api/v1/workspaces/:slug/changes/:number/checks, with or without the query parameter version",
+          "action": "return the check results that apply to the current version, or to the version the query names, ordered by name",
+          "contract": "HTTP 200 with {items, next_cursor}: one check object per name that has an applying result for the version (the current one by default), ordered by name ascending; a carried-over result shows in its version member the earlier version it was reported on; items is [] when no result applies",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not"
+            ],
+            "pseudocode": "in internal/policy/check_routes_test.go: on version 1 report 'test' passed, 'lint' failed, 'build' passed; version 2 is recorded as a pure rebase; on version 2 report 'lint' passed; r = get('/api/v1/workspaces/w1/changes/1/checks') as bob's PAT with [changes:read]; assert r.status == 200 and r.json.next_cursor == null; assert [(i.name, i.version, i.status) for i in r.json.items] == [('build',1,'passed'), ('lint',2,'passed'), ('test',1,'passed')]; r1 = get('/api/v1/workspaces/w1/changes/1/checks?version=1'); assert [(i.name, i.version, i.status) for i in r1.json.items] == [('build',1,'passed'), ('lint',1,'failed'), ('test',1,'passed')]; version 3 is recorded with a commit that edits a file; assert get('/api/v1/workspaces/w1/changes/1/checks').json.items == []; assert get('/api/v1/workspaces/w1/changes/1/checks?version=2') still returns the three results; r3 = get('/api/v1/workspaces/w1/changes/1/checks?version=2&limit=2'); assert len(r3.json.items) == 2 and r3.json.next_cursor != null"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "ubiquitous",
+          "action": "for any version of a change and any check name, treat as the applying result the one reported on that version, else the one reported on the nearest earlier version reached from it by following patch_equivalent_to, else none",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/policy/check_test.go, a table over the applying-result function with versions {1: pe null, 2: pe 1, 3: pe 2, 4: pe null, 5: pe 4, 6: pe 3} and results {(1,'test',passed), (2,'test',failed), (1,'lint',passed), (4,'test',pending)}: applying(3,'test') is the result on 2; applying(6,'test') is the result on 2; applying(6,'lint') is the result on 1; applying(1,'test') is the result on 1; applying(5,'test') is the result on 4; applying(5,'lint') is none; applying(4,'lint') is none; applying(3,'build') is none; with an own pending result added on 3: applying(3,'test') is that pending result and applying(6,'test') is it too"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "event_driven",
+          "condition": "the landing evaluator of package 27 asks for the status of a check that a requirement names",
+          "action": "answer with the status of the result that applies to the change's current version, and with pending when none applies",
+          "contract": "the checks member of the requirement in the stored landing shows, for each named check, the status of the applying result for the current version, or pending when no result applies; a result for a name no requirement asks for changes nothing",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not",
+              "policy of w1 set through PUT /api/v1/workspaces/w1/policy by alice; the change's landing read through GET /api/v1/workspaces/w1/changes/1"
+            ],
+            "pseudocode": "in internal/policy/facts_test.go: policy {default: {approvals: 0, checks: ['test','lint']}}; l = () => get(change 1).json.landing; assert l().status == 'pending' and l().requirements[0].checks == [{name:'test', status:'pending'}, {name:'lint', status:'pending'}]; report test passed; assert l().status == 'pending'; report lint failed; assert l().requirements[0].checks[1].status == 'failed' and l().status == 'pending'; report lint passed; assert l().status == 'ready'; report 'docs' failed (a name policy does not ask for); assert l().status == 'ready'; version 2 is recorded as a pure rebase; assert l().status == 'ready'; report test pending on version 2; assert l().status == 'pending'; version 3 is recorded with a commit that edits a file; assert both checks are pending"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "optional",
+          "condition": "a requirement sets fresh_checks",
+          "action": "count for that requirement only results reported on the change's current version itself",
+          "contract": "the requirement's named checks show pending until a result is reported on the current version, while a requirement without fresh_checks on the same change shows the carried-over status",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not",
+              "policy of w1 set through PUT /api/v1/workspaces/w1/policy by alice; the change's landing read through GET /api/v1/workspaces/w1/changes/1"
+            ],
+            "pseudocode": "in internal/policy/facts_test.go: policy {default: {approvals: 0, checks: ['test']}, rules: [{name: 'billing', paths: ['billing/**'], require: {checks: ['test'], fresh_checks: true}}]} and a change touching billing/a.go and README.md; report test passed on version 1; assert landing.status == 'ready'; version 2 is recorded as a pure rebase; l = get(change 1).json.landing; assert the requirement with rule 'billing' has checks == [{name:'test', status:'pending'}] and satisfied == false; assert the requirement with rule 'default' has checks == [{name:'test', status:'passed'}] and satisfied == true; assert l.status == 'pending'; report test passed on version 2; assert landing.status == 'ready'"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "event_driven",
+          "condition": "a check is reported on a version that is neither the change's current version nor an earlier version the current version reaches by following patch_equivalent_to",
+          "action": "store the result on the named version and leave the change's landing as it was",
+          "contract": "HTTP 200 with the check on the named version; the change's landing is unchanged and the result does not appear in the list for the current version",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not",
+              "policy of w1 set through PUT /api/v1/workspaces/w1/policy by alice; the change's landing read through GET /api/v1/workspaces/w1/changes/1"
+            ],
+            "pseudocode": "in internal/policy/facts_test.go: policy {default: {approvals: 0, checks: ['test']}}; version 2 is recorded with a commit that edits a file; before = get(change 1).json.landing; r = put('/api/v1/workspaces/w1/changes/1/checks/test', {status:'passed', version:1}); assert r.status == 200 and r.json.version == 1; assert get(change 1).json.landing == before and before.status == 'pending'; assert get('/api/v1/workspaces/w1/changes/1/checks').json.items == []; assert get('/api/v1/workspaces/w1/changes/1/checks?version=1').json.items[0].status == 'passed'; assert one parley.change.check event with metadata.version == 1 was written"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "Re-evaluation and atomicity",
+      "rationale": "Evidence that changed without the change's landing status following it would let a change land on stale grounds, or hold a ready change back (LAND-FR-044).",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "event_driven",
+          "condition": "a verdict is recorded or replaced, a verdict is withdrawn, or a check result is stored",
+          "action": "re-evaluate the change's policy through the evaluator of package 27 and store the result as the change's landing in the store transaction of the write",
+          "contract": "a GET /api/v1/workspaces/:slug/changes/:number sent after the write's response shows a landing computed from the evidence as it is after the write",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not",
+              "policy of w1 set through PUT /api/v1/workspaces/w1/policy by alice; the change's landing read through GET /api/v1/workspaces/w1/changes/1"
+            ],
+            "pseudocode": "in internal/policy/facts_test.go: policy {default: {approvals: 1, approvers: ['owner'], checks: ['test']}}; s = () => get(change 1).json.landing.status; assert s() == 'pending'; put test passed; assert s() == 'pending'; a = post(approvals, approve) as alice's API key; assert s() == 'ready'; delete(approvals/a.id); assert s() == 'pending'; post(approvals, approve) as alice; assert s() == 'ready'; put test failed; assert s() == 'pending'; post(approvals, reject) as alice (a replacement); put test passed; assert s() == 'pending'; each s() is read by a request sent after the write's response, with no wait; on a draft change the same writes leave landing {status:'blocked', reason:'draft'}"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "unwanted",
+          "condition": "storing the row, re-evaluating the change or writing the event fails while a verdict is recorded, a verdict is withdrawn or a check is reported",
+          "action": "roll back the whole write and answer with a hub failure",
+          "contract": "HTTP 500 with error_type internal and a message that does not contain the cause; the verdicts, the check results and the change's landing are as before the request; no event was committed",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not",
+              "policy of w1 set through PUT /api/v1/workspaces/w1/policy by alice; the change's landing read through GET /api/v1/workspaces/w1/changes/1"
+            ],
+            "pseudocode": "in internal/policy/facts_test.go, a table over the write {POST approvals, DELETE approvals/:id, PUT checks/test} and the failing part {the event writer returns errors.New('writer down') (not for DELETE, which writes no event), the evaluator returns an error, the row write fails}: snapshot = (verdict rows, check rows, get(change 1).json.landing); r = the write; assert r.status == 500; assert r.json.error.error_type == 'internal'; assert not contains(r.body, 'writer down'); assert (verdict rows, check rows, landing) == snapshot; assert writer.committed() gained no event"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "ubiquitous",
+          "action": "for any two concurrent verdicts by one user on one version, and any two concurrent reports of one check name on one version, answer both with success and keep exactly one row",
+          "contract": "no request answers 409 or 500 because of the other; after both, the store holds one verdict of that user on that version, or one result for that version and name, and the change's landing agrees with what is stored",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not"
+            ],
+            "pseudocode": "in internal/policy/facts_test.go, run with the race detector by the project's test command, 20 rounds each: two goroutines post {verdict:'approve'} and {verdict:'reject'} as bob at once; assert the statuses are {201, 200} in some order; assert get(approvals) lists one verdict of bob and it equals the body of the 200 response; two goroutines put test passed and test failed at once; assert both statuses are 200; assert get(checks) lists one 'test' result whose status equals the stored row; assert the landing equals an evaluation of the stored rows; a third goroutine reporting 'lint' at the same time is answered 200"
+          }
+        },
+        {
+          "id": "REQ-7.4",
+          "pattern": "event_driven",
+          "condition": "GET /api/v1/workspaces/:slug/changes/:number is sent with include naming approvals, checks or both",
+          "action": "add the member approvals, holding the verdicts on the change's current version newest first, and the member checks, holding the results that apply to the current version by name",
+          "contract": "the change object carries approvals (an array of approval objects equal to the items of GET …/approvals?version=<current>) when include names approvals, and checks (an array equal to the items of GET …/checks) when include names checks; without them neither member is present",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler built from the server pipeline of internal/server with authentication, the scope check, the binding guard, the access rule, the change component of internal/change and the policy component of internal/policy installed, a store in t.TempDir() and a recording event writer",
+              "workspace w1 in organization acme, its repository made with git init in t.TempDir(); alice owns w1, bob is a member of acme without write access to w1, carol belongs to no organization of w1; each has an API key",
+              "change 1 on w1, open, whose version 1 was created by alice's PAT pat_push (scopes git:write, changes:read, changes:write, changes:approve) through the change component (Open); later versions are added with RecordVersion: a pure rebase for a patch-equivalent version, a commit that edits a file for one that is not"
+            ],
+            "pseudocode": "in internal/policy/facts_test.go: bob approves version 1 and 'test' is reported passed on version 1; version 2 is recorded as a pure rebase; alice rejects version 2; c = get('/api/v1/workspaces/w1/changes/1?include=approvals,checks').json; assert [a.by.username for a in c.approvals] == ['alice', 'bob'] and c.approvals[1].carried_from == 1 and every a.version == 2; assert c.approvals == get('/api/v1/workspaces/w1/changes/1/approvals?version=2').json.items; assert c.checks == get('/api/v1/workspaces/w1/changes/1/checks').json.items; assert get('/api/v1/workspaces/w1/changes/1').json has neither member; assert get('…/changes/1?include=approvals').json has approvals and no checks"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "CLI commands for verdicts and checks",
+      "rationale": "Developers approve from a terminal and check runners report from a script; both need the routes as commands (§8.6).",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "event_driven",
+          "condition": "a developer or a review agent runs parley change approve <slug> <number>, parley change reject <slug> <number> --comment <text>, parley change approvals <slug> <number>, parley change check <slug> <number> <name> --status <status> or parley change checks <slug> <number>, with their optional flags --version, --comment, --summary and --url",
+          "action": "send the one request of that command, print the response body on stdout and exit 0",
+          "contract": "one request: approve and reject send POST /api/v1/workspaces/<slug>/changes/<number>/approvals with {verdict, version?, comment?}; approvals sends GET on the same path with ?version= when given; check sends PUT …/checks/<name> with {status, version?, summary?, url?}; checks sends GET …/checks with ?version= when given; members for flags not given are absent; stdout is the response body and the exit status is 0",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub (net/http/httptest) that records requests and answers canned bodies; PARLEY_CONFIG_DIR set to t.TempDir() with a config.toml holding endpoint_url and api_key"
+            ],
+            "pseudocode": "in internal/cli/change_review_test.go, a table: {['change','approve','w1','7'] -> POST /api/v1/workspaces/w1/changes/7/approvals body {verdict:'approve'}; ['change','approve','w1','7','--version','2','--comment','lgtm'] -> body {verdict:'approve', version:2, comment:'lgtm'}; ['change','reject','w1','7','--comment','no tests'] -> body {verdict:'reject', comment:'no tests'}; ['change','approvals','w1','7'] -> GET …/changes/7/approvals with no query; ['change','approvals','w1','7','--version','2'] -> GET …/approvals?version=2; ['change','check','w1','7','test','--status','passed'] -> PUT …/changes/7/checks/test body {status:'passed'}; ['change','check','w1','7','lint.go','--status','failed','--version','2','--summary','3 errors','--url','https://ci.example/9'] -> PUT …/checks/lint.go body {status:'failed', version:2, summary:'3 errors', url:'https://ci.example/9'}; ['change','checks','w1','7'] -> GET …/changes/7/checks; ['change','checks','w1','7','--version','2'] -> GET …/checks?version=2; ['change','approve','team/w','7'] -> path segment team%2Fw}: res = run(args); assert the stub saw exactly one request with that method, path, query and JSON body and Authorization: Bearer <configured key>; assert res.stdout == the canned body as JSON indented by 2 spaces; assert res.exit == 0; row with the stub answering 409 change_closed: assert stdout is empty, stderr is the envelope as received and exit == 1"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "event_driven",
+          "condition": "a developer runs parley change approvals <slug> <number> --withdraw <id>",
+          "action": "send DELETE for that verdict and report success",
+          "contract": "one request DELETE /api/v1/workspaces/<slug>/changes/<number>/approvals/<id>; on HTTP 204 stdout is {} and the exit status is 0",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub (net/http/httptest) that records requests and answers canned bodies; PARLEY_CONFIG_DIR set to t.TempDir() with a config.toml holding endpoint_url and api_key"
+            ],
+            "pseudocode": "in internal/cli/change_review_test.go: the stub answers 204; res = run(['change','approvals','w1','7','--withdraw','0b9c6c1e-5d0a-4f43-9a55-0d3a7c0a1f10']); assert the stub saw exactly one request, DELETE /api/v1/workspaces/w1/changes/7/approvals/0b9c6c1e-5d0a-4f43-9a55-0d3a7c0a1f10, and no GET; assert res.stdout == '{}\\n'; assert res.exit == 0; row with the stub answering 403 forbidden: stdout empty, the envelope on stderr, exit == 1"
+          }
+        },
+        {
+          "id": "REQ-8.3",
+          "pattern": "unwanted",
+          "condition": "parley change reject is run without --comment or with an empty one, parley change check without --status or with a status other than pending, passed and failed, any of the five commands with a --version or a <number> that is not a positive integer or with a wrong number of arguments, or parley change approvals with --withdraw together with --version or with an empty --withdraw",
+          "action": "report a usage error and send no request",
+          "contract": "exit status 2; nothing on stdout; the error envelope on stderr with code 0 and error_type usage_error; no request reaches the hub",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a stub hub (net/http/httptest) that records requests and answers canned bodies; PARLEY_CONFIG_DIR set to t.TempDir() with a config.toml holding endpoint_url and api_key"
+            ],
+            "pseudocode": "in internal/cli/change_review_test.go, a table over args {['change','reject','w1','7'], ['change','reject','w1','7','--comment',''], ['change','check','w1','7','test'], ['change','check','w1','7','test','--status','ok'], ['change','check','w1','7','--status','passed'] (no name), ['change','approve','w1','7','--version','0'], ['change','approve','w1','7','--version','x'], ['change','checks','w1','seven'], ['change','approve','w1'], ['change','approvals','w1','7','--withdraw','id1','--version','2'], ['change','approvals','w1','7','--withdraw','']}: res = run(args); assert res.exit == 2; assert res.stdout == ''; assert json(res.stderr).error.error_type == 'usage_error' and json(res.stderr).error.code == 0; assert the stub saw no request"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "A check report and an owner's approval make a change ready",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "has set a policy on the workspace that requires one approval by the owner and the check test"
+        },
+        {
+          "actor": "agent",
+          "action": "opens a change from its fork with the token bound to that fork; the change is pending"
+        },
+        {
+          "actor": "review agent",
+          "action": "runs parley change check <slug> 1 test --status passed with a PAT of the owner that holds only checks:write"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends PUT /api/v1/workspaces/<slug>/changes/1/checks/test with {status: passed}"
+        },
+        {
+          "actor": "parleyd",
+          "action": "stores the result, writes parley.change.check and re-evaluates the change, which stays pending because no approval counts yet"
+        },
+        {
+          "actor": "agent",
+          "action": "sends POST …/changes/1/approvals with the token that pushed the change and is refused 403 token_bound"
+        },
+        {
+          "actor": "developer",
+          "action": "runs parley change approve <slug> 1 with an API key"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends POST /api/v1/workspaces/<slug>/changes/1/approvals with {verdict: approve}"
+        },
+        {
+          "actor": "parleyd",
+          "action": "stores the verdict, finds that it counts toward the requirement, writes parley.change.approve and re-evaluates the change to ready"
+        },
+        {
+          "actor": "developer",
+          "action": "runs parley change approvals <slug> 1 and parley change checks <slug> 1 and sees the verdict with its counts_for and the passed check"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parley CLI command tree and HTTP client",
+          "HTTP server pipeline of internal/server",
+          "authentication, scope check, binding guard and access rule",
+          "approval and check routes of internal/policy",
+          "landing evaluator of package 27",
+          "change component of internal/change",
+          "store",
+          "git repositories on disk"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with a store and repositories in a temporary directory and a recording event writer in place of the event log of package 52",
+          "user alice with an API key owns workspace w1, whose repository the test seeds with git init and one commit; alice has a PAT ci with only checks:write; fork f1 of w1 with a token bound to it holds one more commit on a branch",
+          "alice has set the policy {default: {approvals: 1, approvers: ['owner'], checks: ['test']}} through PUT /api/v1/workspaces/w1/policy, and change 1 was opened from f1 with the bound token through POST /api/v1/workspaces/w1/changes"
+        ],
+        "end_state": [
+          "GET /api/v1/workspaces/w1/changes/1 shows landing.status ready, with the requirement's approvals.counted 1 and its check test passed",
+          "parley change approvals w1 1 prints one item by alice with counts_for ['default']; parley change checks w1 1 prints one item named test with status passed",
+          "the event writer holds one parley.change.check and one parley.change.approve event for change 1, in that order",
+          "the bound token's POST of a verdict was answered 403 token_bound and stored nothing"
+        ],
+        "pseudocode": "in test/e2e/approvals_checks_test.go: assert landing(1).status == 'pending'; out = parley(as ci, 'change','check','w1','1','test','--status','passed'); assert out.code == 0 and json(out.stdout).status == 'passed'; assert landing(1).status == 'pending'; assert post('/api/v1/workspaces/w1/changes/1/approvals', {verdict:'approve'}, forkToken).json.error.error_type == 'token_bound'; out = parley(as alice, 'change','approve','w1','1'); assert out.code == 0 and json(out.stdout).counts_for == ['default']; assert landing(1).status == 'ready'; assert json(parley('change','approvals','w1','1').stdout).items[0].by.username == 'alice'; assert json(parley('change','checks','w1','1').stdout).items[0].name == 'test'; assert types(writer.events(change 1, 'parley.change.check', 'parley.change.approve')) == ['parley.change.check', 'parley.change.approve']"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "Evidence survives a pure rebase and is dropped by a content change",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "pushes version 1 of a change with a PAT and approves it with the same PAT"
+        },
+        {
+          "actor": "parleyd",
+          "action": "records the verdict and does not count it, because the credential created the version; the change stays pending"
+        },
+        {
+          "actor": "developer",
+          "action": "approves version 1 with an API key, and a check runner's report of test passed is on version 1"
+        },
+        {
+          "actor": "parleyd",
+          "action": "counts the developer's approval and re-evaluates the change to ready"
+        },
+        {
+          "actor": "agent",
+          "action": "rebases the source branch onto the moved target without changing its content"
+        },
+        {
+          "actor": "parleyd",
+          "action": "records version 2 as patch-equivalent to version 1, copies both verdicts to it with carried_from 1, applies the check result of version 1 to it, and keeps the change ready"
+        },
+        {
+          "actor": "agent",
+          "action": "commits a content change to the source branch"
+        },
+        {
+          "actor": "parleyd",
+          "action": "records version 3 with no verdicts and no applying check result and re-evaluates the change to pending"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "HTTP server pipeline of internal/server",
+          "source control API of package 21",
+          "change component of internal/change with its version observers",
+          "approval carry-over, counting rule and check lookup of internal/policy",
+          "landing evaluator of package 27",
+          "store",
+          "git repositories on disk"
+        ],
+        "setup": [
+          "the in-process hub of PATH-1 with workspace w2 owned by alice, the policy {default: {approvals: 1, approvers: ['owner'], checks: ['test']}}, and a PAT agentpat of alice with changes:read, changes:write, changes:approve, git:write and checks:write",
+          "change 1 on w2 opened with agentpat from branch work; the test moves the target branch by one unrelated commit before the rebase",
+          "versions are created through the source control API of package 21: a server-side rebase for the pure rebase, an API commit that edits a file for the content change"
+        ],
+        "end_state": [
+          "after the agent's own approval the requirement's approvals.counted is 0; after alice's API key approval it is 1 and landing.status is ready",
+          "after the rebase the change has version 2 with patch_equivalent_to 1, GET …/approvals?version=2 lists two verdicts with carried_from 1, GET …/checks lists test passed with version 1, and landing.status is ready",
+          "after the content change GET …/approvals?version=3 and GET …/checks are empty lists and landing.status is pending with approvals.counted 0 and test pending",
+          "the verdicts and the check result of versions 1 and 2 are still readable with ?version="
+        ],
+        "pseudocode": "in test/e2e/approvals_checks_test.go: post(approvals, {verdict:'approve'}, agentpat); assert req(1).approvals.counted == 0; put(checks/test, {status:'passed'}, agentpat); post(approvals, {verdict:'approve'}, aliceKey); assert landing(1).status == 'ready'; rebase branch work onto the target through the source control API with agentpat; c = get(change 1); assert c.version == 2 and version(2).patch_equivalent_to == 1; items = get(approvals + '?version=2').items; assert len(items) == 2 and all(i.carried_from == 1); assert get(checks).items[0].version == 1; assert landing(1).status == 'ready'; commit an edit of a file to work with agentpat; assert get(change 1).version == 3; assert get(approvals + '?version=3').items == [] and get(checks).items == []; assert landing(1).status == 'pending'; assert len(get(approvals + '?version=1').items) == 2"
+      }
+    }
+  ],
+  "external_apis": [
+    {
+      "package": "github.com/spf13/cobra",
+      "version": "v1",
+      "verified": false,
+      "symbols": [
+        {
+          "name": "Command.AddCommand",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) AddCommand(cmds ...*Command)"
+        },
+        {
+          "name": "Command.MarkFlagRequired",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func (c *Command) MarkFlagRequired(name string) error"
+        },
+        {
+          "name": "ExactArgs",
+          "import_path": "github.com/spf13/cobra",
+          "signature": "func ExactArgs(n int) PositionalArgs"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,363 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "20",
+  "spec_name": "scm_read_api",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/scm/... ./internal/gitrepo/... ./internal/cli/... ./internal/config/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "09",
+      "reason": "builds its CLI commands on the client, output and exit-code helpers of the CLI foundation"
+    },
+    {
+      "spec": "17",
+      "reason": "reads the workspace repositories the git server serves; a fork is read through the RefView interface, which shows the same hub-owned refs and tracking branches the git server advertises"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Resolve revisions against a bare repository",
+      "criteria": [
+        "REQ-2.1",
+        "REQ-2.2",
+        "REQ-2.3",
+        "REQ-2.4"
+      ],
+      "steps": [
+        "Add the revision behaviours to internal/gitrepo/read_test.go (against a repository made with `git init` in t.TempDir()) and to internal/scm/revision_test.go (through a small test route) and confirm they fail",
+        "In internal/gitrepo, add the read primitives this package builds on, each taking a context and running the `git` binary through the package's runner: resolve a full ref name to a commit id with annotated tags peeled, list refs by prefix with ids, resolve a full or abbreviated commit id reporting 'not found', 'ambiguous' and 'not a commit' as distinct errors, and read an object's type and size",
+        "Never pass a caller's string to git as an argument that git could read as an option or as a revision expression: validate it first and give ids and ref names only in the forms the primitives define",
+        "In internal/scm, add the revision resolver with this order: a string starting with `refs/` is a full ref name and nothing else; otherwise look for branch `refs/heads/<s>` and tag `refs/tags/<s>` in the workspace's ref view, where both existing is ambiguous and one existing wins; otherwise accept 4 to 40 hexadecimal characters as a commit id; anything else is not a revision",
+        "Take the list of refs from the interface RefView declared in internal/scm so that a fork's view can be supplied later; the default view is the repository's own refs. Packages 21 and 22 resolve every revision through this one resolver and never through git directly",
+        "Answer every failure of resolution (unknown, ambiguous, not a commit, not one of the accepted forms) as the API error `ref_not_found` with status 404, built with the specific-type constructor of internal/server",
+        "Resolve an absent optional `ref` to the head of the workspace's default branch, read from the workspace record",
+        "Return a resolved revision as a value holding the full 40-character commit id and whether the caller wrote it as a full id, which the caching task reads later",
+        "Serve a commit by full id whether or not any ref reaches it, as long as the object exists"
+      ],
+      "touches": [
+        "internal/gitrepo/read.go",
+        "internal/gitrepo/read_test.go",
+        "internal/scm/revision.go",
+        "internal/scm/revision_test.go"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Mount the read routes with access, state and accounting, and serve refs",
+      "criteria": [
+        "REQ-1",
+        "REQ-4"
+      ],
+      "steps": [
+        "Add the access, state, fork, recorder and refs behaviours to internal/scm/access_test.go, fork_test.go, recorder_test.go and refs_test.go and confirm they fail",
+        "Add the scm route group in internal/scm: a constructor that takes the workspace lookup, the repository opener, the ref view, the lookups and the request recorder, and a function that registers the ten `GET` routes under `/workspaces/{slug}/scm` on the router of internal/server, each declared with scope `git:read` and workspace need `read` so that the shared pipeline answers 401, 403 `insufficient_scope` and 404 `not_found` before the handler runs",
+        "Before any git command, apply the state precondition of package 10 in its read form: `ready` and `archived` pass, as does a fork whose parent is `archived`; exclusive maintenance of the workspace or of a fork's parent answers 409 `workspace_busy`; `failed` answers 409 `workspace_not_ready`",
+        "Wrap every route so that exactly one observation reaches the request recorder when the handler returns: the op of the route (`refs` for both refs routes, `commits` for both commits routes) and `ok` for a status below 400, `error` otherwise; define the recorder as an interface with a no-op default; emit no hub event from any read",
+        "Define the three lookup interfaces with their defaults: whether a branch of a workspace is protected (default: only its default branch; parleyd passes the protected-branch test of package 18, which uses the branch-glob matcher of package 11, so this package matches no glob itself), change of a source branch and change of a commit (default: none; package 22 supplies OpenChangeOfBranch and ChangeOfCommit), session of a commit (default: none)",
+        "Implement `GET …/scm/refs`: `prefix` defaults to `refs/heads/`; keep only refs under `refs/heads/`, `refs/tags/` and `refs/parley/`; order by name in byte order; page with the list helper of internal/server, whose `limit` and `cursor` rules apply unchanged",
+        "Build the ref object with exactly six members: name, kind by namespace, sha as the peeled commit id, protected (protected branch or any `refs/parley/` ref), tracking from the ref view, change from the lookup",
+        "Implement `GET …/scm/refs/{name...}`: a name that does not start with `refs/` is a branch name; a missing ref and a ref outside the three namespaces answer 404 `ref_not_found`",
+        "Make reads on a task fork go through RefView, which parleyd fills with the ref view of package 15 (internal/fork) where that package exists: tracking branches appear at the parent's current heads with `tracking` true and the fork's own branches with `tracking` false, the same names and heads package 17 advertises to a git client; revision resolution from the first task goes through the same view",
+        "Wire the route group into the server in cmd/parleyd with the real workspace lookup, repository opener and ref view and the default lookups and recorder"
+      ],
+      "touches": [
+        "internal/scm/handler.go",
+        "internal/scm/lookup.go",
+        "internal/scm/refs.go",
+        "internal/scm/access_test.go",
+        "internal/scm/fork_test.go",
+        "internal/scm/recorder_test.go",
+        "internal/scm/refs_test.go",
+        "cmd/parleyd/"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Serve commit history and single commits",
+      "criteria": [
+        "REQ-5"
+      ],
+      "steps": [
+        "Add the commit behaviours to internal/gitrepo/history_test.go and internal/scm/commits_test.go and confirm they fail",
+        "In internal/gitrepo, add the history read: commits reachable from a commit id, newest first, with the options first-parent, path, follow renames of one file, since and until on the committer time, author substring without regard to case, and an offset and count; and the read of one commit with its parents, tree, author, committer and full message",
+        "Add the per-commit numbers (files changed, insertions, deletions) against the first parent, and against the empty tree for a commit without a parent",
+        "Build the commit object in one place in internal/scm, used by every route that returns commits: full ids, `author` and `committer` as `{name, email, time}` with RFC 3339 UTC times, the full message, `change` and `session_id` from the lookups (null when unknown), and `stats` only where the caller asks for it",
+        "Implement `GET …/scm/commits`: `first_parent` defaults to true; return `resolved_sha` beside `items` and `next_cursor`; the cursor carries the resolved commit id and the position, so later pages read the same history when the ref has moved, and a cursor used with other query parameters is refused as the list convention says",
+        "Parse booleans strictly (`true` or `false`), `since` and `until` as RFC 3339 timestamps, and refuse `follow=true` without `path`; each failure is 400 `invalid_request`. A `path` no commit changed gives an empty list",
+        "Implement `GET …/scm/commits/{sha}`: the segment is any revision; always include `stats`; with `files=true` add the file changes against the first parent"
+      ],
+      "touches": [
+        "internal/gitrepo/history.go",
+        "internal/gitrepo/history_test.go",
+        "internal/scm/commits.go",
+        "internal/scm/commits_test.go",
+        "internal/scm/params.go"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Serve directory listings",
+      "criteria": [
+        "REQ-6.1",
+        "REQ-6.2",
+        "REQ-6.3"
+      ],
+      "steps": [
+        "Add the tree behaviours to internal/gitrepo/read_test.go and internal/scm/tree_test.go and confirm they fail",
+        "Add the repository-path check used by every read that takes a `path`: not empty where required, no leading `/`, no empty, `.` or `..` segment, nothing under `.git`; a failure is 400 `invalid_request`",
+        "In internal/gitrepo, add the tree read: the entries of a directory at a commit, optionally recursive with directories included, each with path, name, mode, object id, type and blob size; report 'path does not exist' and 'path is not a directory' as distinct errors",
+        "Map git's entries to the four types: mode 120000 is `symlink`, mode 160000 is `commit`, a tree is `tree`, every other blob is `blob`; give `size` only for type `blob`",
+        "Implement `GET …/scm/tree`: `path` defaults to the root; entries ordered by path in byte order; `resolved_sha` and the listed directory's `tree_sha` beside the list; `limit` defaults to 1,000 with bounds 1 to 10,000; the cursor pins the resolved commit",
+        "Answer a missing path with 404 `path_not_found` and a path that is a file with 400 `invalid_request`"
+      ],
+      "touches": [
+        "internal/gitrepo/read.go",
+        "internal/gitrepo/read_test.go",
+        "internal/scm/tree.go",
+        "internal/scm/tree_test.go",
+        "internal/scm/params.go"
+      ],
+      "depends_on": [
+        2
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Serve one file, raw and as JSON, from one resolved commit",
+      "criteria": [
+        "REQ-6.4",
+        "REQ-6.5",
+        "REQ-6.6",
+        "REQ-6.7",
+        "REQ-6.8",
+        "REQ-2.5"
+      ],
+      "steps": [
+        "Add the file behaviours to internal/scm/file_test.go and the concurrent-move behaviour to internal/scm/consistency_test.go and confirm they fail",
+        "In internal/gitrepo, add the blob read: look up a path at a commit and return its mode, blob id, type and size, then stream the blob's bytes",
+        "Implement the raw form of `GET …/scm/file`: check the size against the limit before reading content, then answer the bytes with `Content-Type: application/octet-stream`, `Content-Length`, `X-Parley-Blob-Sha`, `X-Parley-Resolved-Sha` and `X-Parley-File-Mode`; a symlink's content is its target",
+        "Honour a `Range` header that holds exactly one range: `a-b`, `a-` and `-n`, with an end past the file cut to the last byte, answered 206 with `Content-Range`; a start at or after the end is 416 with the new specific type `range_not_satisfiable` and `Content-Range: bytes */<size>`; several ranges are ignored and the whole file is answered",
+        "Implement the JSON form when `Accept` names `application/json`: `{path, sha, mode, size, encoding, content, resolved_sha}` with `utf8` for valid UTF-8 and `base64` otherwise; ignore `Range` in this form",
+        "Refuse a file larger than the configured limit with 413 `payload_too_large` and the member `size` in the envelope, in both forms and for ranged requests; a file of exactly the limit is served. Take the limit from a field of the route group that defaults to 32 MiB",
+        "Refuse a missing `path`, a directory, a submodule entry and an illegal path with 400 `invalid_request`, and a path that does not exist with 404 `path_not_found`; errors are the JSON envelope in both forms",
+        "Check, and where needed change, every route written so far so that each revision is resolved once at the start of the request and nothing later in the request reads a ref again; the concurrent-move test must pass for the file and the tree route"
+      ],
+      "touches": [
+        "internal/gitrepo/read.go",
+        "internal/gitrepo/read_test.go",
+        "internal/scm/file.go",
+        "internal/scm/file_test.go",
+        "internal/scm/consistency_test.go"
+      ],
+      "depends_on": [
+        4
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Serve the diff between two revisions",
+      "criteria": [
+        "REQ-7.1",
+        "REQ-7.2",
+        "REQ-7.3",
+        "REQ-7.4",
+        "REQ-7.5"
+      ],
+      "steps": [
+        "Add the diff behaviours to internal/gitrepo/difftree_test.go and internal/scm/diff_test.go and confirm they fail; build the 5,001-file and the 3 x 3 MiB fixtures with `git fast-import`",
+        "In internal/gitrepo, add: the merge base of two commits (none is a result, not an error); the file changes between two trees with rename and copy detection on, giving path, old path, status, blob ids, line counts and the binary flag; and the unified patch of the same comparison with a chosen number of context lines, readable file by file",
+        "Build the file change object in one place in internal/scm, used by the diff, compare and commit routes: the six statuses, `old_path` only for renames and copies, null ids on the missing side, zero counts for binary files",
+        "Implement `GET …/scm/diff` in JSON: left side is the merge base in `merge_base` mode (the empty tree when there is none) and `base` in `direct` mode; answer `base_sha`, `head_sha`, `merge_base_sha` (null when there is none), `files` ordered by path, `stats` over the whole filtered diff and `truncated`",
+        "Apply the `path` globs with the matching rules of PLAT-FR-057 (`*` within a segment, `**` across segments, whole path, case-sensitive); a file matches when any glob matches; filtered-out files count nowhere",
+        "Honour `patches=false` (no `patch` members), `context` (default 3, 0 to 20) and `format=patch` (`text/x-diff` body)",
+        "Cut the result: at most 5,000 files; add patch text file by file until the next patch would pass 8 MiB in total and leave later files without `patch`; set `truncated` when either cut happened; in the patch format end the text at a file boundary and set `X-Parley-Truncated: true`",
+        "Refuse a missing `base` or `head`, an unknown `mode` or `format`, a `context` outside 0 to 20 and a non-boolean `patches` with 400 `invalid_request`",
+        "Extend the commit route's `files=true` from the commits task to use the shared file change object if it does not already"
+      ],
+      "touches": [
+        "internal/gitrepo/difftree.go",
+        "internal/gitrepo/difftree_test.go",
+        "internal/scm/diff.go",
+        "internal/scm/diff_test.go",
+        "internal/scm/glob.go",
+        "internal/scm/commits.go"
+      ],
+      "depends_on": [
+        3
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Compare two revisions with a trial rebase",
+      "criteria": [
+        "REQ-7.5",
+        "REQ-7.6",
+        "REQ-7.7",
+        "REQ-7.8"
+      ],
+      "steps": [
+        "Add the compare behaviours to internal/gitrepo/trial_test.go and internal/scm/compare_test.go and confirm they fail, with one fixture branch per conflict kind",
+        "In internal/gitrepo, add the ahead and behind counts of two commits and the list of commits in one and not in the other, oldest first, with a cap",
+        "In internal/gitrepo, add the trial rebase: replay the commits of head that are not in base, oldest first, on top of base, entirely in the object store with no work tree, no index of the repository and no ref update (git 2.38's `merge-tree --write-tree` with an explicit merge base does one step); stop at the first commit that does not apply",
+        "Declare the one conflict report type of the hub, ConflictReport, in internal/gitrepo/conflictreport.go: target_sha, head_sha, base_sha, commit_sha, files (each path, kind, base, ours, theirs as {sha, mode, path} or null, and landed_by), landed_changes and change, encoded with every member present. Return from the trial either 'clean' or a ConflictReport with the commit that did not apply and, per conflicted path, the kind (`content`, `add_add`, `modify_delete`, `delete_modify`, and `rename`, `mode`, `binary`, `submodule` where git reports them) and the three sides, null where the file does not exist on that side",
+        "Report a merge commit among the commits to replay as a distinct error before replaying anything",
+        "Implement `GET …/scm/compare`: both revisions required (400 `invalid_request` otherwise); answer the ids, `merge_base_sha`, `ahead`, `behind`, up to 200 commit objects without stats, up to 5,000 file changes from the merge base to head without patch text, `mergeable` and `conflict`",
+        "Answer the trial's ConflictReport with `target_sha` = base, `head_sha`, `base_sha` = merge base, `commit_sha`, `files` with `landed_by: []`, `landed_changes: []` and `change: null`; packages 21, 23 and 24 return this same type from the rebase, the mergeability check and the restack, and package 26 fills the three members left empty here by extending this type, not by declaring another",
+        "Answer a merge commit in the range with 400 and the specific type `merge_commits_unsupported`; a head contained in base is `clean` with empty lists",
+        "Assert in the tests that the output of `git for-each-ref` is identical before and after every compare"
+      ],
+      "touches": [
+        "internal/gitrepo/trial.go",
+        "internal/gitrepo/trial_test.go",
+        "internal/gitrepo/history.go",
+        "internal/scm/compare.go",
+        "internal/scm/compare_test.go",
+        "internal/gitrepo/conflictreport.go"
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Serve blame as ranges",
+      "criteria": [
+        "REQ-8"
+      ],
+      "steps": [
+        "Add the blame behaviours to internal/gitrepo/blame_test.go and internal/scm/blame_test.go and confirm they fail",
+        "In internal/gitrepo, add the blame read of one file at a commit, optionally limited to a line span, following renames, returning per line group the commit id, the original path and the original first line",
+        "Before blaming, look the path up: missing is 404 `path_not_found`; a directory or submodule entry is 400 `invalid_request`; a blob over 2,097,152 bytes is 413 `payload_too_large`; a blob git treats as binary (a NUL byte in its first 8,000 bytes) is 400 `invalid_request`",
+        "Validate the span: integers; `start_line` at least 1, at most `end_line` and at most the last line, else 400 `invalid_request`; cut an `end_line` past the last line to it; defaults are the first and the last line",
+        "Merge adjacent lines into one range when they come from the same commit and their original lines are adjacent; return ranges in line order; an empty file gives no ranges",
+        "Fill each range's `commit` with the shared commit object without `stats`, reading each distinct commit once per request",
+        "Implement `GET …/scm/blame` answering `{resolved_sha, path, ranges}`"
+      ],
+      "touches": [
+        "internal/gitrepo/blame.go",
+        "internal/gitrepo/blame_test.go",
+        "internal/scm/blame.go",
+        "internal/scm/blame_test.go"
+      ],
+      "depends_on": [
+        3
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Search file contents at a ref",
+      "criteria": [
+        "REQ-9"
+      ],
+      "steps": [
+        "Add the search behaviours to internal/gitrepo/grep_test.go and internal/scm/search_test.go and confirm they fail",
+        "In internal/gitrepo, add the content search of a commit's tree: a pattern taken as a fixed string or as an extended regular expression, with or without regard to case, binary files skipped, results as path, line number and line text in path-then-line order; give the pattern to git so that it cannot be read as an option",
+        "Validate before searching: `q` present with 1 to 500 characters; `regex` and `case_sensitive` strictly boolean; with `regex=true` a pattern that is not a valid extended regular expression is 400 `invalid_request` (detect it from git's own refusal or by a check that accepts the same syntax)",
+        "Apply the `path` globs with the same matcher as the diff route",
+        "Cut each match's text to its first 500 characters, counting characters and not bytes, so that no multi-byte character is split",
+        "Implement `GET …/scm/search` as a paged list with `resolved_sha`: `limit` defaults to 50 with bounds 1 to 200; the cursor pins the resolved commit and the position after the last match returned"
+      ],
+      "touches": [
+        "internal/gitrepo/grep.go",
+        "internal/gitrepo/grep_test.go",
+        "internal/scm/search.go",
+        "internal/scm/search_test.go",
+        "internal/scm/glob.go"
+      ],
+      "depends_on": [
+        6
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Answer reads with caching headers and conditional requests",
+      "criteria": [
+        "REQ-3.1",
+        "REQ-3.2",
+        "REQ-3.3"
+      ],
+      "steps": [
+        "Add the caching behaviours to internal/scm/cache_test.go as tables over all ten routes and confirm they fail",
+        "Compute an `ETag` for every successful read as a quoted digest of: the resolved commit ids of the request, the route, the query string, and the representation (raw or JSON on the file route, JSON or patch on the diff route); for the two refs routes use the names and commit ids of the refs in the response instead of resolved ids",
+        "Set `Cache-Control: private, max-age=31536000, immutable` when the route has revision parameters and the caller wrote every one of them as a 40-character commit id; an omitted optional `ref` is not a full id; the refs routes are never immutable",
+        "Set `Cache-Control: private, no-cache` on every other successful read, replacing the `no-store` default of the shared header middleware for these routes only",
+        "Add `Vary: Accept` on the file route",
+        "Answer 304 with no body and the same `ETag` and `Cache-Control` when `If-None-Match` contains the tag, alone or in a comma-separated list; decide this after resolution and before the expensive part of the read, so that a matching request runs no diff, blame or search",
+        "Leave error responses without `ETag` and with the shared default `Cache-Control`"
+      ],
+      "touches": [
+        "internal/scm/cache.go",
+        "internal/scm/cache_test.go",
+        "internal/scm/handler.go"
+      ],
+      "depends_on": [
+        3,
+        5,
+        6,
+        7,
+        8,
+        9
+      ]
+    },
+    {
+      "id": 11,
+      "title": "Bound every read by the configured timeout and file size",
+      "criteria": [
+        "REQ-3.4",
+        "REQ-3.5",
+        "REQ-3.6"
+      ],
+      "steps": [
+        "Add the timeout behaviours to internal/scm/timeout_test.go and internal/gitrepo/read_test.go, and the configuration behaviours to internal/config/scm_test.go, and confirm they fail",
+        "Add the `[scm]` section to the configuration of internal/config with the keys `read_timeout` (duration, default 30s) and `max_file_size` (size, default 32MB = 33,554,432 bytes), parsed with the duration and size parsers that package already has; leave room for package 21's `max_commit_size` without defining it",
+        "Refuse a value of zero or below for either key when the configuration is loaded, with an error that names the key, so that `parleyd` stops before it listens",
+        "Give every read request a deadline of the read timeout, starting when the route group begins handling it, and pass that context to every git command of the request",
+        "Make the git runner end the subprocess when its context is done and wait for it to exit, so that no process outlives the request",
+        "Map a deadline that passed to 503 with the specific type `scm_timeout` on every read route, also when it passes while a response body is being prepared; a response whose body has already begun is cut off instead",
+        "Pass the configured `max_file_size` to the file route and the configured timeout to the route group in cmd/parleyd"
+      ],
+      "touches": [
+        "internal/config/scm.go",
+        "internal/config/scm_test.go",
+        "internal/scm/handler.go",
+        "internal/scm/timeout_test.go",
+        "internal/scm/file_test.go",
+        "internal/gitrepo/read.go",
+        "internal/gitrepo/read_test.go",
+        "cmd/parleyd/"
+      ]
+    },
+    {
+      "id": 12,
+      "title": "Add the read commands of `parley scm`",
+      "criteria": [
+        "REQ-10"
+      ],
+      "steps": [
+        "Add the command behaviours to internal/cli/scm_test.go as tables that run the root command against an httptest server recording each request, and confirm they fail",
+        "Add the command group `scm` to the CLI root with the nine subcommands `refs`, `log`, `show`, `ls`, `cat`, `diff`, `compare`, `blame` and `search`, their positional arguments and exactly the flags of §6.6; a wrong argument count or flag value is a usage error through the CLI foundation, before any request",
+        "Build each request with the HTTP client of the CLI foundation: the slug and, for `show`, the revision are percent-encoded as one path segment; a flag that was not given sends no query parameter; boolean flags send `true`; repeatable `--path` flags send one `path` value each; `--ignore-case` sends `case_sensitive=false`; `--lines <start>:<end>` sends `start_line` and `end_line`",
+        "Print the response body as the foundation prints every JSON result for `refs`, `log`, `show`, `ls`, `blame`, `search`, `compare` and `diff` without `--patch`; `ls` and `search` print the page the hub answered and do not follow `next_cursor`",
+        "`cat`: request the raw form; on success write the bytes unchanged to stdout, or with `--output` to that file, creating or replacing it only after the hub answered 200; on a hub error write nothing and leave an existing file as it was; a file that cannot be written is a `client_error`",
+        "`diff`: `--patch` sends `format=patch` and prints the text as received; `--name-only` sends `patches=false`; both together and a `--mode` other than `merge_base` or `direct` are usage errors",
+        "`compare --fail-on-conflict`: print the response, then when `mergeable` is `conflict` report `condition_not_met` through the foundation and exit 3",
+        "Register the group in cmd/parley so that `parley scm` without a subcommand prints help and exits 0"
+      ],
+      "touches": [
+        "internal/cli/scm.go",
+        "internal/cli/scm_test.go",
+        "cmd/parley/"
+      ],
+      "depends_on": [
+        3,
+        5,
+        6,
+        7,
+        8,
+        9
+      ]
+    }
+  ]
+}

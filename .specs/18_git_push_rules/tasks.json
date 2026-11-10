@@ -1,0 +1,288 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "18",
+  "spec_name": "git_push_rules",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/gitserver/... ./internal/gitrepo/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "11",
+      "reason": "uses its single branch-glob matcher in internal/workspace/branchglob.go to decide which branches protected_branches protects"
+    },
+    {
+      "spec": "12",
+      "reason": "uses IsAncestor of internal/gitrepo for the ancestry questions of the rules, and the ErrRefMoved of its CompareAndSwapRef as the mismatch error of the several-ref transaction, instead of declaring either again"
+    },
+    {
+      "spec": "17",
+      "reason": "implements the PushProcessor interface that package declares for the git-receive-pack hand-off, starts from the caller and workspace facts it hands over, and returns the result its request counter counts"
+    },
+    {
+      "spec": "52",
+      "reason": "emits its hub events through the event log component"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Build the rule engine with the rules for hub-owned refs, the default branch and tracking branches",
+      "criteria": [
+        "REQ-1.2",
+        "REQ-1.4",
+        "REQ-2"
+      ],
+      "steps": [
+        "Add the behaviours of this task to engine_test.go and rules_test.go as table-driven tests over a bare repository made with git init in t.TempDir(), and confirm they fail",
+        "Define the engine's input: the workspace facts (slug, kind, parent, default branch, mode, effective protected_branches and protect.owner_push, read through a settings reader that can fail), the caller facts (level admin, owner or member; credential kind admin_token, api_key or pat; the credential id and the user id; bound or not; paths or none), the ordered ref updates {ref, before, after}, an opens-change flag per update, and a repository view that answers is-ancestor with IsAncestor of internal/gitrepo (package 12; declare no second ancestry test, and give the call the quarantine's object directory when the view has one) and can read objects held in a quarantine",
+        "Define the output: one decision per update in request order, allowed with created, deleted, forced and direct, or refused with message, error_type and optional path; and a verdict that reports whether any update is refused",
+        "Compute created from an all-zero before, deleted from an all-zero after, and forced as neither create nor delete with before not an ancestor of after",
+        "Evaluate the rules as an ordered list in which the first refusal decides, with empty slots for rules 2, 4 and 5 that later tasks fill; an update no rule refuses is allowed in every namespace outside refs/parley/",
+        "Rule 1: refuse create, update and delete of any ref under refs/parley/ for every caller, with the message of the PRD and error_type hub_owned_ref; refs/parleyx/ and refs/heads/parley/ are not hub-owned",
+        "Rule 2a: refuse the delete of refs/heads/<default branch> with '<branch> is the default branch and cannot be deleted' and error_type default_branch",
+        "Rule 3: on a workspace of kind fork, ask the tracking-branch lookup interface for the branch and refuse create, update and delete with the tracking message and error_type tracking_branch; do not call the lookup on a repository workspace; the default lookup reports no tracking branches",
+        "Keep evaluation free of effects: it writes no ref, calls no event writer and invokes no forward"
+      ],
+      "touches": [
+        "internal/gitserver/pushrule/engine.go",
+        "internal/gitserver/pushrule/rules.go",
+        "internal/gitserver/pushrule/engine_test.go",
+        "internal/gitserver/pushrule/rules_test.go"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Refuse writes to protected branches and grant the owner exemption",
+      "criteria": [
+        "REQ-3.1",
+        "REQ-3.2",
+        "REQ-3.3",
+        "REQ-3.4",
+        "REQ-3.5"
+      ],
+      "steps": [
+        "Add the protected-branch table and the caller-by-update table to protected_test.go and confirm they fail",
+        "Decide whether a branch is protected by calling the branch-glob matcher of package 11 in internal/workspace/branchglob.go with the branch name without refs/heads/ and each glob of protected_branches; write no matcher in this package; an empty list protects nothing; export this protected-branch test for packages 20, 21 and 25",
+        "Apply rule 2 to refs/heads/* only, in the engine's second slot",
+        "Refuse a forced update and a delete of a protected branch for every caller with '<branch> is protected and cannot be force-pushed or deleted'",
+        "Refuse a create of a branch that a glob matches for every caller with '<branch> is protected; push another branch and open a change (git push -o parley.change)'",
+        "For a fast-forward of an existing protected branch, pass rule 2 and set direct true only when protect.owner_push is true, the level is owner or admin, and the credential is an API key, the admin token or a PAT that is not bound and has no paths; otherwise refuse with the same message as a create",
+        "Leave rules 1, 2a, 3 and the later slots in force for an exempt update, and report direct false for every update that is not an exempt fast-forward of a protected branch"
+      ],
+      "touches": [
+        "internal/gitserver/pushrule/protected.go",
+        "internal/gitserver/pushrule/protected_test.go",
+        "internal/gitserver/pushrule/engine.go"
+      ],
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Hand rule 4 to a registered carry-patch controller",
+      "criteria": [
+        "REQ-4.1"
+      ],
+      "steps": [
+        "Add the controller table to carrypatch_test.go with a recording stub and confirm it fails",
+        "Define the controller interface package 37 will implement: given the workspace facts, the caller facts and one ref update it answers allow, refuse with a message and error_type integration_branch or patch_branch, or allow-after-forward with a forward function that takes a context and returns a refusal message on failure",
+        "Let the wiring in internal/hub register at most one controller on the engine; registration is optional",
+        "In the engine's fourth slot ask the controller once for every update that passed rules 1 to 3 on a workspace whose mode is carry_patch, and never on a workspace in mode standard",
+        "Carry a pending forward on the allowed decision so that the ref writer can run it later; evaluation itself does not invoke it"
+      ],
+      "touches": [
+        "internal/gitserver/pushrule/carrypatch.go",
+        "internal/gitserver/pushrule/carrypatch_test.go",
+        "internal/gitserver/pushrule/engine.go"
+      ],
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Check the paths of a path-scoped token and close the rule order",
+      "criteria": [
+        "REQ-5",
+        "REQ-1.1",
+        "REQ-1.3",
+        "REQ-3.6",
+        "REQ-4.2"
+      ],
+      "steps": [
+        "Add the push table and the lookup cases to paths_test.go, and the two-rule table and the fault table to engine_test.go, and confirm they fail",
+        "Add to internal/gitrepo the question 'which commits are reachable from these ids and from no ref of this repository nor of a given parent repository', answered oldest first with a parent before its children, and the question 'which paths does this commit change against its first parent', with the whole tree for a root commit and both paths for a rename, both able to read objects in a quarantine",
+        "Run rule 5 after every update of the request has passed rules 1 to 4 and only when the credential is a PAT with paths; for any other credential ask the repository nothing",
+        "Resolve an annotated tag to its commit and treat tags, notes and other refs like branches; skip deletes",
+        "Match every changed path against the token's globs with the matcher of package 06; on the first path that matches none, in commit order and then byte order of paths, refuse the first update in command order whose after value reaches that commit, with 'path <path> is outside this token's allowed paths', error_type path_not_allowed and the path",
+        "For an update that adds no new commit, ask the version-files lookup interface with the slug, the branch, the after value and the opens-change flag, and with no target branch (for an update that opens a change the lookup of package 29 takes the target that package 22's open defaults to); when it reports files, check them in byte order the same way; when it reports no version, allow; the default lookup reports no version",
+        "Turn every failure of a collaborator during evaluation (settings reader, is-ancestor, tracking lookup, controller, new-commits and changed-files questions, version-files lookup) and a carry_patch workspace with no controller into a refusal with 'internal error; try again' and error_type internal, never into an allowed decision and never into a Go error from Evaluate",
+        "Confirm with the two-rule table that the order is rule 1, 2, 2a, 3, 4, 5 and that an exempt direct push is still refused by rules 3 and 4"
+      ],
+      "touches": [
+        "internal/gitserver/pushrule/paths.go",
+        "internal/gitserver/pushrule/paths_test.go",
+        "internal/gitserver/pushrule/engine.go",
+        "internal/gitserver/pushrule/engine_test.go",
+        "internal/gitrepo/newcommits.go",
+        "internal/gitrepo/newcommits_test.go"
+      ],
+      "depends_on": [
+        2,
+        3
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Write all refs of a request in one compare-and-swap transaction with its ref-updated stages",
+      "criteria": [
+        "REQ-7.1",
+        "REQ-7.4",
+        "REQ-7.5",
+        "REQ-7.6",
+        "REQ-7.7"
+      ],
+      "steps": [
+        "Add the mismatch table, the stage behaviours and the fork activity table to apply_test.go and a transaction test to internal/gitrepo/reftx_test.go and confirm they fail",
+        "Add to internal/gitrepo a ref transaction over a list of {ref, expected old value, new value}, run as one git update-ref --stdin transaction in two phases: prepare verifies every expected value and reports which ref failed it with the ErrRefMoved that package 12 declares for CompareAndSwapRef, the single-ref writer this transaction does not replace or redeclare (a moved ref, a create of an existing ref, an update or delete of a missing ref, or a ref another transaction holds at that moment), commit then applies all; an abort applies none; it can read new objects from a quarantine",
+        "Let Apply take an optional hook that runs between prepare and commit, so that the push processor can move quarantined objects into the repository only once the transaction is certain to commit",
+        "Add the ref writer entry point Apply, the one writer the git server, package 21 and package 25 call: it takes a verdict, the repository, the workspace and caller facts, an optional session id, via and a version kind (push, commit, ref, rebase or none), and returns per-update results, each with the version {workspace_slug, number, version} a ref-updated stage reported for it or none; export AllowedVerdict(updates), which builds a verdict that allows every update (created, deleted and forced computed, direct false) without Evaluate, and accept it in Apply with via land, so that package 25 moves a protected target without the rule engine being asked",
+        "Add RegisterRefUpdatedStage: a stage receives a store transaction, the workspace facts, the caller facts, the session id, via, the version kind and the accepted updates with their flags, and returns per-update versions or an error; package 22 registers the stage that records versions and package 23 the one that notes target moves",
+        "Build the commit step of Apply: prepare the ref transaction, run the optional hook, begin one store transaction, run the stages in registration order, commit the ref transaction, then commit the store transaction; when a stage fails abort the ref transaction, roll back, refuse every update with 'internal error; try again' and return the stage's error; when only the store commit fails after the refs moved, log it and report the request accepted (the start-up reconciliation of package 23 records the missed version)",
+        "When the verdict has a refused update, write nothing and give every other update the message 'not updated: another ref in this push was refused'",
+        "When the transaction reports a mismatch, return outcome ref_moved with 'ref changed since it was read; fetch and try again' on the mismatching update and the not-updated message on the others",
+        "Take no lock that spans a request: two Apply calls on one repository are ordered only by the transaction",
+        "After a successful transaction on a repository workspace whose default branch moved, call the head_sha setter interface with the slug and the new id; do not call it for a fork",
+        "Declare the interface ForkActivity (one operation: record activity for a fork slug) with a registration function that package 16 calls from internal/hub/fork.go; after a successful transaction with via git or api on a task fork call it once with the fork's slug, log an error and go on"
+      ],
+      "touches": [
+        "internal/gitserver/pushrule/apply.go",
+        "internal/gitserver/pushrule/apply_test.go",
+        "internal/gitrepo/reftx.go",
+        "internal/gitrepo/reftx_test.go"
+      ],
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Run forwards to origin last and refuse the push when one fails",
+      "criteria": [
+        "REQ-4.3",
+        "REQ-4.4",
+        "REQ-4.5"
+      ],
+      "steps": [
+        "Add the forward-order, forward-failure and forward-timeout behaviours to apply_test.go and confirm they fail",
+        "In Apply, when no update is refused, invoke the pending forwards in command order before the ref transaction, each with a context that ends after 120 seconds; make the limit settable by a test option",
+        "On the first forward that returns a refusal message, stop: refuse that update with the message and error_type patch_branch, give the others the not-updated message, write no ref, run no later forward and do nothing about forwards already done",
+        "When the limit passes, cancel the forward's context and refuse with 'origin rejected push: timed out' and error_type patch_branch",
+        "Invoke no forward when the verdict already has a refused update"
+      ],
+      "touches": [
+        "internal/gitserver/pushrule/apply.go",
+        "internal/gitserver/pushrule/apply_test.go"
+      ],
+      "depends_on": [
+        3,
+        5
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Process a push behind git-receive-pack",
+      "criteria": [
+        "REQ-6",
+        "REQ-7.2",
+        "REQ-7.3"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/gitserver/receive_test.go with a pkt-line request builder and a report parser as test helpers, and confirm they fail",
+        "Add to internal/gitrepo a quarantine: a temporary object directory beside the repository into which git index-pack writes the pack with the repository's objects as alternates, a repository view over both, a migrate step that moves the objects into the repository, and a discard step that removes the directory; verify that every command's after value resolves to an object",
+        "Parse the request: the command list with the client's capabilities (report-status, side-band-64k, delete-refs, atomic, push-options), then the push options when announced, then the pack; a gzip request body is read through its decoder; a request with no commands is answered 200 with an empty body and nothing else runs",
+        "Run the stages in order: options stage, pack into quarantine (skipped for a request of deletes only), Evaluate over the quarantine view, Apply (forwards, prepare the ref transaction, migrate the quarantine, commit, head_sha), mapping stage, answer; define the options stage and the mapping stage as interfaces package 19 registers, with defaults that accept every option and add no line; pass Apply via git and version kind push",
+        "Let the options stage refuse the push with a message M before any pack byte is stored: read the rest of the body and discard it, report 'unpack ok' and 'ng <ref> M' for every ref, send the one side-band line 'error: M', write nothing; let the stage set the session id that Apply receives",
+        "Write the status report: 'unpack ok' and 'ok <ref>' per command for an accepted push; for a refused push 'unpack ok', 'ng <ref> <message>' per ref and a side-band line 'error: <ref>: <message>' per refused ref (not for the not-updated refs); always HTTP 200 with Content-Type application/x-git-receive-pack-result",
+        "On a pack that git index-pack rejects, an empty body where a pack is due, or an after value that names no object, report 'unpack invalid pack' and 'ng <ref> unpacker error' per command",
+        "Discard the quarantine on every outcome except an accepted push, so that a refused push's objects are never readable in the repository and no directory is left behind",
+        "Send the lines the mapping stage returns on the side band, after the refs are written; pass it the accepted updates with their direct flags and the version each ref-updated stage reported",
+        "Send only what the client asked for: no report without report-status, no side-band framing and no 'error:' lines without side-band-64k",
+        "Call no post-push listener from the processor: the event step of the ref writer calls them for every surface (task 8); run that step after the mapping stage and do not wait for the listeners before the response is written",
+        "Implement the interface PushProcessor that package 17 declares in internal/gitserver/push.go with this processor: take the caller facts and the workspace record it hands over, turn them into the engine's workspace and caller facts, write the whole response and return ok, refused or error; pass the processor to the handler of package 17 and wire the engine, the ref writer and their collaborators in internal/hub/gitserver.go"
+      ],
+      "touches": [
+        "internal/gitserver/receive.go",
+        "internal/gitserver/report.go",
+        "internal/gitserver/receive_test.go",
+        "internal/gitrepo/quarantine.go",
+        "internal/gitrepo/quarantine_test.go",
+        "internal/gitserver/push_integration_test.go",
+        "internal/hub/gitserver.go"
+      ],
+      "depends_on": [
+        4,
+        6
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Record every accepted ref update as a parley.git.push event",
+      "criteria": [
+        "REQ-8",
+        "REQ-4.6"
+      ],
+      "steps": [
+        "Add the behaviours of this task to internal/gitserver/push_event_test.go, internal/gitserver/pushrule/event_test.go and journal_test.go and confirm they fail",
+        "Register a store migration for the journal: one entry per request with the workspace slug, the ordered ref updates with their flags, actor type and actor id, credential id, session id and via",
+        "In Apply, accept only via 'git', 'api' or 'land' and return an error before any effect for another value",
+        "Write the journal entry in its own transaction after the forwards and before the ref transaction; remove it when the ref transaction refuses",
+        "Give the ref writer a second step that the caller runs after the ref transaction, so that the push processor can run the mapping stage in between; in that step write one parley.git.push event per update in command order through the event component, with the fields of the PRD (before null for a create, after null for a delete, created, deleted, forced, direct, via, session id or null, actor_type after the credential, the request's workspace slug), and delete the journal entry, all in one store transaction",
+        "When that transaction fails, log it, keep the journal entry and still return the request as accepted",
+        "Add RegisterPostPushListener and end the event step, whether or not its transaction succeeded, by calling every registered listener on its own goroutine with the slug, the accepted updates in command order, via and the session id (or none), recovering a panic and ignoring an error; do this for via git, api and land alike, so that package 21 and package 25 send no notification of their own, and call none for a refused request",
+        "Add Reconcile: for every journal entry, compare each ref with its after value (absent for a delete); when they agree write the entry's events and remove it in one transaction; when the refs still hold their before values remove the entry without events; running it on an empty journal does nothing",
+        "Register Reconcile in internal/hub/gitserver.go as a start hook of package 03, so that it completes before the listener accepts requests",
+        "Write no event for a refused push, a pack failure or a request with no commands"
+      ],
+      "touches": [
+        "internal/gitserver/pushrule/event.go",
+        "internal/gitserver/pushrule/journal.go",
+        "internal/gitserver/pushrule/apply.go",
+        "internal/gitserver/pushrule/event_test.go",
+        "internal/gitserver/pushrule/journal_test.go",
+        "internal/gitserver/push_event_test.go",
+        "internal/hub/gitserver.go"
+      ],
+      "depends_on": [
+        7
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Bound a push by size and time and count how it ends",
+      "criteria": [
+        "REQ-9"
+      ],
+      "steps": [
+        "Add the size table, the two timeout cases and the counter table to internal/gitserver/limits_test.go and confirm they fail",
+        "Register [git].max_push_size (a size, default 0, unlimited) with the configuration loader and read [git].timeout (default 30m), the key package 17 registers; do not apply [server].max_body_size on the git route",
+        "Count the pack bytes while feeding git index-pack; one byte over the limit stops the read, discards the quarantine and reports 'unpack pack exceeds the maximum push size' with 'ng <ref> unpacker error' per command; a pack of exactly the limit passes",
+        "Run every stage before the ref transaction under a context that ends at [git].timeout; when it ends, kill the git subprocesses of the push, discard the quarantine, report 'unpack push timed out' when the client can still be answered, and change nothing; once the ref transaction has started, finish the push",
+        "Return the result of each handled request to the handler of package 17: ok for an accepted push and a no-op; refused for a rule refusal, an options-stage refusal and a compare-and-swap refusal; error for a pack failure, a timeout and any update refused with error_type internal",
+        "Increment no counter in the processor: package 17 owns parley_git_requests_total and counts the request once, with service receive-pack, from the returned result"
+      ],
+      "touches": [
+        "internal/gitserver/receive.go",
+        "internal/gitserver/limits_test.go",
+        "internal/config"
+      ],
+      "depends_on": [
+        7
+      ]
+    }
+  ]
+}

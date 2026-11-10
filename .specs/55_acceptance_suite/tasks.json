@@ -1,0 +1,371 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "55",
+  "spec_name": "acceptance_suite",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./test/acceptance/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "09",
+      "reason": "the suite drives the parley CLI"
+    },
+    {
+      "spec": "11",
+      "reason": "scenarios read workspaces through GET /workspaces/:slug"
+    },
+    {
+      "spec": "15",
+      "reason": "the fork-create call with its token, the first step of the agent's journey and of every fork scenario"
+    },
+    {
+      "spec": "21",
+      "reason": "commit creation and ref moves without a clone, used by the source control scenarios and to prepare changes"
+    },
+    {
+      "spec": "25",
+      "reason": "the land route and the land attempt that the landing, conflict, policy, automatic-landing and revert scenarios drive"
+    },
+    {
+      "spec": "30",
+      "reason": "activity, overlaps and claims, proved by the awareness scenarios and used as the event source of the event scenarios"
+    },
+    {
+      "spec": "52",
+      "reason": "the event log and stream through which every scenario observes what the hub did"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Build the harness and prove the hub runs from one binary, one file and one directory",
+      "criteria": [
+        "REQ-9.4",
+        "REQ-9.8"
+      ],
+      "steps": [
+        "Add TestHarness_HubRunsFromOneBinaryConfigAndDataDir and TestHarness_GatedScenariosSkipWithAStatedReason to test/acceptance/harness_test.go, plus one placeholder gated test per prefix (TestSandbox_, TestLong_, TestLargeRepo_, TestPerformance_) that only calls the gate, and confirm they fail",
+        "Create the package test/acceptance/harness. It may import the standard library and internal/gitrepo/gitrepotest and no other package of this module; it never opens a file under the hub's data directory",
+        "Build ./cmd/parleyd and ./cmd/parley once per test run into a temporary directory (guarded so parallel scenarios share the build) and expose the two paths",
+        "Start a hub: create a configuration directory and a data directory under t.TempDir(); reserve a free loopback port; write config.toml with [server] bind 127.0.0.1, that port and external_url, the [[oauth.providers]] entry for the fake identity provider, and the extra TOML a scenario passes; run parleyd --admin-email once and read the admin_token file; start parleyd with XDG_CONFIG_HOME, XDG_DATA_HOME, PARLEY_SECRETS_KEY, the origin's GIT_SSL_CAINFO, an empty HOME and an empty working directory; wait for the listening line on stderr and for GET /readyz to answer 200, failing the scenario with the hub's stderr after 30 seconds",
+        "Give the hub handle Stop (SIGTERM, wait for exit status 0), Kill (SIGKILL), Start (again on the same directories and port) and StartOn (another data directory, another port); register a cleanup that stops the hub and attaches its stderr to a failed scenario",
+        "Add the fake identity provider: an httptest server answering the token URL and the user-info URL for codes the harness issues, and hub.User(name), which sends POST /api/v1/auth/callback with such a code and returns the user with its API key; add helpers that create an organization and its members with the admin token and mint PATs (unbound, workspace-bound, path-scoped) through the token routes",
+        "Add hub.Origin (a seeded origin from internal/gitrepo/gitrepotest, read-only or accepting pushes, with helpers to add a commit and read a head) and hub.Workspace(owner, name), which registers the origin through the API and waits until the workspace is ready",
+        "Add the runners: CLI(credential, args...) runs the built parley with PARLEY_ENDPOINT_URL, PARLEY_API_KEY and a private PARLEY_CONFIG_DIR and returns exit status, stdout and stderr; Git(dir, auth, args...) runs stock git with an empty HOME, GIT_CONFIG_NOSYSTEM=1, GIT_TERMINAL_PROMPT=0 and either the credential in the remote URL or credential.helper set to the built parley's credential-helper; a JSON HTTP client that returns status, headers and decoded body and never retries",
+        "Add the observers: an event-stream reader for GET /api/v1/events that records every frame with its seq and offers Next(n, timeout), MaxSeq and Close; a webhook receiver on a loopback port that records each request with headers, exact body and arrival time, answers with a status the scenario sets, and verifies Parley-Signature; a fake forge API serving a repository and its issues",
+        "Add the gates: Require(t, gate) for Gateway, Long, LargeRepo and ReferenceHost calls t.Skip with a reason naming the gate's environment variable when it is unset, before any hub is started; a set gateway variable never skips, so a broken gateway fails the scenario",
+        "Make the two harness scenarios pass: the one-binary scenario runs the fork-push-land journey once and then inspects the working directory, the home, the configuration directory and the hub's child processes; the gate scenario runs go test on the gated prefixes in a child process with the four variables removed and reads its verbose output"
+      ],
+      "touches": [
+        "test/acceptance/harness/hub.go",
+        "test/acceptance/harness/identity.go",
+        "test/acceptance/harness/origin.go",
+        "test/acceptance/harness/run.go",
+        "test/acceptance/harness/events.go",
+        "test/acceptance/harness/receiver.go",
+        "test/acceptance/harness/forge.go",
+        "test/acceptance/harness/gate.go",
+        "test/acceptance/harness_test.go",
+        "test/acceptance/sandbox_test.go",
+        "test/acceptance/forks_test.go",
+        "test/acceptance/events_test.go",
+        "test/acceptance/performance_test.go"
+      ],
+      "done_when": [
+        "`go test ./test/acceptance/ -run '^TestHarness_' -count=1` passes with none of the PARLEY_ACCEPTANCE_ variables set",
+        "`go list -deps ./test/acceptance/...` names no package under internal/ other than internal/gitrepo/gitrepotest and what that package imports"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Prove changes, versions and stacks",
+      "criteria": [
+        "REQ-1"
+      ],
+      "steps": [
+        "Add the five change scenarios to test/acceptance/changes_test.go and the three stack scenarios to test/acceptance/stacks_test.go, each starting its own hub through the harness and marked parallel, and confirm they fail",
+        "Five pushes: push one branch with -o parley.change, then three more commits and one forced push of an amended commit; read the change and its versions over the REST API after each push",
+        "Version refs: fetch refs/parley/changes/<number>/<1..5> into a fresh clone and compare FETCH_HEAD with each version's head_sha",
+        "Interdiff: rebase the branch onto a moved main with no other edit, force-push, and read the diff with against set to the previous version; then change content and show the interdiff is no longer empty",
+        "Landed commit: open a session with the CLI, push with -o parley.session, land, and resolve the landed commit through by-commit, the commit read and parley change find",
+        "Direct push: fast-forward main with the owner's API key and show the commit has change null and one parley.git.push event with direct true",
+        "Stacks: push branches a, b and c in one push; amend a and wait, by polling reads only, for restack versions on b and c; land the bottom and wait for the next change's depends_on to clear",
+        "Conflicting restack: make the lower change's new version collide with the dependant's edit and show needs_restack, the conflict report, and an unmoved branch and version number",
+        "Use a single polling helper with a 30-second limit for everything the hub does in the background; a scenario never sleeps a fixed time to wait for the hub"
+      ],
+      "touches": [
+        "test/acceptance/changes_test.go",
+        "test/acceptance/stacks_test.go",
+        "test/acceptance/harness/"
+      ],
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Prove task forks",
+      "criteria": [
+        "REQ-2"
+      ],
+      "steps": [
+        "Add the seven fork scenarios to test/acceptance/forks_test.go, replacing the placeholder gated tests of the harness task, and confirm they fail",
+        "One call: create a fork with a token object and, with no wait, clone its remote and push a new branch with the returned token",
+        "Confinement: with the fork's token, run the table of requests against another workspace, an unknown slug and the parent's routes, and compare the answers for the other workspace and the unknown slug",
+        "Reach: with the fork's token, read and land the fork's own change on the parent and read the parent's activity and policy; a change from another fork answers 404",
+        "Tracking branch: push to the fork's main and assert the refusal text on git's stderr and the unmoved branch",
+        "Default lifetime: create a fork without ttl and compare expires_at with created_at",
+        "Removal at the TTL (gate Long): create a fork with ttl 5m, assert it is still there after 4 minutes and gone, with its token dead and parley.fork.expire written, within 7 minutes",
+        "Size independence (gate LargeRepo): let the harness build an origin whose pack is at least 1 GiB from incompressible blobs and time 20 fork creations on it and on a 1 MiB workspace"
+      ],
+      "touches": [
+        "test/acceptance/forks_test.go",
+        "test/acceptance/harness/origin.go"
+      ],
+      "depends_on": [
+        1
+      ],
+      "done_when": [
+        "`PARLEY_ACCEPTANCE_LONG=1 go test ./test/acceptance/ -run '^TestLong_Fork' -timeout 15m -count=1` passes"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Prove the source control API and git compatibility",
+      "criteria": [
+        "REQ-3"
+      ],
+      "steps": [
+        "Add the five source control scenarios to test/acceptance/scm_test.go and the two git scenarios to test/acceptance/git_compat_test.go and confirm they fail",
+        "Reads: compare file, tree, path history, diff and blame from the REST API and from the parley scm commands with what stock git reports for a reference clone",
+        "Commit of several files: create, update and delete in one commit on a new branch from base_ref; read the ref, the parents and the diff",
+        "Stale head: repeat a commit with the previous expected_head_sha and assert 409 ref_moved with current_sha, over the API and through parley scm commit (exit status 1)",
+        "Open and land without a clone, then compare the tree id of main in a fresh clone with the tree id of a local repository in which the same file operations were committed with stock git; run git fsck on the clone",
+        "Git compatibility: the table of authentication (PAT in the URL, credential helper) by clone kind (full, depth 1, blob:none), each followed by a fetch and a push",
+        "Anti-enumeration: as a user with no access, compare status, error_type, message and WWW-Authenticate for an existing and an unknown workspace on the API paths of the table and on the git info/refs route, and compare git clone's stderr"
+      ],
+      "touches": [
+        "test/acceptance/scm_test.go",
+        "test/acceptance/git_compat_test.go",
+        "test/acceptance/harness/run.go"
+      ],
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Prove optimistic landing, conflict resolution and the three journeys",
+      "criteria": [
+        "REQ-4"
+      ],
+      "steps": [
+        "Add the three landing scenarios to test/acceptance/landing_test.go, the resolution scenario to test/acceptance/conflict_test.go and the three journeys to test/acceptance/journey_test.go, and confirm they fail",
+        "Twenty disjoint changes: prepare them through API commits, release twenty land requests from a start gate, and count requests per caller so that a retry would fail the scenario; verify linearity and once-only content in a fresh clone",
+        "Same lines: release two land requests together; assert one 200 and one 409 land_conflict whose report names the file and the winner; read the file on main",
+        "Kill during land: for each kill delay, start ten lands, send SIGKILL to the hub, start it again on the same directories and check the two-state invariant for every change from the change, the target's tree and the event log; assert no attempt is left running",
+        "Resolution: fetch the conflicted file with markers, run parley change resolve with a local file, wait for mergeable clean, land with the CLI and read the file on main; the scenario runs no git command",
+        "Journeys: the fork-push-land journey, the race-and-resolve journey and the stream-resume journey of the three execution paths, each on one hub from workspace creation to its end state"
+      ],
+      "touches": [
+        "test/acceptance/landing_test.go",
+        "test/acceptance/conflict_test.go",
+        "test/acceptance/journey_test.go",
+        "test/acceptance/harness/hub.go"
+      ],
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Prove policy by path, approvals and path-scoped tokens",
+      "criteria": [
+        "REQ-5"
+      ],
+      "steps": [
+        "Add the six policy scenarios to test/acceptance/policy_test.go and the two path-token scenarios to test/acceptance/path_tokens_test.go and confirm they fail",
+        "Add a helper that sets the four-rule policy (docs, code, billing, secrets) with parley policy set and returns its revision",
+        "Docs-only change lands with no approval; a change under src/ stays pending through a failed check report and becomes ready on passed, reported by a second user with checks:write",
+        "Approval counting: approve with the PAT that pushed (not counted, counts_for empty), then with the owner's API key (counted); rebase purely and show the count stays; change content and show it drops",
+        "Blocked path: land with and without override as the owner and as the admin token and assert 409 policy_blocked each time and an unmoved target; include the control that an override does pass an unmet check",
+        "Evaluate: call evaluate for the four path sets while no change exists, then open a change for each and compare status and rule names",
+        "Path-scoped token: push and API-commit under a/ successfully; then a push and API commits touching b/x, alone and mixed with a/, are refused with the path named, and the branch and version are unchanged"
+      ],
+      "touches": [
+        "test/acceptance/policy_test.go",
+        "test/acceptance/path_tokens_test.go",
+        "test/acceptance/harness/identity.go"
+      ],
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Prove protected branches, automatic landing and revert",
+      "criteria": [
+        "REQ-6"
+      ],
+      "steps": [
+        "Add the five protected-branch scenarios to test/acceptance/protected_test.go and the two scenarios of test/acceptance/autoland_revert_test.go and confirm they fail",
+        "Add a helper that builds the cast: organization acme, owner alice, member bob, workspace demo in acme, and the five credentials (owner API key, owner's bound PAT, owner's path-scoped PAT, member API key, admin token)",
+        "Landing and sync: land a change, then add a commit at the origin and run parley workspace sync; the origin must accept pushes so that the hub's and the origin's main agree before the sync",
+        "Direct push: the table of allowed credentials by operation (git push, API commit, API ref move), each followed by a read of the ref and of its parley.git.push event with direct true",
+        "Refusals: the nine rows of bound token, path-scoped token and member by operation; then force and delete for all five credentials over git and over the API; assert the texts and 403 protected_branch and an unmoved branch",
+        "Owner push off: set protect.owner_push to false with parley workspace update, repeat the direct updates for the owner and the admin token, and show a land still moves the branch",
+        "Automatic landing: open a change with auto_land under a policy that requires check test, show nothing lands before the report, report passed and wait for the land attempt with trigger auto",
+        "Revert: record the tree id of main, land a change, revert it with parley change revert, land the reverting change and compare tree ids; a second revert is 409 already_reverted"
+      ],
+      "touches": [
+        "test/acceptance/protected_test.go",
+        "test/acceptance/autoland_revert_test.go",
+        "test/acceptance/harness/identity.go",
+        "test/acceptance/harness/origin.go"
+      ],
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Prove awareness and the session thread",
+      "criteria": [
+        "REQ-7"
+      ],
+      "steps": [
+        "Add the four awareness scenarios to test/acceptance/awareness_test.go and the two session scenarios to test/acceptance/sessions_test.go and confirm they fail",
+        "Overlap: make a second change touch a file of the first, wait for exactly two parley.change.overlap events, read overlaps of a change, and show a further overlapping version adds no event",
+        "Activity: create a claim with the CLI, read activity over the API and with parley activity, and find both changes and the claim",
+        "Expiry: create a claim with ttl 2s, read activity at once and again 4 seconds after its creation; the claim reads back as expired",
+        "No refusal: with an overlap and another user's claim in place, push, commit through the API and land both changes",
+        "Session thread: start a session with the CLI, name it on a fork, on two pushes and on a land; walk from GET /sessions/<id> to the fork, the changes, every version and the land attempt",
+        "From the commit: read the landed commit, follow its session_id to the session and its change through by-commit"
+      ],
+      "touches": [
+        "test/acceptance/awareness_test.go",
+        "test/acceptance/sessions_test.go"
+      ],
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Prove durable events and event webhooks",
+      "criteria": [
+        "REQ-8"
+      ],
+      "steps": [
+        "Add the four event scenarios to test/acceptance/events_test.go, replacing the placeholder gated test, and the four webhook scenarios to test/acceptance/webhooks_test.go, and confirm they fail",
+        "Resume: use claim creations as the event source, because each writes exactly one event; close the reader, create fifty claims, reconnect with Last-Event-ID and compare resource ids and seqs, then one live event; repeat the read with parley events tail --after",
+        "Session on events: one scenario that forks, pushes two colliding changes and lands one, all naming one session, then reads the log filtered by session_id and finds the five event types",
+        "Kill under load: eight writers, SIGKILL after two seconds, restart, and compare the set of claims with the set of parley.claim.create events in both directions; assert seq order across the restart",
+        "Cursor expiry (gate Long): a hub with [events] retention 1h, events written, a wait of 65 minutes, a restart so retention runs, then 410 cursor_expired with oldest_seq on both event routes",
+        "Webhook delivery: start hubs for these scenarios with [webhooks] allow_insecure = true; create the subscription with the CLI, keep the secret from the answer, and verify order and signature of ten deliveries against the event log",
+        "Failing receiver: switch the receiver to 500, write five events, assert the same Parley-Delivery twice at least 10 seconds apart and no later seq; switch to 200 and assert all five arrive in order",
+        "Refused destinations: the table of private, link-local and unique-local URLs on create and on update; ping and redelivery arrive signed, the redelivery with the original Parley-Delivery and body"
+      ],
+      "touches": [
+        "test/acceptance/events_test.go",
+        "test/acceptance/webhooks_test.go",
+        "test/acceptance/harness/events.go",
+        "test/acceptance/harness/receiver.go"
+      ],
+      "depends_on": [
+        1
+      ],
+      "done_when": [
+        "`PARLEY_ACCEPTANCE_LONG=1 go test ./test/acceptance/ -run '^TestLong_Cursor' -timeout 90m -count=1` passes"
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Prove the conventions, backup and the single-client performance targets",
+      "criteria": [
+        "REQ-9.1",
+        "REQ-9.2",
+        "REQ-9.3",
+        "REQ-9.5",
+        "REQ-9.6"
+      ],
+      "steps": [
+        "Add the three convention scenarios to test/acceptance/conventions_test.go, the backup scenario to test/acceptance/operations_test.go and the gated performance scenario to test/acceptance/performance_test.go (replacing the placeholder), and confirm they fail",
+        "Write the route table in test/acceptance/routes_test.go as the route table generated from the PRD's route index (docs/prd/appendix_a_routes.md): one row of method and path per route of the index, with flags for public, list and creating POST, the show-once members of a create, and the name of the seeding function that makes the path's identifiers exist",
+        "Assert in the envelope scenario that the table's (method, path) pairs equal the routes read from docs/prd/appendix_a_routes.md, so that the table follows the index and no row count is written into the suite",
+        "Seed one hub with every kind of resource the table's placeholders need (workspace, fork, change with versions, land attempt, claim, token, webhook, session, secret, variable, carry-patch workspace with a patch and a rebuild); rows whose resource needs an OpenShell gateway or a forge are filled with identifiers that do not exist, which is enough for the 401 and 405 checks",
+        "Envelope and 405: for every row send the request without a credential and with a method the path lacks, and assert status, content type, code, error_type and a non-empty message; add the unknown path",
+        "Lists: for every list row assert the empty answer, page three items with limit=1 to the end, and assert the two limit bounds and the foreign cursor",
+        "Idempotency: for every creating POST except the OAuth callback, replay with the same key and body, with another body, with an empty key and with a 256-character key, counting resources before and after",
+        "Backup: run parleyd backup into an empty directory while eight writers run, start a second hub on the snapshot and verify readiness, workspaces, version refs, git fsck, a land and seq order; a second backup into the now non-empty directory exits 1",
+        "Performance (gate ReferenceHost): seed an origin with 1,000 commits and 5,000 files, take 100 samples of each of the five latency operations and assert the 95th percentile, land 80 disjoint changes from eight clients for one minute, and measure event delay on a live stream"
+      ],
+      "touches": [
+        "test/acceptance/conventions_test.go",
+        "test/acceptance/routes_test.go",
+        "test/acceptance/operations_test.go",
+        "test/acceptance/performance_test.go",
+        "test/acceptance/harness/hub.go"
+      ],
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 11,
+      "title": "Prove one journey per carried feature",
+      "criteria": [
+        "REQ-9.7"
+      ],
+      "steps": [
+        "Add TestCarried_OneJourneyPerFeature with its five subtests to test/acceptance/carried_test.go and confirm it fails",
+        "Workspace: create with --wait, sync after a new origin commit, archive, reactivate, delete, and a final get that exits 1 with not_found",
+        "Carry-patch: create a workspace in carry-patch mode with a second test origin as upstream, push a patch branch, add it with parley patch add, submit a rebuild with --wait and verify in a clone that the integration branch is upstream's head plus the patch",
+        "Secrets and variables: create a workspace secret and a workspace variable with the CLI; collect every stdout and stderr of the subtest and assert the secret's value occurs in none of them; resolve the variable and read its value and origin",
+        "Forge: set the workspace setting forge_api_url to the harness's fake forge and list its issues with parley issue list",
+        "Sessions, audit and metrics: start a session, report usage, create a claim under the session, find its event with parley audit query, find parley_agent_sessions_active in GET /metrics, complete the session",
+        "Keep each subtest to the one journey: the success and error cases of these features are the feature packages' checks and are not repeated here"
+      ],
+      "touches": [
+        "test/acceptance/carried_test.go",
+        "test/acceptance/harness/forge.go",
+        "test/acceptance/harness/origin.go"
+      ],
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 12,
+      "title": "Prove sandboxes against an OpenShell gateway",
+      "criteria": [
+        "REQ-10"
+      ],
+      "steps": [
+        "Add the eight sandbox scenarios to test/acceptance/sandbox_test.go, replacing the placeholder, each beginning with the Gateway gate, and confirm that with the gateway variables set they fail and without them they are skipped",
+        "Add a harness helper that renders the [sandbox] section from the three environment variables (gateway URL, token file, image) with the profiles a scenario names: default, cred (attaches a credential, exposes nothing), exposing (exposes DEPLOY_KEY), needs (requires an absent secret) and quick (idle timeout 1m, ttl 3m); and a helper that creates a sandbox, waits for ready and runs a collected exec",
+        "Fork with sandbox: one fork-create call, wait for ready, read HEAD inside, commit and push with parley.change inside, and find the change on the parent",
+        "Placeholders and exposure: read env under the cred profile and in a read-only member's fork; under the exposing profile read the value inside and search the profile list, the sandbox object, the create event and the stored log for name and value",
+        "Refusals: creation under the needs profile through fork-create (no fork is left behind), approval with a fork-bound token, exec with a PAT that lacks a scope of the hub credential",
+        "Network: serve a page from the harness on an address the gateway can reach, request it from the sandbox (blocked, deny event, pending proposal), approve as the owner and request again; then approve with scope workspace and show which sandboxes reach the host before and after the rule is deleted",
+        "Capacity: four hubs, each with one limit set to 1; create the second sandbox where that limit is the one hit and assert 429 sandbox_capacity naming it and none of the other three",
+        "Checkpoints and restart: end sandboxes by stop, by idleness and by expiry, list the checkpoint refs with git ls-remote, restore each into a new sandbox and compare the committed and uncommitted files; stop and start the hub under a sandbox whose main process appends a tick every second and compare the ticks",
+        "Delete every sandbox a scenario created in its cleanup, also when the scenario failed, so a shared gateway is left empty"
+      ],
+      "touches": [
+        "test/acceptance/sandbox_test.go",
+        "test/acceptance/harness/sandbox.go",
+        "test/acceptance/harness/hub.go"
+      ],
+      "depends_on": [
+        1
+      ],
+      "done_when": [
+        "with the three PARLEY_ACCEPTANCE_OPENSHELL_ and SANDBOX_IMAGE variables set, `go test ./test/acceptance/ -run '^TestSandbox_' -timeout 45m -count=1` passes; without them every TestSandbox_ scenario is reported as skipped"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,365 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "46",
+  "spec_name": "sandbox_exec_files_and_logs",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/sandbox/... ./internal/cli/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "45",
+      "reason": "provides the sandbox record (state, hub_access, exposed secrets, working directory, environment, last_activity_at) and, through package 44, the runtime client with its named operations, its fake, the [sandbox] limits, the no-widening rule, the runtime-error answer and the metrics recorder that the routes here use; registers a purge hook with its hook list"
+    },
+    {
+      "spec": "09",
+      "reason": "provides the CLI's HTTP client, output and exit codes that the five parley sandbox commands are built on"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Gate the five routes that use a sandbox",
+      "criteria": [
+        "REQ-1"
+      ],
+      "steps": [
+        "Add the gate behaviours to internal/sandbox/use_test.go, driving the route table through probe operations as the checks describe, and confirm they fail",
+        "Create internal/sandbox/use.go with the route table of this package: POST exec, PUT files, GET files, GET logs and GET attach under /workspaces/{slug}/sandboxes/{id}, each entry with its scope (sandboxes:read for GET files and GET logs, sandboxes:write for the others), its access level (read or write), whether the no-widening rule applies (exec, PUT files, attach), its allowed states (ready; ready, completed and failed for GET files; every state for logs) and its operation",
+        "Write the gate that runs before an entry's operation, in this order after the conventions of package 02 have run steps 1 to 4: sandboxes enabled (404 sandboxes_disabled, through package 44's feature check), the binding guard of package 08, the PAT scope, the workspace access rule of package 07, the sandbox lookup through package 45's record (404 sandbox_not_found for an id of the wrong form, an unknown id, or a sandbox whose workspace is not :slug), the no-widening rule of package 44 against the record's hub_access, the entry's validation, and the state check (409 sandbox_not_ready)",
+        "Use the existing helpers of packages 02, 07, 08, 44 and 45 for each of those checks; add no second implementation of any of them",
+        "Hand the operation a context that holds the caller, the workspace and the sandbox record, so that no operation looks them up again",
+        "Answer runtime failures, the kind unsupported included, with the runtime-error answer of package 44 (502 sandbox_runtime_error), giving it the runtime's text after the scrubbing function of package 45 for the sandbox; write no second error answer",
+        "Allow each entry to state its own body limit and accepted content types to the conventions of package 02 (exec: JSON up to 8 MiB; PUT files: application/octet-stream and application/x-tar without the default body limit)",
+        "Register the route table with the router where package 45 registers the sandbox routes, so the five routes exist only through the gate; the operations are filled in by the tasks that follow"
+      ],
+      "touches": [
+        "internal/sandbox/use.go",
+        "internal/sandbox/use_test.go",
+        "internal/hub/"
+      ],
+      "done_when": [
+        "`go test ./internal/sandbox/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Run a command and answer with its collected output",
+      "criteria": [
+        "REQ-2"
+      ],
+      "steps": [
+        "Add the collected-exec behaviours to internal/sandbox/exec_test.go and confirm they fail",
+        "Run commands with ExecStream of package 44's runtime client (argument list, working directory, environment, stdin reader; stdout and stderr as they are produced; the exit code; the command killed when the context ends); add nothing to the interface, its OpenShell implementation or its fake",
+        "Validate the body in the gate's validation step: command (1 to 256 strings); env with the validator package 45 uses for the create request (at most 64 entries, values up to 8192 bytes, no PARLEY_ or OPENSHELL_ prefix) plus a refusal of names in the sandbox's exposed_secrets; stdin or stdin_base64 but not both, at most 4194304 bytes decoded; timeout as a duration above zero and at most [sandbox].max_exec_timeout, default 60s",
+        "Keep an in-memory count of running execs per sandbox id; take a slot after validation and state, answer 429 rate_limited without Retry-After when [sandbox].max_concurrent_execs slots are taken, and release the slot when the exec ends in any way",
+        "Run the command with the sandbox's environment overlaid by the request's env, in workdir or the sandbox's working directory, under a context that ends at the timeout (measured with the replaceable clock) and when the request's context ends",
+        "Collect stdout and stderr up to 1048576 bytes each, discard the rest while still draining the command, and set truncated when either stream lost bytes; cut a truncated stream back to the last complete UTF-8 character",
+        "Answer 200 with exit_code, stdout, stderr, truncated, timed_out and duration_ms; return a stream that is not valid UTF-8 in its _base64 member with an empty text member; on timeout answer timed_out true with exit_code null and the output so far",
+        "When the request's context ends before the command does, kill the command and write no response; when the runtime fails, use the runtime error answer of the gate",
+        "Wire the operation into the exec entry of the route table for requests whose Accept does not name text/event-stream"
+      ],
+      "touches": [
+        "internal/sandbox/exec.go",
+        "internal/sandbox/exec_test.go",
+        "internal/sandbox/use.go"
+      ],
+      "done_when": [
+        "`go test ./internal/sandbox/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Stream a command's output as server-sent events",
+      "criteria": [
+        "REQ-3"
+      ],
+      "steps": [
+        "Add the streamed-exec behaviours to internal/sandbox/exec_test.go and confirm they fail",
+        "Choose the streamed form when the request's Accept header names text/event-stream; validation, the exec slot, the environment, the working directory and the timeout are the code of the collected form, so every refusal is the same JSON error envelope",
+        "After the command started, send status 200 with Content-Type text/event-stream and Cache-Control no-cache, and flush after every frame",
+        "Send each chunk of output as a frame named stdout or stderr, split so that no frame carries more than 32768 bytes, with data {data} when the chunk is valid UTF-8 and {data_base64} otherwise; apply no cap",
+        "When the command ends send one frame named exit with exit_code, timed_out and duration_ms and end the response; on timeout kill the command and send exit with exit_code null and timed_out true",
+        "When the request's context ends first, kill the command; when the runtime fails after the headers were sent, end the response without an exit frame; release the exec slot in every case"
+      ],
+      "touches": [
+        "internal/sandbox/exec_stream.go",
+        "internal/sandbox/exec.go",
+        "internal/sandbox/exec_test.go"
+      ],
+      "done_when": [
+        "`go test ./internal/sandbox/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Upload a file or a tar stream",
+      "criteria": [
+        "REQ-4"
+      ],
+      "steps": [
+        "Add the upload behaviours to internal/sandbox/files_test.go and confirm they fail",
+        "Write files with Upload (a reader, a path and a mode; parent directories are created) and create directories with MakeDir of package 44's runtime client, whose fake holds a file tree per sandbox; add nothing to the interface, its OpenShell implementation or its fake",
+        "Write the path resolver: join a relative path with the working directory constant of package 45 (/workspace), clean . and .. lexically, and report path_outside_workdir (400) unless the result is the working directory or below it; it follows no symbolic links",
+        "Validate the query in the gate's validation step: path present and non-empty and inside the working directory; archive absent or tar; mode an octal number from 0000 to 0777 and absent with archive=tar; content type application/octet-stream, or application/x-tar with archive=tar, else 415",
+        "Refuse a declared Content-Length above [sandbox].max_transfer_size with 413 before writing; otherwise read the body through a counter that stops at the limit and answers 413, leaving what was written",
+        "Single file: stream the body to the runtime's file write with the mode (default 0644) and answer 200 {path, bytes, entries: 1}",
+        "Tar: read the body with archive/tar entry by entry without buffering the stream; resolve each name under the target directory and refuse an absolute name or one that leaves it with 400 path_outside_workdir; write directories and regular files with their modes; refuse any other entry type and an unreadable stream with 400 invalid_request; stop at the first refused entry; answer 200 {path, bytes, entries}",
+        "Map a runtime failure to the runtime error answer of the gate and wire the operation into the PUT files entry"
+      ],
+      "touches": [
+        "internal/sandbox/files.go",
+        "internal/sandbox/files_test.go",
+        "internal/sandbox/use.go"
+      ],
+      "depends_on": [
+        1
+      ],
+      "done_when": [
+        "`go test ./internal/sandbox/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Download a file or a directory as a tar stream",
+      "criteria": [
+        "REQ-5"
+      ],
+      "steps": [
+        "Add the download behaviours to internal/sandbox/files_test.go and confirm they fail",
+        "Use Stat (file or directory, size and mode), Download and Walk of package 44's runtime client; its result of kind not found, for the path or for the working directory, is the missing-path case and every other failure a runtime failure",
+        "Validate the query with the path resolver of the upload: path present and inside the working directory, archive absent or tar",
+        "Answer 404 path_not_found for a missing path or a missing working directory, and 400 path_is_directory for a directory without archive=tar",
+        "File without archive: answer 413 payload_too_large when its size exceeds [sandbox].max_transfer_size; otherwise send 200 with Content-Type application/octet-stream, the Content-Length and the bytes as they are read",
+        "archive=tar: send 200 with Content-Type application/x-tar and write a tar stream with archive/tar, one entry per directory and regular file with names relative to the directory and the files' modes, or one entry named by the base name for a file",
+        "Count the bytes sent of a tar stream and, at the limit, abort the connection so the caller's read ends with an error and not with a clean end of body",
+        "Wire the operation into the GET files entry"
+      ],
+      "touches": [
+        "internal/sandbox/files.go",
+        "internal/sandbox/files_test.go",
+        "internal/sandbox/use.go"
+      ],
+      "done_when": [
+        "`go test ./internal/sandbox/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Collect, redact and retain each sandbox's logs",
+      "criteria": [
+        "REQ-6"
+      ],
+      "steps": [
+        "Add the collection and retention behaviours to internal/sandbox/logs_test.go and confirm they fail",
+        "Add a table for log lines through the migration mechanism of internal/store: a per-row sequence that gives the storage order, the sandbox id, time (whole seconds, UTC), source, stream, line, and for policy lines action, program, host, port and credential",
+        "Follow a sandbox with Logs of package 44's runtime client, one stream with source process and one with source policy, each with follow and since, until the context ends; the fake emits the entries a test gives it",
+        "Write the collector: every 5 seconds on the replaceable clock it reads the sandboxes in state ready from the store, starts one follower for each that has none and cancels the followers of sandboxes that are no longer ready; it starts with the hub when sandboxes are enabled and stops at shutdown",
+        "A follower asks the runtime for output from the time of the sandbox's last stored line, skips the lines of that second that are already stored, and ends when its stream breaks, so that the next round opens it again",
+        "Split process output into lines at line ends, holding an unfinished line until its end arrives, and split a line longer than 16384 bytes into consecutive lines of at most 16384 bytes",
+        "Before storing, replace every exact match of each exposed secret value of the sandbox that is at least 8 characters long with [redacted]; take the values from the sandbox component of package 45 and keep them out of the store and the log",
+        "Store policy entries with source policy, stream null, their text and their action, program, host, port and, when present, the provider name as credential",
+        "Register one task in the maintenance registry of package 03 that deletes lines older than [sandbox].log_retention and lines whose sandbox record no longer exists, and register a purge hook with the list of package 45 that deletes a sandbox's lines in the transaction that removes its record",
+        "Start the collector and register the maintenance task in the hub's composition"
+      ],
+      "touches": [
+        "internal/sandbox/logs_store.go",
+        "internal/sandbox/logs_collect.go",
+        "internal/sandbox/logs_test.go",
+        "internal/store/",
+        "internal/hub/"
+      ],
+      "depends_on": [
+        1
+      ],
+      "done_when": [
+        "`go test ./internal/sandbox/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Serve a sandbox's logs as pages and as a followed stream",
+      "criteria": [
+        "REQ-7"
+      ],
+      "steps": [
+        "Add the read and follow behaviours to internal/sandbox/logs_test.go and confirm they fail",
+        "Validate the query in the gate's validation step: source process or policy; since an RFC 3339 timestamp; tail an integer of at least 1; follow true or false; follow=true not together with cursor or limit; limit and cursor by the list helper of package 02",
+        "Paged read: select the sandbox's lines by source and since, restrict to the last tail lines of that selection when tail is given, order by storage sequence, and answer {items, next_cursor} through the list helper of package 02; never call the runtime",
+        "Render an item as {time, source, stream, line}, with action, program, host and port for policy lines and credential only when it is set",
+        "Follow: send 200 with Content-Type text/event-stream and Cache-Control no-cache, one frame named log per selected stored line, then each newly stored matching line within 1 second, found by reading the store past the last sequence sent when the collector signals new lines or after at most 1 second",
+        "End a followed stream when the request's context ends, when the hub shuts down, or when the sandbox's state is deleted, after sending the lines stored until then",
+        "Wire the operation into the logs entry of the route table"
+      ],
+      "touches": [
+        "internal/sandbox/logs_read.go",
+        "internal/sandbox/logs_store.go",
+        "internal/sandbox/logs_test.go",
+        "internal/sandbox/use.go"
+      ],
+      "done_when": [
+        "`go test ./internal/sandbox/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Attach an interactive terminal over WebSocket",
+      "criteria": [
+        "REQ-8"
+      ],
+      "steps": [
+        "Add the attach behaviours to internal/sandbox/attach_test.go and confirm they fail",
+        "Add golang.org/x/net to go.mod for golang.org/x/net/websocket and confirm the signatures recorded in the package's external API against the module",
+        "Open the terminal with ExecInteractive of package 44's runtime client (a command, a working directory, an environment and a size; an input writer, an output reader, a resize call and a close call); its fake's terminal echoes its input",
+        "Validate in the gate's validation step that the request is a WebSocket upgrade and that cols and rows, when given, are integers from 1 to 1000 (defaults 80 and 24); answer 400 invalid_request otherwise",
+        "Open the terminal for /bin/sh in the sandbox's working directory with the sandbox's environment before the upgrade, so that a runtime failure is still answered with the runtime error envelope",
+        "Complete the upgrade with a websocket.Server whose Handshake accepts a request without an Origin header, and read frames with a Codec that keeps the payload type",
+        "Copy binary frames from the caller to the terminal's input and each chunk of terminal output to the caller as one binary frame; apply a text frame {resize: {cols, rows}} with both values from 1 to 1000 and ignore every other text frame",
+        "When the caller closes, the request's context ends or the hub shuts down, close the terminal and nothing else; when the terminal ends or fails, send the output received and close the connection",
+        "Wire the operation into the attach entry of the route table"
+      ],
+      "touches": [
+        "internal/sandbox/attach.go",
+        "internal/sandbox/attach_test.go",
+        "internal/sandbox/use.go",
+        "go.mod",
+        "go.sum"
+      ],
+      "depends_on": [
+        1
+      ],
+      "done_when": [
+        "`go test ./internal/sandbox/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Record activity and report finished operations to observers",
+      "criteria": [
+        "REQ-9"
+      ],
+      "steps": [
+        "Add the activity and observer behaviours to internal/sandbox/activity_test.go and confirm they fail",
+        "Write the activity tracker: Touch(sandbox id, time) updates last_activity_at of package 45's record with one conditional statement that only ever raises the value",
+        "Call Touch with the clock's time when an exec starts and ends (both forms), when an upload or download starts and ends, when an attach opens and closes, and for an arriving attach frame when at least 60 seconds have passed since that connection's last write",
+        "Call Touch from the log collector when it stores a process line, and not for policy lines",
+        "Make sure nothing before the operation starts touches the sandbox: a request refused by any check, the exec limit included, leaves last_activity_at alone, and so does a log read",
+        "Add the operation observer registry to internal/sandbox: a register function and a record type with kind, sandbox id, workspace slug, session id, actor type and id, start time, duration_ms, and for an exec command, exit_code, timed_out and result, for a transfer path and bytes",
+        "Derive the exec result: ok for exit code 0, nonzero for another exit code, timeout when the command was killed at its timeout, error for a runtime failure or a command killed because its caller went away; when an exec ends add 1 to parley_sandbox_exec_total{result} through the metrics recorder of package 44",
+        "Notify every observer once when an operation that passed the gate ends, after the response was written; recover from a panic and log an error per failing observer without changing the response or skipping the remaining observers",
+        "Keep stdin, output, terminal bytes, file content and environment values out of the record",
+        "Start test/e2e/sandbox_use_test.go with a helper that brings up an in-process hub with the fake runtime of package 44, a fork and a ready sandbox, and a recording observer, for the end-to-end checks of this package"
+      ],
+      "touches": [
+        "test/e2e/sandbox_use_test.go",
+        "internal/sandbox/activity.go",
+        "internal/sandbox/activity_test.go",
+        "internal/sandbox/exec.go",
+        "internal/sandbox/exec_stream.go",
+        "internal/sandbox/files.go",
+        "internal/sandbox/attach.go",
+        "internal/sandbox/logs_collect.go"
+      ],
+      "depends_on": [
+        3,
+        5,
+        6,
+        8
+      ],
+      "done_when": [
+        "`go test ./internal/sandbox/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Add parley sandbox exec",
+      "criteria": [
+        "REQ-10.1",
+        "REQ-10.2",
+        "REQ-10.3",
+        "REQ-10.4"
+      ],
+      "steps": [
+        "Add the exec command behaviours to internal/cli/sandbox_test.go and confirm they fail",
+        "Declare parley sandbox exec <workspace-slug> <id> -- <command...> in internal/cli/sandbox.go through the declaration helper of package 09, with the flags --workdir, --env (repeatable), --timeout, --stdin and --json; at least one argument after -- is required, and an --env value without = is a usage error",
+        "Build the body: command; workdir, env and timeout only when their flags were given; with --stdin read standard input to its end, refuse more than 4194304 bytes with a client_error before any request, and send it as stdin_base64",
+        "Send the request through the client of package 09 without the 30-second timeout, as a raw response the command reads itself; a non-2xx answer is the hub's envelope on stderr and exit status 1, as for every command",
+        "Default form: send Accept: text/event-stream, parse the frames, write stdout frames to stdout and stderr frames to stderr (decoding data_base64) as they arrive, and take the exit status from the exit frame",
+        "With --json: send no text/event-stream, print the response document through the output of package 09 and take the exit status from exit_code and timed_out",
+        "Exit with the command's exit code, mapping values above 125 to 125; on timed_out report wait_timeout on stderr and exit 1; when the stream ends without an exit frame report client_error and exit 2"
+      ],
+      "touches": [
+        "internal/cli/sandbox.go",
+        "internal/cli/sandbox_test.go"
+      ],
+      "depends_on": [
+        3
+      ],
+      "done_when": [
+        "`go test ./internal/cli/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 11,
+      "title": "Add parley sandbox shell and parley sandbox logs",
+      "criteria": [
+        "REQ-10.5",
+        "REQ-10.6"
+      ],
+      "steps": [
+        "Add the shell and logs command behaviours to internal/cli/sandbox_test.go and confirm they fail",
+        "Add golang.org/x/term to go.mod and confirm the signatures recorded in the package's external API against the module",
+        "Declare parley sandbox logs <workspace-slug> <id> with --source (process or policy), --since, --tail (at least 1) and --follow; invalid values are usage errors before any request",
+        "Without --follow, request GET logs page by page, following next_cursor until it is null, and print each item as one compact JSON object on its own line",
+        "With --follow, open the event stream without the 30-second timeout, print the data of each log frame as one line as it arrives, and exit 0 when the hub ends the stream",
+        "Declare parley sandbox shell <workspace-slug> <id>; build the ws or wss URL of GET attach from the hub URL with cols and rows from the local terminal (80 and 24 when standard input is not a terminal), and dial with golang.org/x/net/websocket, sending the Authorization header in Config.Header",
+        "When the dial is refused with an HTTP answer, repeat the request as a plain GET through the client of package 09 to obtain the hub's error envelope, print it and exit 1; a connection failure is a client_error with exit status 2",
+        "In internal/cli/terminal.go: put a terminal on standard input into raw mode and restore it on every way out; copy standard input to binary frames and binary frames to stdout; send {resize: {cols, rows}} as a text frame when the local size changes (SIGWINCH); exit 0 when the hub closes the connection"
+      ],
+      "touches": [
+        "internal/cli/sandbox.go",
+        "internal/cli/terminal.go",
+        "internal/cli/sandbox_test.go",
+        "go.mod",
+        "go.sum"
+      ],
+      "depends_on": [
+        7,
+        8
+      ],
+      "done_when": [
+        "`go test ./internal/cli/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 12,
+      "title": "Add parley sandbox upload and parley sandbox download",
+      "criteria": [
+        "REQ-10.7",
+        "REQ-10.8"
+      ],
+      "steps": [
+        "Add the upload and download command behaviours to internal/cli/sandbox_test.go and confirm they fail",
+        "Declare parley sandbox upload <workspace-slug> <id> <local-path> <sandbox-path>; a local path that does not exist or cannot be read is a client_error with exit status 2 before any request",
+        "For a regular file send PUT files with path, mode from the file's permission bits in octal and the file as a streamed application/octet-stream body with its length; for a directory send archive=tar and a tar stream written while it is sent, with regular files and directories under names relative to the directory, skipping symbolic links with a warning line on stderr",
+        "Send both without the 30-second timeout and print the hub's response document",
+        "Declare parley sandbox download <workspace-slug> <id> <sandbox-path> <local-path>; request GET files with path and, when the answer is the error_type path_is_directory, request again with archive=tar",
+        "Write a file through a temporary file in the target's directory that is renamed on success and removed on failure, or copy it to stdout when <local-path> is -; print {path, bytes} unless the bytes went to stdout",
+        "Unpack a tar answer into the directory <local-path>, creating it, with the entries' modes; refuse an entry whose name is absolute or leaves the directory with a client_error and exit status 2; print {path, bytes} with the sum of the file sizes",
+        "Print any other hub error as received and exit 1, leaving nothing at <local-path>"
+      ],
+      "touches": [
+        "internal/cli/sandbox.go",
+        "internal/cli/sandbox_test.go"
+      ],
+      "depends_on": [
+        5
+      ],
+      "done_when": [
+        "`go test ./internal/cli/... -count=1` passes"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,879 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "43",
+  "spec_name": "forge_webhook_ingress",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Set or rotate the webhook secret",
+      "rationale": "The forge can only prove a delivery against a secret the workspace holds, and a developer must be able to create and replace it without the hub ever showing a stored value again.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "a caller with `forge:write` and write access sends `PUT /api/v1/workspaces/{slug}/forge/webhook` with no body, with `{}` or with `{\"secret\": null}`",
+          "action": "generate 32 random bytes, store their 64 lower-case hex characters as the workspace secret `FORGE_WEBHOOK_SECRET`, replacing an earlier value, and record `parley.forge.webhook.set` with metadata `generated` true in the same transaction",
+          "contract": "HTTP 200 with body {configured: true, url: string|null, secret: string of 64 characters 0-9a-f}; the stored secret equals `secret`; one event `parley.forge.webhook.set` with resource_type `webhook`, resource_id the slug, action `set`, the caller as actor and metadata {generated: true}; no `parley.secret.*` event",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler with a real store, the secret component with an encryption key and the event component",
+              "a ready repository workspace demo owned by the caller"
+            ],
+            "pseudocode": "in internal/forge/webhook_test.go, a table over bodies {none, `{}`, `{\"secret\":null}`, `{\"secret\":null,\"x\":1}`}: r = PUT(owner, /workspaces/demo/forge/webhook, body); assert r.status == 200 and r.json.configured == true and r.json.secret matches ^[0-9a-f]{64}$; assert secrets.Read(workspace demo, FORGE_WEBHOOK_SECRET) == r.json.secret; ev = events of demo; assert exactly one of type parley.forge.webhook.set with resource_type webhook, resource_id demo, action set, metadata.generated == true; assert none of type parley.secret.*; assert two calls return different secrets and the second replaces the first; assert no event JSON contains r.json.secret"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "event_driven",
+          "condition": "the body of the `PUT` carries `secret` as a string of 16 to 255 characters, each in the range `!` to `~`",
+          "action": "store the given value as the workspace secret `FORGE_WEBHOOK_SECRET`, replacing an earlier value under any casing of the key, and record `parley.forge.webhook.set` with metadata `generated` false",
+          "contract": "HTTP 200 with body {configured: true, url: string|null} and no `secret` member; the stored secret equals the given value; one event with metadata {generated: false}; the workspace still has one secret whose key equals `FORGE_WEBHOOK_SECRET` ignoring case",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/webhook_test.go, a table over secrets {16 characters, 255 characters, `!~!~!~!~!~!~!~!~`}: r = PUT(owner, ..., {secret: s}); assert r.status == 200 and 'secret' not in r.json; assert secrets.Read(demo, FORGE_WEBHOOK_SECRET) == s; assert last event metadata.generated == false. Then with a workspace that already holds the secret under the key `forge_webhook_secret`: PUT a new value; assert the workspace's secret list has one entry matching the name ignoring case and its value is the new one"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "unwanted",
+          "condition": "the body of the `PUT` is not a JSON object, or its `secret` is neither absent, `null` nor a string of 16 to 255 characters in the range `!` to `~`",
+          "action": "refuse the request, store nothing, record no event and leave the given value out of the error message",
+          "contract": "HTTP 400 with `error_type` `invalid_request` and a message that does not contain the submitted value; the stored secret and the event count are unchanged",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/webhook_test.go, a table over bodies {secret of 15 characters, secret of 256 characters, secret containing a space, secret containing a tab, secret containing `é`, secret \"\", secret 42, secret true, secret [], body `[]`, body `\"x\"`, body `{`}: before = stored secret, events; r = PUT(owner, ..., body); assert r.status == 400 and r.json.error.error_type == invalid_request; for string secrets assert the secret text is not a substring of r.body; assert stored secret and event count equal before"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "ubiquitous",
+          "action": "for any workspace slug, report the webhook URL as `[server].external_url` without a trailing `/` followed by `/hooks/forge/<slug>`, and as `null` when `external_url` is empty, while still storing the secret",
+          "contract": "`url` in the `PUT` response is `https://hub.example.com/hooks/forge/demo` for `external_url` `https://hub.example.com` and for `https://hub.example.com/`, `https://h.example/parley/hooks/forge/demo` for `https://h.example/parley/`, and JSON null for an empty `external_url`",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/webhook_test.go, a table over external_url {\"https://hub.example.com\", \"https://hub.example.com/\", \"https://h.example/parley/\", \"\"}: r = PUT(owner, /workspaces/demo/forge/webhook) on a handler built with that external_url; assert r.json.url equals the row's expectation (null for the empty row) and r.status == 200 and the secret is stored in every row"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "unwanted",
+          "condition": "the `PUT` comes from a PAT without `forge:write`, from a caller without write access, names a task fork, or names an archived workspace",
+          "action": "refuse the request by the first of these that applies, in this order: scope, access, fork, body, archived; store nothing and record no event",
+          "contract": "HTTP 403 `insufficient_scope` for a PAT without `forge:write` (also for an unknown slug); HTTP 404 `not_found` for a caller without read access; HTTP 403 `forbidden` for a caller with read access only (also on an archived workspace); HTTP 400 `fork_has_no_origin` for a task fork (also with an invalid body); HTTP 409 `workspace_archived` for an archived workspace with a valid body, and HTTP 400 `invalid_request` for an archived workspace with an invalid body",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "workspaces demo (ready), archived (archived) and the task fork demo--t1, with an owner, an org member with read access and a stranger"
+            ],
+            "pseudocode": "in internal/forge/webhook_test.go, a table of {caller, slug, body} -> {status, error_type}: {PAT with forge:read only, demo} -> 403 insufficient_scope; {PAT with forge:read only, nosuch} -> 403 insufficient_scope; {stranger, demo} -> 404 not_found; {org member with read access, demo} -> 403 forbidden; {org member, archived} -> 403 forbidden; {owner, fork demo--t1, valid} -> 400 fork_has_no_origin; {owner, demo--t1, secret \"short\"} -> 400 fork_has_no_origin; {owner, archived, valid} -> 409 workspace_archived; {owner, archived, secret \"short\"} -> 400 invalid_request; in every row assert no secret was stored on the workspace and no parley.forge.webhook.set event was added"
+          }
+        },
+        {
+          "id": "REQ-1.6",
+          "pattern": "unwanted",
+          "condition": "a valid `PUT` reaches a hub with no secret encryption key configured, or a workspace that holds 100 secrets none of which is `FORGE_WEBHOOK_SECRET`",
+          "action": "refuse the request, store nothing and record no event, answering the missing key before the full scope",
+          "contract": "HTTP 503 `secrets_unavailable` without a key; HTTP 429 `secret_limit_reached` for the full scope; with both conditions HTTP 503; a workspace with 100 secrets one of which is `FORGE_WEBHOOK_SECRET` is answered 200",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/webhook_test.go: (a) handler whose secret component has no key: r = PUT(owner, ...); assert 503 secrets_unavailable; (b) workspace with 100 other secrets: assert 429 secret_limit_reached and the secret count is still 100; (c) no key and 100 secrets: assert 503; (d) 99 other secrets plus FORGE_WEBHOOK_SECRET: assert 200 and count still 100; in (a)-(c) assert no parley.forge.webhook.set event"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Remove the webhook secret",
+      "rationale": "Removing the secret is how a developer turns the ingress off for a workspace, and it must work even after the workspace was archived.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "a caller with `forge:write` and write access sends `DELETE /api/v1/workspaces/{slug}/forge/webhook` for a workspace that has a webhook secret",
+          "action": "remove the workspace secret `FORGE_WEBHOOK_SECRET` and record `parley.forge.webhook.unset` with metadata `existed` true in the same transaction",
+          "contract": "HTTP 204 with no body; the workspace has no secret named `FORGE_WEBHOOK_SECRET`; one event `parley.forge.webhook.unset` with resource_type `webhook`, resource_id the slug, action `unset` and metadata {existed: true}; no `parley.secret.delete` event",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the handler and workspaces of the secret-setting tests"
+            ],
+            "pseudocode": "in internal/forge/webhook_test.go: PUT a secret; r = DELETE(owner, /workspaces/demo/forge/webhook); assert r.status == 204 and r.body empty; assert secrets.Read(demo, FORGE_WEBHOOK_SECRET) reports absent; assert last event type parley.forge.webhook.unset with metadata.existed == true and no parley.secret.delete event"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "event_driven",
+          "condition": "the `DELETE` names a workspace that has no webhook secret",
+          "action": "change nothing and record `parley.forge.webhook.unset` with metadata `existed` false",
+          "contract": "HTTP 204; one event `parley.forge.webhook.unset` with metadata {existed: false}",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/webhook_test.go: r = DELETE(owner, /workspaces/demo/forge/webhook) on a workspace without the secret; assert 204; assert one new event of type parley.forge.webhook.unset with metadata.existed == false; a second DELETE answers 204 with a second such event"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "state_driven",
+          "condition": "the workspace is archived",
+          "action": "serve the `DELETE` as for a ready workspace",
+          "contract": "HTTP 204 and the secret is removed",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/webhook_test.go: workspace `archived` holding FORGE_WEBHOOK_SECRET: r = DELETE(owner, /workspaces/archived/forge/webhook); assert 204 and the secret is absent and the event has existed == true"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "unwanted",
+          "condition": "the `DELETE` comes from a PAT without `forge:write`, from a caller without write access, or names a task fork",
+          "action": "refuse the request, keep the secret and record no event",
+          "contract": "HTTP 403 `insufficient_scope` for a PAT without `forge:write`; HTTP 404 `not_found` without read access; HTTP 403 `forbidden` with read access only; HTTP 400 `fork_has_no_origin` for a task fork; the stored secret is unchanged",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/webhook_test.go, a table {PAT with forge:read only -> 403 insufficient_scope, stranger -> 404 not_found, org member with read access -> 403 forbidden, owner on fork demo--t1 -> 400 fork_has_no_origin}: r = DELETE(caller, ...); assert status and error_type; assert the secret of demo is still readable and no parley.forge.webhook.unset event was added"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "ubiquitous",
+          "action": "for any `PUT` or `DELETE` of the webhook secret, send no request to the forge",
+          "contract": "a forge API server configured for the workspace receives zero requests while the secret is set, rotated and removed",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "an httptest server standing in for the forge API"
+            ],
+            "pseudocode": "in internal/forge/webhook_test.go: a workspace whose forge_api_url setting points at an httptest server that counts requests; PUT (generated), PUT (given), DELETE; assert the server's request count == 0"
+          }
+        },
+        {
+          "id": "REQ-2.6",
+          "pattern": "unwanted",
+          "condition": "the event of a `PUT` or a `DELETE` of the webhook secret cannot be recorded",
+          "action": "roll back the transaction, so that the secret is neither stored, replaced nor removed",
+          "contract": "HTTP 500 with `error_type` `internal` and a message that does not carry the cause or the secret; the workspace's `FORGE_WEBHOOK_SECRET` is as it was before the request",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a handler whose event component returns an error from Emit"
+            ],
+            "pseudocode": "in internal/forge/webhook_test.go, a table over {PUT on a workspace without a secret, PUT on a workspace holding secret s1, DELETE on a workspace holding s1}: r = request(owner, ...); assert r.status == 500 and error_type == 'internal'; assert the secret is absent in the first row and still s1 in the other two; assert no parley.forge.webhook.* event was added"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Authenticate and answer a delivery at the ingress",
+      "rationale": "The ingress is the only route of the hub that an unauthenticated party on the internet may post to, so every answer must follow one fixed order and leak nothing about workspaces or secrets.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "unwanted",
+          "condition": "`POST /hooks/forge/{slug}` names an unknown slug, a task fork, or a workspace whose `FORGE_WEBHOOK_SECRET` is absent or empty",
+          "action": "refuse the delivery before looking at any header or reading the body, and record nothing",
+          "contract": "HTTP 404 with the error envelope {code: 404, error_type: `not_found`, message: `not found`}; the three cases, the empty-secret case and a workspace whose secret was removed with the `DELETE` route return byte-identical bodies; no delivery is recorded",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "an ingress handler with a real store, secret component and event component, registered outside /api/v1"
+            ],
+            "pseudocode": "in internal/forge/ingress_test.go, a table over slugs {nosuch, fork demo--t1 whose parent has a secret, nosecret, emptysecret (FORGE_WEBHOOK_SECRET stored as \"\" through the secret component), unset (secret set then removed through the DELETE route)}, each posted with a signature that would be valid for the parent's secret: r = POST(/hooks/forge/{slug}); assert r.status == 404 and r.json.error.error_type == not_found; assert all five bodies are byte-identical; assert count(all deliveries) == 0"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "unwanted",
+          "condition": "a delivery for a workspace with a secret carries neither `X-Hub-Signature-256` nor `X-Gitlab-Token`, carries its scheme header more than once, carries a GitLab token that differs from the secret, or carries a GitHub signature that is not `sha256=` followed by the lower-case hex HMAC-SHA256 of the raw body under the secret",
+          "action": "refuse the delivery with one fixed message and record nothing",
+          "contract": "HTTP 401 with `error_type` `unauthenticated` and the message `delivery signature missing or invalid`, identical in every case; no delivery is recorded and no event is written",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/ingress_test.go, a table of header sets for workspace demo with secret S and body B: {no scheme header}, {only X-Hub-Signature (sha1 form)}, {X-Gitlab-Token wrong}, {X-Gitlab-Token empty}, {X-Gitlab-Token S given twice}, {X-Hub-Signature-256 computed with another secret}, {X-Hub-Signature-256 of another body}, {X-Hub-Signature-256 correct hex in upper case}, {X-Hub-Signature-256 hex without the sha256= prefix}, {X-Hub-Signature-256 correct, given twice}, {X-Hub-Signature-256 wrong plus X-Gitlab-Token S}: r = POST(/hooks/forge/demo); assert r.status == 401, error_type unauthenticated, message == \"delivery signature missing or invalid\"; assert all bodies identical; assert count(deliveries) == 0 and no event"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "event_driven",
+          "condition": "a delivery carries exactly one `X-Hub-Signature-256` that matches the raw body under the workspace's secret, with or without an `X-Gitlab-Token` header, or carries no `X-Hub-Signature-256` and exactly one `X-Gitlab-Token` equal to the secret",
+          "action": "treat the first as a GitHub delivery, ignoring its GitLab token, with the id of `X-GitHub-Delivery` and the event name of `X-GitHub-Event`, and the second as a GitLab delivery with the id of `Idempotency-Key` or, when that header is absent, of `X-Gitlab-Event-UUID` and the event name of `X-Gitlab-Event`; reduce and record it and answer with the outcome",
+          "contract": "HTTP 202 with body {outcome: `relayed`|`ignored`|`repository_mismatch`}; the recorded delivery has forge `github` or `gitlab`, the event name of its header and the id of its header, which for GitLab is `Idempotency-Key` when both id headers are present",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "workspace demo with origin repository acme/widgets and secret S"
+            ],
+            "pseudocode": "in internal/forge/ingress_test.go: body = GitHub issues/opened payload for acme/widgets; sign with S; r = POST with X-GitHub-Delivery d1, X-GitHub-Event issues; assert 202 and r.json == {outcome: relayed}; assert delivery d1 has forge github, event issues; repeat with id d2 and an extra header X-Gitlab-Token: wrong; assert 202 relayed; a ping payload with id d3 -> 202 {outcome: ignored}; a payload for other/repo with id d4 -> 202 {outcome: repository_mismatch}; body = GitLab Issue Hook open payload for acme/widgets; r = POST with X-Gitlab-Token S, X-Gitlab-Event \"Issue Hook\", Idempotency-Key k1, X-Gitlab-Event-UUID u1; assert 202 relayed and the delivery is recorded under k1 with forge gitlab and event \"Issue Hook\"; POST again with only X-Gitlab-Event-UUID u2; assert recorded under u2"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "unwanted",
+          "condition": "the body of a delivery is larger than 1,048,576 bytes, with or without a declared length",
+          "action": "stop reading at the limit, refuse the delivery and record nothing; for GitHub whatever the signature, for GitLab only after the token matched",
+          "contract": "HTTP 413 with `error_type` `payload_too_large` for a GitHub delivery of 1,048,577 bytes with a valid or an invalid signature and for a GitLab delivery with the right token; HTTP 401 for an oversized GitLab delivery with a wrong token; a body of exactly 1,048,576 bytes is not answered 413",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/ingress_test.go, a table {github, 1048577 bytes, signature valid -> 413}, {github, 1048577, signature wrong -> 413}, {github, 1048577 sent chunked without Content-Length -> 413}, {gitlab, 1048577, token right -> 413}, {gitlab, 1048577, token wrong -> 401}, {github, a JSON object padded to exactly 1048576 bytes, valid signature -> 202}: r = POST(...); assert status and error_type; assert no delivery recorded in the refused rows"
+          }
+        },
+        {
+          "id": "REQ-3.5",
+          "pattern": "unwanted",
+          "condition": "an authenticated delivery has no delivery id header, no event name header, or an id that is empty, longer than 255 characters or holds a character outside the range space to `~`",
+          "action": "refuse the delivery and record nothing",
+          "contract": "HTTP 400 with `error_type` `invalid_request`; no delivery is recorded and no event is written; an id of exactly 255 printable ASCII characters is accepted",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/ingress_test.go, a table over correctly authenticated requests: {github without X-GitHub-Delivery}, {github without X-GitHub-Event}, {github with empty X-GitHub-Event}, {gitlab with neither Idempotency-Key nor X-Gitlab-Event-UUID}, {gitlab without X-Gitlab-Event}, {id of 256 characters}, {id \"\"}, {id containing byte 0x7F}, {id containing `é`} -> 400 invalid_request and count(deliveries) == 0; {id of 255 characters `a`} and {id \"a b\"} -> 202"
+          }
+        },
+        {
+          "id": "REQ-3.6",
+          "pattern": "event_driven",
+          "condition": "a new authenticated delivery is reduced to the outcome `malformed`, or its id is already recorded for the workspace",
+          "action": "answer the malformed delivery as a refusal while keeping its record, and answer the repeated one as a duplicate without recording or relaying anything",
+          "contract": "HTTP 400 `invalid_request` for the malformed delivery, which is listed with outcome `malformed`; HTTP 202 with body exactly {\"outcome\":\"duplicate\"} for a repeated id, also when the first copy was `malformed`; a correctly signed GitHub delivery in the form encoding is `malformed`",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/ingress_test.go: post a signed body `payload=%7B%22action%22...` with Content-Type application/x-www-form-urlencoded and id m1; assert 400 invalid_request and the delivery m1 exists with outcome malformed and relayed []; post m1 again; assert 202 and body == {\"outcome\":\"duplicate\"}; post a relayed issues/opened delivery r1 twice; assert second is 202 duplicate, count(deliveries) == 2 and one event exists for r1"
+          }
+        },
+        {
+          "id": "REQ-3.7",
+          "pattern": "unwanted",
+          "condition": "the workspace's `FORGE_WEBHOOK_SECRET` is stored but cannot be read or decrypted, or the recording step of an authenticated delivery fails",
+          "action": "refuse the delivery as a hub failure, never as an unknown workspace or a bad signature, and leave nothing recorded",
+          "contract": "HTTP 500 with `error_type` `internal` and a message that holds neither the secret nor any part of the payload; no delivery and no event is stored; the same delivery sent again after the fault is gone is answered 202 with its own outcome",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/ingress_test.go: (a) a workspace whose secret was encrypted under a key the secret component no longer has: r = POST(signed delivery); assert r.status == 500 and error_type internal, not 404 or 401; (b) a handler whose event appender fails on the second event: post a GitLab Issue Hook update yielding three events; assert 500 internal, count(deliveries) == 0 and count(events) == 0 and the response body does not contain the payload's title; remove the failure and post the same id again; assert 202 relayed and three events"
+          }
+        },
+        {
+          "id": "REQ-3.8",
+          "pattern": "ubiquitous",
+          "action": "for any delivery, accept it without a bearer credential, leave it out of the request rate limit, verify it against the secret as stored at that moment, and relay it also when the workspace is archived",
+          "contract": "a delivery with no `Authorization` header and one with an invalid bearer token are both answered 202; with the rate limit set to 1 request per minute three deliveries in a row are answered 202; after a rotation the old signature is answered 401 and the new one 202 without a restart; a secret of 3 characters stored through the secret component verifies a delivery; a delivery to an archived workspace is answered 202 `relayed` and its event is written",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the server handler of package 02 with its rate limiter and the authenticator installed"
+            ],
+            "pseudocode": "in internal/forge/ingress_test.go on the full server handler of internal/server with requests_per_minute = 1: three signed deliveries d1..d3 without Authorization -> all 202; one with `Authorization: Bearer nonsense` -> 202; rotate the secret with PUT; a delivery signed with the old secret -> 401, with the new one -> 202; store FORGE_WEBHOOK_SECRET = \"abc\" through the secret component and post a GitLab delivery with X-Gitlab-Token abc -> 202; archive the workspace record and post a signed issues/opened delivery -> 202 relayed and one more parley.forge.issue.opened event"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Record each delivery once, together with its events",
+      "rationale": "Forges redeliver and retry in parallel; consumers of the event stream must see each forge event exactly once, and a recorded relay must never lack its events.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "a verified delivery whose id is not yet recorded for the workspace is reduced",
+          "action": "record one delivery with `delivery_id`, `forge`, `event` cut to 64 bytes, `action` cut to 64 bytes or `\"\"`, `target`, `outcome`, `relayed` and `received_at` in whole seconds UTC, storing neither the payload nor the secret",
+          "contract": "the record reads back with the eight fields; `relayed` lists the relayed event types in order and is `[]` unless `outcome` is `relayed`; `target` is `origin`, `upstream` or null; no stored row of the delivery contains a marker string placed in the payload or the secret value",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a real store opened in t.TempDir() and the event component"
+            ],
+            "pseudocode": "in internal/forge/delivery_test.go with a fixed clock: out = Record(workspace demo, github, id d1, event \"issues\", payload issues/labeled for acme/widgets with a title holding the marker ZZMARKER); assert out.outcome == relayed; d = Get(demo, d1); assert d == {delivery_id d1, forge github, event issues, action labeled, target origin, outcome relayed, relayed [parley.forge.issue.labeled], received_at clock time}; record an event name of 80 bytes and assert the stored event has 64 bytes; record an ignored ping and assert relayed == [] and action == \"\"; dump every row of the delivery table and assert no column contains ZZMARKER or the secret"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "event_driven",
+          "condition": "a verified delivery carries an id that the same workspace already has recorded",
+          "action": "report it as a duplicate, record nothing and append no event; treat the same id in another workspace as a new delivery",
+          "contract": "the recording step returns the outcome `duplicate`; the delivery count and the event count of the workspace are unchanged, and the first record keeps its fields; the same id recorded for a second workspace returns that delivery's own outcome",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/delivery_test.go: Record(demo, d1, issues/opened) -> relayed; Record(demo, d1, a different payload issues/closed) -> duplicate; assert count(deliveries demo) == 1, Get(demo, d1).action == opened and count(events demo) == 1; Record(other, d1, issues/opened for other's repository) -> relayed and count(deliveries other) == 1"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "ubiquitous",
+          "action": "for any new delivery, write the delivery record and append all its relayed events in one transaction before the outcome is returned, and complete that transaction also when the request's connection is closed early",
+          "contract": "after the outcome is returned the delivery and exactly the events named in its `relayed` exist; when the forge's request context is cancelled before the recording step starts, the delivery and its events still exist afterwards",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/delivery_test.go: Record a GitLab Issue Hook update that yields three events; assert Get(...).relayed has three types and the event log holds exactly those three, in that order, each with metadata.delivery_id == the id; then call Record with an already cancelled context for id d9; assert Get(demo, d9) exists with outcome relayed and its event exists"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "unwanted",
+          "condition": "appending an event or writing the delivery record fails",
+          "action": "roll the whole step back so that neither the delivery nor any of its events is stored, and report the failure",
+          "contract": "the recording step returns an error that holds neither the payload nor the secret; the delivery and event counts are unchanged; the same delivery recorded again after the fault is gone returns its own outcome, not `duplicate`",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/delivery_test.go: wrap the event component with an appender that fails on the second event; out, err = Record(demo, d1, GitLab Issue Hook update yielding three events); assert err != nil; assert count(deliveries demo) == 0 and count(events demo) == 0; remove the failure and call Record(demo, d1, the same payload) again; assert outcome relayed and three events"
+          }
+        },
+        {
+          "id": "REQ-4.5",
+          "pattern": "ubiquitous",
+          "action": "for any number of concurrent copies of one delivery, record exactly one and append its events once, and report every other copy as a duplicate",
+          "contract": "of N concurrent recordings of one id, exactly one returns its outcome and N-1 return `duplicate`; one delivery record and one set of events exist",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/delivery_test.go: start 16 goroutines that call Record(demo, d1, issues/opened) at the same time; collect outcomes; assert exactly one relayed and 15 duplicate and no error; assert count(deliveries demo) == 1 and count(events demo of type parley.forge.issue.opened) == 1; run with -race"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Reduce a payload to an action, a target and an outcome",
+      "rationale": "A forge sends far more than the hub relays; one fixed decision table makes every delivery end in exactly one named outcome.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "unwanted",
+          "condition": "the body of a verified delivery is not one JSON object",
+          "action": "reduce it to the outcome `malformed` with action `\"\"`, target null and no events",
+          "contract": "the reduction returns {outcome: `malformed`, action: \"\", target: null, events: []}",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/reduce_test.go, a table over bodies {empty, `[]`, `\"x\"`, `42`, `null`, `{`, `{} {}`, `payload=%7B%7D`}: red = Reduce(github, \"issues\", body, repos{origin acme/widgets}); assert red.Outcome == malformed, red.Action == \"\", red.Target == nil and len(red.Events) == 0"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "ubiquitous",
+          "action": "for any JSON object payload, read the action from `action` on GitHub and from `object_attributes.action` on GitLab, and the repository path from `repository.full_name` on GitHub and from `project.path_with_namespace` on GitLab, and set the target to `origin` when the path equals the origin repository ignoring case, else to `upstream` when the workspace is a carry-patch workspace whose upstream repository equals it ignoring case, else to null",
+          "contract": "the reduction returns the action as a string (`\"\"` when absent or not a string, cut to 64 bytes) and target `origin`, `upstream` or null; the target is set also when the outcome is `ignored`",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/reduce_test.go, a table with repos{origin acme/widgets, upstream up/widgets} over {github, full_name \"acme/widgets\" -> origin}, {github, \"ACME/Widgets\" -> origin}, {github, \"up/widgets\" -> upstream}, {github, \"other/x\" -> nil}, {github, full_name missing -> nil}, {github, full_name 7 -> nil}, {gitlab, path_with_namespace \"Up/Widgets\" -> upstream}, {gitlab, \"group/sub/widgets\" with origin group/sub/widgets -> origin}, and with repos{origin acme/widgets, no upstream} {\"up/widgets\" -> nil}; with origin equal to upstream {-> origin}; action rows {\"labeled\" -> labeled}, {absent -> \"\"}, {action 5 -> \"\"}, {a 100-byte action -> its first 64 bytes}; a github ping for acme/widgets has outcome ignored and target origin"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "ubiquitous",
+          "action": "for any JSON object payload, decide the outcome by the first matching row of: no mapping for the event and action gives `ignored`; a required field missing or of the wrong type gives `malformed`; a mapping that yields no events gives `ignored`; events with no repository path in the payload give `malformed`; events with a repository that is neither origin nor upstream give `repository_mismatch`; otherwise `relayed`",
+          "contract": "the reduction returns exactly one of `relayed`, `ignored`, `repository_mismatch`, `malformed`; it returns events only for `relayed`",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/reduce_test.go, a table with repos{origin acme/widgets}: {github ping, no repository -> ignored}, {github issues/opened without issue.number, repository other/x -> malformed}, {github issues/opened with issue.number \"7\" (a string) -> malformed}, {github issues/opened with issue.number 0 -> malformed}, {gitlab Merge Request Hook update without oldrev, no project -> ignored}, {github issues/opened valid, repository missing -> malformed}, {github issues/opened valid, repository other/x -> repository_mismatch}, {github issues/opened valid, acme/widgets -> relayed with 1 event}, {github issues/assigned, repository missing -> ignored}: red = Reduce(...); assert red.Outcome and that len(red.Events) > 0 only when relayed"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Map GitHub deliveries to hub events",
+      "rationale": "Consumers subscribe to hub event types, not to GitHub's event names and actions.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "a GitHub `issues` delivery has the action `opened`, `edited`, `closed` or `reopened` and an integer `issue.number` of at least 1",
+          "action": "yield one event `parley.forge.issue.<action>` for that issue",
+          "contract": "the mapping returns one event of type `parley.forge.issue.opened`, `.edited`, `.closed` or `.reopened` with resource_type `issue` and resource_id the decimal number",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/github_hook_test.go, a table over actions {opened, edited, closed, reopened} with issue.number 7: evs, err = mapGitHub(\"issues\", payload); assert err == nil, len(evs) == 1, evs[0].Type == \"parley.forge.issue.\" + action, evs[0].ResourceType == issue, evs[0].ResourceID == \"7\"; rows without issue.number, with number 0 and with number 1.5 return the missing-field error"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "event_driven",
+          "condition": "a GitHub `issues` delivery has the action `labeled` or `unlabeled`, an integer `issue.number` of at least 1 and a non-empty string `label.name`",
+          "action": "yield one event `parley.forge.issue.labeled` or `parley.forge.issue.unlabeled` naming that label",
+          "contract": "the mapping returns one event of the type with resource_type `issue`, resource_id the number and metadata `label` equal to `label.name`; a payload without `label.name` is reported as a missing required field",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/github_hook_test.go, rows {labeled, number 7, label.name \"bug\"} and {unlabeled, ...}: assert one event of the type with Metadata.label == \"bug\"; rows {labeled without label}, {label.name \"\"}, {label.name 3}, {labeled without issue.number}: assert the missing-field error and no event"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "event_driven",
+          "condition": "a GitHub `issue_comment` delivery has the action `created` and an integer `issue.number` of at least 1",
+          "action": "yield one event `parley.forge.comment.created` for that issue or pull request",
+          "contract": "the mapping returns one event with resource_type `comment`, resource_id the number, and metadata `pull_request` true when `issue.pull_request` is an object and false otherwise",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/github_hook_test.go: {issue_comment created, issue.number 7, no issue.pull_request} -> one event parley.forge.comment.created, ResourceType comment, ResourceID \"7\", Metadata.pull_request == false; {same with issue.pull_request {url: ...}} -> pull_request == true; {created without issue.number} -> missing-field error"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "event_driven",
+          "condition": "a GitHub `pull_request` delivery has the action `opened`, `reopened`, `synchronize` or `closed` and an integer `pull_request.number` of at least 1",
+          "action": "yield one event `parley.forge.pull_request.<action>`, where a `closed` action yields `.merged` when `pull_request.merged` is true and `.closed` otherwise, never both",
+          "contract": "the mapping returns exactly one event of type `parley.forge.pull_request.opened`, `.reopened`, `.synchronize`, `.merged` or `.closed` with resource_type `pull_request` and resource_id the number",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/github_hook_test.go, a table {opened -> .opened}, {reopened -> .reopened}, {synchronize -> .synchronize}, {closed, merged true -> .merged}, {closed, merged false -> .closed}, {closed, merged absent -> .closed}, {closed, merged \"yes\" -> .closed}: assert len(evs) == 1 and evs[0].Type; {opened without pull_request.number} -> missing-field error"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "event_driven",
+          "condition": "a GitHub `push` delivery has a non-empty string `ref`",
+          "action": "yield one event `parley.forge.push` for that ref",
+          "contract": "the mapping returns one event with resource_type `ref` and resource_id the ref; a payload without a string `ref` is reported as a missing required field",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/github_hook_test.go: {push, ref \"refs/heads/main\"} -> one event parley.forge.push, ResourceType ref, ResourceID \"refs/heads/main\"; {push without ref}, {ref \"\"}, {ref 1} -> missing-field error"
+          }
+        },
+        {
+          "id": "REQ-6.6",
+          "pattern": "ubiquitous",
+          "action": "for any GitHub event name and action that the mapping does not list, yield no mapping, whatever the payload holds",
+          "contract": "the mapping reports `no mapping` and the reduction's outcome is `ignored`",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/github_hook_test.go, a table {ping, no action}, {issue_comment edited}, {issue_comment deleted}, {issues assigned}, {issues deleted}, {pull_request labeled}, {pull_request edited}, {pull_request_review submitted}, {star created}, {Issues opened (wrong case)}, {issues with action absent}: assert mapGitHub reports no mapping; assert Reduce(github, event, payload, repos).Outcome == ignored"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-7",
+      "title": "Map GitLab deliveries to hub events",
+      "rationale": "A GitLab workspace must produce the same hub event types as a GitHub one, although GitLab reports label and title changes as one update.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-7.1",
+          "pattern": "event_driven",
+          "condition": "a GitLab `Issue Hook` delivery has the action `open`, `close` or `reopen` and an integer `object_attributes.iid` of at least 1",
+          "action": "yield one event `parley.forge.issue.opened`, `.closed` or `.reopened` for that issue",
+          "contract": "the mapping returns one event of the type with resource_type `issue` and resource_id the `iid`; a payload without an integer `iid` is reported as a missing required field",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/gitlab_hook_test.go, a table {open -> parley.forge.issue.opened}, {close -> .closed}, {reopen -> .reopened} with object_attributes.iid 12: assert one event, ResourceType issue, ResourceID \"12\"; {open without iid}, {iid \"12\"} -> missing-field error; {Issue Hook with action absent} -> no mapping"
+          }
+        },
+        {
+          "id": "REQ-7.2",
+          "pattern": "event_driven",
+          "condition": "a GitLab `Issue Hook` delivery has the action `update` and an integer `object_attributes.iid` of at least 1",
+          "action": "yield `parley.forge.issue.edited` when `changes.title` or `changes.description` is present, then one `parley.forge.issue.unlabeled` for each label title in `changes.labels.previous` that is not in `changes.labels.current`, then one `parley.forge.issue.labeled` for each title in `current` that is not in `previous`, each group in ascending byte order of the title, keeping at most the first 100 label events",
+          "contract": "the mapping returns the events in the order edited, unlabeled…, labeled…, each label event carrying metadata `label`; an update that changes no title, description or label returns zero events and the reduction's outcome is `ignored`; an update that removes 80 and adds 80 labels returns 100 label events: the 80 unlabeled and the first 20 labeled by name",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/gitlab_hook_test.go: {changes.title present, labels previous [b, a] current [a, d, c]} -> types [edited, unlabeled(b), labeled(c), labeled(d)]; {changes.description only} -> [edited]; {labels previous [a] current [a]} -> [] and Reduce(...).Outcome == ignored; {changes {} } -> []; {changes.updated_at only} -> []; {previous 80 titles p00..p79, current 80 titles c00..c79} -> 100 events, first 80 unlabeled p00..p79, then labeled c00..c19; {changes.title present and 150 added labels} -> 1 edited + 100 labeled; {update without iid} -> missing-field error"
+          }
+        },
+        {
+          "id": "REQ-7.3",
+          "pattern": "event_driven",
+          "condition": "a GitLab `Note Hook` delivery has `object_attributes.noteable_type` `Issue` with an integer `issue.iid` of at least 1, or `MergeRequest` with an integer `merge_request.iid` of at least 1",
+          "action": "yield one event `parley.forge.comment.created` for that issue or merge request, and yield no mapping for a note on anything else",
+          "contract": "the mapping returns one event with resource_type `comment`, resource_id the `iid` and metadata `pull_request` true for a merge request and false for an issue; a note on a commit or a snippet reports `no mapping`; a note on an issue without `issue.iid` is reported as a missing required field",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/gitlab_hook_test.go: {noteable_type Issue, issue.iid 5} -> one parley.forge.comment.created, ResourceID \"5\", Metadata.pull_request == false; {MergeRequest, merge_request.iid 9} -> ResourceID \"9\", pull_request == true; {Commit}, {Snippet}, {noteable_type absent} -> no mapping; {Issue without issue.iid}, {MergeRequest with merge_request.iid \"9\"} -> missing-field error"
+          }
+        },
+        {
+          "id": "REQ-7.4",
+          "pattern": "event_driven",
+          "condition": "a GitLab `Merge Request Hook` delivery has the action `open`, `close`, `reopen`, `merge` or `update` and an integer `object_attributes.iid` of at least 1",
+          "action": "yield one event `parley.forge.pull_request.opened`, `.closed`, `.reopened` or `.merged` for the first four actions, and for `update` yield `parley.forge.pull_request.synchronize` when `object_attributes.oldrev` is a non-empty string and no event otherwise",
+          "contract": "the mapping returns one event with resource_type `pull_request` and resource_id the `iid`; an `update` without `oldrev` returns zero events and the reduction's outcome is `ignored`",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/gitlab_hook_test.go, a table with iid 9: {open -> .opened}, {close -> .closed}, {reopen -> .reopened}, {merge -> .merged}, {update with oldrev \"abc\" -> .synchronize}, {update without oldrev -> zero events, Reduce outcome ignored}, {update with oldrev \"\" -> zero events}, {approved -> no mapping}, {open without iid -> missing-field error}"
+          }
+        },
+        {
+          "id": "REQ-7.5",
+          "pattern": "event_driven",
+          "condition": "a GitLab `Push Hook` or `Tag Push Hook` delivery has a non-empty string `ref`",
+          "action": "yield one event `parley.forge.push` for that ref",
+          "contract": "the mapping returns one event with resource_type `ref` and resource_id the ref; a payload without a string `ref` is reported as a missing required field; any other GitLab event name reports `no mapping`",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/gitlab_hook_test.go: {Push Hook, ref refs/heads/main} and {Tag Push Hook, ref refs/tags/v1} -> one parley.forge.push with ResourceID the ref; {Push Hook without ref} -> missing-field error; {Pipeline Hook}, {Job Hook}, {Wiki Page Hook}, {issue hook (wrong case)} -> no mapping"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-8",
+      "title": "Describe each relayed event without carrying forge text",
+      "rationale": "Events travel to every reader of the workspace and to event webhooks, so they carry identifiers and links, never bodies, comment text or secrets.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-8.1",
+          "pattern": "ubiquitous",
+          "action": "for any relayed event, set `workspace` to the slug, `actor_type` to `forge`, `actor_id` to null, `action` to the last segment of the type, and the metadata `forge`, `target`, `delivery_id` and `actor`, where `actor` is `sender.login` on GitHub, `user.username` on GitLab and `user_username` on GitLab push hooks, and `\"\"` when the payload names none",
+          "contract": "every delivery event read from the event log has actor_type `forge`, actor_id null, the workspace slug, action equal to the type's last segment, and metadata.forge `github` or `gitlab`, metadata.target `origin` or `upstream`, metadata.delivery_id the delivery's id and metadata.actor a string",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a real store and event component",
+              "a workspace demo with origin acme/widgets and a carry-patch workspace cp with upstream up/widgets"
+            ],
+            "pseudocode": "in internal/forge/hook_event_test.go: record a GitHub issues/opened delivery d1 with sender.login octo for the origin repository, a GitLab Push Hook d2 with user_username gl for the upstream repository of a carry-patch workspace, and a GitHub push d3 without sender; read the three events from the event component; assert each has ActorType forge, ActorID nil, Workspace the slug, Action == last segment of Type; assert metadata {forge github, target origin, delivery_id d1, actor octo}, {forge gitlab, target upstream, delivery_id d2, actor gl}, {actor \"\"}"
+          }
+        },
+        {
+          "id": "REQ-8.2",
+          "pattern": "event_driven",
+          "condition": "an issue event `parley.forge.issue.opened`, `.edited`, `.closed`, `.reopened`, `.labeled` or `.unlabeled` is relayed",
+          "action": "give it the metadata `number`, `url` and `labels` (the issue's current label names, at most the first 100), plus `title` cut to 256 bytes at a character boundary on the first four types, plus `label` on the two label types",
+          "contract": "metadata of the first four types is {number, title, url, labels} and of the label types {number, label, labels, url}, beside the common keys; `title` has at most 256 bytes and is valid UTF-8; `labels` has at most 100 entries; a missing title or URL is `\"\"` and missing labels are `[]`",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/hook_event_test.go, a table: {github issues/opened, number 7, title \"T\", html_url U, labels [bug, p1]} -> metadata number 7, title T, url U, labels [bug, p1], no `label` key; {github issues/labeled, label bug} -> keys number, label bug, labels, url and no `title` key; {gitlab Issue Hook open, object_attributes.title, .url, top-level labels [{title: a}]} -> title, url, labels [a]; {title of 300 two-byte characters} -> len(title) <= 256 and utf8.Valid; {150 labels} -> 100 entries, the first 100; {no title, no html_url, labels absent} -> title \"\", url \"\", labels []; {labels holding a non-object entry} -> that entry skipped"
+          }
+        },
+        {
+          "id": "REQ-8.3",
+          "pattern": "event_driven",
+          "condition": "a `parley.forge.comment.created` event is relayed",
+          "action": "give it the metadata `number`, `comment_url` and `pull_request`",
+          "contract": "metadata is {number, comment_url, pull_request} beside the common keys, where `comment_url` is `comment.html_url` on GitHub and the note's `object_attributes.url` on GitLab, `\"\"` when missing; the metadata has no key holding the comment's text",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/hook_event_test.go: {github issue_comment created with comment.body \"SECRETTEXT\", comment.html_url C} -> metadata == common + {number 7, comment_url C, pull_request false}; {gitlab Note Hook on MergeRequest with object_attributes.note \"SECRETTEXT\", url N} -> {number 9, comment_url N, pull_request true}; assert the JSON of each event does not contain SECRETTEXT"
+          }
+        },
+        {
+          "id": "REQ-8.4",
+          "pattern": "event_driven",
+          "condition": "a pull request event `parley.forge.pull_request.opened`, `.closed`, `.merged`, `.reopened` or `.synchronize` is relayed",
+          "action": "give it the metadata `number`, `url`, `head` and `base` (the source and target branch names) and `merged`, which is true exactly on the `.merged` type",
+          "contract": "metadata is {number, url, head, base, merged} beside the common keys; `head` and `base` are `pull_request.head.ref` and `pull_request.base.ref` on GitHub and `object_attributes.source_branch` and `.target_branch` on GitLab, `\"\"` when missing; `merged` is true on `.merged` and false on the other four types",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/hook_event_test.go, a table: {github pull_request opened, head.ref feat, base.ref main, html_url U} -> {number, url U, head feat, base main, merged false}; {github closed merged true} -> merged true; {github closed merged false} -> merged false; {gitlab merge} -> head source_branch, base target_branch, merged true; {gitlab update with oldrev} -> merged false; {no head object} -> head \"\""
+          }
+        },
+        {
+          "id": "REQ-8.5",
+          "pattern": "event_driven",
+          "condition": "a `parley.forge.push` event is relayed",
+          "action": "give it the metadata `ref`, `before` and `after` from the payload's top-level members",
+          "contract": "metadata is {ref, before, after} beside the common keys; `before` and `after` are `\"\"` when missing or not strings; resource_id equals `ref`",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/hook_event_test.go: {github push ref refs/heads/main, before B, after A} -> metadata ref, before B, after A and ResourceID refs/heads/main; {gitlab Tag Push Hook} -> same keys; {push without before/after} -> \"\" and \"\"; {before 5} -> \"\""
+          }
+        },
+        {
+          "id": "REQ-8.6",
+          "pattern": "ubiquitous",
+          "action": "for any relayed event, keep issue bodies, pull request bodies, comment text, commit messages and the webhook secret out of the event, and remove userinfo from every URL in its metadata",
+          "contract": "the JSON of every relayed event contains none of the body, description, note, comment or commit-message texts of the payload and not the secret; a URL `https://user:pw@forge.example/acme/widgets/issues/7` appears as `https://forge.example/acme/widgets/issues/7`; a value that is not a parseable absolute URL appears as `\"\"`",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/hook_event_test.go: build one payload per mapped event kind for both forges with the marker BODYMARK in issue.body, pull_request.body, comment.body, object_attributes.description, object_attributes.note and commits[].message and with html_url/url holding `user:pw@`; reduce each with secret S; for every event assert json(event) contains neither BODYMARK nor S nor \"user:pw@\" and that the url field equals the URL without userinfo; {html_url \"not a url\"} -> url \"\""
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-9",
+      "title": "List, prune and delete the delivery log",
+      "rationale": "A developer debugging a webhook needs to see what the hub received and decided, and the log must not grow without bound or outlive its workspace.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-9.1",
+          "pattern": "event_driven",
+          "condition": "a caller with `forge:read` and read access sends `GET /api/v1/workspaces/{slug}/forge/deliveries`, in any workspace state",
+          "action": "answer the recorded deliveries of that workspace, newest first by `received_at` and for equal instants the later recorded first, paged by `limit` and `cursor`",
+          "contract": "HTTP 200 with body {items: [{delivery_id, forge, event, action, target, outcome, relayed, received_at}], next_cursor: string|null}; `items` is `[]` for a workspace without deliveries; following `next_cursor` returns every delivery once in that order; an archived workspace and a read-only org member are answered 200; deliveries recorded before the webhook secret was removed are still listed",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub handler with a real store",
+              "workspaces demo, other and archived; an owner and an org member with read access"
+            ],
+            "pseudocode": "in internal/forge/delivery_log_test.go with a fixed clock: record 5 deliveries for demo (two in the same second) and 1 for other; r = GET(member, /workspaces/demo/forge/deliveries?limit=2); assert 200, 2 items with exactly the eight fields, received_at in RFC 3339 whole seconds, next_cursor != null; follow cursors; assert the concatenation is the 5 deliveries of demo, newest first, the same-second pair in reverse recording order, none of other; GET on a workspace without deliveries -> items [] and next_cursor null; GET on the archived workspace -> 200; GET with ?target=upstream -> 200 with the same items; remove the secret of demo with the DELETE route and GET again -> the same 5 deliveries"
+          }
+        },
+        {
+          "id": "REQ-9.2",
+          "pattern": "event_driven",
+          "condition": "the deliveries request carries `since` as an RFC 3339 instant",
+          "action": "list only the deliveries received at or after that instant",
+          "contract": "HTTP 200 whose items all have `received_at` >= `since`; a delivery received exactly at `since` is included",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/delivery_log_test.go: deliveries at 09:00:00Z, 09:00:05Z, 09:00:10Z; GET ?since=2026-10-21T09:00:05Z -> the two at :05 and :10; ?since=2026-10-21T11:00:05+02:00 -> the same two; ?since=2026-10-21T09:00:11Z -> items []"
+          }
+        },
+        {
+          "id": "REQ-9.3",
+          "pattern": "unwanted",
+          "condition": "the deliveries request names a task fork, carries a `since` that is not RFC 3339, comes from a PAT without `forge:read`, or comes from a caller without read access",
+          "action": "refuse the request",
+          "contract": "HTTP 400 `fork_has_no_origin` for a task fork; HTTP 400 `invalid_request` for a bad `since`; HTTP 403 `insufficient_scope` for a PAT without `forge:read`; HTTP 404 `not_found` without read access",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/delivery_log_test.go, a table {owner, fork demo--t1 -> 400 fork_has_no_origin}, {owner, demo, since=yesterday -> 400 invalid_request}, {owner, demo, since=2026-10-21 -> 400 invalid_request}, {owner, demo, since= (empty) -> 400 invalid_request}, {PAT with workspaces:read only -> 403 insufficient_scope}, {stranger -> 404 not_found}, {PAT with forge:write only -> 200}: assert status and error_type"
+          }
+        },
+        {
+          "id": "REQ-9.4",
+          "pattern": "event_driven",
+          "condition": "the maintenance loop runs the task `forge_delivery_pruning`, once at start and then every hour",
+          "action": "delete every delivery of every workspace whose `received_at` is more than 7 days before the pass and keep the others",
+          "contract": "after a pass the list shows no delivery older than 604,800 seconds and still shows one received exactly 604,800 seconds before; a pruned id sent again is recorded as a new delivery; the task is registered under the name `forge_delivery_pruning`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the maintenance registry of internal/maintenance and a replaceable clock"
+            ],
+            "pseudocode": "in internal/forge/delivery_log_test.go: with clock T record deliveries at T-8d, T-7d-1s, T-7d, T-1h in two workspaces; run the task function registered with the maintenance registry under forge_delivery_pruning; assert the ids at T-8d and T-7d-1s are gone and those at T-7d and T-1h remain; Record the T-8d id again -> its own outcome (not duplicate)"
+          }
+        },
+        {
+          "id": "REQ-9.5",
+          "pattern": "unwanted",
+          "condition": "the pruning task cannot delete from the store",
+          "action": "return the error to the maintenance loop, delete nothing in that pass and delete the same deliveries at the next pass",
+          "contract": "the task function returns a non-nil error and the delivery count is unchanged; the next pass against a working store removes the deliveries older than 7 days",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/forge/delivery_log_test.go: run the pruning task against a store whose delete statement fails (a closed database handle); assert err != nil; reopen; assert the old deliveries still exist; run the task again; assert they are gone"
+          }
+        },
+        {
+          "id": "REQ-9.6",
+          "pattern": "event_driven",
+          "condition": "a workspace is deleted through the workspace delete transaction",
+          "action": "delete all its deliveries in that transaction, so that a slug registered again starts with an empty log and accepts earlier delivery ids as new",
+          "contract": "after the delete commits the store holds no delivery of the slug; when the delete transaction rolls back the deliveries are still there; the deliveries of other workspaces are untouched",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the registry of removers of owned data of internal/workspace"
+            ],
+            "pseudocode": "in internal/forge/delivery_log_test.go: record 3 deliveries for demo and 1 for other; call the remover this package registers with the workspace remover registry inside a transaction for demo and commit; assert count(deliveries demo) == 0 and count(other) == 1; Record(demo, an earlier id) -> not duplicate; repeat with a rollback and assert count(deliveries demo) == 3"
+          }
+        },
+        {
+          "id": "REQ-9.7",
+          "pattern": "ubiquitous",
+          "action": "for any repository workspace, report through the provider registered with package 41's forge component (SetLastDeliveryProvider) the `received_at` of the newest recorded delivery, or that there is none, so that the diagnostic route `GET /api/v1/workspaces/{slug}/forge` answers it as `webhook.last_delivery_at` beside the `configured` and `url` that package 41 computes",
+          "contract": "the diagnostic route's `webhook` member is {configured: false, url, last_delivery_at: null} before a secret is set, has `configured` true after the `PUT`, carries the newest delivery's `received_at` after a delivery, and has `configured` false again after the `DELETE` while `last_delivery_at` keeps its value; after every delivery is pruned `last_delivery_at` is null",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/forge/delivery_log_test.go, with this package's provider registered through SetLastDeliveryProvider: w = GET(/workspaces/demo/forge).json.webhook; assert w == {configured: false, url: \"https://hub.example.com/hooks/forge/demo\", last_delivery_at: null}; PUT the secret; assert configured true; record deliveries at 09:00:00Z and 09:12:03Z; assert last_delivery_at == \"…T09:12:03Z\"; DELETE the secret; assert configured false and last_delivery_at unchanged; call the provider for a slug without deliveries and assert it reports none and no error; advance the clock 8 days, run the pruning task and assert last_delivery_at == null"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-10",
+      "title": "Manage the webhook and read the log from the shell",
+      "rationale": "The developer who pastes the URL and the secret into the forge's settings works from a terminal.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-10.1",
+          "pattern": "event_driven",
+          "condition": "a user runs `parley forge webhook set <workspace-slug>` with no flag or with `--generate`",
+          "action": "send `PUT /api/v1/workspaces/<slug>/forge/webhook` with no body, print the hub's answer on stdout, and, when the answer contains `secret`, write a note on stderr that the secret will not be shown again",
+          "contract": "one PUT request without a body; stdout is the response document indented by 2 spaces; stderr holds a line saying the secret will not be shown again; exit status 0",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/forge_test.go against an httptest server that answers {configured: true, url: U, secret: 64 hex}: out, errOut, code = run(\"forge\", \"webhook\", \"set\", \"demo\"); assert the server saw PUT /api/v1/workspaces/demo/forge/webhook with an empty body; assert json(out) equals the answer; assert errOut contains \"will not be shown again\"; assert code == 0; the same with --generate; a slug `a/b` is sent as the path segment a%2Fb"
+          }
+        },
+        {
+          "id": "REQ-10.2",
+          "pattern": "event_driven",
+          "condition": "a user runs `parley forge webhook set <workspace-slug>` with `--secret <string>` or with `--from-stdin`",
+          "action": "send the `PUT` with the body `{\"secret\": <value>}`, where `--from-stdin` reads all of stdin and drops one trailing line break, and print the hub's answer without the stderr note when the answer has no `secret`",
+          "contract": "the request body is {secret: value}; with stdin `s3cret-value-0123\\n` or `s3cret-value-0123\\r\\n` the value is `s3cret-value-0123`, with stdin `abc\\n\\n` it is `abc\\n`; stderr does not mention the secret; exit status 0",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/forge_test.go against a server that answers {configured: true, url: U}: run(\"forge\", \"webhook\", \"set\", \"demo\", \"--secret\", \"s3cret-value-0123\"); assert body == {secret: s3cret-value-0123}, code 0 and errOut does not contain \"shown again\"; a table over stdin {\"s3cret-value-0123\\n\", \"s3cret-value-0123\\r\\n\", \"s3cret-value-0123\", \"abc\\n\\n\"} with --from-stdin: assert the sent secret equals the expectation of the row"
+          }
+        },
+        {
+          "id": "REQ-10.3",
+          "pattern": "unwanted",
+          "condition": "more than one of `--secret`, `--from-stdin` and `--generate` is given, or the slug argument is missing",
+          "action": "fail before any request is sent",
+          "contract": "exit status 2; stderr holds the error envelope with code 0 and `error_type` `usage_error`; stdout is empty; the hub receives no request",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/forge_test.go, a table over args {--secret x --generate}, {--secret x --from-stdin}, {--from-stdin --generate}, {all three}, {no slug}: out, errOut, code = run(\"forge\", \"webhook\", \"set\", args...); assert code == 2, out == \"\", json(errOut).error.error_type == usage_error and the server saw zero requests"
+          }
+        },
+        {
+          "id": "REQ-10.4",
+          "pattern": "event_driven",
+          "condition": "a user runs `parley forge webhook unset <workspace-slug>` and the hub answers 204",
+          "action": "send `DELETE /api/v1/workspaces/<slug>/forge/webhook` and print the confirmation document",
+          "contract": "stdout is the JSON document {\"status\": \"unset\", \"workspace\": \"<slug>\"}; exit status 0; when the hub answers an error, stdout is empty, stderr holds the hub's envelope and the exit status is 1",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/forge_test.go: server answers 204: out, _, code = run(\"forge\", \"webhook\", \"unset\", \"demo\"); assert the server saw DELETE /api/v1/workspaces/demo/forge/webhook; assert json(out) == {status: unset, workspace: demo} and code == 0; server answers 400 fork_has_no_origin: assert out == \"\", json(errOut).error.error_type == fork_has_no_origin and code == 1"
+          }
+        },
+        {
+          "id": "REQ-10.5",
+          "pattern": "event_driven",
+          "condition": "a user runs `parley forge deliveries <workspace-slug>` with any of `--since <rfc3339>`, `--limit <n>` and `--cursor <cursor>`",
+          "action": "send `GET /api/v1/workspaces/<slug>/forge/deliveries` with a query parameter for each flag that was given and none for a flag that was not, and print the hub's answer",
+          "contract": "the request's query holds exactly the given flags as `since`, `limit` and `cursor`; stdout is the list document; exit status 0",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/forge_test.go: run(\"forge\", \"deliveries\", \"demo\"); assert the request has an empty query and stdout is the server's {items, next_cursor}; run with --since 2026-10-21T09:00:00Z --limit 10 --cursor abc; assert query == {since: 2026-10-21T09:00:00Z, limit: 10, cursor: abc}; code == 0"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "A developer sets the webhook, the forge delivers and redelivers, and the delivery is read back",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "runs `parley forge webhook set demo`"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends PUT /api/v1/workspaces/demo/forge/webhook with no body"
+        },
+        {
+          "actor": "parleyd",
+          "action": "generates a secret, stores it as the workspace secret FORGE_WEBHOOK_SECRET, writes parley.forge.webhook.set and answers 200 with the URL and the secret"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints the answer and notes on stderr that the secret will not be shown again"
+        },
+        {
+          "actor": "forge",
+          "action": "posts a GitHub `issues` `labeled` delivery, signed with the secret, to /hooks/forge/demo"
+        },
+        {
+          "actor": "parleyd",
+          "action": "verifies the signature, reduces the payload, records the delivery and appends parley.forge.issue.labeled in one transaction, and answers 202 with outcome relayed"
+        },
+        {
+          "actor": "forge",
+          "action": "posts the same delivery again"
+        },
+        {
+          "actor": "parleyd",
+          "action": "finds the delivery id recorded and answers 202 with outcome duplicate, writing nothing"
+        },
+        {
+          "actor": "developer",
+          "action": "runs `parley forge deliveries demo` and reads the event log of the workspace"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers one delivery with outcome relayed and one parley.forge.issue.labeled event"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parley CLI command tree and HTTP client",
+          "parleyd HTTP server with authentication, access rule and the public ingress route",
+          "webhook secret management, ingress, reduction and delivery record in internal/forge",
+          "secret component with an encryption key",
+          "transactional store",
+          "event log"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 as the end-to-end tests of package 01 do, with a secret encryption key and server.external_url set",
+          "a developer U and a ready repository workspace demo cloned from a test origin served under the path /acme/widgets.git, so that its origin repository is acme/widgets",
+          "an httptest server set as the workspace's forge_api_url that counts the requests it receives"
+        ],
+        "end_state": [
+          "the set command printed a 64-character hex secret and a url ending in /hooks/forge/demo",
+          "the first delivery was answered 202 relayed and the second 202 duplicate",
+          "`parley forge deliveries demo` prints exactly one item, with outcome relayed, target origin and relayed [parley.forge.issue.labeled]",
+          "the event log of demo holds exactly one parley.forge.issue.labeled, with actor_type forge and metadata.delivery_id the delivery's id, and one parley.forge.webhook.set",
+          "the forge API server received zero requests"
+        ],
+        "pseudocode": "in test/e2e/forge_webhook_test.go: out, errOut = parley(U, \"forge\", \"webhook\", \"set\", \"demo\"); assert out.secret matches ^[0-9a-f]{64}$ and out.url == hubURL + \"/hooks/forge/demo\" and errOut mentions that it is not shown again; body = github issues/labeled payload for acme/widgets; sig = \"sha256=\" + hex(hmac_sha256(out.secret, body)); r1 = POST(out.url, body, X-Hub-Signature-256 sig, X-GitHub-Delivery d1, X-GitHub-Event issues) with no Authorization; assert r1.status == 202 and r1.json.outcome == relayed; r2 = the same request; assert r2.json.outcome == duplicate; list = parley(U, \"forge\", \"deliveries\", \"demo\"); assert len(list.items) == 1 and list.items[0].outcome == relayed; ev = GET(U, /events/log?workspace=demo&types=parley.forge.*); assert the types are [parley.forge.webhook.set, parley.forge.issue.labeled]; assert forgeAPI.requests == 0"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "A GitLab label update is relayed as ordered events, and an unset webhook stops the ingress",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "sets a secret of their own with `parley forge webhook set demo --secret <value>` and enters it as the token on GitLab"
+        },
+        {
+          "actor": "parleyd",
+          "action": "stores the given secret and answers without showing it"
+        },
+        {
+          "actor": "forge",
+          "action": "posts an `Issue Hook` `update` with the token header: a changed title, one removed label and two added labels"
+        },
+        {
+          "actor": "parleyd",
+          "action": "compares the token, records the delivery and appends parley.forge.issue.edited, one .unlabeled and two .labeled events in that order in one transaction, and answers 202 relayed"
+        },
+        {
+          "actor": "developer",
+          "action": "runs `parley forge webhook unset demo`"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends the DELETE and prints {\"status\":\"unset\",\"workspace\":\"demo\"}"
+        },
+        {
+          "actor": "parleyd",
+          "action": "removes the secret and writes parley.forge.webhook.unset"
+        },
+        {
+          "actor": "forge",
+          "action": "posts another delivery with the old token"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers 404 not_found and records nothing; the earlier delivery stays listed"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "parley CLI command tree and HTTP client",
+          "parleyd HTTP server with the public ingress route",
+          "GitLab mapping, reduction and delivery record in internal/forge",
+          "secret component with an encryption key",
+          "transactional store",
+          "event log"
+        ],
+        "setup": [
+          "a hub started in-process on 127.0.0.1:0 with a secret encryption key",
+          "a developer U and a ready repository workspace demo whose origin repository is acme/widgets"
+        ],
+        "end_state": [
+          "the event log of demo holds, in ascending seq, parley.forge.issue.edited, parley.forge.issue.unlabeled and two parley.forge.issue.labeled events in label-name order, all with the same metadata.delivery_id",
+          "the delivery posted after the unset was answered 404 with error_type not_found",
+          "the deliveries list still holds exactly the one relayed delivery, with forge gitlab and four entries in relayed"
+        ],
+        "pseudocode": "in test/e2e/forge_webhook_test.go: out = parley(U, \"forge\", \"webhook\", \"set\", \"demo\", \"--secret\", \"gitlab-token-0123456789\"); assert 'secret' not in out; body = gitlab Issue Hook update for acme/widgets with changes.title and labels previous [old] current [beta, alpha]; r = POST(hubURL + \"/hooks/forge/demo\", body, X-Gitlab-Token gitlab-token-0123456789, X-Gitlab-Event \"Issue Hook\", X-Gitlab-Event-UUID u1); assert r.status == 202 and r.json.outcome == relayed; ev = GET(U, /events/log?workspace=demo&types=parley.forge.issue.*); assert [e.type, e.metadata.label] == [[edited, -], [unlabeled, old], [labeled, alpha], [labeled, beta]]; out = parley(U, \"forge\", \"webhook\", \"unset\", \"demo\"); assert out == {status: unset, workspace: demo}; r = POST(same url, body, same token, X-Gitlab-Event-UUID u2); assert r.status == 404 and r.json.error.error_type == not_found; list = GET(U, /workspaces/demo/forge/deliveries); assert len(list.items) == 1 and list.items[0].forge == gitlab and len(list.items[0].relayed) == 4"
+      }
+    }
+  ]
+}

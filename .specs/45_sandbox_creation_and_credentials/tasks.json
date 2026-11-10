@@ -1,0 +1,310 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "45",
+  "spec_name": "sandbox_creation_and_credentials",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/sandbox/... ./internal/cli/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "44",
+      "reason": "uses the runtime client interface and its fake, the profiles and configured credentials, the [sandbox] limits and the route guard with the feature check and authorization rules"
+    },
+    {
+      "spec": "15",
+      "reason": "uses the fork record and implements the sandbox component interface its create route calls"
+    },
+    {
+      "spec": "39",
+      "reason": "uses the secret store whose values become credentials and exposed secrets, and its unavailable error"
+    },
+    {
+      "spec": "08",
+      "reason": "calls the minting component for the hub credential and relies on the binding guard on its routes"
+    },
+    {
+      "spec": "06",
+      "reason": "uses the scope check and revokes the hub credential by its token id inside its own transaction"
+    },
+    {
+      "spec": "40",
+      "reason": "calls the function that resolves a secret name along the chain of a workspace or fork"
+    },
+    {
+      "spec": "52",
+      "reason": "writes parley.sandbox.create, parley.sandbox.ready and parley.sandbox.fail through the event component with their state changes"
+    },
+    {
+      "spec": "09",
+      "reason": "builds the three commands on the HTTP client, output, exit codes and --wait helper"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Store sandbox records and move them through one conditional transition",
+      "criteria": [
+        "REQ-1"
+      ],
+      "steps": [
+        "Add the record, transition and object behaviours to internal/sandbox/state_test.go and internal/sandbox/object_test.go against a real store and event log with a fixed clock, and confirm they fail",
+        "Register the sandbox schema step with the store of package 03: one row per sandbox with every field of the sandbox object except runtime_reachable, plus the internal fields of the PRD's paragraph 'Stored with the record and not shown': the profile snapshot (ttl, idle_timeout, checkpoint, allow_proposals, hub_access, the profile's env, the base policy document, the required and optional credential and exposed-secret names with each credential's provider profile), the copies of the recorded workspace rule bodies, the id of the hub credential's token, the owner's user id, the organization id and the family root slug used by the quotas, the provisioning marker (create or start), the created-at-the-runtime mark, the runtime-caused-provisioning mark and the time the sandbox last became ready",
+        "Generate ids as sbx_ followed by 32 lowercase hexadecimal characters from a cryptographic random source",
+        "Implement the store operations other sandbox packages use: insert inside a given transaction, get by workspace and id, get by id, list by state, removal of a record inside a given transaction, and update of single fields (checkout, checkpoint, exit_code, expires_at, purpose, labels, hub_access, credentials, exposed_secrets, policy_revision, last_activity_at, hub credential token id, the markers)",
+        "Implement the transition operation: given a transaction or none, an id, the expected state, the target state, a reason and an optional event, update the row only where the stored state equals the expected one, set updated_at and, for failed, completed, stopped and deleted, ended_at, and write the event through the event component of package 52 in the same transaction; report whether it applied",
+        "Hold the allowed pairs in one table (provisioning to ready and failed; ready to completed, failed, stopped and provisioning; stopped, completed and failed to provisioning; every state but deleted to deleted) and return the invalid-transition error for any other pair and the not-found error for an unknown id",
+        "In the transition operation keep the time of the applied transition to ready when none is kept, and on an applied transition from ready to stopped, completed, failed or deleted observe the seconds since then in parley_sandbox_seconds through the metrics recorder of package 44 and clear the kept time",
+        "Give every sandbox event resource_type sandbox, resource_id the sandbox id, the sandbox's workspace and its session_id",
+        "Render the sandbox object from a record and a runtime-reachable flag with all 31 members present, empty lists and maps as [] and {}, and timestamps in RFC 3339 UTC with whole seconds",
+        "Export the working directory path /workspace as one constant of internal/sandbox",
+        "Create internal/sandbox/hooks.go with the two lists packages 46 and 48 register with and package 47 runs: delete hooks and purge hooks, each a function taking the transaction and the sandbox id, with a registration function and a run function per list that stops at the first error"
+      ],
+      "touches": [
+        "internal/sandbox/record.go",
+        "internal/sandbox/store.go",
+        "internal/sandbox/state.go",
+        "internal/sandbox/object.go",
+        "internal/sandbox/state_test.go",
+        "internal/sandbox/object_test.go",
+        "internal/sandbox/hooks.go"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Accept a create request, apply the defaults and refuse what is invalid",
+      "criteria": [
+        "REQ-2.1",
+        "REQ-2.2",
+        "REQ-2.3",
+        "REQ-2.4",
+        "REQ-2.5",
+        "REQ-2.6",
+        "REQ-2.8"
+      ],
+      "steps": [
+        "Add the creation, defaults, validation, session, workspace-state and event behaviours to internal/sandbox/create_test.go and internal/sandbox/create_refuse_test.go against a hub built in-process with the fake runtime of package 44, and confirm they fail",
+        "Register POST /api/v1/workspaces/{slug}/sandboxes through the route guard of package 44 with the scope sandboxes:write and the need write, and as a creating route for the idempotency support of package 02; refuse the admin token with 403 forbidden before the body is read",
+        "Write the create operation as one function that takes the caller, the workspace record, the raw body, optional defaults for session_id and purpose, and an optional open transaction, so that the route and the fork component share it; without a given transaction it opens and commits its own",
+        "Parse the body: absent is {}, null members count as absent, unknown members are ignored; pick the profile (the one marked default when absent; with none marked, answer 400 with a message listing the configured names)",
+        "Validate in this order and answer 400 invalid_request for the first failure: profile, ttl (a duration from 1 minute to the profile's ttl), command (1 to 256 non-empty strings), env (map of strings, at most 64 entries, key plus value at most 8,192 bytes, key an environment variable name, not starting with PARLEY_ or OPENSHELL_, not a name in the profile's expose_secrets or optional_expose_secrets), labels (the label rules), purpose (at most 200 code points), checkout (false or an object with string members; branch only on a fork and a valid branch name; ref resolving to a commit in the workspace's repository through internal/gitrepo), restore_from (a sandbox of the same workspace whose latest checkpoint has ok true; not with checkout false or hub_access none)",
+        "Export the ttl rule (bounds, expires_at as now plus ttl cut to a fork's expires_at) as a function package 47 can call",
+        "Define the session linker interface SessionLinker with a registration function: a check (caller, session id, workspace slug) and a record (the open transaction, the session id, the workspace slug and the sandbox id); answer 400 unknown_session when the check refuses or no linker is registered; record the link in the creating transaction when the sandbox has a session; default session_id to the fork's session when the workspace is a fork that has one",
+        "Apply the state guard of package 10 after validation: 409 workspace_archived, parent_archived or workspace_not_ready",
+        "Store the record in state provisioning with the whole profile snapshot of the record (image, cpu, memory, gpu and idle timeout in seconds for the object; ttl, checkpoint, allow_proposals, hub_access, env, base policy document and the credential and exposed-secret lists for later use), the provisioning marker set to create, created_by from the caller, and created_at, updated_at and last_activity_at equal to the clock's time; compute checkout as {path, ref, sha, branch} from the request, the fork's name and base branch and the repository, or null (the condition is completed by the hub-credential task)",
+        "Write parley.sandbox.create through the event component in the same transaction with the nine metadata members, command reduced to its first argument; a failing event write fails the request with 500 and stores nothing",
+        "Answer 201 with the sandbox object and wake the provisioner after the commit"
+      ],
+      "touches": [
+        "internal/sandbox/create.go",
+        "internal/sandbox/validate.go",
+        "internal/sandbox/routes.go",
+        "internal/sandbox/create_test.go",
+        "internal/sandbox/create_refuse_test.go"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Enforce the four sandbox quotas atomically",
+      "criteria": [
+        "REQ-3"
+      ],
+      "steps": [
+        "Add the quota behaviours to internal/sandbox/quota_test.go, including the run of 12 concurrent creates against a store on a file, and confirm they fail",
+        "Count sandboxes in state provisioning or ready inside the transaction that inserts the new one: over the hub, over the organization id stored on the records, over the family root slug (the parent's slug for a fork, the slug itself otherwise), and over the creating user's id",
+        "Compare each count with max_sandboxes, max_per_org, max_per_workspace and max_per_user of package 44's configuration in that order and refuse at the first limit whose count is not below its value",
+        "Skip the per-organization limit for a workspace that has no organization",
+        "Make count and insert atomic: run them in one write transaction of the store so that two requests cannot both read the same count",
+        "Answer 429 sandbox_capacity with the extra members limit, maximum and current in the error object and the message `sandbox limit reached: <limit>`, through the error helper of package 02 that carries extra members",
+        "Export the quota check as a function that takes a transaction, the workspace record and the creating user, so that package 47 applies it at start"
+      ],
+      "touches": [
+        "internal/sandbox/quota.go",
+        "internal/sandbox/create.go",
+        "internal/sandbox/quota_test.go"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Resolve credentials and exposed secrets, scrub text, and settle the order of refusals",
+      "criteria": [
+        "REQ-4",
+        "REQ-2.7"
+      ],
+      "steps": [
+        "Add the resolution, refusal, leak and scrubbing behaviours to internal/sandbox/credentials_test.go and internal/sandbox/scrub_test.go, and the authorization and order table to internal/sandbox/create_refuse_test.go, and confirm they fail",
+        "Write one resolution step that, for a workspace and a profile, asks the resolver of package 40 for the secret of every credential in credentials and optional_credentials and for every name in expose_secrets and optional_expose_secrets, and returns the attached credentials with their values, the placed secrets with their values, the missing required credentials, the missing required secrets and the scopes the resolver searched",
+        "Run the step in the create operation after the workspace-state check and before the quota check; map the resolver's unavailable and undecryptable errors to 503 secrets_unavailable",
+        "When a required name is missing answer 422 credential_missing with the extra members credentials, secrets (both sorted) and scopes_searched; skip missing optional names",
+        "Store on the record only the sorted names: credentials and exposed_secrets; never a value",
+        "Implement the scrubbing function on top of internal/scrub: replace every exact occurrence of a credential secret, of an exposed secret of at least 8 bytes and of the hub credential by [redacted], longer values first, then cut to 1,024 bytes at a UTF-8 boundary",
+        "Keep a per-sandbox list of values to scrub in memory, filled at provisioning; when it is empty for a sandbox (after a restart) fill it by resolving the names on the record again; export it and the scrubbing function so that package 46 scrubs stored logs and packages 47 and 48 scrub runtime error text with them",
+        "Route every error text this package logs, stores in an event or returns for a sandbox through the scrubbing function",
+        "Confirm the full order of refusals with the table of adjacent pairs: feature, scope, access, admin token, body, session, workspace state, secret store, missing secrets, quotas"
+      ],
+      "touches": [
+        "internal/sandbox/credentials.go",
+        "internal/sandbox/scrub.go",
+        "internal/sandbox/create.go",
+        "internal/sandbox/credentials_test.go",
+        "internal/sandbox/scrub_test.go",
+        "internal/sandbox/create_refuse_test.go"
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Mint the hub credential with no more than the creator's access",
+      "criteria": [
+        "REQ-5"
+      ],
+      "steps": [
+        "Add the hub-credential behaviours to internal/sandbox/hubcred_test.go with the real minting component and a spy around it, and confirm they fail",
+        "Compute the scopes as the intersection of git:read, git:write, changes:read, changes:write, sessions:write and audit:write with what the creating credential holds, using the scope check of package 06 (an API key holds all), sorted; take paths from the creating credential, null when it has none",
+        "Decide that the sandbox has hub access only when the profile's hub_access is fork, the scopes are not empty and [server].external_url is not empty; otherwise store hub_access null and checkout null and mint nothing",
+        "Inside the creating transaction call MintBound, the minting component of package 08 and the only way this package mints, with the creating user as owner, the sandbox's workspace as binding, a name derived from the sandbox id, the computed scopes and paths and the sandbox's expires_at as expiry instant; store the token id on the record and hub_access {scopes, paths, expires_at} for the object",
+        "Hand the token value to the provisioner through an in-memory table keyed by sandbox id; never store or log it, and add it to the sandbox's list of values to scrub",
+        "On an error of the minting component fail the creation with 500 internal and roll everything back",
+        "Set checkout to null when the scopes do not include git:read, completing the condition left open in the create operation",
+        "Export the helpers package 47 uses at start, stop and delete: mint a replacement with the stored scopes, paths and a given expiry on behalf of the owning user through MintBound of package 08, and revoke the stored token by its id through RevokeTokenByID(tx, token_id), the revocation by id that package 06 exports from internal/identity, inside a given transaction; add nothing to internal/identity"
+      ],
+      "touches": [
+        "internal/sandbox/hubcred.go",
+        "internal/sandbox/create.go",
+        "internal/sandbox/hubcred_test.go"
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Provision a stored sandbox at the runtime until it is ready or failed",
+      "criteria": [
+        "REQ-6"
+      ],
+      "steps": [
+        "Add the provisioning behaviours to internal/sandbox/provision_test.go and internal/sandbox/metrics_test.go against the fake runtime, with faults injected at each step, and confirm they fail",
+        "Run one provisioner per hub: it looks for records with a provisioning marker when it is woken, every second by the replaceable clock, and once from a start hook of package 03; it works each sandbox at most once at a time and at most 8 at once",
+        "For each sandbox, under a context that ends after 10 minutes: resolve the secrets again; when the in-memory hub credential value is missing, delete whatever the runtime holds under the sandbox's label, revoke the stored token and mint a replacement with the stored scopes, paths and expiry",
+        "Register one provider per attached credential with EnsureProvider, its provider profile and secret value, and one for the hub credential with the hub provider profile package 44 installed; label everything with the sandbox id; export the protected rules of a sandbox: the hub rule (the hub credential's provider on the scheme, host and port of [server].external_url, for the API and git routes of the sandbox's workspace only) when it has a hub credential, then one rule naming the provider of each attached credential in the order of the credentials list",
+        "Define the workspace rule provider interface and the policy composer interface (Compose: sandbox record to policy value or error; Explain: sandbox record and the runtime's refusal to an error text), each with a registration function; ask the rule provider in the creating transaction for the rules of the family root and record their ids in workspace_rules and their bodies with the record; the default composer returns the snapshot's base policy with the protected rules and no added rule, and returns a refusal unchanged",
+        "Build the environment in the order caller env, profile env, exposed secrets, provider placeholder variables as the runtime client reports them, then the PARLEY_ variables, later entries replacing earlier ones; leave out PARLEY_SESSION_ID without a session and the three hub variables without hub access",
+        "Call CreateSandbox with the profile snapshot, the policy value of the registered composer (a composer error is a failed step), the providers, the working directory and the environment, and set the created-at-the-runtime mark; when the runtime refuses the policy value as invalid, use the composer's Explain text as the error; then run the checkout step and the restorer (both filled in by the checkout task) and call RunMain when command is set",
+        "On success clear the marker and move provisioning to ready through the transition operation with parley.sandbox.ready (actor system, metadata checkout)",
+        "On any failure, including the ended context, map the step to credential_missing, checkout_failed or provision_failed; delete the runtime sandbox and providers with a fresh context of 30 seconds; revoke the hub credential; clear the marker; move provisioning to failed with parley.sandbox.fail (actor system, metadata reason and the scrubbed error)",
+        "When the transition reports that it did not apply, change nothing in the record, write no event and do the same runtime clean-up and revocation",
+        "Report through the metrics recorder of package 44: add 1 to parley_sandbox_creates_total{result} for applied ready and failed transitions, and set parley_sandboxes{state} for the five states from the store's counts after every insert, applied transition and removal of a record",
+        "Stop the provisioner on hub shutdown by cancelling its context without changing any record, so that the marker makes the next start resume the work"
+      ],
+      "touches": [
+        "internal/sandbox/provision.go",
+        "internal/sandbox/environment.go",
+        "internal/sandbox/metrics.go",
+        "internal/sandbox/create.go",
+        "internal/sandbox/provision_test.go",
+        "internal/sandbox/metrics_test.go"
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Check the repository out in the sandbox before it becomes ready",
+      "criteria": [
+        "REQ-7"
+      ],
+      "steps": [
+        "Add the checkout behaviours to internal/sandbox/checkout_test.go, reading the commands the fake runtime recorded, and confirm they fail",
+        "Run the checkout as commands in the sandbox through the runtime client's exec, in the working directory, only when the record's checkout is not null",
+        "First configure git globally: a credential helper for the hub's scheme and host that prints the username x-token-auth and the content of the environment variable PARLEY_API_KEY as password; pass the variable's name, never the value",
+        "Clone PARLEY_REMOTE into the working directory with the filter blob:none and without checking out files",
+        "For a fork: when the remote has a branch named checkout.branch, check it out as it is; otherwise create the branch at the remote's checkout.ref and check it out. For a workspace that is not a fork: check out checkout.ref and create no branch",
+        "Set user.name and user.email in the clone to the creating user's name and e-mail from the user record",
+        "Read the commit id of HEAD in the sandbox and store it as checkout.sha before the ready transition",
+        "Treat a non-zero exit code or an exec error of any of these commands as a failed step with the reason checkout_failed, with the scrubbed stderr as the error text",
+        "Define the restorer interface (new sandbox, source sandbox) and call it once after the checkout and before the main process when restored_from is set; fail the provisioning with provision_failed when it returns an error or none is wired"
+      ],
+      "touches": [
+        "internal/sandbox/checkout.go",
+        "internal/sandbox/provision.go",
+        "internal/sandbox/checkout_test.go"
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Read one sandbox, wait for it, and list a workspace's sandboxes",
+      "criteria": [
+        "REQ-8"
+      ],
+      "steps": [
+        "Add the read, wait, list and authorization behaviours to internal/sandbox/read_test.go and confirm they fail",
+        "Register GET /api/v1/workspaces/{slug}/sandboxes and GET /api/v1/workspaces/{slug}/sandboxes/{id} through the route guard of package 44 with the scope sandboxes:read and the need read",
+        "Get: answer 404 sandbox_not_found for an id that is malformed, unknown or of another workspace; otherwise 200 with the object, runtime_reachable taken from the runtime client",
+        "Validate wait_for and wait together (both or neither, wait_for ready or ended, wait a whole number from 1 to 60) and answer 400 invalid_request otherwise",
+        "Hold a waiting request until the state satisfies the condition, the wait has passed on the replaceable clock, or the request's context ends; learn of changes from a notification the transition operation sends after each applied transition, with a re-read of the record every second as a fallback",
+        "List: parse state (repeatable, each one of the six states; default all but deleted), session_id, label (key=value, repeatable, all must match), include_forks (true or false), limit and cursor with the list helper of package 02; answer 400 invalid_request for a value outside these forms",
+        "With include_forks on a workspace that is not a fork, add the sandboxes of those forks for which the access component gives the caller read access and which the caller's binding covers",
+        "Order by created_at descending and id descending and page with a cursor over that pair",
+        "Implement the sandbox source of package 44 over the record store (filters state and creating user id, position (created_at, id), limit; objects rendered with runtime_reachable from the client's flag) and register it with RegisterSource, so that GET /sandboxes lists the stored sandboxes of every workspace"
+      ],
+      "touches": [
+        "internal/sandbox/read.go",
+        "internal/sandbox/routes.go",
+        "internal/sandbox/state.go",
+        "internal/sandbox/read_test.go"
+      ],
+      "depends_on": [
+        2
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Create the sandbox inside the fork-create call and wire the package into parleyd",
+      "criteria": [
+        "REQ-9"
+      ],
+      "steps": [
+        "Add the fork-and-sandbox behaviours to internal/sandbox/forkcomponent_test.go with the real fork component of package 15, and the two end-to-end flows to test/e2e/sandbox_create_test.go, and confirm they fail",
+        "Implement the sandbox component interface that package 15 defines in internal/fork: given the context, the open transaction, the caller, the fork record, the raw sandbox member and the fork's session_id and purpose, call the create operation with that transaction and those defaults and return the sandbox object as JSON or the API error",
+        "In the component, check the sandboxes:write scope of a PAT first and answer 403 insufficient_scope; cut a default purpose to its first 200 code points; skip the workspace access check, because the caller owns the fork",
+        "Do not wake the provisioner from inside the given transaction; the record becomes visible to the provisioner's one-second pass when the fork route commits",
+        "Drop an in-memory hub credential value whose sandbox has no stored record 60 seconds after the component returned",
+        "Return every refusal of the create operation unchanged, with status, error_type and extra members, and write nothing in the transaction in that case",
+        "In internal/hub/sandbox.go, when sandboxes are enabled: build the sandbox service with the store, the clock, the runtime client and the profiles of package 44, the metrics recorder the composition holds (the recorder of package 51 from internal/metrics, which satisfies the recorder interface of package 44; the default of package 44, which records nothing, as long as package 51 is not built), the resolver of package 40, MintBound of package 08 and the revocation by id of package 06, the event component of package 52 and the access component; register its routes and its sandbox source; register the provisioner's start hook and its stop; pass the component to the fork component of package 15; the session linker, the workspace rule provider, the policy composer, the restorer and the hooks are registered by their packages through the registration functions of this one",
+        "When sandboxes are not enabled wire none of this, so that the fork route answers 404 sandboxes_disabled and the routes are answered by the guard of package 44"
+      ],
+      "touches": [
+        "internal/sandbox/forkcomponent.go",
+        "internal/sandbox/forkcomponent_test.go",
+        "internal/hub/sandbox.go",
+        "test/e2e/sandbox_create_test.go"
+      ],
+      "depends_on": [
+        7
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Add the commands parley sandbox create, list and get",
+      "criteria": [
+        "REQ-10"
+      ],
+      "steps": [
+        "Add the command behaviours to internal/cli/sandbox_test.go against a fake hub served by net/http/httptest and confirm they fail",
+        "Declare the sandbox command group in internal/cli/sandbox.go with the command declaration of package 09, adding create, list and get to the group package 44 starts with profiles, or creating the group when it does not exist yet",
+        "create <workspace-slug> [-- command...]: exactly one argument before the dash; build the body from the flags that were given and from no others; split each --env and --label value at its first = and refuse an empty key or a missing =; --no-checkout sends checkout false, --ref and --branch send a checkout object; the arguments after the dash become command",
+        "Fail as a usage error before any request for: no slug, more than one argument before the dash, --wait-exit without a command, --no-checkout with --ref or --branch, a malformed --env or --label",
+        "With --wait, use the waiting helper of package 09 on GET /workspaces/<slug>/sandboxes/<id>: terminal states are every state but provisioning; ready and completed are successful",
+        "With --wait-exit (which turns waiting on): terminal states are completed, failed, stopped and deleted; only completed is successful",
+        "list <workspace-slug>: send one state and one label query parameter per flag occurrence, session_id, include_forks=true, limit and cursor for the flags given, and print the list document",
+        "get <workspace-slug> <id>: send the GET and print the sandbox object; percent-encode the slug and the id as single path segments through the client of package 09",
+        "Extend test/e2e/sandbox_create_test.go so that the create-and-wait flow runs the real command against the in-process hub"
+      ],
+      "touches": [
+        "internal/cli/sandbox.go",
+        "internal/cli/sandbox_test.go",
+        "test/e2e/sandbox_create_test.go"
+      ],
+      "depends_on": [
+        1
+      ]
+    }
+  ]
+}

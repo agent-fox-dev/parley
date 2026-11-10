@@ -1,0 +1,126 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "35",
+  "spec_name": "rebuild_rollback_and_preview",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/carrypatch/... ./internal/gitrepo/... ./internal/cli/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "34",
+      "reason": "rolls back to the previous_integration_head_sha a completed rebuild of that package recorded, and builds preview conflict reports with its exported report builder and conflict-file describer; through it uses the job record, job lookup and rebuild routes file of package 33 and the carry-patch workspace, patch list, upstream base, integration branch accessor and git runner of package 31"
+    },
+    {
+      "spec": "09",
+      "reason": "builds parley rebuild rollback and parley rebuild preview on its HTTP client, output, exit codes and the shared exit 3 of --fail-on flags"
+    },
+    {
+      "spec": "52",
+      "reason": "emits parley.rebuild.rollback through its event component"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Roll the integration branch back to the head before a completed rebuild",
+      "criteria": [
+        "REQ-1",
+        "REQ-2"
+      ],
+      "steps": [
+        "Build on what the earlier packages deliver and add only what is missing: the carry-patch route guard and IntegrationBranch of package 31, the rebuild job lookup and the route registration of package 33 in internal/carrypatch/rebuild_routes.go, the ref read and the compare-and-swap with ErrRefMoved that package 12 put into internal/gitrepo/refs.go, and the carry-patch git runner of package 31 for every git operation; the test that an object is a commit is added to internal/gitrepo/refs.go here",
+        "Add a test fixture to internal/carrypatch/rollback_test.go (a bare repository made with git in t.TempDir() with deploy at H2 and its parent H1, a ready carry-patch workspace my-fork in a real store, a completed job J2 with previous_integration_head_sha H1, a recording event emitter) and the tests TestRollbackRoute_RefusesCallersWithoutWriteAccess, TestRollbackRoute_RefusesNonCarryPatchWorkspace, TestRollbackRoute_RefusesByWorkspaceStatus, TestRollbackRoute_UnknownJob, TestRollback_Unavailable, TestRollback_MovesIntegrationBranch, TestRollback_LosesCompareAndSwap, TestRollback_CreatesMissingIntegrationBranch, TestRollback_ChangesIntegrationBranchOnly, TestRollback_EmitsEvent and TestRollback_ProceedsBesideARebuild; confirm they fail",
+        "Mount POST /api/v1/workspaces/{slug}/rebuilds/{id}/rollback in internal/carrypatch/rebuild_routes.go, where package 33 mounts the other rebuild routes, as a write route with scope rebuilds:write and need write, taking no body and no Idempotency-Key",
+        "After access, check in this order and answer with the first failure: the workspace is in carry-patch mode, else 400 workspace_mode_mismatch (a standard workspace and every task fork); the workspace status, else 409 workspace_busy, workspace_not_ready or workspace_archived as for every route that needs the repository; the job exists and belongs to this workspace, else 404 not_found with the message 'rebuild job not found' (an id that is not a UUID gets the same answer without a store error)",
+        "Answer 409 rollback_unavailable when the job's status is not completed, when its previous_integration_head_sha is null, or when that id does not name a commit object in the repository; test the object with the id passed as a revision argument that cannot be read as an option",
+        "Read the current head of refs/heads/<IntegrationBranch(workspace) of package 31>; move the ref to the target with one compare-and-swap against the head read, or, when the branch does not exist, create it with a compare-and-swap that expects it to be absent; when the branch already points at the target the compare-and-swap still runs and succeeds",
+        "On a lost compare-and-swap (ErrRefMoved) answer 409 ref_moved with details.current_sha set to the branch's head as read after the miss, and write nothing else",
+        "On success emit one parley.rebuild.rollback event through the event component after the ref has moved: resource_type rebuild, resource_id the job id, the workspace slug, the caller as actor, metadata integration_branch, rolled_back_to and previous_head_sha (null when the branch was created); then answer 200 with {rolled_back_to, previous_head_sha} as full 40-character ids",
+        "Write nothing else: no patch row, no job row, no other ref, no enqueue, no push to origin and no read of rebuild_push_integration_branch; do not consult the job queue's dedup, so a queued, running or failed job of the workspace does not change the answer",
+        "Give the rollback operation a test hook between the head read and the compare-and-swap so the lost race can be produced deterministically"
+      ],
+      "touches": [
+        "internal/carrypatch/rollback.go",
+        "internal/carrypatch/rollback_test.go",
+        "internal/gitrepo/refs.go",
+        "internal/gitrepo/refs_test.go",
+        "internal/carrypatch/rebuild_routes.go"
+      ],
+      "done_when": [
+        "`go test ./internal/carrypatch/... -run 'Rollback' -count=1` passes against real git repositories and a real store"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Predict the outcome of a rebuild patch by patch",
+      "criteria": [
+        "REQ-3",
+        "REQ-4"
+      ],
+      "steps": [
+        "Build on what the earlier packages deliver: UpstreamBase of package 31 (it reads refs only and never fetches), the patch store of package 31, and the exported conflict report builder of package 34 with its conflict-file describer, which takes the file entries from the report component of package 26, so that a preview report and a rebuild report are one type; package 34 merges in a scratch working tree and offers no merge without one, so the trial merge is added here",
+        "Add a preview fixture to internal/carrypatch/preview_test.go (a bare repository with refs/remotes/upstream/HEAD and upstream/main at U, a ready carry-patch workspace in a real store, helpers that create patch branches and patch rows) and the tests TestPreviewRoute_Access, TestPreviewRoute_RefusesNonCarryPatchWorkspace, TestPreviewRoute_RefusesByWorkspaceStatus, TestPreview_UpstreamUnknown, TestPreview_UsesLastFetchedBaseWithoutFetching, TestPreview_ListsTestedPatchesInPositionOrder, TestPreview_MissingBranchWouldSkip, TestPreview_CleanPatchJoinsPredictedState, TestPreview_ConflictingPatchIsLeftOut and TestPreview_ConflictReportShape; confirm they fail",
+        "Provide in internal/gitrepo/merge.go a trial merge of two commits in a bare repository that needs no working tree and moves no ref (git merge-tree --write-tree, available from git 2.38): it returns either the merged tree, or the conflicted paths with the stage entries of each, and it reports any other failure as an error distinct from a conflict; add its test to internal/gitrepo/merge_test.go with a clean case, a content conflict, an add/add conflict and a modify/delete conflict",
+        "Mount GET /api/v1/workspaces/{slug}/rebuild-preview in internal/carrypatch/rebuild_routes.go as a read route with scope rebuilds:read and need read, taking no query parameter",
+        "After access, check the carry-patch mode (400 workspace_mode_mismatch) and then the workspace status (409 workspace_busy, workspace_not_ready, workspace_archived), although the route is a read",
+        "Resolve the upstream base from the refs under refs/remotes/upstream/ only: the upstream's default branch, else the upstream branch named like the workspace's default_branch; when neither resolves answer 409 upstream_unknown; never start a fetch and never resolve credentials",
+        "List the non-deleted patches in position order, drop those in status disabled or merged_upstream, and read the tip of each remaining patch branch once, before the first merge",
+        "Walk the patches with a predicted state that starts at the upstream base: a missing branch gives would_skip; a trial merge of the tip onto the state without a conflict gives would_succeed, and the state becomes a commit of the merged tree with the state and the tip as parents, built with the hub's committer identity and pointed at by no ref; a conflict gives would_conflict and leaves the state unchanged",
+        "For a would_conflict patch set conflict_files to the conflicted paths in ascending order and conflict to the report, built with the report builder of package 34: patch_id, target_sha the state tested against, head_sha and commit_sha the patch tip, base_sha the merge base of state and tip, files with path, kind, base, ours (from the state), theirs (from the patch) and landed_by [], landed_changes [] and change null",
+        "Answer 200 with upstream_head_sha and patch_results, each entry carrying patch_id, branch_name, position, status, conflict_files (an empty array, never null, unless would_conflict) and conflict (null unless would_conflict); with no patch to test, patch_results is an empty array"
+      ],
+      "touches": [
+        "internal/carrypatch/preview.go",
+        "internal/carrypatch/preview_test.go",
+        "internal/gitrepo/merge.go",
+        "internal/gitrepo/merge_test.go",
+        "internal/carrypatch/rebuild_routes.go"
+      ],
+      "done_when": [
+        "`go test ./internal/carrypatch/... ./internal/gitrepo/... -run 'Preview|Merge' -count=1` passes against real git repositories"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Keep preview a prediction that changes nothing",
+      "criteria": [
+        "REQ-5"
+      ],
+      "steps": [
+        "Add TestPreview_TestsAMergeWhateverTheStrategy, TestPreview_IgnoresRememberedResolutions, TestPreview_ChangesNothing, TestPreview_AnswersBesideARebuild and TestPreview_GitFailureIsInternalError to internal/carrypatch/preview_test.go and confirm which fail",
+        "Make the preview operation independent of the workspace setting rebuild_strategy: it does not read the setting and always uses the trial merge of the patch tip",
+        "Run the trial merge so that it neither reads nor writes the repository's remembered resolutions: no rerere replay, no entry added to rr-cache",
+        "Make the preview operation write nothing to the store and emit no event: it takes read-only access to patches and jobs, updates no patch status or conflict_files, and never calls the enqueue or the event component; the only repository writes are unreferenced objects of the predicted state",
+        "Do not consult the job queue: a queued, running or failed job of the workspace does not change the answer",
+        "Put the trial merge behind a small interface of the preview operation so a test can substitute a failing one; map every git error that is not a conflict, ErrGitTimeout of the carry-patch git runner of package 31 included (every git operation of the preview runs through that runner, which holds the 10-minute limit), to 500 internal for the whole request, with no patch_results in the body; the error text is the runner's cleaned text and passes the hub's credential scrubbing before it is logged"
+      ],
+      "touches": [
+        "internal/carrypatch/preview.go",
+        "internal/carrypatch/preview_test.go"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Add the parley rebuild rollback and preview commands",
+      "criteria": [
+        "REQ-6"
+      ],
+      "steps": [
+        "Add TestRebuildRollback_PostsAndPrints, TestRebuildPreview_GetsAndPrints and TestRebuildPreview_FailOnConflict to internal/cli/rebuild_test.go against a stub hub and confirm they fail",
+        "Add the subcommand rollback to the rebuild command group of internal/cli/rebuild.go (package 33 creates the file and the group with submit, list, status, cancel and requeue): exactly two arguments, the workspace slug and the rebuild id; it sends POST /workspaces/<slug>/rebuilds/<id>/rollback with no body through the shared client, each argument as one percent-encoded path segment, and prints the answer as the one document on stdout",
+        "Add the subcommand preview to the same group: exactly one argument, the workspace slug, and the boolean flag --fail-on-conflict; it sends GET /workspaces/<slug>/rebuild-preview through the shared client with the default request timeout and prints the answer as the one document on stdout",
+        "With --fail-on-conflict, after printing and only when the request succeeded: collect the branch_name of every patch_results entry whose status is would_conflict and, when the collection is not empty, end through the CLI foundation's condition-not-met exit with a message that lists those names, so stderr carries the condition_not_met envelope and the exit code is 3",
+        "Leave errors to the foundation: a hub error is printed on stderr as received with exit 1 and nothing on stdout, a wrong argument count is a usage error with exit 2 before any request",
+        "Add the two end-to-end tests TestRebuildRollback_FromTheShell and TestRebuildPreview_FromTheShell to test/e2e/rebuild_rollback_preview_test.go, each starting a real hub in-process with an origin and an upstream served by internal/gitrepo/gitrepotest, and run them"
+      ],
+      "touches": [
+        "internal/cli/rebuild.go",
+        "internal/cli/rebuild_test.go",
+        "test/e2e/rebuild_rollback_preview_test.go"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,266 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "28",
+  "spec_name": "approvals_and_checks",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/policy/... ./internal/cli/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "09",
+      "reason": "builds its CLI commands on the client, output and exit-code helpers of the CLI foundation"
+    },
+    {
+      "spec": "22",
+      "reason": "registers a version observer, which hands over each version's creating credential, and the include expanders approvals and checks with its change component"
+    },
+    {
+      "spec": "27",
+      "reason": "uses the policy, the requirement object and the landing evaluator, which this package feeds with approval and check facts and calls to re-evaluate a change after each write"
+    },
+    {
+      "spec": "52",
+      "reason": "emits its hub events through the event log component"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Remember who created each version and decide whether a verdict counts",
+      "criteria": [
+        "REQ-3.1",
+        "REQ-3.2"
+      ],
+      "steps": [
+        "Add the counting tables to internal/policy/counting_test.go (the credential rule and the approver forms) and confirm they fail",
+        "Add a store migration, registered with internal/store as package 27 registers the policy tables, for three tables: verdicts (id, workspace, change, version, user id, username, credential type, credential id, verdict, comment, carried_from, created_at; unique on workspace, change, version, user id), check results (workspace, change, version, name, status, summary, url, details, reporter, updated_at; unique on workspace, change, version, name) and version creators (workspace, change, version, credential type, credential id)",
+        "Write the counting function as a pure function: given a verdict (user id, username, credential type and id, version), a requirement's approvers, the workspace's owner and organization members, and the creators of the change's versions, it answers whether the verdict counts",
+        "Approver forms: owner is the workspace's owner; member is every member of the workspace's organization; user:<username> matches the verdict's stored username exactly, case-sensitive; an empty approvers list matches nobody",
+        "Credential rule: the verdict does not count when a version numbered at or below the verdict's version has a creator with the same credential type and the same credential id; two credentials are equal only when both agree",
+        "A version whose created_by.actor_type is system has no creator and never excludes anyone; a version that is not hub-created and has no creator row excludes every verdict of its created_by user",
+        "Register a version observer with the change component of package 22 that, in the transaction that records a version, writes the creator row from the creating credential the observer is handed with the version (credential type api_key, pat or admin and its credential id), and writes none for a hub-created version, which carries no credential; do not read the request's authenticated caller for it; return any store error to the change component"
+      ],
+      "touches": [
+        "internal/policy/counting.go",
+        "internal/policy/counting_test.go",
+        "internal/policy/review_schema.go",
+        "internal/policy/creators.go"
+      ],
+      "done_when": [
+        "`go test ./internal/policy/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Record a verdict over REST",
+      "criteria": [
+        "REQ-1"
+      ],
+      "steps": [
+        "Add the behaviours of POST …/changes/:number/approvals to internal/policy/approval_routes_test.go and confirm they fail; put the shared test hub (server pipeline, authentication, scope check, binding guard, access rule, change component, policy component, store in t.TempDir(), recording event writer, users alice, bob and carol, workspace w1 and change 1) into internal/policy/review_testing_test.go",
+        "Register POST /api/v1/workspaces/{slug}/changes/{number}/approvals beside the policy routes of package 27, declaring the PAT scope changes:approve and the access need read; rely on package 08's guard for 403 token_bound and on packages 06 and 07 for 403 insufficient_scope and 404 not_found",
+        "Refuse the admin token with 403 forbidden before reading the body's content, so that a valid and an invalid body get the same answer",
+        "Check in this order: the change exists (404 change_not_found, also for a number that is not a positive integer); the body is a JSON object with verdict approve or reject, an optional comment of at most 16,000 Unicode code points, an optional positive integer version and no other member (400 invalid_request); the workspace is not archived (409 workspace_archived); the change is draft or open (409 change_closed); the version exists (404 not_found)",
+        "Store the verdict on the named version, or on the current version when none is named, in one store transaction: when the user has no verdict there answer 201; when the user has one, delete it and insert the new one with a new id, a new created_at and carried_from null and answer 200",
+        "Build the approval object with by {actor_type api_key or pat, actor_id, username} and counts_for computed at read time: for a verdict on the change's current version, the rule of every requirement in the change's stored landing for which the counting function of task 1 answers yes, in requirement order; for a verdict on another version, an empty array",
+        "In the same transaction call the re-evaluation of package 27 for the change and then hand one event to the event writer the change component uses: parley.change.approve or parley.change.reject, resource_type change, resource_id the number, the caller as actor, session_id null, metadata {version, approval_id, counts_for} with the counts_for of the response",
+        "Answer 500 internal and roll back when the store, the re-evaluation or the event writer fails"
+      ],
+      "touches": [
+        "internal/policy/approval.go",
+        "internal/policy/approval_routes.go",
+        "internal/policy/approval_routes_test.go",
+        "internal/policy/review_testing_test.go",
+        "cmd/parleyd"
+      ],
+      "done_when": [
+        "`go test ./internal/policy/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "List and withdraw verdicts",
+      "criteria": [
+        "REQ-2.1",
+        "REQ-2.4",
+        "REQ-2.5",
+        "REQ-2.6"
+      ],
+      "steps": [
+        "Add the list and withdraw behaviours to internal/policy/approval_routes_test.go and confirm they fail",
+        "Register GET /api/v1/workspaces/{slug}/changes/{number}/approvals with scope changes:read and need read: answer the list envelope of package 02 with approval objects ordered by created_at descending and then id descending, of every version, or of the version the query names",
+        "A version that is not a positive integer is 400 invalid_request; one the change does not have is 404 not_found; an unknown change is 404 change_not_found",
+        "Register DELETE /api/v1/workspaces/{slug}/changes/{number}/approvals/{id} with scope changes:approve and need read",
+        "Check in this order: the change exists (404 change_not_found); the workspace is not archived (409 workspace_archived); the change is draft or open (409 change_closed); the id names a verdict of this change (404 not_found, also for a string that is not a UUID); the caller is the verdict's user with any credential, the workspace's owner, or the admin token (403 forbidden)",
+        "Delete exactly that verdict, call the re-evaluation of package 27 in the same transaction, write no event of this package and answer 204 with an empty body"
+      ],
+      "touches": [
+        "internal/policy/approval.go",
+        "internal/policy/approval_routes.go",
+        "internal/policy/approval_routes_test.go"
+      ],
+      "done_when": [
+        "`go test ./internal/policy/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Give the landing evaluator the approval facts",
+      "criteria": [
+        "REQ-3.3",
+        "REQ-3.4",
+        "REQ-3.5",
+        "REQ-3.6",
+        "REQ-3.7"
+      ],
+      "steps": [
+        "Add the approval behaviours to internal/policy/facts_test.go and the creator behaviour to internal/policy/carry_test.go and confirm they fail; the tests set policies through PUT …/policy and read the result through the landing member of GET …/changes/:number",
+        "Implement the evidence source that package 27 declares in internal/policy/ports.go, in internal/policy/facts.go: asked per requirement with the workspace, the change, its current version, the requirement's approvers, its check names and its fresh_checks, it answers the number of approve verdicts on the change's current version that count and whether a reject verdict on the current version counts; install it with the registration function of package 27 where parleyd builds the policy component, in place of the source that answers nothing",
+        "Read only the verdicts stored on the current version, carried copies included; a verdict on any other version contributes nothing, so recording one leaves the landing as it was",
+        "Confirm that the evaluator of package 27 keeps a requirement unsatisfied while the evidence reports a counted reject, whatever the count of approvals; the rule is package 27's and is not written again here",
+        "Confirm through the routes that the creators written by task 1's observer take effect: an approval with the credential that created a version does not count, the same user's other credential does, and a hub-created version changes nothing",
+        "Confirm that counts_for follows a policy update and a new version without any write to the verdicts: it is computed from the change's stored landing at each read"
+      ],
+      "touches": [
+        "internal/policy/facts.go",
+        "internal/policy/facts_test.go",
+        "internal/policy/carry_test.go",
+        "internal/policy/creators.go",
+        "cmd/parleyd"
+      ],
+      "done_when": [
+        "`go test ./internal/policy/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Carry verdicts to patch-equivalent versions",
+      "criteria": [
+        "REQ-4"
+      ],
+      "steps": [
+        "Add the carry-over behaviours to internal/policy/carry_test.go and confirm they fail; versions are made with the change component's RecordVersion on a repository created with git init in t.TempDir(): a pure rebase for a patch-equivalent version, an edited file for one that is not",
+        "Extend the version observer of task 1: when the recorded version's patch_equivalent_to names an earlier version, copy every verdict of that version to the new one inside the version's transaction, each copy with a new id, the same verdict, comment, user, credential and created_at, and carried_from set to the source's carried_from when it has one, else to the source's version",
+        "Copy nothing when patch_equivalent_to is null; write no event for a copy; package 22 calls the landing evaluator before the version observers, so after the observer has copied at least one verdict it calls the re-evaluation of package 27 for the change in the same transaction, and the stored landing counts the carried verdicts",
+        "Return a store error from the observer to the change component, so that the version is not recorded without its carried verdicts",
+        "In the record-verdict path of task 2: when the named version is not current and the current version reaches it by following patch_equivalent_to, also write a copy on the current version in the same transaction, with carried_from set to the named version, replacing a verdict of the same user there; the response is still the approval on the named version"
+      ],
+      "touches": [
+        "internal/policy/carry.go",
+        "internal/policy/carry_test.go",
+        "internal/policy/approval.go",
+        "internal/policy/creators.go"
+      ],
+      "done_when": [
+        "`go test ./internal/policy/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Report a check result over REST",
+      "criteria": [
+        "REQ-5"
+      ],
+      "steps": [
+        "Add the behaviours of PUT …/changes/:number/checks/:name to internal/policy/check_routes_test.go and confirm they fail",
+        "Register PUT /api/v1/workspaces/{slug}/changes/{number}/checks/{name} beside the approval routes, declaring the PAT scope checks:write and the access need write; the admin token is allowed and is reported as {actor_type admin_token, actor_id null, username null}",
+        "Check in this order: the change exists (404 change_not_found); the name matches ^[a-z0-9][a-z0-9_.-]{0,62}$, the body is a JSON object with status pending, passed or failed, an optional summary of at most 2,000 code points, an optional url that is an absolute http or https URL of at most 2,048 characters, an optional details that is a JSON object whose text as received is at most 16,384 bytes, an optional positive integer version and no other member (400 invalid_request); the workspace is not archived (409 workspace_archived); the change is draft or open (409 change_closed); the version exists (404 not_found)",
+        "Store the result for the named version, or the current one, and the name with an upsert that replaces status, summary, url, details, reporter and updated_at together, so that members the new report omits become empty; answer 200 with the check object for a first report and for a replacement",
+        "In the same transaction call the re-evaluation of package 27 and hand one parley.change.check event to the event writer for every stored report, the status changed or not: resource_type change, resource_id the number, the caller as actor, session_id null, metadata {version, name, status}",
+        "Answer 500 internal and roll back when the store, the re-evaluation or the event writer fails"
+      ],
+      "touches": [
+        "internal/policy/check.go",
+        "internal/policy/check_routes.go",
+        "internal/policy/check_routes_test.go",
+        "cmd/parleyd"
+      ],
+      "done_when": [
+        "`go test ./internal/policy/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Read checks and give the evaluator their status",
+      "criteria": [
+        "REQ-6",
+        "REQ-2.2",
+        "REQ-2.3"
+      ],
+      "steps": [
+        "Add the applying-result table to internal/policy/check_test.go, the list behaviours to internal/policy/check_routes_test.go, the status behaviours to internal/policy/facts_test.go and the shared read refusals and the fork-bound reads to internal/policy/approval_routes_test.go, and confirm they fail",
+        "Write the applying-result function: for a version and a name, the result reported on that version, else the one on the nearest earlier version reached by following patch_equivalent_to, else none; the walk ends at a version whose patch_equivalent_to is null",
+        "Register GET /api/v1/workspaces/{slug}/changes/{number}/checks with scope changes:read and need read: for the current version, or the one the query names, answer the list envelope with one check object per name that has an applying result, ordered by name; a carried-over result keeps the version it was reported on; the version errors are those of the approvals list",
+        "Extend the evidence source of task 4 with the third answer package 27 declares, a status per check name that has a result: the status of a named check is the applying result's status for the change's current version, and no entry (which the evaluator reads as pending) when none applies; when the requirement sets fresh_checks only a result reported on the current version itself applies",
+        "A report on a version the current version does not reach is stored and changes no status the evaluator sees",
+        "On both read routes, when the caller's binding (package 08) says the token is bound to a fork and the request is on the fork's parent, answer 404 change_not_found for a change whose source workspace is not that fork, with the body an unknown number gets"
+      ],
+      "touches": [
+        "internal/policy/check.go",
+        "internal/policy/check_test.go",
+        "internal/policy/check_routes.go",
+        "internal/policy/check_routes_test.go",
+        "internal/policy/facts.go",
+        "internal/policy/facts_test.go",
+        "internal/policy/approval_routes.go",
+        "internal/policy/approval_routes_test.go"
+      ],
+      "done_when": [
+        "`go test ./internal/policy/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Keep landing in step with the evidence and expand it on the change",
+      "criteria": [
+        "REQ-7"
+      ],
+      "steps": [
+        "Add the re-evaluation sequence, the failure table, the concurrent writes and the include behaviours to internal/policy/facts_test.go and confirm they fail",
+        "Make each of the three writes (record or replace a verdict, withdraw a verdict, store a check result) one store transaction that holds the row change, the re-evaluation of package 27 with the stored landing, and the event; a failure of any part rolls all of it back and answers 500 internal with a message that does not contain the cause",
+        "Give the tests fault points: an event writer that fails, an evaluator that fails and a store whose row write fails",
+        "Make two concurrent verdicts of one user on one version, and two concurrent reports of one check on one version, both succeed: serialize on the unique key inside the store (retry the transaction on a busy or constraint answer) and never surface 409 or 500 for it; the verdict answered 200 is the one that remains",
+        "Register two include expanders with the change component of package 22: approvals adds the verdicts on the current version, newest first; checks adds the results that apply to the current version, by name; both reuse the list functions of the routes",
+        "Wire the routes, the version observer, the evidence source and the expanders where parleyd builds the policy and change components, so that a hub started by the run function of package 01 serves them"
+      ],
+      "touches": [
+        "internal/policy/facts.go",
+        "internal/policy/facts_test.go",
+        "internal/policy/approval.go",
+        "internal/policy/check.go",
+        "internal/policy/expand.go",
+        "cmd/parleyd"
+      ],
+      "done_when": [
+        "`go test ./internal/policy/... -count=1` passes"
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Add the verdict and check commands to the CLI",
+      "criteria": [
+        "REQ-8"
+      ],
+      "steps": [
+        "Add the command behaviours to internal/cli/change_review_test.go against a stub hub (net/http/httptest) and confirm they fail",
+        "Add five subcommands to the change command group that package 22 creates in internal/cli/change.go, declared through the command helper of package 09 with method, path and auth user: approve, reject, approvals, check and checks",
+        "approve and reject take <slug> <number> and the flags --version and --comment and send POST …/approvals with verdict approve or reject; reject refuses a missing or empty --comment as a usage error",
+        "approvals takes --version and --withdraw: without --withdraw it sends GET …/approvals, adding ?version= when given; with --withdraw it sends DELETE …/approvals/<id> and prints {} on 204; --withdraw with --version, and an empty --withdraw, are usage errors",
+        "check takes <slug> <number> <name> and the flags --status (required; pending, passed or failed), --version, --summary and --url and sends PUT …/checks/<name>; checks takes --version and sends GET …/checks",
+        "Send only the members whose flags were given; refuse a --version or a <number> that is not a positive integer before any request; leave path encoding, output and exit codes to the helpers of package 09"
+      ],
+      "touches": [
+        "internal/cli/change_review.go",
+        "internal/cli/change_review_test.go",
+        "internal/cli/change.go",
+        "test/e2e/approvals_checks_test.go"
+      ],
+      "done_when": [
+        "`go test ./internal/cli/... -count=1` passes"
+      ]
+    }
+  ]
+}
