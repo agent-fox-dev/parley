@@ -3,6 +3,7 @@ package identity
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestAuthenticate_LiveCredentialsPassWithTheirCaller(t *testing.T) {
@@ -146,5 +147,169 @@ func TestAuthenticate_TheAdminTokenIsRefusedWhereAUserIsNeeded(t *testing.T) {
 	}
 	if r := h.get("/api/v1/test/whoami", bearer(admin)); r.status != 200 {
 		t.Errorf("admin on /test/whoami: %d", r.status)
+	}
+}
+
+// stateHub has alice with a live API key and a live PAT.
+type stateHub struct {
+	*testHub
+	alice    User
+	key      string
+	keyID    string
+	pat      string
+	tokenID  string
+	unknown  string
+	tableFor map[string]string
+	idFor    map[string]string
+}
+
+func newStateHub(t *testing.T) *stateHub {
+	h := &stateHub{testHub: newTestHub(t)}
+	h.alice = h.seedUser("alice")
+	h.key, h.keyID = h.issueKey(h.alice.ID)
+	h.pat, h.tokenID = h.storePAT(h.alice.ID, PATSpec{Name: "ci", Permissions: []string{"git:read"}})
+	h.unknown = "parley_UNKNOWN1_" + strings.Repeat("Z", 32)
+	h.tableFor = map[string]string{h.key: "api_keys", h.pat: "pats"}
+	h.idFor = map[string]string{h.key: "key_id = '" + h.keyID + "'", h.pat: "token_id = '" + h.tokenID + "'"}
+	return h
+}
+
+func (h *stateHub) revoke(cred string) {
+	h.exec("UPDATE "+h.tableFor[cred]+" SET revoked_at = ? WHERE "+h.idFor[cred], nanos(h.clock.Now()))
+}
+
+func (h *stateHub) expireAt(cred string, at *time.Time) {
+	h.exec("UPDATE "+h.tableFor[cred]+" SET expires_at = ? WHERE "+h.idFor[cred], nullNanos(at))
+}
+
+func (h *stateHub) setStatus(status string) {
+	h.exec("UPDATE users SET status = ? WHERE id = ?", status, h.alice.ID)
+}
+
+// wrongSecret keeps a credential's id and replaces its secret.
+func wrongSecret(cred string) string {
+	i := strings.LastIndex(cred, "_")
+	repl := strings.Repeat("Z", 32)
+	if strings.HasPrefix(cred, "parley_pat_") {
+		repl = strings.Repeat("z", 32)
+	}
+	return cred[:i+1] + repl
+}
+
+func TestAuthenticate_ARevokedCredentialIsRefused(t *testing.T) {
+	h := newStateHub(t)
+	for _, cred := range []string{h.key, h.pat} {
+		if r := h.get("/api/v1/test/whoami", bearer(cred)); r.status != 200 {
+			t.Fatalf("live: %d", r.status)
+		}
+		h.revoke(cred)
+		r := h.get("/api/v1/test/whoami", bearer(cred))
+		if r.status != 401 || r.errorMember("error_type") != "unauthenticated" || r.errorMember("message") != "credential revoked" {
+			t.Errorf("revoked: %d %s", r.status, r.body)
+		}
+	}
+}
+
+func TestAuthenticate_AnExpiredCredentialIsRefused(t *testing.T) {
+	now := t0
+	before, after := now.Add(-time.Second), now.Add(time.Second)
+	for _, at := range []*time.Time{&before, &now, &after, nil} {
+		h := newStateHub(t)
+		h.clock.set(now)
+		for _, cred := range []string{h.key, h.pat} {
+			h.expireAt(cred, at)
+			r := h.get("/api/v1/test/whoami", bearer(cred))
+			if at != nil && !at.After(now) {
+				if r.status != 401 || r.errorMember("error_type") != "unauthenticated" || r.errorMember("message") != "credential expired" {
+					t.Errorf("expires_at %v: %d %s", at, r.status, r.body)
+				}
+			} else if r.status != 200 {
+				t.Errorf("expires_at %v: %d %s", at, r.status, r.body)
+			}
+		}
+	}
+}
+
+func TestAuthenticate_ABlockedUsersCredentialIsForbidden(t *testing.T) {
+	h := newStateHub(t)
+	h.setStatus(StatusBlocked)
+	for _, cred := range []string{h.key, h.pat} {
+		r := h.get("/api/v1/test/whoami", bearer(cred))
+		if r.status != 403 || r.errorMember("error_type") != "forbidden" || r.errorMember("message") != "user is blocked" {
+			t.Errorf("blocked: %d %s", r.status, r.body)
+		}
+	}
+	var revoked int
+	if err := h.st.DB().QueryRow(`SELECT (SELECT count(*) FROM api_keys WHERE revoked_at IS NOT NULL) + (SELECT count(*) FROM pats WHERE revoked_at IS NOT NULL)`).Scan(&revoked); err != nil || revoked != 0 {
+		t.Errorf("blocking revoked %d credentials (%v)", revoked, err)
+	}
+}
+
+func TestAuthenticate_TheFirstFailingCheckDecidesAndAWrongSecretRevealsNothing(t *testing.T) {
+	past := t0.Add(-time.Hour)
+	states := []struct {
+		name    string
+		arrange func(h *stateHub, cred string)
+		message string
+	}{
+		{"revoked and expired", func(h *stateHub, c string) { h.revoke(c); h.expireAt(c, &past) }, "credential revoked"},
+		{"revoked, user blocked", func(h *stateHub, c string) { h.revoke(c); h.setStatus(StatusBlocked) }, "credential revoked"},
+		{"expired, user blocked", func(h *stateHub, c string) { h.expireAt(c, &past); h.setStatus(StatusBlocked) }, "credential expired"},
+	}
+	for _, s := range states {
+		for _, pick := range []string{"key", "pat"} {
+			h := newStateHub(t)
+			cred := map[string]string{"key": h.key, "pat": h.pat}[pick]
+			s.arrange(h, cred)
+			if r := h.get("/api/v1/test/whoami", bearer(cred)); r.status != 401 || r.errorMember("message") != s.message {
+				t.Errorf("%s %s: %d %s", s.name, pick, r.status, r.body)
+			}
+		}
+	}
+	for _, s := range []struct {
+		name    string
+		arrange func(h *stateHub, cred string)
+	}{
+		{"revoked", func(h *stateHub, c string) { h.revoke(c) }},
+		{"expired", func(h *stateHub, c string) { h.expireAt(c, &past) }},
+		{"user blocked", func(h *stateHub, _ string) { h.setStatus(StatusBlocked) }},
+	} {
+		for _, pick := range []string{"key", "pat"} {
+			h := newStateHub(t)
+			cred := map[string]string{"key": h.key, "pat": h.pat}[pick]
+			s.arrange(h, cred)
+			r := h.get("/api/v1/test/whoami", bearer(wrongSecret(cred)))
+			unknown := h.get("/api/v1/test/whoami", bearer(h.unknown))
+			if r.status != 401 || r.errorMember("message") != "invalid credentials" || r.body != unknown.body {
+				t.Errorf("%s %s with a wrong secret: %d %s", s.name, pick, r.status, r.body)
+			}
+		}
+	}
+}
+
+func TestAuthenticate_UnblockingRestoresTheLiveCredentials(t *testing.T) {
+	h := newStateHub(t)
+	revokedKey, revokedID := h.issueKey(h.alice.ID)
+	h.exec("UPDATE api_keys SET revoked_at = ? WHERE key_id = ?", nanos(t0), revokedID)
+	expiredPAT, expiredID := h.storePAT(h.alice.ID, PATSpec{Name: "old", Permissions: []string{"git:read"}})
+	h.exec("UPDATE pats SET expires_at = ? WHERE token_id = ?", nanos(t0.Add(-time.Hour)), expiredID)
+	h.setStatus(StatusBlocked)
+	want := map[string]string{h.key: "user is blocked", h.pat: "user is blocked", revokedKey: "credential revoked", expiredPAT: "credential expired"}
+	for cred, msg := range want {
+		if r := h.get("/api/v1/test/whoami", bearer(cred)); r.errorMember("message") != msg {
+			t.Errorf("blocked: %s %s, want %s", cred[:14], r.body, msg)
+		}
+	}
+	h.setStatus(StatusActive)
+	for _, cred := range []string{h.key, h.pat} {
+		if r := h.get("/api/v1/test/whoami", bearer(cred)); r.status != 200 {
+			t.Errorf("after unblocking: %d %s", r.status, r.body)
+		}
+	}
+	if r := h.get("/api/v1/test/whoami", bearer(revokedKey)); r.errorMember("message") != "credential revoked" {
+		t.Errorf("revoked key after unblocking: %s", r.body)
+	}
+	if r := h.get("/api/v1/test/whoami", bearer(expiredPAT)); r.errorMember("message") != "credential expired" {
+		t.Errorf("expired PAT after unblocking: %s", r.body)
 	}
 }

@@ -55,7 +55,9 @@ type Authenticator struct {
 }
 
 // NewAuthenticator builds the authenticator of the request pipeline over the
-// store, with a clock (time.Now in production).
+// store, with a clock (time.Now in production). Every request reads the
+// credential and its user from the store, so a revocation, a block and an
+// unblock take effect on the next request.
 func NewAuthenticator(st *store.Store, now func() time.Time) server.Authenticator {
 	a := &Authenticator{st: st, now: now}
 	return a.authenticate
@@ -131,12 +133,22 @@ func (a *Authenticator) Check(ctx context.Context, credential string) (*Principa
 	if !secretMatches(cred.secret, stored.secretHash) {
 		return nil, errInvalid()
 	}
+	// Only now that the secret matched is the credential's state reported.
+	if stored.revokedAt != nil {
+		return nil, server.Unauthenticated("credential revoked")
+	}
+	if stored.expiresAt != nil && !a.now().Before(*stored.expiresAt) {
+		return nil, server.Unauthenticated("credential expired")
+	}
 	user, err := GetUser(ctx, a.st.DB(), stored.userID)
 	if errors.Is(err, ErrNotFound) {
 		return nil, errInvalid()
 	}
 	if err != nil {
 		return nil, err
+	}
+	if user.Status == StatusBlocked {
+		return nil, server.Forbidden("user is blocked")
 	}
 	p := &Principal{Type: cred.kind, CredentialID: cred.id, User: &user}
 	if cred.kind == TypePAT {
