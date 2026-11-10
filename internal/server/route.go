@@ -60,6 +60,9 @@ type Route struct {
 	// Marks are named declarations with a value that installed checks read
 	// (an admin mark, the workspace access a route needs, …).
 	Marks map[string]string
+	// Paging overrides the default and bounds of a list route's limit
+	// parameter; the zero value means a default of 50 and bounds 1 to 200.
+	Paging PageBounds
 }
 
 // Match is the route a request matched and its path parameter values.
