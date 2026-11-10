@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 // DefaultLoginWait bounds the wait for the browser's redirect.
@@ -31,19 +32,22 @@ type loginFlags struct {
 
 func newLoginCommand(flags *globalFlags, opts Options) *cobra.Command {
 	var lf loginFlags
-	cmd := &cobra.Command{
-		Use:   "login",
-		Short: "Sign in through the browser, or store a credential with --api-key",
-		Args:  cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			lf.apiKey = flags.apiKey
-			l := &login{flags: flags, lf: lf, opts: opts, cmd: cmd, keyFlow: cmd.Flags().Changed("api-key")}
-			return l.run(cmd.Context())
+	// login calls several routes and resolves the hub URL itself, needing
+	// no credential: its auth is none and it names no single route.
+	return Declare(Spec{
+		Use:         "login",
+		Description: "Sign in through the browser, or store a credential with --api-key",
+		Auth:        AuthNone,
+		Flags: func(fs *pflag.FlagSet) {
+			fs.StringVar(&lf.provider, "provider", "github", "the identity provider to sign in with")
+			fs.StringVar(&lf.expires, "expires", "90", "the new key's lifetime in days: 0, 30, 60 or 90")
 		},
-	}
-	cmd.Flags().StringVar(&lf.provider, "provider", "github", "the identity provider to sign in with")
-	cmd.Flags().StringVar(&lf.expires, "expires", "90", "the new key's lifetime in days: 0, 30, 60 or 90")
-	return cmd
+		Run: func(c *Call) error {
+			lf.apiKey = flags.apiKey
+			l := &login{flags: flags, lf: lf, opts: opts, cmd: c.Cmd, keyFlow: c.Cmd.Flags().Changed("api-key")}
+			return l.run(c.Ctx)
+		},
+	})
 }
 
 // login is one run of parley login.

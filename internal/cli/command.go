@@ -41,8 +41,11 @@ type Spec struct {
 	Method      string
 	Path        string
 	Args        []Arg
-	Auth        Auth
-	Flags       func(fs *pflag.FlagSet)
+	// Variadic lets the last argument take every remaining word, joined
+	// by single spaces.
+	Variadic bool
+	Auth     Auth
+	Flags    func(fs *pflag.FlagSet)
 	// Run is the command's run step; nil sends the declared request
 	// through the client and prints its result.
 	Run func(c *Call) error
@@ -103,6 +106,9 @@ func Declare(s Spec) *cobra.Command {
 			use += " [" + a.Name + "]"
 		}
 	}
+	if s.Variadic {
+		use += "..."
+	}
 	argsJSON, _ := json.Marshal(s.Args)
 	cmd := &cobra.Command{
 		Use:   use,
@@ -120,7 +126,7 @@ func Declare(s Spec) *cobra.Command {
 					required++
 				}
 			}
-			if len(args) < required || len(args) > len(s.Args) {
+			if len(args) < required || (len(args) > len(s.Args) && !s.Variadic) {
 				return UsageError("%s takes %s, got %d", commandName(cmd), argCount(required, len(s.Args)), len(args))
 			}
 			return nil
@@ -131,6 +137,11 @@ func Declare(s Spec) *cobra.Command {
 			}
 			call := &Call{Ctx: cmd.Context(), Cmd: cmd, Args: map[string]string{}, Stdout: cmd.OutOrStdout(), Stderr: cmd.ErrOrStderr()}
 			for i, v := range args {
+				if i >= len(s.Args) {
+					last := s.Args[len(s.Args)-1].Name
+					call.Args[last] += " " + v
+					continue
+				}
 				call.Args[s.Args[i].Name] = v
 			}
 			if s.Auth == AuthUser || s.Auth == AuthAdmin {

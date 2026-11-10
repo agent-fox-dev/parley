@@ -80,7 +80,51 @@ removes what it wrote. It opens no listener and changes nothing in the data.
 
 ## parley
 
-`parley` alone prints its help and exits 0.
+`parley` alone, or the words of a command group alone (such as
+`parley probe`), prints that help on stdout and exits 0.
+
+### Help
+
+`parley help <words>` prints exactly what `parley <words> --help` prints: the
+command's description, its arguments, its own flags with their defaults and
+the global flags `--endpoint-url`, `--api-key` and `--json`. Help never
+resolves settings, never reads the configuration file and never sends a
+request. Words that name no command are a usage error (exit status 2) naming
+them.
+
+With `--json`, help for a command that is not a group prints one object built
+from its declaration:
+
+```json
+{
+  "name": "login",
+  "description": "Sign in through the browser, or store a credential with --api-key",
+  "method": null,
+  "path": null,
+  "args": [],
+  "flags": [
+    {
+      "name": "api-key",
+      "type": "string",
+      "required": false,
+      "default": "",
+      "description": "the credential (default from PARLEY_API_KEY, then the configuration file)"
+    }
+  ],
+  "auth": "none"
+}
+```
+
+(`flags` shortened here.) `name` is the words after `parley`; `method` and
+`path` (relative to `/api/v1`) are both `null` for a command that calls no
+single route; `args` lists `{name, required}` in order; `flags` holds the
+command's own flags and the three global flags, sorted by name, without
+`--help`, `type` being the flag library's name for it; `auth` is `none`,
+`user` or `admin`.
+
+With `--json`, help for a command group, or `parley help --json` and
+`parley --help --json`, prints `{"commands": [...]}`: the object of every
+command under it that is not a group, at any depth, sorted by name.
 
 ### parley login
 
@@ -109,7 +153,7 @@ On success the user is printed on stdout (2-space indented JSON) and
 | Exit status | When |
 |---|---|
 | 0 | logged in |
-| 1 | the hub refused; its error envelope is printed on stderr as received |
+| 1 | the hub refused; its error envelope is printed on stderr, indented by 2 spaces |
 | 2 | a client-side failure: an envelope with `code` 0 and `error_type` `usage_error` (a bad flag or credential) or `client_error` (no hub URL, an unreachable hub, a state mismatch, a timeout, an unreadable or unwritable configuration file) |
 
 The configuration file is `$PARLEY_CONFIG_DIR/config.toml`, or
@@ -135,8 +179,10 @@ Prints the client's build and, when a hub URL is given, the hub's:
 }
 ```
 
-The hub URL is the first non-empty value of `--endpoint-url` and
-`PARLEY_ENDPOINT_URL`. Without one, only `cli` is printed. When the hub
+The hub URL is the first non-empty value of `--endpoint-url`,
+`PARLEY_ENDPOINT_URL` and the configuration file's `endpoint_url`; a file
+that cannot be read is one `warning: ` line on stderr. Without a hub URL,
+only `cli` is printed. When the hub
 cannot be read (refused, no answer within 5 seconds, a status other than 200,
 a body that is not a JSON object), one line starting with `warning: ` and
 naming the URL goes to stderr and `server` is left out. The exit status is

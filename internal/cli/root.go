@@ -56,6 +56,7 @@ func newRootCommand(flags *globalFlags, opts Options) *cobra.Command {
 	root.PersistentFlags().BoolVar(&flags.json, "json", false, "print help as JSON")
 	root.AddCommand(newVersionCommand(flags))
 	root.AddCommand(newLoginCommand(flags, opts))
+	installHelp(root, flags)
 	return root
 }
 
