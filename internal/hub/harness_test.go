@@ -89,7 +89,8 @@ type runningHub struct {
 	t       *testing.T
 	stdout  *syncBuffer
 	stderr  *syncBuffer
-	code    chan int
+	done    chan struct{} // closed when Run has returned with exit
+	exit    int
 	cancel  context.CancelFunc
 	addr    string
 	rt      atomic.Pointer[Runtime]
@@ -121,8 +122,8 @@ func (h *runningHub) stop() int {
 func (h *runningHub) wait(within time.Duration) int {
 	h.t.Helper()
 	select {
-	case c := <-h.code:
-		return c
+	case <-h.done:
+		return h.exit
 	case <-time.After(within):
 		h.t.Fatalf("Run did not return within %v; stderr:\n%s", within, h.stderr.String())
 		return -1
@@ -134,7 +135,7 @@ func (h *runningHub) wait(within time.Duration) int {
 func startHub(t *testing.T, dir string, env map[string]string, opts ...Option) *runningHub {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	h := &runningHub{t: t, stdout: &syncBuffer{}, stderr: &syncBuffer{}, code: make(chan int, 1), cancel: cancel}
+	h := &runningHub{t: t, stdout: &syncBuffer{}, stderr: &syncBuffer{}, done: make(chan struct{}), cancel: cancel}
 	o := Options{Env: config.MapEnv(env), WorkDir: dir, Stdout: h.stdout, Stderr: h.stderr,
 		OnRuntime: func(rt *Runtime) { h.rt.Store(rt) }}
 	for _, opt := range opts {
@@ -147,7 +148,10 @@ func startHub(t *testing.T, dir string, env map[string]string, opts ...Option) *
 			inner(rt)
 		}
 	}
-	go func() { h.code <- Run(ctx, o) }()
+	go func() {
+		h.exit = Run(ctx, o)
+		close(h.done)
+	}()
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if rec := listening(t, h.stderr.String()); rec != nil {
@@ -156,16 +160,16 @@ func startHub(t *testing.T, dir string, env map[string]string, opts ...Option) *
 			t.Cleanup(func() {
 				cancel()
 				select {
-				case <-h.code:
+				case <-h.done:
 				case <-time.After(5 * time.Second):
 				}
 			})
 			return h
 		}
 		select {
-		case c := <-h.code:
+		case <-h.done:
 			cancel()
-			t.Fatalf("Run returned %d before listening; stderr:\n%s", c, h.stderr.String())
+			t.Fatalf("Run returned %d before listening; stderr:\n%s", h.exit, h.stderr.String())
 		case <-time.After(5 * time.Millisecond):
 		}
 	}

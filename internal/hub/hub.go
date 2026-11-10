@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/config"
+	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/scrub"
 	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/store"
@@ -119,6 +120,7 @@ func (c *Composition) OnServer(fn func(rt *Runtime, srv *server.Server) error) {
 // one call here to its own compose function.
 func compose(c *Composition) {
 	c.AddStep(idempotencyStep)
+	c.AddStep(identity.AdminSettingsStep)
 }
 
 const usage = `Usage: parleyd [flags]
@@ -303,12 +305,6 @@ func (r *hubRun) closeStore() {
 	if err := r.st.Close(); err != nil {
 		r.logger.Error("closing the stores failed", "error", err.Error())
 	}
-}
-
-// bootstrap is the stage after the stores are open and before the start
-// hooks; done reports that the run ends here with code.
-func (r *hubRun) bootstrap(context.Context) (done bool, code int, err error) {
-	return false, 0, nil
 }
 
 // startMaintenance runs every registered task once, in the background,
