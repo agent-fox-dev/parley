@@ -70,13 +70,13 @@ func newLoginCommand(flags *globalFlags, opts Options) *cobra.Command {
 		Short: "Sign in through the browser, or store a credential with --api-key",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			lf.apiKey = flags.apiKey
 			l := &login{flags: flags, lf: lf, opts: opts, cmd: cmd, keyFlow: cmd.Flags().Changed("api-key")}
 			return l.run(cmd.Context())
 		},
 	}
 	cmd.Flags().StringVar(&lf.provider, "provider", "github", "the identity provider to sign in with")
 	cmd.Flags().StringVar(&lf.expires, "expires", "90", "the new key's lifetime in days: 0, 30, 60 or 90")
-	cmd.Flags().StringVar(&lf.apiKey, "api-key", "", "store this credential instead of signing in; - reads it from stdin")
 	return cmd
 }
 

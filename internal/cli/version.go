@@ -37,24 +37,26 @@ type versionDoc struct {
 }
 
 func newVersionCommand(flags *globalFlags) *cobra.Command {
-	return &cobra.Command{
-		Use:   "version",
-		Short: "Print the client's build and, with a hub URL, the hub's build",
-		Args:  cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
+	return Declare(Spec{
+		Use:         "version",
+		Description: "Print the client's build and, with a hub URL, the hub's build",
+		Method:      "GET",
+		Path:        "/version",
+		Auth:        AuthNone,
+		Run: func(c *Call) error {
 			info := buildinfo.Get()
 			doc := versionDoc{CLI: clientBuild{Version: info.Version, Commit: info.Commit}}
 			if hub := hubURL(flags); hub != "" {
-				server, err := fetchServerBuild(cmd.Context(), hub)
+				server, err := fetchServerBuild(c.Ctx, hub)
 				if err != nil {
-					fmt.Fprintf(cmd.ErrOrStderr(), "warning: cannot read the hub's version from %s: %v\n", hub, err)
+					fmt.Fprintf(c.Stderr, "warning: cannot read the hub's version from %s: %v\n", hub, err)
 				} else {
 					doc.Server = server
 				}
 			}
-			return printJSON(cmd.OutOrStdout(), doc)
+			return printJSON(c.Stdout, doc)
 		},
-	}
+	})
 }
 
 // hubURL is the first non-empty value of --endpoint-url and

@@ -3,6 +3,7 @@ package e2e
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -74,5 +75,26 @@ func TestBuild_LinkerFlagsSetTheReportedBuild(t *testing.T) {
 
 	if err := exec.Command(parleyd, "--help").Run(); err != nil {
 		t.Errorf("parleyd --help: %v, want exit status 0", err)
+	}
+}
+
+func TestBuild_AnUnknownCommandIsAUsageError(t *testing.T) {
+	parley := buildBinary(t, t.TempDir(), "./cmd/parley", "")
+	cmd := exec.Command(parley, "nosuch")
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 2 {
+		t.Fatalf("exit %v, want 2", err)
+	}
+	var doc struct {
+		Error struct {
+			Code      int    `json:"code"`
+			ErrorType string `json:"error_type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(stderr.String()), &doc); err != nil || doc.Error.ErrorType != "usage_error" || doc.Error.Code != 0 {
+		t.Errorf("stderr %q", stderr.String())
 	}
 }
