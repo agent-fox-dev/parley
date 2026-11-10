@@ -88,25 +88,21 @@ type login struct {
 	cmd     *cobra.Command
 	keyFlow bool
 
-	path string
-	file map[string]any
-	hub  string
+	settings Settings
+	hub      string
 }
 
 // run reads the configuration file before any request, resolves the hub
 // URL, and runs the key flow or the browser flow.
 func (l *login) run(ctx context.Context) error {
-	path, err := configPath()
+	settings, err := readConfig()
 	if err != nil {
 		return clientError("%v", err)
 	}
-	file, err := readConfig(path)
-	if err != nil {
-		return clientError("%v", err)
-	}
-	l.path, l.file = path, file
+	l.settings = settings
 	l.hub = strings.TrimRight(l.hubURL(), "/")
 	if l.hub == "" {
+		path, _ := configPath()
 		return clientError("no hub URL: give --endpoint-url, set PARLEY_ENDPOINT_URL or set endpoint_url in %s", path)
 	}
 	if l.keyFlow {
@@ -124,8 +120,7 @@ func (l *login) hubURL() string {
 	if v := os.Getenv("PARLEY_ENDPOINT_URL"); v != "" {
 		return v
 	}
-	s, _ := l.file[keyEndpointURL].(string)
-	return s
+	return l.settings.EndpointURL
 }
 
 // withKey is the key flow: GET /user with the credential and, on 200, save
@@ -210,11 +205,8 @@ func (l *login) finish(cred string, user []byte) error {
 	if err := json.Unmarshal(user, &u); err != nil || u.ID == "" {
 		return clientError("the hub's answer carries no user")
 	}
-	l.file[keyEndpointURL] = l.hub
-	l.file[keyAPIKey] = cred
-	l.file[keyUserID] = u.ID
-	if err := saveConfig(l.path, l.file); err != nil {
-		return clientError("the hub accepted the credential but it was not saved to %s: %v", l.path, err)
+	if err := saveSettings(Settings{EndpointURL: l.hub, APIKey: cred, UserID: u.ID}); err != nil {
+		return clientError("the hub accepted the credential but it was not saved: %v", err)
 	}
 	var out bytes.Buffer
 	if err := json.Indent(&out, bytes.TrimSpace(user), "", "  "); err != nil {
