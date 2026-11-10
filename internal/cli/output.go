@@ -42,3 +42,9 @@ func printDocument(w io.Writer, v any) error {
 func warnf(w io.Writer, format string, args ...any) {
 	fmt.Fprintf(w, "warning: "+format+"\n", args...)
 }
+
+// progressf writes one progress line of a wait to stderr; a progress line
+// begins with "waiting: ".
+func progressf(w io.Writer, format string, args ...any) {
+	fmt.Fprintf(w, "waiting: "+format+"\n", args...)
+}

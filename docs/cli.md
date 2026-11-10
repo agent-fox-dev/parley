@@ -126,6 +126,40 @@ With `--json`, help for a command group, or `parley help --json` and
 `parley --help --json`, prints `{"commands": [...]}`: the object of every
 command under it that is not a group, at any depth, sorted by name.
 
+### Waiting for a long operation
+
+A command that starts a long operation (a clone, a rebuild, a landing) has
+three flags:
+
+| Flag | Default | |
+|---|---|---|
+| `--wait` | `false` | wait until the operation ends |
+| `--timeout <duration>` | `5m` | how long `--wait` waits |
+| `--poll-interval <duration>` | `5s` | how often `--wait` reads the operation |
+
+A duration is a positive whole number followed by one of `s`, `m`, `h` and
+`d` (24 hours): `90s`, `5m`, `2h`, `1d`. Any other value (`0s`, `-5s`, `5`,
+`1.5m`, `1m30s`, `5 m`, `5w`) is a usage error naming the flag, with or
+without `--wait`, and nothing is sent.
+
+Without `--wait` the command prints the answer of the request that starts the
+operation, whatever its state, and sends nothing else. With `--wait` it
+writes `waiting: <state>` on stderr when the wait begins and at each change of
+state, reads the operation once per poll interval until it reaches a terminal
+state or `--timeout` passes (counted from the start request's answer), and
+then:
+
+| End | stdout | stderr | Exit status |
+|---|---|---|---|
+| a successful terminal state | the final record | progress lines | 0 |
+| an unsuccessful terminal state | the final record | an envelope with `error_type` `wait_failed` naming the state | 1 |
+| `--timeout` passed (a poll in flight is abandoned) | nothing | an envelope with `error_type` `wait_timeout` | 1 |
+| the hub refused a poll | nothing | the hub's envelope | 1 |
+| a poll failed on the client side | nothing | an envelope with `error_type` `client_error` | 2 |
+
+A state that is not terminal, waiting to retry included, never ends the wait,
+and a timeout sends no request that cancels or changes the operation.
+
 ### parley login
 
 Signs in and saves the hub URL, the credential and the user's id to the

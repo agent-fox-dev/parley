@@ -58,6 +58,8 @@ type Spec struct {
 	FailOn []FailOn
 	// Timeout replaces the request timeout for this command's requests.
 	Timeout time.Duration
+	// Wait gives the command --wait, --timeout and --poll-interval.
+	Wait *Wait
 }
 
 // FailOn is a --fail-on-… flag: when it is given and Holds is true of the
@@ -81,6 +83,8 @@ type Call struct {
 	// Client sends the command's requests; nil for a command whose auth is
 	// none.
 	Client *Client
+
+	spec *Spec
 }
 
 // The keys of a declaration in the cobra command's Annotations.
@@ -135,7 +139,7 @@ func Declare(s Spec) *cobra.Command {
 			if marker, ok := cmd.Context().Value(ranStepKey{}).(*bool); ok {
 				*marker = true
 			}
-			call := &Call{Ctx: cmd.Context(), Cmd: cmd, Args: map[string]string{}, Stdout: cmd.OutOrStdout(), Stderr: cmd.ErrOrStderr()}
+			call := &Call{Ctx: cmd.Context(), Cmd: cmd, Args: map[string]string{}, Stdout: cmd.OutOrStdout(), Stderr: cmd.ErrOrStderr(), spec: &s}
 			for i, v := range args {
 				if i >= len(s.Args) {
 					last := s.Args[len(s.Args)-1].Name
@@ -154,14 +158,20 @@ func Declare(s Spec) *cobra.Command {
 				}
 				call.Client.timeout = s.Timeout
 			}
-			if s.Run == nil {
-				return runDefault(call, &s)
+			switch {
+			case s.Run != nil:
+				return s.Run(call)
+			case s.Wait != nil:
+				return runWait(call, &s)
 			}
-			return s.Run(call)
+			return runDefault(call, &s)
 		},
 	}
 	if s.Flags != nil {
 		s.Flags(cmd.Flags())
+	}
+	if s.Wait != nil {
+		addWaitFlags(cmd.Flags())
 	}
 	for _, f := range s.FailOn {
 		cmd.Flags().Bool(f.Name, false, f.Usage)
