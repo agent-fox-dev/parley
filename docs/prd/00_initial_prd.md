@@ -74,7 +74,6 @@ It ships as two programs:
   - a git smart-HTTP server under `/git`
   - a forge webhook ingress under `/hooks/forge`
   - Prometheus metrics and health endpoints
-  - optionally, an AgentKit-compatible sandbox gateway (gRPC) on a second listener
 - **`parley`** is the command-line client. It speaks only the REST API, and everything it does can also be done over REST.
 
 | Capability | What it gives the user | Section |
@@ -89,7 +88,7 @@ It ships as two programs:
 | Carry-patch workspaces | Maintain a long-lived set of patches on top of an upstream. When upstream moves, the hub rebuilds the integration branch and remembers conflict resolutions | §10 |
 | Secrets and variables | Stored per user, organization or workspace. Secret values can be written but never read back | §11 |
 | Forge access | Read and write issues and pull requests on GitHub or GitLab through the hub, using the workspace's own credential. Receive the forge's webhooks as hub events | §12 |
-| Sandboxes | Lease an isolated container shaped by an operator-defined profile. The hub injects secrets so the caller never sees them | §13 |
+| Sandboxes | An isolated environment, running on OpenShell, born attached to a task fork with the fork checked out and shaped by an operator-defined profile. It holds no real credentials, has no network egress by default, and its work is checkpointed to the fork | §13 |
 | Accounting, audit and events | Agent sessions with token usage, agent run telemetry, an audit log, a durable and replayable event stream, Prometheus metrics | §14 |
 
 ### 1.4 End-to-end example
@@ -129,20 +128,27 @@ parley workspace push demo main                            # publish main from t
 
 An agent with no local checkout can do the same through the API alone: `POST …/scm/commits` to create the commit, `POST …/changes` to open the change, `POST …/changes/12/land` to land it.
 
+When the hub has sandboxes enabled (§13), the fork can come with a sandbox that has the fork checked out, and the agent runs inside it:
+
+```sh
+parley fork create demo --name greeting --sandbox-profile agent -- my-agent --task "Add a greeting endpoint"
+parley sandbox exec demo--greeting "$SANDBOX_ID" -- git status   # look at the work from outside
+```
+
 ### 1.5 System context
 
 ```
-  parley, HTTP clients      git clients        GitHub / GitLab        AgentKit clients
-         │                   │              webhooks │                    │
-         ▼                   ▼                       ▼                    ▼
- ┌─────────────────────── parleyd: main HTTP listener ─────────────────────┐  ┌─ sandbox listener ─┐
- │ /api/v1/...            identity, workspaces and forks, source control   │  │ sandbox gateway    │
- │                        API, changes, landing, policy, awareness,        │  │ (gRPC, lease token)│
- │                        secrets, forge, sandboxes, sessions, events      │  └─────────┬──────────┘
- │ /git/<org>/<slug>.git  git smart HTTP (v2), push rules, push → change   │            │
- │ /hooks/forge/:slug     webhook signature → delivery log → hub event     │            ▼
- │ /metrics, /healthz, /readyz, /version                                   │    Podman or a remote
- └──────┬───────────────────┬─────────────────────┬────────────────────────┘    AgentKit gateway
+  parley, HTTP clients      git clients        GitHub / GitLab
+         │                   │              webhooks │
+         ▼                   ▼                       ▼
+ ┌─────────────────────── parleyd: HTTP listener ──────────────────────────┐
+ │ /api/v1/...            identity, workspaces and forks, source control   │       ┌───────────────────┐
+ │                        API, changes, landing, policy, awareness,        │       │ OpenShell gateway │
+ │                        secrets, forge, sandboxes, sessions, events      │ ────▶ │ (optional, §13)   │
+ │ /git/<org>/<slug>.git  git smart HTTP (v2), push rules, push → change   │       └─────────┬─────────┘
+ │ /hooks/forge/:slug     webhook signature → delivery log → hub event     │                 ▼
+ │ /metrics, /healthz, /readyz, /version                                   │             sandboxes
+ └──────┬───────────────────┬─────────────────────┬────────────────────────┘
         ▼                   ▼                     ▼
    hub state            event log and        repositories (bare),
    (identity, changes,  audit store          forks share objects
@@ -157,7 +163,7 @@ An agent with no local checkout can do the same through the API alone: `POST …
 3. **Legible to an agent.** Every refusal, conflict and policy decision is returned as structured data that says what to do next.
 4. **Reviewable by intent.** People review what a change is for and whether policy was met, and read lines only where policy says they must.
 5. **Traceable.** Every commit on a protected branch can be traced to a change, its versions, its approvals and the session that produced it.
-6. **Simple to run.** One server process, embedded storage, one configuration file. No external database or message broker.
+6. **Simple to run.** One server process, embedded storage, one configuration file. No external database or message broker. The only optional external component is the OpenShell gateway that runs sandboxes (§13).
 
 ### 1.7 Non-goals
 
@@ -165,6 +171,7 @@ An agent with no local checkout can do the same through the API alone: `POST …
 - **Hyperscale.** Several replicas, regional caches and repositories beyond what one host can serve are out of scope (§15).
 - **A code review user interface.** Parley provides the review data model and API (changes, versions, approvals, checks). It ships no web interface.
 - **Built-in CI.** Checks are reported to the hub by external runners. The hub does not run builds or tests itself.
+- **Sandbox isolation of its own.** Sandboxes run on OpenShell, which provides the isolation and enforces policy. Parley is the control plane on top and implements no isolation itself (§13).
 - **A built-in issue tracker or message board.** Issues stay on the forge (§12). Coordination between agents happens through changes, claims and events (§9, §14).
 - **Compatibility with the earlier hub.** The earlier hub gave Parley its shape. Its API, CLI, configuration names and data files are not supported.
 
@@ -177,6 +184,7 @@ An agent with no local checkout can do the same through the API alone: `POST …
 | Sapling | Stacks without branch juggling; automatic restack; recorded rewrite history; server-side rebase on push |
 | Twigg | Changes with stable identifiers and versions, each reviewed on its own; per-directory ownership; mirroring landed work out to plain git |
 | AgentHub | A coordination surface for agent swarms; per-agent limits |
+| OpenShell | The sandbox runtime itself; placeholder credentials that are resolved outside the sandbox; a network policy that denies by default and allows per program; proposals for new access |
 
 Parley deliberately does not take Scion's storage engine, AgentHub's branchless graph or Twigg's built-in tracker and CI.
 
@@ -188,13 +196,12 @@ Parley deliberately does not take Scion's storage engine, AgentHub's branchless 
 
 | Persona | Who | Typical credential | Main goals |
 |---|---|---|---|
-| **Operator** | Runs and administers the hub | Admin token (written at first boot) | Deploy and configure the hub; manage users, orgs, keys and tokens; define sandbox profiles; watch metrics and the audit log |
+| **Operator** | Runs and administers the hub | Admin token (written at first boot) | Deploy and configure the hub; manage users, orgs, keys and tokens; connect the hub to an OpenShell gateway and define sandbox profiles and credentials; watch metrics and the audit log |
 | **Developer** | A person who registers repositories and directs agents | API key, from `parley login` | Create workspaces; write landing policy; approve the changes that need a person; maintain carry-patch workspaces; manage secrets; mint scoped tokens for agents |
-| **Agent** | An AI coding agent running on a developer's behalf | PAT bound to one workspace or task fork, often limited to paths | Fork, read and write code through git or the API; open changes and state their intent; fix conflicts; land; report sessions, usage and telemetry; lease a sandbox |
+| **Agent** | An AI coding agent running on a developer's behalf | PAT bound to one workspace or task fork, often limited to paths | Fork, read and write code through git or the API; open changes and state their intent; fix conflicts; land; report sessions, usage and telemetry; create a sandbox on its fork, work in it through the REST API and ask for more network access when blocked |
 | **Review agent / check runner** | Automation that reacts to changes | PAT with `changes:read`, `audit:read` and `checks:write`, possibly `changes:approve`; to report checks it belongs to a user with write access to the workspace (§8) | Follow the event stream; report check results; approve or reject versions where policy allows |
 | **Org member** | A user who belongs to the organization that owns a workspace | API key or PAT | Read the org's workspaces; contribute through a task fork and a change |
 | **Forge** | GitHub or GitLab | Webhook secret | Deliver webhooks that the hub turns into hub events |
-| **Sandbox client** | An AgentKit client that holds a sandbox lease | Lease token | Create and drive exactly one sandbox through the gateway |
 
 ### 2.2 Glossary
 
@@ -227,8 +234,13 @@ Parley deliberately does not take Scion's storage engine, AgentHub's branchless 
 | Scope / permission | A string carried by a PAT that grants read or write access to an area |
 | Bound token | A PAT confined to one workspace (and the forks created with it). A token bound to a fork also reaches its own changes, and the awareness and policy reads, on the fork's parent (§3) |
 | Path-scoped token | A PAT whose writes are limited to files matching a list of globs |
-| Lease | A short-lived right to create and use one sandbox, shaped by a profile |
-| Profile | An operator-defined sandbox template |
+| Sandbox | An isolated environment in which an agent runs, attached to a workspace (normally a task fork) and started with it checked out. It runs on OpenShell; the hub controls it (§13) |
+| OpenShell | The open-source sandbox runtime Parley's sandboxes run on. It provides the isolation, the policy format and the credential mechanism. The hub is a client of one OpenShell gateway |
+| Profile | The operator's template for a sandbox, defined in configuration: image, resources, time limits, base policy and credentials |
+| Credential (sandbox) | A secret (§11) attached to a sandbox as an OpenShell provider. The workload sees only a placeholder; the runtime adds the real value outside the sandbox, on requests to the endpoints the provider's profile authorizes |
+| Hub credential | The fork-bound PAT the hub mints for a sandbox so that it can reach the hub. The workload sees only its placeholder, in `PARLEY_API_KEY` |
+| Checkpoint | The git state of a sandbox's working directory, saved to the workspace under `refs/hub/sandboxes/<id>/<branch>` |
+| Proposal (network access) | A request from a sandbox's workload for an additional network rule. A person approves or rejects it; an approved rule applies to that sandbox only |
 | Session | An agent session: who ran, on which workspace, with what token usage, and which changes it produced |
 | Hub event | A record of something the hub did (`hub.*` types), with a sequence number. Hub events form the audit log and the event stream |
 | Agent telemetry | Run events, tool calls, traces, outcomes and postmortems that agents send to the hub |
@@ -455,7 +467,7 @@ An API key of an admin-role user is **not** `admin` here. The admin role governs
 #### Server start, bootstrap and shutdown
 
 - **PLAT-FR-001 (flags).** `parleyd` takes two flags: `--admin-email <string>` and `--reset-admin-token`. `--help` prints usage and exits 0. An unknown flag prints usage and exits 2. There are no subcommands.
-- **PLAT-FR-002 (start).** The server loads and validates its configuration (§3.9), opens its data, runs the bootstrap (PLAT-FR-003), resumes durable work, starts the maintenance loop (PLAT-FR-005) and then listens on `[server].bind:[server].port`. Any failure before listening stops the process with exit status 1 and one error line on stderr. Durable work that is resumed at start includes clones left `pending` or `cloning` (§4) , pending restacks (§7), running land attempts (§8) and rebuild jobs (§10). When it starts listening, the server logs the address, the configuration path and the data directory.
+- **PLAT-FR-002 (start).** The server loads and validates its configuration (§3.9), opens its data, runs the bootstrap (PLAT-FR-003), resumes durable work, starts the maintenance loop (PLAT-FR-005) and then listens on `[server].bind:[server].port`. Any failure before listening stops the process with exit status 1 and one error line on stderr. Durable work that is resumed at start includes clones left `pending` or `cloning` (§4) , pending restacks (§7), running land attempts (§8), rebuild jobs (§10) and sandbox provisioning (§13). When sandboxes are enabled, the start also checks the sandbox runtime once and stops on a failure (SBX-FR-003). When it starts listening, the server logs the address, the configuration path and the data directory.
 - **PLAT-FR-003 (bootstrap).** The hub is **bootstrapped** once an admin token hash is stored. The token file is `<config dir>/admin_token`, where `<config dir>` is the directory of `config.toml` (§3.9).
 
   | Situation | Behaviour |
@@ -467,7 +479,7 @@ An API key of an admin-role user is **not** `admin` here. The admin role governs
   | bootstrapped, no token file | start normally; `--admin-email` is ignored |
 
   The token file has mode 0600 and holds the token with no trailing newline. After writing it, the server logs the file's absolute path at warn level, tells the operator to save the token and delete the file, and exits with status 0 without serving. The token itself is never logged.
-- **PLAT-FR-004 (shutdown).** On SIGTERM or SIGINT the server stops accepting connections and gives in-flight requests 15 seconds to finish. Event streams are closed. Background work stops within the grace its section sets (running rebuild jobs: 30 s, §10; sandbox teardown: 20 s, §13). The process exits when requests and background work have ended or their grace has passed, at most 30 s after the signal. Anything durable resumes at the next start. A clean shutdown exits 0. A failure to bind the listener exits 1.
+- **PLAT-FR-004 (shutdown).** On SIGTERM or SIGINT the server stops accepting connections and gives in-flight requests 15 seconds to finish. Event streams are closed. Background work stops within the grace its section sets (running rebuild jobs: 30 s, §10). Sandboxes are not touched: a shutdown ends the open exec, attach, log and transfer requests and nothing else (SBX-FR-063). The process exits when requests and background work have ended or their grace has passed, at most 30 s after the signal. Anything durable resumes at the next start. A clean shutdown exits 0. A failure to bind the listener exits 1.
 - **PLAT-FR-005 (maintenance loop).** The loop runs once right after start and then every hour. A pass runs these tasks in order:
 
   | Task | Defined in |
@@ -479,6 +491,7 @@ An API key of an admin-role user is **not** `admin` here. The admin role governs
   | token binding sweep | PLAT-FR-086 |
   | patch purge | §10 |
   | fork expiry | §4 |
+  | sandbox record cleanup | §13 |
 
   A failing task is logged and does not stop the others. Passes never overlap. The interval is not configurable. A section may also act on its own, finer timer; the loop is the guaranteed backstop.
 
@@ -541,7 +554,7 @@ An API key of an admin-role user is **not** `admin` here. The admin role governs
   | 9 | State preconditions | `409` or `400` |
   | 10 | Act | |
 
-  Consequences: a PAT without the scope gets 403 whether or not the workspace exists, so the answer leaks nothing. A member's write to an archived workspace is 403, not 409. Steps 1–4 on public routes skip authentication. One section inserts a step of its own: the sandbox feature check runs after step 4 and before step 5 (§13).
+  Consequences: a PAT without the scope gets 403 whether or not the workspace exists, so the answer leaks nothing. A member's write to an archived workspace is 403, not 409. Steps 1–4 on public routes skip authentication. One section inserts a step of its own: the sandbox feature check runs after step 4 and before step 5 (SBX-FR-010).
 - **PLAT-FR-014 (lists).** Every list endpoint answers
 
   ```json
@@ -690,7 +703,7 @@ An API key of an admin-role user is **not** `admin` here. The admin role governs
 - **PLAT-FR-080 (binding).** A PAT may be bound to exactly one workspace. The binding is set at creation and never changes. A bound token is an ordinary PAT of the minting user, with that user's access, restricted further by the binding. There are two ways for a caller to mint one, and one way for the hub:
   - `POST /workspaces/:slug/tokens` binds a new token to that workspace;
   - the fork-create call can mint a token bound to the new fork (§4);
-  - the hub itself mints a short-lived token bound to a task fork when it injects a git credential into a sandbox (§13). It is owned by the user who issued the lease, never exceeds the scopes and `paths` of the issuing credential, is returned by no route, and emits `hub.token.bind`.
+  - the hub itself mints the hub credential of a sandbox: a token bound to the sandbox's workspace (§13.3.4). It is owned by the user who created the sandbox and carries `git:read`, `git:write`, `changes:read`, `changes:write`, `sessions:write` and `audit:write`, each only if the creating credential holds it. It inherits the `paths` limit of the creating credential, expires with the sandbox, is returned by no route, and emits `hub.token.bind`. One is minted when the sandbox is created and at each start; it is revoked when the sandbox is stopped or deleted.
 - **PLAT-FR-081 (coverage).** A token bound to workspace W is valid on:
   - W;
   - every task fork of W that was created by a request authenticated with this token. The hub records the creating token on the fork.
@@ -733,7 +746,7 @@ An API key of an admin-role user is **not** `admin` here. The admin role governs
   A missing value fails before any request, with exit status 2 and a message that names the flag, the variable and the file.
 - **PLAT-FR-091 (requests).** Requests go to `<hub URL without trailing slash>/api/v1<path>` with `Authorization: Bearer <credential>`. Each request times out after 30 seconds unless a command states otherwise. Every user-supplied path segment is percent-encoded as one segment, so a `/` inside an argument becomes `%2F`.
 - **PLAT-FR-092 (output).**
-  - **stdout** carries the result and nothing else: one JSON document, indented by 2 spaces, followed by a newline. A command whose route answers `204` prints `{}`, unless its entry states a confirmation document (for example `{"status":"deleted","slug":"<slug>"}`).
+  - **stdout** carries the result and nothing else: one JSON document, indented by 2 spaces, followed by a newline. A command whose route answers `204` prints `{}`, unless its entry states a confirmation document (for example `{"status":"deleted","slug":"<slug>"}`). The commands that pass a sandbox's own output or files through (`parley sandbox exec`, `shell`, `logs` and `download`, §13.6) are the exception and say so in their entries.
   - **stderr** carries errors, warnings, hints and progress.
   - An error is printed on stderr as the error envelope (PLAT-FR-011). A hub error is printed as received, including `error_type`. An error raised by the CLI itself uses `code: 0` and one of these types:
 
@@ -764,7 +777,7 @@ An API key of an admin-role user is **not** `admin` here. The admin role governs
 
 #### Scrubbing
 
-- **PLAT-FR-098.** Text that leaves the hub in logs, events, audit records or error messages MUST NOT contain credentials. Before such text is emitted, known secret values (tokens, secrets, forge and gateway credentials) are replaced by `[redacted]`, user information is removed from URLs (`https://user:pass@host/…` becomes `https://host/…`), and the text is cut to at most 1024 bytes on a character boundary. If a secret cannot be removed cleanly, the whole text becomes `[redacted]`. The hub never logs an `Authorization` header or a request body that carries a secret.
+- **PLAT-FR-098.** Text that leaves the hub in logs, events, audit records or error messages MUST NOT contain credentials. Before such text is emitted, known secret values (tokens, secrets, forge and sandbox runtime credentials) are replaced by `[redacted]`, user information is removed from URLs (`https://user:pass@host/…` becomes `https://host/…`), and the text is cut to at most 1024 bytes on a character boundary. If a secret cannot be removed cleanly, the whole text becomes `[redacted]`. The hub never logs an `Authorization` header or a request body that carries a secret.
 
 ### 3.5 REST API
 
@@ -818,7 +831,7 @@ Paths are relative to `/api/v1` unless they start with `/healthz`, `/readyz`, `/
   {"version":"1.4.0","commit":"3f2a1bc","build_time":"2026-01-02T03:04:05Z","go_version":"go1.25.1"}
   ```
 
-  `version` is the release version, or `dev` for an untagged build. `go_version` is the toolchain that built the binary.
+  `version` is the release version, or `dev` for an untagged build. `go_version` is the toolchain that built the binary. When sandboxes are enabled the document also has `sandbox_runtime: {supported, connected}`: the OpenShell releases this hub supports and the release of the connected gateway (§13.9).
 
 #### `GET /metrics`
 - **Purpose:** Prometheus text exposition. No auth. The metric families are listed in §14.
@@ -1257,7 +1270,7 @@ Events are stored and streamed by §14 and carry the common fields listed there 
 
 | Event | When | Actor | Resource / action / workspace | `metadata` |
 |---|---|---|---|---|
-| `hub.token.bind` | once per bound token minted, by `POST /workspaces/:slug/tokens`, by fork-create, or by the hub for a sandbox git credential (§13) | the minting user; `api_key` or `pat` | `token` / token id / `bind` / the bound slug | `token_id`, `workspace`, `permissions`, `paths` (or null), `expires_at` (or null). Never the token value. |
+| `hub.token.bind` | once per bound token minted, by `POST /workspaces/:slug/tokens`, by fork-create, or by the hub as the hub credential of a sandbox, at create and at each start (§13) | the minting user; `api_key` or `pat` | `token` / token id / `bind` / the bound slug | `token_id`, `workspace`, `permissions`, `paths` (or null), `expires_at` (or null). Never the token value. |
 | `hub.token.bound_refused` | the binding guard refused a request, rate-limited (PLAT-FR-087) | the token's user; `pat` | `token` / token id / `bound_refused` / the bound slug | `token_id`, `bound_workspace`, `requested_workspace` (when the request named one), `method`, `route`, `status` (403 or 404), `surface` (`api` or `git`), `suppressed` (int) |
 
 `hub.token.*` events are visible only to callers with level `owner` or `admin` on the bound workspace (§14.3.7). `hub.token.bound_refused` is visible to them even when the requested workspace is not. `requested_workspace` is the slug as the caller typed it and says nothing about whether it exists.
@@ -1331,7 +1344,7 @@ Logs are JSON lines on stderr. Each request produces one access-log line with `m
 | `[land]` | §8 | landing attempts, timeout, workers, committer identity |
 | `[awareness]` | §9 | claim TTLs and limits |
 | `[secrets]` | §11 | encryption key file |
-| `[sandbox]`, `[[sandbox.profiles]]` | §13 | sandboxes |
+| `[sandbox]`, `[[sandbox.profiles]]`, `[[sandbox.credentials]]` | §13 | the sandbox runtime, limits, profiles and credentials |
 
 #### Server flags
 
@@ -1344,7 +1357,7 @@ Logs are JSON lines on stderr. Each request produces one access-log line with `m
 | `XDG_CONFIG_HOME` | `parleyd` | directory of `config.toml` and `admin_token`; default: the working directory |
 | `XDG_DATA_HOME` | `parleyd` | base directory for `database.path` and `workspace.path` |
 | any `${NAME}` referenced in `config.toml` | `parleyd` | substituted into the configuration (for example OAuth client secrets) |
-| `PATH` | `parleyd` | locates `git` and, with sandboxes, the container engine |
+| `PATH` | `parleyd` | locates `git` |
 | `PARLEY_SECRETS_KEY`, `PARLEY_SECRETS_KEY_PREVIOUS` | `parleyd` | secret encryption key and the former key during rotation (§11) |
 | `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY` | `parleyd` | standard proxy behaviour for outgoing calls (identity providers, origins, forges) |
 | `PARLEY_CONFIG_DIR` | `parley` | CLI config directory; default `~/.parley` |
@@ -1374,7 +1387,7 @@ Retention is configured only through the `[events]`, `[audit]` and `[sessions]` 
   - A username change at the provider that collides with another user keeps the old username silently.
 - **Idempotent replays of token creation** return the token object without the `token` value. A client that lost the value must revoke the token and create a new one.
 - **Rate limiting** counts refused requests too. The CLI does not retry on 429.
-- **Readiness** reports only whether the hub can reach its own data. It does not check origins, forges, identity providers or the sandbox provider.
+- **Readiness** reports only whether the hub can reach its own data. It does not check origins, forges, identity providers or the sandbox runtime.
 
 ---
 
@@ -1429,7 +1442,7 @@ Out of scope, with hand-off points only: the git protocol and `hub.git.push` (§
 **WS-US-08: Recover a damaged copy (Developer).** As an owner, I want `reclone` to discard the hub's copy and clone origin again.
 
 **WS-US-09: Fork for a task (Agent).** As an agent, I want my own disposable copy of a repository in one call, so that I can start work immediately and cannot disturb anyone else.
-- `POST /workspaces/:slug/forks` answers `201` with a workspace in `status: "ready"`, its git remote URL and, if I asked, a token bound to the fork.
+- `POST /workspaces/:slug/forks` answers `201` with a workspace in `status: "ready"`, its git remote URL and, if I asked, a token bound to the fork and a sandbox with the fork checked out (§13).
 - The call takes the same time for a small and a very large repository.
 - The fork shows the parent's branches, read-only and always current. I push my work to new branches.
 
@@ -1583,8 +1596,9 @@ A task fork is a workspace with `kind: "fork"` and a `parent_slug`.
 - **No copy.** Creating a fork copies no history. All commits of the parent that are reachable from its branches and tags can be fetched from the fork.
 - **Automatic change.** With `auto_change` (default true), a push or API commit that creates or moves an own branch which is not the source of a `draft` or `open` change opens a change (§7) in the parent, with the fork branch as source and the fork's base branch as target. Normally that is the first push of a new branch.
 - **Lifetime.** A fork has an `expires_at` and is deleted when it passes. It can also be deleted early by the hub once its work has landed (WS-FR-070).
+- **Sandboxes.** A fork can have sandboxes (§13), and one can be created with it in the same call (WS-FR-082). A sandbox never outlives its fork: deleting the fork deletes its sandboxes first.
 - **Ownership and access.** The caller owns the fork. The fork is in the parent's organization. Every reader of the parent can read the fork.
-- **Configuration data.** Variables and secrets resolve in the order fork → parent workspace → organization → user (§11). For secrets the parent step applies only when the fork's owner has write access to the parent, so a fork owned by a read-only org member never receives the parent's secrets (§11.3).
+- **Configuration data.** Variables and secrets resolve in the order fork → parent workspace → organization → user (§11). For secrets the parent step applies only when the fork's owner has write access to the parent, so a fork owned by a read-only org member never receives the parent's secrets (§11.3). The same chain decides which secrets become credentials of a fork's sandbox (SBX-FR-024).
 - **Carry-patch parents.** A fork of a carry-patch workspace is a plain fork. It has no patches, no upstream and no integration branch of its own. The parent's integration branch and patch branches are ordinary tracking branches in it.
 
 ### 4.4 Functional requirements
@@ -1706,7 +1720,7 @@ A task fork is a workspace with `kind: "fork"` and a `parent_slug`.
 - WS-FR-062 Reactivate applies to an `archived` workspace, else `409 workspace_not_archived`. It sets `pending` and records clone work, which finds the kept copy (WS-FR-026).
 - WS-FR-063 Reclone applies to a repository workspace in `ready` or `failed`. It is refused with `409`, `error_type: has_forks`, while the workspace has forks, because forks depend on the parent's copy. It first tries to push every branch to origin, fast-forward only (on a carry-patch workspace: every branch except the integration branch); a failure of that push does not stop it. It then discards the hub's copy, clears `sync_error`, `origin_head_sha` and all origin heads, sets `pending` and records clone work. Whatever did not reach origin is lost, including refs under `refs/hub/`. Change records stay; what a change does when its commits are gone is defined in §7.
 - WS-FR-064 Delete of a repository workspace applies only when it is `archived`, else `409`, `error_type: workspace_not_archived`.
-- WS-FR-065 Delete is transactional. In one step it removes the workspace and its forks, revokes every token bound to any of them, and removes everything they own: workspace secrets and variables, patches, changes, policy, claims and settings. If the step fails the answer is `500` and nothing has changed. The same step force-closes the remaining active sessions of the workspace and its forks (reason `workspace deleted`, §14). Only after it succeeded does the hub discard the repository data. The slug is free again. Audit records and the event log are kept.
+- WS-FR-065 Delete is transactional. The sandboxes of the workspace and of its forks are deleted first (SBX-FR-045). In one step the hub then removes the workspace and its forks, revokes every token bound to any of them, and removes everything they own: workspace secrets and variables, patches, changes, policy, claims and settings. If the step fails the answer is `500` and nothing has changed. The same step force-closes the remaining active sessions of the workspace and its forks (reason `workspace deleted`, §14). Only after it succeeded does the hub discard the repository data. The slug is free again. Audit records and the event log are kept.
 
 **Task forks**
 
@@ -1714,7 +1728,7 @@ A task fork is a workspace with `kind: "fork"` and a `parent_slug`.
 - WS-FR-067 Fork creation is synchronous. The answer is `201` with the fork in `status: "ready"`, and the fork is usable over git and the API from that moment.
 - WS-FR-068 Fork creation copies no history. Its duration and the storage it adds MUST NOT depend on the size of the parent repository (number of commits, files, branches of history, or bytes). The target is under one second for any repository; the measured bound is set in §15. The storage a fork uses grows only with what is pushed to it.
 - WS-FR-069 `ttl` defaults to `[forks].default_ttl` and may not exceed `[forks].max_ttl`. The shortest `ttl` is 5 minutes. `expires_at` is the creation time plus `ttl`.
-- WS-FR-070 Early expiry. When `[forks].expire_on_land` is true, a fork is deleted before `expires_at` once all of these have held for one hour without interruption: the fork is the source of at least one change; every such change is `landed` or `abandoned`; every own branch that still exists in the fork is the source of such a change. A push to the fork, a new change from it, or a restored change starts the hour again.
+- WS-FR-070 Early expiry. When `[forks].expire_on_land` is true, a fork is deleted before `expires_at` once all of these have held for one hour without interruption: the fork is the source of at least one change; every such change is `landed` or `abandoned`; every own branch that still exists in the fork is the source of such a change. A push to the fork, a new change from it, or a restored change starts the hour again. Early expiry also waits while the fork has a sandbox in state `provisioning` or `ready` (SBX-FR-045). The fork's `expires_at` still applies.
 - WS-FR-071 The owner can set a new lifetime at any time: `ttl` in an update sets `expires_at` to now plus `ttl`, within the same bounds as at creation. This may also shorten the lifetime.
 - WS-FR-072 A parent may have at most `[forks].max_per_workspace` forks at one time. A create beyond that answers `429`, `error_type: fork_limit_reached`. Forks that were deleted or expired do not count.
 - WS-FR-073 A tracking branch cannot be written in the fork by any means (git push, API ref update, API commit, delete). The refusal is `403`, `error_type: tracking_branch`; over git it is a per-ref rejection (§5). A fork cannot create a branch with the name of a tracking branch.
@@ -1727,10 +1741,11 @@ A task fork is a workspace with `kind: "fork"` and a `parent_slug`.
   - `name` defaults to `fork:<fork slug>`.
   - The token is revoked when the fork is deleted or expires.
 - WS-FR-077 `session_id` at creation must satisfy the session-linking rule of §14 (the session's status is not checked), else `400`, `error_type: unknown_session`. It is stored on the fork and carried on the fork's events.
-- WS-FR-078 Deleting a fork needs no archive first. It removes the fork, its own branches, its variables and secrets, and revokes the tokens bound to it, and force-closes its active sessions (reason `workspace deleted`, or `fork expired` when the sweep deletes it), all in one transactional step.
+- WS-FR-078 Deleting a fork needs no archive first. The fork's sandboxes are deleted first, without a checkpoint (SBX-FR-045). The delete then removes the fork, its own branches, its variables and secrets, and revokes the tokens bound to it, and force-closes its active sessions (reason `workspace deleted`, or `fork expired` when the sweep deletes it), all in one transactional step.
 - WS-FR-079 Deleting or expiring a fork does not delete changes. Changes that have the fork as source belong to the parent and their versions stay fetchable there (§7). What an open change does when its source is gone is defined in §7.
 - WS-FR-080 Deleting a parent deletes all its forks in the same step (WS-FR-065). One `hub.workspace.delete` is emitted for each fork and one for the parent.
 - WS-FR-081 A fork never changes its parent's branches. The only path from a fork into the parent is a change that lands (§7, §8).
+- WS-FR-082 Fork creation may create a sandbox. When the body has `sandbox`, an object with the fields of the sandbox create request (§13.5), the hub creates the fork and then a sandbox on it, and the response carries both (SBX-FR-028). The caller also needs `sandboxes:write`. If the sandbox request is refused, the fork is not created either and the answer is the sandbox route's error. The sandbox's `session_id` and `purpose` default to the fork's. The fork is `ready` at once (WS-FR-067); the sandbox is returned in state `provisioning` and becomes `ready` later.
 
 ### 4.5 REST API
 
@@ -1893,6 +1908,7 @@ All paths are relative to `/api/v1`. Errors use the error envelope (§3). Every 
 | `token` | object | none | `{name?, permissions, paths?, expires?}`, WS-FR-076 |
 | `purpose` | string | null | ≤ 1024 characters |
 | `session_id` | string | null | WS-FR-077 |
+| `sandbox` | object | none | The body of the sandbox create request (§13.5), WS-FR-082 |
 
 - **Response:** `201`
 
@@ -1903,13 +1919,14 @@ All paths are relative to `/api/v1`. Errors use the error envelope (§3). Every 
   "token": { "token_id": "k3x9q2mz", "user_id": "uuid", "name": "fork:my-project--k3f9x2ab", "token": "parley_pat_…",
              "permissions": ["git:read", "git:write", "changes:write"], "paths": ["src/loader/**"],
              "workspace": "my-project--k3f9x2ab", "expires_at": null, "revoked_at": null,
-             "created_at": "2026-01-01T00:00:00Z" }
+             "created_at": "2026-01-01T00:00:00Z" },
+  "sandbox": { "id": "sbx_…", "workspace": "my-project--k3f9x2ab", "state": "provisioning", "…": "…" }
 }
 ```
 
-  `workspace` is the fork's workspace object with `access: "owner"`. `remote` equals its `hub_url`. `token` is present only when it was requested. It is the `Token` object of §3 with its value in the member `token`; the value is never shown again, and an idempotent replay omits it (§3).
-- **Errors:** `400 invalid_request` (bad `name`, `ttl`, `token`, malformed `session_id`); `400 unknown_session` (`session_id` fails the session-linking rule of §14); `400`, `error_type: fork_ref_not_found` (`ref` is not a branch of the parent); `400 not_supported_on_fork` (the parent is itself a fork); `403 forbidden` (admin token); `403 insufficient_scope` (a PAT caller without `tokens:manage`, or token permissions or paths beyond the caller's); `409` per WS-FR-007 (parent not `ready`); `409 conflict` (fork name in use); `429 fork_limit_reached`.
-- **Side effects:** fork created; optional token created; `hub.workspace.fork`.
+  `workspace` is the fork's workspace object with `access: "owner"`. `remote` equals its `hub_url`. `sandbox` is present only when it was requested and is the sandbox object of §13. `token` is present only when it was requested. It is the `Token` object of §3 with its value in the member `token`; the value is never shown again, and an idempotent replay omits it (§3).
+- **Errors:** `400 invalid_request` (bad `name`, `ttl`, `token`, malformed `session_id`); `400 unknown_session` (`session_id` fails the session-linking rule of §14); `400`, `error_type: fork_ref_not_found` (`ref` is not a branch of the parent); `400 not_supported_on_fork` (the parent is itself a fork); `403 forbidden` (admin token); `403 insufficient_scope` (a PAT caller without `tokens:manage`, or token permissions or paths beyond the caller's); `409` per WS-FR-007 (parent not `ready`); `409 conflict` (fork name in use); `429 fork_limit_reached`. With `sandbox`, also the errors of the sandbox create route (§13.5), among them `404 sandboxes_disabled`, `422 credential_missing` and `429 sandbox_capacity`; the fork is then not created.
+- **Side effects:** fork created; optional token created; `hub.workspace.fork`. With `sandbox`: sandbox created; `hub.sandbox.create`.
 
 #### `GET /workspaces/:slug/forks`
 
@@ -1994,9 +2011,11 @@ The commands use the global connection and credential flags and the conventions 
 | `--token-paths <globs>` | `token.paths` | Comma-separated. Needs `--token-permissions` (else exit 2). |
 | `--purpose <text>` | `purpose` | |
 | `--session <id>` | `session_id` | |
+| `--sandbox-profile <name>` | `sandbox.profile` | Giving this flag is what requests a sandbox (SBX-FR-028). |
+| `-- command...` | `sandbox.command` | Optional trailing command: the sandbox's main process. Needs `--sandbox-profile` (else exit 2). |
 
 - **Calls:** `POST /workspaces/:slug/forks`.
-- **Output:** the response: `workspace`, `remote` and, when requested, `token` with its secret. The secret is printed this once only; the command says so on stderr.
+- **Output:** the response: `workspace`, `remote` and, when requested, `sandbox` and `token` with its secret. The secret is printed this once only; the command says so on stderr.
 - **Exit codes:** 0, 1, 2.
 
 #### `parley fork list <parent>`
@@ -2029,7 +2048,7 @@ For a carry-patch workspace, a fresh clone is followed by the upstream set-up of
 A sweep runs at least once a minute. It deletes, as in WS-FR-078:
 
 - every fork whose `expires_at` has passed (reason `ttl`);
-- when `[forks].expire_on_land` is true, every fork that has met the conditions of WS-FR-070 for one hour (reason `landed`).
+- when `[forks].expire_on_land` is true, every fork that has met the conditions of WS-FR-070 for one hour (reason `landed`). A fork with a `provisioning` or `ready` sandbox is skipped.
 
 Each deletion emits `hub.fork.expire`. A fork stays usable until the sweep removes it, so a fork may live up to a minute past `expires_at`. Forks of an archived parent expire as usual. A deletion that fails is retried by the next sweep. The number of forks that exist is exported as `parley_forks_active` (§14).
 
@@ -2143,7 +2162,7 @@ Out of scope: SSH transport and the dumb HTTP protocol (not offered); change sem
 
 A PAT bound to a workspace is valid only on that workspace and on the forks it created (§4). On any other repository it is answered like a stranger, and the refusal is reported as `hub.token.bound_refused` with `surface: "git"` (§3).
 
-**Hub-owned refs.** Everything under `refs/hub/` is written only by the hub. Two families are defined elsewhere: `refs/hub/changes/<number>/<version>` (every version of every change, §7) and `refs/hub/replaced/<name>` (backups of patch branch tips the hub replaced, §10). Hub-owned refs are listed and fetchable by name. A default clone does not fetch them, because git's default refspec covers only branches and tags.
+**Hub-owned refs.** Everything under `refs/hub/` is written only by the hub. Three families are defined elsewhere: `refs/hub/changes/<number>/<version>` (every version of every change, §7), `refs/hub/replaced/<name>` (backups of patch branch tips the hub replaced, §10) and `refs/hub/sandboxes/<sandbox id>/<branch>` (checkpoints of sandboxes, §13). Hub-owned refs are listed and fetchable by name. A default clone does not fetch them, because git's default refspec covers only branches and tags.
 
 **Ref update.** One command of a push: `{ref, before, after}`. `before` is the all-zero id for a create, `after` is the all-zero id for a delete. An update is **forced** when it is neither a create nor a delete and `before` is not an ancestor of `after`.
 
@@ -4290,16 +4309,16 @@ Updates of a patch branch and of the integration branch also produce the general
 
 ### 11.1 Purpose and scope
 
-The hub keeps named key/value pairs for three kinds of owner: a user, an organization and a workspace. **Secrets** are write-only. Their values never leave the hub through any API response, and they are encrypted at rest. The hub consumes them itself: as git and forge credentials, as the webhook secret, and as values injected into sandboxes. **Variables** follow the same rules and scopes, but their values are readable, and a workspace's effective variables can be read merged along a precedence chain.
+The hub keeps named key/value pairs for three kinds of owner: a user, an organization and a workspace. **Secrets** are write-only. Their values never leave the hub through any API response, and they are encrypted at rest. The hub consumes them itself: as git and forge credentials, as the webhook secret, and as the credentials of sandboxes, where the workload never receives a value (§13). **Variables** follow the same rules and scopes, but their values are readable, and a workspace's effective variables can be read merged along a precedence chain.
 
-In scope: scopes, validation, access rules, encryption and key rotation, resolution chains (including task forks), REST routes, events and the `parley secrets` / `parley vars` commands. Out of scope: how sandboxes use injected secrets (§13), how git credentials are used (§4, §10) and the forge webhook (§12). Variables never change hub behaviour; behaviour switches are workspace settings (§4).
+In scope: scopes, validation, access rules, encryption and key rotation, resolution chains (including task forks), REST routes, events and the `parley secrets` / `parley vars` commands. Out of scope: how a secret becomes a credential of a sandbox (§13), how git credentials are used (§4, §10) and the forge webhook (§12). Variables never change hub behaviour; behaviour switches are workspace settings (§4).
 
 ### 11.2 User stories
 
 - **SEC-US-01** As a Developer, I want to store a git PAT for my workspace (`GIT_PAT`) without it ever being readable again, so that the hub can clone, push and call the forge for me.
 - **SEC-US-02** As an Org member, I want to store secrets and variables at the organization level, so that every workspace of the org shares them.
 - **SEC-US-03** As an Agent with a workspace-bound token and `vars:read`, I want the effective variables of my workspace or fork, each with its origin, so that I can configure myself.
-- **SEC-US-04** As an Org member working in a task fork, I want my fork to run with the parent's variables, while the parent's secrets stay out of my reach: not readable, not listable and not injected into my fork's sandboxes.
+- **SEC-US-04** As an Org member working in a task fork, I want my fork to run with the parent's variables, while the parent's secrets stay out of my reach: not readable, not listable and not usable as credentials in my fork's sandboxes.
 - **SEC-US-05** As an Operator, I want secrets encrypted with a key I supply and can rotate, so that a copy of the hub's storage does not disclose them.
 - **SEC-US-06** As a user, I want every change to my secrets and variables recorded without values and visible to me in `/audit` and `/events`.
 
@@ -4360,15 +4379,15 @@ A task fork has no origin and therefore no origin credential. Reserved names sto
 The user is always the workspace owner, never the caller. For a fork, the owner is whoever created the fork, and the org is the parent's. The rule is the same for every caller, including admin tokens.
 
 - **Variables** resolve by merge: for each key, compared case-insensitively, the entry of the highest-priority scope that has it wins entirely (its key casing, value, timestamps and `origin`).
-- **Secrets** resolve by name for sandbox injection (§13): the first scope in the chain that has the name wins. Values are read when the sandbox is created and go only into the sandbox environment. For secrets, step 2 applies only when the fork's owner has write access to the parent workspace (the parent's owner). The test is on the fork's owner, never on the caller: an admin token acts as the fork owner here. In a fork owned by a read-only org member, step 2 is skipped for secrets, so the parent's secrets never reach that fork's sandboxes. Reserved names are skipped in step 2 for everyone, so no fork's sandbox receives the parent's origin, upstream or webhook credentials.
+- **Secrets** resolve by name for the credentials of a sandbox (SBX-FR-024): the first scope in the chain that has the name wins. Values are read when the sandbox is created and again at each start. A value reaches a sandbox only as a credential attached through an OpenShell provider: the hub hands it to the runtime, which adds it outside the sandbox on requests to authorized endpoints. The workload sees a placeholder and never receives the value (§13.3.4). For secrets, step 2 applies only when the fork's owner has write access to the parent workspace (the parent's owner). The test is on the fork's owner, never on the caller: an admin token acts as the fork owner here. In a fork owned by a read-only org member, step 2 is skipped for secrets, so the parent's secrets never reach that fork's sandboxes. Reserved names are skipped in step 2 for everyone, so no fork's sandbox receives the parent's origin, upstream or webhook credentials.
 
-Resolution is use, not read access. A fork owner who is only an org member of the parent gets the parent's variables in the fork's resolved set, and nothing of the parent's secrets: no value, no injection, and no secret names (SEC-FR-006). No route returns a stored secret value to anyone. The only value the hub ever shows is a webhook secret it generated itself, once, in the response that creates it (§12).
+Resolution is use, not read access. A fork owner who is only an org member of the parent gets the parent's variables in the fork's resolved set, and nothing of the parent's secrets: no value, no credential in a sandbox, and no secret names (SEC-FR-006). No route returns a stored secret value to anyone. The only value the hub ever shows is a webhook secret it generated itself, once, in the response that creates it (§12).
 
 ### 11.4 Functional requirements
 
 - **SEC-FR-001** Every route follows the global check order (§3): authenticate → binding guard (bound PATs) → PAT scope → scope access → request validation → state → act. PAT scopes are `secrets:read`, `secrets:write`, `vars:read`, `vars:write`; a read accepts either, a write only `write`. API keys and admin tokens are not scope-checked.
 - **SEC-FR-002** A workspace-bound token may use only the `workspace` scope of a workspace it is valid on (its workspace and the forks it created, §3). On `/user/…` and `/orgs/…` routes it gets `403 token_bound`; on another workspace `404 workspace not found`.
-- **SEC-FR-003** Secret values are returned by no route, event, log line or error message, except the webhook secret the hub generates, which `PUT …/forge/webhook` shows once (§12). Only credential resolution, webhook verification and sandbox injection read them.
+- **SEC-FR-003** Secret values are returned by no route, event, log line or error message, except the webhook secret the hub generates, which `PUT …/forge/webhook` shows once (§12). Only credential resolution, webhook verification and the attachment of credentials to sandboxes (§13) read them.
 - **SEC-FR-004** User scope: a credential without a user identity (admin token) gets `403 forbidden`, message `user-scoped endpoints require a user credential`.
 - **SEC-FR-005** Org scope: an unknown org and a non-member both get `404 not_found` with the same body. Admin tokens bypass membership.
 - **SEC-FR-006** Workspace scope uses the workspace access rule (§3):
@@ -4556,9 +4575,9 @@ To rotate: set the new key as `PARLEY_SECRETS_KEY` and the old one as `PARLEY_SE
 
 - A full scope answers `429 secret_limit_reached` on create even when a key of the request also conflicts.
 - An empty `GIT_PAT` counts as no credential.
-- No key configured: secret create and update answer `503 secrets_unavailable`; git and forge operations that need a stored credential fail with an error that says the secret is unreadable; public repositories keep working; a sandbox whose profile requires an unreadable secret fails as for a store error (§13).
+- No key configured: secret create and update answer `503 secrets_unavailable`; git and forge operations that need a stored credential fail with an error that says the secret is unreadable; public repositories keep working; a sandbox whose profile requires a credential whose secret cannot be read is not created or started (§13).
 - A fork with a variable of the same name as its parent's wins over the parent; deleting the fork's entry exposes the parent's again.
-- A fork owner who loses write access to the parent loses the parent step for secrets at the next resolution; sandboxes already created keep what they were given. The parent step for variables is unaffected.
+- A fork owner who loses write access to the parent loses the parent step for secrets at the next resolution; a sandbox that is already running keeps its credentials until it stops, and its next start resolves again (SBX-FR-041). The parent step for variables is unaffected.
 - A fork owner who leaves the org loses access to the fork (§3). Until the fork expires or is deleted, its chain has no org step; the parent step for variables stays for the callers who can still reach the fork (the parent's owner, admin tokens).
 
 ---
@@ -5011,477 +5030,584 @@ The limits stated in §12.4 (deadlines, redirects, sizes, lengths, retention) ar
 
 ### 13.1 Purpose and scope
 
-The hub lends isolated sandboxes (containers, optionally micro-VMs) to agents. A sandbox comes filled with the secrets the agent needs, and the caller never sees those secrets.
+A sandbox is where an agent runs. In Parley a sandbox is born attached to a workspace, normally a task fork: it starts with the fork checked out, it can reach the hub and nothing else unless an operator allowed more, it holds no real credential, and what the agent did in it is saved back to the fork before the sandbox goes away.
 
-An operator defines the allowed shapes as **profiles** in the `[sandbox]` section of the hub configuration. A caller obtains a **lease** over REST and receives a one-time **lease token**. With that token the caller connects to the hub's **sandbox gateway**, a gRPC listener separate from the REST port that speaks the AgentKit-compatible gateway protocol, creates exactly one sandbox (a **box**) for the lease, and works in it. The hub enforces lifetimes and a hub-wide capacity limit, and it cleans up after crashes and at shutdown.
+Parley does not implement isolation itself. Sandboxes run on **OpenShell**, an open-source sandbox runtime. OpenShell provides the isolation (filesystem, process and network confinement, with containers or micro-VMs underneath), the policy format, and the credential mechanism in which a workload sees only a placeholder and the real credential is added outside the sandbox, on requests to approved endpoints. Parley is the control plane on top. It decides who may have a sandbox and of which shape, connects the sandbox to the fork, the session and the secrets of §11, enforces lifetimes and quotas, saves work, and records what happened.
 
-A lease belongs to a workspace. When that workspace is a task fork (§4), the box is told where the fork's git remote is and can be given a short-lived git credential for it, so an agent can go from "fork" to "working checkout in a clean box" without handling a credential.
+The division of work:
 
-The feature is optional. Without a `[sandbox]` section every sandbox REST route answers `404` with `error_type: sandboxes_disabled`, and no gateway listens.
+| Concern | Owner |
+|---|---|
+| Isolation, enforcement of filesystem, process and network policy, credential substitution, the sandbox's own lifecycle | OpenShell |
+| Who may create a sandbox, with which profile; the checkout of the fork; the hub credential; which secrets become credentials; time limits, idle stop and quotas; checkpoints; approval of new network access; events and audit | Parley |
 
-In scope: configuration and start-up checks, profile listing, the lease lifecycle, secret injection, the gateway as clients see it, expiry, retention, recovery, shutdown, events, metrics and the `parley sandbox` commands.
+An agent needs nothing but the REST API to use a sandbox: create, run commands, move files, read logs. No runtime-specific client is required.
 
-Out of scope: building or pulling images, a CLI command for the admin-wide lease list, more than one box per lease, and running checks in sandboxes (a later candidate, §17).
+The feature is optional. Without a `[sandbox]` section every sandbox route answers `404`, `error_type: sandboxes_disabled`.
+
+In scope: configuration and start-up checks, profiles, credentials for sandboxes, the sandbox lifecycle, the checkout, exec, files, logs and attach, checkpoints, network policy and its proposals, time limits, quotas, reconciliation with the runtime, events, metrics and the `parley sandbox` commands. Out of scope: building images; exposing services that run in a sandbox; GPU scheduling beyond passing a count; running policy checks of §8 in sandboxes (§17); any policy language of Parley's own.
 
 ### 13.2 User stories
 
-**SBX-US-01 (Operator): enable sandboxes.** As an operator, I want to declare a provider and profiles in the configuration, so that agents get sandboxes only of shapes I control.
-- Every static error in `[sandbox]`, unknown keys included, is reported in one message and stops the start.
-- The provider is probed once at start. A provider that cannot honour a profile stops the start.
-- Without the section the hub starts normally and logs that sandboxes are disabled.
+**SBX-US-01 (Operator): enable sandboxes.** As an operator, I want to point the hub at an OpenShell gateway and declare profiles, so that agents get sandboxes only of shapes I control.
+- A configuration error or an unreachable or incompatible gateway stops the start with one message that names the problem.
 
-**SBX-US-02 (Developer, Agent): discover profiles.** As a developer, I want to list profiles, so that I can choose one by name.
-- The list shows secret names and environment key names, never values.
+**SBX-US-02 (Agent): one call to a working environment.** As an agent, I want to create a task fork and a sandbox for it in one call, and find the fork checked out in the sandbox with git already able to push.
 
-**SBX-US-03 (Agent): get a lease.** As an agent with a `sandboxes:write` token, I want a lease in my workspace or task fork, so that I can create a box with the profile's secrets.
-- The answer carries the lease and its token. The token is shown only here.
-- Required secrets must exist, and the hub must be under its capacity limit.
+**SBX-US-03 (Agent): work without a runtime client.** As an agent, I want to run commands, read their output, and upload and download files through the REST API.
 
-**SBX-US-04 (Agent): work on a fork inside a box.** As an agent that created a task fork, I want the box to know the fork's git remote and, if the operator allows it, to hold a credential for it, so that I can clone and push from inside the box without ever holding that credential myself.
+**SBX-US-04 (Developer): run the agent inside.** As a developer, I want to start a sandbox whose main process is my coding agent, detach, and later read its logs and exit code.
 
-**SBX-US-05 (Sandbox client): create and use the box.** As a client holding a lease token, I want to dial `gateway_url` and create my box, so that I can run code in it.
-- The image, network, resources and environment come from the lease, never from my request.
-- The first create makes the lease `active`. A second create is refused.
+**SBX-US-05 (Operator): no real credentials inside.** As an operator, I want the model API key and every other secret to stay outside the sandbox, usable only for requests to the endpoints I named, so that code in the sandbox cannot read or send them elsewhere.
 
-**SBX-US-06 (Developer, Agent): end the lease.** As a lease holder, I want to end the lease by `DELETE` or by closing the box, so that the box is destroyed and the token is revoked.
+**SBX-US-06 (Operator): no egress by default.** As an operator, I want a sandbox to reach the hub and nothing else unless a profile allows it.
 
-**SBX-US-07 (Operator): nothing leaks or outlives its time.** As an operator, I want unused leases to lapse, boxes to be destroyed at `expires_at`, leases left behind by a crash to be reconciled at start, and all boxes to be destroyed at shutdown.
+**SBX-US-07 (Agent, Developer): ask for more network access.** As an agent blocked by the network policy, I want my request for a new destination to reach a person, and as that person I want to approve or reject it with the risk assessment in front of me.
 
-**SBX-US-08 (Operator): inspect all leases.** As an operator with the admin token, I want to list the leases of every workspace.
+**SBX-US-08 (Agent): nothing is lost.** As an agent, I want uncommitted and unpushed work saved to the fork when my sandbox stops, expires or fails.
 
-**SBX-US-09 (Org member): read only.** As an org member with read-only access to a workspace, I can list and read its leases, but I cannot issue or end one there. I can fork the workspace and lease a sandbox on my fork.
+**SBX-US-09 (Operator): hub restarts are harmless.** As an operator, I want to restart or upgrade the hub without ending any sandbox.
+
+**SBX-US-10 (Operator): fair use.** As an operator, I want limits per user and per workspace, idle sandboxes stopped, and every sandbox ended at its time limit.
+
+**SBX-US-11 (Org member).** As an org member with read-only access to a workspace, I cannot create a sandbox on it. I can fork it and create a sandbox on my fork.
 
 ### 13.3 Concepts and data model
 
-#### 13.3.1 Profile
+#### 13.3.1 Runtime
 
-A profile is defined in configuration and is never stored. It is fixed for the life of the process.
+The hub is a client of one OpenShell gateway, configured in `[sandbox]`. The hub uses one OpenShell workspace of that gateway (`openshell_workspace`, default `parley`) and owns everything in it: no other client creates sandboxes, providers or policies there. People do not need an OpenShell account to use Parley's sandboxes.
 
-| Field | Type | Default | Constraints |
+Where sandboxes physically run (a container engine, Kubernetes, micro-VMs) is OpenShell's configuration, not Parley's. The hub requires a compatible OpenShell release (§13.9) and checks it at start.
+
+#### 13.3.2 Profile
+
+A profile is the operator's template for a sandbox. It is defined in configuration and fixed for the life of the hub process.
+
+| Field | Type | Default | Meaning |
 |---|---|---|---|
 | `name` | string | required | `^[a-z0-9][a-z0-9_-]{0,62}$`, unique |
-| `default` | bool | false | at most one profile may set it |
-| `image` | string | required | non-empty; the hub does not pull or check it |
-| `cpus` | number | 0 | ≥ 0; fractions allowed |
-| `memory_mb` | integer (MiB) | 0 | ≥ 0 |
-| `pids` | integer | 0 | ≥ 0 |
-| `disk_mb` | integer (MiB) | 0 | ≥ 0; refused at start if the provider cannot limit disk |
-| `network` | string | `none` | one of `[sandbox].network_modes` |
-| `ttl` | duration | required | > 0 and ≤ `[sandbox].max_ttl` |
-| `secrets` | list of strings | `[]` | secret names (§11 naming rules); required at issue and at create |
-| `optional_secrets` | list of strings | `[]` | same rules; injected when present |
-| `env` | map of strings | `{}` | fixed environment; keys follow secret naming rules; values are private |
-| `require_landlock` | bool | false | the box must run under Landlock |
-| `inject_git_credential` | bool | false | allow a git credential in boxes leased on a task fork (§13.4, fork integration) |
+| `default` | bool | false | At most one profile sets it |
+| `description` | string | `""` | Shown in the profile list |
+| `image` | string | the runtime's default image | OCI image reference. The hub does not build or pull images |
+| `cpu` | string | `""` | CPU limit as the runtime understands it (for example `2`); empty means the runtime's default |
+| `memory` | string | `""` | Memory limit (for example `4Gi`) |
+| `gpu` | int | 0 | Number of GPUs requested |
+| `ttl` | duration | required | Default and longest lifetime of a sandbox of this profile; at most `[sandbox].max_ttl` |
+| `idle_timeout` | duration | `[sandbox].idle_timeout` | Stop the sandbox after this long without activity; `0` disables |
+| `policy` | path | the built-in policy | An OpenShell policy file (YAML, OpenShell's schema). It is the sandbox's base policy |
+| `credentials` | list of strings | `[]` | Names of entries in `[[sandbox.credentials]]` attached to every sandbox of this profile |
+| `optional_credentials` | list of strings | `[]` | Attached when their secret exists; skipped otherwise |
+| `hub_access` | enum | `fork` | `fork`: the sandbox gets a hub credential for its workspace. `none`: it gets none and cannot reach the hub |
+| `env` | map of strings | `{}` | Fixed, non-secret environment for the main process and for every exec |
+| `checkpoint` | bool | true | Save work at stop, expiry and deletion (§13.3.6) |
+| `allow_proposals` | bool | true | Whether network access proposals are accepted from sandboxes of this profile |
 
-A zero resource value means "provider default". Names in `secrets`, `optional_secrets` and `env` are compared without regard to case and must be unique across all three. `PARLEY_REMOTE` and `PARLEY_GIT_TOKEN` are reserved and may not appear in any of them.
+**The built-in policy** allows no egress at all and lets the workload read the image and write only its working directory. The hub adds the hub rule and the rules of attached credentials (§13.3.4) to whatever base policy a profile names.
 
-#### 13.3.2 Lease
+Parley defines no policy language. A `policy` file is read by OpenShell as it is; the hub validates it against the runtime at start and refuses to start if the runtime rejects it.
+
+#### 13.3.3 Sandbox
 
 | Field | Type | Meaning |
 |---|---|---|
 | `id` | string | `sbx_` + 32 lowercase hex characters |
-| `workspace` | string | workspace slug; may be a task fork |
-| `session_id` | string or null | the agent session the lease belongs to (§14) |
-| `profile` | string | profile name at issue |
-| `purpose` | string | caller text, ≤ 64 characters, no control characters |
-| `state` | enum | `leased`, `active`, `destroyed`, `expired`, `failed` |
-| `gateway_url` | string | where to dial the gateway; the same for every lease |
-| `expires_at` | timestamp | `created_at` + effective TTL; the box and the token end here |
-| `lease_expires_at` | timestamp | `created_at` + min(`lease_timeout`, TTL); the deadline for creating the box |
-| `image`, `network`, `resources`, `require_landlock` | | snapshot of the profile at issue; `resources` is `{cpus, memory_mb, pids, disk_mb}` |
-| `secrets`, `optional_secrets` | list of strings | secret names from the profile, sorted |
-| `remote` | string or null | the fork's git URL when the workspace is a task fork |
-| `git_credential` | bool | whether a git credential is injected into the box |
-| `labels` | map of strings | the caller's labels |
-| `created_by` | string | the caller's user id, or `admin` for the admin token |
-| `created_at`, `updated_at` | timestamp | |
-| `sandbox_id` | string or null | the provider's box id once `active` |
-| `error` | string or null | failure message of a `failed` lease |
-| `ended_at` | timestamp or null | when the lease reached a terminal state |
-| `end_reason` | string or null | `client`, `api`, `expired`, `shutdown`, `restart`, `workspace_deleted`; null for `failed` |
+| `workspace` | string | Workspace slug; normally a task fork |
+| `session_id` | string or null | The agent session the sandbox belongs to (§14) |
+| `profile` | string | Profile name at creation |
+| `purpose` | string | Caller text, at most 200 characters |
+| `state` | enum | `provisioning`, `ready`, `stopped`, `completed`, `failed`, `deleted` |
+| `state_reason` | string or null | Why, for `stopped`, `failed` and `deleted` (table below) |
+| `command` | string[] or null | The main process. Null means an idle sandbox that is driven by exec |
+| `exit_code` | int or null | Exit code of the main process once it ended |
+| `checkout` | object or null | `{path, ref, sha, branch}`: where the repository was checked out, from which ref, and the branch created for the work |
+| `image`, `cpu`, `memory`, `gpu` | | Snapshot of the profile at creation |
+| `credentials` | string[] | Names of the credentials attached, sorted. Never values |
+| `hub_access` | object or null | `{scopes, paths, expires_at}` of the hub credential in the sandbox; null when there is none |
+| `policy_revision` | int | Increases each time the sandbox's network policy changes |
+| `expires_at` | timestamp | When the sandbox is deleted |
+| `idle_timeout_seconds` | int | 0 when disabled |
+| `last_activity_at` | timestamp | Last exec, attach, file transfer, or output of the main process |
+| `checkpoint` | object or null | The latest checkpoint: `{at, ok, error, refs: [{branch, sha, dirty}]}` |
+| `restored_from` | string or null | Id of the sandbox whose checkpoint seeded this one |
+| `runtime_reachable` | bool | False while the hub cannot reach the runtime; the other fields then show the last known state |
+| `labels` | map of strings | The caller's labels |
+| `created_by` | object | `{actor_type, actor_id, username}` |
+| `created_at`, `updated_at`, `ended_at` | timestamp | |
 
-The hub also keeps, and never returns: a hash of the lease token, and the profile's fixed `env` with its values. A lease keeps its snapshot; a later change to the profile does not alter it.
+**States.**
 
-**Lease token.** `sbl_` + 44 base64url characters, from a cryptographic random source. It is returned once, in the `201` of the lease request. The hub stores only a hash, and removes that hash when the lease ends.
+| State | Meaning | Exec, files, attach |
+|---|---|---|
+| `provisioning` | The runtime is creating or restarting the sandbox, or the hub is preparing the checkout | refused, `409 sandbox_not_ready` |
+| `ready` | Running | available |
+| `stopped` | Compute released; the working directory is kept | refused |
+| `completed` | The main process exited with code 0 | refused; files can still be downloaded |
+| `failed` | The main process exited with another code, or the runtime failed | refused; files can still be downloaded when the runtime kept them |
+| `deleted` | Gone. The record stays readable for 24 hours | refused |
 
-**Live** means `leased` or `active`. **Terminal** means `destroyed`, `expired` or `failed`.
+**Transitions.**
 
-#### 13.3.3 State machine
-
-| From | To | Trigger | `end_reason` | Event |
+| From | To | Trigger | `state_reason` | Event |
 |---|---|---|---|---|
-| (new) | `leased` | lease request | n/a | `hub.sandbox.lease` |
-| `leased` | `active` | gateway Create succeeded; sets `sandbox_id` | n/a | `hub.sandbox.create` |
-| `leased` | `failed` | Create could not make the box (profile gone, required secret missing, provider error); sets `error` | null | `hub.sandbox.failed` |
-| `leased` | `expired` | no box by `lease_expires_at` | `expired` | `hub.sandbox.expire` |
-| `active` | `expired` | `expires_at` reached; box destroyed first | `expired` | `hub.sandbox.expire` |
-| `leased`, `active` | `destroyed` | `DELETE` | `api` | `hub.sandbox.destroy` |
-| `active` | `destroyed` | the holder closes the box through the gateway | `client` | `hub.sandbox.destroy` |
-| `leased`, `active` | `destroyed` | the workspace is deleted, or the fork expires | `workspace_deleted` | `hub.sandbox.destroy` |
-| `active` | `destroyed` | hub shutdown | `shutdown` | `hub.sandbox.destroy` |
-| `active` | `destroyed` | start-up recovery | `restart` | `hub.sandbox.destroy` |
+| (new) | `provisioning` | create | | `hub.sandbox.create` |
+| `provisioning` | `ready` | runtime ready and checkout done | | `hub.sandbox.ready` |
+| `provisioning` | `failed` | image, runtime or checkout failure; a required credential is missing | `provision_failed`, `checkout_failed`, `credential_missing` | `hub.sandbox.fail` |
+| `ready` | `completed` | main process exited 0 | | `hub.sandbox.exit` |
+| `ready` | `failed` | main process exited non-zero, or the runtime lost the sandbox | `exit`, `runtime_error` | `hub.sandbox.exit` or `hub.sandbox.fail` |
+| `ready` | `stopped` | stop request; idle timeout; the workspace or its parent is archived | `api`, `idle`, `archived` | `hub.sandbox.stop` |
+| `ready` | `provisioning` | the runtime is restarting the sandbox or reconnecting to it | | none |
+| `stopped`, `completed`, `failed` | `provisioning` | start request | | `hub.sandbox.start` |
+| any but `deleted` | `deleted` | delete request; `expires_at`; the workspace is deleted or the fork expires | `api`, `expired`, `workspace_deleted` | `hub.sandbox.delete` |
 
-Rules:
+`deleted` is the only terminal state. Every transition is conditional on the expected current state, so racing paths produce one transition and one event.
 
-- Every transition is conditional on the expected current state. When two paths race, exactly one wins and exactly one event is emitted.
-- A terminal lease never changes.
-- Ending a lease and revoking its token are one atomic act. `leased → active` keeps the token valid.
-- At most one box ever exists per lease.
+#### 13.3.4 Credentials
+
+A sandbox never holds a real credential. Each credential is an OpenShell **provider**: the workload sees a placeholder in an environment variable, and the runtime replaces it with the real value outside the sandbox, only on requests that go to an endpoint the provider's profile authorizes, from a program that profile lists.
+
+**Configured credentials** connect a secret of §11 to a provider profile:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `name` | string | Unique; what profiles refer to |
+| `provider_profile` | string | Id of an OpenShell provider profile known to the gateway (for example a model vendor's, or one the operator imported for an internal API) |
+| `secret` | string | Name of a secret (§11), resolved for the sandbox's workspace along the chain of §11.3 |
+
+The provider profile, not Parley, defines the environment variable name, the authorized hosts, ports and paths, and the programs that may use the credential.
+
+**The hub credential.** With `hub_access: fork` the hub mints a PAT for the sandbox and attaches it as a provider whose profile authorizes exactly the hub's own API and git endpoints for the workspace. The PAT:
+
+- is bound to the sandbox's workspace and owned by the user who created the sandbox;
+- carries `git:read`, `git:write`, `changes:read`, `changes:write`, `sessions:write` and `audit:write`, each only if the creating credential holds it (the subset rule of §3; an API key holds all);
+- inherits the `paths` limit of the creating credential;
+- expires with the sandbox and is revoked when the sandbox is stopped or deleted. A start mints a new one.
+
+The value is treated as a secret: no response, event or log contains it, and the workload sees only its placeholder.
+
+**What the workload finds in its environment:**
+
+| Variable | Value |
+|---|---|
+| `PARLEY_ENDPOINT_URL` | The hub's base URL |
+| `PARLEY_WORKSPACE` | The sandbox's workspace slug |
+| `PARLEY_REMOTE` | The workspace's git URL (§5) |
+| `PARLEY_SANDBOX_ID` | The sandbox id |
+| `PARLEY_SESSION_ID` | The session id, when the sandbox has one |
+| `PARLEY_API_KEY` | The placeholder of the hub credential (absent with `hub_access: none`) |
+| the variable each attached provider profile declares | That credential's placeholder |
+| the profile's `env` and the caller's `env` | As given |
+
+Names starting with `PARLEY_` or `OPENSHELL_` are reserved and refused in a profile's or a caller's `env`.
+
+**No raw secrets.** There is no way to place a secret's real value in a sandbox's environment or files through Parley. A secret reaches a sandbox only as a credential of the kind above. The `env` maps are for non-secret configuration and are shown in responses.
+
+#### 13.3.5 Checkout
+
+When the sandbox's workspace has a repository and the profile has `hub_access: fork`, the hub prepares the working directory before the sandbox becomes `ready`:
+
+- The repository is cloned from `PARLEY_REMOTE` into the working directory as a partial clone (file contents are fetched when needed, §5).
+- `checkout.ref` selects the starting point (default: for a fork, its base branch; otherwise the default branch).
+- For a fork, a new branch is created for the work and checked out. Its name is `checkout.branch`; the default is the fork's `name`. If the branch already exists in the fork it is checked out as it is.
+- Git is configured to authenticate to the hub with the hub credential, and the commit identity is set to the creating user's name and e-mail.
+
+A push of that branch from the sandbox then opens or updates a change by the rules of §5 and §7, with the sandbox's session attached.
+
+`checkout: false` at creation skips all of this.
+
+#### 13.3.6 Checkpoint
+
+A checkpoint saves the git state of the working directory to the sandbox's workspace on the hub:
+
+- For every local branch that has commits the hub does not have, and for the checked-out branch when the working tree has uncommitted changes, the hub stores a ref `refs/hub/sandboxes/<sandbox id>/<branch>`. Uncommitted changes, including new files that are not git-ignored, are saved as one extra commit on top; `dirty` is then true.
+- Checkpoint refs are hub-owned (§5) and fetchable. They are not versions of a change and trigger nothing.
+- A checkpoint is taken before a stop (requested or idle), before deletion for any reason except `workspace_deleted`, when the main process ends, and on request. It is best effort: a failure is recorded in `checkpoint.error` and never blocks the stop or deletion.
+- Checkpoint refs live as long as the workspace. A fork's checkpoints go with the fork.
+- A new sandbox can start from a checkpoint (`restore_from`): its working directory is the checkout with each checkpointed branch restored and the uncommitted changes of the checked-out branch put back in the working tree.
+
+Files that git ignores, and anything outside the working directory, are not saved.
+
+#### 13.3.7 Network policy and proposals
+
+- A sandbox's **effective policy** is its profile's base policy, plus the hub rule (the hub's API and git endpoints, for the workspace's routes only), plus the rules contributed by each attached credential's provider profile. Everything else is denied.
+- The filesystem and process parts are fixed at creation. The network part can change while the sandbox runs.
+- A **denial** is a connection or request the runtime blocked. The hub reads denials from the runtime's log and reports the first denial of each destination per sandbox as an event.
+- A **proposal** is a request from the workload for an additional network rule, made with the runtime's own mechanism. The hub lists open proposals with the runtime's risk findings (for example: the rule would let a credentialed program reach a new host). A proposal is approved or rejected by a person. An approved rule is added to that sandbox's policy only; it does not change the profile.
+
+| Proposal field | Type | Meaning |
+|---|---|---|
+| `id` | string | |
+| `sandbox_id` | string | |
+| `rule` | object | The proposed rule, in OpenShell's schema |
+| `summary` | string | One line: program, host, port, and methods or paths when restricted |
+| `findings` | object[] | The runtime's findings: `{severity, message}` |
+| `state` | enum | `open`, `approved`, `rejected`, `withdrawn` |
+| `decided_by`, `decided_at`, `comment` | | Set when decided |
+| `created_at` | timestamp | |
 
 ### 13.4 Functional requirements
 
 **Configuration and start-up**
 
-- SBX-FR-001: The feature is on when the configuration has a `[sandbox]` section, and off otherwise. When off, the hub logs once that sandboxes are disabled, runs no sandbox background work and binds no gateway. Stored leases are left as they are.
-- SBX-FR-002: An unknown key anywhere under `[sandbox]` is an error that names the key by its full path (for example `sandbox.profiles[1].memroy_mb`).
-- SBX-FR-003: `${NAME}` in any string value of the section is replaced by the value of that environment variable, as everywhere in the configuration (§3); a reference to an unset variable is a start error. Map keys are not expanded. Replacements are not expanded again.
-- SBX-FR-004: Static validation (§13.9) collects every failure and reports them together, one per line. A profile is named by its `name`, or by its index when it has none. No message contains an `env` value or any part of `gateway_token`. The provider is not contacted for a statically invalid section.
-- SBX-FR-005: Keys that belong to one provider are refused under the other (§13.9).
-- SBX-FR-006: After static validation the hub probes the provider once, within 10 s:
-  - `podman`: the hub runs the container engine once and removes leftover boxes whose own expiry has passed.
-  - `gateway`: the hub connects to the remote gateway with `gateway_token`, reads its capabilities and lists its boxes. Nothing is created or destroyed. The capabilities are read once and used for the life of the process.
-
-  Then every entry of `network_modes` must be a mode the provider honours, and every profile must be a box the provider can make (image, resources, network, TTL, Landlock). Any failure stops the start with a message that names the key or profile. Messages never contain the gateway token or URL credentials.
-- SBX-FR-007: Any sandbox start-up failure is fatal: the hub exits with status 1 before it serves any route.
-- SBX-FR-008: The scopes `sandboxes:read` and `sandboxes:write` exist whether or not sandboxes are enabled.
-- SBX-FR-009: When enabled, the hub binds the gateway on `[sandbox].listen` (TLS 1.2 or later when a key pair is configured). A key pair that cannot be loaded or an address that cannot be bound is fatal. The gateway accepts no connection until start-up recovery (SBX-FR-070) and the first sweep (SBX-FR-071) have run; failures in those two are logged as warnings and do not stop the start. If the gateway listener later fails, the hub logs the error and exits with status 1.
-- SBX-FR-010: `gateway_url` on every lease is `external_url` when set. Otherwise it is `https://` (with TLS) or `http://` followed by the address the listener actually bound. It is computed by the running process, not stored.
+- SBX-FR-001: The feature is on when the configuration has a `[sandbox]` section. When off, the hub runs no sandbox work, and stored sandbox records are left as they are.
+- SBX-FR-002: Static validation of `[sandbox]` (§13.9) collects every failure and reports them together. Unknown keys are errors. No message contains a credential.
+- SBX-FR-003: After static validation the hub contacts the runtime once, within 30 s: it authenticates, checks that the runtime's release is compatible, makes sure its OpenShell workspace exists, installs the provider profile for the hub credential, checks that every `provider_profile` named in `[[sandbox.credentials]]` exists, and validates every profile's `policy` file. Any failure stops the start with a message naming the key or profile.
+- SBX-FR-004: The scopes `sandboxes:read` and `sandboxes:write` exist whether or not sandboxes are enabled.
+- SBX-FR-005: After start, loss of the runtime never stops the hub. Sandbox reads answer from stored state with `runtime_reachable: false`; operations that need the runtime answer `502`, `error_type: sandbox_runtime_error`.
 
 **Authorization**
 
-- SBX-FR-020: Check order on every sandbox route: steps 1–4 of the global order (§3: path and method, authentication `401`, rate limit, body) → feature enabled (`404 sandboxes_disabled`) → binding guard → PAT scope (`403`) → workspace access → validation → state. From the binding guard on, the order is the global one (§3). The feature check comes early so that a disabled hub answers every authenticated caller the same way.
-- SBX-FR-021: Reads need `sandboxes:read` or `sandboxes:write`. Issuing and ending a lease need `sandboxes:write`. Only PATs are scope-checked.
-- SBX-FR-022: Workspace access follows §3: reads need read access; issuing and ending need write access. A caller without read access gets `404 workspace not found`. A read-only member gets `403 forbidden` on a write route.
-- SBX-FR-023: `GET /sandbox-profiles` needs no workspace access, and a workspace-bound token may call it. `GET /sandboxes` needs the admin token: any other credential gets `403 forbidden`, and a workspace-bound token gets `403 token_bound`.
+- SBX-FR-010: Check order: steps 1–4 of the global order (§3) → feature enabled (`404 sandboxes_disabled`) → binding guard → PAT scope → workspace access → validation → state.
+- SBX-FR-011: Reads (get, list, logs, file download, proposals list) need `sandboxes:read` and read access to the workspace. Everything else needs `sandboxes:write` and write access. A read-only member gets `403 forbidden` on a write route.
+- SBX-FR-012 (no widening). A caller can run commands in a sandbox, attach to it, or write files into it only with a credential that covers the sandbox's hub credential: it holds every scope in `hub_access.scopes`, and its `paths` limit, if any, is no narrower than the sandbox's. Otherwise `403 insufficient_scope`. This keeps a weak token from acting through a sandbox that a stronger credential created.
+- SBX-FR-013: The admin token cannot create a sandbox, because the hub credential needs a user as its owner (`403 forbidden`). It can read, stop and delete any sandbox.
+- SBX-FR-014: Approving or rejecting a proposal needs write access to the workspace and a credential that is not a workspace-bound token (`403 token_bound`), so that an agent cannot approve its own request.
+- SBX-FR-015: `GET /sandbox-profiles` needs `sandboxes:read` and no workspace access; bound tokens may call it. `GET /sandboxes` needs the admin token.
 
-**Issuing a lease**
+**Creating a sandbox**
 
-- SBX-FR-030: A lease request on an archived workspace is refused with the archived-workspace error of §4 (`409` `workspace_archived`). A lease request on a task fork whose parent is archived is refused with `409` `parent_archived` (WS-FR-066). Reading and ending leases work on archived workspaces.
-- SBX-FR-031: The body is an optional JSON object. An empty body counts as `{}`. Accepted fields are `profile`, `purpose`, `ttl`, `labels` and `session_id`; any other field is a `400` that names it. A `null` value counts as absent.
-- SBX-FR-032: `profile` defaults to the profile marked `default`. Without a default, an absent `profile` is a `400` that lists the known profile names. A given name must match exactly, else `400` with the same list.
-- SBX-FR-033: `ttl` defaults to the profile's TTL. When given, it is a duration string (`30m`, `90m`) of at least 1 minute and at most the profile's TTL. The effective TTL is cut to whole seconds.
-- SBX-FR-034: `purpose` is at most 64 characters and has no control characters. It defaults to `""`.
-- SBX-FR-035: `labels` holds at most 16 entries. A key is 1 to 63 characters of letters, digits, `.`, `_` and `-`, starting and ending with a letter or digit. The keys `lease` and `workspace` (any case) are reserved. A value is a string of at most 256 bytes without control characters; it may be empty. Violations are `400` and name the key.
-- SBX-FR-036: `session_id` is optional and is validated like every session reference (§14). When it is absent and the workspace is a task fork that has a `session_id`, the lease takes the fork's.
-- SBX-FR-037: Required secrets are checked before the lease is stored. The hub looks up the names in the profile's `secrets` along the resolution chain of §11 for the lease's workspace (for a fork: fork → parent workspace → org → user, exactly as §11.3 defines it: the parent step is used for secrets only when the fork's owner has write access to the parent, the reserved names of §11 are always skipped at the parent, and the org step applies only while the workspace owner is a member of the org). The user scope is the workspace owner's, never the caller's. Names match without regard to case. Values are not read. If any name is missing the answer is `422`, `error_type: secret_missing`, with a message that lists the missing names and the scopes searched. Optional secrets are not checked.
-- SBX-FR-038: Capacity. A lease counts as live for capacity while it is `leased` and before `lease_expires_at`, or `active` and before `expires_at`. If the hub-wide count has reached `max_sandboxes`, the answer is `429`, `error_type: sandbox_capacity`. The count and the insert are atomic: concurrent requests never exceed the limit.
-- SBX-FR-039: On success the hub stores the lease in state `leased` with a full snapshot of the profile and answers `201` with the lease plus `token`. `hub.sandbox.lease` is written in the same transaction that stores the lease (§14).
-- SBX-FR-040: A replay with the same `Idempotency-Key` (§3) answers `200` with the lease as it is now and **without** `token`, because the hub does not keep the token. A caller that lost the token ends the lease and requests a new one.
+- SBX-FR-020: A sandbox is refused on an archived workspace (`409 workspace_archived`) and on a fork whose parent is archived (`409 parent_archived`).
+- SBX-FR-021: `profile` defaults to the profile marked `default`; without one, an absent `profile` is `400` and lists the known names.
+- SBX-FR-022: `ttl` defaults to the profile's and is at least 1 minute and at most the profile's. On a task fork, `expires_at` is cut to the fork's `expires_at`. Extending the fork (§4) does not extend the sandbox; `PATCH` does, within the same limits.
+- SBX-FR-023: `command` is an argument list of at most 256 entries. `env` holds at most 64 entries of at most 8 KiB each, with reserved names refused. `labels` follows the label rules of §13.5. `session_id` is validated like every session reference (§14); when absent on a fork that has a session, the sandbox takes the fork's.
+- SBX-FR-024 (credentials). Before anything is created, the hub resolves the secret of every credential in the profile's `credentials` along the chain of §11.3 for the workspace, as that section defines it for forks. A missing one is `422`, `error_type: credential_missing`, naming the credentials and the scopes searched. Missing `optional_credentials` are skipped. Values are read again at each start, so a rotated secret is used from the next start.
+- SBX-FR-025 (quotas). The hub counts sandboxes in state `provisioning` or `ready`. A request that would exceed `max_sandboxes` hub-wide, `max_per_user` for the creating user, or `max_per_workspace` for the workspace family (a workspace and its forks) is `429`, `error_type: sandbox_capacity`, saying which limit. Stopped sandboxes do not count. The count and the insert are atomic.
+- SBX-FR-026: On success the hub stores the sandbox in state `provisioning`, answers `201`, and continues in the background: it registers the credentials with the runtime, creates the sandbox there with the effective policy, prepares the checkout, starts `command` if there is one, and marks the sandbox `ready`. A failure at any step ends in `failed` with the reason, and what was created at the runtime is removed.
+- SBX-FR-027: `restore_from` names a sandbox of the same workspace that has a checkpoint; otherwise `400`. The new sandbox's working directory is seeded from it (§13.3.6).
+- SBX-FR-028 (fork and sandbox in one call). `POST /workspaces/:slug/forks` (§4) accepts a `sandbox` object with the fields of the sandbox create request. The fork is created first, then the sandbox on it. The response carries both. If the sandbox request is refused, the fork is not created either. `session_id` and `purpose` default to the fork's.
 
-**Task fork integration**
+**Using a sandbox**
 
-- SBX-FR-045: When the lease's workspace is a task fork, the box environment contains `PARLEY_REMOTE`, the fork's `hub_url` (§4). The lease shows the same value as `remote`. When `[server].external_url` is not set, `hub_url` is null: `remote` is null, the variable is not set and no git credential is injected. For any other workspace `remote` is null and the variable is not set.
-- SBX-FR-046: When the workspace is a task fork and the profile sets `inject_git_credential = true`, the hub mints a PAT at box creation and places it in the box environment as `PARLEY_GIT_TOKEN`. The PAT:
-  - is bound to the fork and is owned by the user who issued the lease. A lease issued with the admin token gets no git credential (`git_credential: false`), because a bound token needs a user as its owner (§3);
-  - carries a subset of `git:read`, `git:write` and `changes:write`: each of the three only if the credential that issued the lease holds it (an API key holds all three; this is the subset rule of §3), so that a push from the box can open the fork's automatic change (WS-FR-075, GIT-FR-043). An issuing PAT that holds neither `git:read` nor `git:write` gets no git credential (`git_credential: false`);
-  - inherits the `paths` limit of the issuing PAT, if it had one (§3);
-  - expires at the lease's `expires_at` and is revoked when the lease ends, whichever comes first.
+- SBX-FR-030 (exec). A command runs in the sandbox as the workload user, in the working directory unless `workdir` says otherwise, with the sandbox's environment plus the request's `env`. The request waits for the command up to `timeout` (default 60 s, at most `[sandbox].max_exec_timeout`, default 30 min), then kills it and answers with `timed_out: true`. Output is returned up to 1 MiB each for stdout and stderr; more is dropped and `truncated` says so. `stdin` is at most 4 MiB.
+- SBX-FR-031 (exec stream). With `Accept: text/event-stream` the answer is a stream of `stdout`, `stderr` and a final `exit` frame, without the 1 MiB cap. Closing the stream kills the command.
+- SBX-FR-032: Exec is independent of the main process. Several execs may run at once (at most `[sandbox].max_concurrent_execs` per sandbox, default 8; beyond that `429`).
+- SBX-FR-033 (files). Upload writes one file, or with `archive=tar` unpacks a tar stream, under a path inside the working directory. Download returns one file, or a tar stream of a directory. Paths that resolve outside the working directory are `400`, `error_type: path_outside_workdir`. Transfers are streamed and limited to `[sandbox].max_transfer_size` (default 1 GiB).
+- SBX-FR-034 (logs). Logs are the output of the main process and the runtime's policy log for the sandbox (denials, credential use by provider name). They can be read as pages or followed as a stream. The hub keeps the last `[sandbox].log_retention` (default 7 d) of each sandbox's logs for the life of its record.
+- SBX-FR-035 (attach). A WebSocket gives an interactive terminal on a new shell in the sandbox, with resize messages. It is meant for people. Closing it ends that shell only.
+- SBX-FR-036 (activity). Exec, attach, file transfer and output of the main process each set `last_activity_at`. A running main process alone does not count as activity unless it produces output.
 
-  The PAT is treated as a secret: no REST response, event, log line or gateway answer contains it. The lease shows only `git_credential: true`.
-- SBX-FR-047: A lease ends when its workspace is deleted. For a task fork this includes expiry and early deletion after landing (§4). The hub destroys the box, then ends the lease with reason `workspace_deleted`, before the workspace is removed. A box that cannot be destroyed does not block the deletion; the sweep retries it (SBX-FR-071).
+**Stop, start, time limits**
 
-**Reading**
+- SBX-FR-040 (stop). Stop takes a checkpoint, revokes the hub credential, and releases the sandbox's compute. The working directory is kept by the runtime. A stop of a sandbox that is not `ready` is a no-op answered with the sandbox.
+- SBX-FR-041 (start). Start is allowed from `stopped`, `completed` and `failed`, subject to the quotas of SBX-FR-025. It mints a new hub credential, resolves secrets again, and runs `command` again if there is one. If the runtime no longer has the working directory, the hub rebuilds it from the latest checkpoint.
+- SBX-FR-042 (idle). A `ready` sandbox whose `last_activity_at` is older than its idle timeout is stopped with reason `idle`.
+- SBX-FR-043 (expiry). At `expires_at` the sandbox is checkpointed and deleted with reason `expired`, whatever its state. The hub enforces this itself and does not rely on the runtime. When a sandbox's expiry falls together with its fork's, the fork's deletion applies: reason `workspace_deleted`, no checkpoint (SBX-FR-045).
+- SBX-FR-044 (delete). Delete takes a checkpoint unless the reason is `workspace_deleted`, removes the sandbox and its credentials at the runtime, revokes the hub credential, and marks the record `deleted`. It is idempotent. If the runtime cannot be reached, the record becomes `deleted` at once, the credentials are revoked on the hub side, and reconciliation removes the runtime's remains later.
+- SBX-FR-045 (workspace deletion). Deleting a workspace, including fork expiry, deletes its sandboxes first. A fork with a `provisioning` or `ready` sandbox is not deleted early after landing (§4): early expiry waits until its sandboxes are stopped, ended or deleted. The fork's TTL still applies. Archiving a workspace (§4) stops the `ready` sandboxes of that workspace and of its forks, with a checkpoint and reason `archived`; they cannot be started while the workspace stays archived (`409 workspace_archived` or `parent_archived`).
+- SBX-FR-046 (main process end). When the main process exits, the hub takes a checkpoint and records `completed` or `failed` with the exit code. The sandbox's compute is released; the record and the working directory stay until `expires_at`, so logs and files remain available.
 
-- SBX-FR-050: The workspace list returns the workspace's leases, newest first (`created_at`, then `id`, descending). By default it shows only live leases. `all=true` adds ended leases.
-- SBX-FR-051: An ended lease stays readable for 24 hours after `ended_at`. After that it is gone: lists omit it and a read answers `404`. The hub removes it from storage at the next sweep.
-- SBX-FR-052: A lease id that is malformed, unknown, removed, or that belongs to another workspace answers `404 sandbox lease not found`.
-- SBX-FR-053: No response other than the `201` of the lease request contains `token`. No response contains `env` values, secret values or the injected git credential. List and map fields are never null.
+**Network policy**
 
-**Ending a lease**
+- SBX-FR-050: The hub rule and the credential rules cannot be removed or narrowed by a profile's base policy, and a base policy cannot grant the hub credential to any other endpoint.
+- SBX-FR-051 (denials). The first denial of each (program, host, port) per sandbox emits `hub.sandbox.deny`; later ones are counted in the metric only. Denials are always visible in the sandbox's logs.
+- SBX-FR-052 (proposals). The hub collects proposals from the runtime for sandboxes whose profile has `allow_proposals`, and emits `hub.sandbox.proposal` for each new one. Proposals from other sandboxes are rejected automatically.
+- SBX-FR-053 (decision). Approving a proposal adds its rule to that sandbox's policy at the runtime and increases `policy_revision`. A proposal with a finding of severity `high` needs `acknowledge_findings: true` in the approval, else `409`, `error_type: findings_not_acknowledged`. Rejecting records the decision. Both emit `hub.sandbox.proposal_decided`. Open proposals of a sandbox that is deleted become `withdrawn`.
+- SBX-FR-054: Approved rules last for the sandbox's life, across stop and start. They are not copied to a sandbox restored from its checkpoint.
 
-- SBX-FR-055: `DELETE` ends a lease and is idempotent:
-  - `leased`: the lease becomes `destroyed`. If a Create is in flight, its box is destroyed as soon as it exists and that Create fails.
-  - `active`: the hub destroys the box (bounded to 30 s), then the lease becomes `destroyed`. A box that is already gone counts as destroyed.
-  - terminal: nothing happens.
+**Runtime reconciliation**
 
-  The answer is `204` in all three cases.
-- SBX-FR-056: If the provider fails or times out while destroying the box, the answer is `502`, `error_type: sandbox_provider_error`, and the lease is unchanged: still `active`, token still valid. The call can be retried.
-- SBX-FR-057: Scrubbing. Any provider error text that is stored, logged, emitted or returned has these replaced by `[redacted]`: every resolved secret value, every fixed `env` value, the injected git credential, and for the `gateway` provider the hub's gateway token, the remote URL and its host. URL user information is removed. The text is cut to 1,024 bytes. If a value cannot be removed with certainty, the whole text becomes `[redacted]`.
-
-**Gateway**
-
-- SBX-FR-060: Authentication. Every RPC must carry one `authorization: Bearer <lease token>` metadata entry. The token is accepted only if it belongs to a lease in state `leased` or `active` whose `expires_at` is in the future. This is checked on every RPC, so a lease that ends is refused from the next call on, including calls relayed to an existing box. Every refusal is gRPC `Unauthenticated` with one fixed message that does not say why.
-- SBX-FR-061: Capabilities answers the provider's capabilities, with network modes limited to `network_modes`, the maximum TTL `max_ttl` and the capacity `max_sandboxes`.
-- SBX-FR-062: Create builds the box **from the lease**. Image, fixed environment, resources, network mode and the Landlock setting come from the lease snapshot. The box's lifetime is the time left until `expires_at`. Only the working directory and labels come from the caller. Whatever else the caller's spec says is ignored, not rejected.
-- SBX-FR-063: Labels on the box are the caller's labels, minus every key in the `hub.` namespace and every key reserved by the gateway protocol, plus each lease label as `hub.<key>`, plus `hub.lease=<lease id>` and `hub.workspace=<slug>`.
-- SBX-FR-064: Secret injection. At Create the hub resolves the values of the profile's required and optional secrets along the chain of SBX-FR-037 and adds them to the environment under the profile's spelling of each name. The first scope that has a name wins. Values are read at Create, so a rotation between issue and Create is honoured. Only secrets are injected; variables (§11) are not. On a fork, `PARLEY_REMOTE` and, when applicable, `PARLEY_GIT_TOKEN` are added (SBX-FR-045, SBX-FR-046).
-- SBX-FR-065: Create outcomes:
-
-  | Condition | Lease | gRPC status |
-  |---|---|---|
-  | hub is shutting down | unchanged | `Unavailable` |
-  | another Create for the lease is in progress | unchanged | `Aborted` |
-  | lease is not `leased` | unchanged | `FailedPrecondition` (names the state) |
-  | `lease_expires_at` has passed | `→ expired` | `FailedPrecondition` |
-  | profile no longer configured, or its network mode no longer honoured | `→ failed` | `FailedPrecondition` |
-  | a required secret is missing | `→ failed` | `FailedPrecondition` |
-  | the secret store cannot be read | unchanged; retry allowed | `Internal` |
-  | the provider refuses or fails | `→ failed` | `Unavailable` (scrubbed message) |
-  | the lease ended while the box was being made | unchanged; new box destroyed | `FailedPrecondition` |
-  | success | `→ active` | OK |
-
-  If the hub cannot record `active` after the provider made the box, it destroys the box, the lease stays `leased` and the call answers `Internal`.
-- SBX-FR-066: The box returned by Create reports its effective spec with every environment value replaced by `[redacted]`. Keys are kept.
-- SBX-FR-067: Isolation. A lease holder sees and reaches only its own box. List returns zero or one box. Destroy of an unknown or foreign id answers OK and does nothing. Calls relayed into a box (tool calls, file sync in and out, git sync) reach only the caller's box; a missing or foreign box id is refused. Messages are limited to 16 MiB. Reap from a lease holder does nothing.
-- SBX-FR-068: Client close. When the holder destroys its box through the gateway, the hub destroys the box at the provider and the lease becomes `destroyed` with reason `client`. If the provider fails, the client gets the scrubbed error, the lease stays `active`, and a later `DELETE` or sweep retries.
-- SBX-FR-069: If the `gateway` provider's remote refuses the hub's own token after start, the caller sees `Unavailable`, never `Unauthenticated`, and the hub logs an error that names `sandbox.gateway_token`.
-
-**Lifecycle**
-
-- SBX-FR-070: Start-up recovery. A lease found `active` at start was left by a previous process, and this process cannot relay to its box. The hub destroys the box through the provider by `sandbox_id`, then ends the lease with reason `restart`. If the destroy fails the lease is ended all the same, a warning lists the box ids, and the sweep keeps retrying them. `leased` leases are untouched and remain usable after a restart.
-- SBX-FR-071: Sweep. A sweep runs once at start and then every `reap_interval`. Sweeps never overlap. A failing step is logged and the later steps still run. Steps, in order:
-  1. **Reap**: ask the provider to remove boxes whose own expiry has passed.
-  2. **Lapse**: every `leased` lease past `lease_expires_at` becomes `expired`.
-  3. **Overdue**: for every `active` lease past `expires_at`, destroy the box, then mark the lease `expired`. The box is always destroyed first. If the destroy fails the lease stays `active` and the next sweep retries. Such a lease is already unusable: its token is refused and it no longer counts against capacity.
-  4. **Orphans**: destroy every box that carries a `hub.lease` label naming a terminal or unknown lease. Boxes without that label are left alone.
-  5. **Prune**: remove leases that ended more than 24 hours ago.
-  6. **Recalibrate**: reset the active-box gauge from the stored leases.
-- SBX-FR-072: The hub does not wait for the sweep to enforce `expires_at`. It destroys the box of an `active` lease when `expires_at` arrives and then marks the lease `expired`. The sweep is the backstop for anything this misses.
-- SBX-FR-073: Shutdown. When the hub stops, within a total of 20 s:
-  1. New Creates are refused and no further sweep starts. A running sweep is allowed to finish.
-  2. For each `active` lease, in parallel, the hub destroys the box and ends the lease with reason `shutdown`.
-  3. The gateway listener stops.
-
-  `leased` leases are not changed. If the time runs out, the leases still `active` are logged and are ended by recovery at the next start.
-- SBX-FR-074: A crash runs none of SBX-FR-073. The next start applies SBX-FR-070.
-- SBX-FR-075: Every provider call made while ending a lease is bounded to 30 s. A timeout counts as a provider failure.
+- SBX-FR-060 (hub restart). Sandboxes are owned by the runtime and are not affected by a stop, crash or upgrade of the hub. Running commands started through a closed exec request are killed; the main process is not.
+- SBX-FR-061 (reconcile). At start and every `reconcile_interval` the hub compares its records with the runtime: it updates the state of each sandbox, records the exit of main processes that ended while it was away, deletes runtime sandboxes and providers that carry this hub's label and belong to no live record, and marks as `failed` (`runtime_error`) any `provisioning` or `ready` record the runtime does not know. Work that became overdue while the hub was down (idle stops, expiry) is done then.
+- SBX-FR-062 (runtime restart). While the runtime restarts or reconnects to a sandbox, the sandbox shows `provisioning` and the workload is paused. It returns to `ready` without action by the hub.
+- SBX-FR-063 (shutdown). Stopping the hub ends open exec, attach, log and transfer requests and nothing else.
+- SBX-FR-064 (scrubbing). Runtime error text that is stored, logged, emitted or returned has resolved secret values and the hub credential replaced by `[redacted]` and is cut to 1,024 bytes.
 
 ### 13.5 REST API
 
-All routes follow the conventions of §3. The feature check of SBX-FR-020 applies to every route below and is not repeated in the error lists.
+All routes follow the conventions of §3. The feature check of SBX-FR-010 applies to every route and is not repeated. Common errors: `401`; `403 insufficient_scope`; `403 forbidden`; `404 workspace not found`; `404`, `error_type: sandbox_not_found` (unknown id, an id of another workspace, or a record removed after 24 hours); `502 sandbox_runtime_error`.
 
-**Lease object.** Every lease response has all the fields of §13.3.2. Example:
-
-```json
-{"id":"sbx_3f2a9c0e7b1d4c5a8e6f0b2d1c3a4e5f","workspace":"widgets--a1b2c3d4","session_id":"0b6f3c1e-8a52-4d7e-9c1b-2f4a6d8e0c13","profile":"tools",
- "purpose":"triage","state":"leased","gateway_url":"https://sandboxes.example.com",
- "expires_at":"2026-01-02T04:04:05Z","lease_expires_at":"2026-01-02T03:09:05Z",
- "image":"registry.example.com/tools:1","network":"none","resources":{"cpus":1,"memory_mb":512,"pids":100,"disk_mb":0},
- "require_landlock":true,"secrets":["GIT_PAT"],"optional_secrets":[],
- "remote":"https://hub.example.com/git/acme/widgets--a1b2c3d4.git","git_credential":true,
- "labels":{"team":"red"},"created_by":"user-1","created_at":"2026-01-02T03:04:05Z","updated_at":"2026-01-02T03:04:05Z",
- "sandbox_id":null,"error":null,"ended_at":null,"end_reason":null}
-```
+**Labels.** At most 16 entries. A key is 1 to 63 characters of letters, digits, `.`, `_` and `-`, starting and ending with a letter or digit, and does not start with `parley.` or `openshell.`. A value is at most 256 bytes without control characters.
 
 #### `GET /sandbox-profiles`
 
-- **Purpose:** List the hub's profiles.
-- **Auth:** any credential; a PAT needs `sandboxes:read`. No workspace access is needed. Workspace-bound tokens are allowed.
-- **Behaviour:** The list comes from configuration only. It keeps answering when the provider is down. Every caller gets the same list.
-- **Response:** `200`, a list ordered by `name`:
-  ```json
-  {"items":[{"name":"agent","default":true,"image":"registry.example.com/agent:1.4","network":"none","ttl_seconds":1200,
-    "resources":{"cpus":2,"memory_mb":4096,"pids":512,"disk_mb":0},
-    "secrets":["ANTHROPIC_API_KEY","GIT_PAT"],"optional_secrets":["GH_TOKEN"],"env_keys":["LANG","TZ"],
-    "require_landlock":true,"inject_git_credential":true}],"next_cursor":null}
-  ```
-  `secrets`, `optional_secrets` and `env_keys` are sorted and are always arrays. Nothing about the provider or the hub's limits is included.
-- **Errors:** `401`; `404 sandboxes_disabled`; `403` scope.
+- **Purpose:** list the hub's profiles.
+- **Response:** `200`, a list ordered by `name`. Each item has the fields of §13.3.2 except `policy` (replaced by `policy_summary`: the hosts the base policy allows) and `env` (replaced by `env_keys`), plus `ttl_seconds`.
 
 #### `POST /workspaces/:slug/sandboxes`
 
-- **Purpose:** Issue a lease.
-- **Auth:** `sandboxes:write`; workspace write access.
-- **Request body:** optional JSON object.
+- **Purpose:** create a sandbox.
+- **Body:**
 
-  | Field | Type | Default | Validation |
-  |---|---|---|---|
-  | `profile` | string | the default profile | exact name (SBX-FR-032) |
-  | `purpose` | string | `""` | ≤ 64 characters, no control characters |
-  | `ttl` | duration string | the profile's TTL | 1 m ≤ `ttl` ≤ profile TTL |
-  | `labels` | object of strings | `{}` | SBX-FR-035 |
-  | `session_id` | string | the fork's session, else null | SBX-FR-036 |
+  | Field | Type | Default |
+  |---|---|---|
+  | `profile` | string | the default profile |
+  | `command` | string[] | none (an idle sandbox driven by exec) |
+  | `env` | map of strings | `{}` |
+  | `checkout` | `false`, or `{ref?, branch?}` | checkout with defaults (§13.3.5) |
+  | `restore_from` | sandbox id | none |
+  | `ttl` | duration | the profile's |
+  | `purpose` | string | `""` |
+  | `labels` | map of strings | `{}` |
+  | `session_id` | string | the fork's session, else null |
 
-- **Behaviour:** SBX-FR-030 to SBX-FR-046. Accepts `Idempotency-Key` (SBX-FR-040).
-- **Response:** `201` with the lease object plus `"token":"sbl_…"`.
-- **Errors:** `401`; `403` scope; `404 workspace not found`; `403 forbidden` (read-only member); archived workspace (§4); `413`; `400` body and field errors; `422 secret_missing`; `429 sandbox_capacity`.
-- **Side effects:** stores the lease; emits `hub.sandbox.lease`.
+- **Response:** `201` sandbox object, state `provisioning`.
+- **Errors:** `400` validation; `400 unknown_session`; `409 workspace_archived`, `parent_archived`; `422 credential_missing`; `429 sandbox_capacity`.
+- **Side effects:** `hub.sandbox.create`; later `hub.sandbox.ready` or `hub.sandbox.fail`.
 
 #### `GET /workspaces/:slug/sandboxes`
 
-- **Purpose:** List the workspace's leases.
-- **Auth:** `sandboxes:read`; workspace read access.
-- **Query:** `all` (`true` or `false`, default `false`; anything else is `400`), `limit`, `cursor`.
-- **Response:** `200`, a list of lease objects, newest first.
-- **Errors:** `401`; `403` scope; `404 workspace not found`; `400`.
+- **Purpose:** list the workspace's sandboxes, newest first.
+- **Query:** `state` (repeatable; default: every state but `deleted`), `session_id`, `label` (`key=value`, repeatable), `include_forks` (bool; on a parent, include its forks' sandboxes), `limit`, `cursor`.
 
 #### `GET /workspaces/:slug/sandboxes/:id`
 
-- **Purpose:** Read one lease in any state.
-- **Auth:** as for the list.
-- **Response:** `200` with the lease object. No `token`.
-- **Errors:** `401`; `403` scope; `404 workspace not found`; `404 sandbox lease not found`.
+- **Purpose:** read one sandbox. **Query:** `wait_for` (`ready` or `ended`) with `wait` (seconds, at most 60) holds the request until the sandbox reaches that condition or the time passes.
+
+#### `PATCH /workspaces/:slug/sandboxes/:id`
+
+- **Purpose:** change `ttl` (counted from now, within SBX-FR-022), `purpose` or `labels`.
+- **Response:** `200` sandbox object. **Errors:** `409`, `error_type: sandbox_deleted`.
+
+#### `POST /workspaces/:slug/sandboxes/:id/exec`
+
+- **Purpose:** run a command (SBX-FR-030 to SBX-FR-032).
+- **Body:** `{"command": string[], "workdir"?: string, "env"?: map, "stdin"?: string, "stdin_base64"?: string, "timeout"?: duration}`.
+- **Response:** `200 {"exit_code": int | null, "stdout": string, "stderr": string, "stdout_base64"?: string, "stderr_base64"?: string, "truncated": bool, "timed_out": bool, "duration_ms": int}`. Output that is not valid UTF-8 is returned in the `_base64` members. With `Accept: text/event-stream`: frames `stdout` and `stderr` (`{"data": string}` or `{"data_base64": string}`) and one `exit` (`{"exit_code", "timed_out", "duration_ms"}`).
+- **Errors:** `409 sandbox_not_ready`; `403 insufficient_scope` (SBX-FR-012); `429`.
+- A non-zero exit code is not an error: the answer is `200`.
+
+#### `PUT /workspaces/:slug/sandboxes/:id/files`
+
+- **Purpose:** upload (SBX-FR-033).
+- **Query:** `path` (required), `archive` (`tar`), `mode` (octal, for a single file).
+- **Body:** raw bytes (`application/octet-stream`) or a tar stream.
+- **Response:** `200 {"path", "bytes", "entries"}`. **Errors:** `400 path_outside_workdir`; `409 sandbox_not_ready`; `413`.
+
+#### `GET /workspaces/:slug/sandboxes/:id/files`
+
+- **Purpose:** download a file, or a directory as a tar stream.
+- **Query:** `path` (required), `archive` (`tar`, required for a directory).
+- **Response:** `200` bytes. Allowed in `ready`, `completed` and `failed`. **Errors:** `404 path_not_found`; `400 path_outside_workdir`.
+
+#### `GET /workspaces/:slug/sandboxes/:id/logs`
+
+- **Purpose:** read or follow logs (SBX-FR-034).
+- **Query:** `source` (`process`, `policy`; default both), `since` (timestamp), `tail` (lines), `follow` (bool; then the answer is an event stream), `limit`, `cursor`.
+- **Response:** `200` list of `{time, source, stream, line}`; policy lines also carry `action` (`allow`, `deny`), `program`, `host`, `port` and, for credentialed requests, `credential`.
+
+#### `GET /workspaces/:slug/sandboxes/:id/attach`
+
+- **Purpose:** interactive terminal over WebSocket (SBX-FR-035).
+- **Query:** `cols`, `rows`. Binary frames carry terminal bytes; a text frame `{"resize": {"cols", "rows"}}` resizes.
+- **Errors:** `409 sandbox_not_ready`; `403 insufficient_scope` (SBX-FR-012).
+
+#### `POST /workspaces/:slug/sandboxes/:id/checkpoint`
+
+- **Purpose:** take a checkpoint now. **Response:** `200` sandbox object with the new `checkpoint`. **Errors:** `409 sandbox_not_ready`; `502` with the reason when the checkpoint failed.
+
+#### `POST /workspaces/:slug/sandboxes/:id/stop`
+
+- **Purpose:** stop (SBX-FR-040). **Response:** `200` sandbox object.
+
+#### `POST /workspaces/:slug/sandboxes/:id/start`
+
+- **Purpose:** start again (SBX-FR-041). **Response:** `200` sandbox object, state `provisioning`. **Errors:** `409 sandbox_deleted`; `422 credential_missing`; `429 sandbox_capacity`.
 
 #### `DELETE /workspaces/:slug/sandboxes/:id`
 
-- **Purpose:** End a lease, destroy its box and revoke its token.
-- **Auth:** `sandboxes:write`; workspace write access.
-- **Behaviour:** SBX-FR-055 and SBX-FR-056.
-- **Response:** `204`, no body, whether or not anything changed.
-- **Errors:** `401`; `403` scope; `404 workspace not found`; `403 forbidden` (read-only member); `404 sandbox lease not found`; `502 sandbox_provider_error` (lease unchanged).
-- **Side effects:** one `hub.sandbox.destroy` per actual change, with the caller as actor.
+- **Purpose:** delete (SBX-FR-044). **Query:** `checkpoint` (bool, default the profile's). **Response:** `204`, also when it was already deleted.
+
+#### `GET /workspaces/:slug/sandboxes/:id/proposals`
+
+- **Purpose:** list network access proposals. **Query:** `state` (default `open`).
+
+#### `POST /workspaces/:slug/sandboxes/:id/proposals/:proposal_id/approve`
+
+- **Purpose:** approve (SBX-FR-053). **Body:** `{"comment"?: string, "acknowledge_findings"?: bool}`.
+- **Response:** `200` proposal. **Errors:** `403 token_bound`; `409 findings_not_acknowledged`; `409`, `error_type: proposal_decided`.
+
+#### `POST /workspaces/:slug/sandboxes/:id/proposals/:proposal_id/reject`
+
+- **Purpose:** reject. **Body:** `{"comment"?: string}`. **Response:** `200` proposal.
 
 #### `GET /sandboxes`
 
-- **Purpose:** List the leases of every workspace.
-- **Auth:** admin token only.
-- **Query:** `all`, `limit`, `cursor`, as for the workspace list.
-- **Response:** `200`, a list of lease objects, newest first. Leases that ended in the last 24 hours remain listed with `all=true` even when their workspace has since been deleted.
-- **Errors:** `401`; `403 forbidden`; `403 token_bound`; `400`.
-
-#### Gateway protocol surface (gRPC, not REST)
-
-The gateway serves the AgentKit-compatible gateway protocol, version 1.0, on `[sandbox].listen`, in plaintext on loopback or over TLS.
-
-| Call | Behaviour on this hub |
-|---|---|
-| Capabilities | SBX-FR-061 |
-| Create | makes the lease's one box (SBX-FR-062 to SBX-FR-066); answers the box id, the redacted spec, and creation and expiry times |
-| List | the caller's zero or one box |
-| Destroy | closes the caller's box and ends the lease (SBX-FR-068); OK for unknown or foreign ids |
-| SyncGit | relayed to the caller's box |
-| Reap | no effect for lease holders |
-| Agent calls (hello, list tools, call a tool, tar in, tar out, rsync) | relayed to the caller's box |
-
-The only credential is the lease token, sent as a bearer token on every call (SBX-FR-060). There are no static gateway tokens.
-
-A client dials `gateway_url` with the token and calls Create. Any spec it sends is advisory except for the working directory and labels. Inside a box leased on a fork, `git clone "$PARLEY_REMOTE"` works without further setup when the lease has `git_credential: true` and the image configures git to use `PARLEY_GIT_TOKEN`.
+- **Purpose:** list the sandboxes of every workspace. Admin token only.
+- **Query:** `state`, `user`, `limit`, `cursor`. Newest first.
 
 ### 13.6 CLI
 
-All commands live under `parley sandbox` and follow the CLI conventions of §3.
+All commands follow the CLI conventions of §3.
 
 #### `parley sandbox profiles`
-
-- **Purpose:** List the hub's sandbox profiles.
 - **Calls:** `GET /sandbox-profiles`.
-- **Output:** the response JSON.
 
-#### `parley sandbox create <workspace-slug>`
-
-- **Purpose:** Issue a sandbox lease in a workspace or task fork.
-- **Flags:**
-
-  | Flag | Type | Description |
-  |---|---|---|
-  | `--profile` | string | Profile name (default: the hub's default profile) |
-  | `--purpose` | string | What the sandbox is for (at most 64 characters) |
-  | `--ttl` | string | Lifetime of the lease, such as `30m` (default: the profile's) |
-  | `--label` | `key=value`, repeatable | Label for the lease |
-  | `--session` | string | Session id to link the lease to |
-  | `--token-file` | path | Write the lease token to this file (mode 0600) instead of printing it |
-
-- **Client checks (exit 2, before any request):** a label without `=`; a label key given twice; a token file that cannot be opened for writing.
-- **Calls:** `POST /workspaces/<slug>/sandboxes`. Only flags that were given are sent.
-- **Output:**
-  - Without `--token-file`: a warning on stderr that the token will not be shown again, then the lease including `token` on stdout.
-  - With `--token-file`: the token is written to the file with no trailing newline, and stdout shows the lease without `token`.
-  - If the token cannot be written, the CLI ends the lease it just created and exits 2 (a client error, §3). The message says whether the lease was released and, if it was not, gives the `parley sandbox destroy` command to run. The token is never printed as a fallback.
-- **Exit codes:** 0; 1 (hub error); 2 (usage, or token write failure).
+#### `parley sandbox create <workspace-slug> [-- command...]`
+- **Flags:** `--profile`, `--env key=value` (repeatable), `--no-checkout`, `--ref`, `--branch`, `--restore-from <id>`, `--ttl`, `--purpose`, `--label key=value` (repeatable), `--session <id>`, `--wait` (until `ready`, or until the main process ended when a command is given and `--wait-exit` is set), `--wait-exit`, `--timeout`, `--poll-interval`.
+- **Calls:** `POST …/sandboxes`, then `GET …/sandboxes/:id` with `--wait`.
+- **Exit codes:** 0; 1 hub error, `failed`, or wait timeout; with `--wait-exit`, 0 only for `completed`.
 
 #### `parley sandbox list <workspace-slug>`
+- **Flags:** `--state` (repeatable), `--session`, `--label`, `--include-forks`, `--limit`, `--cursor`.
 
-- **Purpose:** List the sandbox leases of a workspace.
-- **Flags:** `--all` (include leases that have ended), `--limit`, `--cursor`.
-- **Calls:** `GET /workspaces/<slug>/sandboxes`.
-- **Output:** the response JSON.
+#### `parley sandbox get <workspace-slug> <id>`
+- **Calls:** `GET …/sandboxes/:id`.
 
-#### `parley sandbox get <workspace-slug> <lease-id>`
+#### `parley sandbox exec <workspace-slug> <id> -- <command...>`
+- **Flags:** `--workdir`, `--env key=value` (repeatable), `--timeout`, `--stdin` (read stdin and send it), `--json` (print the response document instead of streaming).
+- **Calls:** `POST …/exec` as a stream by default.
+- **Output:** the command's stdout on stdout and stderr on stderr. This is one of the commands whose stdout is not JSON unless `--json` is given.
+- **Exit codes:** the command's exit code when it ran (values above 125 are mapped to 125); 1 for a hub error or a timeout; 2 usage.
 
-- **Purpose:** Show one sandbox lease.
-- **Calls:** `GET /workspaces/<slug>/sandboxes/<id>`.
-- **Output:** the lease JSON, without a token.
+#### `parley sandbox shell <workspace-slug> <id>`
+- **Purpose:** interactive terminal. **Calls:** `GET …/attach`.
 
-#### `parley sandbox destroy <workspace-slug> <lease-id>`
+#### `parley sandbox logs <workspace-slug> <id>`
+- **Flags:** `--source process|policy`, `--since`, `--tail <n>`, `--follow`.
+- **Output:** one JSON object per line.
 
-- **Purpose:** End a sandbox lease and revoke its token.
-- **Calls:** `DELETE /workspaces/<slug>/sandboxes/<id>`.
-- **Output:** `{"id":"<id>","status":"destroyed"}`. The output is the same for a lease that had already ended.
-- **Exit codes:** 0; 1 (for example `404`, or `502 sandbox_provider_error`, after which the command can be run again); 2.
+#### `parley sandbox upload <workspace-slug> <id> <local-path> <sandbox-path>`
+- **Purpose:** upload a file, or a directory as a tar stream. **Calls:** `PUT …/files`.
+
+#### `parley sandbox download <workspace-slug> <id> <sandbox-path> <local-path>`
+- **Purpose:** download a file, or a directory (unpacked locally). **Calls:** `GET …/files`.
+
+#### `parley sandbox checkpoint <workspace-slug> <id>`
+- **Calls:** `POST …/checkpoint`.
+
+#### `parley sandbox stop <workspace-slug> <id>`
+- **Calls:** `POST …/stop`.
+
+#### `parley sandbox start <workspace-slug> <id>`
+- **Flags:** `--wait`, `--timeout`, `--poll-interval`. **Calls:** `POST …/start`.
+
+#### `parley sandbox extend <workspace-slug> <id>`
+- **Flags:** `--ttl <duration>` (required). **Calls:** `PATCH …/sandboxes/:id`.
+
+#### `parley sandbox delete <workspace-slug> <id>`
+- **Flags:** `--no-checkpoint`. **Calls:** `DELETE …/sandboxes/:id`. **Output:** `{"id":"<id>","status":"deleted"}`.
+
+#### `parley sandbox proposals <workspace-slug> <id>`
+- **Flags:** `--state`. **Calls:** `GET …/proposals`.
+
+#### `parley sandbox approve <workspace-slug> <id> <proposal-id>`
+- **Flags:** `--comment`, `--acknowledge-findings`. **Calls:** `POST …/proposals/:proposal_id/approve`.
+
+#### `parley sandbox reject <workspace-slug> <id> <proposal-id>`
+- **Flags:** `--comment`. **Calls:** `POST …/proposals/:proposal_id/reject`.
+
+`parley fork create` (§4) takes `--sandbox-profile <name>` and an optional trailing `-- command...` to create the fork and its sandbox in one call (SBX-FR-028).
 
 ### 13.7 Background behaviour
 
 | Activity | When | Effect |
 |---|---|---|
-| Provider probe | start, if enabled | SBX-FR-006; fatal on failure |
-| Gateway bind | start, if enabled | SBX-FR-009; fatal on failure |
-| Recovery | start, before the gateway serves | SBX-FR-070 |
-| First sweep | start, before the gateway serves | SBX-FR-071 |
-| Periodic sweep | every `reap_interval` (default 10 m) | SBX-FR-071 |
-| Box expiry | at each active lease's `expires_at` | box destroyed, then lease `expired` (SBX-FR-072) |
-| Workspace deletion, fork expiry | when it happens | live leases of that workspace are ended (SBX-FR-047) |
-| Shutdown | when the hub stops; 20 s in total | SBX-FR-073 |
+| Runtime check | start | SBX-FR-003; fatal on failure |
+| Reconcile | start, then every `reconcile_interval` (default 1 m) | SBX-FR-061 |
+| Provisioning | after each create and start | SBX-FR-026; durable: resumed after a hub restart |
+| Idle stop | checked every minute | SBX-FR-042 |
+| Expiry | at each sandbox's `expires_at` | SBX-FR-043 |
+| Denials and proposals | read from the runtime continuously | SBX-FR-051, SBX-FR-052 |
+| Record cleanup | hourly maintenance (§3) | `deleted` records older than 24 hours and their logs are removed |
 
-**Metrics** (on `/metrics`, exported from start; with sandboxes disabled they are exported with value 0, §14):
+**Metrics** (§14; exported with value 0 when sandboxes are disabled):
 
 | Metric | Type | Meaning |
 |---|---|---|
-| `parley_sandboxes_active{workspace}` | gauge | leases in state `active`; recalibrated from stored leases at every sweep and after recovery |
-| `parley_sandbox_creates_total{result}` | counter | gateway Creates that reached the provisioning step; `result` is `created` or `failed` |
-| `parley_sandbox_lease_seconds` | histogram | `ended_at − created_at` of every lease that had a box, observed when it ends; buckets 60, 300, 600, 1200, 1800, 3600, 7200, 14400, 28800 |
+| `parley_sandboxes{state}` | gauge | Sandboxes by state, without `deleted` |
+| `parley_sandbox_creates_total{result}` | counter | `ready` or `failed` |
+| `parley_sandbox_seconds` | histogram | Time from `ready` to stop, exit or deletion |
+| `parley_sandbox_exec_total{result}` | counter | `ok`, `nonzero`, `timeout`, `error` |
+| `parley_sandbox_denials_total` | counter | Blocked connections and requests |
+| `parley_sandbox_checkpoints_total{result}` | counter | `ok`, `empty`, `failed` |
+| `parley_sandbox_runtime_up` | gauge | 1 while the runtime is reachable |
 
 ### 13.8 Events
 
-All sandbox events have `resource_type: "sandbox"`, `resource_id` = the lease id, `workspace` = the lease's workspace, and `session_id` = the lease's `session_id` (null when the lease has none). Metadata never contains a secret value, an `env` value, the lease token or the injected git credential. Each event is written in the same transaction as the lease state change it reports (§14). The catalogue is in §14.
+All sandbox events have `resource_type: "sandbox"`, `resource_id` = the sandbox id, `workspace` = the sandbox's workspace and `session_id` = the sandbox's. Metadata never contains a credential, a secret value or command output. Each event is written with the state change it reports (§14).
 
 | Type | Actor | When | Metadata |
 |---|---|---|---|
-| `hub.sandbox.lease` | the caller | lease stored | `profile`, `purpose`, `ttl_seconds`, `secret_names`, `optional_secret_names`, `git_credential` |
-| `hub.sandbox.create` | `lease` / the lease's `created_by` | `leased → active` | `sandbox_id`, `image`, `network` |
-| `hub.sandbox.failed` | `lease` / `created_by` | `leased → failed` | `error` (scrubbed) |
-| `hub.sandbox.destroy` | `DELETE`: the caller. Client close: `lease` / `created_by`. Otherwise `system` | every change into `destroyed` | `sandbox_id` (string or null), `reason` (`api`, `client`, `shutdown`, `restart`, `workspace_deleted`) |
-| `hub.sandbox.expire` | `system` | every change into `expired` | `sandbox_id` (string or null; non-null when a box was destroyed) |
+| `hub.sandbox.create` | caller | sandbox stored | `profile`, `purpose`, `command` (first argument only), `credentials`, `hub_access`, `expires_at`, `restored_from` |
+| `hub.sandbox.ready` | `system` | became `ready` | `checkout` |
+| `hub.sandbox.fail` | `system` | became `failed` other than by exit | `reason`, `error` (scrubbed) |
+| `hub.sandbox.exit` | `system` | the main process ended | `exit_code` |
+| `hub.sandbox.stop` | caller, or `system` | became `stopped` | `reason` (`api`, `idle`, `archived`) |
+| `hub.sandbox.start` | caller | start accepted | |
+| `hub.sandbox.checkpoint` | caller, or `system` | a checkpoint was attempted | `ok`, `refs` (`[{branch, sha, dirty}]`), `error` |
+| `hub.sandbox.deny` | `system` | first denial of a destination (SBX-FR-051) | `program`, `host`, `port`, `method`, `path` |
+| `hub.sandbox.proposal` | `system` | a proposal arrived | `proposal_id`, `summary`, `max_severity` |
+| `hub.sandbox.proposal_decided` | caller | approved or rejected | `proposal_id`, `decision`, `acknowledged_findings` |
+| `hub.sandbox.delete` | caller, or `system` | became `deleted` | `reason` (`api`, `expired`, `workspace_deleted`) |
 
-An expiry emits no `hub.sandbox.destroy`. A `DELETE` that changes nothing emits nothing.
+Exec, attach and file transfers emit no hub events. They are recorded in the audit log (§14) as agent telemetry of the sandbox's session when it has one: who ran which command, when, with which exit code, never the output.
 
 ### 13.9 Configuration
 
-The `[sandbox]` table. Durations are strings such as `30m` or `4h`.
+The `[sandbox]` table:
 
 | Key | Type | Default | Rules |
 |---|---|---|---|
-| `provider` | string | required | `podman` (local container engine) or `gateway` (a remote sandbox gateway) |
-| `engine_binary` | string | `podman` | `podman` provider only: the engine executable, a path or a name on `PATH` |
-| `runtime` | string | `""` | `podman` only: an alternative OCI runtime, for example a micro-VM runtime |
-| `userns` | string | `""` | `podman` only: user-namespace mode for boxes |
-| `gateway_url` | URL | required under `gateway` | `gateway` only: `https://host[:port]`, or `http` to a loopback host only; no user information, query, fragment or path |
-| `gateway_token` | string | required under `gateway` | `gateway` only: at least 16 printable ASCII characters; never echoed in any message or log |
-| `max_ttl` | duration | `4h` | > 0; the ceiling for every profile TTL |
-| `network_modes` | list of strings | `["none"]` | non-empty, unique entries; each must be honoured by the provider (`podman` honours `none` and `unrestricted`) |
-| `max_sandboxes` | integer | `16` | ≥ 1; hub-wide limit on live leases |
-| `listen` | `host:port` | `127.0.0.1:8443` | the gateway listener; a non-loopback address requires `tls_cert`, `tls_key` and `external_url` |
-| `tls_cert`, `tls_key` | path | `""` | PEM files; both or neither |
-| `external_url` | URL | `""` | absolute `http` or `https` URL with a host; no user information, query, fragment or path |
-| `lease_timeout` | duration | `5m` | ≥ 1 s and ≤ `max_ttl`; how long a lease may wait for its box |
-| `reap_interval` | duration | `10m` | 10 s to 1 h; the sweep interval |
-| `[[sandbox.profiles]]` | list of tables | at least one | fields per §13.3.1 |
+| `runtime` | string | `openshell` | The only value |
+| `gateway_url` | URL | required | The OpenShell gateway, `https://host[:port]`; `http` to a loopback host only |
+| `tls_cert`, `tls_key`, `tls_ca` | path | `""` | Client certificate, key and the gateway's CA for mutual TLS. `tls_cert` and `tls_key`: both or neither |
+| `token_file` | path | `""` | A file holding a bearer token for the gateway |
+| `oidc_issuer`, `oidc_client_id`, `oidc_client_secret_file` | URL, string, path | `""` | OIDC client credentials with which the hub obtains and renews its token for the gateway; all three or none |
 
-Further static rules:
+Exactly one way to authenticate to the gateway is configured: mutual TLS, `token_file`, or OIDC client credentials.
 
-- A `podman`-only key under `gateway`, or a `gateway`-only key under `podman`, is an error.
-- At most one profile sets `default = true`.
-- Each profile's `network` is one of `network_modes`, and its `ttl` is at most `max_ttl`.
-- A loopback address is `localhost` or a literal loopback IP. An empty host, `0.0.0.0` and `::` are not loopback.
+| Key | Type | Default | Rules |
+|---|---|---|---|
+| `openshell_workspace` | string | `parley` | The OpenShell workspace the hub owns |
+| `max_ttl` | duration | `24h` | Ceiling for every profile's `ttl` |
+| `idle_timeout` | duration | `30m` | Default idle timeout; `0` disables |
+| `max_sandboxes` | int | `50` | Hub-wide limit on `provisioning` and `ready` sandboxes |
+| `max_per_user` | int | `10` | Per creating user |
+| `max_per_workspace` | int | `20` | Per workspace family |
+| `max_exec_timeout` | duration | `30m` | |
+| `max_concurrent_execs` | int | `8` | Per sandbox |
+| `max_transfer_size` | size | `1GB` | Per upload or download |
+| `log_retention` | duration | `7d` | |
+| `reconcile_interval` | duration | `1m` | 10 s to 10 m |
+| `[[sandbox.profiles]]` | list of tables | at least one | §13.3.2 |
+| `[[sandbox.credentials]]` | list of tables | none | §13.3.4 |
 
-No environment variable configures the feature directly. `${NAME}` expansion (SBX-FR-003) is how secrets such as `gateway_token` are supplied.
+Compatibility: the hub states which OpenShell releases it supports in its release notes and `GET /version` (`sandbox_runtime: {supported, connected}`), and refuses to start against a gateway outside that range.
 
-The hub does not build or pull images. A profile image must contain a sandbox agent that speaks the AgentKit-compatible protocol, and, to use `PARLEY_GIT_TOKEN`, a git credential setup that reads it.
+**Image contract.** A profile's image must contain `git` for the checkout and for checkpoints. Nothing else is required: no agent, no Parley component. An image that also contains the `parley` CLI can use it as it is, because `PARLEY_ENDPOINT_URL` and `PARLEY_API_KEY` are set.
+
+Example:
+
+```toml
+[sandbox]
+gateway_url = "https://openshell.internal:8443"
+tls_cert = "/etc/parley/openshell-client.crt"
+tls_key  = "/etc/parley/openshell-client.key"
+tls_ca   = "/etc/parley/openshell-ca.crt"
+
+[[sandbox.credentials]]
+name = "model"
+provider_profile = "anthropic"
+secret = "ANTHROPIC_API_KEY"
+
+[[sandbox.profiles]]
+name = "agent"
+default = true
+image = "registry.example.com/agent:1.4"
+cpu = "2"
+memory = "4Gi"
+ttl = "4h"
+credentials = ["model"]
+policy = "/etc/parley/policies/agent.yaml"   # an OpenShell policy file
+```
 
 ### 13.10 Edge cases and error handling
 
-- **Feature disabled.** Every sandbox route answers `404 sandboxes_disabled` to any authenticated caller, before scope checks. `401` still comes first.
-- **Lapsed lease before the sweep.** A `leased` lease past `lease_expires_at` stops counting against capacity at once. Its token still authenticates until the sweep marks the lease, but its Create is refused and marks it `expired`.
-- **Overdue lease before its box is gone.** An `active` lease past `expires_at` has its token refused at once and stops counting against capacity. It stays `active` only until its box is destroyed.
-- **Restart with `leased` leases.** They remain usable; the token is still valid.
-- **Profile changed or removed after issue.** A lease keeps its snapshot. If the profile's name is no longer configured at Create, the lease fails.
-- **Secret deleted or rotated between issue and Create.** Deleted: the lease fails with a message that names the secret. Rotated: the new value is injected.
-- **`DELETE` racing a Create.** Whichever transition wins decides. A box made for an ended lease is destroyed at once, no `hub.sandbox.create` is emitted, and the Create fails.
-- **`DELETE` racing a client close or a sweep.** The lease ends once, with one event and one reason: that of the path that won.
-- **Provider cannot destroy a box.** The lease stays `active` (`DELETE` answers `502`; client close answers an error). The next `DELETE` or sweep retries. Shutdown and recovery are the exceptions: there the lease is ended and the orphan step of the sweep keeps retrying the box.
-- **Remote gateway unreachable (`gateway` provider).** Profiles are still listed and leases are still issued. Create fails the lease. `DELETE` of an active lease answers `502`. Sweeps log their failures. The hub does not retry a Create. Connection errors are reported without the remote's address.
-- **Fork expires while a box is running.** The box is destroyed and the lease ends with reason `workspace_deleted`. Work that was not pushed is lost; extending the fork's TTL (§4) before it expires avoids this. A lease's TTL is not shortened to fit the fork's `expires_at`.
-- **Lease on a fork without `inject_git_credential`.** `PARLEY_REMOTE` is still set. The box needs its own way to authenticate, for example a profile secret.
+- **Secrets and the agent.** Code in a sandbox can use a credential only as its provider profile allows: for requests to the named endpoints, from the named programs. It cannot read the value, and a request that carries the placeholder anywhere else is sent without the credential or blocked. This is a property of the runtime; Parley's part is never to hand a real value to the sandbox by another path.
+- **Fork expires while a sandbox runs.** The sandbox is deleted with the fork, without a checkpoint, because the fork that would hold it is going too. Pushed work that became a change is unaffected. A sandbox never outlives its fork (SBX-FR-022), so an agent that needs more time extends the fork first and then the sandbox.
+- **A stopped sandbox whose secret was deleted.** Start fails with `422 credential_missing`; the sandbox stays `stopped`.
+- **The secret store cannot be read** (no encryption key, or a value that cannot be decrypted, §11). Create and start answer `503 secrets_unavailable` and nothing is created or started.
+- **Reclone of the workspace (§4).** A reclone discards the workspace's checkpoint refs. Sandboxes are not touched; their working directories still hold the work, and the next checkpoint writes the refs again.
+- **Replay of a fork-create that carried a `sandbox`.** A replay with the same `Idempotency-Key` returns the fork and the sandbox as they are now and creates nothing.
+- **Checkpoint of a sandbox without a repository** (`checkout: false`, or a working directory that is not a git repository) records `ok: true` with no refs.
+- **Checkpoint of very large untracked files.** Files above 100 MiB each are left out of the uncommitted-changes commit and listed in `checkpoint.error` as skipped.
+- **Exec while the main process is the only thing running.** Allowed; this is how a person inspects a running agent.
+- **The caller disconnects during a non-stream exec.** The command is killed.
+- **The runtime is unreachable at expiry.** The record becomes `deleted`, the hub credential is revoked on the hub, and reconciliation removes the sandbox when the runtime returns. The sandbox cannot reach the hub in the meantime because its credential is gone.
+- **A proposal for a destination the base policy explicitly denies** can be approved only if the runtime accepts the resulting policy; otherwise the approval answers `409` with the runtime's reason.
+- **Profile changed or removed after creation.** A sandbox keeps its snapshot, including across stop and start. A start of a sandbox whose profile no longer exists is allowed.
+- **Two sandboxes on one fork.** Allowed. Each has its own working directory and its own checkout branch unless told otherwise; they meet only through the fork's branches.
+- **`hub_access: none`.** There is no checkout, no hub credential and no checkpoint. Such a sandbox is a plain isolated environment tied to a workspace for access control and accounting.
 
 ---
 
@@ -5556,9 +5682,10 @@ Out of scope: pricing. "Cost" in this section always means token counts. There i
 | `token_summary` | object | `total_input_tokens`, `total_output_tokens`, `total_cache_read_tokens`, `models_used` (distinct model names, sorted ascending) |
 | `forks` | list | Slugs of the task forks created with this session (§4), oldest first |
 | `changes` | list | `{workspace, number}` of each change that has at least one version attributed to this session (§7), ordered by first attribution |
-| `counts` | object | `forks`, `changes`, `versions`, `pushes`, `commits`, `claims`, `lands` |
+| `sandboxes` | list | `{workspace, id}` of each sandbox that belongs to this session (§13), oldest first. Deleted sandboxes stay listed |
+| `counts` | object | `forks`, `changes`, `sandboxes`, `versions`, `pushes`, `commits`, `claims`, `lands` |
 
-Every field is present in every session response. `forks` and `changes` hold at most 500 entries each; `counts` always holds the true totals. `counts.pushes` counts ref updates by git push, `counts.commits` counts commits created through the source control API (§6), `counts.versions` counts change versions, `counts.lands` counts successful lands.
+Every field is present in every session response. `forks`, `changes` and `sandboxes` hold at most 500 entries each; `counts` always holds the true totals. `counts.pushes` counts ref updates by git push, `counts.commits` counts commits created through the source control API (§6), `counts.versions` counts change versions, `counts.lands` counts successful lands.
 
 **State machine.**
 
@@ -5571,7 +5698,7 @@ Every field is present in every session response. `forks` and `changes` hold at 
 
 The four terminal states are absorbing. `terminated` cannot be set by a client. Usage may be reported only while the session is `active`.
 
-**Linking work to a session.** A fork request, a git push (`-o parley.session=<id>`), an API commit, a change version, a claim, a land and a sandbox lease may name a session. The reference is accepted when:
+**Linking work to a session.** A fork request, a git push (`-o parley.session=<id>`), an API commit, a change version, a claim, a land and a sandbox may name a session. The reference is accepted when:
 
 - the session exists,
 - it was created by the caller's user, or the caller is an admin token, and
@@ -5579,7 +5706,7 @@ The four terminal states are absorbing. `terminated` cannot be set by a client. 
 
 The session's status is not checked: work may be attributed after the session has ended, for example a land that happens later. A reference that fails these rules is refused with `400`, `error_type: unknown_session`, and nothing is changed. On a git push the refusal is reported in git's text form (§5).
 
-Every hub event caused by an operation that names a session carries that `session_id`. An event about a change that is caused by the hub itself (restack, conflict detection, automatic land) carries the session of the change version it concerns. An event about a task fork (`hub.workspace.fork`, `hub.workspace.delete`, `hub.fork.expire`) carries the session the fork was created with (§4). A sandbox event carries the session of its lease (§13). A rebuild event carries the session of the push or land that queued the rebuild (§10).
+Every hub event caused by an operation that names a session carries that `session_id`. An event about a change that is caused by the hub itself (restack, conflict detection, automatic land) carries the session of the change version it concerns. An event about a task fork (`hub.workspace.fork`, `hub.workspace.delete`, `hub.fork.expire`) carries the session the fork was created with (§4). A sandbox event carries the session of its sandbox (§13). A rebuild event carries the session of the push or land that queued the rebuild (§10).
 
 #### 14.3.3 Token usage record
 
@@ -5611,7 +5738,7 @@ A hub event reports one state change in the hub. Every event has the same shape:
 | `type` | string | For example `hub.change.land`. Every type starts with `hub.` |
 | `time` | timestamp | When the event was written |
 | `workspace` | string or null | Slug of the workspace the event belongs to. Null for an event that is not workspace-scoped |
-| `actor_type` | enum | `admin_token`, `api_key`, `pat`, `lease`, `forge`, `system` |
+| `actor_type` | enum | `admin_token`, `api_key`, `pat`, `forge`, `system` |
 | `actor_id` | string or null | User id of the actor. Null for `admin_token`, `forge` and `system` |
 | `resource_type` | string | Kind of the resource the event is about. Never empty |
 | `resource_id` | string | Identity of that resource inside its workspace. Never empty |
@@ -5674,7 +5801,7 @@ Bound tokens may call the routes of this section that are not under `/workspaces
 - AUD-FR-005: `complete` accepts `completed`, `failed` or `timeout`. Completing an `active` session sets the status, `ended_at`, `error_message`, `duration_ms` and `cache_creation_input_tokens` in one atomic step. Completing a terminal session answers 200 with the unchanged record; when two completes race, exactly one takes effect and both answer 200.
 - AUD-FR-006: A usage report needs a non-blank `model` and token counts ≥ 0, and an `active` session (else `409 session_not_active`). A new record answers 201. A replay of an existing usage `id` in the same session answers 200 with the stored record and changes nothing: no record, no total, no metric. A usage `id` that exists in another session answers `409 conflict`.
 - AUD-FR-007: A session is readable by its creator, by any caller with read access to its workspace, and by admin tokens. A session on a task fork is also readable by callers with read access to the parent, also after the fork is gone. Workspace status does not affect reads. A caller who may not read a session gets `404 session not found`.
-- AUD-FR-008: Every session response carries `token_summary`, `forks`, `changes` and `counts`, computed at read time.
+- AUD-FR-008: Every session response carries `token_summary`, `forks`, `changes`, `sandboxes` and `counts`, computed at read time.
 - AUD-FR-009: Archiving or deleting a workspace, and the expiry of a task fork, closes all its `active` sessions: `status: terminated`, `ended_at` = the time of the operation, `error_message` = `workspace archived`, `workspace deleted` or `fork expired`. One `hub.session.force_closed` event is written per session, in the same transaction as the workspace change.
 - AUD-FR-010: The cost report sums the usage records of one workspace with `since ≤ reported_at < until`. Totals and each group give the three token sums and the number of distinct sessions. `day` groups are UTC calendar dates. No prices are applied.
 
@@ -5686,6 +5813,7 @@ Bound tokens may call the routes of this section that are not under `/workspaces
 - AUD-FR-023: Each record is idempotent on its `id` (a postmortem: on workspace and run). A new record answers 201. A replay answers 200 with the **stored** record and changes nothing. An `id` that already exists in another workspace or run answers `409 conflict`.
 - AUD-FR-024: Batch routes take a JSON array of 1 to 1000 items. Each item is validated like a single record. Invalid items are reported in `errors` and skipped. Valid items are stored together or not at all. The response is always 200 with `{accepted, duplicates, errors}`.
 - AUD-FR-025: An ingestion write that does not finish within `[audit].write_timeout` answers `503 unavailable` with `Retry-After: 5`, and stores nothing.
+- AUD-FR-026 (sandbox use). Exec, attach and file transfers in a sandbox (§13) write no hub event. When the sandbox has a session and that session has a `run_id`, the hub itself records each of them as a run event of the sandbox's workspace under that `run_id` and `session_id`, with `event_type` `sandbox.exec`, `sandbox.attach`, `sandbox.upload` or `sandbox.download`. The `payload` holds `sandbox_id`, who did it (`actor_type`, `actor_id`), and: for an exec, the `command` (argument list), `exit_code`, `timed_out` and `duration_ms`; for an attach, `duration_ms`; for a transfer, `path` and `bytes`. The record's `timestamp` is the time the operation started. It never holds stdin, command output, terminal content, file content or environment values. A sandbox without such a session leaves no record of these operations. The record is written when the operation ends, and a failure to write it does not fail the operation.
 
 **Reads**
 
@@ -5733,7 +5861,7 @@ Conventions of §3 apply to every route: authentication, check order, error enve
 - **Errors:** 400 (bad parameter; `include_forks` without `workspace`); 404 `workspace not found` (the `workspace` filter names one the caller cannot read).
 
 #### `GET /sessions/:id`
-- **Purpose:** read one session with its token summary, forks, changes and counts.
+- **Purpose:** read one session with its token summary, forks, changes, sandboxes and counts.
 - **Scope / access:** `sessions:read`; AUD-FR-007.
 - **Response:** 200 session object.
 - **Errors:** 400 (`:id` is not a UUID); 404 `session not found`.
@@ -5930,7 +6058,7 @@ Reports one usage increment. Flags: `--model <name>` (required), `--input <n>`, 
 Ends a session. Flags: `--status completed|failed|timeout` (default `completed`), `--error <text>`, `--duration-ms <n>`.
 
 #### `parley session get <session-id>`
-Prints the session object, with its forks, changes and counts.
+Prints the session object, with its forks, changes, sandboxes and counts.
 
 #### `parley session list`
 Lists sessions. Flags: `--workspace <slug>`, `--include-forks`, `--run-id <id>`, `--status <status>`, `--since <time>`, `--limit <n>`, `--cursor <c>`.
@@ -5998,9 +6126,13 @@ The newest event always stays in the event log, whatever its age, so `last_seq` 
 | `parley_jobqueue_depth` | gauge | `type` (`rebuild`), `status` (`queued`, `running`, `failed`, `completed`, `dead_letter`, `cancelled`) | Durable jobs by job type and job status (§10) |
 | `parley_retention_errors_total` | counter | `step` | Failed retention steps |
 | `parley_retention_last_run_timestamp_seconds` | gauge | none | Unix time of the last fully successful retention run |
-| `parley_sandboxes_active` | gauge | `workspace` | See §13 |
-| `parley_sandbox_creates_total` | counter | `result` (`created`, `failed`) | See §13 |
-| `parley_sandbox_lease_seconds` | histogram | none | Buckets 60, 300, 600, 1200, 1800, 3600, 7200, 14400, 28800. See §13 |
+| `parley_sandboxes` | gauge | `state` (`provisioning`, `ready`, `stopped`, `completed`, `failed`) | Sandboxes by state, without `deleted` (§13) |
+| `parley_sandbox_creates_total` | counter | `result` (`ready`, `failed`) | Sandbox creations by outcome (§13) |
+| `parley_sandbox_seconds` | histogram | none | Time from `ready` to stop, exit or deletion. Buckets 60, 300, 600, 1200, 1800, 3600, 7200, 14400, 28800, 86400 |
+| `parley_sandbox_exec_total` | counter | `result` (`ok`, `nonzero`, `timeout`, `error`) | Commands run through exec (§13) |
+| `parley_sandbox_denials_total` | counter | none | Connections and requests the sandbox runtime blocked (§13) |
+| `parley_sandbox_checkpoints_total` | counter | `result` (`ok`, `empty`, `failed`) | Checkpoints attempted (§13) |
+| `parley_sandbox_runtime_up` | gauge | none | 1 while the sandbox runtime is reachable. The sandbox metrics are exported with value 0 when sandboxes are disabled |
 
 Label values with a closed set are all present from start-up with value 0.
 
@@ -6032,7 +6164,7 @@ Events whose `workspace` is a fork (`hub.workspace.fork`, `hub.workspace.delete`
 
 | Type | Emitted when | `resource_type` / `resource_id` | Metadata |
 |---|---|---|---|
-| `hub.token.bind` | A token bound to a workspace was created, including the token issued with a fork and the git credential the hub mints for a sandbox (§13) | `token` / token id | `token_id`, `workspace`, `permissions`, `paths` (or null), `expires_at` (or null). Never the token |
+| `hub.token.bind` | A token bound to a workspace was created, including the token issued with a fork and the hub credential the hub mints for a sandbox at create and at each start (§13) | `token` / token id | `token_id`, `workspace`, `permissions`, `paths` (or null), `expires_at` (or null). Never the token |
 | `hub.token.bound_refused` | A bound token was refused because the request was outside its workspace. At most one event per token per minute. `workspace` is the bound workspace; the actor is the token's user | `token` / token id | `token_id`, `bound_workspace`, `requested_workspace` (when the request named one), `method`, `route`, `status` (403 or 404), `surface` (`api`, `git`), `suppressed` (refusals not reported since the previous event) |
 
 #### 14.8.3 Git server and source control API (§5, §6)
@@ -6139,15 +6271,23 @@ At workspace scope the event's `workspace` is the slug. At user and org scope `w
 
 #### 14.8.9 Sandboxes (§13)
 
-`resource_type` is `sandbox` and `resource_id` the lease id.
+`resource_type` is `sandbox` and `resource_id` the sandbox id. `workspace` is the sandbox's workspace and `session_id` the sandbox's. Metadata never contains a credential, a secret value or command output.
 
 | Type | Emitted when | Actor | Metadata |
 |---|---|---|---|
-| `hub.sandbox.lease` | A lease was issued | caller | `profile`, `purpose`, `ttl_seconds`, `secret_names`, `optional_secret_names`, `git_credential` |
-| `hub.sandbox.create` | The sandbox was created and the lease became active | `lease` (the lease's creator) | `sandbox_id`, `image`, `network` |
-| `hub.sandbox.failed` | The lease failed before a sandbox existed | `lease` | `error` |
-| `hub.sandbox.destroy` | The sandbox was destroyed other than by expiry | `lease`, caller, or `system` | `sandbox_id` (or null), `reason` (`api`, `client`, `shutdown`, `restart`, `workspace_deleted`) |
-| `hub.sandbox.expire` | Time ended the lease: every change into `expired` | `system` | `sandbox_id` (string or null; non-null when a box was destroyed) |
+| `hub.sandbox.create` | The sandbox was stored | caller | `profile`, `purpose`, `command` (first argument only), `credentials`, `hub_access`, `expires_at`, `restored_from` |
+| `hub.sandbox.ready` | The sandbox became `ready` | `system` | `checkout` |
+| `hub.sandbox.fail` | The sandbox became `failed` other than by exit | `system` | `reason`, `error` (scrubbed) |
+| `hub.sandbox.exit` | The main process ended | `system` | `exit_code` |
+| `hub.sandbox.stop` | The sandbox became `stopped` | caller, or `system` | `reason` (`api`, `idle`) |
+| `hub.sandbox.start` | A start was accepted | caller | none |
+| `hub.sandbox.checkpoint` | A checkpoint was attempted | caller, or `system` | `ok`, `refs` (`[{branch, sha, dirty}]`), `error` |
+| `hub.sandbox.deny` | First denial of a destination per sandbox (SBX-FR-051) | `system` | `program`, `host`, `port`, `method`, `path` |
+| `hub.sandbox.proposal` | A network access proposal arrived | `system` | `proposal_id`, `summary`, `max_severity` |
+| `hub.sandbox.proposal_decided` | A proposal was approved or rejected | caller | `proposal_id`, `decision`, `acknowledged_findings` |
+| `hub.sandbox.delete` | The sandbox became `deleted` | caller, or `system` | `reason` (`api`, `expired`, `workspace_deleted`) |
+
+Exec, attach and file transfers emit no hub event; they are recorded as run telemetry (AUD-FR-026).
 
 ### 14.9 Configuration
 
@@ -6200,12 +6340,12 @@ The workspace setting `audit_fetches` (boolean, default `false`, §4) turns on `
 
 ### 15.1 Deployment model
 
-- **NFR-001** The hub runs as **one process**. Several replicas are not supported. Nothing in the product may require an external database, cache or message broker.
-- **NFR-002** State is kept in embedded stores on local disk under one data directory: the hub's transactional state (identity, workspaces, changes, policy, land attempts, claims, jobs, secrets, leases, the event log), the analytical store for audit queries and agent telemetry, and the repositories. The choice of storage engines is an implementation decision. The repositories MUST remain ordinary git repositories that stock `git` can read.
+- **NFR-001** The hub runs as **one process**. Several replicas are not supported. Nothing in the product may require an external database, cache or message broker. The one optional external component is the OpenShell gateway, needed only when sandboxes are enabled (§13); a hub without `[sandbox]` needs nothing external.
+- **NFR-002** State is kept in embedded stores on local disk under one data directory: the hub's transactional state (identity, workspaces, changes, policy, land attempts, claims, jobs, secrets, sandbox records, the event log), the analytical store for audit queries and agent telemetry, and the repositories. The choice of storage engines is an implementation decision. The repositories MUST remain ordinary git repositories that stock `git` can read.
 - **NFR-003** Schema evolution is automatic. Every start brings the stores to the current schema without a separate migration step, and a newer binary can always open the data of the previous release.
 - **NFR-004** The server needs the `git` command at run time (version 2.38 or later, checked at start). The `parley` client is a single static binary with no dependency on the server's stacks.
 - **NFR-005** Version, commit and build time are set at build time and reported by `GET /version` and `parley version`.
-- **NFR-006** Deliverables: the two binaries, a hub container image, a sandbox base image, and Kubernetes manifests (configuration, deployment with one replica, persistent volume claim, service, an example for secrets).
+- **NFR-006** Deliverables: the two binaries, a hub container image, a reference sandbox image that satisfies the image contract of §13.9, and Kubernetes manifests (configuration, deployment with one replica, persistent volume claim, service, an example for secrets).
 - **NFR-007** Backup is a consistent copy of the data directory. The hub provides `parleyd backup <directory>` (§3), which writes a consistent snapshot of the data directory of a running hub into an empty directory. A hub started on a restored snapshot starts cleanly.
 
 ### 15.2 Concurrency and consistency
@@ -6213,8 +6353,8 @@ The workspace setting `audit_fetches` (boolean, default `false`, §4) turns on `
 - **NFR-010** There is no global or per-workspace lock that a request waits on or fails on. Ref updates are compare-and-swap. The only exclusive periods are the maintenance operations of §4 (initial clone, reclone, archive, delete).
 - **NFR-011** Readers never see a partial update: a ref has its old or its new value, a change is landed or not, a rebuild's integration branch is the old or the new one.
 - **NFR-012** State that must agree is changed atomically: a ref move with its version record (§7), a land with its bookkeeping and event (§8), a state change with the event that reports it (§14).
-- **NFR-013** Every piece of background work that a client was told about (clone, rebuild, land attempt, restack, automatic landing) survives a restart and is resumed or cleanly failed. After a crash the hub reconciles refs with records at start (§7.7).
-- **NFR-014** Only these things live in memory and are lost at restart without harm: open event-stream connections (clients resume by `seq`), rate-limit counters, and caches.
+- **NFR-013** Every piece of background work that a client was told about (clone, rebuild, land attempt, restack, automatic landing, sandbox provisioning) survives a restart and is resumed or cleanly failed. After a crash the hub reconciles refs with records at start (§7.7).
+- **NFR-014** Only these things live in memory and are lost at restart without harm: open event-stream connections (clients resume by `seq`), rate-limit counters, caches, and open exec, attach, log and transfer requests to sandboxes. The sandboxes themselves belong to the runtime and are not affected by a stop, crash or upgrade of the hub (SBX-FR-060).
 
 ### 15.3 Security
 
@@ -6225,6 +6365,8 @@ The workspace setting `audit_fetches` (boolean, default `false`, §4) turns on `
 - **NFR-024** Least privilege is expressible end to end: a token can be limited to scopes, to one workspace or fork, to paths, and in time. A task fork's token reaches nothing outside the fork except its own changes and the read-only awareness and policy routes of its parent (§3).
 - **NFR-025** Forge webhooks are authenticated by signature or token and de-duplicated (§12). The ingress is outside bearer authentication and has its own body limit.
 - **NFR-026** Policy cannot be bypassed by choice of surface: the push rules apply identically to git pushes and to the source control API, and a protected branch moves only by landing or by sync from origin (§8.3.1).
+- **NFR-027** No real credential is ever placed in a sandbox. The workload sees placeholders only; the hub credential and every secret are added outside the sandbox, on requests to authorized endpoints (§13.3.4). A sandbox has no network egress except to the hub unless a profile or an approved proposal allows it.
+- **NFR-028** Sandbox isolation (filesystem, process and network confinement) is provided and enforced by OpenShell, not by the hub. The hub's part is access control, the policy it hands to the runtime, time limits, quotas and the record of what happened (§13.1).
 
 ### 15.4 Performance targets
 
@@ -6243,6 +6385,8 @@ Targets are for one hub on a host with 8 cores, 32 GB of memory and local SSD st
 | Active task forks per hub | 5,000 |
 | Open changes per workspace | 2,000 |
 | Concurrent event-stream connections | 500 (configurable) |
+| Sandbox `ready` after create, image already cached by the runtime | within 60 s |
+| Overhead the hub adds to a sandbox exec | under 200 ms |
 
 ### 15.5 Limits
 
@@ -6264,6 +6408,11 @@ Each limit is defined in the section that owns it. The main ones:
 | Policy document | 200 rules, 64 KiB | §8 |
 | Claim TTL | default 1 h, max 24 h | §9 |
 | Durable job retries | 20, backoff 4 s doubling to 2 h | §10 |
+| Sandbox TTL | set per profile, max 24 h | §13 |
+| Sandbox idle timeout | default 30 min | §13 |
+| Running sandboxes (`provisioning` or `ready`) | 50 per hub, 10 per user, 20 per workspace and its forks | §13 |
+| Sandbox exec timeout | default 60 s, max 30 min | §13 |
+| Sandbox file transfer | 1 GiB per upload or download | §13 |
 | Event log retention | 30 d | §14 |
 | `parley` request timeout | 30 s (3 min for sync, push to origin, archive and reclone) | §3, §4 |
 | `--wait` defaults | `--timeout 5m`, `--poll-interval 5s` | §3 |
@@ -6295,9 +6444,10 @@ Parley is accepted when the following hold, demonstrated by black-box tests agai
 12. **Durable events (§14).** A consumer that disconnects, misses fifty events and reconnects with its last `seq` receives exactly those fifty, in order, then live events. A cursor older than retention gets `410 cursor_expired`. Events for a push, a fork, a version, a land and a conflict each carry the session given on the operation. No event is missing after the hub is killed and restarted under load.
 13. **Sessions as the thread (§14).** From a session id, the fork, the changes, their versions and their land attempts are reachable. From a landed commit, the session is reachable.
 14. **Git compatibility (§5).** Stock `git` clones (full, shallow, and with `--filter=blob:none`), fetches and pushes through the hub with a PAT and the credential helper. A workspace the caller cannot read is indistinguishable from one that does not exist.
-15. **Carried features.** Workspaces (§4), carry-patch workspaces (§10), secrets and variables (§11), forge integration (§12), sandboxes (§13) and sessions, audit and metrics (§14) each pass a test of every listed success and error case of their REST routes and CLI commands.
+15. **Carried features.** Workspaces (§4), carry-patch workspaces (§10), secrets and variables (§11), forge integration (§12) and sessions, audit and metrics (§14) each pass a test of every listed success and error case of their REST routes and CLI commands.
 16. **Conventions (§3).** Every error on every route is the envelope with an `error_type`. Every list is paged the same way. Every creating `POST` honours `Idempotency-Key`. A wrong method is `405`.
 17. **Operations (§15).** The hub runs from one binary, one configuration file and one data directory. A backup taken while running restores to a hub that starts cleanly. The performance targets of §15.4 are met on the reference host.
+18. **Sandboxes (§13).** Demonstrated against a hub connected to an OpenShell gateway. One fork-create call with a `sandbox` object returns a fork and a sandbox; when the sandbox is `ready` the fork is checked out in it, and a `git push` run inside it opens a change in the parent. A command run in the sandbox cannot read the value of the hub credential or of an attached credential: it sees placeholders only. A request from the sandbox to a host that no rule allows is blocked and reported as `hub.sandbox.deny`. A proposal for that host cannot be approved with a workspace-bound token (`403 token_bound`); once a person approves it, the same request succeeds. A requested stop, an idle stop and expiry each leave a checkpoint under `refs/hub/sandboxes/`, and a new sandbox created with `restore_from` has the committed and the uncommitted work back. A hub restart leaves a running sandbox and its main process untouched, and the hub shows it `ready` again afterwards. A token that lacks a scope of the sandbox's hub credential cannot exec in it (`403 insufficient_scope`). Every listed success and error case of the sandbox routes and commands passes its test.
 
 ---
 
@@ -6312,7 +6462,7 @@ The sections are written as one product, but they are meant to be built in this 
 | 0. Foundation | Platform, identity and access (§3); workspaces without forks (§4); git server without change mapping (§5); secrets and variables (§11); the event log and basic audit (§14) | A hub that hosts repositories and serves git with scoped tokens |
 | 1. First cut | Changes without stacks (§7); optimistic landing with the default policy, protected branches and conflict reports (§8); task forks (§4); source control API (§6); push-to-change mapping (§5) | An agent can fork, work, open a change and land it, over git or over the API alone |
 | 2. Coordination | Stacks and restack (§7); policy rules, approvals, checks, automatic landing, revert, path-scoped tokens (§8, §3); awareness (§9); event replay, filters and long-poll (§14); sessions linked to changes (§14) | Many agents on one repository, with rules about what lands and visibility of each other |
-| 3. Carried features | Forge integration (§12); sandboxes (§13); carry-patch workspaces (§10); agent telemetry ingestion and the full audit query (§14) | The complete product |
+| 3. Carried features | Forge integration (§12); sandboxes on OpenShell (§13); carry-patch workspaces (§10); agent telemetry ingestion and the full audit query (§14) | The complete product |
 
 Stage 3 has no dependency on stage 2 and can run in parallel with it.
 
@@ -6322,7 +6472,9 @@ Not part of this document's requirements. Listed so that the design leaves room 
 
 - **Parallel attempts.** Several forks started from one point for the same task, compared side by side, one chosen to land.
 - **An undo log** for server-side operations (land, restack, abandon, ref moves), in the manner of Sapling's `undo`.
-- **Checks run by the hub** in its own sandboxes (§13), on the rebased result of a change.
+- **Checks run by the hub** in its own sandboxes (§13), on the rebased result of a change. With sandboxes that are created on a fork, driven by exec and report an exit code, this is now a small step.
+- **Exposing services that run in a sandbox**, for example a preview of a web application, to people outside it.
+- **A second sandbox runtime** behind the same contract (the REST routes and the sandbox record of §13), next to OpenShell.
 - **Automatic mirror to origin** after each land, as a workspace setting.
 - **Exporting a change to the forge** as a pull request, and importing forge review state as approvals.
 - **Per-agent quotas** beyond the request rate limit: forks, lands and storage per user or session.
@@ -6337,7 +6489,7 @@ Choices made while writing this document that the product owner should confirm o
 
 | # | Decision taken | Where | Alternative |
 |---|---|---|---|
-| 1 | Names: credential prefix `parley_` (sandbox lease tokens are the exception: `sbl_`, §13), environment prefix `PARLEY_`, client configuration in `~/.parley`, metrics `parley_*`; event types keep `hub.*` and refs keep `refs/hub/` | §3, §14 | Shorter credential prefix; `parley.*` events |
+| 1 | Names: credential prefix `parley_`, environment prefix `PARLEY_`, client configuration in `~/.parley`, metrics `parley_*`; event types keep `hub.*` and refs keep `refs/hub/` | §3, §14 | Shorter credential prefix; `parley.*` events |
 | 2 | The default branch is protected by default, so even the owner cannot push to it directly | §4, §8 | Protection off by default, or an owner exemption |
 | 3 | The default policy requires nothing: every change may land | §8 | A default that requires one approval for agent-authored changes |
 | 4 | Checks are reported on a version, not on the rebased result, and carry over a pure rebase | §8 | `fresh_checks` on by default |
@@ -6358,13 +6510,19 @@ Choices made while writing this document that the product owner should confirm o
 | 19 | A fork never grants more than its parent: a member who leaves the organization loses the forks they created in it | §3, §4 | The creator keeps the fork until it expires |
 | 20 | An approval is discounted for any credential that created any version of the change, not only the approved one | §8 | Discount only the credential that created the approved version |
 | 21 | Secret and bound-token events of a workspace are visible only at `owner` or `admin` level | §3, §14 | Token events visible to every reader |
-| 22 | A sandbox lease issued with the admin token gets no injected git credential | §13 | Mint it as the fork's owner |
+| 22 | The admin token cannot create sandboxes, because the hub credential needs a user as its owner. It can read, stop and delete any sandbox | §13 | Mint the hub credential as the workspace's owner |
+| 23 | OpenShell is a hard dependency for sandboxes, and it is pre-1.0. The hub supports a stated range of releases and refuses to start against another | §13 | An abstract runtime contract with a second implementation |
+| 24 | No raw secret is ever injected into a sandbox. A secret reaches a sandbox only as a credential behind a placeholder | §11, §13 | An opt-in per profile to place chosen secrets in the environment |
+| 25 | Exec, files, logs and attach go through the hub's REST API, not directly to the runtime | §13 | Hand the caller a direct, short-lived connection to the runtime |
+| 26 | An approved network rule applies to one sandbox only and is not copied to a sandbox restored from it | §13 | Let an owner promote an approved rule to the profile |
+| 27 | A sandbox never outlives its fork, and the deletion of a fork takes no checkpoint of its sandboxes | §4, §13 | Keep checkpoints in the parent, or hold the fork until its sandboxes have ended |
+| 28 | Default quotas of 50 running sandboxes per hub, 10 per user and 20 per workspace and its forks; a sandbox lives at most 24 h | §13 | Other defaults; quotas per organization |
 
 ---
 
 ## Appendix A: REST route index
 
-Generated from the route headings of §3–§14: 205 routes. Paths under `/api/v1` are shown in full.
+Generated from the route headings of §3–§14: 217 routes. Paths under `/api/v1` are shown in full.
 
 | Method | Path | Section |
 |---|---|---|
@@ -6546,7 +6704,19 @@ Generated from the route headings of §3–§14: 205 routes. Paths under `/api/v
 | POST | `/api/v1/workspaces/:slug/sandboxes` | §13 |
 | GET | `/api/v1/workspaces/:slug/sandboxes` | §13 |
 | GET | `/api/v1/workspaces/:slug/sandboxes/:id` | §13 |
+| PATCH | `/api/v1/workspaces/:slug/sandboxes/:id` | §13 |
+| POST | `/api/v1/workspaces/:slug/sandboxes/:id/exec` | §13 |
+| PUT | `/api/v1/workspaces/:slug/sandboxes/:id/files` | §13 |
+| GET | `/api/v1/workspaces/:slug/sandboxes/:id/files` | §13 |
+| GET | `/api/v1/workspaces/:slug/sandboxes/:id/logs` | §13 |
+| GET | `/api/v1/workspaces/:slug/sandboxes/:id/attach` | §13 |
+| POST | `/api/v1/workspaces/:slug/sandboxes/:id/checkpoint` | §13 |
+| POST | `/api/v1/workspaces/:slug/sandboxes/:id/stop` | §13 |
+| POST | `/api/v1/workspaces/:slug/sandboxes/:id/start` | §13 |
 | DELETE | `/api/v1/workspaces/:slug/sandboxes/:id` | §13 |
+| GET | `/api/v1/workspaces/:slug/sandboxes/:id/proposals` | §13 |
+| POST | `/api/v1/workspaces/:slug/sandboxes/:id/proposals/:proposal_id/approve` | §13 |
+| POST | `/api/v1/workspaces/:slug/sandboxes/:id/proposals/:proposal_id/reject` | §13 |
 | GET | `/api/v1/sandboxes` | §13 |
 | POST | `/api/v1/sessions` | §14 |
 | GET | `/api/v1/sessions` | §14 |
@@ -6578,7 +6748,7 @@ Generated from the route headings of §3–§14: 205 routes. Paths under `/api/v
 
 ## Appendix B: CLI command index
 
-Generated from the command headings of §3–§14: 163 commands. Flags, calls, output and exit codes are in the section named.
+Generated from the command headings of §3–§14: 175 commands. Flags, calls, output and exit codes are in the section named.
 
 | Command | Section |
 |---|---|
@@ -6733,10 +6903,22 @@ Generated from the command headings of §3–§14: 163 commands. Flags, calls, o
 | `parley pr create <workspace-slug>` | §12 |
 | `parley pr comment <workspace-slug> <number>` | §12 |
 | `parley sandbox profiles` | §13 |
-| `parley sandbox create <workspace-slug>` | §13 |
+| `parley sandbox create <workspace-slug> [-- command...]` | §13 |
 | `parley sandbox list <workspace-slug>` | §13 |
-| `parley sandbox get <workspace-slug> <lease-id>` | §13 |
-| `parley sandbox destroy <workspace-slug> <lease-id>` | §13 |
+| `parley sandbox get <workspace-slug> <id>` | §13 |
+| `parley sandbox exec <workspace-slug> <id> -- <command...>` | §13 |
+| `parley sandbox shell <workspace-slug> <id>` | §13 |
+| `parley sandbox logs <workspace-slug> <id>` | §13 |
+| `parley sandbox upload <workspace-slug> <id> <local-path> <sandbox-path>` | §13 |
+| `parley sandbox download <workspace-slug> <id> <sandbox-path> <local-path>` | §13 |
+| `parley sandbox checkpoint <workspace-slug> <id>` | §13 |
+| `parley sandbox stop <workspace-slug> <id>` | §13 |
+| `parley sandbox start <workspace-slug> <id>` | §13 |
+| `parley sandbox extend <workspace-slug> <id>` | §13 |
+| `parley sandbox delete <workspace-slug> <id>` | §13 |
+| `parley sandbox proposals <workspace-slug> <id>` | §13 |
+| `parley sandbox approve <workspace-slug> <id> <proposal-id>` | §13 |
+| `parley sandbox reject <workspace-slug> <id> <proposal-id>` | §13 |
 | `parley session start <workspace-slug>` | §14 |
 | `parley session usage <session-id>` | §14 |
 | `parley session complete <session-id>` | §14 |
