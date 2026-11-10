@@ -231,8 +231,14 @@ func TestOAuth_AFailingProviderIsAnUpstreamFailureThatLeaksNothing(t *testing.T)
 		{"token 503", func(f *fakeProvider) { f.set("/token", 503, `provider-body-text`) }, ""},
 		{"token not JSON", func(f *fakeProvider) { f.set("/token", 200, `provider-body-text`) }, ""},
 		{"token without access token", func(f *fakeProvider) { f.set("/token", 200, `{}`) }, ""},
-		{"user 401", func(f *fakeProvider) { f.set("/token", 200, `{"access_token":"at-1"}`); f.set("/user", 401, `provider-body-text`) }, ""},
-		{"user 500", func(f *fakeProvider) { f.set("/token", 200, `{"access_token":"at-1"}`); f.set("/user", 500, `provider-body-text`) }, ""},
+		{"user 401", func(f *fakeProvider) {
+			f.set("/token", 200, `{"access_token":"at-1"}`)
+			f.set("/user", 401, `provider-body-text`)
+		}, ""},
+		{"user 500", func(f *fakeProvider) {
+			f.set("/token", 200, `{"access_token":"at-1"}`)
+			f.set("/user", 500, `provider-body-text`)
+		}, ""},
 		{"user not an object", func(f *fakeProvider) { f.set("/token", 200, `{"access_token":"at-1"}`); f.set("/user", 200, `[1,2]`) }, ""},
 		{"e-mail list 500", func(f *fakeProvider) {
 			f.set("/token", 200, `{"access_token":"at-1"}`)

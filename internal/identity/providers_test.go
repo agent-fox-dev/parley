@@ -9,17 +9,18 @@ import (
 	"github.com/agent-fox-dev/parley/internal/config"
 )
 
-// withRoutes mounts this package's routes over the configured providers.
-func (h *testHub) withRoutes(providers ...config.Provider) *Routes {
+// withRoutes mounts this package's routes over the configured providers,
+// with the given identity reader.
+func (h *testHub) withRoutes(reader IdentityReader, providers ...config.Provider) *Routes {
 	h.t.Helper()
-	rs := &Routes{Providers: ProvidersFrom(providers)}
+	rs := &Routes{Providers: ProvidersFrom(providers), Store: h.st, Reader: reader, Now: h.clock.Now}
 	rs.Register(h.srv)
 	return rs
 }
 
 func TestProviders_ListsTheConfiguredProvidersWithTheirAuthorizeURLs(t *testing.T) {
 	h := newTestHub(t)
-	h.withRoutes(
+	h.withRoutes(nil,
 		config.Provider{Name: "google", ClientID: "gg-id", ClientSecret: "gg-secret"},
 		config.Provider{Name: "github", ClientID: "gh-id", ClientSecret: "gh-secret"},
 	)
@@ -76,7 +77,7 @@ func TestProviders_ListsTheConfiguredProvidersWithTheirAuthorizeURLs(t *testing.
 
 func TestProviders_AnEmptyConfigurationListsNothing(t *testing.T) {
 	h := newTestHub(t)
-	h.withRoutes()
+	h.withRoutes(nil)
 	r := h.get("/api/v1/auth/providers", "")
 	if r.status != 200 || !strings.Contains(r.body, `"items":[]`) || r.doc["next_cursor"] != nil {
 		t.Errorf("%d %s", r.status, r.body)
@@ -85,7 +86,7 @@ func TestProviders_AnEmptyConfigurationListsNothing(t *testing.T) {
 
 func TestProviders_AConfiguredAuthorizeURLReplacesThePublicOne(t *testing.T) {
 	h := newTestHub(t)
-	h.withRoutes(config.Provider{Name: "github", ClientID: "gh-id", ClientSecret: "s", AuthorizeURL: "https://ghe.example/login/oauth/authorize"})
+	h.withRoutes(nil, config.Provider{Name: "github", ClientID: "gh-id", ClientSecret: "s", AuthorizeURL: "https://ghe.example/login/oauth/authorize"})
 	r := h.get("/api/v1/auth/providers", "")
 	items, _ := r.doc["items"].([]any)
 	if len(items) != 1 || items[0].(map[string]any)["authorize_url"] != "https://ghe.example/login/oauth/authorize?client_id=gh-id&scope=user%3Aemail" {
