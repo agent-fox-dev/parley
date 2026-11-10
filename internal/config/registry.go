@@ -48,12 +48,13 @@ type Registry struct {
 	keys     map[string]*Key
 	order    []string
 	sections map[string]bool
+	whole    map[string]SectionValidator
 	errs     []error
 }
 
 // NewRegistry returns a registry holding the keys this package owns.
 func NewRegistry() *Registry {
-	r := &Registry{keys: map[string]*Key{}, sections: map[string]bool{}}
+	r := &Registry{keys: map[string]*Key{}, sections: map[string]bool{}, whole: map[string]SectionValidator{}}
 	r.registerOwn()
 	return r
 }
@@ -62,6 +63,10 @@ func NewRegistry() *Registry {
 // remembered and fails the next Load with an error naming it.
 func (r *Registry) Register(k Key) {
 	id := k.id()
+	if r.whole[k.Section] != nil {
+		r.errs = append(r.errs, fmt.Errorf("configuration key %s is in section [%s], which is registered as a whole", id, k.Section))
+		return
+	}
 	if _, dup := r.keys[id]; dup {
 		r.errs = append(r.errs, fmt.Errorf("configuration key %s is registered twice", id))
 		return
@@ -156,4 +161,26 @@ func validLevel(v any) error {
 		return errors.New("must be trace, debug, info, warn or error")
 	}
 	return nil
+}
+
+// SectionValidator checks a whole section a package owns. It receives the
+// section's parsed content (keys, tables and arrays of tables) after the
+// environment references in its string values are replaced, and returns
+// one error that reports every failure of the section together.
+type SectionValidator func(section map[string]any) error
+
+// RegisterSection registers a whole section with its validator: the loader
+// does not check the section's keys, and hands the section to the validator
+// once when the file holds it. A section is registered either key by key or
+// as a whole; a conflicting registration fails the next Load with an error
+// naming the section.
+func (r *Registry) RegisterSection(name string, v SectionValidator) {
+	switch {
+	case r.whole[name] != nil:
+		r.errs = append(r.errs, fmt.Errorf("configuration section [%s] is registered twice", name))
+	case r.sections[name]:
+		r.errs = append(r.errs, fmt.Errorf("configuration section [%s] has registered keys and cannot be registered as a whole", name))
+	default:
+		r.whole[name] = v
+	}
 }

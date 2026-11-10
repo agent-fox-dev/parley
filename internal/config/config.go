@@ -81,7 +81,8 @@ type Config struct {
 		Providers []Provider
 	}
 
-	values map[string]any
+	values   map[string]any
+	sections map[string]map[string]any
 }
 
 // Load reads the configuration with the keys of this package only.
@@ -166,11 +167,14 @@ func (r *Registry) Load(env LookupEnv, workDir string) (*Config, error) {
 		}
 	}
 
-	cfg := &Config{Path: path, Dir: filepath.Dir(path), values: map[string]any{}}
+	cfg := &Config{Path: path, Dir: filepath.Dir(path), values: map[string]any{}, sections: map[string]map[string]any{}}
 	for _, id := range r.order {
 		cfg.values[id] = r.keys[id].Default
 	}
-	if err := r.apply(raw, cfg); err != nil {
+	if err := r.apply(raw, cfg, env); err != nil {
+		return nil, err
+	}
+	if err := r.applyWhole(raw, cfg, env); err != nil {
 		return nil, err
 	}
 	cfg.fill(env, workDir)
@@ -198,16 +202,21 @@ func sortedKeys(m map[string]any) []string {
 	return keys
 }
 
-// apply checks every key of the parsed file against the registry and sets
-// the values; the first problem, in name order, is the error.
-func (r *Registry) apply(raw map[string]any, cfg *Config) error {
+// apply checks every key of the parsed file against the registry, replaces
+// environment references in string values, and sets the values; the first
+// problem, in name order, is the error. Sections registered as a whole are
+// left to applyWhole.
+func (r *Registry) apply(raw map[string]any, cfg *Config, env LookupEnv) error {
 	for _, section := range sortedKeys(raw) {
 		table, isTable := raw[section].(map[string]any)
 		if !isTable {
 			return fmt.Errorf("configuration key %s is not in a section", section)
 		}
+		if r.whole[section] != nil {
+			continue
+		}
 		if section == "oauth" {
-			providers, err := parseOAuth(table)
+			providers, err := parseOAuth(table, env)
 			if err != nil {
 				return err
 			}
@@ -227,6 +236,11 @@ func (r *Registry) apply(raw map[string]any, cfg *Config) error {
 			if err != nil {
 				return fmt.Errorf("%s: %w", id, err)
 			}
+			if str, ok := v.(string); ok {
+				if v, err = expand(str, env); err != nil {
+					return fmt.Errorf("%s: %w", id, err)
+				}
+			}
 			if k.Validate != nil {
 				if err := k.Validate(v); err != nil {
 					return fmt.Errorf("%s: %w", id, err)
@@ -234,6 +248,27 @@ func (r *Registry) apply(raw map[string]any, cfg *Config) error {
 			}
 			cfg.values[id] = v
 		}
+	}
+	return nil
+}
+
+// applyWhole hands every section registered as a whole that the file holds
+// to its validator, once, after replacing the references in its strings.
+func (r *Registry) applyWhole(raw map[string]any, cfg *Config, env LookupEnv) error {
+	for _, section := range sortedKeys(raw) {
+		validate := r.whole[section]
+		if validate == nil {
+			continue
+		}
+		expanded, err := expandDeep(raw[section], section, env)
+		if err != nil {
+			return fmt.Errorf("[%s]: %w", section, err)
+		}
+		content := expanded.(map[string]any)
+		if err := validate(content); err != nil {
+			return fmt.Errorf("[%s]: %w", section, err)
+		}
+		cfg.sections[section] = content
 	}
 	return nil
 }
@@ -264,7 +299,7 @@ var providerKeys = map[string]bool{"name": true, "client_id": true, "client_secr
 
 // parseOAuth validates the [oauth] table, which holds only the repeatable
 // [[oauth.providers]] table.
-func parseOAuth(table map[string]any) ([]Provider, error) {
+func parseOAuth(table map[string]any, env LookupEnv) ([]Provider, error) {
 	var out []Provider
 	seen := map[string]bool{}
 	for _, name := range sortedKeys(table) {
@@ -281,15 +316,21 @@ func parseOAuth(table map[string]any) ([]Provider, error) {
 			if !providerKeys[k] {
 				return nil, fmt.Errorf("unknown configuration key oauth.providers.%s", k)
 			}
-			if _, ok := p[k].(string); !ok {
+			str, ok := p[k].(string)
+			if !ok {
 				return nil, fmt.Errorf("oauth.providers.%s: must be a string", k)
 			}
+			expanded, err := expand(str, env)
+			if err != nil {
+				return nil, fmt.Errorf("oauth.providers.%s: %w", k, err)
+			}
+			p[k] = expanded
 		}
 		get := func(k string) string { s, _ := p[k].(string); return s }
 		prov := Provider{Name: get("name"), ClientID: get("client_id"), ClientSecret: get("client_secret")}
 		defaults, known := providerEndpoints[prov.Name]
 		if !known {
-			return nil, fmt.Errorf("oauth.providers.name: %q is not github or google", prov.Name)
+			return nil, errors.New("oauth.providers.name: must be github or google")
 		}
 		if seen[prov.Name] {
 			return nil, fmt.Errorf("oauth.providers: provider %s is configured more than once", prov.Name)
@@ -349,4 +390,11 @@ func dataPath(configured, defaultName, xdg, workDir string) string {
 		return absUnder(workDir, filepath.Join(xdg, configured))
 	}
 	return filepath.Join(workDir, configured)
+}
+
+// Section returns a section registered as a whole: its content as its
+// validator received it, and whether the file held it.
+func (c *Config) Section(name string) (map[string]any, bool) {
+	s, ok := c.sections[name]
+	return s, ok
 }
