@@ -115,6 +115,7 @@ func (s *Server) writeFailure(w http.ResponseWriter, r *http.Request, err error)
 		WriteError(w, apiErr)
 		return
 	}
+	s.logger.Error("internal error", "request_id", RequestID(r.Context()), "error", err.Error())
 	WriteError(w, Internal("internal error"))
 }
 
@@ -138,6 +139,14 @@ func (t *trackingWriter) Write(b []byte) (int, error) {
 		t.status, t.wrote = http.StatusOK, true
 	}
 	return t.ResponseWriter.Write(b)
+}
+
+// statusOrOK is the status written, or 200 when nothing was.
+func (t *trackingWriter) statusOrOK() int {
+	if !t.wrote {
+		return http.StatusOK
+	}
+	return t.status
 }
 
 // Unwrap lets http.ResponseController reach the underlying writer.

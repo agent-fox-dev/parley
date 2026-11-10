@@ -1,8 +1,10 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -236,5 +238,64 @@ func TestPipeline_APublicRouteSkipsTheCallerChecksButKeepsLimits(t *testing.T) {
 	}
 	if r := do(t, h, "POST", "/api/v1/open", jsonBody("{}")); r.status != 429 {
 		t.Errorf("third request from the address = %d, want 429", r.status)
+	}
+}
+
+func TestPipeline_UnexpectedFailuresAreInternalAndLogged(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*Server)
+	}{
+		{"handler returns a plain error", func(s *Server) {
+			s.Register(Route{Method: "GET", Pattern: "/fail", Handler: func(http.ResponseWriter, *http.Request) error {
+				return errors.New("db password hunter2")
+			}})
+		}},
+		{"handler panics", func(s *Server) {
+			s.Register(Route{Method: "GET", Pattern: "/fail", Handler: func(http.ResponseWriter, *http.Request) error {
+				panic("boom hunter2")
+			}})
+		}},
+		{"scope check returns a plain error", func(s *Server) {
+			s.SetScopeCheck(func(*http.Request) error { return errors.New("scope store hunter2") })
+			s.Register(Route{Method: "GET", Pattern: "/fail", Handler: (&countingHandler{status: 200}).handle})
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := DefaultOptions()
+			logger, buf := debugLogger()
+			opts.Logger = logger
+			s := New(opts)
+			s.SetAuthenticator(bearerAuth(nil))
+			s.Register(Route{Method: "GET", Pattern: "/fine", Public: true, Handler: (&countingHandler{status: 200}).handle})
+			tt.setup(s)
+			h := s.Handler()
+
+			r := do(t, h, "GET", "/api/v1/fail", bearer("a"))
+			if r.status != 500 {
+				t.Fatalf("status = %d, want 500", r.status)
+			}
+			e := r.errorOf(t)
+			if e["error_type"] != "internal" || e["message"] != "internal error" {
+				t.Errorf("error = %v, want internal with the fixed message", e)
+			}
+			if strings.Contains(string(r.body), "hunter2") {
+				t.Errorf("the cause leaked into the response: %s", r.body)
+			}
+			id := r.header.Get("X-Request-ID")
+			found := false
+			for _, l := range buf.lines() {
+				if strings.Contains(l, "hunter2") && strings.Contains(l, id) {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("no log line holds the cause and request id %s: %q", id, buf.lines())
+			}
+			if r := do(t, h, "GET", "/api/v1/fine"); r.status != 200 {
+				t.Errorf("the next request = %d, want 200", r.status)
+			}
+		})
 	}
 }

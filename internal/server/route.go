@@ -179,6 +179,9 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
 		writeUnmatched(w, allowed)
 		return
 	}
+	if m.Route.CacheControl != "" {
+		w.Header().Set("Cache-Control", m.Route.CacheControl)
+	}
 	s.runPipeline(w, r.WithContext(context.WithValue(r.Context(), keyMatch, m)), m)
 }
 

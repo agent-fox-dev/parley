@@ -5,6 +5,7 @@ package server
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net"
 	"net/http"
 	"sync"
@@ -36,6 +37,12 @@ type Options struct {
 	RequestsPerMinute int
 	// Now is the server's clock; nil means time.Now.
 	Now func() time.Time
+	// Logger receives the access log and the causes of internal errors;
+	// nil means slog.Default().
+	Logger *slog.Logger
+	// LogHealthProbes writes access-log lines, at debug level, for
+	// /healthz and /readyz.
+	LogHealthProbes bool
 }
 
 // DefaultOptions returns the options with the product's defaults: listen on
@@ -57,6 +64,7 @@ type Server struct {
 
 	now     func() time.Time
 	limiter *Limiter
+	logger  *slog.Logger
 
 	routes []*compiledRoute
 	auth   Authenticator
@@ -74,6 +82,10 @@ func New(opts Options) *Server {
 	}
 	s := &Server{opts: opts, mux: http.NewServeMux(), now: now}
 	s.limiter = NewLimiter(opts.RequestsPerMinute, now)
+	s.logger = opts.Logger
+	if s.logger == nil {
+		s.logger = slog.Default()
+	}
 	s.HandleFunc("GET /healthz", s.healthz)
 	s.HandleFunc("GET /readyz", s.readyz)
 	s.HandleFunc("GET /version", s.version)
@@ -93,13 +105,13 @@ func (s *Server) HandleFunc(pattern string, h func(http.ResponseWriter, *http.Re
 // Handler returns the server's HTTP handler: the REST API under APIPrefix and
 // every other surface registered with Handle.
 func (s *Server) Handler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return s.stamp(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if isAPIPath(r.URL.Path) {
 			s.serveAPI(w, r)
 			return
 		}
 		s.serveSurface(w, r)
-	})
+	}))
 }
 
 // connTracker records the state of every connection the server holds.

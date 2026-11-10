@@ -60,7 +60,7 @@ func run(ctx context.Context, args []string, addr string, grace time.Duration, s
 
 	logger := slog.New(slog.NewJSONHandler(stderr, nil))
 	opts := server.DefaultOptions()
-	opts.Addr, opts.ShutdownGrace = addr, grace
+	opts.Addr, opts.ShutdownGrace, opts.Logger = addr, grace, logger
 	srv := server.New(opts)
 	for _, mount := range mounts {
 		mount(srv)
