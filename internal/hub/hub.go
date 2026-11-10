@@ -131,6 +131,7 @@ func (c *Composition) OnServer(fn func(rt *Runtime, srv *server.Server) error) {
 func compose(c *Composition) {
 	c.AddStep(idempotencyStep)
 	c.AddStep(identity.AdminSettingsStep)
+	composeIdentity(c)
 }
 
 const usage = `Usage: parleyd [flags]

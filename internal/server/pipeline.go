@@ -16,6 +16,10 @@ type Caller struct {
 	UserID string
 	// Admin is true for the admin token.
 	Admin bool
+	// Principal is the authenticator's own description of the caller (the
+	// credential's type, the user, a token's permissions); the package that
+	// installed the authenticator reads it back.
+	Principal any
 }
 
 // Authenticator authenticates a request to a route that is not public. It
