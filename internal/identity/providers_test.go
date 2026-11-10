@@ -1,0 +1,94 @@
+package identity
+
+import (
+	"net/url"
+	"sort"
+	"strings"
+	"testing"
+
+	"github.com/agent-fox-dev/parley/internal/config"
+)
+
+// withRoutes mounts this package's routes over the configured providers.
+func (h *testHub) withRoutes(providers ...config.Provider) *Routes {
+	h.t.Helper()
+	rs := &Routes{Providers: ProvidersFrom(providers)}
+	rs.Register(h.srv)
+	return rs
+}
+
+func TestProviders_ListsTheConfiguredProvidersWithTheirAuthorizeURLs(t *testing.T) {
+	h := newTestHub(t)
+	h.withRoutes(
+		config.Provider{Name: "google", ClientID: "gg-id", ClientSecret: "gg-secret"},
+		config.Provider{Name: "github", ClientID: "gh-id", ClientSecret: "gh-secret"},
+	)
+	r := h.get("/api/v1/auth/providers", "")
+	if r.status != 200 || r.header.Get("Cache-Control") != "public, max-age=300" {
+		t.Fatalf("%d %s, Cache-Control %q", r.status, r.body, r.header.Get("Cache-Control"))
+	}
+	if _, present := r.doc["next_cursor"]; !present || r.doc["next_cursor"] != nil {
+		t.Errorf("next_cursor = %v", r.doc["next_cursor"])
+	}
+	items, _ := r.doc["items"].([]any)
+	if len(items) != 2 {
+		t.Fatalf("items = %v", r.doc["items"])
+	}
+	gh, gg := items[0].(map[string]any), items[1].(map[string]any)
+	if gh["name"] != "github" || gg["name"] != "google" {
+		t.Errorf("order = %v, %v", gh["name"], gg["name"])
+	}
+	if gh["authorize_url"] != "https://github.com/login/oauth/authorize?client_id=gh-id&scope=user%3Aemail" {
+		t.Errorf("github authorize_url = %v", gh["authorize_url"])
+	}
+	u, err := url.Parse(gg["authorize_url"].(string))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.Scheme+"://"+u.Host+u.Path != "https://accounts.google.com/o/oauth2/v2/auth" {
+		t.Errorf("google endpoint = %s", u)
+	}
+	q := u.Query()
+	if len(q) != 3 || q.Get("client_id") != "gg-id" || q.Get("scope") != "openid email profile" || q.Get("response_type") != "code" {
+		t.Errorf("google query = %v", q)
+	}
+	for _, it := range []map[string]any{gh, gg} {
+		var keys []string
+		for k := range it {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		if strings.Join(keys, ",") != "authorize_url,name" {
+			t.Errorf("item members = %v", keys)
+		}
+	}
+	for _, secret := range []string{"gh-secret", "gg-secret"} {
+		if strings.Contains(r.body, secret) {
+			t.Errorf("the body carries %s", secret)
+		}
+		for k, vs := range r.header {
+			if strings.Contains(strings.Join(vs, " "), secret) {
+				t.Errorf("header %s carries %s", k, secret)
+			}
+		}
+	}
+}
+
+func TestProviders_AnEmptyConfigurationListsNothing(t *testing.T) {
+	h := newTestHub(t)
+	h.withRoutes()
+	r := h.get("/api/v1/auth/providers", "")
+	if r.status != 200 || !strings.Contains(r.body, `"items":[]`) || r.doc["next_cursor"] != nil {
+		t.Errorf("%d %s", r.status, r.body)
+	}
+}
+
+func TestProviders_AConfiguredAuthorizeURLReplacesThePublicOne(t *testing.T) {
+	h := newTestHub(t)
+	h.withRoutes(config.Provider{Name: "github", ClientID: "gh-id", ClientSecret: "s", AuthorizeURL: "https://ghe.example/login/oauth/authorize"})
+	r := h.get("/api/v1/auth/providers", "")
+	items, _ := r.doc["items"].([]any)
+	if len(items) != 1 || items[0].(map[string]any)["authorize_url"] != "https://ghe.example/login/oauth/authorize?client_id=gh-id&scope=user%3Aemail" {
+		t.Errorf("items = %v", r.doc["items"])
+	}
+}
