@@ -3,12 +3,19 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"math/rand"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -122,3 +129,183 @@ func jsonEqual(a, b any) bool {
 	return string(x) == string(y)
 }
 
+func TestClient_EveryArgumentIsOnePathSegment(t *testing.T) {
+	hub := newRecordingHub(t, 200, `{}`)
+	alphabet := []string{"a", "Z", "7", "/", "?", "#", "%", " ", "+", ".", "..", "&", "=", "ü", "ö", "é"}
+	values := []string{"a/b", "feature/x y", "100%", "..", "a?b#c", "ü/ö"}
+	rng := rand.New(rand.NewSource(7))
+	for range 200 {
+		var b strings.Builder
+		for range 1 + rng.Intn(20) {
+			b.WriteString(alphabet[rng.Intn(len(alphabet))])
+		}
+		values = append(values, b.String())
+	}
+	for _, v := range values {
+		cliEnv(t)
+		before := len(hub.all())
+		r := runProbe(t, []*cobra.Command{defaultProbe()}, "probe", "get", v, "--endpoint-url", hub.URL, "--api-key", "k")
+		if r.code != 0 {
+			t.Fatalf("%q: exit %d %s", v, r.code, r.stderr)
+		}
+		rec := hub.all()[before]
+		seg, ok := strings.CutPrefix(rec.raw, "/api/v1/things/")
+		if !ok || strings.ContainsAny(seg, "/?# ") || rec.query != "" {
+			t.Errorf("%q: raw path %q query %q", v, rec.raw, rec.query)
+			continue
+		}
+		if back, err := url.PathUnescape(seg); err != nil || back != v {
+			t.Errorf("%q: segment %q decodes to %q", v, seg, back)
+		}
+	}
+}
+
+func TestClient_ARequestThatTakesTooLongIsAClientError(t *testing.T) {
+	if requestTimeout != 30*time.Second {
+		t.Errorf("default request timeout = %v", requestTimeout)
+	}
+	slow := func(d time.Duration, half bool) *httptest.Server {
+		var once sync.Once
+		release := make(chan struct{})
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if half {
+				w.Header().Set("Content-Length", "100")
+				w.WriteHeader(200)
+				io.WriteString(w, `{"a":`)
+				w.(http.Flusher).Flush()
+			}
+			select {
+			case <-time.After(d):
+			case <-release:
+			}
+			if !half {
+				io.WriteString(w, `{}`)
+			}
+		}))
+		t.Cleanup(func() { once.Do(func() { close(release) }); s.Close() })
+		return s
+	}
+	stated := func(d time.Duration) *cobra.Command {
+		return defaultProbeWith(func(s *Spec) { s.Timeout = d })
+	}
+	tests := []struct {
+		name    string
+		hub     *httptest.Server
+		cmd     *cobra.Command
+		short   time.Duration
+		timeout time.Duration
+		ok      bool
+	}{
+		{"default shortened", slow(2*time.Second, false), defaultProbe(), 100 * time.Millisecond, 100 * time.Millisecond, false},
+		{"stated, in time", slow(200*time.Millisecond, false), stated(300 * time.Millisecond), 0, 300 * time.Millisecond, true},
+		{"stated, too slow", slow(2*time.Second, false), stated(300 * time.Millisecond), 0, 300 * time.Millisecond, false},
+		{"half a body then a stall", slow(2*time.Second, true), defaultProbe(), 100 * time.Millisecond, 100 * time.Millisecond, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cliEnv(t)
+			if tt.short > 0 {
+				old := requestTimeout
+				requestTimeout = tt.short
+				t.Cleanup(func() { requestTimeout = old })
+			}
+			start := time.Now()
+			r := runProbe(t, []*cobra.Command{tt.cmd}, "probe", "get", "x", "--endpoint-url", tt.hub.URL, "--api-key", "k")
+			if tt.ok {
+				if r.code != 0 {
+					t.Errorf("exit %d %s", r.code, r.stderr)
+				}
+				return
+			}
+			if r.code != 2 || r.stdout != "" || r.envelope(t)["error_type"] != "client_error" {
+				t.Errorf("exit %d stdout %q stderr %q", r.code, r.stdout, r.stderr)
+			}
+			if d := time.Since(start); d >= tt.timeout+time.Second {
+				t.Errorf("returned after %v", d)
+			}
+		})
+	}
+}
+
+func defaultProbeWith(extra func(*Spec)) *cobra.Command { return defaultProbe(extra) }
+
+func TestClient_AConnectionThatFailsNamesTheHub(t *testing.T) {
+	closed, _ := net.Listen("tcp", "127.0.0.1:0")
+	closedURL := "http://" + closed.Addr().String()
+	closed.Close()
+	tlsHub := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer tlsHub.Close()
+	for _, hub := range []string{closedURL, "http://no-such-host.invalid", tlsHub.URL} {
+		cliEnv(t)
+		r := runProbe(t, []*cobra.Command{defaultProbe()}, "probe", "get", "x", "--endpoint-url", hub, "--api-key", "k")
+		u, _ := url.Parse(hub)
+		e := r.envelope(t)
+		if r.code != 2 || r.stdout != "" || e["code"] != float64(0) || e["error_type"] != "client_error" || !strings.Contains(e["message"].(string), u.Host) {
+			t.Errorf("%s: exit %d %v", hub, r.code, e)
+		}
+	}
+}
+
+func TestClient_AnAnswerThatCannotBeDecodedNamesTheStatus(t *testing.T) {
+	answers := []struct {
+		status int
+		body   string
+	}{
+		{200, "<html>"}, {200, `{"a":`}, {502, "<html>Bad Gateway</html>"}, {404, "not found"},
+		{500, "{}"}, {500, `{"error":"boom"}`}, {403, `{"error":{"message":"x"}}`},
+	}
+	for _, a := range answers {
+		cliEnv(t)
+		hub := newRecordingHub(t, a.status, a.body)
+		r := runProbe(t, []*cobra.Command{defaultProbe()}, "probe", "get", "x", "--endpoint-url", hub.URL, "--api-key", "k")
+		e := r.envelope(t)
+		if r.code != 2 || r.stdout != "" || e["error_type"] != "client_error" || !strings.Contains(e["message"].(string), strconv.Itoa(a.status)) {
+			t.Errorf("%d %q: exit %d %v", a.status, a.body, r.code, e)
+		}
+	}
+}
+
+func TestClient_EveryRequestIsSentOnce(t *testing.T) {
+	envelope := func(code int, typ string) string {
+		return fmt.Sprintf(`{"error":{"code":%d,"message":"m","error_type":%q}}`, code, typ)
+	}
+	cases := []struct {
+		status int
+		body   string
+		hangUp bool
+	}{
+		{429, envelope(429, "rate_limited"), false},
+		{500, envelope(500, "internal"), false},
+		{502, envelope(502, "upstream_error"), false},
+		{503, envelope(503, "unavailable"), false},
+		{0, "", true},
+	}
+	for _, c := range cases {
+		cliEnv(t)
+		var count atomic.Int32
+		hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			count.Add(1)
+			if c.hangUp {
+				conn, _, _ := w.(http.Hijacker).Hijack()
+				conn.Close()
+				return
+			}
+			if c.status == 429 {
+				w.Header().Set("Retry-After", "1")
+			}
+			w.WriteHeader(c.status)
+			io.WriteString(w, c.body)
+		}))
+		r := runProbe(t, []*cobra.Command{defaultProbe()}, "probe", "get", "x", "--endpoint-url", hub.URL, "--api-key", "k")
+		if c.status == 429 {
+			time.Sleep(1500 * time.Millisecond)
+			if r.code != 1 || r.envelope(t)["error_type"] != "rate_limited" {
+				t.Errorf("429: exit %d %s", r.code, r.stderr)
+			}
+		}
+		if n := count.Load(); n != 1 {
+			t.Errorf("%d: %d requests", c.status, n)
+		}
+		hub.Close()
+	}
+}

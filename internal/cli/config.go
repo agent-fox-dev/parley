@@ -80,13 +80,13 @@ func readConfig() (Settings, error) {
 	return Settings{EndpointURL: str(keyEndpointURL), APIKey: str(keyAPIKey), UserID: str(keyUserID)}, nil
 }
 
-// saveSettings saves the settings, as parley login does: it creates the
+// SaveSettings saves the settings, as parley login does: it creates the
 // directory with mode 0700 when missing, keeps every key of the existing
 // file it does not know, writes a temporary file beside it, syncs it, sets
 // mode 0600 and renames it over config.toml, so a reader sees the old file
 // or the new one. Any failure is a client error naming the path, leaves the
 // previous file as it was and removes the temporary file.
-func saveSettings(s Settings) error {
+func SaveSettings(s Settings) error {
 	path, ok := configPath()
 	if !ok {
 		return ClientError("cannot save the configuration file %s: no home directory and PARLEY_CONFIG_DIR is not set", path)

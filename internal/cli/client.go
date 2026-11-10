@@ -19,10 +19,11 @@ var requestTimeout = 30 * time.Second
 // credential as Authorization: Bearer. Every command sends its requests
 // through it.
 type Client struct {
-	base string
-	cred string
-	http *http.Client
-	host string
+	base    string
+	cred    string
+	http    *http.Client
+	host    string
+	timeout time.Duration
 }
 
 // Response is a hub's answer: its status and its body as received.
@@ -58,7 +59,11 @@ func (c *Client) Send(ctx context.Context, method, path string, query url.Values
 		}
 		rd = bytes.NewReader(b)
 	}
-	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
+	timeout := c.timeout
+	if timeout <= 0 {
+		timeout = requestTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, method, target, rd)
 	if err != nil {
@@ -67,7 +72,9 @@ func (c *Client) Send(ctx context.Context, method, path string, query url.Values
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	req.Header.Set("Authorization", "Bearer "+c.cred)
+	if c.cred != "" {
+		req.Header.Set("Authorization", "Bearer "+c.cred)
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, ClientError("cannot reach the hub at %s: %v", c.host, err)
@@ -99,6 +106,9 @@ func isEnvelope(body []byte) bool {
 // the status.
 func (r *Response) Result() ([]byte, error) {
 	if r.Status >= 200 && r.Status < 300 {
+		if body := bytes.TrimSpace(r.Body); len(body) > 0 && !json.Valid(body) {
+			return nil, ClientError("the hub answered status %d with a body that is not JSON", r.Status)
+		}
 		return r.Body, nil
 	}
 	if r.Status >= 400 && isEnvelope(r.Body) {

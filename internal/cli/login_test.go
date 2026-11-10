@@ -279,7 +279,7 @@ func TestLogin_AHubErrorIsPrintedAsReceivedAndNothingIsSaved(t *testing.T) {
 			hub := newStubHub(t)
 			hub.answer("GET /api/v1/user", a.status, a.body)
 			r := runCLI(t, "", "login", "--api-key", apiKey, "--endpoint-url", hub.URL)
-			if r.code != 1 || strings.TrimSpace(r.stderr) != a.body || r.stdout != "" {
+			if r.code != 1 || r.stderr != reindent(t, a.body) || r.stdout != "" {
 				t.Errorf("%d: exit %d stderr %q stdout %q", a.status, r.code, r.stderr, r.stdout)
 			}
 			got, err := os.ReadFile(filepath.Join(dir, "config.toml"))

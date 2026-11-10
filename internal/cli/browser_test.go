@@ -315,8 +315,7 @@ func TestBrowserLogin_AHubErrorIsPrintedAsReceived(t *testing.T) {
 		hub.answer(tt.route, tt.status, tt.body)
 		b := &fakeBrowser{query: approve("c1")}
 		r := runBrowser(t, b, time.Second, "login", "--endpoint-url", hub.URL)
-		lines := strings.Split(strings.TrimSpace(r.stderr), "\n")
-		if r.code != 1 || lines[len(lines)-1] != tt.body || r.stdout != "" {
+		if r.code != 1 || !strings.HasSuffix(r.stderr, reindent(t, tt.body)) || r.stdout != "" {
 			t.Errorf("%s %d: exit %d stderr %q", tt.route, tt.status, r.code, r.stderr)
 		}
 		if _, err := os.Stat(dir); err == nil {

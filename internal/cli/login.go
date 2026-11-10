@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -22,39 +21,6 @@ import (
 
 // DefaultLoginWait bounds the wait for the browser's redirect.
 const DefaultLoginWait = 120 * time.Second
-
-// loginTimeout bounds each request of parley login.
-const loginTimeout = 30 * time.Second
-
-// exitError ends a command with an exit status and an error envelope on
-// stderr. Package 09 replaces it with the CLI's shared errors.
-type exitError struct {
-	code     int
-	envelope []byte
-}
-
-func (e *exitError) Error() string { return string(e.envelope) }
-
-func envelopeError(code int, errorType, message string) *exitError {
-	b, _ := json.Marshal(map[string]any{"error": map[string]any{"code": 0, "message": message, "error_type": errorType}})
-	return &exitError{code: code, envelope: append(b, '\n')}
-}
-
-// clientError is a failure on the client's side: exit status 2.
-func clientError(format string, args ...any) *exitError {
-	return envelopeError(2, "client_error", fmt.Sprintf(format, args...))
-}
-
-// usageError is a bad flag or argument: exit status 2.
-func usageError(format string, args ...any) *exitError {
-	return envelopeError(2, "usage_error", fmt.Sprintf(format, args...))
-}
-
-// hubError is the hub's own error, printed as received: exit status 1.
-func hubError(body []byte) *exitError {
-	b := bytes.TrimSpace(body)
-	return &exitError{code: 1, envelope: append(append([]byte(nil), b...), '\n')}
-}
 
 // loginFlags are the flags of parley login.
 type loginFlags struct {
@@ -97,13 +63,13 @@ type login struct {
 func (l *login) run(ctx context.Context) error {
 	settings, err := readConfig()
 	if err != nil {
-		return clientError("%v", err)
+		return err
 	}
 	l.settings = settings
 	l.hub = strings.TrimRight(l.hubURL(), "/")
 	if l.hub == "" {
 		path, _ := configPath()
-		return clientError("no hub URL: give --endpoint-url, set PARLEY_ENDPOINT_URL or set endpoint_url in %s", path)
+		return ClientError("no hub URL: give --endpoint-url, set PARLEY_ENDPOINT_URL or set endpoint_url in %s", path)
 	}
 	if l.keyFlow {
 		return l.withKey(ctx)
@@ -134,65 +100,34 @@ func (l *login) withKey(ctx context.Context) error {
 		}
 		b, err := io.ReadAll(stdin)
 		if err != nil {
-			return clientError("cannot read the credential from stdin: %v", err)
+			return ClientError("cannot read the credential from stdin: %v", err)
 		}
 		cred = string(b)
 	}
 	cred = strings.TrimSpace(cred)
 	if cred == "" {
-		return usageError("--api-key needs a credential")
+		return UsageError("--api-key needs a credential")
 	}
-	user, err := l.request(ctx, http.MethodGet, "/api/v1/user", cred, nil)
+	user, err := l.request(ctx, http.MethodGet, "/user", cred, nil)
 	if err != nil {
 		return err
 	}
 	return l.finish(cred, user)
 }
 
-// request sends one request to the hub and returns the JSON object it
-// answered 200; a hub error is printed as received, anything unreadable is
-// a client error.
+// request sends one request through the shared client — path relative to
+// /api/v1, the credential only when one is given — and decodes the answer
+// as every command does.
 func (l *login) request(ctx context.Context, method, path, cred string, body any) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(ctx, loginTimeout)
-	defer cancel()
-	var rd io.Reader
-	if body != nil {
-		b, err := json.Marshal(body)
-		if err != nil {
-			return nil, clientError("%v", err)
-		}
-		rd = bytes.NewReader(b)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, l.hub+path, rd)
+	c, err := newClient(l.hub, cred)
 	if err != nil {
-		return nil, clientError("the hub URL %s is not usable: %v", l.hub, err)
+		return nil, err
 	}
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	if cred != "" {
-		req.Header.Set("Authorization", "Bearer "+cred)
-	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := c.Send(ctx, method, path, nil, body)
 	if err != nil {
-		return nil, clientError("cannot reach the hub at %s: %v", l.hub, err)
+		return nil, err
 	}
-	defer resp.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return nil, clientError("cannot read the hub's answer: %v", err)
-	}
-	var obj map[string]any
-	if json.Unmarshal(data, &obj) != nil || obj == nil {
-		return nil, clientError("the hub's answer to %s %s is not a JSON object", method, path)
-	}
-	if resp.StatusCode != http.StatusOK {
-		if _, ok := obj["error"]; ok {
-			return nil, hubError(data)
-		}
-		return nil, clientError("the hub answered %s %s with status %d", method, path, resp.StatusCode)
-	}
-	return data, nil
+	return resp.Result()
 }
 
 // finish saves the hub URL, the credential and the user's id, prints the
@@ -203,16 +138,14 @@ func (l *login) finish(cred string, user []byte) error {
 		Username string `json:"username"`
 	}
 	if err := json.Unmarshal(user, &u); err != nil || u.ID == "" {
-		return clientError("the hub's answer carries no user")
+		return ClientError("the hub's answer carries no user")
 	}
-	if err := saveSettings(Settings{EndpointURL: l.hub, APIKey: cred, UserID: u.ID}); err != nil {
-		return clientError("the hub accepted the credential but it was not saved: %v", err)
+	if err := SaveSettings(Settings{EndpointURL: l.hub, APIKey: cred, UserID: u.ID}); err != nil {
+		return ClientError("the hub accepted the credential but it was not saved: %v", err)
 	}
-	var out bytes.Buffer
-	if err := json.Indent(&out, bytes.TrimSpace(user), "", "  "); err != nil {
-		return clientError("%v", err)
+	if err := printResult(l.cmd.OutOrStdout(), user); err != nil {
+		return err
 	}
-	fmt.Fprintf(l.cmd.OutOrStdout(), "%s\n", out.Bytes())
 	fmt.Fprintf(l.cmd.ErrOrStderr(), "Logged in as %s\n", u.Username)
 	return nil
 }
@@ -226,7 +159,7 @@ var validExpires = map[string]int{"0": 0, "30": 30, "60": 60, "90": 90}
 func (l *login) withBrowser(ctx context.Context) error {
 	expires, ok := validExpires[l.lf.expires]
 	if !ok {
-		return usageError("--expires must be 0, 30, 60 or 90")
+		return UsageError("--expires must be 0, 30, 60 or 90")
 	}
 	authorizeURL, err := l.pickProvider(ctx)
 	if err != nil {
@@ -236,7 +169,7 @@ func (l *login) withBrowser(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	answer, err := l.request(ctx, http.MethodPost, "/api/v1/auth/callback", "", map[string]any{
+	answer, err := l.request(ctx, http.MethodPost, "/auth/callback", "", map[string]any{
 		"provider": l.lf.provider, "code": code, "redirect_uri": redirectURI, "expires": expires,
 	})
 	if err != nil {
@@ -249,7 +182,7 @@ func (l *login) withBrowser(ctx context.Context) error {
 		} `json:"api_key"`
 	}
 	if err := json.Unmarshal(answer, &out); err != nil || out.APIKey.Key == "" {
-		return clientError("the hub's login answer carries no key")
+		return ClientError("the hub's login answer carries no key")
 	}
 	return l.finish(out.APIKey.Key, out.User)
 }
@@ -257,7 +190,7 @@ func (l *login) withBrowser(ctx context.Context) error {
 // pickProvider fetches the providers the hub lists, without a credential,
 // and returns the authorize URL of the one --provider names.
 func (l *login) pickProvider(ctx context.Context) (string, error) {
-	data, err := l.request(ctx, http.MethodGet, "/api/v1/auth/providers", "", nil)
+	data, err := l.request(ctx, http.MethodGet, "/auth/providers", "", nil)
 	if err != nil {
 		return "", err
 	}
@@ -268,7 +201,7 @@ func (l *login) pickProvider(ctx context.Context) (string, error) {
 		} `json:"items"`
 	}
 	if err := json.Unmarshal(data, &list); err != nil {
-		return "", clientError("the hub's provider list is not readable")
+		return "", ClientError("the hub's provider list is not readable")
 	}
 	var names []string
 	for _, it := range list.Items {
@@ -278,9 +211,9 @@ func (l *login) pickProvider(ctx context.Context) (string, error) {
 		names = append(names, it.Name)
 	}
 	if len(names) == 0 {
-		return "", clientError("the hub offers no identity provider")
+		return "", ClientError("the hub offers no identity provider")
 	}
-	return "", clientError("the hub does not offer the provider %s; it offers %s", l.lf.provider, strings.Join(names, ", "))
+	return "", ClientError("the hub does not offer the provider %s; it offers %s", l.lf.provider, strings.Join(names, ", "))
 }
 
 // redirectResult is what the one redirect brought.
@@ -296,17 +229,17 @@ type redirectResult struct {
 func (l *login) awaitRedirect(ctx context.Context, authorizeURL string) (code, redirectURI string, err error) {
 	state, err := randomState()
 	if err != nil {
-		return "", "", clientError("%v", err)
+		return "", "", ClientError("%v", err)
 	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		return "", "", clientError("cannot listen for the browser's redirect: %v", err)
+		return "", "", ClientError("cannot listen for the browser's redirect: %v", err)
 	}
 	redirectURI = "http://" + ln.Addr().String() + "/callback"
 	target, err := withQuery(authorizeURL, map[string]string{"redirect_uri": redirectURI, "state": state})
 	if err != nil {
 		_ = ln.Close()
-		return "", "", clientError("the provider's authorize URL is not usable: %v", err)
+		return "", "", ClientError("the provider's authorize URL is not usable: %v", err)
 	}
 
 	results := make(chan redirectResult, 1)
@@ -355,9 +288,9 @@ func (l *login) awaitRedirect(ctx context.Context, authorizeURL string) (code, r
 		}
 		return res.code, redirectURI, nil
 	case <-timer.C:
-		return "", "", clientError("no sign-in arrived from the browser within %s", wait)
+		return "", "", ClientError("no sign-in arrived from the browser within %s", wait)
 	case <-ctx.Done():
-		return "", "", clientError("the login was cancelled")
+		return "", "", ClientError("the login was cancelled")
 	}
 }
 
@@ -366,11 +299,11 @@ func (l *login) awaitRedirect(ctx context.Context, authorizeURL string) (code, r
 func checkRedirect(q url.Values, state string) redirectResult {
 	switch {
 	case q.Get("error") != "":
-		return redirectResult{err: clientError("the provider refused the sign-in")}
+		return redirectResult{err: ClientError("the provider refused the sign-in")}
 	case subtle.ConstantTimeCompare([]byte(q.Get("state")), []byte(state)) != 1:
-		return redirectResult{err: clientError("the sign-in's state does not match")}
+		return redirectResult{err: ClientError("the sign-in's state does not match")}
 	case q.Get("code") == "":
-		return redirectResult{err: clientError("the sign-in brought no code")}
+		return redirectResult{err: ClientError("the sign-in brought no code")}
 	}
 	return redirectResult{code: q.Get("code")}
 }

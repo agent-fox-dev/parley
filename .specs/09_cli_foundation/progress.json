@@ -3,7 +3,7 @@
   "spec_id": "09",
   "spec_name": "cli_foundation",
   "schema_version": 3,
-  "updated_at": "2026-11-10T22:30:06Z",
+  "updated_at": "2026-11-10T22:32:41Z",
   "tasks": [
     {
       "id": 1,
@@ -23,7 +23,7 @@
     },
     {
       "id": 5,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 6,

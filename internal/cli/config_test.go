@@ -145,7 +145,7 @@ func TestConfigPath_IsTheConfigDirOrDotParleyUnderHome(t *testing.T) {
 func TestSaveSettings_CreatesThePrivateDirectoryAndFile(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "new", "dir")
 	t.Setenv("PARLEY_CONFIG_DIR", dir)
-	if err := saveSettings(Settings{EndpointURL: "http://hub", APIKey: "k", UserID: "u1"}); err != nil {
+	if err := SaveSettings(Settings{EndpointURL: "http://hub", APIKey: "k", UserID: "u1"}); err != nil {
 		t.Fatal(err)
 	}
 	path := filepath.Join(dir, "config.toml")
@@ -173,7 +173,7 @@ func TestSaveSettings_ReplacesTheFileKeepingUnknownKeys(t *testing.T) {
 	path := filepath.Join(dir, "config.toml")
 	os.WriteFile(path, []byte("endpoint_url = \"http://old\"\napi_key = \"old\"\ncolor = \"blue\"\nretries = 3\n\n[profile]\nname = \"x\"\n"), 0o644)
 	before := inode(t, path)
-	if err := saveSettings(Settings{EndpointURL: "http://new", APIKey: "new", UserID: "u2"}); err != nil {
+	if err := SaveSettings(Settings{EndpointURL: "http://new", APIKey: "new", UserID: "u2"}); err != nil {
 		t.Fatal(err)
 	}
 	got := readTOML(t, path)
@@ -243,7 +243,7 @@ func TestSaveSettings_AFailedSaveChangesNothing(t *testing.T) {
 			t.Setenv("HOME", t.TempDir())
 			path := c.arrange(t, dir)
 			before := snapshot(t, dir, path)
-			err := saveSettings(Settings{EndpointURL: "http://new", APIKey: "new", UserID: "u"})
+			err := SaveSettings(Settings{EndpointURL: "http://new", APIKey: "new", UserID: "u"})
 			var ce *Error
 			if !errors.As(err, &ce) || ce.Type != TypeClient {
 				t.Fatalf("err = %v, want a client error", err)
@@ -458,7 +458,7 @@ func TestSettings_AFileUnderHomeAndASavedFileAreUsed(t *testing.T) {
 		t.Fatalf("file under HOME: exit %d %s", r.code, r.stderr)
 	}
 	t.Setenv("PARLEY_CONFIG_DIR", filepath.Join(t.TempDir(), "new", "dir"))
-	if err := saveSettings(Settings{EndpointURL: hub.URL, APIKey: "saved", UserID: "u1"}); err != nil {
+	if err := SaveSettings(Settings{EndpointURL: hub.URL, APIKey: "saved", UserID: "u1"}); err != nil {
 		t.Fatal(err)
 	}
 	if r := runProbe(t, []*cobra.Command{probeGet()}, "probe", "get", "x"); r.code != 0 || hub.all()[1].header.Get("Authorization") != "Bearer saved" {

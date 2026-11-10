@@ -5,7 +5,6 @@ package cli
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"time"
@@ -83,11 +82,6 @@ func run(ctx context.Context, args []string, opts Options, stdout, stderr io.Wri
 	err := root.ExecuteContext(context.WithValue(ctx, ranStepKey{}, &ranStep))
 	if err == nil {
 		return 0
-	}
-	var ee *exitError
-	if errors.As(err, &ee) {
-		fmt.Fprintf(stderr, "%s", ee.envelope)
-		return ee.code
 	}
 	var hub *HubError
 	var ce *Error

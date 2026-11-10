@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net/url"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -51,6 +53,8 @@ type Spec struct {
 	ShowOnce bool
 	// FailOn are the command's --fail-on-… flags.
 	FailOn []FailOn
+	// Timeout replaces the request timeout for this command's requests.
+	Timeout time.Duration
 }
 
 // FailOn is a --fail-on-… flag: when it is given and Holds is true of the
@@ -137,6 +141,7 @@ func Declare(s Spec) *cobra.Command {
 				if call.Client, err = newClient(hub, cred); err != nil {
 					return err
 				}
+				call.Client.timeout = s.Timeout
 			}
 			if s.Run == nil {
 				return runDefault(call, &s)
@@ -154,12 +159,13 @@ func Declare(s Spec) *cobra.Command {
 }
 
 // expandPath fills the :param segments of a declared path with the named
-// arguments' values.
+// arguments' values, each percent-encoded as one segment: a / in a value is
+// sent as %2F, and ?, #, % and spaces are encoded too.
 func expandPath(pattern string, args map[string]string) string {
 	parts := strings.Split(pattern, "/")
 	for i, p := range parts {
 		if name, ok := strings.CutPrefix(p, ":"); ok {
-			parts[i] = args[name]
+			parts[i] = url.PathEscape(args[name])
 		}
 	}
 	return strings.Join(parts, "/")
