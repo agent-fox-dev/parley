@@ -75,9 +75,11 @@ func (s *Server) pipeline(w http.ResponseWriter, r *http.Request, rt *Route) err
 	if err != nil {
 		return err
 	}
-	checks := []Check{rt.Feature}
+	// A public route skips steps 5 to 7: the feature check, the binding
+	// guard, the scope check and the access checks.
+	var checks []Check
 	if !rt.Public {
-		checks = append(checks, s.guard, s.scope)
+		checks = append(checks, rt.Feature, s.guard, s.scope)
 		checks = append(checks, s.access...)
 	}
 	for _, check := range checks {

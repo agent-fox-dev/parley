@@ -32,8 +32,9 @@ type Route struct {
 	Pattern string
 	Handler HandlerFunc
 
-	// Public routes skip authentication, the binding guard, the scope check
-	// and the access checks; the rate limit and the body checks still apply.
+	// Public routes skip authentication, the feature check, the binding
+	// guard, the scope check and the access checks; the rate limit and the
+	// body checks still apply.
 	Public bool
 	// Create marks a POST that creates a resource: it accepts
 	// Idempotency-Key.
@@ -52,7 +53,7 @@ type Route struct {
 	// no-store.
 	CacheControl string
 	// Feature is the route's feature check, run after the body checks and
-	// before the binding guard.
+	// before the binding guard, on routes that are not public.
 	Feature Check
 	// Scope is the one scope a personal access token needs for the route;
 	// the scope check installed by its owner interprets it.

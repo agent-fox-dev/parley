@@ -224,7 +224,7 @@ func TestPipeline_APublicRouteSkipsTheCallerChecksButKeepsLimits(t *testing.T) {
 	s.SetScopeCheck(recordingCheck(log, "scope", nil))
 	s.AddAccessCheck(recordingCheck(log, "access", nil))
 	handler := &countingHandler{status: 200}
-	s.Register(Route{Method: "POST", Pattern: "/open", Public: true, Handler: handler.handle})
+	s.Register(Route{Method: "POST", Pattern: "/open", Public: true, Feature: recordingCheck(log, "feature check", nil), Handler: handler.handle})
 	h := s.Handler()
 
 	if r := do(t, h, "POST", "/api/v1/open", jsonBody("{}")); r.status != 200 || handler.calls.Load() != 1 {
