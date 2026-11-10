@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -40,7 +41,26 @@ type Spec struct {
 	Args        []Arg
 	Auth        Auth
 	Flags       func(fs *pflag.FlagSet)
-	Run         func(c *Call) error
+	// Run is the command's run step; nil sends the declared request
+	// through the client and prints its result.
+	Run func(c *Call) error
+	// Confirm is the document printed when the route answers without a
+	// body; nil prints {}.
+	Confirm func(args map[string]string) any
+	// ShowOnce marks a result that carries a secret shown once.
+	ShowOnce bool
+	// FailOn are the command's --fail-on-… flags.
+	FailOn []FailOn
+}
+
+// FailOn is a --fail-on-… flag: when it is given and Holds is true of the
+// result, the result is printed and the command ends with
+// condition_not_met and Message.
+type FailOn struct {
+	Name    string
+	Usage   string
+	Holds   func(result []byte) bool
+	Message func(result []byte) string
 }
 
 // Call is one run of a declared command.
@@ -119,7 +139,7 @@ func Declare(s Spec) *cobra.Command {
 				}
 			}
 			if s.Run == nil {
-				return nil
+				return runDefault(call, &s)
 			}
 			return s.Run(call)
 		},
@@ -127,7 +147,54 @@ func Declare(s Spec) *cobra.Command {
 	if s.Flags != nil {
 		s.Flags(cmd.Flags())
 	}
+	for _, f := range s.FailOn {
+		cmd.Flags().Bool(f.Name, false, f.Usage)
+	}
 	return cmd
+}
+
+// expandPath fills the :param segments of a declared path with the named
+// arguments' values.
+func expandPath(pattern string, args map[string]string) string {
+	parts := strings.Split(pattern, "/")
+	for i, p := range parts {
+		if name, ok := strings.CutPrefix(p, ":"); ok {
+			parts[i] = args[name]
+		}
+	}
+	return strings.Join(parts, "/")
+}
+
+// runDefault is the run step of a command that declares none: it sends the
+// declared request through the shared client, prints the result (or {},
+// or the confirmation document, for a success without a body), warns about
+// a secret shown once, and checks the --fail-on-… flags.
+func runDefault(c *Call, s *Spec) error {
+	resp, err := c.Client.Send(c.Ctx, s.Method, expandPath(s.Path, c.Args), nil, nil)
+	if err != nil {
+		return err
+	}
+	result, err := resp.Result()
+	if err != nil {
+		return err
+	}
+	if len(bytes.TrimSpace(result)) == 0 && s.Confirm != nil {
+		err = printDocument(c.Stdout, s.Confirm(c.Args))
+	} else {
+		err = printResult(c.Stdout, result)
+	}
+	if err != nil {
+		return err
+	}
+	if s.ShowOnce {
+		warnf(c.Stderr, "%s", showOnceWarning)
+	}
+	for _, f := range s.FailOn {
+		if on, _ := c.Cmd.Flags().GetBool(f.Name); on && f.Holds(result) {
+			return ConditionNotMet("%s", f.Message(result))
+		}
+	}
+	return nil
 }
 
 func argCount(required, total int) string {

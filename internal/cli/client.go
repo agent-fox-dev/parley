@@ -79,3 +79,30 @@ func (c *Client) Send(ctx context.Context, method, path string, query url.Values
 	}
 	return &Response{Status: resp.StatusCode, Body: data}, nil
 }
+
+// isEnvelope reports whether a body is the hub's error envelope: an object
+// whose error member is an object holding error_type.
+func isEnvelope(body []byte) bool {
+	var doc struct {
+		Error map[string]json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(body, &doc) != nil || doc.Error == nil {
+		return false
+	}
+	_, ok := doc.Error["error_type"]
+	return ok
+}
+
+// Result decodes a response for a command whose output is one JSON
+// document: a 2xx body is the result; a status of 400 or above with the
+// error envelope is a hub error; anything else is a client error naming
+// the status.
+func (r *Response) Result() ([]byte, error) {
+	if r.Status >= 200 && r.Status < 300 {
+		return r.Body, nil
+	}
+	if r.Status >= 400 && isEnvelope(r.Body) {
+		return nil, &HubError{Status: r.Status, Body: r.Body}
+	}
+	return nil, ClientError("the hub answered status %d without the error envelope", r.Status)
+}

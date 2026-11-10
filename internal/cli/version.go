@@ -49,7 +49,7 @@ func newVersionCommand(flags *globalFlags) *cobra.Command {
 			if hub := versionHubURL(flags, c.Stderr); hub != "" {
 				server, err := fetchServerBuild(c.Ctx, hub)
 				if err != nil {
-					fmt.Fprintf(c.Stderr, "warning: cannot read the hub's version from %s: %v\n", hub, err)
+					warnf(c.Stderr, "cannot read the hub's version from %s: %v", hub, err)
 				} else {
 					doc.Server = server
 				}
@@ -68,7 +68,7 @@ func versionHubURL(flags *globalFlags, stderr io.Writer) string {
 	}
 	file, err := readConfig()
 	if err != nil {
-		fmt.Fprintf(stderr, "warning: %v\n", err)
+		warnf(stderr, "%v", err)
 		return ""
 	}
 	return file.EndpointURL
