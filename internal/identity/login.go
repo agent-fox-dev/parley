@@ -130,14 +130,25 @@ type signedIn struct {
 	expiresAt *time.Time
 }
 
-// signIn runs in one transaction: it finds the user by provider identity or
-// creates the user with the personal org, and issues an API key of days.
+// errBlocked refuses the login of a blocked user.
+var errBlocked = errors.New("user is blocked")
+
+// signIn runs in one transaction: it finds the user by provider identity
+// and refreshes it, or creates the user with the personal org; then it
+// revokes every live API key of the user and issues one of days.
 func signIn(ctx context.Context, tx *sql.Tx, id Identity, days int, now time.Time) (signedIn, error) {
 	user, err := scanUser(tx.QueryRowContext(ctx, `SELECT `+userColumns+` FROM users WHERE provider = ? AND provider_id = ?`, id.Provider, id.ProviderID))
-	if errors.Is(err, ErrNotFound) {
+	switch {
+	case errors.Is(err, ErrNotFound):
 		user, err = createSignedInUser(ctx, tx, id, now)
+	case err == nil:
+		user, err = refreshUser(ctx, tx, user, id, now)
 	}
 	if err != nil {
+		return signedIn{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE api_keys SET revoked_at = ?
+WHERE user_id = ? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)`, nanos(now), user.ID, nanos(now)); err != nil {
 		return signedIn{}, err
 	}
 	key, keyID, expiresAt, err := IssueAPIKey(ctx, tx, user.ID, days, now)
@@ -145,6 +156,36 @@ func signIn(ctx context.Context, tx *sql.Tx, id Identity, days int, now time.Tim
 		return signedIn{}, err
 	}
 	return signedIn{user: user, key: key, keyID: keyID, expiresAt: expiresAt}, nil
+}
+
+// refreshUser updates an existing user's e-mail and username from the
+// provider: a blocked user is refused; an e-mail of another user is a
+// conflict; a username of another user keeps the old one. Id, role,
+// full_name, created_at and the personal org stay as they are.
+func refreshUser(ctx context.Context, tx *sql.Tx, user User, id Identity, now time.Time) (User, error) {
+	if user.Status == StatusBlocked {
+		return User{}, errBlocked
+	}
+	emailTaken, err := exists(ctx, tx, `SELECT 1 FROM users WHERE email = ? AND id != ?`, id.Email, user.ID)
+	if err != nil {
+		return User{}, err
+	}
+	if emailTaken {
+		return User{}, ErrConflict
+	}
+	nameTaken, err := exists(ctx, tx, `SELECT 1 FROM users WHERE username = ? AND id != ?`, id.Username, user.ID)
+	if err != nil {
+		return User{}, err
+	}
+	username := id.Username
+	if nameTaken {
+		username = user.Username
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE users SET email = ?, username = ?, updated_at = ? WHERE id = ?`,
+		id.Email, username, nanos(now), user.ID); err != nil {
+		return User{}, err
+	}
+	return GetUser(ctx, tx, user.ID)
 }
 
 // createSignedInUser creates the user a first login brings.

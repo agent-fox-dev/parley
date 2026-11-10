@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"regexp"
 	"testing"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/config"
 )
@@ -190,5 +191,167 @@ func TestCallback_AUniquenessConflictCreatesNothing(t *testing.T) {
 				t.Errorf("counts %v, before %v", c, before)
 			}
 		})
+	}
+}
+
+// loggedIn has alice from an earlier login with github id 123.
+type loggedIn struct {
+	*testHub
+	reader *stubReader
+	alice  map[string]any
+	key    string
+}
+
+func newLoggedIn(t *testing.T) *loggedIn {
+	t.Helper()
+	l := &loggedIn{testHub: newTestHub(t), reader: &stubReader{id: Identity{Provider: "github", ProviderID: "123", Username: "alice", FullName: "Alice A", Email: "a@x"}}}
+	l.withRoutes(l.reader, github)
+	r := l.callback(loginBody)
+	if r.status != 200 {
+		t.Fatalf("first login: %d %s", r.status, r.body)
+	}
+	l.alice, _ = r.doc["user"].(map[string]any)
+	key, _ := r.doc["api_key"].(map[string]any)
+	l.key = key["key"].(string)
+	return l
+}
+
+func (l *loggedIn) storedAlice() (username, email string, updated int64) {
+	l.t.Helper()
+	if err := l.st.DB().QueryRow(`SELECT username, email, updated_at FROM users WHERE id = ?`, l.alice["id"]).Scan(&username, &email, &updated); err != nil {
+		l.t.Fatal(err)
+	}
+	return
+}
+
+func TestCallback_ALaterLoginRefreshesTheUser(t *testing.T) {
+	l := newLoggedIn(t)
+	l.exec(`UPDATE users SET role = 'admin', full_name = 'Custom' WHERE id = ?`, l.alice["id"])
+	l.clock.set(t0.Add(time.Hour))
+	l.reader.id = Identity{Provider: "github", ProviderID: "123", Username: "alicia", FullName: "Other", Email: "new@x"}
+	r := l.callback(loginBody)
+	u, _ := r.doc["user"].(map[string]any)
+	if r.status != 200 || u["id"] != l.alice["id"] || u["username"] != "alicia" || u["email"] != "new@x" || u["role"] != "admin" ||
+		u["full_name"] != "Custom" || u["created_at"] != l.alice["created_at"] || u["updated_at"] != "2026-01-02T04:04:05Z" {
+		t.Fatalf("%d %v", r.status, u)
+	}
+	if c := l.counts(); c[0] != 1 || c[1] != 1 || c[2] != 1 {
+		t.Errorf("counts %v", c)
+	}
+	var name, slug string
+	l.st.DB().QueryRow(`SELECT name, slug FROM orgs`).Scan(&name, &slug)
+	if name != "alice" || slug != "alice" {
+		t.Errorf("org %s %s", name, slug)
+	}
+}
+
+func TestCallback_ARefreshedUsernameThatIsTakenKeepsTheOldOne(t *testing.T) {
+	l := newLoggedIn(t)
+	l.seedUser("bob")
+	l.reader.id = Identity{Provider: "github", ProviderID: "123", Username: "bob", Email: "new@x"}
+	r := l.callback(loginBody)
+	u, _ := r.doc["user"].(map[string]any)
+	if r.status != 200 || u["username"] != "alice" || u["email"] != "new@x" {
+		t.Fatalf("%d %v", r.status, u)
+	}
+	var bob string
+	l.st.DB().QueryRow(`SELECT username FROM users WHERE email = 'bob@x'`).Scan(&bob)
+	if bob != "bob" {
+		t.Errorf("bob became %q", bob)
+	}
+}
+
+func TestCallback_ABlockedUserIsRefusedAndNothingChanges(t *testing.T) {
+	l := newLoggedIn(t)
+	l.exec(`UPDATE users SET status = 'blocked' WHERE id = ?`, l.alice["id"])
+	_, _, updatedBefore := l.storedAlice()
+	before := l.counts()
+	l.reader.id = Identity{Provider: "github", ProviderID: "123", Username: "alicia", Email: "new@x"}
+	r := l.callback(loginBody)
+	if r.status != 403 || r.errorMember("error_type") != "forbidden" || r.errorMember("message") != "user is blocked" {
+		t.Fatalf("%d %s", r.status, r.body)
+	}
+	if name, email, updated := l.storedAlice(); name != "alice" || email != "a@x" || updated != updatedBefore {
+		t.Errorf("alice changed: %s %s %d", name, email, updated)
+	}
+	if c := l.counts(); c != before {
+		t.Errorf("counts %v, before %v", c, before)
+	}
+}
+
+func TestCallback_EveryLoginReplacesTheUsersKeys(t *testing.T) {
+	type row struct {
+		expires string
+		days    int
+	}
+	for _, tt := range []row{{"", 90}, {`,"expires":90`, 90}, {`,"expires":60`, 60}, {`,"expires":30`, 30}, {`,"expires":0`, 0}} {
+		l := newLoggedIn(t)
+		alice := l.alice["id"].(string)
+		k1 := l.key
+		k2, _ := l.issueKey(alice)
+		_, k0ID := l.issueKey(alice)
+		dayAgo := t0.Add(-24 * time.Hour)
+		l.exec(`UPDATE api_keys SET revoked_at = ? WHERE key_id = ?`, nanos(dayAgo), k0ID)
+		pat, _ := l.storePAT(alice, PATSpec{Name: "ci", Permissions: []string{"git:read"}})
+		bob := l.seedUser("bob")
+		bobKey, _ := l.issueKey(bob.ID)
+		l.clock.set(t0.Add(time.Hour))
+		body := `{"provider":"github","code":"c","redirect_uri":"http://127.0.0.1:5000/callback"` + tt.expires + `}`
+		r := l.callback(body)
+		if r.status != 200 {
+			t.Fatalf("%s: %d %s", tt.expires, r.status, r.body)
+		}
+		key, _ := r.doc["api_key"].(map[string]any)
+		want := any(nil)
+		if tt.days > 0 {
+			want = t0.Add(time.Hour).Add(time.Duration(tt.days) * 24 * time.Hour).Format("2006-01-02T15:04:05Z")
+		}
+		if key["expires_at"] != want {
+			t.Errorf("%s: expires_at %v, want %v", tt.expires, key["expires_at"], want)
+		}
+		if tt.expires != "" {
+			continue
+		}
+		for _, old := range []string{k1, k2} {
+			if m := l.get("/api/v1/test/whoami", bearer(old)).errorMember("message"); m != "credential revoked" {
+				t.Errorf("an old key: %v", m)
+			}
+		}
+		var k0Revoked int64
+		l.st.DB().QueryRow(`SELECT revoked_at FROM api_keys WHERE key_id = ?`, k0ID).Scan(&k0Revoked)
+		if k0Revoked != nanos(dayAgo) {
+			t.Error("an already revoked key got a new revoked_at")
+		}
+		for _, cred := range []string{pat, bobKey, key["key"].(string)} {
+			if r := l.get("/api/v1/test/whoami", bearer(cred)); r.status != 200 {
+				t.Errorf("%s: %d", cred[:12], r.status)
+			}
+		}
+		var live int
+		l.st.DB().QueryRow(`SELECT count(*) FROM api_keys WHERE user_id = ? AND revoked_at IS NULL`, alice).Scan(&live)
+		if live != 1 {
+			t.Errorf("alice holds %d live keys", live)
+		}
+	}
+}
+
+func TestCallback_ARefreshedEmailOfAnotherUserIsAConflict(t *testing.T) {
+	l := newLoggedIn(t)
+	l.seedUser("b")
+	l.exec(`UPDATE users SET email = 'b@x' WHERE username = 'b'`)
+	before := l.counts()
+	l.reader.id = Identity{Provider: "github", ProviderID: "123", Username: "alicia", Email: "b@x"}
+	r := l.callback(loginBody)
+	if r.status != 409 || r.errorMember("error_type") != "conflict" {
+		t.Fatalf("%d %s", r.status, r.body)
+	}
+	if name, email, _ := l.storedAlice(); name != "alice" || email != "a@x" {
+		t.Errorf("alice changed: %s %s", name, email)
+	}
+	if c := l.counts(); c != before {
+		t.Errorf("counts %v, before %v", c, before)
+	}
+	if r := l.get("/api/v1/test/whoami", bearer(l.key)); r.status != 200 {
+		t.Errorf("alice's key: %d", r.status)
 	}
 }

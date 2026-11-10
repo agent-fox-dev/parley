@@ -74,6 +74,9 @@ func (rs *Routes) callback(w http.ResponseWriter, r *http.Request) error {
 		out, err = signIn(r.Context(), tx, id, days, rs.Now())
 		return err
 	})
+	if errors.Is(err, errBlocked) {
+		return server.Forbidden("user is blocked")
+	}
 	if errors.Is(err, ErrConflict) {
 		return server.Conflict("the login conflicts with an existing user or organization")
 	}
