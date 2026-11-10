@@ -289,7 +289,7 @@ func TestWait_AnUnsuccessfulEndIsWaitFailed(t *testing.T) {
 		if err := json.Unmarshal([]byte(r.stdout), &doc); err != nil || doc["state"] != final {
 			t.Errorf("%v: stdout %q", c, r.stdout)
 		}
-		e := r.envelope(t)
+		e := r.lastEnvelope(t)
 		if e["code"] != float64(0) || e["error_type"] != "wait_failed" || !strings.Contains(e["message"].(string), final) {
 			t.Errorf("%v: envelope %v", c, e)
 		}
@@ -332,7 +332,7 @@ func TestWait_PassingTheTimeoutIsWaitTimeout(t *testing.T) {
 			t.Errorf("%s: exit %d, stdout %q", name, r.code, r.stdout)
 			continue
 		}
-		if e := r.envelope(t); e["error_type"] != "wait_timeout" || e["code"] != float64(0) {
+		if e := r.lastEnvelope(t); e["error_type"] != "wait_timeout" || e["code"] != float64(0) {
 			t.Errorf("%s: envelope %v", name, e)
 		}
 		reqs := hub.requests()
@@ -375,7 +375,7 @@ func TestWait_TheHubsEnvelopeOnAPollEndsTheWait(t *testing.T) {
 			Error map[string]any `json:"error"`
 		}
 		_ = json.Unmarshal([]byte(body), &want)
-		if got := r.envelope(t); !reflect.DeepEqual(got, want.Error) {
+		if got := r.lastEnvelope(t); !reflect.DeepEqual(got, want.Error) {
 			t.Errorf("%d: envelope %v, want %v", status, got, want.Error)
 		}
 		time.Sleep(60 * time.Millisecond)
@@ -430,7 +430,7 @@ func TestWait_AClientFailureOnAPollEndsTheWait(t *testing.T) {
 			t.Errorf("%s: exit %d, stdout %q, stderr %q", name, r.code, r.stdout, r.stderr)
 			continue
 		}
-		if e := r.envelope(t); e["error_type"] != "client_error" || e["code"] != float64(0) {
+		if e := r.lastEnvelope(t); e["error_type"] != "client_error" || e["code"] != float64(0) {
 			t.Errorf("%s: envelope %v", name, e)
 		}
 		polls := hub.count("GET")

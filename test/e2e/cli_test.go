@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -20,8 +21,8 @@ import (
 	"github.com/agent-fox-dev/parley/internal/store"
 )
 
-// recordedHub is the hub's real handler (the conventions of package 02 and
-// the authenticator of package 04 over a store) behind a handler that
+// recordedHub is the hub's real handler (the HTTP conventions of the server and
+// the identity authenticator over a store) behind a handler that
 // records each request's path, Authorization header and answered status.
 type recordedHub struct {
 	*httptest.Server
@@ -100,8 +101,10 @@ func TestCLI_VersionFindsTheHubThroughTheConfigurationFile(t *testing.T) {
 	var doc struct {
 		Server map[string]any `json:"server"`
 	}
-	json.Unmarshal(stdout.Bytes(), &doc)
-	if len(doc.Server) == 0 || doc.Server["version"] != want["version"] || doc.Server["go_version"] != want["go_version"] || stderr.Len() != 0 {
+	if err := json.Unmarshal(stdout.Bytes(), &doc); err != nil {
+		t.Fatalf("stdout %q: %v", stdout.String(), err)
+	}
+	if len(doc.Server) == 0 || !reflect.DeepEqual(doc.Server, want) || stderr.Len() != 0 {
 		t.Errorf("server %v, stderr %q", doc.Server, stderr.String())
 	}
 	after, _ := os.ReadFile(file)

@@ -34,8 +34,8 @@ func helpProbe() *cobra.Command {
 
 // helpEnv unsets the settings' variables, points PARLEY_CONFIG_DIR at a
 // directory whose config.toml is not valid TOML, and returns a count of the
-// requests a hub receives.
-func helpEnv(t *testing.T) *atomic.Int64 {
+// requests a hub receives and the global flags that point a command at it.
+func helpEnv(t *testing.T) (*atomic.Int64, []string) {
 	t.Helper()
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte("endpoint_url = [unclosed"), 0o600); err != nil {
@@ -47,7 +47,7 @@ func helpEnv(t *testing.T) *atomic.Int64 {
 	var n atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { n.Add(1) }))
 	t.Cleanup(srv.Close)
-	return &n
+	return &n, []string{"--endpoint-url", srv.URL, "--api-key", "k"}
 }
 
 func runHelp(t *testing.T, args ...string) cliResult {
@@ -56,17 +56,17 @@ func runHelp(t *testing.T, args ...string) cliResult {
 }
 
 func TestHelp_RootAndGroupsListTheirSubcommands(t *testing.T) {
-	requests := helpEnv(t)
+	requests, hub := helpEnv(t)
 	cases := []struct {
 		args []string
 		want []string
 	}{
-		{nil, []string{"version", "help", "login", "probe", "probe commands"}},
+		{nil, []string{"version", "Print the client's build", "help", "Print the help of a command", "login", "Sign in through the browser", "probe", "probe commands"}},
 		{[]string{"probe"}, []string{"get", "gets a thing", "admin", "admin probe commands"}},
 		{[]string{"probe", "admin"}, []string{"purge", "purges things"}},
 	}
 	for _, c := range cases {
-		r := runHelp(t, c.args...)
+		r := runHelp(t, append(slices.Clone(c.args), hub...)...)
 		if r.code != 0 || r.stderr != "" {
 			t.Errorf("%v: exit %d, stderr %q", c.args, r.code, r.stderr)
 		}
@@ -82,10 +82,11 @@ func TestHelp_RootAndGroupsListTheirSubcommands(t *testing.T) {
 }
 
 func TestHelp_HelpWordsEqualsDashDashHelp(t *testing.T) {
-	requests := helpEnv(t)
+	requests, hub := helpEnv(t)
 	for _, words := range [][]string{{"probe", "get"}, {"probe", "admin", "purge"}, {"version"}, {"probe"}, {"help"}} {
-		a := runHelp(t, append([]string{"help"}, words...)...)
-		b := runHelp(t, append(slices.Clone(words), "--help")...)
+		// With a hub URL and a credential given, help still sends nothing.
+		a := runHelp(t, append(append([]string{"help"}, words...), hub...)...)
+		b := runHelp(t, append(append(slices.Clone(words), "--help"), hub...)...)
 		if a.code != 0 || b.code != 0 || a.stderr != "" || b.stderr != "" {
 			t.Errorf("%v: exits %d/%d, stderr %q/%q", words, a.code, b.code, a.stderr, b.stderr)
 		}
@@ -151,7 +152,7 @@ func names(list []any, member string) []string {
 }
 
 func TestHelp_JSONDescribesACommand(t *testing.T) {
-	helpEnv(t)
+	_, _ = helpEnv(t)
 	d := helpDoc(t, runHelp(t, "help", "probe", "get", "--json"))
 	if got := keys(d); !reflect.DeepEqual(got, []string{"args", "auth", "description", "flags", "method", "name", "path"}) {
 		t.Errorf("members %v", got)
@@ -191,7 +192,7 @@ func TestHelp_JSONDescribesACommand(t *testing.T) {
 }
 
 func TestHelp_JSONOfAGroupListsEveryCommandUnderIt(t *testing.T) {
-	helpEnv(t)
+	_, _ = helpEnv(t)
 	g := helpDoc(t, runHelp(t, "help", "probe", "--json"))
 	if got := keys(g); !reflect.DeepEqual(got, []string{"commands"}) {
 		t.Fatalf("members %v", got)
@@ -226,7 +227,7 @@ func TestHelp_JSONOfAGroupListsEveryCommandUnderIt(t *testing.T) {
 }
 
 func TestHelp_UnknownWordsAreAUsageError(t *testing.T) {
-	helpEnv(t)
+	_, _ = helpEnv(t)
 	for _, args := range [][]string{{"help", "nosuch"}, {"help", "probe", "nosuch"}, {"help", "nosuch", "--json"}} {
 		r := runHelp(t, args...)
 		if r.code != 2 || r.stdout != "" {

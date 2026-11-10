@@ -18,7 +18,7 @@ of its REST API.
 | `internal/scrub/` | removes credentials from text (a leaf package) |
 | `internal/identity/` | the identity records (users, orgs, memberships, API keys, personal access tokens), the admin token, authentication of every request, the OAuth client and the login routes |
 | `internal/maintenance/` | the hourly maintenance loop and its task registry |
-| `internal/cli/` | the CLI's commands |
+| `internal/cli/` | the CLI: every command is declared through `Declare` (its word, route, arguments, auth and flags), which gives it the shared settings resolution, the one HTTP client, the output and exit-status rules, help as text and JSON, and `--wait`; it imports no server package |
 | `internal/buildinfo/` | version, commit and build time set by the linker |
 | `test/e2e/` | end-to-end tests of the built binaries and the process |
 

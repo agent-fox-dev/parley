@@ -40,7 +40,12 @@ func newClient(hubURL, credential string) (*Client, error) {
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return nil, ClientError("the hub URL %q is not an absolute http or https URL", hubURL)
 	}
-	return &Client{base: strings.TrimRight(hubURL, "/"), cred: credential, http: &http.Client{}, host: u.Host}, nil
+	// Every request gets a connection of its own: Go's transport sends a
+	// GET again on a new connection when a reused one breaks under it, and
+	// a request is sent once.
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DisableKeepAlives = true
+	return &Client{base: strings.TrimRight(hubURL, "/"), cred: credential, http: &http.Client{Transport: transport}, host: u.Host}, nil
 }
 
 // Send sends one request: method, a path relative to /api/v1, an optional

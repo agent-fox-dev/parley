@@ -100,27 +100,41 @@ func runCLI(t *testing.T, stdin string, args ...string) cliResult {
 
 // envelope parses the error envelope on stderr: the last JSON document,
 // after any plain text lines.
+// envelope is the error member of stderr, which must be exactly one JSON
+// error envelope; the CLI's own error types carry code 0.
 func (r cliResult) envelope(t *testing.T) map[string]any {
 	t.Helper()
-	text := r.stderr
-	if i := strings.Index(text, "{"); i >= 0 {
-		text = text[i:]
+	if !strings.HasPrefix(r.stderr, "{") {
+		t.Fatalf("stderr %q is not one error envelope", r.stderr)
 	}
-	dec := json.NewDecoder(strings.NewReader(text))
-	var last map[string]any
-	for {
-		var doc struct {
-			Error map[string]any `json:"error"`
-		}
-		if err := dec.Decode(&doc); err != nil {
-			break
-		}
-		last = doc.Error
+	return r.lastEnvelope(t)
+}
+
+// lastEnvelope is the error member of the one JSON error envelope that ends
+// stderr, after any whole lines of progress or warnings.
+func (r cliResult) lastEnvelope(t *testing.T) map[string]any {
+	t.Helper()
+	i := strings.Index(r.stderr, "{")
+	if i < 0 || (i > 0 && r.stderr[i-1] != '\n') {
+		t.Fatalf("stderr %q holds no error envelope after whole lines", r.stderr)
 	}
-	if last == nil {
+	dec := json.NewDecoder(strings.NewReader(r.stderr[i:]))
+	var doc struct {
+		Error map[string]any `json:"error"`
+	}
+	if err := dec.Decode(&doc); err != nil || doc.Error == nil {
 		t.Fatalf("stderr %q holds no error envelope", r.stderr)
 	}
-	return last
+	if rest, _ := io.ReadAll(dec.Buffered()); strings.TrimSpace(string(rest)) != "" || dec.More() {
+		t.Fatalf("stderr %q holds more than the envelope", r.stderr)
+	}
+	switch doc.Error["error_type"] {
+	case TypeUsage, TypeClient, TypeWaitFailed, TypeWaitTimeout, TypeCondition:
+		if doc.Error["code"] != float64(0) {
+			t.Errorf("the CLI's own envelope has code %v: %q", doc.Error["code"], r.stderr)
+		}
+	}
+	return doc.Error
 }
 
 func readTOML(t *testing.T, path string) map[string]any {

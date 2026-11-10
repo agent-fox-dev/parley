@@ -80,8 +80,58 @@ removes what it wrote. It opens no listener and changes nothing in the data.
 
 ## parley
 
-`parley` alone, or the words of a command group alone (such as
-`parley probe`), prints that help on stdout and exits 0.
+`parley` alone, or the words of a command group alone, prints that help on
+stdout and exits 0.
+
+### Every command
+
+**Settings.** A command that talks to the hub takes the hub URL and the
+credential each from the first non-empty value of its flag, its variable and
+the configuration file:
+
+| Setting | Flag | Variable | File key |
+|---|---|---|---|
+| hub URL | `--endpoint-url` | `PARLEY_ENDPOINT_URL` | `endpoint_url` |
+| credential | `--api-key` | `PARLEY_API_KEY` | `api_key` |
+
+The file is read only when a flag and the environment leave a setting empty
+(`parley login` always reads it, since it saves it again). A setting still missing is a `client_error` (exit status 2) before any
+request, naming its flag, its variable and the file. The global flags
+`--endpoint-url`, `--api-key` and `--json` go before or after a command's
+words.
+
+**The configuration file** is `$PARLEY_CONFIG_DIR/config.toml` when the
+variable is set and not empty, otherwise `~/.parley/config.toml`. Reading it
+creates nothing; a missing file holds no settings. A file that is not valid
+TOML, or whose `endpoint_url`, `api_key` or `user_id` is not a string, is a
+`client_error` naming its path (for `parley version`, a warning). Saving it (as `parley login` does) creates the
+directory with mode 0700, keeps every key it does not know, and replaces the
+file atomically with mode 0600.
+
+**Requests.** A command's requests go to `<hub URL>/api/v1<path>` with
+`Authorization: Bearer <credential>` (`parley login` sends its provider list
+and callback requests without one, and `parley version` reads
+`<hub URL>/version` without one); each argument is percent-encoded as one
+path segment (a `/` is sent as `%2F`). A request is sent once on a
+connection of its own, never retried, and gets 30 seconds to connect, send
+and read its answer (`parley version`: 5 seconds). A connection that
+fails, a timeout, and a 2xx answer that is not JSON are `client_error`s
+naming the hub's host or the status.
+
+**Output.** Apart from help as text, stdout holds exactly one JSON document
+indented by 2 spaces, or nothing; a success without a body prints `{}` (or the command's own
+confirmation document). Warnings (`warning: `) and wait progress
+(`waiting: `) go to stderr; a result that carries a secret shown once is
+followed by `warning: this value is shown once and will not be shown again`.
+Every error is one envelope on stderr, indented by 2 spaces: the hub's as it answered, member order kept, or the CLI's own
+`{"error": {"code": 0, "message": …, "error_type": …}}`.
+
+| Exit status | When |
+|---|---|
+| 0 | success |
+| 1 | the hub refused (its envelope), `wait_failed`, `wait_timeout` |
+| 2 | `usage_error` (an unknown command or flag, a bad argument count or value) or `client_error` |
+| 3 | `condition_not_met`: a `--fail-on-…` condition held; the result is still printed on stdout |
 
 ### Help
 
@@ -169,7 +219,7 @@ client configuration file.
 |---|---|---|
 | `--provider <name>` | `github` | the identity provider to sign in with |
 | `--expires <days>` | `90` | the new key's lifetime: 0, 30, 60 or 90 |
-| `--api-key <key \| ->` | | store this credential instead of signing in; `-` reads it from stdin |
+| `--api-key <key \| ->` (global) | | with login: store this credential instead of signing in; `-` reads it from stdin |
 
 The hub URL is the first non-empty value of `--endpoint-url`,
 `PARLEY_ENDPOINT_URL` and the file key `endpoint_url`.
@@ -219,5 +269,5 @@ that cannot be read is one `warning: ` line on stderr. Without a hub URL,
 only `cli` is printed. When the hub
 cannot be read (refused, no answer within 5 seconds, a status other than 200,
 a body that is not a JSON object), one line starting with `warning: ` and
-naming the URL goes to stderr and `server` is left out. The exit status is
-always 0.
+naming the URL goes to stderr and `server` is left out; the exit status
+stays 0. An argument or an unknown flag is a usage error (exit status 2).

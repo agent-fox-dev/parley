@@ -164,10 +164,12 @@ func TestClient_ARequestThatTakesTooLongIsAClientError(t *testing.T) {
 	if requestTimeout != 30*time.Second {
 		t.Errorf("default request timeout = %v", requestTimeout)
 	}
+	var arrived atomic.Int32
 	slow := func(d time.Duration, half bool) *httptest.Server {
 		var once sync.Once
 		release := make(chan struct{})
 		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			arrived.Add(1)
 			if half {
 				w.Header().Set("Content-Length", "100")
 				w.WriteHeader(200)
@@ -209,8 +211,12 @@ func TestClient_ARequestThatTakesTooLongIsAClientError(t *testing.T) {
 				requestTimeout = tt.short
 				t.Cleanup(func() { requestTimeout = old })
 			}
+			arrived.Store(0)
 			start := time.Now()
 			r := runProbe(t, []*cobra.Command{tt.cmd}, "probe", "get", "x", "--endpoint-url", tt.hub.URL, "--api-key", "k")
+			if n := arrived.Load(); n != 1 {
+				t.Errorf("the hub received %d requests", n)
+			}
 			if tt.ok {
 				if r.code != 0 {
 					t.Errorf("exit %d %s", r.code, r.stderr)
@@ -307,5 +313,30 @@ func TestClient_EveryRequestIsSentOnce(t *testing.T) {
 			t.Errorf("%d: %d requests", c.status, n)
 		}
 		hub.Close()
+	}
+	// A connection that served one request and breaks under the next: the
+	// next request is not sent again on a new connection.
+	var count atomic.Int32
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if count.Add(1) == 2 {
+			conn, _, _ := w.(http.Hijacker).Hijack()
+			conn.Close()
+			return
+		}
+		io.WriteString(w, `{}`)
+	}))
+	defer hub.Close()
+	c, err := newClient(hub.URL, "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Send(context.Background(), http.MethodGet, "/a", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Send(context.Background(), http.MethodGet, "/a", nil, nil); err == nil {
+		t.Error("a broken connection answered")
+	}
+	if n := count.Load(); n != 2 {
+		t.Errorf("two sends arrived as %d requests", n)
 	}
 }

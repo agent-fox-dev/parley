@@ -256,6 +256,18 @@ func TestSaveSettings_AFailedSaveChangesNothing(t *testing.T) {
 			}
 		})
 	}
+	// A rename the file system refuses leaves no temporary file behind.
+	dir := t.TempDir()
+	target := filepath.Join(dir, "config.toml")
+	if err := os.MkdirAll(filepath.Join(target, "inside"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := replaceFile(dir, target, []byte("a = 1\n")); err == nil {
+		t.Error("a rename over a non-empty directory succeeded")
+	}
+	if left, _ := filepath.Glob(filepath.Join(dir, ".config.toml.*")); len(left) != 0 {
+		t.Errorf("temporary files left: %v", left)
+	}
 }
 
 func TestSettings_FlagThenEnvironmentThenFile(t *testing.T) {
@@ -331,9 +343,13 @@ func TestSettings_AMissingSettingFailsBeforeAnyRequest(t *testing.T) {
 			if e["code"] != float64(0) || e["error_type"] != "client_error" || !strings.Contains(msg, path) {
 				t.Errorf("%s: %v", missing, e)
 			}
-			urlNamed := strings.Contains(msg, "--endpoint-url") && strings.Contains(msg, "PARLEY_ENDPOINT_URL")
-			keyNamed := strings.Contains(msg, "--api-key") && strings.Contains(msg, "PARLEY_API_KEY")
-			if urlNamed != (missing != "key") || keyNamed != (missing != "url") {
+			// A missing setting is named by its flag and its variable; a
+			// given one by neither.
+			named := func(flag, variable string, want bool) bool {
+				f, v := strings.Contains(msg, flag), strings.Contains(msg, variable)
+				return (f && v) == want && (f || v) == want
+			}
+			if !named("--endpoint-url", "PARLEY_ENDPOINT_URL", missing != "key") || !named("--api-key", "PARLEY_API_KEY", missing != "url") {
 				t.Errorf("%s: message %q", missing, msg)
 			}
 		}
