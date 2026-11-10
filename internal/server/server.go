@@ -4,7 +4,6 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net"
 	"net/http"
@@ -93,7 +92,7 @@ type statusDoc struct {
 }
 
 func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, statusDoc{Status: "ok"})
+	WriteJSON(w, http.StatusOK, statusDoc{Status: "ok"})
 }
 
 func (s *Server) readyz(w http.ResponseWriter, r *http.Request) {
@@ -104,26 +103,14 @@ func (s *Server) readyz(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if !ready {
-		writeJSON(w, http.StatusServiceUnavailable, statusDoc{Status: "not ready"})
+		WriteJSON(w, http.StatusServiceUnavailable, statusDoc{Status: "not ready"})
 		return
 	}
-	writeJSON(w, http.StatusOK, statusDoc{Status: "ready"})
+	WriteJSON(w, http.StatusOK, statusDoc{Status: "ready"})
 }
 
 func (s *Server) version(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, buildinfo.Get())
-}
-
-// writeJSON writes v as the JSON body of a response with the given status.
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	body, err := json.Marshal(v)
-	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	w.Write(body)
+	WriteJSON(w, http.StatusOK, buildinfo.Get())
 }
 
 // Serve binds the listen address, calls onListen with the address it bound

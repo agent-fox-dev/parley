@@ -3,11 +3,11 @@
   "spec_id": "02",
   "spec_name": "http_api_conventions",
   "schema_version": 3,
-  "updated_at": "",
+  "updated_at": "2026-11-10T21:08:10Z",
   "tasks": [
     {
       "id": 1,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 2,
