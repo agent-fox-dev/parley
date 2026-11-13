@@ -727,9 +727,16 @@ and at a first login picks the username (the provider's, else the first
 free of `<name>-2` to `<name>-10`) and the role (`admin` when the e-mail is
 the `admin_email` of `admin_settings`, read in the same transaction,
 ignoring letter case, and no user has the role `admin`), then calls
-`identity.CreateUserAndPersonalOrg`; last it issues the API key with
-`identity.IssueAPIKey`, `expires` days (90 when absent) from the clock of
-`Deps.Now`. Any error rolls the whole transaction back.
+`identity.CreateUserAndPersonalOrg`. A user it finds is refreshed instead:
+a blocked user is answered `server.Forbidden("user is blocked")`, an e-mail
+another user has is an `ErrConflict`, a username another user has keeps
+the old one, and the new e-mail, username and `updated_at` are written;
+role, full name, creation time and the personal org are left alone. Then,
+for a new and an existing user alike, it sets `revoked_at` on every API key
+of the user with `revoked_at` NULL and `expires_at` NULL or after the
+login time, and last it issues the API key with `identity.IssueAPIKey`,
+`expires` days (90 when absent) from the clock of `Deps.Now`. Any error
+rolls the whole transaction back.
 
 `identity.CreateUserAndPersonalOrg(ctx, tx, identity.NewUser{Username,
 Email, FullName, Provider, ProviderID, CreatedAt}, role)` is the one way a

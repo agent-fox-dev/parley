@@ -79,25 +79,68 @@ func (s *Service) callback(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// signIn finds the user of the identity id, or creates the user with the
-// personal org at the first login, and issues the user an API key that
-// lasts days days, all in one transaction: a login that fails leaves
-// nothing behind.
+// signIn finds the user of the identity id and refreshes it, or creates the
+// user with the personal org at the first login, revokes the user's live
+// API keys and issues one that lasts days days, all in one transaction: a
+// login that fails leaves nothing behind, and one that succeeds leaves the
+// user exactly one live key.
 func (s *Service) signIn(ctx context.Context, id Identity, days int) (u User, key string, rec APIKey, err error) {
 	now := s.deps.Now().UTC()
 	err = s.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
 		var err error
 		u, err = UserByProvider(ctx, tx, id.Provider, id.ProviderID)
-		if errors.Is(err, ErrNotFound) {
+		switch {
+		case errors.Is(err, ErrNotFound):
 			u, err = createFirstLogin(ctx, tx, id, now)
+		case err == nil:
+			u, err = refreshLogin(ctx, tx, u, id, now)
 		}
 		if err != nil {
+			return err
+		}
+		if err := revokeLiveAPIKeys(ctx, tx, u.ID, now); err != nil {
 			return err
 		}
 		key, rec, err = IssueAPIKey(ctx, tx, u.ID, days, now)
 		return err
 	})
 	return u, key, rec, err
+}
+
+// refreshLogin refreshes the user u of a later login with the e-mail and the
+// username the provider now gives, id, and sets updated_at to now. It keeps
+// the old username when the new one is another user's, and refuses a
+// blocked user and an e-mail that is another user's. The id, role,
+// full_name, created_at and the personal org stay as they are: the user
+// changes full_name through the API, and the org keeps its name.
+func refreshLogin(ctx context.Context, tx *sql.Tx, u User, id Identity, now time.Time) (User, error) {
+	if u.Status == StatusBlocked {
+		return User{}, server.Forbidden("user is blocked")
+	}
+	if id.Email != u.Email {
+		taken, err := exists(ctx, tx, `SELECT count(*) FROM users WHERE email = ? AND id <> ?`, id.Email, u.ID)
+		if err != nil {
+			return User{}, err
+		}
+		if taken {
+			return User{}, conflictError{"the e-mail belongs to another user"}
+		}
+		u.Email = id.Email
+	}
+	if id.Username != u.Username {
+		taken, err := exists(ctx, tx, `SELECT count(*) FROM users WHERE username = ? AND id <> ?`, id.Username, u.ID)
+		if err != nil {
+			return User{}, err
+		}
+		if !taken {
+			u.Username = id.Username
+		}
+	}
+	u.UpdatedAt = now
+	if err := updateUserLogin(ctx, tx, u); err != nil {
+		return User{}, err
+	}
+	return u, nil
 }
 
 // createFirstLogin creates the user of a first login with the personal

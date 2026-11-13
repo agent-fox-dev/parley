@@ -3,7 +3,7 @@
   "spec_id": "04",
   "spec_name": "authentication_and_login",
   "schema_version": 3,
-  "updated_at": "2026-11-13T15:06:31Z",
+  "updated_at": "2026-11-13T15:09:16Z",
   "tasks": [
     {
       "id": 1,
@@ -27,7 +27,7 @@
     },
     {
       "id": 6,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 7,

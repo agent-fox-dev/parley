@@ -492,8 +492,8 @@ The body is a JSON object:
 The hub exchanges the code at the provider and reads the user's identity
 (provider, provider user id, username, full name, verified e-mail), then,
 in one transaction, finds the user who signs in with that provider and
-provider user id, or creates one at the first login, and issues the user
-an API key. A `parleyd` started from the command line has no provider
+provider user id, or creates one at the first login, revokes the user's
+live API keys and issues the user a new one. A `parleyd` started from the command line has no provider
 client yet and answers every login `502` with `error_type`
 `upstream_error`.
 
@@ -516,10 +516,24 @@ At a first login the hub creates:
   `alice-smith`, `42bob` gives `u-42bob`.
 - the user's membership of that org, and the API key.
 
+At a later login of an `active` user the hub refreshes the user's `email`
+and `username` from the provider and sets `updated_at` to the login time.
+When another user has the new username, the old username is kept and the
+login goes on. The user's `id`, `role`, `full_name`, `created_at` and
+personal org (its name and slug included) stay as they are.
+
+At every login, a first one included, the hub sets `revoked_at` to the
+login time on every API key of the user that is neither revoked nor
+expired, then issues the new key, so the user holds exactly one live key.
+Those keys are answered `401` `credential revoked` from then on. A key
+revoked earlier keeps its `revoked_at`, an expired key is left as it is,
+and the user's PATs and the keys of other users are not touched.
+
 | Status | When |
 |---|---|
 | `200 OK` | the user signed in; the body is `{"user": …, "api_key": …}` |
-| `409` `conflict` | a new user cannot be created: the e-mail is another user's, an org already has the username as its name, the username and all of `<name>-2` to `<name>-10` are taken, or the slug and all of `<slug>-1` to `<slug>-10` are taken. Nothing is created. |
+| `403` `forbidden` | the user is `blocked`; the message is `user is blocked`. Nothing changes: the user is not refreshed, no key is revoked and none is issued. |
+| `409` `conflict` | a new user cannot be created: the e-mail is another user's, an org already has the username as its name, the username and all of `<name>-2` to `<name>-10` are taken, or the slug and all of `<slug>-1` to `<slug>-10` are taken; or, at a later login, the e-mail the provider now gives is another user's. Nothing is created or changed. |
 | `502` `upstream_error` | the hub has no provider client |
 
 `user` is the User object (`id`, `username`, `email`, `full_name`, `role`,

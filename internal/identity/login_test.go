@@ -2,6 +2,7 @@ package identity_test
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"maps"
 	"slices"
@@ -239,6 +240,208 @@ func TestCallback_RefusesAFirstLoginThatBreaksUniquenessAndCreatesNothing(t *tes
 			}
 			if after := counts(h); !slices.Equal(after, before) {
 				t.Errorf("users, orgs, memberships, keys, revoked keys = %v, want %v", after, before)
+			}
+		})
+	}
+}
+
+// seedAlice stores alice as an earlier login left her: the github identity
+// 123, the e-mail a@x, the role admin and the full name Custom, with her
+// personal org and no key.
+func (h *testHub) seedAlice() identity.User {
+	h.t.Helper()
+	var u identity.User
+	h.tx(func(tx *sql.Tx) (err error) {
+		u, _, err = identity.CreateUserAndPersonalOrg(context.Background(), tx, identity.NewUser{
+			Username: "alice", Email: "a@x", FullName: "Custom", Provider: "github", ProviderID: "123", CreatedAt: h.now(),
+		}, identity.RoleAdmin)
+		return err
+	})
+	return u
+}
+
+// storedUser reads the user userID from the hub's store.
+func (h *testHub) storedUser(userID string) identity.User {
+	h.t.Helper()
+	u, err := identity.UserByID(context.Background(), h.st.Main(), userID)
+	if err != nil {
+		h.t.Fatalf("read user %s: %v", userID, err)
+	}
+	return u
+}
+
+func TestCallback_RefreshesAnExistingUserAndKeepsTheRest(t *testing.T) {
+	t.Parallel()
+	h := newLoginHub(t, identity.Identity{Provider: "github", ProviderID: "123", Username: "alicia", FullName: "Other", Email: "new@x"})
+	alice := h.seedAlice()
+	h.advance(time.Hour)
+
+	r := h.callback(loginBody)
+
+	if r.status != 200 {
+		t.Fatalf("status = %d, want 200; body %s", r.status, r.body)
+	}
+	u, _ := r.json["user"].(map[string]any)
+	want := map[string]any{"id": alice.ID, "username": "alicia", "email": "new@x", "role": "admin", "full_name": "Custom",
+		"created_at": timefmt.Format(alice.CreatedAt), "updated_at": timefmt.Format(h.now())}
+	for k, v := range want {
+		if u[k] != v {
+			t.Errorf("user.%s = %v, want %v", k, u[k], v)
+		}
+	}
+	if s := h.storedUser(alice.ID); s.Username != "alicia" || s.Email != "new@x" || !s.UpdatedAt.Equal(h.now()) {
+		t.Errorf("stored user = %q, %q, updated %v; want alicia, new@x, %v", s.Username, s.Email, s.UpdatedAt, h.now())
+	}
+	for _, table := range []string{"users", "orgs", "memberships"} {
+		if n := h.count(`SELECT count(*) FROM ` + table); n != 1 {
+			t.Errorf("%d %s, want 1", n, table)
+		}
+	}
+	if name, slug, _, _ := h.orgOf(alice.ID); name != "alice" || slug != "alice" {
+		t.Errorf("org = name %q, slug %q; want alice, alice", name, slug)
+	}
+}
+
+func TestCallback_KeepsTheOldUsernameWhenTheNewOneIsAnotherUsers(t *testing.T) {
+	t.Parallel()
+	h := newLoginHub(t, identity.Identity{Provider: "github", ProviderID: "123", Username: "bob", Email: "new@x"})
+	h.seedAlice()
+	bob := h.seedUser("bob")
+
+	r := h.callback(loginBody)
+
+	if r.status != 200 {
+		t.Fatalf("status = %d, want 200; body %s", r.status, r.body)
+	}
+	u, _ := r.json["user"].(map[string]any)
+	if u["username"] != "alice" || u["email"] != "new@x" {
+		t.Errorf("user = %v, %v; want alice, new@x", u["username"], u["email"])
+	}
+	if s := h.storedUser(bob.ID); s.Username != "bob" {
+		t.Errorf("bob's username = %q, want bob", s.Username)
+	}
+}
+
+func TestCallback_RefusesALaterLoginAndChangesNothing(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name               string
+		email              string
+		blocked            bool
+		status             int
+		errorType, message string
+		whoami             int // the answer to alice's key after the login
+	}{
+		{"the user is blocked", "new@x", true, 403, "forbidden", "user is blocked", 403},
+		{"the e-mail is another user's", "bob@x", false, 409, "conflict", "", 200},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			h := newLoginHub(t, identity.Identity{Provider: "github", ProviderID: "123", Username: "alicia", Email: tc.email})
+			alice := h.seedAlice()
+			h.seedUser("bob")
+			k1, k1rec := h.seedKey(alice.ID, 90)
+			if tc.blocked {
+				h.setStatus(alice.ID, identity.StatusBlocked)
+			}
+			h.advance(time.Hour)
+
+			r := h.callback(loginBody)
+
+			if r.status != tc.status || r.errorField("error_type") != tc.errorType {
+				t.Errorf("answer = %d %s, want %d %s", r.status, r.body, tc.status, tc.errorType)
+			}
+			if tc.message != "" && r.errorField("message") != tc.message {
+				t.Errorf("message = %v, want %q", r.errorField("message"), tc.message)
+			}
+			if s := h.storedUser(alice.ID); s.Username != "alice" || s.Email != "a@x" || !s.UpdatedAt.Equal(alice.UpdatedAt) {
+				t.Errorf("stored alice = %q, %q, updated %v; want alice, a@x, %v", s.Username, s.Email, s.UpdatedAt, alice.UpdatedAt)
+			}
+			if n := h.count(`SELECT count(*) FROM api_keys WHERE user_id = ?`, alice.ID); n != 1 {
+				t.Errorf("alice has %d keys, want 1", n)
+			}
+			if at := h.storedRevokedAt("API key", k1rec.KeyID); at != nil {
+				t.Errorf("k1 revoked at %v, want not revoked", at)
+			}
+			if w := h.get("/api/v1/test/whoami", "Bearer "+k1); w.status != tc.whoami {
+				t.Errorf("whoami with k1 = %d %s, want %d", w.status, w.body, tc.whoami)
+			}
+		})
+	}
+}
+
+func TestCallback_RevokesTheUsersLiveKeysAndIssuesTheNewOne(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		expires any // nil leaves expires out of the body
+		days    int // 0: the key never expires
+	}{
+		{"absent", nil, 90},
+		{"90", 90, 90},
+		{"60", 60, 60},
+		{"30", 30, 30},
+		{"0", 0, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			h := newLoginHub(t, newIdentity("alice", "a@x"))
+			start := h.now()
+			alice := h.seedAlice()
+			k1, k1rec := h.seedKey(alice.ID, 90)
+			k2, _ := h.seedKey(alice.ID, 0)
+			_, k0rec := h.seedKey(alice.ID, 90)
+			h.revoke(k0rec.KeyID)
+			_, expiredRec := h.seedKey(alice.ID, 90)
+			h.expireAt(expiredRec.KeyID, start.Add(time.Hour))
+			pat, _ := h.seedCredential("PAT", alice.ID)
+			bobKey, _ := h.seedCredential("API key", h.seedUser("bob").ID)
+			h.advance(24 * time.Hour)
+			t0 := h.now()
+			body := maps.Clone(loginBody)
+			if tc.expires != nil {
+				body["expires"] = tc.expires
+			}
+
+			r := h.callback(body)
+
+			if r.status != 200 {
+				t.Fatalf("status = %d, want 200; body %s", r.status, r.body)
+			}
+			key, _ := r.json["api_key"].(map[string]any)
+			var want any
+			if tc.days > 0 {
+				want = timefmt.Format(t0.Add(time.Duration(tc.days) * 24 * time.Hour))
+			}
+			if key["expires_at"] != want {
+				t.Errorf("api_key.expires_at = %v, want %v", key["expires_at"], want)
+			}
+			for name, k := range map[string]string{"k1": k1, "k2": k2} {
+				if w := h.get("/api/v1/test/whoami", "Bearer "+k); w.status != 401 || w.errorField("message") != "credential revoked" {
+					t.Errorf("whoami with %s = %d %s, want 401 credential revoked", name, w.status, w.body)
+				}
+			}
+			if at := h.storedRevokedAt("API key", k1rec.KeyID); at == nil || !at.Equal(t0) {
+				t.Errorf("k1 revoked at %v, want %v", at, t0)
+			}
+			if at := h.storedRevokedAt("API key", k0rec.KeyID); at == nil || !at.Equal(start) {
+				t.Errorf("k0 revoked at %v, want its old %v", at, start)
+			}
+			if at := h.storedRevokedAt("API key", expiredRec.KeyID); at != nil {
+				t.Errorf("the expired key revoked at %v, want not revoked", at)
+			}
+			newKey, _ := key["key"].(string)
+			for name, cred := range map[string]string{"alice's PAT": pat, "bob's key": bobKey, "the new key": newKey} {
+				if w := h.get("/api/v1/test/whoami", "Bearer "+cred); w.status != 200 {
+					t.Errorf("whoami with %s = %d %s, want 200", name, w.status, w.body)
+				}
+			}
+			live := h.count(`SELECT count(*) FROM api_keys WHERE user_id = ? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)`,
+				alice.ID, t0.UnixNano())
+			if live != 1 {
+				t.Errorf("alice has %d live keys, want 1", live)
 			}
 		})
 	}

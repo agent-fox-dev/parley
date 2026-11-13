@@ -196,6 +196,33 @@ VALUES (?, ?, ?, ?, ?, ?)`, rec.KeyID, rec.UserID, rec.hash, rec.ExpiresDays, na
 	return key, rec, nil
 }
 
+// revokeLiveAPIKeys sets revoked_at to now on every API key of the user
+// userID that is neither revoked nor expired at now. A key that is already
+// revoked keeps its revocation time, and an expired key is left as it is.
+func revokeLiveAPIKeys(ctx context.Context, tx *sql.Tx, userID string, now time.Time) error {
+	at := now.UnixNano()
+	_, err := tx.ExecContext(ctx, `UPDATE api_keys SET revoked_at = ?
+WHERE user_id = ? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)`, at, userID, at)
+	if err != nil {
+		return fmt.Errorf("revoke the API keys of a user: %w", err)
+	}
+	return nil
+}
+
+// updateUserLogin stores the username, the e-mail and updated_at of u, what
+// a later login refreshes.
+func updateUserLogin(ctx context.Context, tx *sql.Tx, u User) error {
+	_, err := tx.ExecContext(ctx, `UPDATE users SET username = ?, email = ?, updated_at = ? WHERE id = ?`,
+		u.Username, u.Email, u.UpdatedAt.UnixNano(), u.ID)
+	if isUniqueViolation(err) {
+		return conflictError{"the username or the e-mail is taken"}
+	}
+	if err != nil {
+		return fmt.Errorf("store the user: %w", err)
+	}
+	return nil
+}
+
 // StorePAT generates a PAT with the fields of spec, stores its record in tx
 // with the hash of its secret, and returns the token, which is shown once,
 // with its record. It draws the id again when it is taken and checks
