@@ -96,12 +96,21 @@ workspace it is bound to. The hub stores the SHA-256 of each secret, never
 the secret, and compares hashes in constant time.
 
 A request that does not pass is answered before any later check runs, with
-one of these:
+the first of these that applies, in the order of the table. The state of an
+API key or PAT (revoked, expired, its user blocked) is looked at only after
+its secret matched, so a wrong secret is answered `invalid credentials`
+whatever that state, with the same body as an unknown id. The credential and
+its user are read on every request: a revocation, a block or an unblock
+holds from the next request on, and blocking a user changes none of the
+user's credentials.
 
 | Status | `error_type` | `message` | When |
 |---|---|---|---|
 | `401` | `unauthenticated` | `authentication required` | no `Authorization` header, another scheme (such as `Basic`), an empty credential, or a credential of none of the three formats |
 | `401` | `unauthenticated` | `invalid credentials` | an API key or PAT whose id is not stored or whose secret does not match, an admin-format token that is not the admin token, or any admin-format token on a hub that is not bootstrapped; the answer is the same whichever part was wrong |
+| `401` | `unauthenticated` | `credential revoked` | an API key or PAT whose secret matches and that is revoked |
+| `401` | `unauthenticated` | `credential expired` | an API key or PAT whose secret matches, that is not revoked, and whose `expires_at` is at or before the current time; one without `expires_at` never expires |
+| `403` | `forbidden` | `user is blocked` | a live API key or PAT whose user's status is `blocked` |
 | `403` | `forbidden` | `this route needs a user` | the admin token on a route that needs a user; an API key or a PAT passes there |
 
 ```json

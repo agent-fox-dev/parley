@@ -249,6 +249,37 @@ func (h *testHub) seedPAT(spec identity.PATSpec) (string, identity.PAT) {
 	return tok, rec
 }
 
+// seedCredential gives userID a live credential of kind, "API key" or
+// "PAT", that never expires, and returns it with its id.
+func (h *testHub) seedCredential(kind, userID string) (credential, id string) {
+	h.t.Helper()
+	if kind == "PAT" {
+		tok, rec := h.seedPAT(identity.PATSpec{UserID: userID, Permissions: []string{"git:read"}})
+		return tok, rec.TokenID
+	}
+	key, rec := h.seedKey(userID, 0)
+	return key, rec.KeyID
+}
+
+// storedRevokedAt reads the revoked_at of the API key or PAT with the id
+// credentialID; nil when it is not revoked.
+func (h *testHub) storedRevokedAt(kind, credentialID string) *time.Time {
+	h.t.Helper()
+	ctx, db := context.Background(), h.st.Main()
+	if kind == "PAT" {
+		rec, err := identity.PATByID(ctx, db, credentialID)
+		if err != nil {
+			h.t.Fatalf("read PAT %s: %v", credentialID, err)
+		}
+		return rec.RevokedAt
+	}
+	rec, err := identity.APIKeyByID(ctx, db, credentialID)
+	if err != nil {
+		h.t.Fatalf("read API key %s: %v", credentialID, err)
+	}
+	return rec.RevokedAt
+}
+
 // revoke marks the API key or PAT with the id credentialID revoked now.
 func (h *testHub) revoke(credentialID string) {
 	h.exec(`UPDATE api_keys SET revoked_at = ? WHERE key_id = ?`, h.now().UnixNano(), credentialID)

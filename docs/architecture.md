@@ -662,6 +662,11 @@ elsewhere: it recognises the format, verifies an admin token with
 compares the SHA-256 of the presented secret with the stored hash with
 `crypto/subtle.ConstantTimeCompare`, against a fixed dummy hash when the id
 is unknown, so that an unknown id and a wrong secret take the same path.
+Only after the secret matched does it look at the credential's state, in
+this order: `revoked_at` set is `401 credential revoked`, the clock of
+`identity.Deps.Now` at or after `expires_at` is `401 credential expired`,
+and a user whose status is `blocked` is `403 user is blocked`. It reads the
+record and the user from the store on every call and caches nothing.
 It returns an `identity.Principal` (`Type` `admin`, `api_key` or `pat`,
 `CredentialID`, the `User`, and a PAT's `Permissions`, `Paths` and
 `Workspace`) or the `*server.Error` that answers the request. The

@@ -126,10 +126,16 @@ func (s *Service) Authenticate(r *http.Request) (server.Caller, error) {
 
 // VerifyCredential checks a credential given as a string, the same check
 // the Authorization header gets, for callers that read it from elsewhere.
-// It returns the credential's Principal, or the *server.Error that answers
-// it: 401 "authentication required" for a string of no known format, 401
-// "invalid credentials" for an unknown id, a wrong secret or an admin-format
-// token that is not the admin token. Any other error is the store's.
+// It returns the credential's Principal, or the *server.Error of the first
+// check that fails, in this order: 401 "authentication required" for a
+// string of no known format; 401 "invalid credentials" for an unknown id, a
+// wrong secret or an admin-format token that is not the admin token; then,
+// for an API key or PAT whose secret matched, 401 "credential revoked", 401
+// "credential expired" from expires_at on, and 403 "user is blocked". The
+// state is reported only after the secret matched, so that the id of a
+// credential alone tells nothing about it. The credential and its user are
+// read from the store on every call, so that a revocation, a block or an
+// unblock holds from the next request on. Any other error is the store's.
 func (s *Service) VerifyCredential(ctx context.Context, credential string) (Principal, error) {
 	c, ok := parseCredential(credential)
 	if !ok {
@@ -150,10 +156,16 @@ func (s *Service) VerifyCredential(ctx context.Context, credential string) (Prin
 		if err := checkSecret(c.secret, k.hash, err); err != nil {
 			return Principal{}, err
 		}
+		if err := s.checkState(k.RevokedAt, k.ExpiresAt); err != nil {
+			return Principal{}, err
+		}
 		return s.withUser(ctx, Principal{Type: TypeAPIKey, CredentialID: k.KeyID}, k.UserID)
 	default:
 		t, err := PATByID(ctx, s.deps.Store.Main(), c.id)
 		if err := checkSecret(c.secret, t.hash, err); err != nil {
+			return Principal{}, err
+		}
+		if err := s.checkState(t.RevokedAt, t.ExpiresAt); err != nil {
 			return Principal{}, err
 		}
 		p := Principal{Type: TypePAT, CredentialID: t.TokenID, Permissions: t.Permissions, Paths: t.Paths}
@@ -183,11 +195,27 @@ func checkSecret(secret, stored string, lookupErr error) error {
 	return nil
 }
 
-// withUser fills in the user the credential of p acts for.
+// checkState refuses a credential that is revoked, or expired: one whose
+// expires_at is not after the current time. A nil expiresAt never expires.
+func (s *Service) checkState(revokedAt, expiresAt *time.Time) error {
+	if revokedAt != nil {
+		return server.Unauthenticated("credential revoked")
+	}
+	if expiresAt != nil && !s.deps.Now().Before(*expiresAt) {
+		return server.Unauthenticated("credential expired")
+	}
+	return nil
+}
+
+// withUser fills in the user the credential of p acts for, and refuses a
+// blocked user without changing the credential.
 func (s *Service) withUser(ctx context.Context, p Principal, userID string) (Principal, error) {
 	u, err := UserByID(ctx, s.deps.Store.Main(), userID)
 	if err != nil {
 		return Principal{}, err
+	}
+	if u.Status == StatusBlocked {
+		return Principal{}, server.Forbidden("user is blocked")
 	}
 	p.User = &u
 	return p, nil
