@@ -231,6 +231,10 @@ func TestCreateUser_RefusesWhatIsTakenAndCreatesNothing(t *testing.T) {
 var userSelectorRoutes = []adminRoute{
 	{http.MethodGet, "/api/v1/users/:user", nil},
 	{http.MethodPatch, "/api/v1/users/:user", map[string]any{"full_name": "x"}},
+	{http.MethodPost, "/api/v1/users/:user/promote", nil},
+	{http.MethodPost, "/api/v1/users/:user/demote", nil},
+	{http.MethodPost, "/api/v1/users/:user/block", nil},
+	{http.MethodPost, "/api/v1/users/:user/unblock", nil},
 }
 
 // itemIDs returns the ids of the items of a list answer.
@@ -480,5 +484,164 @@ func TestUserSelectors_AnswerNotFoundForNoUserAndChangeNothing(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// post sends POST path without a body, with authorization as the
+// Authorization header.
+func (h *testHub) post(path, authorization string) response {
+	h.t.Helper()
+	return h.call(http.MethodPost, path, authorization, nil)
+}
+
+func TestPromoteAndDemote_SetTheRoleAndTheTimeOfTheChange(t *testing.T) {
+	t.Parallel()
+	h := newTeamHub(t)
+	before := withoutMembers(h.get("/api/v1/users/alice", h.admin).json, "role", "updated_at")
+	// In order: root's API key demotes alice while root is an active admin.
+	for _, c := range []struct{ verb, caller, role string }{
+		{"promote", h.admin, "admin"},
+		{"demote", h.ka, "user"},
+	} {
+		t.Run(c.verb, func(t *testing.T) {
+			h.advance(time.Hour)
+			r := h.post("/api/v1/users/alice/"+c.verb, c.caller)
+			if r.status != http.StatusOK || r.json["role"] != c.role {
+				t.Fatalf("POST /users/alice/%s = %d %s, want 200 with the role %s", c.verb, r.status, r.body, c.role)
+			}
+			if want := h.now().Format(time.RFC3339); r.json["updated_at"] != want {
+				t.Errorf("updated_at = %v, want %s", r.json["updated_at"], want)
+			}
+			if got := withoutMembers(r.json, "role", "updated_at"); !reflect.DeepEqual(got, before) {
+				t.Errorf("user = %v, want %v but for role and updated_at", got, before)
+			}
+			if got := h.get("/api/v1/users/alice", h.admin).json; !reflect.DeepEqual(got, r.json) {
+				t.Errorf("GET /users/alice = %v, want %v", got, r.json)
+			}
+		})
+	}
+}
+
+func TestBlockAndUnblock_SetTheStatusAndRevokeNoCredential(t *testing.T) {
+	t.Parallel()
+	h := newTeamHub(t)
+	before := withoutMembers(h.get("/api/v1/users/alice", h.admin).json, "status", "updated_at")
+	revoked := func() int {
+		return h.count(`SELECT count(*) FROM api_keys WHERE revoked_at IS NOT NULL`) +
+			h.count(`SELECT count(*) FROM pats WHERE revoked_at IS NOT NULL`)
+	}
+	// In order: alice's credentials are refused while she is blocked and
+	// pass again once she is unblocked.
+	for _, c := range []struct {
+		verb, status string
+		credentials  int
+	}{
+		{"block", "blocked", http.StatusForbidden},
+		{"unblock", "active", http.StatusOK},
+	} {
+		t.Run(c.verb, func(t *testing.T) {
+			h.advance(time.Hour)
+			r := h.post("/api/v1/users/alice/"+c.verb, h.admin)
+			if r.status != http.StatusOK || r.json["status"] != c.status || r.json["role"] != "user" {
+				t.Fatalf("POST /users/alice/%s = %d %s, want 200 with the status %s and the role user", c.verb,
+					r.status, r.body, c.status)
+			}
+			if want := h.now().Format(time.RFC3339); r.json["updated_at"] != want {
+				t.Errorf("updated_at = %v, want %s", r.json["updated_at"], want)
+			}
+			if got := withoutMembers(r.json, "status", "updated_at"); !reflect.DeepEqual(got, before) {
+				t.Errorf("user = %v, want %v but for status and updated_at", got, before)
+			}
+			if n := revoked(); n != 0 {
+				t.Errorf("%d credentials are revoked, want none", n)
+			}
+			for name, cred := range map[string]string{"API key": h.ku, "PAT": h.pu} {
+				if got := h.get("/api/v1/user", cred); got.status != c.credentials {
+					t.Errorf("GET /user with alice's %s = %d %s, want %d", name, got.status, got.body, c.credentials)
+				}
+			}
+		})
+	}
+}
+
+func TestRoleAndStatusChanges_AnswerTheUnchangedUserWhenNothingChanges(t *testing.T) {
+	t.Parallel()
+	h := newTeamHub(t)
+	mallory := h.createUser("mallory", identity.RoleUser)
+	h.setStatus(mallory.ID, identity.StatusBlocked)
+	for _, c := range []struct{ verb, username string }{
+		{"promote", "root"}, {"demote", "alice"}, {"block", "mallory"}, {"unblock", "alice"},
+	} {
+		t.Run(c.verb+" "+c.username, func(t *testing.T) {
+			before := h.get("/api/v1/users/"+c.username, h.admin).json
+			stored := h.snapshot()
+			h.advance(2 * time.Second)
+			r := h.post("/api/v1/users/"+c.username+"/"+c.verb, h.admin)
+			if r.status != http.StatusOK {
+				t.Fatalf("POST /users/%s/%s = %d %s, want 200", c.username, c.verb, r.status, r.body)
+			}
+			if !reflect.DeepEqual(r.json, before) {
+				t.Errorf("user = %v, want the unchanged %v", r.json, before)
+			}
+			if h.snapshot() != stored {
+				t.Errorf("the store changed")
+			}
+		})
+	}
+}
+
+func TestDemote_RefusesTheOnlyActiveAdmin(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		name string
+		// blockedAdmin is true when oscar, a blocked admin, exists.
+		blockedAdmin bool
+	}{
+		{"root is the only admin", false},
+		{"root and a blocked admin exist", true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			h := newTeamHub(t)
+			if c.blockedAdmin {
+				oscar := h.createUser("oscar", identity.RoleAdmin)
+				h.setStatus(oscar.ID, identity.StatusBlocked)
+			}
+			for name, caller := range map[string]string{"admin token": h.admin, "API key of root": h.ka} {
+				before := h.snapshot()
+				r := h.post("/api/v1/users/root/demote", caller)
+				checkRefusal(t, name, r, http.StatusConflict, "conflict", "the user is the only active admin")
+				if got := h.get("/api/v1/users/root", h.admin).json["role"]; got != "admin" {
+					t.Errorf("%s: root's role = %v, want admin", name, got)
+				}
+				if h.snapshot() != before {
+					t.Errorf("%s: the store changed", name)
+				}
+			}
+			if c.blockedAdmin {
+				if r := h.post("/api/v1/users/oscar/demote", h.admin); r.status != http.StatusOK || r.json["role"] != "user" {
+					t.Errorf("POST /users/oscar/demote = %d %s, want 200 with the role user", r.status, r.body)
+				}
+			}
+		})
+	}
+}
+
+func TestBlock_BlocksTheOnlyActiveAdmin(t *testing.T) {
+	t.Parallel()
+	h := newTeamHub(t)
+	r := h.post("/api/v1/users/root/block", h.admin)
+	if r.status != http.StatusOK || r.json["status"] != "blocked" || r.json["role"] != "admin" {
+		t.Fatalf("POST /users/root/block = %d %s, want 200 with the status blocked and the role admin", r.status, r.body)
+	}
+	if got := h.get("/api/v1/users", h.admin); got.status != http.StatusOK {
+		t.Errorf("GET /users with the admin token = %d %s, want 200", got.status, got.body)
+	}
+	r = h.post("/api/v1/users/root/unblock", h.admin)
+	if r.status != http.StatusOK || r.json["status"] != "active" {
+		t.Fatalf("POST /users/root/unblock = %d %s, want 200 with the status active", r.status, r.body)
+	}
+	if got := h.get("/api/v1/users", h.ka); got.status != http.StatusOK {
+		t.Errorf("GET /users with root's API key after the unblock = %d %s, want 200", got.status, got.body)
 	}
 }

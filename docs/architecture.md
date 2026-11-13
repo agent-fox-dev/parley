@@ -637,7 +637,9 @@ The service's routes are, so far, the public `GET /auth/providers` (see
 /auth/callback` (see [api.md](api.md#post-apiv1authcallback)), which is not
 a create route, the admin route `POST /users` (see
 [api.md](api.md#post-apiv1users)), a create route, the admin routes `GET /users`, `GET /users/:id`
-and `PATCH /users/:id` (see [api.md](api.md#get-apiv1users)), and the
+and `PATCH /users/:id` (see [api.md](api.md#get-apiv1users)), the admin
+routes `POST /users/:id/promote`, `/demote`, `/block` and `/unblock` (see
+[api.md](api.md#role-and-status-of-a-user)), and the
 caller's own profile, `GET /user` and `PATCH /user` (see
 [api.md](api.md#get-apiv1user)), which need a user.
 `(*identity.Service).Routes()` in `internal/identity/routes.go` returns
@@ -812,6 +814,21 @@ in the same `(*store.Store).Tx`. `GET /users` reads one page with
 `ORDER BY created_at DESC, id DESC`, continuing after the position
 `{created_at in nanoseconds, id}` that the cursor of `server.ReadPage`
 carries, and writes it with `server.WritePage`.
+
+Promote, demote, block and unblock (`setRole` and `setStatus` in
+`handlers_users.go`) go through `changeUser`, which resolves the selector
+and applies the change in one `(*store.Store).Tx`. A user who already has
+the requested role or status is answered as read, without a write, so
+`updated_at` stays; otherwise `updateRole` or `updateStatus` in `users.go`
+sets the column and `updated_at` (from `Deps.Now`). No credential is
+touched: authentication refuses a blocked user's credentials on its own.
+The last-admin guard is `guardLastAdmin(ctx, tx, u)` in `users.go`: it
+returns the conflict `the user is the only active admin` when `u` has the
+role `admin` and the status `active` and no other user has both, and nil
+otherwise. Demote calls it before `updateRole`, in the same transaction
+that read `u`; since the store admits one writer at a time, the count and
+the change cannot interleave with another demotion or deletion. Block has
+no guard.
 
 `GET /user` and `PATCH /user`, in `internal/identity/handlers_user.go`,
 carry the mark `identity.MarkNeedsUser` and declare the scopes `users:read`

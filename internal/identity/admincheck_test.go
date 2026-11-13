@@ -23,6 +23,10 @@ var adminRoutes = []adminRoute{
 	{http.MethodGet, "/api/v1/users", nil},
 	{http.MethodGet, "/api/v1/users/:user", nil},
 	{http.MethodPatch, "/api/v1/users/:user", map[string]any{"full_name": "x"}},
+	{http.MethodPost, "/api/v1/users/:user/promote", nil},
+	{http.MethodPost, "/api/v1/users/:user/demote", nil},
+	{http.MethodPost, "/api/v1/users/:user/block", nil},
+	{http.MethodPost, "/api/v1/users/:user/unblock", nil},
 }
 
 // newUserBody is a POST /users body for a user no team hub has.

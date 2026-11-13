@@ -1,6 +1,7 @@
 package identity
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -20,6 +21,10 @@ func (s *Service) userRoutes() []server.Route {
 		{Method: http.MethodGet, Pattern: "/users", Marks: adminMark, Handler: s.listUsers},
 		{Method: http.MethodGet, Pattern: "/users/:id", Marks: adminMark, Handler: s.getUser},
 		{Method: http.MethodPatch, Pattern: "/users/:id", Marks: adminMark, Handler: s.updateUser},
+		{Method: http.MethodPost, Pattern: "/users/:id/promote", Marks: adminMark, Handler: s.setRole(RoleAdmin)},
+		{Method: http.MethodPost, Pattern: "/users/:id/demote", Marks: adminMark, Handler: s.setRole(RoleUser)},
+		{Method: http.MethodPost, Pattern: "/users/:id/block", Marks: adminMark, Handler: s.setStatus(StatusBlocked)},
+		{Method: http.MethodPost, Pattern: "/users/:id/unblock", Marks: adminMark, Handler: s.setStatus(StatusActive)},
 	}
 }
 
@@ -168,4 +173,67 @@ func stringMember(body map[string]json.RawMessage, name string) (string, bool, e
 		return "", true, server.InvalidRequest(name + " must be a string")
 	}
 	return v, true, nil
+}
+
+// setRole answers promote (role admin) and demote (role user): it gives the
+// user the selector names the role, with updated_at the time of the change,
+// and answers 200 with the User object. A user who has the role already is
+// answered as stored, and nothing is written. A demotion of the only active
+// admin is 409 conflict.
+func (s *Service) setRole(role string) server.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) error {
+		return s.changeUser(w, r, func(ctx context.Context, tx *sql.Tx, u User) (User, error) {
+			if u.Role == role {
+				return u, nil
+			}
+			if err := guardLastAdmin(ctx, tx, u); err != nil {
+				return User{}, err
+			}
+			return updateRole(ctx, tx, u.ID, role, s.deps.Now())
+		})
+	}
+}
+
+// setStatus answers block (status blocked) and unblock (status active): it
+// gives the user the selector names the status, with updated_at the time of
+// the change, and answers 200 with the User object. A user who has the
+// status already is answered as stored, and nothing is written. Blocking
+// has no last-admin guard, because the admin token can always unblock.
+func (s *Service) setStatus(status string) server.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) error {
+		return s.changeUser(w, r, func(ctx context.Context, tx *sql.Tx, u User) (User, error) {
+			if u.Status == status {
+				return u, nil
+			}
+			return updateStatus(ctx, tx, u.ID, status, s.deps.Now())
+		})
+	}
+}
+
+// changeUser reads the user the selector names and applies change to it in
+// one write transaction, and answers 200 with the user change returns. No
+// user is 404 not_found, and a conflict of change is 409 conflict.
+func (s *Service) changeUser(w http.ResponseWriter, r *http.Request,
+	change func(ctx context.Context, tx *sql.Tx, u User) (User, error)) error {
+	ctx := r.Context()
+	var u User
+	err := s.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+		target, err := UserBySelector(ctx, tx, server.Param(r, "id"))
+		if err != nil {
+			return err
+		}
+		u, err = change(ctx, tx, target)
+		return err
+	})
+	if errors.Is(err, ErrNotFound) {
+		return errUserNotFound()
+	}
+	if ce := (conflictError{}); errors.As(err, &ce) {
+		return server.Conflict(ce.msg)
+	}
+	if err != nil {
+		return err
+	}
+	server.WriteJSON(w, http.StatusOK, u)
+	return nil
 }

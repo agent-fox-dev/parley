@@ -91,3 +91,54 @@ func updateFullName(ctx context.Context, tx *sql.Tx, id, fullName string, now ti
 	}
 	return UserByID(ctx, tx, id)
 }
+
+// errLastAdmin refuses a change that would leave the hub without an active
+// admin user.
+var errLastAdmin = conflictError{"the user is the only active admin"}
+
+// guardLastAdmin returns a conflict, errLastAdmin, when u has the role admin
+// and the status active and no other user has both, and nil otherwise. A
+// change that takes u out of the active admins, a demotion or a deletion,
+// calls it in the write transaction tx that makes the change, with u read
+// in tx: the store admits one writer at a time, so no other change can
+// make the count stale between the check and the change.
+func guardLastAdmin(ctx context.Context, tx *sql.Tx, u User) error {
+	if u.Role != RoleAdmin || u.Status != StatusActive {
+		return nil
+	}
+	var others int
+	err := tx.QueryRowContext(ctx, `SELECT count(*) FROM users WHERE role = ? AND status = ? AND id <> ?`,
+		RoleAdmin, StatusActive, u.ID).Scan(&others)
+	if err != nil {
+		return fmt.Errorf("count the active admins: %w", err)
+	}
+	if others == 0 {
+		return errLastAdmin
+	}
+	return nil
+}
+
+// updateRole stores role as the role of the user id in tx, with updated_at
+// now, and returns the stored user, or ErrNotFound when there is no such
+// user.
+func updateRole(ctx context.Context, tx *sql.Tx, id, role string, now time.Time) (User, error) {
+	_, err := tx.ExecContext(ctx, `UPDATE users SET role = ?, updated_at = ? WHERE id = ?`,
+		role, now.UTC().UnixNano(), id)
+	if err != nil {
+		return User{}, fmt.Errorf("store the role: %w", err)
+	}
+	return UserByID(ctx, tx, id)
+}
+
+// updateStatus stores status as the status of the user id in tx, with
+// updated_at now, and returns the stored user, or ErrNotFound when there is
+// no such user. The user's credentials are left as they are: Authenticate
+// refuses those of a blocked user, and they pass again once it is active.
+func updateStatus(ctx context.Context, tx *sql.Tx, id, status string, now time.Time) (User, error) {
+	_, err := tx.ExecContext(ctx, `UPDATE users SET status = ?, updated_at = ? WHERE id = ?`,
+		status, now.UTC().UnixNano(), id)
+	if err != nil {
+		return User{}, fmt.Errorf("store the status: %w", err)
+	}
+	return UserByID(ctx, tx, id)
+}

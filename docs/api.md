@@ -630,7 +630,9 @@ every request: an API key whose user loses the role `admin` is refused from
 its next request on, and one whose user gains it passes.
 
 The admin routes so far: `POST /api/v1/users`, `GET /api/v1/users`,
-`GET /api/v1/users/{id}` and `PATCH /api/v1/users/{id}`.
+`GET /api/v1/users/{id}`, `PATCH /api/v1/users/{id}`,
+`POST /api/v1/users/{id}/promote`, `POST /api/v1/users/{id}/demote`,
+`POST /api/v1/users/{id}/block` and `POST /api/v1/users/{id}/unblock`.
 
 ## User selectors
 
@@ -754,4 +756,48 @@ to the time of the change and answers the updated User object.
 
 ```json
 {"full_name":"Alice B."}
+```
+
+## Role and status of a user
+
+`POST /api/v1/users/{id}/promote`, `POST /api/v1/users/{id}/demote`,
+`POST /api/v1/users/{id}/block` and `POST /api/v1/users/{id}/unblock`
+change the role or the status of the user `{id}` names (see
+[User selectors](#user-selectors)). They are admin routes (see
+[Admin routes](#admin-routes)) and read no body.
+
+| Route | Sets |
+|---|---|
+| `POST /api/v1/users/{id}/promote` | the role `admin` |
+| `POST /api/v1/users/{id}/demote` | the role `user` |
+| `POST /api/v1/users/{id}/block` | the status `blocked` |
+| `POST /api/v1/users/{id}/unblock` | the status `active` |
+
+The hub sets `updated_at` to the time of the change and answers the
+updated User object; every other member is unchanged. A user who already
+has the requested role or status is answered as stored, `updated_at`
+included, and nothing changes.
+
+Blocking and unblocking revoke and restore no credential. While a user is
+blocked, every API key and PAT of the user is answered `403` `forbidden`
+(`user is blocked`, see [Authentication](#authentication)); once the user
+is unblocked, the same credentials pass again.
+
+The hub never loses its last active admin to a demotion: demoting the only
+user with both the role `admin` and the status `active` is `409` `conflict`,
+and the role stays `admin`. Blocked admins do not count. The count and the
+demotion run in one write transaction, so of two concurrent demotions of
+the last two active admins one is refused. Blocking has no such
+safeguard, because the admin token can always unblock: blocking the only
+active admin answers `200`.
+
+| Status | When |
+|---|---|
+| `200 OK` | the role or status is set, or was already; the body is the User object |
+| `403` `forbidden` | the caller is not an admin (see [Admin routes](#admin-routes)) |
+| `404` `not_found` | no user has that id, e-mail or username (`user not found`) |
+| `409` `conflict` | demote only: the user is the only active admin (`the user is the only active admin`). The role is unchanged. |
+
+```json
+{"error":{"code":409,"message":"the user is the only active admin","error_type":"conflict"}}
 ```
