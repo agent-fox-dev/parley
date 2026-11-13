@@ -436,6 +436,12 @@ appends it there ([ADR 01](adr/01-compose-the-hub-in-one-package.md)).
 | `AddRoute(server.Route)`, `Handle(pattern, handler)` | REST routes and surfaces outside the REST API |
 | `SetAuthenticator`, `SetBindingGuard`, `SetScopeCheck`, `AddAccessCheck` | the checks of the pipeline's positions |
 
+The composition also keeps the identity service in its unexported field
+`identity`, which `composeIdentity` sets. A part listed after it that keeps
+data for a user or an org registers the remover of that data there, with
+`c.identity.RegisterUserRemover` or `c.identity.RegisterOrgRemover`
+([ADR 03](adr/03-register-removers-of-owned-data-on-the-identity-service.md)).
+
 `hub.Runtime` holds the loaded `*config.Config`, the open `*store.Store`, the
 `*slog.Logger`, the `*scrub.Scrubber` and the clock `Now`. Start hooks,
 maintenance tasks and background work receive it; a route handler or a check keeps
@@ -900,6 +906,37 @@ which the caller is a member through `listOrgs(ctx, q, includeBlocked,
 memberID, after, limit)`, the reader of `GET /orgs`, whose `memberID` limits
 the list to that user's orgs. `pageAfter[T](page)` decodes a page's
 position for these lists.
+
+`POST /orgs/:id/block` and `/unblock` (`setOrgStatus` in
+`handlers_orgs.go`) are admin routes: in one `(*store.Store).Tx` they
+resolve the selector and, unless the org has the requested status already,
+call `updateOrgStatus(ctx, tx, id, status, now)` in `orgs.go`, which sets
+`status` and `updated_at` and leaves the memberships alone; an org that has
+the status is answered as read, so `updated_at` stays. A blocked org leaves
+`GET /user/orgs` and the default `GET /orgs` because both lists read
+`status = 'active'`, and `visibleOrg` answers it to admins only.
+`GET /orgs/:id` and `GET /orgs/:id/members` both go through `visibleOrg`, so
+a missing org, an org of which the caller is no member and a blocked org of
+which it is a member get one and the same `errOrgNotFound()`.
+
+`DELETE /orgs/:id` (`deleteOrg` in `handlers_orgs.go`) is an admin route.
+In one `(*store.Store).Tx` it resolves the selector (`errOrgNotFound()`
+before anything else), calls the org removers, then `deleteOrg(ctx, tx,
+id)` in `orgs.go`, which deletes the org's memberships and the org; users
+are never touched, so the owner and the members stay. A remover is an
+`identity.Remover`, `func(ctx context.Context, tx *sql.Tx, id string)
+error`, registered on the service with
+`(*identity.Service).RegisterOrgRemover` or `RegisterUserRemover` in
+`internal/identity/removers.go`, and kept in registration order under a
+mutex ([ADR 03](adr/03-register-removers-of-owned-data-on-the-identity-service.md)).
+`removeOrgData` calls the org removers in order with the delete's
+transaction and the org's id and stops at the first error, which
+`callRemovers` returns as text only, not wrapped, so that whatever a
+remover returns the delete answers `500 internal` and the transaction rolls
+back, with everything earlier removers wrote through it. A package that
+keeps data for a user or an org registers its remover from its part in
+`internal/hub` through the `identity` field of `hub.Composition`, which
+`composeIdentity` sets.
 
 ### The logger
 

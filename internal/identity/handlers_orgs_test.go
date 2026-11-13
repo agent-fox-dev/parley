@@ -30,10 +30,37 @@ var orgSelectorRoutes = []adminRoute{
 	{http.MethodGet, "/api/v1/orgs/:org/members", nil},
 	{http.MethodDelete, "/api/v1/orgs/:org/members/alice", nil},
 	{http.MethodPut, "/api/v1/orgs/:org/members/alice", nil},
+	{http.MethodPost, "/api/v1/orgs/:org/block", nil},
+	{http.MethodPost, "/api/v1/orgs/:org/unblock", nil},
+	{http.MethodDelete, "/api/v1/orgs/:org", nil},
 }
 
 // membershipRoute reports whether rt adds or removes a membership.
 func membershipRoute(rt adminRoute) bool { return strings.Contains(rt.path, "/members/") }
+
+// orgDeleteRoute reports whether rt deletes the org.
+func orgDeleteRoute(rt adminRoute) bool {
+	return rt.method == http.MethodDelete && !membershipRoute(rt)
+}
+
+// deletesAcme sends the org delete at path as the admin token and reports
+// unless the answer is 204 without a body and the org acme, whose id is
+// acme, is gone: its going shows that the selector reached it. It then
+// stores acme again, with the same id and root as its member, so that the
+// next request finds it.
+func (h teamHub) deletesAcme(t *testing.T, acme, path string) {
+	t.Helper()
+	if r := h.call(http.MethodDelete, path, h.admin, nil); r.status != http.StatusNoContent || len(r.body) != 0 {
+		t.Errorf("answer = %d %s, want 204 without a body", r.status, r.body)
+	}
+	if n := h.count(`SELECT count(*) FROM orgs WHERE id = ?`, acme); n != 0 {
+		t.Errorf("acme is still there")
+	}
+	now := h.now().UnixNano()
+	h.exec(`INSERT OR IGNORE INTO orgs (id, name, slug, status, created_at, updated_at) VALUES (?, 'Acme Inc', 'acme', 'active', ?, ?)`,
+		acme, now, now)
+	h.setMember(acme, h.root.ID, true)
+}
 
 // reachesAliceInAcme sends the membership route rt, at path, as the admin
 // token, with alice a member of the org acme before a DELETE and not one
@@ -436,6 +463,10 @@ func TestOrgSelectors_ReachTheSameOrgByIdOrSlug(t *testing.T) {
 					h.reachesAliceInAcme(t, rt, id, path)
 					return
 				}
+				if orgDeleteRoute(rt) {
+					h.deletesAcme(t, id, path)
+					return
+				}
 				r := h.call(rt.method, path, h.admin, rt.body)
 				if ids := answeredOrgIDs(t, r); r.status != http.StatusOK || len(ids) == 0 || slices.ContainsFunc(ids, func(got string) bool { return got != id }) {
 					t.Errorf("answer = %d %s, want 200 about acme's id %s alone", r.status, r.body, id)
@@ -635,4 +666,141 @@ func TestRemoveMember_AnswersNotFoundForNoMembershipAndChangesNothing(t *testing
 	}
 	r = h.call(http.MethodDelete, "/api/v1/orgs/acme/members/alice", h.admin, nil)
 	checkRefusal(t, "DELETE of the membership just deleted", r, http.StatusNotFound, "not_found", "membership not found")
+}
+
+func TestOrgReads_AnswerOneNotFoundForAMissingAForeignAndABlockedOrg(t *testing.T) {
+	t.Parallel()
+	h := newTeamHub(t)
+	blocked := h.seedOrg("Blocked Co", "blocked-co")
+	h.addMember(blocked, h.alice.ID)
+	h.setOrgStatus(blocked, identity.StatusBlocked)
+	h.seedOrg("Other", "other")
+	for _, route := range []string{"/api/v1/orgs/%s", "/api/v1/orgs/%s/members"} {
+		for name, caller := range map[string]string{"API key of a user": h.ku, "PAT of a user": h.pu, "PAT of an admin": h.pa} {
+			t.Run(route+"/"+name, func(t *testing.T) {
+				missing := h.get(fmt.Sprintf(route, "nope"), caller)
+				checkRefusal(t, "a missing org", missing, http.StatusNotFound, "not_found", "org not found")
+				for what, slug := range map[string]string{"an org of which the caller is no member": "other",
+					"a blocked org of which the caller is a member": "blocked-co"} {
+					if caller == h.pa && slug == "blocked-co" {
+						continue // root is no member of blocked-co
+					}
+					r := h.get(fmt.Sprintf(route, slug), caller)
+					if r.status != missing.status || string(r.body) != string(missing.body) {
+						t.Errorf("%s: answer = %d %s, want the answer for a missing org, %d %s", what, r.status, r.body,
+							missing.status, missing.body)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestBlockAndUnblockOrg_SetTheStatusAndKeepTheMembers(t *testing.T) {
+	t.Parallel()
+	h := newTeamHub(t)
+	acme := h.seedOrg("Acme Inc", "acme")
+	h.addMember(acme, h.alice.ID)
+	listed := func(t *testing.T) (byAlice, byAdmin bool) {
+		t.Helper()
+		byAlice = slices.Contains(itemMember(t, h.get("/api/v1/user/orgs", h.ku), "slug"), "acme")
+		byAdmin = slices.Contains(itemMember(t, h.get("/api/v1/orgs?limit=200", h.admin), "slug"), "acme")
+		return byAlice, byAdmin
+	}
+	for _, c := range []struct {
+		verb, caller, status string
+		listed               bool
+	}{
+		{"block", h.admin, "blocked", false},
+		{"unblock", h.ka, "active", true},
+	} {
+		t.Run(c.verb, func(t *testing.T) {
+			h.advance(time.Minute)
+			r := h.call(http.MethodPost, "/api/v1/orgs/acme/"+c.verb, c.caller, nil)
+			if r.status != http.StatusOK {
+				t.Fatalf("POST /orgs/acme/%s = %d %s, want 200", c.verb, r.status, r.body)
+			}
+			if got := slices.Sorted(maps.Keys(r.json)); !slices.Equal(got, orgMembers) {
+				t.Errorf("members = %v, want %v", got, orgMembers)
+			}
+			if r.json["id"] != acme || r.json["status"] != c.status || r.json["updated_at"] != h.now().Format(time.RFC3339) {
+				t.Errorf("org = %s, want acme with the status %s, updated at %s", r.body, c.status, h.now().Format(time.RFC3339))
+			}
+			if byAlice, byAdmin := listed(t); byAlice != c.listed || byAdmin != c.listed {
+				t.Errorf("acme listed by alice's GET /user/orgs: %t, by GET /orgs: %t, want %t", byAlice, byAdmin, c.listed)
+			}
+			if got := itemMember(t, h.get("/api/v1/orgs/acme/members", h.admin), "username"); !slices.Equal(got, []string{"alice"}) {
+				t.Errorf("members of acme = %v, want [alice]", got)
+			}
+		})
+	}
+}
+
+func TestOrgStatusChanges_AnswerTheUnchangedOrgWhenNothingChanges(t *testing.T) {
+	t.Parallel()
+	h := newTeamHub(t)
+	h.seedOrg("Acme Inc", "acme")
+	h.setOrgStatus(h.seedOrg("Blocked Co", "blocked-co"), identity.StatusBlocked)
+	for _, c := range []struct{ verb, slug string }{{"block", "blocked-co"}, {"unblock", "acme"}} {
+		t.Run(c.verb+" "+c.slug, func(t *testing.T) {
+			before, stored := h.get("/api/v1/orgs/"+c.slug, h.admin).json, h.snapshot()
+			h.advance(2 * time.Second)
+			r := h.call(http.MethodPost, "/api/v1/orgs/"+c.slug+"/"+c.verb, h.admin, nil)
+			if r.status != http.StatusOK || !reflect.DeepEqual(r.json, before) {
+				t.Errorf("answer = %d %s, want 200 with %v", r.status, r.body, before)
+			}
+			if h.snapshot() != stored {
+				t.Errorf("the store changed")
+			}
+		})
+	}
+}
+
+func TestDeleteOrg_DeletesTheOrgAndItsMembershipsAndKeepsTheUsers(t *testing.T) {
+	t.Parallel()
+	h := newTeamHub(t)
+	bob := h.createUser("bob", identity.RoleUser)
+	acme := h.seedOrg("Acme Inc", "acme")
+	h.addMember(acme, h.alice.ID)
+	h.addMember(acme, bob.ID)
+	blocked := h.seedOrg("Blocked Co", "blocked-co")
+	h.addMember(blocked, h.alice.ID)
+	h.setOrgStatus(blocked, identity.StatusBlocked)
+	for _, c := range []struct {
+		name, slug string
+		members    []string
+	}{
+		{"an org with members", "acme", []string{"alice", "bob"}},
+		{"a personal org", "alice", []string{"alice"}},
+		{"a blocked org", "blocked-co", []string{"alice"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			o := h.get("/api/v1/orgs/"+c.slug, h.admin).json
+			id, name := o["id"].(string), o["name"].(string)
+			if n := len(h.membershipsOf(id)); n != len(c.members) {
+				t.Fatalf("%s has %d members before the delete, want %d", c.slug, n, len(c.members))
+			}
+			r := h.call(http.MethodDelete, "/api/v1/orgs/"+c.slug, h.admin, nil)
+			if r.status != http.StatusNoContent || len(r.body) != 0 {
+				t.Fatalf("DELETE /orgs/%s = %d %s, want 204 without a body", c.slug, r.status, r.body)
+			}
+			for _, sel := range []string{c.slug, id} {
+				checkRefusal(t, "GET /orgs/"+sel, h.get("/api/v1/orgs/"+sel, h.admin), http.StatusNotFound, "not_found", "org not found")
+			}
+			if slugs := itemMember(t, h.get("/api/v1/user/orgs", h.ku), "slug"); slices.Contains(slugs, c.slug) {
+				t.Errorf("alice's orgs = %v, want no %s", slugs, c.slug)
+			}
+			if ms := h.membershipsOf(id); len(ms) != 0 {
+				t.Errorf("memberships of the deleted org = %v, want none", ms)
+			}
+			for _, member := range c.members {
+				if u := h.get("/api/v1/users/"+member, h.admin); u.status != http.StatusOK {
+					t.Errorf("GET /users/%s = %d %s, want 200", member, u.status, u.body)
+				}
+			}
+			if r := h.call(http.MethodPost, "/api/v1/orgs", h.admin, newOrgBody(name, c.slug)); r.status != http.StatusCreated {
+				t.Errorf("POST /orgs with the deleted org's name and slug = %d %s, want 201", r.status, r.body)
+			}
+		})
+	}
 }

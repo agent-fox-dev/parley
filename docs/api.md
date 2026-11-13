@@ -651,8 +651,10 @@ The admin routes so far: `POST /api/v1/users`, `GET /api/v1/users`,
 `POST /api/v1/users/{id}/promote`, `POST /api/v1/users/{id}/demote`,
 `POST /api/v1/users/{id}/block`, `POST /api/v1/users/{id}/unblock`,
 `POST /api/v1/orgs`, `GET /api/v1/orgs`, `PATCH /api/v1/orgs/{id}`,
-`PUT /api/v1/orgs/{id}/members/{user_id}` and
-`DELETE /api/v1/orgs/{id}/members/{user_id}`. `GET /api/v1/orgs/{id}` and
+`PUT /api/v1/orgs/{id}/members/{user_id}`,
+`DELETE /api/v1/orgs/{id}/members/{user_id}`,
+`POST /api/v1/orgs/{id}/block`, `POST /api/v1/orgs/{id}/unblock` and
+`DELETE /api/v1/orgs/{id}`. `GET /api/v1/orgs/{id}` and
 `GET /api/v1/orgs/{id}/members` are not: a member reads an org and its
 member list too (see [`GET /api/v1/orgs/{id}`](#get-apiv1orgsid)).
 
@@ -1004,3 +1006,52 @@ also when the user removed is the owner: the owner is informational.
 ```json
 {"error":{"code":404,"message":"membership not found","error_type":"not_found"}}
 ```
+
+## Status of an org
+
+`POST /api/v1/orgs/{id}/block` sets the status `blocked` and
+`POST /api/v1/orgs/{id}/unblock` the status `active` on the org `{id}`
+names (see [Org selectors](#org-selectors)). Both are admin routes (see
+[Admin routes](#admin-routes)) and read no body.
+
+The hub sets `updated_at` to the time of the change and answers the
+updated Org object; every other member is unchanged. An org that already
+has the requested status is answered as stored, `updated_at` included, and
+nothing changes.
+
+The memberships of a blocked org are kept. While it is blocked, the org is
+left out of its members' [`GET /api/v1/user/orgs`](#get-apiv1userorgs) and
+of [`GET /api/v1/orgs`](#get-apiv1orgs) without `include_blocked=true`, and
+only an admin reads it and its member list (see
+[`GET /api/v1/orgs/{id}`](#get-apiv1orgsid)). Once it is unblocked, it is
+listed in both again, with the same members.
+
+| Status | When |
+|---|---|
+| `200 OK` | the status is set, or was already; the body is the Org object |
+| `403` `forbidden` | the caller is not an admin (see [Admin routes](#admin-routes)) |
+| `404` `not_found` | no org has that id or slug (`org not found`) |
+
+## `DELETE /api/v1/orgs/{id}`
+
+Deletes the org `{id}` names (see [Org selectors](#org-selectors)), a
+personal org or a blocked one included. An admin route (see
+[Admin routes](#admin-routes)).
+
+The org and all its memberships are deleted in one transaction. The users
+who were its members or its owner are kept. Afterwards the org is `404`
+`not_found` by its id and by its slug, for admins too, it is gone from its
+former members' [`GET /api/v1/user/orgs`](#get-apiv1userorgs), and a new
+org may take its name and its slug.
+
+Data that other parts of the hub keep for the org is removed in the same
+transaction (see [ADR 03](adr/03-register-removers-of-owned-data-on-the-identity-service.md)).
+When that removal fails, the delete is undone as a whole, and the answer is
+`500` `internal`.
+
+| Status | When |
+|---|---|
+| `204 No Content` | the org was deleted; the body is empty |
+| `403` `forbidden` | the caller is not an admin (see [Admin routes](#admin-routes)) |
+| `404` `not_found` | no org has that id or slug (`org not found`). Nothing changes. |
+| `500` `internal` | removing data another part of the hub keeps for the org failed (`internal error`). Nothing changes. |

@@ -22,7 +22,70 @@ func (s *Service) orgRoutes() []server.Route {
 		{Method: http.MethodGet, Pattern: "/orgs/:id/members", Scope: "orgs:read", Handler: s.listMembers},
 		{Method: http.MethodPut, Pattern: "/orgs/:id/members/:user_id", Marks: adminMark, Handler: s.addMember},
 		{Method: http.MethodDelete, Pattern: "/orgs/:id/members/:user_id", Marks: adminMark, Handler: s.removeMember},
+		{Method: http.MethodPost, Pattern: "/orgs/:id/block", Marks: adminMark, Handler: s.setOrgStatus(StatusBlocked)},
+		{Method: http.MethodPost, Pattern: "/orgs/:id/unblock", Marks: adminMark, Handler: s.setOrgStatus(StatusActive)},
+		{Method: http.MethodDelete, Pattern: "/orgs/:id", Marks: adminMark, Handler: s.deleteOrg},
 	}
+}
+
+// setOrgStatus answers block (status blocked) and unblock (status active):
+// it sets the status of the org the selector names, with updated_at the
+// time of the change, and answers 200 with the Org object. The memberships
+// are kept. An org that has the status already is answered as stored, and
+// nothing is written, so updated_at stays.
+func (s *Service) setOrgStatus(status string) server.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) error {
+		ctx := r.Context()
+		var o Org
+		err := s.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+			target, err := OrgBySelector(ctx, tx, server.Param(r, "id"))
+			if err != nil {
+				return err
+			}
+			if target.Status == status {
+				o = target
+				return nil
+			}
+			o, err = updateOrgStatus(ctx, tx, target.ID, status, s.deps.Now())
+			return err
+		})
+		if errors.Is(err, ErrNotFound) {
+			return errOrgNotFound()
+		}
+		if err != nil {
+			return err
+		}
+		server.WriteJSON(w, http.StatusOK, o)
+		return nil
+	}
+}
+
+// deleteOrg answers DELETE /orgs/:id: in one store transaction it calls
+// the org removers with the id of the org the selector names, then deletes
+// its memberships and the org, a personal or a blocked one included, and
+// answers 204. The users who were members or owner are kept. A selector
+// that names no org calls no remover; a remover's error rolls the whole
+// delete back and is answered 500 internal.
+func (s *Service) deleteOrg(w http.ResponseWriter, r *http.Request) error {
+	ctx := r.Context()
+	err := s.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+		o, err := OrgBySelector(ctx, tx, server.Param(r, "id"))
+		if errors.Is(err, ErrNotFound) {
+			return errOrgNotFound()
+		}
+		if err != nil {
+			return err
+		}
+		if err := s.removeOrgData(ctx, tx, o.ID); err != nil {
+			return err
+		}
+		return deleteOrg(ctx, tx, o.ID)
+	})
+	if err != nil {
+		return err
+	}
+	w.WriteHeader(http.StatusNoContent)
+	return nil
 }
 
 // errOrgNotFound answers a selector that names no org, and an org the

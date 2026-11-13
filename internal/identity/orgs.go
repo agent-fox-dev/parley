@@ -329,3 +329,26 @@ func removeMembership(ctx context.Context, tx *sql.Tx, orgID, userID string) err
 	}
 	return nil
 }
+
+// updateOrgStatus stores status as the status of the org id in tx, with
+// updated_at now, and returns the stored org. The memberships are kept.
+func updateOrgStatus(ctx context.Context, tx *sql.Tx, id, status string, now time.Time) (Org, error) {
+	_, err := tx.ExecContext(ctx, `UPDATE orgs SET status = ?, updated_at = ? WHERE id = ?`,
+		status, now.UTC().UnixNano(), id)
+	if err != nil {
+		return Org{}, fmt.Errorf("store the status of the org: %w", err)
+	}
+	return OrgByID(ctx, tx, id)
+}
+
+// deleteOrg deletes the org id and its memberships in tx. Its members and
+// its owner are kept.
+func deleteOrg(ctx context.Context, tx *sql.Tx, id string) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM memberships WHERE org_id = ?`, id); err != nil {
+		return fmt.Errorf("delete the memberships of the org: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM orgs WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("delete the org: %w", err)
+	}
+	return nil
+}

@@ -14,9 +14,11 @@ import (
 // /auth/providers, POST /auth/callback and the admin route POST /users. The
 // service gets its store, clock and configuration in a start hook, which
 // runs before the hub serves its first request, with the client that reads
-// a user's identity from the configured providers at login.
+// a user's identity from the configured providers at login. The service is
+// kept on the composition, where later parts register their removers.
 func composeIdentity(c *Composition) {
 	svc := &identity.Service{}
+	c.identity = svc
 	c.AddSchemaStep(identity.SchemaStep)
 	c.AddStartHook("identity", func(_ context.Context, rt *Runtime) error {
 		svc.Bind(identity.Deps{

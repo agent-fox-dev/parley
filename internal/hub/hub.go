@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/config"
+	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/maintenance"
 	"github.com/agent-fox-dev/parley/internal/scrub"
 	"github.com/agent-fox-dev/parley/internal/server"
@@ -129,6 +130,13 @@ type Composition struct {
 	runtime       *Runtime
 	shutdown      chan struct{}
 	errs          []error
+
+	// identity is the identity service composeIdentity creates. A part
+	// that runs after it and keeps data for a user or an org registers its
+	// remover here, with RegisterUserRemover or RegisterOrgRemover, so
+	// that the delete of the user or the org removes that data in its own
+	// transaction (docs/adr/03-register-removers-of-owned-data-on-the-identity-service.md).
+	identity *identity.Service
 }
 
 func newComposition() *Composition {
