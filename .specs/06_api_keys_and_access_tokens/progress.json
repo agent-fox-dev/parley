@@ -3,11 +3,11 @@
   "spec_id": "06",
   "spec_name": "api_keys_and_access_tokens",
   "schema_version": 3,
-  "updated_at": "",
+  "updated_at": "2026-11-13T18:18:42Z",
   "tasks": [
     {
       "id": 1,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 2,

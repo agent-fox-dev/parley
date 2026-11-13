@@ -26,8 +26,8 @@ import (
 )
 
 // testHub is the request pipeline of internal/server with the identity
-// service, its admin check and its routes installed, as the hub composes
-// them, over a store in t.TempDir(), served
+// service, the scope check, the admin check and the service's routes
+// installed, as the hub composes them, over a store in t.TempDir(), served
 // in-process. It also registers two non-public test routes: GET
 // /api/v1/test/whoami answers the caller's Principal, and GET
 // /api/v1/test/me, declared as needing a user, answers 200. Both count
@@ -125,6 +125,7 @@ func newTestHub(t *testing.T, opts ...hubOption) *testHub {
 	h.svc.Bind(identity.Deps{Store: st, Now: h.now, Providers: cfg.providers, ExternalURL: cfg.externalURL, Client: client})
 	h.srv = server.New(server.Options{Logger: slog.New(slog.DiscardHandler), RateLimitDisabled: true, Now: h.now})
 	h.srv.SetAuthenticator(h.svc.Authenticate)
+	h.srv.SetScopeCheck(identity.ScopeCheck)
 	h.srv.AddAccessCheck(h.svc.AdminCheck)
 	for _, r := range h.svc.Routes() {
 		h.srv.Register(r)
@@ -506,7 +507,7 @@ func checkRefusal(t *testing.T, what string, r response, status int, errorType, 
 }
 
 // everyScope is every scope a route of the identity service declares, so
-// that a PAT holding them passes any scope check a test installs.
+// that a PAT holding them passes the scope check of every identity route.
 var everyScope = []string{"users:read", "users:write", "orgs:read"}
 
 // teamHub is a bootstrapped test hub with two users, each created with a

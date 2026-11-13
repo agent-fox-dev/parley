@@ -52,7 +52,8 @@ that fails answers the request, and no later check or the handler runs.
    [Request bodies](#request-bodies).
 5. The route's own feature check, where it declares one, then the binding
    guard.
-6. The scope check.
+6. The scope check: `403 insufficient_scope` for a PAT whose permissions
+   do not satisfy the scope the route declares (see [Scopes](#scopes)).
 7. The access checks, among them the admin check of the admin routes:
    `403 forbidden` with the message `this route needs an admin` for every
    caller but the admin token and an API key whose user has the role
@@ -121,6 +122,45 @@ user's credentials.
 ```
 
 The rate limit counts an authenticated request against its credential id.
+
+## Scopes
+
+A route may declare one scope that a PAT needs to call it; each route's
+section names it. The admin token and API keys carry no scopes and are never
+held to one, and a route that declares none is open to a PAT whatever its
+permissions. These 32 names are the registered scopes, matched exactly, in
+case and without trimming; any other string is not a scope:
+
+`users:read`, `users:write`, `orgs:read`, `keys:read`, `keys:manage`,
+`tokens:read`, `tokens:write`, `tokens:manage`, `workspaces:read`,
+`workspaces:write`, `git:read`, `git:write`, `changes:read`,
+`changes:write`, `changes:approve`, `checks:write`, `patches:read`,
+`patches:write`, `rebuilds:read`, `rebuilds:write`, `secrets:read`,
+`secrets:write`, `vars:read`, `vars:write`, `forge:read`, `forge:write`,
+`sandboxes:read`, `sandboxes:write`, `audit:read`, `audit:write`,
+`sessions:read`, `sessions:write`.
+
+A PAT passes a route's scope check when it holds the declared scope itself
+or a scope that implies it:
+
+| The route needs | Also satisfied by |
+|---|---|
+| `R:read`, for an area `R` that has `R:write` | `R:write` |
+| `keys:read` | `keys:manage` |
+| `tokens:read` | `tokens:write`, `tokens:manage` |
+| `tokens:write` | `tokens:manage` |
+
+Nothing else implies anything: `changes:approve` and `checks:write` are
+satisfied only by themselves and satisfy no other check, so `changes:write`
+does not let a token approve a change.
+
+A PAT that fails the check is answered before the access checks, request
+validation and the handler run, so the answer is the same whether or not
+the resource it addresses exists, and nothing changes:
+
+```json
+{"error":{"code":403,"message":"this route needs the scope users:read","error_type":"insufficient_scope"}}
+```
 
 ## Request ids and response headers
 
@@ -581,6 +621,7 @@ from the store for this request.
 |---|---|
 | `200 OK` | the body is the caller's User object |
 | `403` `forbidden` | the caller is the admin token (`this route needs a user`) |
+| `403` `insufficient_scope` | a PAT without `users:read` or a scope that implies it (see [Scopes](#scopes)) |
 
 The User object has exactly `id`, `username`, `email`, `full_name`, `role`,
 `status`, `provider`, `provider_id`, `created_at` and `updated_at`;
@@ -605,6 +646,7 @@ updated User object; every other member is unchanged.
 | `200 OK` | the name was stored; the body is the updated User object |
 | `400` `invalid_request` | `full_name` is missing (message `full_name is required`), or is not a JSON string, `null` included (message `full_name must be a string`); or the body is not a JSON object. The user is unchanged. |
 | `403` `forbidden` | the caller is the admin token (`this route needs a user`) |
+| `403` `insufficient_scope` | a PAT without `users:write` or a scope that implies it (see [Scopes](#scopes)) |
 
 ```json
 {"full_name":"Alice A."}
@@ -626,6 +668,7 @@ membership in an active org gets `items` `[]`.
 | `200 OK` | the body is a page: `items` are Org objects (see [`POST /api/v1/orgs`](#post-apiv1orgs)) |
 | `400` `invalid_request` | a bad `limit` or `cursor` (see [Lists](#lists)) |
 | `403` `forbidden` | the caller is the admin token (`this route needs a user`) |
+| `403` `insufficient_scope` | a PAT without `orgs:read` or a scope that implies it (see [Scopes](#scopes)) |
 
 ## Admin routes
 
@@ -953,6 +996,7 @@ exist, so a caller cannot tell an org it may not read from a missing one.
 | Status | When |
 |---|---|
 | `200 OK` | the body is the Org object |
+| `403` `insufficient_scope` | a PAT without `orgs:read` or a scope that implies it (see [Scopes](#scopes)) |
 | `404` `not_found` | no org has that id or slug, or the caller is not an admin and is not a member of the org or the org is blocked (`org not found`) |
 
 ## `PATCH /api/v1/orgs/{id}`
@@ -1002,7 +1046,8 @@ user's). An org without members gets `items` `[]`.
 | Status | When |
 |---|---|
 | `200 OK` | the body is a page of member items |
-| `400` `invalid_request` | a bad `limit` or `cursor` (see [Lists](#lists)), checked first, for an org that does not exist too |
+| `403` `insufficient_scope` | a PAT without `orgs:read` or a scope that implies it (see [Scopes](#scopes)), checked before anything else |
+| `400` `invalid_request` | a bad `limit` or `cursor` (see [Lists](#lists)), checked first after the scope, for an org that does not exist too |
 | `404` `not_found` | the `limit` and `cursor` are good, and no org has that id or slug, or the caller is not an admin and is not a member of the org or the org is blocked (`org not found`) |
 
 ```json

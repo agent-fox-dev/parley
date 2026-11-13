@@ -627,7 +627,8 @@ without running a start hook or binding the listener.
 `internal/hub/identity.go` adds the part `composeIdentity`, after
 `composeBootstrap` in `parts`. It adds the schema step
 `identity.SchemaStep` (`identity_records`), installs the `Authenticate`
-method of an `identity.Service` as the pipeline's authenticator, adds its
+method of an `identity.Service` as the pipeline's authenticator, installs
+`identity.ScopeCheck` with `SetScopeCheck`, adds the service's
 `AdminCheck` method with `AddAccessCheck`, registers every route of `(*identity.Service).Routes()` with `AddRoute`, and adds the
 start hook `identity`, which binds the service with
 `(*identity.Service).Bind(identity.Deps{Store, Now, Providers,
@@ -800,6 +801,24 @@ whose `Role` is `admin`, and answers every other caller, PATs included,
 change of role holds from the next request on. Because it runs in the access
 position, after the body's size and media type and before the handler, a
 refused request is not validated, looks nothing up and changes nothing.
+
+`internal/identity/scope.go` holds the scope registry and the scope check.
+`identity.RegisteredScopes()` returns a copy of the 32 registered scopes in
+their documented order, and `identity.IsRegisteredScope(s)` tells a
+registered name from any other string, exactly. `identity.Satisfies(held,
+needed)` is the one implication rule: `needed` itself, `R:write` for an
+`R:read` where both are registered, `keys:manage` for `keys:read`, and
+`tokens:manage` for `tokens:write` and `tokens:read`; nothing else, so
+`changes:approve` and `checks:write` are granted only by name.
+`identity.ScopeCheck` is a package-level `server.Check`, since it needs no
+service state, which the hub installs in the pipeline's scope position. It
+reads the `Scope` of `server.MatchedRoute(r).Route`, the one declaration a
+route of any part makes, and the `identity.Principal` of the request: a
+route without a scope, the admin token and an API key pass, and a PAT whose
+`Permissions` do not satisfy the scope is answered
+`server.InsufficientScope("this route needs the scope <scope>")`. It runs
+before the access checks and the handler, so a refused token learns nothing
+about the resource it addressed.
 
 `POST /users` (`createUser`) decodes the body into a
 `map[string]json.RawMessage`, so that a missing member, `null` and a value
