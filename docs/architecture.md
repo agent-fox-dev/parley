@@ -14,6 +14,7 @@ command-line client. Both are written in Go, in the module
 | `internal/buildinfo` | the version, commit and build time the binary was built with, shared by both programs |
 | `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra` |
 | `internal/server` | the hub's HTTP server: its built-in routes, the REST API's route registration and check pipeline, the error envelope, request ids, response headers and the access log, list paging, idempotency keys, and the readiness probes |
+| `internal/server/timefmt` | the one timestamp format (`Format`, and the response member type `Time`) and the one duration grammar (`ParseDuration`); a leaf package that imports nothing of the project, so that the configuration loader can use it as well as the REST API |
 | `test/e2e` | tests that build the binaries and run them |
 
 ## The HTTP server
@@ -284,6 +285,21 @@ reaches zero. A waiting request whose client goes away stops waiting.
 The installed checks are copied under a read lock at the start of each
 request, and no lock is held while a check or a handler runs, so a request
 blocked in its handler never holds up another one.
+
+### Timestamps and durations
+
+Timestamps and durations are written and read in `internal/server/timefmt`,
+not in `internal/server` itself, because the package imports nothing of the
+project: the configuration loader can parse its duration keys with it
+without importing the HTTP server. `timefmt.Format(t)` writes an instant as
+RFC 3339 in UTC with the fraction of a second truncated. A response struct
+declares a timestamp member as `timefmt.Time` (a defined type over
+`time.Time`, converted with `timefmt.Time(t)`), whose `MarshalJSON` writes
+the same string, so no handler formats a timestamp by hand.
+`timefmt.ParseDuration(s)` reads a whole number with one of the units `s`,
+`m`, `h` or `d`; it checks the digits itself, because `strconv` would accept
+a sign, and refuses a value whose product with the unit would overflow a
+`time.Duration`. No route or configuration key uses the package yet.
 
 ### Serving and stopping
 

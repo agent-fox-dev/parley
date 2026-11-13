@@ -250,6 +250,36 @@ is sent.
 - The records are kept in memory in this version and are lost when `parleyd`
   restarts.
 
+## Timestamps and durations
+
+Every timestamp in a response body is a string in RFC 3339, in UTC, with
+whole seconds and the suffix `Z`:
+
+```json
+{"created_at":"2026-01-02T03:04:05Z"}
+```
+
+A fraction of a second is cut off, never rounded, so the instant
+`2026-01-02T05:04:05.999+02:00` is written `2026-01-02T03:04:05Z`. A
+timestamp never carries an offset other than `Z` or a fraction of a second.
+
+A duration, wherever Parley reads one, is a non-negative whole number
+followed by exactly one unit:
+
+| Unit | Means | Example |
+|---|---|---|
+| `s` | seconds | `30s` |
+| `m` | minutes | `15m` (900 seconds) |
+| `h` | hours | `24h` (86400 seconds) |
+| `d` | days of 24 hours | `30d` (2592000 seconds) |
+
+`0s` is zero. Every other form is refused, with an error that quotes the
+value: an empty value, a number without a unit (`30`), a unit without a
+number (`s`), any other unit (`30x`, `30w`), an upper-case unit (`30S`), a
+sign (`-5m`, `+5m`), a fraction (`1.5h`), a compound (`1h30m`), spaces
+(` 30s`, `30 s`), and a value too large to hold (more than about 292 years,
+such as `106752d`).
+
 ## Errors
 
 Every error of the REST API is answered with one JSON envelope, sent with
