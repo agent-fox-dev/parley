@@ -3,7 +3,10 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
+	"runtime/debug"
 	"slices"
 )
 
@@ -87,10 +90,33 @@ func (s *Server) installed() positions {
 }
 
 // runPipeline runs the checks of a request to rt in their fixed order, then
-// the handler. The first error ends the request and answers it.
+// the handler. The first error ends the request and answers it. A check or
+// handler that panics is answered like one that returns an unexpected error,
+// and the server goes on serving.
 func (s *Server) runPipeline(w http.ResponseWriter, r *http.Request, rt Route) {
+	if rt.CacheControl != "" {
+		w.Header().Set("Cache-Control", rt.CacheControl)
+	}
+	defer func() {
+		p := recover()
+		if p == nil {
+			return
+		}
+		if p == http.ErrAbortHandler {
+			// The handler asked net/http to drop the connection.
+			panic(p)
+		}
+		s.logger.LogAttrs(r.Context(), slog.LevelError, "panic",
+			slog.String("request_id", RequestID(r.Context())),
+			slog.String("error", fmt.Sprint(p)),
+			slog.String("stack", string(debug.Stack())),
+		)
+		if !headersSent(w) {
+			WriteError(w, Internal("internal error"))
+		}
+	}()
 	if err := s.pipeline(w, r, rt); err != nil {
-		writeErr(w, err)
+		s.writeErr(w, r, err)
 	}
 }
 
@@ -139,10 +165,16 @@ func authenticate(a Authenticator, r *http.Request) (Caller, error) {
 }
 
 // writeErr answers err: an *Error as its envelope, anything else as an
-// internal error whose text stays out of the response.
-func writeErr(w http.ResponseWriter, err error) {
+// internal error whose text stays out of the response, since it may describe
+// the hub's internals. Its cause goes to the log with the request id, which
+// the client sees, so the two can be matched.
+func (s *Server) writeErr(w http.ResponseWriter, r *http.Request, err error) {
 	var e *Error
 	if !errors.As(err, &e) {
+		s.logger.LogAttrs(r.Context(), slog.LevelError, "internal error",
+			slog.String("request_id", RequestID(r.Context())),
+			slog.String("error", err.Error()),
+		)
 		e = Internal("internal error")
 	}
 	WriteError(w, e)

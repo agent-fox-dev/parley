@@ -13,7 +13,7 @@ command-line client. Both are written in Go, in the module
 | `cmd/parleyd` | the `parleyd` program: argument parsing, signals, the start log line and the exit status |
 | `internal/buildinfo` | the version, commit and build time the binary was built with, shared by both programs |
 | `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra` |
-| `internal/server` | the hub's HTTP server: its built-in routes, the REST API's route registration and check pipeline, the error envelope, and the readiness probes |
+| `internal/server` | the hub's HTTP server: its built-in routes, the REST API's route registration and check pipeline, the error envelope, request ids, response headers and the access log, and the readiness probes |
 | `test/e2e` | tests that build the binaries and run them |
 
 ## The HTTP server
@@ -23,8 +23,9 @@ returns the `http.Handler` that serves its routes. `Options` holds the listen
 address (`Addr`), the shutdown grace (`ShutdownGrace`), the readiness
 probes (`ReadinessProbes`) and `OnListen`, a function `Serve` calls once with
 the address it bound (with port `0` in `Addr`, the port the system chose),
-the REST body limit (`MaxBodySize`) and the rate limit (`RequestsPerMinute`,
-`RateLimitDisabled`, and `Now`, the clock it reads, which tests replace).
+the REST body limit (`MaxBodySize`), the rate limit (`RequestsPerMinute`,
+`RateLimitDisabled`, and `Now`, the clock it reads, which tests replace), the
+`Logger` (a `*slog.Logger`; nil means `slog.Default()`) and `LogHealthProbes`.
 `Serve` serves `Handler()`, so the running hub and in-process tests answer
 the same way.
 
@@ -37,9 +38,37 @@ written with `server.WriteJSON`, errors with `server.WriteError`, both with
 `Content-Type: application/json; charset=utf-8`. The routes are described in
 [api.md](api.md).
 
+### Request ids, headers and the access log
+
+`Handler()` returns the dispatcher below wrapped in one outermost middleware
+(`internal/server/headers.go`), so it covers every surface: the built-in
+routes, the REST API, unknown paths and surfaces mounted with `Handle`. Before
+anything else runs it:
+
+1. takes the request id from an incoming `X-Request-ID` that is a UUID in the
+   36-character hyphenated hexadecimal form (any version, either case),
+   unchanged, or else generates a random version 4 UUID from `crypto/rand`;
+   puts it in the request's context, where `server.RequestID(ctx)` reads it;
+2. sets `X-Request-ID`, `X-Content-Type-Options: nosniff`,
+   `X-Frame-Options: DENY` and `Referrer-Policy: no-referrer` on the response;
+3. sets `Cache-Control: no-store` when the path is `/api/v1` or under it. The
+   pipeline replaces it with the matched route's `CacheControl` when the route
+   states one; the `/healthz` and `/readyz` handlers set `no-cache` and the
+   `/version` handler `public, max-age=300`.
+
+It hands the request on with a `ResponseWriter` that records the status. The
+wrapper keeps `Unwrap()`, so `http.ResponseController` (flush, deadlines)
+still reaches the connection's writer. When the request is answered, it writes
+the access-log line (`internal/server/accesslog.go`) through `Options.Logger`:
+message `request` with `method`, `path` (`r.URL.Path`, never the query
+string, so a credential sent as a query parameter never reaches the log),
+`status`, `duration_ms` and `request_id`, at info level. Requests to
+`/healthz` and `/readyz` get a line only when `Options.LogHealthProbes` is
+set, and then at debug level.
+
 ### Dispatch
 
-`Handler()` returns a dispatcher in front of the mux. The mux alone would
+The dispatcher sits in front of the mux. The mux alone would
 redirect a path that is not clean (`//x`, `/a/../x`) or that lacks the
 trailing slash of a subtree pattern, and would answer an unknown path or a
 wrong method in plain text. The dispatcher answers a path that is not clean
@@ -110,7 +139,15 @@ authenticator reports a `server.Caller` (`CredentialID`, and `UserID` or
 context; later checks and the handler read it with
 `server.CallerOf(r.Context())`. An `*server.Error` (also when wrapped) is
 written as its envelope; any other error as `500 internal` with the message
-`internal error`.
+`internal error`, and its text is logged through `Options.Logger` as an
+error line `internal error` with the `request_id` and the `error`. The
+pipeline also recovers a panic in a check or the handler: it logs an error
+line `panic` with the `request_id`, the panic value as `error` and the
+`stack`, and answers `500 internal` unless the handler had already started
+its answer. A panic with `http.ErrAbortHandler` is passed on, so net/http
+drops the connection as the handler asked. A panic on a surface outside the
+REST API is not recovered: net/http drops that connection, and the access
+log records the request with status `500`.
 
 A request that authentication refuses, also for want of an authenticator,
 is counted against its remote IP address and then answered with
@@ -173,7 +210,8 @@ milliseconds. `run`:
    `SIGINT`, before the listener is bound;
 3. builds the server and calls `Serve`, with an `OnListen` that writes the
    start line, a JSON object with `"msg":"listening"` and the bound
-   `"addr"`, to stderr with `log/slog`'s JSON handler;
+   `"addr"`, to stderr with `log/slog`'s JSON handler, and the same logger as
+   `Options.Logger`, so the access log and internal errors go to stderr too;
 4. returns `1` after one `cannot listen` error line when the address cannot
    be bound, and `0` when `Serve` returns after a stop.
 

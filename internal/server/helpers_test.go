@@ -1,15 +1,27 @@
 package server
 
 import (
+	"bytes"
+	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+// TestMain silences slog.Default(), which a server built without
+// Options.Logger writes its access log to, so a failing test's output is not
+// buried under access-log lines. Tests that read the log pass a logBuffer.
+func TestMain(m *testing.M) {
+	slog.SetDefault(slog.New(slog.DiscardHandler))
+	os.Exit(m.Run())
+}
 
 // errorMembers parses body as the REST error envelope and returns the members
 // of its error object. It fails the test when body is not a JSON object whose
@@ -144,4 +156,43 @@ func (c *testClock) Advance(d time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.now = c.now.Add(d)
+}
+
+// logBuffer collects what a server logs, as JSON lines at debug level and
+// above. It is safe for concurrent requests.
+type logBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *logBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+// logger returns a logger that writes to b, for Options.Logger.
+func (b *logBuffer) logger() *slog.Logger {
+	return slog.New(slog.NewJSONHandler(b, &slog.HandlerOptions{Level: slog.LevelDebug}))
+}
+
+// lines returns the lines logged so far, in order.
+func (b *logBuffer) lines() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var lines []string
+	for line := range strings.Lines(b.buf.String()) {
+		lines = append(lines, strings.TrimSuffix(line, "\n"))
+	}
+	return lines
+}
+
+// decodeLine parses one logged line as a JSON object.
+func decodeLine(t *testing.T, line string) map[string]any {
+	t.Helper()
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(line), &doc); err != nil {
+		t.Fatalf("log line %q is not a JSON object: %v", line, err)
+	}
+	return doc
 }

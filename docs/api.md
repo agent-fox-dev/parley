@@ -12,6 +12,8 @@ routes. It grows as features land.
   or without one, valid or not, gets the same answer.
 - Every body is one JSON object, sent with
   `Content-Type: application/json; charset=utf-8`.
+- Every response, on every path, carries a request id and the security
+  headers; see [Request ids and response headers](#request-ids-and-response-headers).
 
 ## Routes and matching
 
@@ -53,9 +55,44 @@ that fails answers the request, and no later check or the handler runs.
 8. The route's handler.
 
 A public route skips steps 2 and 5 to 7; it keeps the rate limit, counted
-by client address, and the body checks. An error the hub did not expect is
-answered `500` with `error_type` `internal` and the message `internal error`;
-its details stay out of the response.
+by client address, and the body checks.
+
+An error the hub did not expect, from a check or a handler, is answered `500`
+with `error_type` `internal` and the message `internal error`; this includes
+a check or handler that panics. Its details stay out of the response: the hub
+writes them to its log with the request id that the response carries in
+`X-Request-ID`, and goes on serving other requests.
+
+## Request ids and response headers
+
+Every response the hub sends, on the REST API, on the built-in routes, for an
+unknown path and on any other surface, carries these headers:
+
+| Header | Value |
+|---|---|
+| `X-Request-ID` | the id of the request, see below |
+| `X-Content-Type-Options` | `nosniff` |
+| `X-Frame-Options` | `DENY` |
+| `Referrer-Policy` | `no-referrer` |
+
+A request may send its own `X-Request-ID`. When it is a UUID in the
+36-character hyphenated hexadecimal form (`3f2a1bc4-0000-4000-8000-0123456789ab`),
+of any version and in either letter case, the hub uses it as the request's id
+and returns it exactly as received. Otherwise, or when the header is absent,
+the hub generates a random (version 4) UUID in lower case and returns that.
+The id is in the hub's log line for the request, so quote it when reporting a
+problem.
+
+`Cache-Control` is set once per response:
+
+| Response | `Cache-Control` |
+|---|---|
+| anything under `/api/v1`, error answers (`401`, `404`, `405`, `413`, `429`, `500`, ...) included | `no-store`, unless the route states its own value in its section of this page |
+| `GET /healthz`, `GET /readyz` | `no-cache` |
+| `GET /version` | `public, max-age=300` |
+
+A route's own value applies to every answer after the route has been matched,
+its errors included; `404` and `405` at route matching are always `no-store`.
 
 ## Rate limit
 
@@ -174,6 +211,8 @@ Liveness: the process is up and serving HTTP.
 |---|---|
 | `200 OK` | `{"status":"ok"}` |
 
+The answer carries `Cache-Control: no-cache`.
+
 ## `GET /readyz`
 
 Readiness: whether the hub can do its work. Each request calls every
@@ -185,8 +224,9 @@ also when no probe is registered.
 | `200 OK` | every probe succeeded, or none is registered | `{"status":"ready"}` |
 | `503 Service Unavailable` | at least one probe failed | `{"status":"not ready"}` |
 
-The `503` body is this plain status document, not an error envelope, and it
-never carries the probe's error text. `GET /healthz` still answers `200` while
+Both answers carry `Cache-Control: no-cache`. The `503` body is this plain
+status document, not an error envelope, and it never carries the probe's
+error text. `GET /healthz` still answers `200` while
 the hub is not ready.
 
 ## `GET /version`
@@ -196,6 +236,8 @@ The build of the running hub.
 | Status | Body |
 |---|---|
 | `200 OK` | an object with exactly the string members below |
+
+The answer carries `Cache-Control: public, max-age=300`.
 
 | Member | Value |
 |---|---|

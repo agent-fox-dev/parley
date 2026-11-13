@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"sync"
@@ -42,6 +43,12 @@ type Options struct {
 	RateLimitDisabled bool
 	// Now is the clock of the rate limit; nil means time.Now.
 	Now func() time.Time
+	// Logger receives the access log and the causes of internal errors; nil
+	// means slog.Default().
+	Logger *slog.Logger
+	// LogHealthProbes writes access-log lines for /healthz and /readyz, at
+	// debug level; without it they get none.
+	LogHealthProbes bool
 }
 
 // Server is the hub's HTTP server.
@@ -58,6 +65,7 @@ type Server struct {
 	pos   positions
 
 	limiter *Limiter
+	logger  *slog.Logger
 }
 
 // New builds a Server from opts and registers its built-in routes. Unknown
@@ -68,6 +76,10 @@ func New(opts Options) *Server {
 		mux:     http.NewServeMux(),
 		routes:  make(map[string]struct{}),
 		limiter: newServerLimiter(opts),
+		logger:  opts.Logger,
+	}
+	if s.logger == nil {
+		s.logger = slog.Default()
 	}
 	s.mux.HandleFunc("GET /healthz", s.healthz)
 	s.mux.HandleFunc("GET /readyz", s.readyz)
@@ -75,9 +87,11 @@ func New(opts Options) *Server {
 	return s
 }
 
-// Handler returns the handler that serves every route of the server.
+// Handler returns the handler that serves every route of the server. Every
+// response it sends carries X-Request-ID and the security headers, and every
+// request it answers gets an access-log line.
 func (s *Server) Handler() http.Handler {
-	return http.HandlerFunc(s.dispatch)
+	return s.stamp(http.HandlerFunc(s.dispatch))
 }
 
 // Handle registers h for pattern on the server's router, with the pattern
@@ -209,7 +223,15 @@ type versionDocument struct {
 	GoVersion string `json:"go_version"`
 }
 
+// The probes must always see the hub's current state, so no cache may keep
+// their answer; the build of a running hub changes only on a restart.
+const (
+	probeCacheControl   = "no-cache"
+	versionCacheControl = "public, max-age=300"
+)
+
 func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Cache-Control", probeCacheControl)
 	WriteJSON(w, http.StatusOK, statusDocument{Status: "ok"})
 }
 
@@ -217,6 +239,7 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 // every request. The probe's error stays out of the body: the route needs no
 // credential, and the error may describe the hub's internals.
 func (s *Server) readyz(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", probeCacheControl)
 	ready := true
 	for _, probe := range s.opts.ReadinessProbes {
 		if err := probe(r.Context()); err != nil {
@@ -231,6 +254,7 @@ func (s *Server) readyz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) version(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Cache-Control", versionCacheControl)
 	info := buildinfo.Get()
 	WriteJSON(w, http.StatusOK, versionDocument{
 		Version:   info.Version,

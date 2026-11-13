@@ -72,6 +72,7 @@ func run(ctx context.Context, args []string, addr string, grace time.Duration, s
 	srv := server.New(server.Options{
 		Addr:          addr,
 		ShutdownGrace: grace,
+		Logger:        logger,
 		OnListen: func(bound net.Addr) {
 			logger.Info("listening", "addr", bound.String())
 		},

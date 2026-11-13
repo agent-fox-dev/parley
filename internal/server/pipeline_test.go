@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"net/http"
 	"slices"
 	"strings"
@@ -331,5 +332,76 @@ func TestPipeline_PublicRouteSkipsTheCredentialChecksButKeepsTheLimitAndBodyChec
 	assertError(t, rec, http.StatusTooManyRequests, "rate_limited")
 	if got, want := log.calls(), []string{"handler"}; !slices.Equal(got, want) {
 		t.Errorf("ran %v, want %v", got, want)
+	}
+}
+
+func TestPipeline_AnswersAnUnexpectedFailureAsInternalAndLogsItsCause(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		handler HandlerFunc
+		scope   Check
+	}{
+		{
+			name:    "handler returns a plain error",
+			handler: func(http.ResponseWriter, *http.Request) error { return errors.New("db password hunter2") },
+		},
+		{
+			name:    "handler panics",
+			handler: func(http.ResponseWriter, *http.Request) error { panic("boom hunter2") },
+		},
+		{
+			name:    "scope check returns a plain error",
+			handler: func(http.ResponseWriter, *http.Request) error { return nil },
+			scope:   func(*http.Request) error { return errors.New("scope store: hunter2") },
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var logs logBuffer
+			s := New(Options{Logger: logs.logger()})
+			s.SetAuthenticator(func(*http.Request) (Caller, error) { return testCaller, nil })
+			if tc.scope != nil {
+				// The healthy route declares a scope the check accepts.
+				scope := tc.scope
+				s.SetScopeCheck(func(r *http.Request) error {
+					if m, _ := MatchedRoute(r); m.Route.Scope == "healthy" {
+						return nil
+					}
+					return scope(r)
+				})
+			}
+			s.Register(Route{Method: http.MethodGet, Pattern: "/fails", Handler: tc.handler})
+			s.Register(Route{Method: http.MethodGet, Pattern: "/healthy", Scope: "healthy", Handler: func(w http.ResponseWriter, _ *http.Request) error {
+				WriteJSON(w, http.StatusOK, map[string]string{})
+				return nil
+			}})
+			h := s.Handler()
+
+			rec := do(h, newRequest(http.MethodGet, "/api/v1/fails", nil, ""))
+
+			assertError(t, rec, http.StatusInternalServerError, "internal")
+			if msg := errorMembers(t, rec.Body.Bytes())["message"]; msg != "internal error" {
+				t.Errorf("message = %v, want %q", msg, "internal error")
+			}
+			if strings.Contains(rec.Body.String(), "hunter2") {
+				t.Errorf("body %s holds the cause", rec.Body.Bytes())
+			}
+			id := rec.Header().Get("X-Request-ID")
+			logged := false
+			for _, line := range logs.lines() {
+				if id != "" && strings.Contains(line, "hunter2") && strings.Contains(line, id) {
+					logged = true
+				}
+			}
+			if !logged {
+				t.Errorf("no log line holds the cause and the request id %q: %q", id, logs.lines())
+			}
+
+			if next := do(h, newRequest(http.MethodGet, "/api/v1/healthy", nil, "")); next.Code != http.StatusOK {
+				t.Errorf("next request: status = %d, want %d (body %s)", next.Code, http.StatusOK, next.Body.Bytes())
+			}
+		})
 	}
 }
