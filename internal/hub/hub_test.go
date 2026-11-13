@@ -410,3 +410,66 @@ func TestRun_AnswersReadinessFromBothStores(t *testing.T) {
 		})
 	}
 }
+
+func TestRun_LogsAFailingMaintenanceTaskAtEveryPassAndKeepsServing(t *testing.T) {
+	t.Parallel()
+	insert := func(name string) func(context.Context, *hub.Runtime) error {
+		return func(ctx context.Context, rt *hub.Runtime) error {
+			return rt.Store.Tx(ctx, func(tx *sql.Tx) error {
+				_, err := tx.ExecContext(ctx, "INSERT INTO passes (task) VALUES (?)", name)
+				return err
+			})
+		}
+	}
+	var rt *hub.Runtime
+	r := startHub(t, hub.Options{
+		WorkDir:             workDir(t, localConfig),
+		MaintenanceInterval: 100 * time.Millisecond,
+		Compose: func(c *hub.Composition) {
+			rt = c.Runtime()
+			c.AddSchemaStep(store.Step{Name: "test_passes", Target: store.Main, Apply: func(ctx context.Context, tx *sql.Tx) error {
+				_, err := tx.ExecContext(ctx, "CREATE TABLE passes (task TEXT NOT NULL)")
+				return err
+			}})
+			c.AddMaintenanceTask("fork_expiry", insert("fork_expiry"))
+			c.AddMaintenanceTask("claim_cleanup", func(context.Context, *hub.Runtime) error {
+				return errors.New("claims unreachable at https://u:p@h/x")
+			})
+			c.AddMaintenanceTask("retention", insert("retention"))
+		},
+	})
+
+	rows := func(task string) int {
+		var n int
+		if err := rt.Store.Main().QueryRow("SELECT count(*) FROM passes WHERE task = ?", task).Scan(&n); err != nil {
+			t.Fatalf("count the rows of %s: %v", task, err)
+		}
+		return n
+	}
+	failures := func() []map[string]any {
+		var errs []map[string]any
+		for _, rec := range r.stderr.records(t) {
+			if rec["level"] == "ERROR" {
+				errs = append(errs, rec)
+			}
+		}
+		return errs
+	}
+	eventually(t, "three passes with a failing task", func() bool {
+		return rows("retention") >= 3 && rows("fork_expiry") >= 3 && len(failures()) >= 3
+	})
+
+	for _, rec := range failures() {
+		text, _ := rec["error"].(string)
+		if rec["task"] != "claim_cleanup" || !strings.Contains(text, "https://h/x") || strings.Contains(text, "u:p") {
+			t.Errorf("error line %v, want task claim_cleanup and an error holding https://h/x without u:p", rec)
+		}
+	}
+	var health map[string]any
+	if status := getJSON(t, r.url("/healthz"), &health); status != http.StatusOK {
+		t.Errorf("GET /healthz = %d after failing passes, want 200", status)
+	}
+	if code := r.stop(t); code != 0 {
+		t.Errorf("Run returned %d after a stop, want 0", code)
+	}
+}

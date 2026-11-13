@@ -88,3 +88,12 @@ write-ahead log.
   missing directory inside the workspace root, for the refusal above. The
   empty-workspace-root case of the check of the repository copy runs in the
   same test, on the same data, before the repositories are created.
+- The end-to-end flows of the first boot and of the backup, in
+  `test/e2e/lifecycle_test.go`, call `hub.Run`, not `cmd/parleyd`'s `run`:
+  package `e2e` cannot call package `main`, and `run` only forwards the
+  process's arguments, environment and working directory to `hub.Run`, which
+  holds the flag and signal handling. The start hook, the maintenance task and
+  the schema step the flows need are added through `hub.Options.Compose`.
+- The flow of the failing maintenance task waits until three passes have run
+  (at most 5 s) instead of sleeping a fixed 350 ms; with the 100 ms interval
+  the third pass runs after about 200 ms.
