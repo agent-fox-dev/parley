@@ -647,7 +647,10 @@ a create route, the admin route `POST /users` (see
 and `PATCH /users/:id` (see [api.md](api.md#get-apiv1users)), the admin
 routes `POST /users/:id/promote`, `/demote`, `/block` and `/unblock` (see
 [api.md](api.md#role-and-status-of-a-user)), the admin route
-`DELETE /users/:id` (see [api.md](api.md#delete-apiv1usersid)), and the
+`DELETE /users/:id` (see [api.md](api.md#delete-apiv1usersid)), the admin
+routes `GET /users/:id/keys`, `GET /users/:id/tokens`,
+`DELETE /users/:id/keys/:key_id` and `DELETE /users/:id/tokens/:token_id`
+(see [api.md](api.md#keys-and-tokens-of-a-user)), and the
 caller's own profile, `GET /user`, `PATCH /user` and `GET /user/orgs` (see
 [api.md](api.md#get-apiv1user)), which need a user, the admin routes
 `POST /orgs`, a create route, `GET /orgs`, `PATCH /orgs/:id`,
@@ -945,6 +948,14 @@ fails from the next one. Every `:key_id` route resolves the id with
 `keyOfUser`, which answers a missing key and another user's alike, `404`
 `API key not found`. `s.writeKeys(w, r, userID)` and `s.revokeKey(w, r,
 userID)` take the user id, so the admin routes reuse them.
+
+`internal/identity/admin_credential_routes.go` holds the admin routes of
+any user's keys and tokens. They carry the admin mark and declare no
+scope, so the admin check refuses every PAT. Each handler is
+`forSelectedUser` around `writeKeys`, `writeTokens`, `revokeKey` or
+`revokeToken`: it resolves the path's `:id` with `UserBySelector`
+(`404 user not found`) and passes the user's id on, so an admin's list and
+revocation run the same code, and give the same answers, as the user's own.
 
 `POST /users` (`createUser`) decodes the body into a
 `map[string]json.RawMessage`, so that a missing member, `null` and a value

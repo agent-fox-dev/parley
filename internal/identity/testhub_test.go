@@ -568,11 +568,13 @@ func (h *testHub) storedKey(keyID string) identity.APIKey {
 // both active and signing in with github. Its callers are the values of an
 // Authorization header: admin is the admin token, ka and ku are live API
 // keys of root and alice, and pa and pu live PATs of root and alice holding
-// everyScope. None of them expires.
+// everyScope. None of them expires. kuID and puID are the ids of ku and
+// pu.
 type teamHub struct {
 	*testHub
 	root, alice           identity.User
 	admin, ka, ku, pa, pu string
+	kuID, puID            string
 }
 
 // newTeamHub builds a team hub; opts are newTestHub's.
@@ -584,9 +586,10 @@ func newTeamHub(t *testing.T, opts ...hubOption) teamHub {
 	bearer := func(credential string) string { return "Bearer " + credential }
 	h.admin = bearer(h.adminToken)
 	h.ka, _ = h.seedKey(h.root.ID, 0)
-	h.ku, _ = h.seedKey(h.alice.ID, 0)
+	ku, kuRec := h.seedKey(h.alice.ID, 0)
 	h.pa, _ = h.seedPAT(identity.PATSpec{UserID: h.root.ID, Permissions: everyScope})
-	h.pu, _ = h.seedPAT(identity.PATSpec{UserID: h.alice.ID, Permissions: everyScope})
+	pu, puRec := h.seedPAT(identity.PATSpec{UserID: h.alice.ID, Permissions: everyScope})
+	h.ku, h.pu, h.kuID, h.puID = ku, pu, kuRec.KeyID, puRec.TokenID
 	h.ka, h.ku, h.pa, h.pu = bearer(h.ka), bearer(h.ku), bearer(h.pa), bearer(h.pu)
 	return h
 }

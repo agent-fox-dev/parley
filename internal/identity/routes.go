@@ -24,6 +24,7 @@ func (s *Service) Routes() []server.Route {
 	routes = append(routes, s.ownUserRoutes()...)
 	routes = append(routes, s.keyRoutes()...)
 	routes = append(routes, s.tokenRoutes()...)
+	routes = append(routes, s.adminCredentialRoutes()...)
 	return append(routes, s.orgRoutes()...)
 }
 

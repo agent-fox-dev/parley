@@ -460,16 +460,19 @@ func TestTokenAnswers_CarryTheValueOnlyWhenTheTokenIsCreated(t *testing.T) {
 	token, _ := created.json["token"].(string)
 	id, _ := created.json["token_id"].(string)
 	secret := strings.TrimPrefix(token, "parley_pat_"+id+"_")
+	alice, admin := "Bearer "+h.key, "Bearer "+h.adminToken
 	for _, rq := range []struct {
-		method, path string
-		body         any
+		method, path, caller string
+		body                 any
 	}{
-		{http.MethodGet, "/api/v1/user/tokens", nil},
-		{http.MethodGet, tokenPath(id), nil},
-		{http.MethodPut, permissionsPath(id), map[string]any{"permissions": []string{"git:read", "vars:read"}}},
-		{http.MethodDelete, tokenPath(id), nil},
+		{http.MethodGet, "/api/v1/user/tokens", alice, nil},
+		{http.MethodGet, tokenPath(id), alice, nil},
+		{http.MethodGet, "/api/v1/users/alice/tokens", admin, nil},
+		{http.MethodPut, permissionsPath(id), alice, map[string]any{"permissions": []string{"git:read", "vars:read"}}},
+		{http.MethodDelete, "/api/v1/users/alice/tokens/" + id, admin, nil},
+		{http.MethodDelete, tokenPath(id), alice, nil},
 	} {
-		r := h.call(rq.method, rq.path, "Bearer "+h.key, rq.body)
+		r := h.call(rq.method, rq.path, rq.caller, rq.body)
 		objects := []any{any(r.json)}
 		if items, ok := r.json["items"].([]any); ok {
 			objects = items

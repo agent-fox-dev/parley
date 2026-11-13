@@ -957,7 +957,9 @@ The admin routes so far: `POST /api/v1/users`, `GET /api/v1/users`,
 `GET /api/v1/users/{id}`, `PATCH /api/v1/users/{id}`,
 `POST /api/v1/users/{id}/promote`, `POST /api/v1/users/{id}/demote`,
 `POST /api/v1/users/{id}/block`, `POST /api/v1/users/{id}/unblock`,
-`DELETE /api/v1/users/{id}`, `POST /api/v1/orgs`, `GET /api/v1/orgs`, `PATCH /api/v1/orgs/{id}`,
+`DELETE /api/v1/users/{id}`, `GET /api/v1/users/{id}/keys`,
+`GET /api/v1/users/{id}/tokens`, `DELETE /api/v1/users/{id}/keys/{key_id}`,
+`DELETE /api/v1/users/{id}/tokens/{token_id}`, `POST /api/v1/orgs`, `GET /api/v1/orgs`, `PATCH /api/v1/orgs/{id}`,
 `PUT /api/v1/orgs/{id}/members/{user_id}`,
 `DELETE /api/v1/orgs/{id}/members/{user_id}`,
 `POST /api/v1/orgs/{id}/block`, `POST /api/v1/orgs/{id}/unblock` and
@@ -1171,6 +1173,46 @@ When that removal fails, the delete is undone as a whole, and the answer is
 | `404` `not_found` | no user has that id, e-mail or username (`user not found`). Nothing changes. |
 | `409` `conflict` | the user is the only active admin (`the user is the only active admin`). Nothing changes. |
 | `500` `internal` | removing data another part of the hub keeps for the user failed (`internal error`). Nothing changes. |
+
+## Keys and tokens of a user
+
+`GET /api/v1/users/{id}/keys`, `GET /api/v1/users/{id}/tokens`,
+`DELETE /api/v1/users/{id}/keys/{key_id}` and
+`DELETE /api/v1/users/{id}/tokens/{token_id}` let an admin see and revoke
+the API keys and PATs of any user, without the user. They are admin routes
+(see [Admin routes](#admin-routes)) and declare no scope: every PAT, a PAT
+of an admin holding every scope included, is answered `403` `forbidden`
+(`this route needs an admin`), as is an API key whose user has the role
+`user`, also on that user's own keys and tokens. `{id}` is a user selector
+(see [User selectors](#user-selectors)), resolved before anything else the
+path names.
+
+Each answers what the route of the caller's own keys or tokens answers, for
+the user `{id}` names:
+
+- `GET /api/v1/users/{id}/keys` is a [list](#lists) of every API key of the
+  user in any state, newest first, as
+  [`GET /api/v1/user/keys`](#get-apiv1userkeys) lists them.
+- `GET /api/v1/users/{id}/tokens` is a list of every PAT of the user in any
+  state, workspace-bound ones included, newest first, as
+  [`GET /api/v1/user/tokens`](#get-apiv1usertokens) lists them, without the
+  tokens' values.
+- `DELETE /api/v1/users/{id}/keys/{key_id}` and
+  `DELETE /api/v1/users/{id}/tokens/{token_id}` revoke the key or token as
+  [`DELETE /api/v1/user/keys/{key_id}`](#delete-apiv1userkeyskey_id) and
+  [`DELETE /api/v1/user/tokens/{token_id}`](#delete-apiv1usertokenstoken_id)
+  do: `revoked_at` is set to the time of the request, an expired one
+  included, and the credential no longer authenticates; one already revoked
+  is answered as it is, with its earlier `revoked_at`. A `key_id` or
+  `token_id` that names nothing and one that names another user's key or
+  token get the same `404`.
+
+| Status | When |
+|---|---|
+| `200 OK` | a list: the body is a page whose `items` are Key or Token objects; a revocation: the body is the Key or Token object with `revoked_at` set |
+| `400` `invalid_request` | a list with a bad `limit` or `cursor` (see [Lists](#lists)) |
+| `403` `forbidden` | the caller is not an admin (`this route needs an admin`). Nothing changes. |
+| `404` `not_found` | no user has that id, e-mail or username (`user not found`); the user has no API key with this id (`API key not found`); the user has no token with this id (`token not found`). Nothing changes. |
 
 ## Org selectors
 
