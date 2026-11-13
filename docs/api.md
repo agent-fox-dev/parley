@@ -43,7 +43,7 @@ that fails answers the request, and no later check or the handler runs.
 2. Authentication. A route that is not public needs a credential. While the
    hub has no authenticator, which is the case in this version, every route
    that is not public is answered `401` with `error_type` `unauthenticated`.
-3. The rate limit (not enforced yet).
+3. The rate limit: `429 rate_limited`, as in [Rate limit](#rate-limit).
 4. The body size, then the content type: `413` or `415`, as in
    [Request bodies](#request-bodies).
 5. The route's own feature check, where it declares one, then the binding
@@ -52,9 +52,37 @@ that fails answers the request, and no later check or the handler runs.
 7. The access checks.
 8. The route's handler.
 
-A public route skips steps 2 and 5 to 7. An error the hub did not expect is
+A public route skips steps 2 and 5 to 7; it keeps the rate limit, counted
+by client address, and the body checks. An error the hub did not expect is
 answered `500` with `error_type` `internal` and the message `internal error`;
 its details stay out of the response.
+
+## Rate limit
+
+The hub limits how many REST requests a caller may send: 600 in a window of
+60 seconds. The window of a caller starts at its first counted request; once
+it has ended, the next request starts a new one.
+
+- An authenticated request is counted against its credential, so two
+  credentials used from the same machine have a count each.
+- A request to a public route, and a request that authentication refused,
+  is counted against the client address: the IP address of the connection.
+  Headers such as `X-Forwarded-For` are not read.
+- A request over the limit is answered `429` with `error_type`
+  `rate_limited`, the message `rate limit exceeded` and a `Retry-After`
+  header: the seconds until the window ends, a whole number from 1 to 60,
+  rounded up. It is answered before the body is read and before any later
+  check or the handler runs.
+- Every request that reaches the limit is counted, whatever its answer: one
+  that a later check or its handler refuses counts like one that succeeds.
+  A request answered `429` does not lengthen the window.
+- A request that authentication refused is still answered with
+  authentication's own error (`401`), even when its address is over the
+  limit; the address's count decides the answer only on public routes.
+- `/healthz`, `/readyz` and `/version`, and any request answered `404` or
+  `405` at route matching (`/metrics` included, which the hub does not
+  serve yet), are never counted or refused.
+- The counts are kept in memory and start from zero when `parleyd` starts.
 
 ## Request bodies
 

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // errorMembers parses body as the REST error envelope and returns the members
@@ -119,3 +120,28 @@ func (l *callLog) handler(name string, status int) HandlerFunc {
 
 // testCaller is the caller a passing authenticator reports.
 var testCaller = Caller{CredentialID: "k1", UserID: "u1"}
+
+// testClock is a clock the test moves by hand; its Now is safe for
+// concurrent requests.
+type testClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func newTestClock() *testClock {
+	return &testClock{now: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)}
+}
+
+// Now is the clock's current time, for Options.Now.
+func (c *testClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+// Advance moves the clock forward by d.
+func (c *testClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+}

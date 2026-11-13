@@ -33,6 +33,15 @@ type Options struct {
 	// MaxBodySize is the body limit of a REST API request in bytes, for a
 	// route that states none of its own; 0 means 1048576 (1 MiB).
 	MaxBodySize int64
+	// RequestsPerMinute is how many REST API requests one credential, or one
+	// client address without a valid credential, may send in a window of 60
+	// seconds; 0 means 600.
+	RequestsPerMinute int
+	// RateLimitDisabled turns the rate limit off, whatever RequestsPerMinute
+	// says.
+	RateLimitDisabled bool
+	// Now is the clock of the rate limit; nil means time.Now.
+	Now func() time.Time
 }
 
 // Server is the hub's HTTP server.
@@ -47,12 +56,19 @@ type Server struct {
 
 	posMu sync.RWMutex
 	pos   positions
+
+	limiter *Limiter
 }
 
 // New builds a Server from opts and registers its built-in routes. Unknown
 // paths and wrong methods are answered with the error envelope.
 func New(opts Options) *Server {
-	s := &Server{opts: opts, mux: http.NewServeMux(), routes: make(map[string]struct{})}
+	s := &Server{
+		opts:    opts,
+		mux:     http.NewServeMux(),
+		routes:  make(map[string]struct{}),
+		limiter: newServerLimiter(opts),
+	}
 	s.mux.HandleFunc("GET /healthz", s.healthz)
 	s.mux.HandleFunc("GET /readyz", s.readyz)
 	s.mux.HandleFunc("GET /version", s.version)

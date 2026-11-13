@@ -3,6 +3,7 @@ package server
 import (
 	"net/http"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -213,5 +214,122 @@ func TestPipeline_ServesARequestWhileAnotherIsBlockedInItsHandler(t *testing.T) 
 	releaseFirst()
 	if code := waitFor(t, first, 2*time.Second, "held request after release"); code != http.StatusOK {
 		t.Errorf("held request: status = %d, want %d", code, http.StatusOK)
+	}
+}
+
+func TestPipeline_AnswersWithTheFirstFailingCheckAndRunsNothingAfterIt(t *testing.T) {
+	t.Parallel()
+	order := []string{"authentication", "feature check", "binding guard", "scope check", "access check", "handler"}
+	cases := []struct {
+		name       string
+		failing    string // the recorded position that fails, or "" when an unrecorded stage does
+		usedUp     bool   // the credential's window is used up before the request
+		body       string
+		wantStatus int
+		wantType   string
+		wantRan    int // how many positions of order run
+	}{
+		{name: "authentication", failing: "authentication", wantStatus: 401, wantType: "unauthenticated", wantRan: 1},
+		{name: "rate limit", usedUp: true, wantStatus: 429, wantType: "rate_limited", wantRan: 1},
+		{name: "body", body: strings.Repeat("x", 2<<20), wantStatus: 413, wantType: "payload_too_large", wantRan: 1},
+		{name: "feature check", failing: "feature check", wantStatus: 503, wantType: "unavailable", wantRan: 2},
+		{name: "binding guard", failing: "binding guard", wantStatus: 403, wantType: "token_bound", wantRan: 3},
+		{name: "scope check", failing: "scope check", wantStatus: 403, wantType: "insufficient_scope", wantRan: 4},
+		{name: "access check", failing: "access check", wantStatus: 404, wantType: "not_found", wantRan: 5},
+		{name: "handler", failing: "handler", wantStatus: 400, wantType: "invalid_request", wantRan: 6},
+		{name: "nothing fails", wantStatus: 201, wantRan: 6},
+	}
+	errs := map[string]error{
+		"authentication": Unauthenticated("no credential"),
+		"feature check":  Unavailable("feature off"),
+		"binding guard":  TokenBound("bound elsewhere"),
+		"scope check":    InsufficientScope("scope missing"),
+		"access check":   NotFound("no such thing"),
+		"handler":        InvalidRequest("bad thing"),
+	}
+	const limit = 1000
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var log callLog
+			fails := func(position string) error {
+				if position == tc.failing {
+					return errs[position]
+				}
+				return nil
+			}
+			s := New(Options{RequestsPerMinute: limit, Now: newTestClock().Now})
+			s.SetAuthenticator(log.authenticator(testCaller, fails("authentication")))
+			s.SetBindingGuard(log.check("binding guard", fails("binding guard")))
+			s.SetScopeCheck(log.check("scope check", fails("scope check")))
+			s.AddAccessCheck(log.check("access check", fails("access check")))
+			s.Register(Route{
+				Method:  http.MethodPost,
+				Pattern: "/things",
+				Feature: log.check("feature check", fails("feature check")),
+				Handler: func(w http.ResponseWriter, _ *http.Request) error {
+					log.add("handler")
+					if err := fails("handler"); err != nil {
+						return err
+					}
+					WriteJSON(w, http.StatusCreated, map[string]string{})
+					return nil
+				},
+			})
+			h := s.Handler()
+			body := tc.body
+			if body == "" {
+				body = "{}"
+			}
+			post := func() *http.Request { return newRequest(http.MethodPost, "/api/v1/things", jsonHeader, body) }
+
+			if tc.usedUp {
+				for range limit {
+					do(h, post())
+				}
+			}
+			before := len(log.calls())
+			rec := do(h, post())
+
+			if tc.wantType == "" {
+				if rec.Code != tc.wantStatus {
+					t.Errorf("status = %d, want %d (body %s)", rec.Code, tc.wantStatus, rec.Body.Bytes())
+				}
+			} else {
+				assertError(t, rec, tc.wantStatus, tc.wantType)
+			}
+			if got, want := log.calls()[before:], order[:tc.wantRan]; !slices.Equal(got, want) {
+				t.Errorf("ran %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+func TestPipeline_PublicRouteSkipsTheCredentialChecksButKeepsTheLimitAndBodyChecks(t *testing.T) {
+	t.Parallel()
+	var log callLog
+	s := New(Options{RequestsPerMinute: 2, Now: newTestClock().Now})
+	s.SetAuthenticator(log.authenticator(testCaller, nil))
+	s.SetBindingGuard(log.check("binding guard", nil))
+	s.SetScopeCheck(log.check("scope check", nil))
+	s.AddAccessCheck(log.check("access check", nil))
+	s.Register(Route{Method: http.MethodPost, Pattern: "/open", Public: true, Handler: log.handler("handler", http.StatusOK)})
+	h := s.Handler()
+
+	rec := do(h, newRequest(http.MethodPost, "/api/v1/open", jsonHeader, "{}"))
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d (body %s)", rec.Code, http.StatusOK, rec.Body.Bytes())
+	}
+	if got, want := log.calls(), []string{"handler"}; !slices.Equal(got, want) {
+		t.Errorf("ran %v, want %v", got, want)
+	}
+
+	rec = do(h, newRequest(http.MethodPost, "/api/v1/open", jsonHeader, strings.Repeat("x", defaultLimit+1)))
+	assertError(t, rec, http.StatusRequestEntityTooLarge, "payload_too_large")
+
+	rec = do(h, newRequest(http.MethodPost, "/api/v1/open", jsonHeader, "{}"))
+	assertError(t, rec, http.StatusTooManyRequests, "rate_limited")
+	if got, want := log.calls(), []string{"handler"}; !slices.Equal(got, want) {
+		t.Errorf("ran %v, want %v", got, want)
 	}
 }

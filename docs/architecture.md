@@ -22,7 +22,9 @@ command-line client. Both are written in Go, in the module
 returns the `http.Handler` that serves its routes. `Options` holds the listen
 address (`Addr`), the shutdown grace (`ShutdownGrace`), the readiness
 probes (`ReadinessProbes`) and `OnListen`, a function `Serve` calls once with
-the address it bound (with port `0` in `Addr`, the port the system chose).
+the address it bound (with port `0` in `Addr`, the port the system chose),
+the REST body limit (`MaxBodySize`) and the rate limit (`RequestsPerMinute`,
+`RateLimitDisabled`, and `Now`, the clock it reads, which tests replace).
 `Serve` serves `Handler()`, so the running hub and in-process tests answer
 the same way.
 
@@ -81,7 +83,10 @@ in a fixed order and stops at the first error:
 1. authentication, through the installed `server.Authenticator`,
    `func(*http.Request) (server.Caller, error)`; with none installed, a route
    that is not public is answered `401 unauthenticated`;
-2. the rate-limit stage, which passes every request in this version;
+2. the rate-limit stage (`internal/server/ratelimit.go`): it counts the
+   request against the caller's credential id, or against the connection's
+   remote IP address on a public route, and answers `429 rate_limited` with
+   `Retry-After` when the key is over the limit;
 3. the body stage (`internal/server/body.go`): it reads the whole body, up to
    one byte past the limit that applies (the route's `MaxBodySize`, else
    `Options.MaxBodySize`, else 1048576 bytes), answers `413
@@ -106,6 +111,26 @@ context; later checks and the handler read it with
 `server.CallerOf(r.Context())`. An `*server.Error` (also when wrapped) is
 written as its envelope; any other error as `500 internal` with the message
 `internal error`.
+
+A request that authentication refuses, also for want of an authenticator,
+is counted against its remote IP address and then answered with
+authentication's error: authentication comes before the rate limit in the
+order of checks, so the address's count decides the answer only on public
+routes.
+
+The rate limit is a `server.Limiter`: `NewLimiter(perMinute, now)` counts
+requests per string key in fixed windows of 60 seconds, each starting at the
+key's first counted request, and `(*Limiter).Allow(key)` reports whether a
+request is admitted and, when not, the whole seconds to the window's end
+(rounded up, at least 1). A refused request does not change the window, and
+a limit of 0 admits everything. It is safe for concurrent use, keeps its
+counts in memory only, and drops ended windows at most once a minute. The
+server builds one from `RequestsPerMinute` (0 means 600) unless
+`RateLimitDisabled` is set, and `(*Server).RateLimiter()` returns it so that a
+surface mounted with `Handle`, such as the git server, counts against the same
+keys. Its keys are `credential:<id>` and `address:<ip>`. Built-in routes and
+`Handle` surfaces do not pass the pipeline, and `404`/`405` are answered by
+the dispatcher before it, so none of them is counted.
 
 A handler decodes a JSON body with `server.DecodeJSON(r, &v)`, which
 returns `400 invalid_request` for an empty body, invalid JSON, a value that

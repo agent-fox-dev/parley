@@ -98,17 +98,15 @@ func (s *Server) pipeline(w http.ResponseWriter, r *http.Request, rt Route) erro
 	pos := s.installed()
 
 	if !rt.Public {
-		if pos.authenticator == nil {
-			return Unauthenticated("authentication required")
-		}
-		caller, err := pos.authenticator(r)
+		caller, err := authenticate(pos.authenticator, r)
 		if err != nil {
+			s.countRefused(r)
 			return err
 		}
 		r = r.WithContext(context.WithValue(r.Context(), callerKey{}, caller))
 	}
 
-	if err := s.rateLimit(r); err != nil {
+	if err := s.rateLimit(w, r); err != nil {
 		return err
 	}
 	r, err := s.readBody(r)
@@ -131,8 +129,14 @@ func (s *Server) pipeline(w http.ResponseWriter, r *http.Request, rt Route) erro
 	return rt.Handler(w, r)
 }
 
-// rateLimit is the rate-limit stage; it passes every request for now.
-func (s *Server) rateLimit(*http.Request) error { return nil }
+// authenticate runs the installed authenticator; with none, a route that is
+// not public is never served.
+func authenticate(a Authenticator, r *http.Request) (Caller, error) {
+	if a == nil {
+		return Caller{}, Unauthenticated("authentication required")
+	}
+	return a(r)
+}
 
 // writeErr answers err: an *Error as its envelope, anything else as an
 // internal error whose text stays out of the response.
