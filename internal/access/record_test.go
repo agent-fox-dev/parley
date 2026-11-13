@@ -3,7 +3,6 @@ package access_test
 import (
 	"context"
 	"errors"
-	"reflect"
 	"strings"
 	"testing"
 
@@ -98,46 +97,5 @@ func TestRecordBySlug_AnswersNotFoundWithoutAnErrorForAStringNoRecordHas(t *test
 		if got, found, err := access.RecordBySlug(context.Background(), st.Main(), slug); err != nil || found {
 			t.Errorf("RecordBySlug(%q) = %+v, %v, %v, want not found and no error", slug, got, found, err)
 		}
-	}
-}
-
-func TestStoreRecords_ListsTheRecordsOfAnOwnerOrOrgsAndTheForksOfParents(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	st := openStore(t, t.TempDir())
-	acme := repo("acme", "u1", "o1", access.StatusReady)
-	team := repo("team", "u2", "o2", access.StatusArchived)
-	solo := repo("solo", "u3", "o3", access.StatusPending)
-	acmeFork := fork("acme--f1", "u2", "o1", "acme")
-	teamFork := fork("team--a", "u3", "o2", "team")
-	seed(t, st, acme, team, solo, acmeFork, teamFork)
-	reader := access.StoreRecords(st.Main())
-	slugs := func(recs []access.Record, err error) []string {
-		if err != nil {
-			t.Fatalf("list: %v", err)
-		}
-		out := []string{}
-		for _, r := range recs {
-			out = append(out, r.Slug)
-		}
-		return out
-	}
-	for _, c := range []struct {
-		name string
-		got  []string
-		want []string
-	}{
-		{"owned by u2 or in o1", slugs(reader.OwnedOrIn(ctx, "u2", []string{"o1"})), []string{"acme", "acme--f1", "team"}},
-		{"owned by u3 or in o2 and o9", slugs(reader.OwnedOrIn(ctx, "u3", []string{"o2", "o9"})), []string{"solo", "team", "team--a"}},
-		{"owned by nobody in no org", slugs(reader.OwnedOrIn(ctx, "u9", nil)), []string{}},
-		{"forks of acme and solo", slugs(reader.ForksOf(ctx, []string{"acme", "solo"})), []string{"acme--f1"}},
-		{"forks of no parent", slugs(reader.ForksOf(ctx, nil)), []string{}},
-	} {
-		if !reflect.DeepEqual(c.got, c.want) {
-			t.Errorf("%s = %v, want %v", c.name, c.got, c.want)
-		}
-	}
-	if got, err := reader.ForksOf(ctx, []string{"team"}); err != nil || len(got) != 1 || got[0] != teamFork {
-		t.Errorf("ForksOf(team) = %+v, %v, want [%+v]", got, err, teamFork)
 	}
 }

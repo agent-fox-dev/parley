@@ -1166,8 +1166,9 @@ with it.
 `internal/access/record.go` holds the record type `access.Record` (`Slug`,
 `OwnerID`, `OrgID`, `Kind`, `ParentSlug`, `Status`; `ParentSlug` is `""`
 for a repository and stored as NULL), the constants `KindRepository`,
-`KindFork` and `StatusPending` to `StatusArchived`, and the store functions,
-which take a `Querier` (the store's `*sql.DB` or an open `*sql.Tx`):
+`KindFork` and `StatusPending` to `StatusArchived`, and the store functions.
+The insert takes the caller's `*sql.Tx`; the reads take a `Querier` (the
+store's `*sql.DB` or an open `*sql.Tx`):
 
 - `InsertRecord(ctx, tx, rec)` stores a record in the caller's transaction.
   It refuses, with an error wrapping `access.ErrInvalidRecord` and without

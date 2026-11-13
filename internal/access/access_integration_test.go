@@ -119,7 +119,10 @@ func (h *accessHub) probe(method, pattern string, need access.Need) server.Route
 		Method: method, Pattern: pattern, Marks: map[string]string{access.MarkNeed: string(need)},
 		Handler: func(w http.ResponseWriter, r *http.Request) error {
 			h.calls.Add(1)
-			d, _ := access.DecisionOf(r)
+			d, ok := access.DecisionOf(r)
+			if !ok {
+				return server.Internal("the probe ran without a decision")
+			}
 			server.WriteJSON(w, http.StatusOK, map[string]any{"level": d.Level})
 			return nil
 		},

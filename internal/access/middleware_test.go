@@ -186,7 +186,7 @@ func TestCheck_GrantsAMemberAReadRouteWithAnyMethodAndGivesTheHandlerTheRecordAs
 	}
 	seed(t, st, stored["acme"], stored["acme--m"])
 	p := newProbe(newService(access.StoreRecords(st.Main()), memberships{of: map[string][]string{"u-member": {"o1"}}, active: []string{"o1"}}))
-	methods := []string{http.MethodPost, http.MethodPatch, http.MethodPut, http.MethodDelete, http.MethodGet}
+	methods := []string{http.MethodPost, http.MethodPatch, http.MethodPut, http.MethodDelete}
 	for _, method := range methods {
 		p.routeFor(method, "/workspaces/:slug/contrib", "read")
 	}

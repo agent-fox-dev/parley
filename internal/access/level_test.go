@@ -138,7 +138,10 @@ func TestLevel_OnAForkNeverExceedsTheLevelOnItsParent(t *testing.T) {
 			continue
 		}
 		onParent, _, _, err := svc.Level(context.Background(), access.CallerFrom(c.caller), rec.ParentSlug)
-		if err == nil && onParent == access.LevelNone && got != access.LevelNone {
+		if err != nil {
+			t.Fatalf("%s: level on the parent %q: %v", c.name, rec.ParentSlug, err)
+		}
+		if onParent == access.LevelNone && got != access.LevelNone {
 			t.Errorf("%s: level %q on %s although none on its parent %q", c.name, got, c.slug, rec.ParentSlug)
 		}
 	}

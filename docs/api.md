@@ -1007,7 +1007,10 @@ needs, the workspace's status or its kind:
 ```
 
 The slug's shape is not checked first: a string that cannot be a slug, or
-that differs from one only in case, is a workspace that does not exist. So a
+that differs from one only in case, is a workspace that does not exist. (A
+path segment `.` or `..` never reaches a route: such a path is not clean
+and is answered the generic `404 not_found` with the message `not found`,
+as in [Routes and matching](#routes-and-matching); no slug can be either.) So a
 caller cannot tell an existing workspace they may not read from a missing
 one. A member on a `write` or `owner` route, who can read the workspace, is
 answered:

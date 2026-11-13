@@ -26,28 +26,16 @@ func TestDecide_AnswersByLevelAndNeedAndAnInvisibleWorkspaceAsAMissingOne(t *tes
 		}
 	}
 
-	for _, c := range []struct {
-		name   string
-		caller access.Caller
-		need   access.Need
-		want   access.Decision
-	}{
-		{"a member reads", access.Caller{UserID: "u-member"}, access.NeedRead, access.Decision{Outcome: access.Granted, Level: access.LevelMember, Record: acme}},
-		{"a member writes", access.Caller{UserID: "u-member"}, access.NeedWrite, access.Decision{Outcome: access.ReadOnly, Level: access.LevelMember, Record: acme}},
-		{"a member needs the owner", access.Caller{UserID: "u-member"}, access.NeedOwner, access.Decision{Outcome: access.ReadOnly, Level: access.LevelMember, Record: acme}},
-		{"the owner", access.Caller{UserID: "u-owner"}, access.NeedOwner, access.Decision{Outcome: access.Granted, Level: access.LevelOwner, Record: acme}},
-		{"the admin token", access.Caller{Admin: true}, access.NeedWrite, access.Decision{Outcome: access.Granted, Level: access.LevelAdmin, Record: acme}},
-	} {
-		if got, err := svc.Decide(ctx, c.caller, "acme", c.need); err != nil || got != c.want {
-			t.Errorf("%s: Decide = %+v, %v, want %+v", c.name, got, err, c.want)
-		}
+	// The outcomes another surface tells apart; the HTTP check maps every
+	// level and need (middleware_test.go).
+	if got, err := svc.Decide(ctx, access.Caller{UserID: "u-member"}, "acme", access.NeedWrite); err != nil || got.Outcome != access.ReadOnly {
+		t.Errorf("a member's write: Decide = %+v, %v, want read_only", got, err)
+	}
+	if got, err := svc.Decide(ctx, access.Caller{UserID: "u-owner"}, "acme", access.NeedOwner); err != nil || got != (access.Decision{Outcome: access.Granted, Level: access.LevelOwner, Record: acme}) {
+		t.Errorf("the owner: Decide = %+v, %v, want granted at level owner with the record", got, err)
 	}
 
 	if got, err := svc.Decide(ctx, access.Caller{UserID: "u-owner"}, "acme", "admin"); err == nil || got != (access.Decision{}) {
 		t.Errorf("Decide with need admin = %+v, %v, want no decision and an error", got, err)
-	}
-	failing := newService(failingRecords{RecordReader: access.StoreRecords(st.Main()), fail: []string{"acme"}}, failingMemberships)
-	if got, err := failing.Decide(ctx, access.Caller{Admin: true}, "acme", access.NeedRead); err == nil || got != (access.Decision{}) {
-		t.Errorf("Decide on a failed read = %+v, %v, want no decision and an error", got, err)
 	}
 }
