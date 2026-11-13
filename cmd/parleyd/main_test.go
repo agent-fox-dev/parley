@@ -224,3 +224,48 @@ func TestRun_ServesTheClientUntilStopped(t *testing.T) {
 		t.Errorf("a connection to %s was accepted after run returned", r.addr)
 	}
 }
+
+func TestRun_AnswersAnUnknownPathWithTheErrorEnvelopeAndLogsIt(t *testing.T) {
+	r := startRun(t, time.Second)
+
+	res, err := http.Get("http://" + r.addr + "/api/v1/no-such-thing")
+	if err != nil {
+		t.Fatalf("GET /api/v1/no-such-thing: %v", err)
+	}
+	defer res.Body.Close()
+	var doc struct {
+		Error struct {
+			Code      int    `json:"code"`
+			ErrorType string `json:"error_type"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&doc); err != nil {
+		t.Fatalf("the answer is not JSON: %v", err)
+	}
+	if res.StatusCode != http.StatusNotFound || doc.Error.Code != 404 || doc.Error.ErrorType != "not_found" {
+		t.Errorf("answer = %d %+v, want 404 with code 404 and error_type not_found", res.StatusCode, doc.Error)
+	}
+	id := res.Header.Get("X-Request-ID")
+
+	r.cancel()
+	if code := r.exitCode(t, 5*time.Second); code != 0 {
+		t.Fatalf("run returned %d after a stop, want 0", code)
+	}
+	var found int
+	for _, line := range nonEmptyLines(r.stderr.String()) {
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("stderr line %q is not a JSON object: %v", line, err)
+		}
+		if rec["msg"] != "request" {
+			continue
+		}
+		found++
+		if rec["path"] != "/api/v1/no-such-thing" || rec["status"] != float64(404) || rec["request_id"] != id {
+			t.Errorf("access-log line = %v, want path /api/v1/no-such-thing, status 404, request_id %q", rec, id)
+		}
+	}
+	if found != 1 {
+		t.Errorf("stderr holds %d access-log lines, want 1: %q", found, r.stderr.String())
+	}
+}

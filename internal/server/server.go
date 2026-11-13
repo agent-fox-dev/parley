@@ -4,9 +4,9 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"sync"
@@ -31,31 +31,84 @@ type Options struct {
 	// OnListen, when set, is called once by Serve with the address it bound,
 	// before it serves; with port 0 in Addr it carries the chosen port.
 	OnListen func(net.Addr)
+	// MaxBodySize is the body limit of a REST API request in bytes, for a
+	// route that states none of its own; 0 means 1048576 (1 MiB).
+	MaxBodySize int64
+	// RequestsPerMinute is how many REST API requests one credential, or one
+	// client address without a valid credential, may send in a window of 60
+	// seconds; 0 means 600.
+	RequestsPerMinute int
+	// RateLimitDisabled turns the rate limit off, whatever RequestsPerMinute
+	// says.
+	RateLimitDisabled bool
+	// Now is the clock of the rate limit and of the idempotency records' age;
+	// nil means time.Now.
+	Now func() time.Time
+	// Logger receives the access log and the causes of internal errors; nil
+	// means slog.Default().
+	Logger *slog.Logger
+	// LogHealthProbes writes access-log lines for /healthz and /readyz, at
+	// debug level; without it they get none.
+	LogHealthProbes bool
+	// IdempotencyStore keeps the records of creates sent with an
+	// Idempotency-Key; nil means an in-memory store, emptied at restart.
+	IdempotencyStore IdempotencyStore
 }
 
 // Server is the hub's HTTP server.
 type Server struct {
 	opts Options
 	mux  *http.ServeMux
+
+	routesMu sync.Mutex
+	// routes holds the REST API routes registered, as "METHOD path" in the
+	// router's syntax.
+	routes map[string]struct{}
+
+	posMu sync.RWMutex
+	pos   positions
+
+	limiter *Limiter
+	logger  *slog.Logger
+	now     func() time.Time
+	idem    *idempotency
 }
 
 // New builds a Server from opts and registers its built-in routes. Unknown
-// paths and wrong methods get the standard library router's own answers.
+// paths and wrong methods are answered with the error envelope.
 func New(opts Options) *Server {
-	s := &Server{opts: opts, mux: http.NewServeMux()}
+	s := &Server{
+		opts:    opts,
+		mux:     http.NewServeMux(),
+		routes:  make(map[string]struct{}),
+		limiter: newServerLimiter(opts),
+		logger:  opts.Logger,
+		now:     opts.Now,
+		idem:    newIdempotency(opts.IdempotencyStore),
+	}
+	if s.logger == nil {
+		s.logger = slog.Default()
+	}
+	if s.now == nil {
+		s.now = time.Now
+	}
 	s.mux.HandleFunc("GET /healthz", s.healthz)
 	s.mux.HandleFunc("GET /readyz", s.readyz)
 	s.mux.HandleFunc("GET /version", s.version)
 	return s
 }
 
-// Handler returns the handler that serves every route of the server.
+// Handler returns the handler that serves every route of the server. Every
+// response it sends carries X-Request-ID and the security headers, and every
+// request it answers gets an access-log line.
 func (s *Server) Handler() http.Handler {
-	return s.mux
+	return s.stamp(http.HandlerFunc(s.dispatch))
 }
 
 // Handle registers h for pattern on the server's router, with the pattern
-// syntax of http.ServeMux. Routes are registered before Serve is called.
+// syntax of http.ServeMux, for a surface outside the REST API. Its requests
+// do not pass the REST API's checks. Routes are registered before Serve is
+// called.
 func (s *Server) Handle(pattern string, h http.Handler) {
 	s.mux.Handle(pattern, h)
 }
@@ -80,7 +133,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 
 	conns := newConnTracker()
-	srv := &http.Server{Handler: s.mux, ConnState: conns.track}
+	srv := &http.Server{Handler: s.Handler(), ConnState: conns.track}
 	served := make(chan error, 1)
 	go func() { served <- srv.Serve(trackingListener{ln, conns}) }()
 
@@ -181,14 +234,23 @@ type versionDocument struct {
 	GoVersion string `json:"go_version"`
 }
 
+// The probes must always see the hub's current state, so no cache may keep
+// their answer; the build of a running hub changes only on a restart.
+const (
+	probeCacheControl   = "no-cache"
+	versionCacheControl = "public, max-age=300"
+)
+
 func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, statusDocument{Status: "ok"})
+	w.Header().Set("Cache-Control", probeCacheControl)
+	WriteJSON(w, http.StatusOK, statusDocument{Status: "ok"})
 }
 
 // readyz calls every probe, even after one has failed, so each probe sees
 // every request. The probe's error stays out of the body: the route needs no
 // credential, and the error may describe the hub's internals.
 func (s *Server) readyz(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", probeCacheControl)
 	ready := true
 	for _, probe := range s.opts.ReadinessProbes {
 		if err := probe(r.Context()); err != nil {
@@ -196,27 +258,19 @@ func (s *Server) readyz(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if !ready {
-		writeJSON(w, http.StatusServiceUnavailable, statusDocument{Status: "not ready"})
+		WriteJSON(w, http.StatusServiceUnavailable, statusDocument{Status: "not ready"})
 		return
 	}
-	writeJSON(w, http.StatusOK, statusDocument{Status: "ready"})
+	WriteJSON(w, http.StatusOK, statusDocument{Status: "ready"})
 }
 
 func (s *Server) version(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Cache-Control", versionCacheControl)
 	info := buildinfo.Get()
-	writeJSON(w, http.StatusOK, versionDocument{
+	WriteJSON(w, http.StatusOK, versionDocument{
 		Version:   info.Version,
 		Commit:    info.Commit,
 		BuildTime: info.BuildTime,
 		GoVersion: info.GoVersion,
 	})
-}
-
-// writeJSON answers status with v encoded as JSON.
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	// The status line is already sent; a failed write means the client went
-	// away, and there is no one left to tell.
-	_ = json.NewEncoder(w).Encode(v)
 }

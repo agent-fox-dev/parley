@@ -54,6 +54,27 @@ listens it writes:
 the port is `0`. Go binds the wildcard `0.0.0.0` as a dual-stack listener, so
 the default address is logged as `[::]:8080`.
 
+While it serves, it writes one access-log line for every request it has
+answered, except requests to `/healthz` and `/readyz`:
+
+```json
+{"time":"2026-11-13T10:12:03.104211+01:00","level":"INFO","msg":"request","method":"GET","path":"/version","status":200,"duration_ms":0.087,"request_id":"0b5c6f2e-8d1a-4c3b-9e7f-2a4d6c8e0f13"}
+```
+
+`path` is the request's URL path without the query string. `status` is the
+status it answered with, `duration_ms` the time from receiving the request to
+answering it in milliseconds, and `request_id` the `X-Request-ID` of the
+response (see [api.md](api.md#request-ids-and-response-headers)).
+
+When a REST request fails in a way the hub did not expect, the client gets
+`500 internal error` and the cause goes to stderr in one line with the same
+`request_id`; a panic is logged with `"msg":"panic"` and also carries the
+goroutine's `stack`:
+
+```json
+{"time":"2026-11-13T10:12:09.551873+01:00","level":"ERROR","msg":"internal error","request_id":"0b5c6f2e-8d1a-4c3b-9e7f-2a4d6c8e0f13","error":"open workspace: permission denied"}
+```
+
 When it cannot bind the address it writes one line and exits `1`, without
 serving:
 
