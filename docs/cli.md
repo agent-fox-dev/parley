@@ -477,14 +477,15 @@ configuration file of each missing setting (the file is
 ```
 
 The hub URL must be an absolute URL with the scheme `http` or `https` and a
-host; anything else (`localhost:8080`, `ftp://host`, `http://`, `/api`)
-fails before any request:
+host, and without a query or a fragment; anything else (`localhost:8080`,
+`ftp://host`, `http://`, `/api`, `http://host?x`, `http://host#f`) fails
+before any request:
 
 ```json
 {
   "error": {
     "code": 0,
-    "message": "the hub URL \"localhost:8080\" is not an absolute http or https URL with a host",
+    "message": "the hub URL \"localhost:8080\" is not an absolute http or https URL with a host and without a query or fragment",
     "error_type": "client_error"
   }
 }
@@ -520,9 +521,10 @@ not completed by then is abandoned with a `client_error`:
 ```
 
 Every request is sent exactly once. `parley` does not send it again after
-a `429`, a `5xx`, a timeout or a broken connection, and does not act on
-`Retry-After`; the error goes to stderr and the command ends with its exit
-status, so a script decides whether to try again.
+a `429`, a `5xx`, a timeout or a broken connection, does not act on
+`Retry-After`, and does not follow a redirect; the error goes to stderr and
+the command ends with its exit status, so a script decides whether to try
+again.
 
 A hub that cannot be reached (the connection is refused, the host name does
 not resolve, the TLS handshake fails) is a `client_error` whose message
@@ -543,7 +545,8 @@ names the HTTP status, because it came from something else (a proxy, a wrong
 URL): a status of `400` or above whose body is not an error envelope (a JSON
 object with an `error` member holding `error_type`), a `2xx` status whose
 body is neither empty nor JSON (`the hub answered 200 with a body that is
-not JSON`), and a status outside `2xx` below `400`.
+not JSON`), and a status outside `2xx` below `400`, a redirect included
+(`the hub answered 302, which is neither a success nor an error`).
 
 `parley version` and `parley login` need no credential and read the hub URL
 themselves, as their sections say; help needs neither setting.
@@ -593,7 +596,8 @@ hub's build in `server`:
 ```
 
 When the connection is refused, the hub does not answer within the timeout,
-or it answers a status other than `200` or a body that is not a JSON object,
+or it answers a status other than `200` (a redirect, which it does not
+follow, included) or a body that is not a JSON object,
 `parley version` writes one warning line that names the hub URL to stderr and
 prints the document without `server`:
 
@@ -636,13 +640,15 @@ Global Flags:
 `parley login` saves the hub URL, a credential and the user's id in the
 client configuration file (see
 [configuration.md](configuration.md#the-client-configuration-file)). It
-first reads that file, and a file that cannot be read, is not valid TOML
+first checks its flags: a bad `--expires` and an empty credential are a
+`usage_error` before the file is read (see below). It then reads that
+file, and a file that cannot be read, is not valid TOML
 or holds `endpoint_url`, `api_key` or `user_id` with a value that is not a
 string fails the login before any request, leaving the file as it is. It
 then takes the hub URL from the first non-empty of `--endpoint-url`,
 `PARLEY_ENDPOINT_URL` and the file's `endpoint_url`, and drops trailing
 slashes from it. A hub URL that is not an absolute `http` or `https` URL
-with a host fails before any request, as for every command (see
+with a host and without a query or fragment fails before any request, as for every command (see
 [Settings](#settings-the-hub-url-and-the-credential)). With none it fails
 before any request:
 
@@ -669,7 +675,13 @@ default); any other value is a `usage_error` before the config file is read
 or any request is sent:
 
 ```json
-{"error":{"code":0,"message":"--expires must be 0, 30, 60 or 90, got \"45\"","error_type":"usage_error"}}
+{
+  "error": {
+    "code": 0,
+    "message": "--expires must be 0, 30, 60 or 90, got \"45\"",
+    "error_type": "usage_error"
+  }
+}
 ```
 
 The login then:
@@ -680,7 +692,13 @@ The login then:
    ones it does:
 
    ```json
-   {"error":{"code":0,"message":"the hub does not offer the identity provider \"google\"; it offers github","error_type":"client_error"}}
+   {
+     "error": {
+       "code": 0,
+       "message": "the hub does not offer the identity provider \"google\"; it offers github",
+       "error_type": "client_error"
+     }
+   }
    ```
 
 2. listens on `127.0.0.1` on a free port and opens in the browser the
@@ -732,7 +750,8 @@ writes that envelope to stderr as received, indented by two spaces (see
 holds, an API key or a personal access token, without a browser. With
 `--api-key -` it reads the credential from stdin, which keeps it out of the
 process list. White space around the credential is dropped; an empty one
-is a `usage_error` and sends nothing. `--provider` and `--expires` have no
+is a `usage_error`, raised before the config file is read, and sends
+nothing. `--provider` and `--expires` have no
 effect here.
 
 It sends `GET <hub URL>/api/v1/user` with `Authorization: Bearer
@@ -922,7 +941,8 @@ under one deadline: `--timeout` counted from the moment the start
 request's answer came. A state that is not terminal never ends the wait,
 "waiting to retry" (a job's `failed`) included. Which states are terminal,
 and which of them are a success, each command states. Each poll is an
-ordinary request: 30-second timeout, sent once.
+ordinary request: sent once, with the command's request timeout (30
+seconds unless the command or the poll states another).
 
 stdout receives nothing until the wait ends. stderr receives one progress
 line, `waiting: <state>`, when the wait begins and each time the state
@@ -978,7 +998,9 @@ operation, which goes on on the hub.
 ### Errors and exit statuses
 
 stdout carries the result, and nothing on a failure, except the result a
-`--fail-on-…` condition held in. Every error goes to stderr as one error
+`--fail-on-…` condition held in and the final record of a wait that ended
+in a state that is not a success (`wait_failed`, see [Waiting](#waiting)).
+Every error goes to stderr as one error
 envelope, a JSON document indented by two spaces and followed by a newline,
 and nothing else: no usage text follows it. An error envelope the hub
 answered (a status of `400` or above whose body is a JSON object with an

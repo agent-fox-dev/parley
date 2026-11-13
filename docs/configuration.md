@@ -154,7 +154,8 @@ its key in the client configuration file: the hub URL from
 from `--api-key`, `PARLEY_API_KEY` and `api_key`. An empty or unset variable
 gives nothing, and values are not trimmed. A command that needs the hub and
 a credential and finds no value for one fails before any request with a
-`client_error`. `parley version` without a URL prints the client's build
+`client_error`, and so does one given a hub URL that is not an absolute
+`http` or `https` URL with a host and without a query or fragment. `parley version` without a URL prints the client's build
 alone. See [cli.md](cli.md#settings-the-hub-url-and-the-credential).
 
 ### The client configuration file
@@ -197,9 +198,11 @@ or the order of the keys. It writes a temporary file in the same directory,
 sets its mode to `0600` whatever the umask and the old file's mode, and
 renames it over `config.toml`, so the file is replaced as a whole and ends
 with mode `0600`; a missing config directory is created with mode `0700`.
-A save that cannot write the new file or replace the old one, finds a file
-it cannot parse, or has no path because there is no home directory fails
-with a `client_error` naming the path, removes its temporary file and
-leaves the old file byte for byte as it was. `parley login` does not read
+A save that cannot write the new file or replace the old one, or finds a
+file it cannot parse, fails with a `client_error` naming the path; one
+that has no path because there is no home directory fails with the
+`client_error` `cannot save the config file: cannot find the config
+directory: set PARLEY_CONFIG_DIR or HOME: …`. Either way it removes its
+temporary file and leaves the old file byte for byte as it was. `parley login` does not read
 `api_key`, and `PARLEY_API_KEY` does not change it. See
 [cli.md](cli.md#parley-login).

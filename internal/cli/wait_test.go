@@ -241,9 +241,7 @@ func TestWait_PrintsTheFinalRecordAndFailsWhenTheOperationEndsUnsuccessfully(t *
 }
 
 func TestWait_TimesOutWithoutPrintingOrChangingTheOperation(t *testing.T) {
-	t.Setenv("PARLEY_CONFIG_DIR", t.TempDir())
-	unsetEnv(t, "PARLEY_ENDPOINT_URL")
-	unsetEnv(t, "PARLEY_API_KEY")
+	loginEnv(t)
 	tests := []struct {
 		name  string
 		polls []http.HandlerFunc

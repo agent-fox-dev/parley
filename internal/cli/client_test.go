@@ -257,18 +257,25 @@ func TestClient_FailsNamingTheStatusOfAnAnswerItCannotDecode(t *testing.T) {
 	tests := []struct {
 		status int
 		body   string
+		// location, when set, makes the answer a redirect to it.
+		location string
 	}{
-		{200, "<html>"},
-		{200, `{"a":`},
-		{502, "<html>Bad Gateway</html>"},
-		{404, "not found"},
-		{500, "{}"},
-		{500, `{"error":"boom"}`},
-		{403, `{"error":{"message":"x"}}`},
+		{200, "<html>", ""},
+		{200, `{"a":`, ""},
+		{502, "<html>Bad Gateway</html>", ""},
+		{404, "not found", ""},
+		{500, "{}", ""},
+		{500, `{"error":"boom"}`, ""},
+		{403, `{"error":{"message":"x"}}`, ""},
+		{302, "", "/api/v1/things/y"},
 	}
 	for _, tt := range tests {
-		t.Run(strconv.Itoa(tt.status)+" "+tt.body, func(t *testing.T) {
+		t.Run(strconv.Itoa(tt.status)+" "+tt.body+tt.location, func(t *testing.T) {
 			hub := newStubHub(t).answer(http.MethodGet, "/api/v1/things/x", tt.status, tt.body)
+			if tt.location != "" {
+				hub.handle(http.MethodGet, "/api/v1/things/x", redirectTo(tt.status, tt.location)).
+					answer(http.MethodGet, tt.location, http.StatusOK, "{}")
+			}
 			probeEnv(t, hub.URL)
 
 			code, stdout, stderr := runProbes(t, "probe", "get", "x")
@@ -303,6 +310,7 @@ func TestClient_SendsEachRequestOnce(t *testing.T) {
 		{"502", envelope(502, "upstream_error"), 502, 1, "upstream_error"},
 		{"503", envelope(503, "unavailable"), 503, 1, "unavailable"},
 		{"a connection closed without an answer", closeWithoutAnswer, 0, 2, "client_error"},
+		{"a 307 to another path", redirectTo(307, "/api/v1/things/y"), 0, 2, "client_error"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

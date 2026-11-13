@@ -44,11 +44,11 @@ type settings struct {
 // read only when the flags and the environment leave one of the two empty,
 // so that a caller who passes both is not stopped by a file it never uses; a
 // file that cannot be read or parsed is then a client error naming it. A
-// setting none of the three gives, and a hub URL that is not an absolute
-// http or https URL with a host, are client errors too.
+// setting none of the three gives, and a hub URL checkHubURL refuses, are
+// client errors too.
 func resolveSettings(cmd *cobra.Command) (settings, error) {
 	s := settings{
-		hubURL:     firstNonEmpty(globalFlag(cmd, "endpoint-url"), os.Getenv(endpointURLEnv)),
+		hubURL:     givenHubURL(cmd),
 		credential: firstNonEmpty(globalFlag(cmd, "api-key"), os.Getenv(apiKeyEnv)),
 	}
 	if s.hubURL == "" || s.credential == "" {
@@ -62,7 +62,7 @@ func resolveSettings(cmd *cobra.Command) (settings, error) {
 
 	var missing []string
 	if s.hubURL == "" {
-		missing = append(missing, fmt.Sprintf("no hub URL: pass --endpoint-url, set %s or set %s in %s", endpointURLEnv, configEndpointURL, configPathForMessage()))
+		missing = append(missing, noHubURL())
 	}
 	if s.credential == "" {
 		missing = append(missing, fmt.Sprintf("no credential: pass --api-key, set %s or set %s in %s", apiKeyEnv, configAPIKey, configPathForMessage()))
@@ -76,12 +76,27 @@ func resolveSettings(cmd *cobra.Command) (settings, error) {
 	return s, nil
 }
 
+// givenHubURL is the hub URL of the first non-empty of the flag
+// --endpoint-url and PARLEY_ENDPOINT_URL, or "" when both are empty; the
+// config file's endpoint_url comes after them, read by the caller when it
+// needs the file.
+func givenHubURL(cmd *cobra.Command) string {
+	return firstNonEmpty(globalFlag(cmd, "endpoint-url"), os.Getenv(endpointURLEnv))
+}
+
+// noHubURL is the message of a command that needs a hub URL and was given
+// none: where a hub URL can be given.
+func noHubURL() string {
+	return fmt.Sprintf("no hub URL: pass --endpoint-url, set %s or set %s in %s", endpointURLEnv, configEndpointURL, configPathForMessage())
+}
+
 // checkHubURL refuses a hub URL that is not an absolute URL with scheme http
-// or https and a host.
+// or https and a host, and one with a query or a fragment, which would come
+// before the path of every request.
 func checkHubURL(hubURL string) error {
 	u, err := url.Parse(hubURL)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return clientError("the hub URL %q is not an absolute http or https URL with a host", hubURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || strings.ContainsAny(hubURL, "?#") {
+		return clientError("the hub URL %q is not an absolute http or https URL with a host and without a query or fragment", hubURL)
 	}
 	return nil
 }

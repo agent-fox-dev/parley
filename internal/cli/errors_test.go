@@ -50,9 +50,7 @@ func TestPrintError_WritesTheEnvelopeOfAnErrorTheCLIRaises(t *testing.T) {
 			if inner["error_type"] != tt.errorType {
 				t.Errorf("error_type = %v, want %q", inner["error_type"], tt.errorType)
 			}
-			var indented bytes.Buffer
-			json.Indent(&indented, bytes.TrimSpace(buf.Bytes()), "", "  ")
-			if want := indented.String() + "\n"; buf.String() != want {
+			if want := indented(t, buf.String()); buf.String() != want {
 				t.Errorf("printed %q, want it indented by 2 spaces with a newline, %q", buf.String(), want)
 			}
 		})

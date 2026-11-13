@@ -2,7 +2,6 @@ package cli
 
 import (
 	"encoding/json"
-	"maps"
 	"reflect"
 	"regexp"
 	"slices"
@@ -86,7 +85,7 @@ func memberNames(t *testing.T, doc string) []string {
 	t.Helper()
 	var members map[string]json.RawMessage
 	oneJSONDocument(t, doc, &members)
-	return slices.Sorted(maps.Keys(members))
+	return sortedKeys(members)
 }
 
 // The test sets environment variables, so it must not run in parallel.
@@ -343,9 +342,7 @@ func TestHelp_RefusesWordsThatNameNoCommand(t *testing.T) {
 //
 // The test sets environment variables, so it must not run in parallel.
 func TestHelp_DescribesEveryCommandOfTheRealTree(t *testing.T) {
-	t.Setenv("PARLEY_CONFIG_DIR", t.TempDir())
-	unsetEnv(t, "PARLEY_ENDPOINT_URL")
-	unsetEnv(t, "PARLEY_API_KEY")
+	loginEnv(t)
 
 	code, stdout, stderr := runCLI(t, "help", "--json")
 

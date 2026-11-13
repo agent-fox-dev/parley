@@ -174,77 +174,16 @@ func TestConfigPath_IsInTheConfigDirOrUnderTheHomeDirectory(t *testing.T) {
 	})
 }
 
-func TestReadConfig_GivesTheKnownKeysOfTheFileOrNothing(t *testing.T) {
-	for _, tc := range []struct {
-		name    string
-		content string // "" leaves the file missing
-		noHome  bool
-		want    configSettings
-	}{
-		{
-			name:    "the file under the home directory",
-			content: "endpoint_url = \"http://hub.example\"\napi_key = \"k\"\nuser_id = \"u1\"\ncolor = 5\n",
-			want:    configSettings{EndpointURL: "http://hub.example", APIKey: "k", UserID: "u1"},
-		},
-		{name: "a missing file"},
-		{name: "no home directory", noHome: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			home := t.TempDir()
-			unsetEnv(t, "PARLEY_CONFIG_DIR")
-			t.Setenv("HOME", home)
-			if tc.noHome {
-				unsetEnv(t, "HOME")
-			}
-			dir := filepath.Join(home, ".parley")
-			if tc.content != "" {
-				os.Mkdir(dir, 0o700)
-				os.WriteFile(filepath.Join(dir, "config.toml"), []byte(tc.content), 0o600)
-			}
+func TestReadConfig_GivesTheKnownKeysOfTheFile(t *testing.T) {
+	home := t.TempDir()
+	unsetEnv(t, "PARLEY_CONFIG_DIR")
+	t.Setenv("HOME", home)
+	writeConfigFile(t, filepath.Join(home, ".parley"), "endpoint_url = \"http://hub.example\"\napi_key = \"k\"\nuser_id = \"u1\"\ncolor = 5\n")
 
-			got, err := readConfig()
+	got, err := readConfig()
 
-			if err != nil || got != tc.want {
-				t.Errorf("readConfig() = %+v, %v, want %+v and no error", got, err, tc.want)
-			}
-			if tc.content == "" {
-				wantAbsent(t, dir)
-			}
-		})
-	}
-}
-
-func TestReadConfig_RefusesAFileItCannotParseAndNamesIt(t *testing.T) {
-	for _, tc := range []struct {
-		name  string
-		setup func(t *testing.T, path string)
-	}{
-		{"not TOML", writeFile("api_key = \"secret\"\nnot = [toml")},
-		{"endpoint_url not a string", writeFile("endpoint_url = 5")},
-		{"api_key not a string", writeFile("api_key = [\"a\"]")},
-		{"user_id not a string", writeFile("user_id = 1")},
-		{"unreadable", func(t *testing.T, path string) {
-			if os.Geteuid() == 0 {
-				t.Skip("root reads a file of mode 0000")
-			}
-			writeFile("api_key = \"k\"")(t, path)
-			os.Chmod(path, 0o000)
-		}},
-		{"a directory", func(t *testing.T, path string) { os.Mkdir(path, 0o700) }},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			t.Setenv("PARLEY_CONFIG_DIR", dir)
-			path := filepath.Join(dir, "config.toml")
-			tc.setup(t, path)
-
-			_, err := readConfig()
-
-			message := wantClientError(t, err, path)
-			if strings.Contains(message, "secret") {
-				t.Errorf("message = %q, want it not to quote the file", message)
-			}
-		})
+	if want := (configSettings{EndpointURL: "http://hub.example", APIKey: "k", UserID: "u1"}); err != nil || got != want {
+		t.Errorf("readConfig() = %+v, %v, want %+v and no error", got, err, want)
 	}
 }
 
@@ -468,7 +407,8 @@ func TestSettings_RefusesToRunWithoutAHubURLOrACredential(t *testing.T) {
 }
 
 func TestSettings_RefusesAHubURLThatIsNotAnAbsoluteHTTPURL(t *testing.T) {
-	for _, hubURL := range []string{"localhost:8080", "ftp://host", "http://", "/api", "host"} {
+	hub := thingHub(t, `{}`)
+	for _, hubURL := range []string{"localhost:8080", "ftp://host", "http://", "/api", "host", hub.URL + "?x", hub.URL + "#f"} {
 		t.Run(hubURL, func(t *testing.T) {
 			loginEnv(t)
 
@@ -476,6 +416,9 @@ func TestSettings_RefusesAHubURLThatIsNotAnAbsoluteHTTPURL(t *testing.T) {
 
 			if message := wantClientFailure(t, code, stdout, stderr, "client_error"); !strings.Contains(message, hubURL) {
 				t.Errorf("message %q does not name %q", message, hubURL)
+			}
+			if n := len(hub.recorded()); n != 0 {
+				t.Errorf("the hub got %d requests, want none", n)
 			}
 		})
 	}
@@ -555,9 +498,10 @@ func TestSettings_RefuseAConfigFileItCannotParseBeforeAnyRequest(t *testing.T) {
 		name  string
 		setup func(t *testing.T, path string)
 	}{
-		{"not TOML", writeFile("not = [toml")},
+		{"not TOML", writeFile("api_key = \"secret\"\nnot = [toml")},
 		{"endpoint_url not a string", writeFile("endpoint_url = 5")},
 		{"api_key not a string", writeFile("api_key = [\"a\"]")},
+		{"user_id not a string", writeFile("user_id = 1")},
 		{"unreadable", func(t *testing.T, path string) {
 			if os.Geteuid() == 0 {
 				t.Skip("root reads a file of mode 0000")
@@ -577,8 +521,12 @@ func TestSettings_RefuseAConfigFileItCannotParseBeforeAnyRequest(t *testing.T) {
 
 			code, stdout, stderr := runProbes(t, "probe", "get", "x")
 
-			if message := wantClientFailure(t, code, stdout, stderr, "client_error"); !strings.Contains(message, path) {
+			message := wantClientFailure(t, code, stdout, stderr, "client_error")
+			if !strings.Contains(message, path) {
 				t.Errorf("message %q does not name %s", message, path)
+			}
+			if strings.Contains(message, "secret") {
+				t.Errorf("message %q quotes the file", message)
 			}
 			if n := len(hub.recorded()); n != 0 {
 				t.Errorf("the hub got %d requests, want none", n)

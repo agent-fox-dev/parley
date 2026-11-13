@@ -6,7 +6,6 @@ import (
 	"io"
 	"log/slog"
 	"maps"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -54,11 +53,6 @@ func (h *recordingHub) recorded() []recordedRequest {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return slices.Clone(h.requests)
-}
-
-// sortedKeys gives the member names of a JSON object.
-func sortedKeys[V any](m map[string]V) []string {
-	return slices.Sorted(maps.Keys(m))
 }
 
 // The test sets environment variables and build values, so it must not run
@@ -143,28 +137,15 @@ func TestVersion_PrintsTheClientAndTheHubBuild(t *testing.T) {
 			}
 
 			for name, hub := range hubs {
-				got := hub.recorded()
-				if name != tt.want {
-					if len(got) != 0 {
-						t.Errorf("hub %s got %d requests, want none", name, len(got))
-					}
-					continue
-				}
-				if len(got) != 1 {
-					t.Fatalf("hub %s got %d requests, want 1", name, len(got))
-				}
-				if got[0].path != "/version" {
-					t.Errorf("request path = %q, want /version", got[0].path)
-				}
-				if len(got[0].authorization) != 0 {
-					t.Errorf("request has an Authorization header %q, want none", got[0].authorization)
+				switch got := hub.recorded(); {
+				case name != tt.want && len(got) != 0:
+					t.Errorf("hub %s got %d requests, want none", name, len(got))
+				case name == tt.want && (len(got) != 1 || got[0].path != "/version" || len(got[0].authorization) != 0):
+					t.Errorf("hub %s got %+v, want one request to /version without an Authorization header", name, got)
 				}
 			}
 
-			var compact, indented bytes.Buffer
-			json.Compact(&compact, []byte(stdout))
-			json.Indent(&indented, compact.Bytes(), "", "  ")
-			if want := indented.String() + "\n"; stdout != want {
+			if want := indented(t, stdout); stdout != want {
 				t.Errorf("stdout is not one JSON document indented by 2 spaces and a newline:\n got %q\nwant %q", stdout, want)
 			}
 		})
@@ -232,24 +213,21 @@ func TestVersion_WarnsAndPrintsTheClientBuildWhenTheHubCannotBeRead(t *testing.T
 		w.Write([]byte(versionBody))
 	}))
 	t.Cleanup(slow.Close)
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	closedPort := "http://" + ln.Addr().String()
-	ln.Close()
+	moved := httptest.NewServer(redirectTo(http.StatusMovedPermanently, answer(http.StatusOK, versionBody)+"/version"))
+	t.Cleanup(moved.Close)
 
 	tests := []struct {
 		name    string
 		hub     string
 		timeout time.Duration
 	}{
-		{name: "connection refused", hub: closedPort},
+		{name: "connection refused", hub: closedPortURL(t)},
 		{name: "no answer within the timeout", hub: slow.URL, timeout: 100 * time.Millisecond},
 		{name: "500 with a JSON body", hub: answer(http.StatusInternalServerError, versionBody)},
 		{name: "404", hub: answer(http.StatusNotFound, "404 page not found\n")},
 		{name: "200 with a body that is not JSON", hub: answer(http.StatusOK, "not json")},
 		{name: "200 with a JSON array", hub: answer(http.StatusOK, "[]")},
+		{name: "301 to a hub that answers", hub: moved.URL},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

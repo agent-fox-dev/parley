@@ -3,8 +3,6 @@ package cli
 import (
 	"errors"
 	"net/http"
-	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -53,7 +51,7 @@ func TestRun_EndsWithTheExitStatusOfTheOutcome(t *testing.T) {
 func TestRun_RefusesWhatItCannotParseWithAUsageErrorBeforeAnyRequest(t *testing.T) {
 	hub := newStubHub(t)
 	dir := t.TempDir()
-	os.WriteFile(filepath.Join(dir, "config.toml"), []byte("endpoint_url = = not TOML\n"), 0o600)
+	writeConfigFile(t, dir, "endpoint_url = = not TOML\n")
 	t.Setenv("PARLEY_CONFIG_DIR", dir)
 	t.Setenv("PARLEY_ENDPOINT_URL", hub.URL)
 	t.Setenv("PARLEY_API_KEY", testAPIKey)

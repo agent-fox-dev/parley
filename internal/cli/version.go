@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"os"
 	"strings"
 
 	"github.com/agent-fox-dev/parley/internal/buildinfo"
@@ -47,7 +46,7 @@ func newVersionCommand() *cobra.Command {
 			info := buildinfo.Get()
 			doc := versionDocument{CLI: clientBuild{Version: info.Version, Commit: info.Commit}}
 
-			hubURL := firstNonEmpty(globalFlag(c.cmd, "endpoint-url"), os.Getenv(endpointURLEnv))
+			hubURL := givenHubURL(c.cmd)
 			if hubURL == "" {
 				file, err := readConfig()
 				if err != nil {

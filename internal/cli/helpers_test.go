@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -203,6 +204,15 @@ func answerWith(status int, body string) http.HandlerFunc {
 	}
 }
 
+// redirectTo is a handler that answers status, a redirect, with location as
+// its Location header and no body.
+func redirectTo(status int, location string) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", location)
+		w.WriteHeader(status)
+	}
+}
+
 // count is how many requests with method the stub hub got.
 func (h *stubHub) count(method string) int {
 	n := 0
@@ -247,6 +257,11 @@ func indented(t *testing.T, body string) string {
 	}
 	json.Indent(&out, compact.Bytes(), "", "  ")
 	return out.String() + "\n"
+}
+
+// sortedKeys gives the member names of a JSON object.
+func sortedKeys[V any](m map[string]V) []string {
+	return slices.Sorted(maps.Keys(m))
 }
 
 // writeConfigFile writes content to config.toml in dir, creating dir, and

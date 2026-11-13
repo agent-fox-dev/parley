@@ -867,12 +867,14 @@ reads no file and sends no request.
 Before the run step of a command whose `auth` is `user` or `admin`,
 `declare` resolves its settings with `resolveSettings`
 (`internal/cli/config.go`): the hub URL from the first non-empty of the
-global flag `--endpoint-url`, `PARLEY_ENDPOINT_URL` and the file's
-`endpoint_url`, the credential from `--api-key`, `PARLEY_API_KEY` and
+global flag `--endpoint-url`, `PARLEY_ENDPOINT_URL` (these two through
+`givenHubURL`, which `parley login` and `parley version` share) and the
+file's `endpoint_url`, the credential from `--api-key`, `PARLEY_API_KEY` and
 `api_key`. It calls `readConfig` only when the flags and the environment
-leave one empty. A missing setting, a file that cannot be parsed and a hub
-URL that is not an absolute `http` or `https` URL with a host
-(`checkHubURL`) are `client_error`s, returned before the run step starts,
+leave one empty. A missing setting (a missing hub URL with the message of
+`noHubURL`, which `parley login` shares), a file that cannot be parsed and
+a hub URL that is not an absolute `http` or `https` URL with a host and
+without a query or fragment (`checkHubURL`) are `client_error`s, returned before the run step starts,
 so no request is sent. The resolved settings build the call's `client`
 (`internal/cli/client.go`) with `call.newClient`, which gives it the
 declaration's `Timeout` or else `options.requestTimeout`
@@ -893,8 +895,9 @@ status and the whole body whatever they hold, for a command whose output is
 not one JSON document. The timeout is a context around connecting, sending
 and reading the whole body; when it runs out the answer is a `client_error`
 (`the hub at <hub URL> gave no complete answer within <timeout>`), and any
-other failure to connect or read is a `client_error` naming the hub URL
-(`cannot reach the hub at <hub URL>: <reason>`). `send(ctx, r)` is `raw`
+other failure is a `client_error` naming the hub URL: to connect or send,
+`cannot reach the hub at <hub URL>: <reason>`; to read the answer,
+`cannot read the answer of the hub at <hub URL>: <reason>`. `send(ctx, r)` is `raw`
 that accepts only an answer of the REST API: a status of `400` or above
 whose body is an object with an `error` member holding `error_type`
 (`isHubEnvelope`, in `errors.go`) becomes a `hubError`; any other status
@@ -904,7 +907,10 @@ is `send` for the common case. Each client has its own transport, a clone
 of `http.DefaultTransport` with keep-alives disabled: Go's transport can
 send a request again on a new connection when a reused one breaks, and the
 hub may have received it the first time, so every connection serves one
-request and nothing in the client retries one.
+request and nothing in the client retries one. Its `CheckRedirect`
+(`keepRedirect`) returns a redirect as the answer instead of following it,
+which would send the request again (a `POST` with its body after a `307`
+or `308`); `send` then refuses it as a status outside `2xx`.
 
 `internal/cli/errors.go` holds the two kinds of error a command ends with.
 `hubError` is an error envelope the hub answered, with the HTTP status and
@@ -982,16 +988,19 @@ it writes a temporary file in the same directory (created with mode `0700`
 when missing), syncs it, sets its mode to `0600` and renames it over
 `config.toml`. Every failure, including a file it cannot parse, is a
 `client_error` naming the path, with the temporary file removed and the old
-file left as it was.
+file left as it was; without a path, because there is no home directory,
+it is `cannot save the config file: <configPath's error>`.
 
 `parley login --api-key`, with the global flag (`internal/cli/login.go`),
-reads the client configuration file with `readConfig`, resolves the hub URL
+takes the credential with `loginCredential` (an empty one is a
+`usage_error` before anything is read or sent), reads the client
+configuration file with `readConfig`, resolves the hub URL
 from the flag, `PARLEY_ENDPOINT_URL` and the file, and asks the hub who the
 credential belongs to with `GET /api/v1/user` through a `client` that
 presents it (30 s timeout). On a `2xx` answer it saves `endpoint_url`,
 `api_key` and `user_id` with `saveConfig`. A hub URL that is not an absolute
-`http` or `https` URL with a host is refused with `checkHubURL`, as for
-every command.
+`http` or `https` URL with a host and without a query or fragment is
+refused with `checkHubURL`, as for every command.
 
 Without `--api-key`, `parley login` signs in through the browser
 (`browserLogin` in `internal/cli/login.go`): it validates `--expires`,

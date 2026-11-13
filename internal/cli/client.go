@@ -44,8 +44,16 @@ func newClient(hubURL, credential string, timeout time.Duration) *client {
 		timeout:    timeout,
 		// The timeout is a context around the whole exchange instead of
 		// the client's, so that a request can state its own.
-		http: &http.Client{Transport: onceTransport()},
+		http: &http.Client{Transport: onceTransport(), CheckRedirect: keepRedirect},
 	}
+}
+
+// keepRedirect has the client return a redirect as the answer instead of
+// following it: following one sends the request a second time, a POST with
+// its body again after a 307 or 308, and a redirect is no answer of the
+// hub's REST API.
+func keepRedirect(*http.Request, []*http.Request) error {
+	return http.ErrUseLastResponse
 }
 
 // onceTransport is the default transport with connections that serve one

@@ -407,6 +407,8 @@ func TestLogin_ReportsAFailureOnTheClientSideAndSavesNothing(t *testing.T) {
 		path   string
 		answer *stubAnswer
 		stdin  string
+		// config, when set, is the content of the config file.
+		config string
 		want   string
 		// mentions are texts the message must hold.
 		mentions []string
@@ -424,6 +426,8 @@ func TestLogin_ReportsAFailureOnTheClientSideAndSavesNothing(t *testing.T) {
 		{name: "empty credential", args: []string{"--api-key", ""}, want: "usage_error"},
 		{name: "empty stdin", args: []string{"--api-key", "-"}, stdin: "", want: "usage_error"},
 		{name: "blank stdin", args: []string{"--api-key", "-"}, stdin: " \n", want: "usage_error"},
+		{name: "empty credential and a config file it cannot parse", args: []string{"--api-key", ""}, config: "not = [toml", want: "usage_error"},
+		{name: "empty stdin and a config file it cannot parse", args: []string{"--api-key", "-"}, config: "not = [toml", want: "usage_error"},
 		{name: "--expires 45", args: []string{"--expires", "45"}, want: "usage_error"},
 		{name: "--expires x", args: []string{"--expires", "x"}, want: "usage_error"},
 		{name: "unknown flag", args: []string{"--nope"}, want: "usage_error"},
@@ -432,6 +436,9 @@ func TestLogin_ReportsAFailureOnTheClientSideAndSavesNothing(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			dir := loginEnv(t)
+			if tt.config != "" {
+				writeConfigFile(t, dir, tt.config)
+			}
 			hub := browserHub(t).answer(http.MethodGet, "/api/v1/user", http.StatusOK, testUser)
 			if tt.answer != nil {
 				hub.answer(http.MethodGet, tt.path, tt.answer.status, tt.answer.body)
@@ -459,7 +466,11 @@ func TestLogin_ReportsAFailureOnTheClientSideAndSavesNothing(t *testing.T) {
 			if n := len(hub.recorded()); tt.want == "usage_error" && n != 0 {
 				t.Errorf("the hub got %d requests, want none", n)
 			}
-			wantAbsent(t, dir)
+			if tt.config == "" {
+				wantAbsent(t, dir)
+			} else if data, _ := os.ReadFile(filepath.Join(dir, "config.toml")); string(data) != tt.config {
+				t.Errorf("the config file holds %q, want %q as it was", data, tt.config)
+			}
 		})
 	}
 }

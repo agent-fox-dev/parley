@@ -11,7 +11,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -53,28 +52,33 @@ func login(c *call) error {
 	// PARLEY_API_KEY or the file; --provider and --expires belong to the
 	// browser flow.
 	browser := !c.cmd.Flags().Changed("api-key")
+	// What the command line gives is checked first, so that a usage error
+	// is reported before any setting is read.
 	var days int
+	var cred string
+	var err error
 	if browser {
 		expires, _ := c.cmd.Flags().GetString("expires")
-		var err error
-		if days, err = loginExpires(expires); err != nil {
-			return err
-		}
+		days, err = loginExpires(expires)
+	} else {
+		cred, err = loginCredential(globalFlag(c.cmd, "api-key"), c.opts.stdin)
 	}
-	// The file is read, and its path found, before anything else is sent,
-	// so that a file or a missing home directory the save would fail on
-	// cannot cost a credential the hub just accepted or issued.
-	path, err := configPath()
 	if err != nil {
+		return err
+	}
+	// The file is read, and its path found, before anything is sent, so
+	// that a file or a missing home directory the save would fail on cannot
+	// cost a credential the hub just accepted or issued.
+	if _, err := configPath(); err != nil {
 		return clientError("%v", err)
 	}
 	file, err := readConfig()
 	if err != nil {
 		return err
 	}
-	hubURL := firstNonEmpty(globalFlag(c.cmd, "endpoint-url"), os.Getenv(endpointURLEnv), file.EndpointURL)
+	hubURL := firstNonEmpty(givenHubURL(c.cmd), file.EndpointURL)
 	if hubURL == "" {
-		return clientError("no hub URL: pass --endpoint-url, set %s or set %s in %s", endpointURLEnv, configEndpointURL, path)
+		return clientError("%s", noHubURL())
 	}
 	if err := checkHubURL(hubURL); err != nil {
 		return err
@@ -82,12 +86,11 @@ func login(c *call) error {
 
 	// The requests before the credential is known carry none.
 	hub := c.newClient(hubURL, "")
-	var cred string
 	var user loginUser
 	if browser {
 		provider, _ := c.cmd.Flags().GetString("provider")
 		cred, user, err = browserLogin(c.ctx, hub, provider, days, c.opts, c.stderr)
-	} else if cred, err = loginCredential(globalFlag(c.cmd, "api-key"), c.opts.stdin); err == nil {
+	} else {
 		user, err = hubUser(c.ctx, c.newClient(hubURL, cred))
 	}
 	if err != nil {
