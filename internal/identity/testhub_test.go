@@ -23,10 +23,11 @@ import (
 )
 
 // testHub is the request pipeline of internal/server with the identity
-// service installed, over a store in t.TempDir(), served in-process. It
-// registers two non-public test routes: GET /api/v1/test/whoami answers
-// the caller's Principal, and GET /api/v1/test/me, declared as needing a
-// user, answers 200. Both count their calls.
+// service and its routes installed, over a store in t.TempDir(), served
+// in-process. It also registers two non-public test routes: GET
+// /api/v1/test/whoami answers the caller's Principal, and GET
+// /api/v1/test/me, declared as needing a user, answers 200. Both count
+// their calls.
 type testHub struct {
 	t          *testing.T
 	st         *store.Store
@@ -57,9 +58,15 @@ func notBootstrapped() hubOption { return func(c *hubConfig) { c.bootstrap = fal
 // withAdminEmail bootstraps the hub with email as its admin_email.
 func withAdminEmail(email string) hubOption { return func(c *hubConfig) { c.adminEmail = email } }
 
-// withProviders configures the identity providers.
-func withProviders(p ...config.Provider) hubOption {
-	return func(c *hubConfig) { c.providers = p }
+// withProviders configures the identity providers. An endpoint a provider
+// leaves empty is its public one, as when the configuration file does not
+// give it.
+func withProviders(ps ...config.Provider) hubOption {
+	return func(c *hubConfig) {
+		for _, p := range ps {
+			c.providers = append(c.providers, p.WithPublicEndpoints())
+		}
+	}
 }
 
 // withExternalURL sets [server].external_url.
@@ -95,6 +102,9 @@ func newTestHub(t *testing.T, opts ...hubOption) *testHub {
 	h.svc.Bind(identity.Deps{Store: st, Now: h.now, Providers: cfg.providers, ExternalURL: cfg.externalURL})
 	h.srv = server.New(server.Options{Logger: slog.New(slog.DiscardHandler), RateLimitDisabled: true, Now: h.now})
 	h.srv.SetAuthenticator(h.svc.Authenticate)
+	for _, r := range h.svc.Routes() {
+		h.srv.Register(r)
+	}
 	h.srv.Register(server.Route{Method: http.MethodGet, Pattern: "/test/whoami", Handler: func(w http.ResponseWriter, r *http.Request) error {
 		h.whoamiCalls.Add(1)
 		p, ok := identity.PrincipalOf(r.Context())

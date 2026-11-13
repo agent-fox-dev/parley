@@ -1,9 +1,9 @@
 # API reference
 
 The hub, `parleyd`, answers the routes below over HTTP. The REST API is
-mounted at `/api/v1`; no feature has registered a route there yet, so this
-page describes the rules every REST route follows and the three built-in
-routes. It grows as features land.
+mounted at `/api/v1`. This page describes the rules every REST route
+follows, the three built-in routes and the REST routes registered so far. It
+grows as features land.
 
 ## Conventions so far
 
@@ -441,3 +441,34 @@ Example:
 ```
 
 How the build values are set is in [architecture.md](architecture.md#build-information).
+
+## `GET /api/v1/auth/providers`
+
+The identity providers the hub is configured with, for a client that starts
+a login. The route is public: it needs no credential and does not read the
+`Authorization` header.
+
+| Status | Body |
+|---|---|
+| `200 OK` | a [list](#lists) of the configured providers, ordered by name |
+
+The answer carries `Cache-Control: public, max-age=300`. An item has exactly
+these members:
+
+| Member | Value |
+|---|---|
+| `name` | `github` or `google` |
+| `authorize_url` | where the client sends the browser: the provider's authorize endpoint with the hub's `client_id` and the scopes the hub needs |
+
+The authorize endpoint is the provider's `authorize_url` from the
+configuration, or its public one (see
+[configuration.md](configuration.md#oauth-providers)). Its query parameters
+are `client_id` and `scope` (`user:email` for `github`, `openid email
+profile` for `google`), and `response_type=code` for `google`. A client
+secret is never part of the answer, in the body or a header. With no
+provider configured, `items` is `[]`. The hub writes `&` in a JSON string
+as `\u0026`, which decodes to `&`:
+
+```json
+{"items":[{"name":"github","authorize_url":"https://github.com/login/oauth/authorize?client_id=gh-id\u0026scope=user%3Aemail"},{"name":"google","authorize_url":"https://accounts.google.com/o/oauth2/v2/auth?client_id=gg-id\u0026response_type=code\u0026scope=openid+email+profile"}],"next_cursor":null}
+```

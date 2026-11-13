@@ -25,3 +25,17 @@ is built with the first login (the package's fifth task), and no other
 user-creation function is added before it. Until then the tests of
 `internal/identity` seed users with an `INSERT` of their own, in
 `internal/identity/testhub_test.go`.
+
+## The providers' public endpoints stay in internal/config
+
+The package's third task describes the two providers in `internal/identity`
+with their default authorize, token and user URLs, and resolves each
+configured `[[oauth.providers]]` entry against them. `internal/config`
+already resolves them when it loads the file: a provider's endpoints arrive
+in `config.Provider` with the public ones filled in where the file gives
+none. A second table in `internal/identity` could drift from the first, so
+the endpoints stay in `internal/config`, which exports
+`config.Provider.WithPublicEndpoints` for code that builds a provider
+without loading a file, and `internal/identity/provider.go` holds only what
+the configuration does not: the supported names, the scopes and Google's
+`response_type=code`.

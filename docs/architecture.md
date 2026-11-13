@@ -621,10 +621,20 @@ without running a start hook or binding the listener.
 `internal/hub/identity.go` adds the part `composeIdentity`, after
 `composeBootstrap` in `parts`. It adds the schema step
 `identity.SchemaStep` (`identity_records`), installs the `Authenticate`
-method of an `identity.Service` as the pipeline's authenticator, and adds the
+method of an `identity.Service` as the pipeline's authenticator, registers
+every route of `(*identity.Service).Routes()` with `AddRoute`, and adds the
 start hook `identity`, which binds the service with
 `(*identity.Service).Bind(identity.Deps{Store, Now, Providers,
 ExternalURL})` from the `Runtime` before the hub serves its first request.
+
+The service's routes are, so far, the public `GET /auth/providers` (see
+[api.md](api.md#get-apiv1authproviders)). The providers in
+`identity.Deps.Providers` come with their endpoints resolved:
+`internal/config` fills an endpoint the file does not give with the
+provider's public one, through `config.Provider.WithPublicEndpoints`, and
+holds the only table of those endpoints. `internal/identity/provider.go`
+holds what the configuration does not: the providers the hub can log in
+with, the scopes it asks each for and Google's extra `response_type=code`.
 
 The schema step creates, in the transactional store:
 

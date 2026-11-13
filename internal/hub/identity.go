@@ -6,11 +6,12 @@ import (
 	"github.com/agent-fox-dev/parley/internal/identity"
 )
 
-// composeIdentity adds the identity records to the transactional store and
+// composeIdentity adds the identity records to the transactional store,
 // installs the identity service as the pipeline's authenticator, so that
-// every non-public route under /api/v1 is authenticated. The service gets
-// its store, clock and configuration in a start hook, which runs before the
-// hub serves its first request.
+// every non-public route under /api/v1 is authenticated, and registers the
+// service's routes, such as GET /auth/providers. The service gets its
+// store, clock and configuration in a start hook, which runs before the hub
+// serves its first request.
 func composeIdentity(c *Composition) {
 	svc := &identity.Service{}
 	c.AddSchemaStep(identity.SchemaStep)
@@ -24,4 +25,7 @@ func composeIdentity(c *Composition) {
 		return nil
 	})
 	c.SetAuthenticator(svc.Authenticate)
+	for _, r := range svc.Routes() {
+		c.AddRoute(r)
+	}
 }
