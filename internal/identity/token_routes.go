@@ -4,7 +4,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"slices"
 
 	"github.com/agent-fox-dev/parley/internal/server"
 )
@@ -21,7 +23,88 @@ func (s *Service) tokenRoutes() []server.Route {
 			Handler: s.getOwnToken},
 		{Method: http.MethodDelete, Pattern: "/user/tokens/:token_id", Scope: "tokens:manage", Marks: needsUserMark,
 			Handler: s.revokeOwnToken},
+		{Method: http.MethodPut, Pattern: "/user/tokens/:token_id/permissions", Scope: "tokens:write", Marks: needsUserMark,
+			Handler: s.changeOwnTokenPermissions},
+		{Method: http.MethodPatch, Pattern: "/user/tokens/:token_id/permissions", Scope: "tokens:write", Marks: needsUserMark,
+			Handler: s.changeOwnTokenPermissions},
+		{Method: http.MethodDelete, Pattern: "/user/tokens/:token_id/permissions", Scope: "tokens:write", Marks: needsUserMark,
+			Handler: s.changeOwnTokenPermissions},
 	}
+}
+
+// changeOwnTokenPermissions answers PUT, PATCH and DELETE
+// /user/tokens/:token_id/permissions: PUT replaces the caller's token's
+// permissions with the list given, PATCH adds the scopes it does not have,
+// DELETE removes the scopes given. The checks run in a fixed order, the
+// owner lookup (404), the body (400), the subset rule on the scopes the
+// change adds for a PAT caller (403), then the token's state (409), so that
+// an answer tells nothing of a token the caller does not own and a change
+// is judged on a valid body. A change that leaves no scope revokes the
+// token in the same transaction. The answer is 200 with the token after the
+// change; its paths, workspace, name and expiry never change.
+func (s *Service) changeOwnTokenPermissions(w http.ResponseWriter, r *http.Request) error {
+	caller, ok := PrincipalOf(r.Context())
+	if !ok {
+		return errors.New("a route that needs a user was reached without a caller")
+	}
+	now := s.deps.Now()
+	var p PAT
+	err := s.deps.Store.Tx(r.Context(), func(tx *sql.Tx) error {
+		cur, err := ownToken(r, tx)
+		if err != nil {
+			return err
+		}
+		given, err := permissionsChangeOf(r)
+		if err != nil {
+			return err
+		}
+		perms := changedPermissions(r.Method, cur.Permissions, given)
+		// DELETE adds nothing, so the rule never refuses it.
+		added := slices.DeleteFunc(slices.Clone(perms), func(scope string) bool { return slices.Contains(cur.Permissions, scope) })
+		if err := CheckPermissionSubset(caller, added); err != nil {
+			return err
+		}
+		if cur.RevokedAt != nil {
+			return server.Conflict("token is revoked")
+		}
+		if expired(cur.ExpiresAt, now) {
+			return server.Conflict("token is expired")
+		}
+		p, err = setTokenPermissions(r.Context(), tx, cur.TokenID, perms, now)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	server.WriteJSON(w, http.StatusOK, p)
+	return nil
+}
+
+// permissionsChangeOf reads the permissions member of the body of a
+// permission change, an array of strings; other members, paths and
+// workspace among them, are ignored. PUT and PATCH take registered scopes
+// only, and PATCH and DELETE at least one string; DELETE takes any
+// string, since removing a scope a token lacks changes nothing.
+func permissionsChangeOf(r *http.Request) ([]string, error) {
+	var body map[string]json.RawMessage
+	if err := server.DecodeJSON(r, &body); err != nil {
+		return nil, err
+	}
+	given, err := stringsMember(body["permissions"], "permissions")
+	if err != nil {
+		return nil, err
+	}
+	if len(given) == 0 && r.Method != http.MethodPut {
+		return nil, server.InvalidRequest("permissions must hold at least one scope")
+	}
+	if r.Method != http.MethodDelete {
+		for _, s := range given {
+			if !IsRegisteredScope(s) {
+				return nil, server.InvalidRequest(fmt.Sprintf("permissions: %q is not a registered scope", s))
+			}
+		}
+	}
+	return given, nil
 }
 
 // listOwnTokens answers GET /user/tokens: a page of the caller's tokens.

@@ -508,7 +508,7 @@ func checkRefusal(t *testing.T, what string, r response, status int, errorType, 
 
 // everyScope is every scope a route of the identity service declares, so
 // that a PAT holding them passes the scope check of every identity route.
-var everyScope = []string{"users:read", "users:write", "orgs:read", "tokens:read", "tokens:manage"}
+var everyScope = []string{"users:read", "users:write", "orgs:read", "tokens:read", "tokens:write", "tokens:manage"}
 
 // omitted marks a member that tokenBody leaves out.
 type omitted struct{}
@@ -606,6 +606,19 @@ func (h *testHub) call(method, path, authorization string, body any) response {
 		header.Set("Authorization", authorization)
 	}
 	return h.do(method, path, body, header)
+}
+
+// needsScope registers a stub route that declares scope and answers 200,
+// and returns its path, so that a test can ask whether a token passes the
+// scope check for scope.
+func (h *testHub) needsScope(scope string) string {
+	pattern := "/test/needs/" + strings.ReplaceAll(scope, ":", "-")
+	h.srv.Register(server.Route{Method: http.MethodGet, Pattern: pattern, Scope: scope,
+		Handler: func(w http.ResponseWriter, r *http.Request) error {
+			server.WriteJSON(w, http.StatusOK, map[string]any{})
+			return nil
+		}})
+	return "/api/v1" + pattern
 }
 
 // snapshot reads every row of the users, orgs, memberships, API keys and

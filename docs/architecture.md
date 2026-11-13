@@ -910,6 +910,22 @@ transaction; every `/user/tokens` route carries `identity.MarkNeedsUser`,
 so the admin token is refused by authentication and no handler refuses it
 again.
 
+`PUT`, `PATCH` and `DELETE /user/tokens/:token_id/permissions` share one
+handler, `changeOwnTokenPermissions`, declaring `tokens:write`. In one
+`(*store.Store).Tx` it looks the token up with `tokenOfUser` (404), reads
+the body's `permissions` with `permissionsChangeOf` (400; registered scopes
+for `PUT` and `PATCH`, at least one entry for `PATCH` and `DELETE`),
+computes the new list with `changedPermissions` (`PUT` the list without
+duplicates, `PATCH` the current list with the new scopes appended, `DELETE`
+the current list without the given ones), passes the scopes the new list
+adds to the token's current ones to `CheckPermissionSubset` (403), refuses a
+revoked or expired token with `409 conflict`, and writes with
+`setTokenPermissions`, which stores `[]` and sets `revoked_at` in the same
+`UPDATE` when the list is empty. Expiry is decided by `expired(expiresAt,
+now)` in `authenticate.go`, the predicate authentication's `checkState`
+uses, so a token is `409` here exactly when it is `401` there. `paths`,
+`workspace`, `name` and `expires_at` are never written.
+
 `POST /users` (`createUser`) decodes the body into a
 `map[string]json.RawMessage`, so that a missing member, `null` and a value
 of another type are told apart: `username`, `email`, `provider` and

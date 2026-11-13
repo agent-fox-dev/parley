@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"slices"
 	"time"
 	"unicode/utf8"
@@ -134,16 +135,57 @@ func tokenPermissions(requested []string) ([]string, error) {
 	if len(requested) == 0 {
 		return nil, server.InvalidRequest("permissions must hold at least one scope")
 	}
-	perms := make([]string, 0, len(requested))
 	for _, s := range requested {
 		if !IsRegisteredScope(s) {
 			return nil, server.InvalidRequest(fmt.Sprintf("permissions: %q is not a registered scope", s))
 		}
+	}
+	return appendNew(make([]string, 0, len(requested)), requested...), nil
+}
+
+// appendNew appends to perms each of scopes it does not hold yet, in order.
+func appendNew(perms []string, scopes ...string) []string {
+	for _, s := range scopes {
 		if !slices.Contains(perms, s) {
 			perms = append(perms, s)
 		}
 	}
-	return perms, nil
+	return perms
+}
+
+// changedPermissions returns the permissions current become under the
+// permission change method with the validated list given: PUT the list
+// given without duplicates, PATCH current followed by the scopes of given
+// it does not hold, in their order, and DELETE current without the scopes
+// given. The result is never nil, so that an empty list is stored as [].
+func changedPermissions(method string, current, given []string) []string {
+	switch method {
+	case http.MethodPut:
+		return appendNew([]string{}, given...)
+	case http.MethodPatch:
+		return appendNew(slices.Clone(current), given...)
+	default:
+		return slices.DeleteFunc(append([]string{}, current...), func(s string) bool { return slices.Contains(given, s) })
+	}
+}
+
+// setTokenPermissions stores perms as the permissions of the PAT tokenID in
+// tx and returns its record as stored then. An empty perms also revokes the
+// token at now, in the same statement, since a token without a scope can do
+// nothing and must not stay live.
+func setTokenPermissions(ctx context.Context, tx *sql.Tx, tokenID string, perms []string, now time.Time) (PAT, error) {
+	data, err := json.Marshal(perms)
+	if err != nil {
+		return PAT{}, fmt.Errorf("encode a PAT's permissions: %w", err)
+	}
+	query, args := `UPDATE pats SET permissions = ? WHERE token_id = ?`, []any{string(data), tokenID}
+	if len(perms) == 0 {
+		query, args = `UPDATE pats SET permissions = ?, revoked_at = ? WHERE token_id = ?`, []any{string(data), now.UTC().UnixNano(), tokenID}
+	}
+	if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+		return PAT{}, fmt.Errorf("set the permissions of PAT %s: %w", tokenID, err)
+	}
+	return PATByID(ctx, tx, tokenID)
 }
 
 // tokenExpiry returns the expiry of a token minted now with the lifetime

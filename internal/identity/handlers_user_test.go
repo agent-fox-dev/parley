@@ -30,6 +30,9 @@ var needsUserRoutes = []needsUserRoute{
 	{http.MethodGet, "/api/v1/user/tokens", nil},
 	{http.MethodGet, "/api/v1/user/tokens/x", nil},
 	{http.MethodDelete, "/api/v1/user/tokens/x", nil},
+	{http.MethodPut, "/api/v1/user/tokens/x/permissions", map[string]any{"permissions": []string{"git:read"}}},
+	{http.MethodPatch, "/api/v1/user/tokens/x/permissions", map[string]any{"permissions": []string{"git:read"}}},
+	{http.MethodDelete, "/api/v1/user/tokens/x/permissions", map[string]any{"permissions": []string{"git:read"}}},
 }
 
 // wholeSecondsUTC is an RFC 3339 time in UTC with whole seconds.

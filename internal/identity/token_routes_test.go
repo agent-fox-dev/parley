@@ -286,6 +286,10 @@ func TestCreateToken_RefusesAPATBeyondItsOwnScopesAndPaths(t *testing.T) {
 // tokenPath is the path of the caller's token tokenID.
 func tokenPath(tokenID string) string { return "/api/v1/user/tokens/" + tokenID }
 
+// permissionsPath is the path of the permissions of the caller's token
+// tokenID.
+func permissionsPath(tokenID string) string { return tokenPath(tokenID) + "/permissions" }
+
 func TestListTokens_AnswersEveryTokenOfTheCallerNewestFirst(t *testing.T) {
 	t.Parallel()
 	h := newAliceHub(t)
@@ -394,16 +398,28 @@ func TestOwnTokenRoutes_AnswerAMissingAndAnotherUsersTokenAlike(t *testing.T) {
 	t.Parallel()
 	h := newAliceHub(t)
 	_, bobs := h.seedPAT(identity.PATSpec{UserID: h.seedUser("bob").ID, Permissions: []string{"git:write"}})
-	for _, method := range []string{http.MethodGet, http.MethodDelete} {
+	change := map[string]any{"permissions": []string{"git:read"}}
+	for _, c := range []struct {
+		method string
+		path   func(string) string
+		body   any
+	}{
+		{http.MethodGet, tokenPath, nil},
+		{http.MethodDelete, tokenPath, nil},
+		{http.MethodPut, permissionsPath, change},
+		{http.MethodPatch, permissionsPath, change},
+		{http.MethodDelete, permissionsPath, change},
+	} {
 		before := h.snapshot()
-		missing := h.call(method, tokenPath("zzzzzzzz"), "Bearer "+h.key, nil)
-		foreign := h.call(method, tokenPath(bobs.TokenID), "Bearer "+h.key, nil)
-		checkRefusal(t, method+" a missing token", missing, http.StatusNotFound, "not_found", "token not found")
+		what := c.method + " " + c.path("<id>")
+		missing := h.call(c.method, c.path("zzzzzzzz"), "Bearer "+h.key, c.body)
+		foreign := h.call(c.method, c.path(bobs.TokenID), "Bearer "+h.key, c.body)
+		checkRefusal(t, what+" of a missing token", missing, http.StatusNotFound, "not_found", "token not found")
 		if !bytes.Equal(foreign.body, missing.body) || foreign.status != missing.status {
-			t.Errorf("%s bob's token = %d %s, want the answer for a missing one %d %s", method, foreign.status, foreign.body, missing.status, missing.body)
+			t.Errorf("%s of bob's token = %d %s, want the answer for a missing one %d %s", what, foreign.status, foreign.body, missing.status, missing.body)
 		}
 		if h.snapshot() != before {
-			t.Errorf("%s: the store changed", method)
+			t.Errorf("%s: the store changed", what)
 		}
 	}
 }
@@ -411,19 +427,24 @@ func TestOwnTokenRoutes_AnswerAMissingAndAnotherUsersTokenAlike(t *testing.T) {
 func TestOwnTokenRoutes_RefuseAPATWithoutTheScopeBeforeTheLookup(t *testing.T) {
 	t.Parallel()
 	h := newAliceHub(t)
+	change := map[string]any{"permissions": []string{"git:read"}}
 	for _, c := range []struct {
 		method, path, held, needed string
+		body                       any
 	}{
-		{http.MethodGet, "/api/v1/user/tokens", "git:read", "tokens:read"},
-		{http.MethodGet, tokenPath("%s"), "keys:manage", "tokens:read"},
-		{http.MethodDelete, tokenPath("%s"), "tokens:write", "tokens:manage"},
-		{http.MethodDelete, tokenPath("%s"), "tokens:read", "tokens:manage"},
+		{http.MethodGet, "/api/v1/user/tokens", "git:read", "tokens:read", nil},
+		{http.MethodGet, tokenPath("%s"), "keys:manage", "tokens:read", nil},
+		{http.MethodDelete, tokenPath("%s"), "tokens:write", "tokens:manage", nil},
+		{http.MethodDelete, tokenPath("%s"), "tokens:read", "tokens:manage", nil},
+		{http.MethodPut, permissionsPath("%s"), "tokens:read", "tokens:write", change},
+		{http.MethodPatch, permissionsPath("%s"), "tokens:read", "tokens:write", change},
+		{http.MethodDelete, permissionsPath("%s"), "git:write", "tokens:write", change},
 	} {
 		caller, _ := h.seedPAT(identity.PATSpec{UserID: h.alice.ID, Permissions: []string{c.held}})
 		for _, id := range []string{h.patRec.TokenID, "zzzzzzzz"} {
 			path := strings.Replace(c.path, "%s", id, 1)
 			before := h.snapshot()
-			r := h.call(c.method, path, "Bearer "+caller, nil)
+			r := h.call(c.method, path, "Bearer "+caller, c.body)
 			checkRefusal(t, c.held+" "+c.method+" "+path, r, http.StatusForbidden, "insufficient_scope", "this route needs the scope "+c.needed)
 			if h.snapshot() != before {
 				t.Errorf("%s %s with %s: the store changed", c.method, path, c.held)
@@ -439,12 +460,16 @@ func TestTokenAnswers_CarryTheValueOnlyWhenTheTokenIsCreated(t *testing.T) {
 	token, _ := created.json["token"].(string)
 	id, _ := created.json["token_id"].(string)
 	secret := strings.TrimPrefix(token, "parley_pat_"+id+"_")
-	for _, rq := range []struct{ method, path string }{
-		{http.MethodGet, "/api/v1/user/tokens"},
-		{http.MethodGet, tokenPath(id)},
-		{http.MethodDelete, tokenPath(id)},
+	for _, rq := range []struct {
+		method, path string
+		body         any
+	}{
+		{http.MethodGet, "/api/v1/user/tokens", nil},
+		{http.MethodGet, tokenPath(id), nil},
+		{http.MethodPut, permissionsPath(id), map[string]any{"permissions": []string{"git:read", "vars:read"}}},
+		{http.MethodDelete, tokenPath(id), nil},
 	} {
-		r := h.call(rq.method, rq.path, "Bearer "+h.key, nil)
+		r := h.call(rq.method, rq.path, "Bearer "+h.key, rq.body)
 		objects := []any{any(r.json)}
 		if items, ok := r.json["items"].([]any); ok {
 			objects = items
@@ -453,6 +478,185 @@ func TestTokenAnswers_CarryTheValueOnlyWhenTheTokenIsCreated(t *testing.T) {
 			if _, has := o.(map[string]any)["token"]; has || r.status != http.StatusOK || strings.Contains(string(r.body), secret) {
 				t.Errorf("%s %s = %d %s, want 200 without the token or its secret", rq.method, rq.path, r.status, r.body)
 			}
+		}
+	}
+}
+
+func TestChangePermissions_ReplacesAddsAndRemovesScopes(t *testing.T) {
+	t.Parallel()
+	h := newAliceHub(t)
+	remover, _ := h.seedPAT(identity.PATSpec{UserID: h.alice.ID, Permissions: []string{"tokens:write"}})
+	changesRead, varsRead := h.needsScope("changes:read"), h.needsScope("vars:read")
+	for _, c := range []struct {
+		name, method, caller string
+		held, given, want    []string
+		// what the token's value gets on the routes needing changes:read
+		// and vars:read after the change
+		changes, vars int
+	}{
+		{"PUT replaces, duplicates dropped", http.MethodPut, h.key, []string{"git:read", "changes:write"},
+			[]string{"vars:read", "git:write", "vars:read"}, []string{"vars:read", "git:write"}, http.StatusForbidden, http.StatusOK},
+		{"PATCH appends what is new, in order", http.MethodPatch, h.key, []string{"git:read", "changes:write"},
+			[]string{"changes:write", "vars:read", "vars:read"}, []string{"git:read", "changes:write", "vars:read"}, http.StatusOK, http.StatusOK},
+		{"DELETE removes, ignoring what the token lacks", http.MethodDelete, remover, []string{"git:read", "changes:write", "vars:read"},
+			[]string{"changes:write", "git:write", "not-a-scope"}, []string{"git:read", "vars:read"}, http.StatusForbidden, http.StatusOK},
+	} {
+		value, target := h.seedPAT(identity.PATSpec{UserID: h.alice.ID, Permissions: c.held})
+		r := h.call(c.method, permissionsPath(target.TokenID), "Bearer "+c.caller, map[string]any{"permissions": c.given})
+		if want := asJSON(t, c.want); r.status != http.StatusOK || !reflect.DeepEqual(r.json["permissions"], want) || r.json["revoked_at"] != nil {
+			t.Errorf("%s: answer = %d %s, want 200 with permissions %v and revoked_at null", c.name, r.status, r.body, c.want)
+		}
+		if got := h.get(tokenPath(target.TokenID), "Bearer "+h.key); !reflect.DeepEqual(got.json, r.json) {
+			t.Errorf("%s: GET = %s, want the answer %s", c.name, got.body, r.body)
+		}
+		if got := h.get(changesRead, "Bearer "+value).status; got != c.changes {
+			t.Errorf("%s: a route needing changes:read = %d, want %d", c.name, got, c.changes)
+		}
+		if got := h.get(varsRead, "Bearer "+value).status; got != c.vars {
+			t.Errorf("%s: a route needing vars:read = %d, want %d", c.name, got, c.vars)
+		}
+	}
+}
+
+func TestChangePermissions_RevokesATokenLeftWithoutScopes(t *testing.T) {
+	t.Parallel()
+	h := newAliceHub(t)
+	both := []string{"git:read", "vars:read"}
+	type change struct {
+		method string
+		given  []string
+	}
+	for _, c := range []struct {
+		name    string
+		changes []change
+	}{
+		{"PUT []", []change{{http.MethodPut, []string{}}}},
+		{"DELETE every scope", []change{{http.MethodDelete, both}}},
+		{"DELETE one scope, then the other", []change{{http.MethodDelete, []string{"vars:read"}}, {http.MethodDelete, []string{"git:read"}}}},
+	} {
+		value, target := h.seedPAT(identity.PATSpec{UserID: h.alice.ID, Permissions: both})
+		h.advance(time.Minute)
+		var r response
+		for _, ch := range c.changes {
+			r = h.call(ch.method, permissionsPath(target.TokenID), "Bearer "+h.key, map[string]any{"permissions": ch.given})
+		}
+		if r.status != http.StatusOK || !reflect.DeepEqual(r.json["permissions"], []any{}) || r.json["revoked_at"] != h.now().Format(time.RFC3339) {
+			t.Errorf("%s: answer = %d %s, want 200 with permissions [] and revoked_at %s", c.name, r.status, r.body, h.now().Format(time.RFC3339))
+		}
+		if got := h.get("/api/v1/test/whoami", "Bearer "+value).status; got != http.StatusUnauthorized {
+			t.Errorf("%s: whoami with the token = %d, want 401", c.name, got)
+		}
+	}
+}
+
+func TestChangePermissions_RefusesAnInvalidBodyAndChangesNothing(t *testing.T) {
+	t.Parallel()
+	h := newAliceHub(t)
+	_, target := h.seedPAT(identity.PATSpec{UserID: h.alice.ID, Permissions: []string{"git:read"}})
+	for _, c := range []struct {
+		method string
+		body   any
+	}{
+		{http.MethodPut, map[string]any{}},
+		{http.MethodPut, map[string]any{"permissions": "git:read"}},
+		{http.MethodPut, map[string]any{"permissions": nil}},
+		{http.MethodPut, map[string]any{"permissions": []string{"git:admin"}}},
+		{http.MethodPut, map[string]any{"permissions": []any{5}}},
+		{http.MethodPatch, map[string]any{}},
+		{http.MethodPatch, map[string]any{"permissions": []string{}}},
+		{http.MethodPatch, map[string]any{"permissions": []string{"git:read", "nope"}}},
+		{http.MethodDelete, map[string]any{}},
+		{http.MethodDelete, map[string]any{"permissions": []string{}}},
+		{http.MethodDelete, map[string]any{"permissions": "git:read"}},
+	} {
+		before := h.snapshot()
+		r := h.call(c.method, permissionsPath(target.TokenID), "Bearer "+h.key, c.body)
+		if r.status != http.StatusBadRequest || r.errorField("error_type") != "invalid_request" {
+			t.Errorf("%s %v: answer = %d %s, want 400 invalid_request", c.method, c.body, r.status, r.body)
+		}
+		if h.snapshot() != before {
+			t.Errorf("%s %v: the store changed", c.method, c.body)
+		}
+	}
+}
+
+func TestChangePermissions_HoldsACallingPATToTheScopesItAdds(t *testing.T) {
+	t.Parallel()
+	h := newAliceHub(t)
+	for _, c := range []struct {
+		name, method string
+		itself       bool // the change is to the calling PAT itself
+		given        []string
+		named        string // the scope a refusal names, "" when the PAT may make the change
+	}{
+		{"PUT adding git:read", http.MethodPut, false, []string{"git:write", "git:read"}, `"git:read"`},
+		{"PATCH adding vars:read", http.MethodPatch, false, []string{"vars:read"}, `"vars:read"`},
+		{"PATCH widening itself", http.MethodPatch, true, []string{"tokens:manage"}, `"tokens:manage"`},
+		{"PUT keeping git:write", http.MethodPut, false, []string{"git:write"}, ""},
+		{"PATCH with one present and one held", http.MethodPatch, false, []string{"git:write", "tokens:write"}, ""},
+	} {
+		value, caller := h.seedPAT(identity.PATSpec{UserID: h.alice.ID, Permissions: []string{"tokens:write", "git:write"}})
+		_, target := h.seedPAT(identity.PATSpec{UserID: h.alice.ID, Permissions: []string{"git:write"}})
+		if c.itself {
+			target = caller
+		}
+		body := map[string]any{"permissions": c.given}
+		before := h.snapshot()
+		r := h.call(c.method, permissionsPath(target.TokenID), "Bearer "+value, body)
+		if c.named == "" {
+			if r.status != http.StatusOK {
+				t.Errorf("%s: answer = %d %s, want 200", c.name, r.status, r.body)
+			}
+			continue
+		}
+		msg, _ := r.errorField("message").(string)
+		if r.status != http.StatusForbidden || r.errorField("error_type") != "insufficient_scope" || !strings.Contains(msg, c.named) {
+			t.Errorf("%s: answer = %d %s, want 403 insufficient_scope naming %s", c.name, r.status, r.body, c.named)
+		}
+		if h.snapshot() != before {
+			t.Errorf("%s: the store changed", c.name)
+		}
+		if r := h.call(c.method, permissionsPath(target.TokenID), "Bearer "+h.key, body); r.status != http.StatusOK {
+			t.Errorf("%s with an API key: answer = %d %s, want 200", c.name, r.status, r.body)
+		}
+	}
+}
+
+func TestChangePermissions_RefusesARevokedOrExpiredToken(t *testing.T) {
+	t.Parallel()
+	h := newAliceHub(t)
+	_, revoked := h.seedPAT(identity.PATSpec{UserID: h.alice.ID, Permissions: []string{"git:read"}})
+	h.revoke(revoked.TokenID)
+	// A token expires at its expires_at, as authentication counts it.
+	now := h.now()
+	_, expired := h.seedPAT(identity.PATSpec{UserID: h.alice.ID, Permissions: []string{"git:read"}, ExpiresAt: &now})
+	for _, method := range []string{http.MethodPut, http.MethodPatch, http.MethodDelete} {
+		for state, target := range map[string]string{"revoked": revoked.TokenID, "expired": expired.TokenID} {
+			before := h.snapshot()
+			r := h.call(method, permissionsPath(target), "Bearer "+h.key, map[string]any{"permissions": []string{"git:read"}})
+			checkRefusal(t, method+" a "+state+" token", r, http.StatusConflict, "conflict", "token is "+state)
+			if h.snapshot() != before {
+				t.Errorf("%s a %s token: the store changed", method, state)
+			}
+		}
+	}
+}
+
+func TestChangePermissions_KeepsEverythingButThePermissions(t *testing.T) {
+	t.Parallel()
+	h := newAliceHub(t)
+	expires := h.now().Add(30 * 24 * time.Hour)
+	for _, method := range []string{http.MethodPut, http.MethodPatch, http.MethodDelete} {
+		_, target := h.seedPAT(identity.PATSpec{UserID: h.alice.ID, Name: "agent", Permissions: []string{"git:read", "vars:read"},
+			Paths: []string{"docs/**"}, Workspace: "my-ws", ExpiresAt: &expires})
+		want := withoutMembers(asJSON(t, target).(map[string]any), "permissions")
+		r := h.call(method, permissionsPath(target.TokenID), "Bearer "+h.key,
+			map[string]any{"permissions": []string{"git:read"}, "paths": []string{"**"}, "workspace": "other"})
+		if got := withoutMembers(r.json, "permissions"); r.status != http.StatusOK || !reflect.DeepEqual(got, want) {
+			t.Errorf("%s: answer = %d %s, want 200 with %v", method, r.status, r.body, want)
+		}
+		if got := withoutMembers(asJSON(t, h.storedPAT(target.TokenID)).(map[string]any), "permissions"); !reflect.DeepEqual(got, want) {
+			t.Errorf("%s: stored %v, want %v", method, got, want)
 		}
 	}
 }

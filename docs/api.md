@@ -802,6 +802,61 @@ that is already revoked is answered as it is, with its earlier
 | `403` `insufficient_scope` | a PAT without `tokens:manage` (`this route needs the scope tokens:manage`) |
 | `404` `not_found` | the caller's user has no token with this id (`token not found`) |
 
+## `PUT`, `PATCH`, `DELETE /api/v1/user/tokens/{token_id}/permissions`
+
+Changes the permissions of one of the caller's PATs without issuing a new
+value: `PUT` replaces them with the list given, a duplicate dropped and the
+order kept; `PATCH` appends the scopes the token does not have yet, in the
+order given, after the ones it has; `DELETE` removes the scopes given and
+ignores every string the token does not have, registered or not. From the
+next request on, the token is scope-checked against its new permissions.
+The routes need a user and declare the scope `tokens:write` for a PAT,
+which `tokens:manage` satisfies, checked before the token is looked up.
+
+The body is a JSON object with the member `permissions`, an array of
+strings; other members are ignored, `paths` and `workspace` among them. A
+change never alters the token's `paths`, `workspace`, `name` or
+`expires_at`.
+
+```json
+{"permissions":["git:read","changes:write"]}
+```
+
+| Method | `permissions` |
+|---|---|
+| `PUT` | registered scopes; may be empty |
+| `PATCH` | at least one registered scope |
+| `DELETE` | at least one string |
+
+A change that leaves the token with no scope, a `PUT` with `[]` or a
+`DELETE` of every scope it has, stores `permissions` `[]` and revokes the
+token in the same transaction: `revoked_at` is the time of the request, and
+the token no longer authenticates.
+
+A PAT caller is held to the subset rule (see
+[`POST /api/v1/user/tokens`](#post-apiv1usertokens)) for the scopes the
+change adds, those of the new list the token does not have now: each must
+be in the caller's own `permissions`, compared exactly. A scope the token
+keeps, or one `DELETE` removes, is not checked; a PAT can therefore not
+widen itself either. An API key is not held to the rule.
+
+The checks run in this order, the first that fails answering: the token is
+looked up (`404`, as for
+`GET /api/v1/user/tokens/{token_id}`), the body is validated (`400`), the
+subset rule (`403`), then the token's state (`409`): a revoked token, and
+one whose `expires_at` has come, the instant from which it no longer
+authenticates, cannot be changed. A refused request changes nothing.
+
+| Status | When |
+|---|---|
+| `200 OK` | the permissions are changed; the body is the Token object after the change |
+| `400` `invalid_request` | the body has no `permissions` or not an array of strings (`permissions must be an array of strings`), a `PUT` or `PATCH` names a string that is not a registered scope (`permissions: "git:admin" is not a registered scope`), or a `PATCH` or `DELETE` sends `[]` (`permissions must hold at least one scope`) |
+| `403` `forbidden` | the caller is the admin token (`this route needs a user`) |
+| `403` `insufficient_scope` | a PAT without `tokens:write` or `tokens:manage` (`this route needs the scope tokens:write`) |
+| `403` `insufficient_scope` | a `PUT` or `PATCH` by a PAT that adds a scope it does not hold; the message names the first one (`permissions: this token does not hold "git:read"`) |
+| `404` `not_found` | the caller's user has no token with this id (`token not found`) |
+| `409` `conflict` | the token is revoked (`token is revoked`) or expired (`token is expired`) |
+
 ## Admin routes
 
 The user and org administration routes are admin routes. Their caller must
