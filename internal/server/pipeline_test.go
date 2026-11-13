@@ -405,3 +405,29 @@ func TestPipeline_AnswersAnUnexpectedFailureAsInternalAndLogsItsCause(t *testing
 		})
 	}
 }
+
+func TestPipeline_KeepsAnAnswerAlreadyStartedWhenTheHandlerFailsLate(t *testing.T) {
+	t.Parallel()
+	var logs logBuffer
+	s := New(Options{Logger: logs.logger()})
+	s.SetAuthenticator(func(*http.Request) (Caller, error) { return testCaller, nil })
+	s.Register(Route{Method: http.MethodGet, Pattern: "/things", Handler: func(w http.ResponseWriter, _ *http.Request) error {
+		WriteJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		return InvalidRequest("failed after answering")
+	}})
+
+	rec := do(s.Handler(), newRequest(http.MethodGet, "/api/v1/things", nil, ""))
+	if rec.Code != http.StatusOK || rec.Body.String() != "{\"ok\":true}\n" {
+		t.Errorf("answer = %d %q, want the handler's 200 {\"ok\":true} and nothing after it", rec.Code, rec.Body.String())
+	}
+	id := rec.Header().Get("X-Request-ID")
+	logged := false
+	for _, line := range logs.lines() {
+		if strings.Contains(line, "failed after answering") && strings.Contains(line, id) {
+			logged = true
+		}
+	}
+	if !logged {
+		t.Errorf("no log line holds the late error and the request id %q: %v", id, logs.lines())
+	}
+}

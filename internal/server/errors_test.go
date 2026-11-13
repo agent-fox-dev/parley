@@ -1,7 +1,6 @@
 package server
 
 import (
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -95,13 +94,12 @@ func TestNewError_AnswersTheCallersOwnTypeAndStatus(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.errorType, func(t *testing.T) {
 			t.Parallel()
-			handler := func() error { return NewError(tc.errorType, tc.status, "it failed") }
-
-			var apiErr *Error
-			if err := handler(); !errors.As(err, &apiErr) {
-				t.Fatalf("handler returned %v, not an API error", err)
-			}
-			rec := writeErrorTo(apiErr)
+			s := New(Options{})
+			s.Register(Route{Method: http.MethodGet, Pattern: "/fails", Public: true,
+				Handler: func(http.ResponseWriter, *http.Request) error {
+					return NewError(tc.errorType, tc.status, "it failed")
+				}})
+			rec := do(s.Handler(), newRequest(http.MethodGet, "/api/v1/fails", nil, ""))
 			if rec.Code != tc.status {
 				t.Errorf("status = %d, want %d", rec.Code, tc.status)
 			}

@@ -145,7 +145,10 @@ context; later checks and the handler read it with
 `server.CallerOf(r.Context())`. An `*server.Error` (also when wrapped) is
 written as its envelope; any other error as `500 internal` with the message
 `internal error`, and its text is logged through `Options.Logger` as an
-error line `internal error` with the `request_id` and the `error`. The
+error line `internal error` with the `request_id` and the `error`. When the
+handler had already started its answer, nothing is written after it: the
+error is logged as `error after the answer began` with the `request_id` and
+the `error`. The
 pipeline also recovers a panic in a check or the handler: it logs an error
 line `panic` with the `request_id`, the panic value as `error` and the
 `stack`, and answers `500 internal` unless the handler had already started
@@ -170,7 +173,8 @@ counts in memory only, and drops ended windows at most once a minute. The
 server builds one from `RequestsPerMinute` (0 means 600) unless
 `RateLimitDisabled` is set, and `(*Server).RateLimiter()` returns it so that a
 surface mounted with `Handle`, such as the git server, counts against the same
-keys. Its keys are `credential:<id>` and `address:<ip>`. Built-in routes and
+keys. Its keys are `credential:<id>` (a caller with a credential id) and
+`address:<ip>` (no caller, or a caller without a credential id). Built-in routes and
 `Handle` surfaces do not pass the pipeline, and `404`/`405` are answered by
 the dispatcher before it, so none of them is counted.
 
@@ -204,11 +208,13 @@ order of checks again.
 
 The idempotency stage runs on create routes only, after every check, so a
 replay is authenticated and authorised like the request it repeats. A
-request without an `Idempotency-Key` header, and every request to a public
-route, which has no caller to record for, goes straight to the handler. A key that is empty or longer
+request without an `Idempotency-Key` header, every request to a public
+route, which has no caller to record for, and a request whose caller has no
+admin flag, user id or credential id, goes straight to the handler. A key that is empty or longer
 than 255 characters (counted in characters, not bytes) is `400
 invalid_request`. Otherwise the record is identified by three strings: the
-key, the caller (`user:<UserID>`, or `admin-token` when `Caller.Admin`) and
+key, the caller (`admin-token` when `Caller.Admin`, else `user:<UserID>`,
+else `credential:<CredentialID>`) and
 the route (the method, one space and the concrete `r.URL.Path`, such as
 `POST /api/v1/workspaces/w1/tokens`). The stage then:
 
@@ -226,7 +232,8 @@ the route (the method, one space and the concrete `r.URL.Path`, such as
    `ShowOnce` members from a copy of the body (a member name, or a dotted path
    into nested objects such as `token.token`; a path the body lacks is
    skipped; an object it changes is re-encoded with its members in sorted
-   order and without white space, and every value kept is unchanged), calls
+   order and without white space between them, and every value kept is
+   unchanged), calls
    `DeleteExpired` with the cutoff `now - 24h` and then `Write`s the record.
    A body that is not a JSON object while `ShowOnce` names members, or a store
    error, is logged as `idempotency record not written` with the
@@ -247,7 +254,7 @@ type IdempotencyStore interface {
 
 type IdempotencyRecord struct {
 	Key         string            // the Idempotency-Key, 1–255 characters
-	Caller      string            // "user:<id>" or "admin-token"
+	Caller      string            // "admin-token", "user:<id>" or "credential:<id>"
 	Route       string            // "POST /api/v1/..." with the concrete path
 	RequestHash [sha256.Size]byte // SHA-256 of the request body's bytes
 	Body        []byte            // the response body without its show-once members

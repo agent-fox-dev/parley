@@ -164,15 +164,7 @@ func TestHeaders_SetOnEveryResponse(t *testing.T) {
 			if rec.Code != tc.wantStatus {
 				t.Errorf("status = %d, want %d (body %s)", rec.Code, tc.wantStatus, rec.Body.Bytes())
 			}
-			for name, want := range map[string]string{
-				"X-Content-Type-Options": "nosniff",
-				"X-Frame-Options":        "DENY",
-				"Referrer-Policy":        "no-referrer",
-			} {
-				if got := rec.Header().Get(name); got != want {
-					t.Errorf("%s = %q, want %q", name, got, want)
-				}
-			}
+			assertSecurityHeaders(t, "the answer", rec.Header())
 			if rec.Header().Get("X-Request-ID") == "" {
 				t.Error("X-Request-ID is missing")
 			}

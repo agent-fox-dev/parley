@@ -10,8 +10,10 @@ routes. It grows as features land.
 - The three built-in routes (`/healthz`, `/readyz`, `/version`) need no
   credential. They never read the `Authorization` header, so a request with
   or without one, valid or not, gets the same answer.
-- Every body is one JSON object, sent with
-  `Content-Type: application/json; charset=utf-8`.
+- Every response body is one JSON object, sent with
+  `Content-Type: application/json; charset=utf-8`. Request bodies are JSON
+  objects too, unless a route states another content type; see
+  [Request bodies](#request-bodies).
 - Every response, on every path, carries a request id and the security
   headers; see [Request ids and response headers](#request-ids-and-response-headers).
 
@@ -64,7 +66,9 @@ An error the hub did not expect, from a check or a handler, is answered `500`
 with `error_type` `internal` and the message `internal error`; this includes
 a check or handler that panics. Its details stay out of the response: the hub
 writes them to its log with the request id that the response carries in
-`X-Request-ID`, and goes on serving other requests.
+`X-Request-ID`, and goes on serving other requests. When a handler has
+already started its answer before it fails, the answer is left as it is: the
+error is written to the log with the request id, not appended to the body.
 
 ## Request ids and response headers
 
@@ -104,7 +108,9 @@ The hub limits how many REST requests a caller may send: 600 in a window of
 it has ended, the next request starts a new one.
 
 - An authenticated request is counted against its credential, so two
-  credentials used from the same machine have a count each.
+  credentials used from the same machine have a count each. A caller for
+  which authentication reported no credential id is counted against its
+  client address.
 - A request to a public route, and a request that authentication refused,
   is counted against the client address: the IP address of the connection.
   Headers such as `X-Forwarded-For` are not read.
@@ -194,8 +200,8 @@ read:
 
 - a `limit` that is not an integer (`abc`, `1.5`, an empty value) or is
   outside the bounds (`0`, `-1`, `201`);
-- a `cursor` that is not one the hub issued (not URL-safe base64, or not a
-  cursor document);
+- a `cursor` that is malformed (not URL-safe base64, or not a cursor
+  document);
 - a `cursor` issued for another query: another route, another value of a path
   parameter, or other query parameters apart from `cursor` and `limit`. The
   same cursor with a different `limit` is accepted, so a client may change
@@ -222,11 +228,12 @@ is sent.
 | a recorded key, with the same body as the recorded request | `200` with the recorded body; the handler does not run |
 | a recorded key, with another body | `409` with `error_type` `conflict`; the handler does not run and the record stays as it was |
 
-- A record belongs to the key, the caller (the user, or the admin token) and
-  the request: the method and the request path. The same key sent by another
-  user, by the admin token, to another route or to another path of the same
+- A record belongs to the key, the caller (the admin token, else the user,
+  else, for a credential that belongs to no user, that credential) and the
+  request: the method and the request path. The same key sent by another
+  caller, by the admin token, to another route or to another path of the same
   route (`/api/v1/owners/a/things` and `/api/v1/owners/b/things`) is a new
-  request.
+  request. A caller with no user and no credential id is never recorded.
 - "The same body" means the same bytes: a body with the members in another
   order or with other white space is another body.
 - A replay answers `200`, not the original `201` or `202`, with the

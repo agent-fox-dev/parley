@@ -105,13 +105,21 @@ func (m *MemoryIdempotencyStore) DeleteExpired(_ context.Context, cutoff time.Ti
 	return nil
 }
 
-// idempotencyCaller is the caller part of a record's identity: the user id,
-// or the admin-token marker.
+// idempotencyCaller is the caller part of a record's identity: the
+// admin-token marker, else the user id, else the credential id, so that two
+// callers never share a record. A caller with none of them has no identity
+// and gets "", and its requests are never recorded.
 func idempotencyCaller(c Caller) string {
-	if c.Admin {
+	switch {
+	case c.Admin:
 		return adminCaller
+	case c.UserID != "":
+		return "user:" + c.UserID
+	case c.CredentialID != "":
+		return "credential:" + c.CredentialID
+	default:
+		return ""
 	}
-	return "user:" + c.UserID
 }
 
 // idempotency is the server's idempotency state: the record store and the
@@ -130,12 +138,14 @@ func newIdempotency(store IdempotencyStore) *idempotency {
 
 // serveCreate is the idempotency stage of a create route, run after every
 // check and in place of a direct call of the handler. A request without an
-// Idempotency-Key, or one with no caller (a public route), runs the handler
-// and records nothing.
+// Idempotency-Key, or one with no caller identity (a public route, or a
+// caller with neither user nor credential), runs the handler and records
+// nothing.
 func (s *Server) serveCreate(w http.ResponseWriter, r *http.Request, rt Route) error {
 	values, present := r.Header["Idempotency-Key"]
-	caller, authenticated := CallerOf(r.Context())
-	if !present || !authenticated {
+	c, _ := CallerOf(r.Context())
+	caller := idempotencyCaller(c)
+	if !present || caller == "" {
 		// Without a caller, a record would replay one anonymous client's
 		// answer to another.
 		return rt.Handler(w, r)
@@ -144,7 +154,7 @@ func (s *Server) serveCreate(w http.ResponseWriter, r *http.Request, rt Route) e
 	if key == "" || utf8.RuneCountInString(key) > maxIdempotencyKey {
 		return InvalidRequest(fmt.Sprintf("Idempotency-Key must be 1 to %d characters", maxIdempotencyKey))
 	}
-	id := recordKey{key: key, caller: idempotencyCaller(caller), route: r.Method + " " + r.URL.Path}
+	id := recordKey{key: key, caller: caller, route: r.Method + " " + r.URL.Path}
 	body, _ := bufferedBody(r)
 	hash := sha256.Sum256(body)
 

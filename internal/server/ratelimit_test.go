@@ -330,3 +330,25 @@ func TestLimiter_AdmitsEverythingWithALimitOfZero(t *testing.T) {
 		}
 	}
 }
+
+func TestRateLimit_CountsACallerWithoutACredentialIDByItsAddress(t *testing.T) {
+	t.Parallel()
+	var log callLog
+	s := New(Options{RequestsPerMinute: 1})
+	s.SetAuthenticator(func(*http.Request) (Caller, error) { return Caller{UserID: "u"}, nil })
+	s.Register(Route{Method: http.MethodGet, Pattern: "/things", Handler: log.handler("things", http.StatusOK)})
+	h := s.Handler()
+
+	for _, step := range []struct {
+		addr string
+		want int
+	}{
+		{"10.0.0.1:1000", http.StatusOK},
+		{"10.0.0.2:1000", http.StatusOK},
+		{"10.0.0.1:1001", http.StatusTooManyRequests},
+	} {
+		if rec := do(h, limitRequest(http.MethodGet, "/api/v1/things", "x", step.addr)); rec.Code != step.want {
+			t.Errorf("from %s: status = %d, want %d", step.addr, rec.Code, step.want)
+		}
+	}
+}

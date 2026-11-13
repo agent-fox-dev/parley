@@ -196,3 +196,18 @@ func decodeLine(t *testing.T, line string) map[string]any {
 	}
 	return doc
 }
+
+// assertSecurityHeaders fails the test unless the answer carries the three
+// security headers every response of the server has.
+func assertSecurityHeaders(t *testing.T, what string, h http.Header) {
+	t.Helper()
+	for name, want := range map[string]string{
+		"X-Content-Type-Options": "nosniff",
+		"X-Frame-Options":        "DENY",
+		"Referrer-Policy":        "no-referrer",
+	} {
+		if got := h.Get(name); got != want {
+			t.Errorf("%s: %s = %q, want %q", what, name, got, want)
+		}
+	}
+}

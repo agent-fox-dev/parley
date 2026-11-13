@@ -170,8 +170,17 @@ func authenticate(a Authenticator, r *http.Request) (Caller, error) {
 // writeErr answers err: an *Error as its envelope, anything else as an
 // internal error whose text stays out of the response, since it may describe
 // the hub's internals. Its cause goes to the log with the request id, which
-// the client sees, so the two can be matched.
+// the client sees, so the two can be matched. When the handler had already
+// started its answer, the error is only logged: an envelope after it would
+// corrupt the body the client is reading.
 func (s *Server) writeErr(w http.ResponseWriter, r *http.Request, err error) {
+	if headersSent(w) {
+		s.logger.LogAttrs(r.Context(), slog.LevelError, "error after the answer began",
+			slog.String("request_id", RequestID(r.Context())),
+			slog.String("error", err.Error()),
+		)
+		return
+	}
 	var e *Error
 	if !errors.As(err, &e) {
 		s.logger.LogAttrs(r.Context(), slog.LevelError, "internal error",

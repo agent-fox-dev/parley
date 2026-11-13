@@ -27,3 +27,15 @@ that guessed the key, so the idempotency stage
 (`internal/server/idempotency.go`, `serveCreate`) runs the handler of a
 public create route directly and records nothing, whatever the header holds.
 No route of this package is both public and a create route.
+
+## A caller without a user is keyed by its credential
+
+The package keys an idempotency record by the user id or the admin token.
+An authenticator may report a caller with neither, such as a credential that
+belongs to no user. Keying all such callers by the same empty user id would
+replay one caller's answer to another, so the stage keys such a caller by its
+credential id (`credential:<id>`), and a caller with no credential id either
+is never recorded (`internal/server/idempotency.go`, `idempotencyCaller`).
+For the same reason the rate limit counts a caller without a credential id
+against its client address, not against one shared window
+(`internal/server/ratelimit.go`, `rateLimit`).

@@ -21,6 +21,9 @@ var idempotencyCallers = map[string]Caller{
 	"Bearer u1":   {CredentialID: "c1", UserID: "u1"},
 	"Bearer u2":   {CredentialID: "c2", UserID: "u2"},
 	"Bearer root": {CredentialID: "admin", Admin: true},
+	"Bearer svcA": {CredentialID: "svc-a"},
+	"Bearer svcB": {CredentialID: "svc-b"},
+	"Bearer anon": {},
 }
 
 // createFixture is a server with a clock the test moves, an in-memory record
@@ -516,5 +519,34 @@ func TestIdempotency_IgnoresTheKeyOnAPublicCreateRoute(t *testing.T) {
 	}
 	if n := len(f.records()); n != 0 {
 		t.Errorf("store holds %d records, want 0", n)
+	}
+}
+
+func TestIdempotency_KeepsCallersWithoutAUserApart(t *testing.T) {
+	t.Parallel()
+	f := newCreateFixture()
+	f.s.Register(f.createRoute("/things", "token"))
+
+	a := f.post("/api/v1/things", "Bearer svcA", `{"name":"a"}`, "k")
+	b := f.post("/api/v1/things", "Bearer svcB", `{"name":"a"}`, "k")
+	if a.Code != http.StatusCreated || b.Code != http.StatusCreated {
+		t.Fatalf("two credentials without a user, same key: statuses %d and %d, want 201 and 201 (bodies %s %s)",
+			a.Code, b.Code, a.Body.Bytes(), b.Body.Bytes())
+	}
+	if again := f.post("/api/v1/things", "Bearer svcA", `{"name":"a"}`, "k"); again.Code != http.StatusOK ||
+		decodeObject(t, again.Body.Bytes())["id"] != decodeObject(t, a.Body.Bytes())["id"] {
+		t.Errorf("replay for the first credential = %d %s, want 200 with its own id", again.Code, again.Body.Bytes())
+	}
+
+	for range 2 {
+		if r := f.post("/api/v1/things", "Bearer anon", `{"name":"a"}`, "k"); r.Code != http.StatusCreated {
+			t.Errorf("caller with neither user nor credential: status %d, want the handler's 201", r.Code)
+		}
+	}
+	if got := f.calls.Load(); got != 4 {
+		t.Errorf("handler ran %d times, want 4", got)
+	}
+	if got := len(f.records()); got != 2 {
+		t.Errorf("store holds %d records, want 2 (none for a caller with no identity)", got)
 	}
 }

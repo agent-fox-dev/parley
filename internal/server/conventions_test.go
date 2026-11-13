@@ -48,21 +48,6 @@ func send(t *testing.T, base, method, target string, header http.Header, body st
 	return served{status: res.StatusCode, header: res.Header, body: b}
 }
 
-// assertSecurityHeaders fails the test unless the answer carries the three
-// security headers every response of the server has.
-func assertSecurityHeaders(t *testing.T, what string, h http.Header) {
-	t.Helper()
-	for name, want := range map[string]string{
-		"X-Content-Type-Options": "nosniff",
-		"X-Frame-Options":        "DENY",
-		"Referrer-Policy":        "no-referrer",
-	} {
-		if got := h.Get(name); got != want {
-			t.Errorf("%s: %s = %q, want %q", what, name, got, want)
-		}
-	}
-}
-
 func TestConventions_AnswerAnUnknownPathOnARunningServer(t *testing.T) {
 	t.Parallel()
 	var logs logBuffer

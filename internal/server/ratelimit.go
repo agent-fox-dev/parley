@@ -106,11 +106,12 @@ func newServerLimiter(opts Options) *Limiter {
 func (s *Server) RateLimiter() *Limiter { return s.limiter }
 
 // rateLimit is the rate-limit stage. The key is the caller's credential when
-// authentication reported one, otherwise the client address. Over the limit
-// it sets Retry-After and answers 429.
+// authentication reported one with an id, otherwise the client address, so
+// callers without a credential id never share one window. Over the limit it
+// sets Retry-After and answers 429.
 func (s *Server) rateLimit(w http.ResponseWriter, r *http.Request) error {
 	key := addressKey(r)
-	if c, ok := CallerOf(r.Context()); ok {
+	if c, ok := CallerOf(r.Context()); ok && c.CredentialID != "" {
 		key = "credential:" + c.CredentialID
 	}
 	ok, retryAfter := s.limiter.Allow(key)
