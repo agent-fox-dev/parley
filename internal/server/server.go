@@ -23,6 +23,10 @@ type Probe func(context.Context) error
 type Options struct {
 	// Addr is the address the server listens on, host:port.
 	Addr string
+	// Listener, when set, is the bound listener Serve serves on instead of
+	// binding Addr, so that a caller can bind before it starts work that must
+	// not run when the address cannot be bound. Serve closes it on a stop.
+	Listener net.Listener
 	// ShutdownGrace is how long in-flight requests get to finish on stop.
 	ShutdownGrace time.Duration
 	// ReadinessProbes are called on every GET /readyz; with none, the hub is
@@ -118,15 +122,19 @@ func (s *Server) Handle(pattern string, h http.Handler) {
 // request the client has already sent would get no answer.
 const newConnWait = 100 * time.Millisecond
 
-// Serve binds Options.Addr and serves until ctx is cancelled. It returns the
-// error when the address cannot be bound. On cancellation it stops accepting
-// connections and gives in-flight requests up to Options.ShutdownGrace to
-// finish; when the grace passes it closes the connections that remain,
-// without waiting for their handlers. A stop returns nil either way.
+// Serve binds Options.Addr, or takes Options.Listener when it is set, and
+// serves until ctx is cancelled. It returns the error when the address cannot
+// be bound. On cancellation it stops accepting connections and gives
+// in-flight requests up to Options.ShutdownGrace to finish; when the grace
+// passes it closes the connections that remain, without waiting for their
+// handlers. A stop returns nil either way.
 func (s *Server) Serve(ctx context.Context) error {
-	ln, err := net.Listen("tcp", s.opts.Addr)
-	if err != nil {
-		return fmt.Errorf("listen on %s: %w", s.opts.Addr, err)
+	ln := s.opts.Listener
+	if ln == nil {
+		var err error
+		if ln, err = net.Listen("tcp", s.opts.Addr); err != nil {
+			return fmt.Errorf("listen on %s: %w", s.opts.Addr, err)
+		}
 	}
 	if s.opts.OnListen != nil {
 		s.opts.OnListen(ln.Addr())

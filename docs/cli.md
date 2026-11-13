@@ -7,55 +7,222 @@ command-line client. This page describes both.
 
 ```
 Usage: parleyd [flags]
+       parleyd backup <directory>
 ```
 
-`parleyd` takes no arguments. It listens for HTTP on `0.0.0.0:8080` and runs
-until it receives `SIGTERM` or `SIGINT`. The address and the shutdown grace are
-fixed for now; see [configuration.md](configuration.md).
+Without a command, `parleyd` starts the hub. It reads `config.toml` (see
+[configuration.md](configuration.md)), opens its data, listens for HTTP on
+`[server].bind` and `[server].port` (`0.0.0.0:8080` by default) and runs
+until it receives `SIGTERM` or `SIGINT`.
 
 ### Flags
 
 | Flag | Effect |
 |---|---|
-| `-h`, `--help` | print the usage on stdout and exit `0` without listening |
+| `--admin-email <address>` | on a hub that has no admin token yet, store the address, write a new admin token to the token file and exit `0` without serving (see [The admin token](#the-admin-token)); ignored once the hub has one. It takes one value; `--admin-email` without one is a usage error, and `--admin-email=` counts as not given |
+| `--reset-admin-token` | write a new admin token to the token file, replacing the stored one, and exit `0` without serving |
+| `-h`, `--help` | print the usage on stdout and exit `0` without reading the configuration or listening |
 
 `--help` prints:
 
 ```
 Usage: parleyd [flags]
+       parleyd backup <directory>
 
-parleyd is the Parley hub. It takes no arguments, listens for HTTP on 0.0.0.0:8080
-and runs until it receives SIGTERM or SIGINT; in-flight requests then get 15s
-to finish.
+parleyd is the Parley hub. It reads config.toml from $XDG_CONFIG_HOME or the
+working directory, opens its data, listens for HTTP on [server].bind and
+[server].port, and runs until it receives SIGTERM or SIGINT.
+
+Commands:
+  backup <directory>   write a snapshot of the hub's data into an empty directory
 
 Flags:
-  -h, --help   print this help and exit
+  --admin-email <address>   on a new hub, store the admin's e-mail, write an
+                            admin token file and exit
+  --reset-admin-token       replace the admin token, write it to the token
+                            file and exit
+  -h, --help                print this help and exit
 ```
 
-A flag it does not define, or any positional argument, prints one error line
-that names the argument, then the same usage, on stderr, and exits `2` without
-listening:
+A flag it does not define, `--admin-email` without a value, a positional
+argument other than `backup`, `backup` followed by no directory or by
+more than one argument, and `backup` with `--admin-email` or
+`--reset-admin-token`, print one error line, then the same usage, on
+stderr, and exit `2` without reading the configuration, creating anything
+or listening:
 
 ```
 parleyd: argument "--nope": flag provided but not defined: -nope
+parleyd: argument "--admin-email": flag needs an argument: -admin-email
 parleyd: unexpected argument "serve"
+parleyd: backup takes one directory, got 0 arguments
 ```
+
+Flags come before the command: in `parleyd backup a --nope`, `--nope` is a
+second argument of `backup`.
+
+### `parleyd backup <directory>`
+
+`parleyd backup <directory>` writes a snapshot of the hub's data into
+`<directory>`, whether or not a hub is running on that data. Run it with the
+environment and working directory of the hub: it reads `config.toml` exactly
+as the hub does, so it finds the same data. A relative `<directory>` is
+resolved against the working directory.
+
+`<directory>` must be an empty directory or not exist; a missing one is
+created with mode `0700` (its parent is not). The snapshot holds three
+entries:
+
+| Entry | What |
+|---|---|
+| the database file's own name (`parley.db` by default) | a copy of the transactional store |
+| `analytics.db` | a copy of the analytical store |
+| the workspace root's own name (`workspaces` by default) | a copy of every file, directory and symbolic link under the workspace root, with the same relative paths |
+
+Each store is copied first, as one read of the engine (SQLite's
+`VACUUM INTO`): the copy holds every transaction committed before the copy
+began, each with all of its rows, while the hub goes on committing, and it
+is a single database file without a write-ahead log. The workspace root is
+copied next; within each git repository the refs, `packed-refs` and `HEAD`
+are copied before the objects, so every copied ref points at a copied
+object.
+
+The command only reads the hub's data: it binds no listener, runs no
+bootstrap, start work or maintenance task, applies no schema step and
+writes nothing under the data directory or the config dir, not even the
+write-ahead log of a stopped store. `--admin-email` or
+`--reset-admin-token` together with `backup` is a usage error (exit `2`):
+
+```
+parleyd: backup does not take --admin-email or --reset-admin-token
+```
+
+On success it writes one log line naming the directory, nothing on stdout,
+and exits `0`:
+
+```json
+{"time":"2026-11-13T13:44:23.060364+01:00","level":"INFO","msg":"backup written","dir":"/srv/backups/2026-11-13"}
+```
+
+Otherwise it writes one line, `backup failed` with the cause in `error`,
+and exits `1`. It refuses, writing nothing, an invalid configuration (the
+error names the key), a missing database file (it names the path and
+creates no database), a directory that is not empty, a path that is not a
+directory, and a directory inside the workspace root or inside the data
+directory (the directory of `[database].path`):
+
+```json
+{"time":"2026-11-13T13:44:22.522501+01:00","level":"ERROR","msg":"backup failed","error":"database file /srv/parley/data/parley.db does not exist"}
+{"time":"2026-11-13T13:44:23.075944+01:00","level":"ERROR","msg":"backup failed","error":"backup directory /srv/backups/2026-11-13 is not empty"}
+{"time":"2026-11-13T13:44:23.081202+01:00","level":"ERROR","msg":"backup failed","error":"backup directory /srv/parley/data/snapshot is inside the data directory /srv/parley/data"}
+```
+
+A relative directory is taken relative to the working directory.
+
+When a copy fails part-way, for example on a file under the workspace root
+it cannot read, it removes everything it wrote (the directory too, when it
+created it), and the line names the path that failed.
+
+### The admin token
+
+A new hub has no users, so its operator administers it with an admin token.
+The hub stores only the token's SHA-256 hash and the address given with
+`--admin-email`; the token itself is written to the file `admin_token` in
+the config dir (the directory `config.toml` is looked for in, see
+[configuration.md](configuration.md#the-configuration-file)), with mode
+`0600`, as `parley_admin_` followed by 64 lowercase hex characters and no
+trailing newline. The token is never written to stdout, to stderr or under
+the data directory.
+
+After the stores are open and before any start work runs, `parleyd`
+decides:
+
+| Flags | Hub | What happens |
+|---|---|---|
+| `--reset-admin-token` | any | a new token replaces the stored one; the address of `--admin-email` is stored too when the hub had no token before. The token file is written, over one that is there, and `parleyd` exits `0` |
+| `--admin-email <address>` | no token stored | the address and the new token's hash are stored, the token file is written, over a leftover one, and `parleyd` exits `0` |
+| none | no token stored | `parleyd` starts and serves without a token |
+| none or `--admin-email` | a token stored, token file there | `parleyd` refuses to start: one error line naming the file, exit `1` |
+| none or `--admin-email` | a token stored, no token file | `parleyd` starts and serves; `--admin-email` is ignored |
+
+A run that writes the token file logs its absolute path at warn level and
+exits `0` without listening or running any start work:
+
+```json
+{"time":"2026-11-13T13:20:41.118034+01:00","level":"WARN","msg":"admin token written: save the token and delete the file","path":"/srv/parley/admin_token"}
+```
+
+Save the token and delete the file: the hub does not start while the file
+is there. The hash and the file are written together, so when the file
+cannot be written (a missing config dir, no permission, a directory in its
+place) nothing is stored, and `parleyd` writes one `cannot start` line naming
+the file and exits `1`. While the file is there, a start without
+`--reset-admin-token` writes:
+
+```json
+{"time":"2026-11-13T13:21:02.530118+01:00","level":"ERROR","msg":"cannot start","error":"admin token file /srv/parley/admin_token exists: save the token, delete the file and start the hub again"}
+```
+
+### The start
+
+`parleyd` starts in this order and stops at the first stage that fails:
+
+1. it loads and checks the configuration;
+2. it creates the data directory and the workspace root when they are
+   missing, opens both stores and brings them to the current schema;
+3. the bootstrap: it writes the admin token file and exits, refuses to
+   start while the file is there, or goes on (see
+   [The admin token](#the-admin-token));
+4. it runs the start work the hub's parts registered, in order, each to
+   completion;
+5. it binds `[server].bind`:`[server].port`;
+6. it starts the maintenance loop in the background, without waiting for
+   its first pass: one pass at once and one every hour, each running the
+   registered maintenance tasks one after the other; and it starts the
+   background work the hub's parts registered;
+7. it writes the `listening` line and serves.
+
+A failure in stages 1 to 5 writes exactly one error line to stderr, closes
+the stores when they were open, and exits `1` without listening.
 
 ### Log lines
 
-`parleyd` logs JSON objects to stderr, one per line, with `log/slog`. Once it
-listens it writes:
+`parleyd` logs JSON objects to stderr, one per line, with `log/slog`. Every
+line has `time`, `level` and `msg`. `level` is `TRACE`, `DEBUG`, `INFO`,
+`WARN` or `ERROR`; lines below `[logging].level` (`info` by default) are not
+written, and with `trace` every line is. Before the configuration is loaded
+the level is `info`.
+
+The message and every attribute of every line are scrubbed before the line
+is written (an error as its text; a value that is neither a string nor an
+error as its printed text, which takes the value's place when scrubbing
+changes it): the
+`client_secret` of every configured OAuth provider, other secret values the
+hub knows and the hub's own credentials (admin tokens, personal access
+tokens and API keys) become `[redacted]`, the user information is removed
+from URLs (`https://u:p@host/x` becomes `https://host/x`), and each value is
+cut to at most 1024 bytes. A value from which a secret cannot be removed
+cleanly is replaced by `[redacted]` as a whole. Attribute names, `time` and
+`level` are written as they are. No `Authorization` header and no request
+body is logged; a set of HTTP headers given to the logger shows its
+`Authorization` and `Proxy-Authorization` values as `[redacted]`.
+
+Once it listens it writes:
 
 ```json
-{"time":"2026-11-13T10:11:20.772527+01:00","level":"INFO","msg":"listening","addr":"[::]:8080"}
+{"time":"2026-11-13T13:11:38.622658+01:00","level":"INFO","msg":"listening","addr":"127.0.0.1:52887","config":"/srv/parley/config.toml","data_dir":"/srv/parley/data"}
 ```
 
-`addr` is the address the listener bound, with the port the system chose when
-the port is `0`. Go binds the wildcard `0.0.0.0` as a dual-stack listener, so
-the default address is logged as `[::]:8080`.
+`addr` is the address the listener bound, with the port the system chose
+when `[server].port` is `0`; Go binds the wildcard `0.0.0.0` as a dual-stack
+listener, so the default address is logged as `[::]:8080`. `config` is the
+absolute path the configuration file was looked for at, also when it does
+not exist, and `data_dir` the absolute data directory, the directory of
+`[database].path`.
 
 While it serves, it writes one access-log line for every request it has
-answered, except requests to `/healthz` and `/readyz`:
+answered, except requests to `/healthz` and `/readyz` (which get one, at
+debug level, when `[logging].log_health_probes` is `true`):
 
 ```json
 {"time":"2026-11-13T10:12:03.104211+01:00","level":"INFO","msg":"request","method":"GET","path":"/version","status":200,"duration_ms":0.087,"request_id":"0b5c6f2e-8d1a-4c3b-9e7f-2a4d6c8e0f13"}
@@ -75,26 +242,63 @@ goroutine's `stack`:
 {"time":"2026-11-13T10:12:09.551873+01:00","level":"ERROR","msg":"internal error","request_id":"0b5c6f2e-8d1a-4c3b-9e7f-2a4d6c8e0f13","error":"open workspace: permission denied"}
 ```
 
-When it cannot bind the address it writes one line and exits `1`, without
-serving:
+A maintenance task that returns an error or panics writes one line with the
+task's name and the scrubbed error, and does not stop the others; it runs
+again in the next hourly pass:
 
 ```json
-{"time":"2026-11-13T10:11:41.348421+01:00","level":"ERROR","msg":"cannot listen","addr":"0.0.0.0:8080","error":"listen on 0.0.0.0:8080: listen tcp 0.0.0.0:8080: bind: address already in use"}
+{"time":"2026-11-13T10:13:00.000000+01:00","level":"ERROR","msg":"maintenance task failed","task":"claim_cleanup","error":"remove claim: database is locked"}
 ```
+
+When a stop stops waiting for something whose grace or the 30-second limit
+has passed, it writes one line naming it in `work`: `requests`,
+`maintenance loop` or the name of a piece of background work:
+
+```json
+{"time":"2026-11-13T14:02:31.401227+01:00","level":"WARN","msg":"abandoned at the stop","work":"event_streams"}
+```
+
+When the start fails before listening it writes one line and exits `1`.
+The line is `cannot start` with the cause in `error`, which names the
+configuration key, the path, the schema step, the admin token file or the
+start work that failed:
+
+```json
+{"time":"2026-11-13T13:11:38.609972+01:00","level":"ERROR","msg":"cannot start","error":"configuration file /srv/parley/config.toml: server.prot: unknown key"}
+```
+
+When it cannot bind the address the line is `cannot listen`:
+
+```json
+{"time":"2026-11-13T10:11:41.348421+01:00","level":"ERROR","msg":"cannot listen","addr":"0.0.0.0:8080","error":"listen tcp 0.0.0.0:8080: bind: address already in use"}
+```
+
+`parleyd backup` writes `backup written` with `dir` on success, or
+`backup failed` with `error` (see
+[`parleyd backup <directory>`](#parleyd-backup-directory)).
 
 ### Signals
 
-On `SIGTERM` or `SIGINT` `parleyd` stops accepting connections, lets the
-requests in flight finish for up to 15 seconds, closes the connections of the
-requests that are still running after that, and exits `0`.
+On `SIGTERM` or `SIGINT` `parleyd` stops accepting connections, tells the
+handlers of long-lived responses to end them, cancels the running
+maintenance task (and starts no further one) and every piece of background
+work the hub's parts registered, and then waits for all of them at the same
+time: up to 15 seconds for the requests in flight, after which it closes
+their connections, up to 15 seconds for the maintenance loop, and for each
+piece of background work up to its own grace (at most 30 seconds). It waits
+for nothing longer than 30 seconds after the signal. Then it closes the
+stores and exits `0`, also when a grace passed; what it stopped waiting for
+is logged (see [Log lines](#log-lines)). With nothing in flight it exits at
+once. A further `SIGTERM` or `SIGINT` during the stop changes nothing: no
+grace starts again and the process does not exit early.
 
 ### Exit statuses
 
 | Status | When |
 |---|---|
-| `0` | `--help`, or a stop by `SIGTERM` or `SIGINT`, whether or not the grace passed |
-| `1` | the listen address cannot be bound |
-| `2` | an unknown flag or a positional argument |
+| `0` | `--help`, a run that wrote the admin token file, a written backup, or a stop by `SIGTERM` or `SIGINT`, whether or not the grace passed |
+| `1` | the start failed before listening (the configuration, the data, a schema step, the admin token file that could not be written or is still there, the start work or the listen address), or `backup` failed (see [`parleyd backup <directory>`](#parleyd-backup-directory)) |
+| `2` | a usage error: an unknown flag, `--admin-email` without a value, a positional argument other than `backup`, `backup` without exactly one directory, or `backup` with `--admin-email` or `--reset-admin-token` |
 
 ## `parley`
 

@@ -103,8 +103,9 @@ its errors included; `404` and `405` at route matching are always `no-store`.
 
 ## Rate limit
 
-The hub limits how many REST requests a caller may send: 600 in a window of
-60 seconds. The window of a caller starts at its first counted request; once
+The hub limits how many REST requests a caller may send in a window of 60
+seconds: `[limits].requests_per_minute`, 600 by default (see
+[configuration.md](configuration.md)); `0` turns the limit off. The window of a caller starts at its first counted request; once
 it has ended, the next request starts a new one.
 
 - An authenticated request is counted against its credential, so two
@@ -141,8 +142,9 @@ guard, the scope check, the access checks and the handler:
 | a body over the body limit, with or without a declared `Content-Length`, whatever its `Content-Type` | `413` with `error_type` `payload_too_large` |
 | a `POST`, `PUT` or `PATCH` with a body within the limit and a `Content-Type` that is missing or is not `application/json` | `415` with `error_type` `unsupported_media_type` |
 
-- The body limit is 1048576 bytes (1 MiB); a body of exactly the limit is
-  accepted. A route can state a limit of its own, which then applies in place
+- The body limit is `[server].max_body_size`, 1048576 bytes (1 MiB) by
+  default (see [configuration.md](configuration.md)); a body of exactly the
+  limit is accepted. A route can state a limit of its own, which then applies in place
   of the hub's; its section of this page says so.
 - The size is checked before the content type, so an oversized body is `413`
   even when its type is wrong.
@@ -256,8 +258,8 @@ is sent.
 - The key is checked after authentication and every other check, so a replay
   is authorised like the original request. A public create route ignores the
   header, since it has no caller to record it for.
-- The records are kept in memory in this version and are lost when `parleyd`
-  restarts.
+- The records are kept in the hub's transactional store, so a request
+  recorded before `parleyd` was restarted is replayed after the restart.
 
 ## Timestamps and durations
 
@@ -352,7 +354,9 @@ The answer carries `Cache-Control: no-cache`.
 
 Readiness: whether the hub can do its work. Each request calls every
 registered readiness probe. The hub is ready when every probe succeeds, and
-also when no probe is registered.
+also when no probe is registered. `parleyd` registers one probe, which fails
+while either of its stores (the transactional store and the analytical
+store) does not answer a query.
 
 | Status | When | Body |
 |---|---|---|

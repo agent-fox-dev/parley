@@ -5,11 +5,50 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+// localConfig makes parleyd listen on a port the system chooses, on the
+// loopback interface only.
+const localConfig = "[server]\nbind = \"127.0.0.1\"\nport = 0\n"
+
+// noEnv is an empty environment.
+func noEnv(string) (string, bool) { return "", false }
+
+// writeFile writes text to the file at path.
+func writeFile(t *testing.T, path, text string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(text), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+// workDir returns a new working directory holding config.toml with text.
+func workDir(t *testing.T, text string) string {
+	t.Helper()
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "config.toml"), text)
+	return dir
+}
+
+// listDir returns the names in dir.
+func listDir(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read %s: %v", dir, err)
+	}
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	return names
+}
 
 // syncBuffer is a bytes.Buffer that run may write to while the test reads it.
 type syncBuffer struct {
@@ -39,18 +78,23 @@ func (b *syncBuffer) String() string {
 	return b.buf.String()
 }
 
-// firstLine waits up to 5 s for a complete first line and returns it.
-func (b *syncBuffer) firstLine(t *testing.T) string {
+// lineWith waits up to 5 s for a complete line holding text and returns it.
+func (b *syncBuffer) lineWith(t *testing.T, text string) string {
 	t.Helper()
 	timeout := time.After(5 * time.Second)
 	for {
-		if line, _, ok := strings.Cut(b.String(), "\n"); ok {
-			return line
+		s := b.String()
+		if i := strings.LastIndexByte(s, '\n'); i >= 0 {
+			for _, line := range nonEmptyLines(s[:i]) {
+				if strings.Contains(line, text) {
+					return line
+				}
+			}
 		}
 		select {
 		case <-b.written:
 		case <-timeout:
-			t.Fatalf("no complete line on stderr within 5 s; stderr = %q", b.String())
+			t.Fatalf("no line holding %s on stderr within 5 s; stderr = %q", text, b.String())
 		}
 	}
 }
@@ -68,34 +112,30 @@ func nonEmptyLines(s string) []string {
 
 // running is a run started by startRun.
 type running struct {
-	addr   string
-	stderr *syncBuffer
-	cancel context.CancelFunc
+	addr string
+	// listening is the run's listening line.
+	listening map[string]any
+	cancel    context.CancelFunc
 	// code receives run's exit status, once.
 	code chan int
 }
 
-// startRun calls run with no arguments on 127.0.0.1:0 in a goroutine, waits
-// for its listening line and returns the address that line names.
-func startRun(t *testing.T, grace time.Duration) *running {
+// startRun calls run with no arguments, the environment env and the working
+// directory dir, in a goroutine, waits for its listening line and returns
+// the address that line names.
+func startRun(t *testing.T, env func(string) (string, bool), dir string) *running {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	r := &running{stderr: newSyncBuffer(), cancel: cancel, code: make(chan int, 1)}
-	go func() { r.code <- run(ctx, nil, "127.0.0.1:0", grace, &bytes.Buffer{}, r.stderr) }()
+	r := &running{cancel: cancel, code: make(chan int, 1)}
+	stderr := newSyncBuffer()
+	go func() { r.code <- run(ctx, nil, env, dir, &bytes.Buffer{}, stderr) }()
 	t.Cleanup(cancel)
 
-	line := r.stderr.firstLine(t)
-	var rec struct {
-		Msg  string `json:"msg"`
-		Addr string `json:"addr"`
+	line := stderr.lineWith(t, `"msg":"listening"`)
+	if err := json.Unmarshal([]byte(line), &r.listening); err != nil {
+		t.Fatalf("listening line %q is not a JSON object: %v", line, err)
 	}
-	if err := json.Unmarshal([]byte(line), &rec); err != nil {
-		t.Fatalf("first stderr line %q is not a JSON object: %v", line, err)
-	}
-	if rec.Msg != "listening" {
-		t.Fatalf("first stderr line %q has msg %q, want %q", line, rec.Msg, "listening")
-	}
-	r.addr = rec.Addr
+	r.addr, _ = r.listening["addr"].(string)
 	return r
 }
 

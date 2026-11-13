@@ -29,6 +29,6 @@ what an agent did is scattered across terminals.
 ## Read more
 
 - [API reference](docs/api.md) — every route, what it answers and how it fails
-- [Configuration](docs/configuration.md) — everything read from the environment
+- [Configuration](docs/configuration.md) — the configuration file and everything read from the environment
 - [Architecture](docs/architecture.md) — how the service is put together
 - [CLI](docs/cli.md) — Parley's client

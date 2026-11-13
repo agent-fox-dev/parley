@@ -350,3 +350,34 @@ func TestServe_ClosesAStuckRequestWhenTheGraceExpires(t *testing.T) {
 		t.Errorf("stuck request got a response %d %q, want its connection closed", r.status, r.body)
 	}
 }
+
+func TestServe_ServesOnTheListenerItIsGiven(t *testing.T) {
+	t.Parallel()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	bound := make(chan net.Addr, 1)
+	// Addr cannot be bound: Serve must not try.
+	s := New(Options{Addr: "256.0.0.1:1", Listener: ln, ShutdownGrace: time.Second, OnListen: func(a net.Addr) { bound <- a }})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.Serve(ctx) }()
+
+	if a := waitFor(t, bound, 5*time.Second, "OnListen"); a.String() != ln.Addr().String() {
+		t.Errorf("OnListen got %s, want the listener's address %s", a, ln.Addr())
+	}
+	r := waitFor(t, getAsync(t, ln.Addr().String(), "/healthz"), 5*time.Second, "GET /healthz")
+	if r.err != nil || r.status != http.StatusOK {
+		t.Errorf("GET /healthz = %d (error %v), want 200", r.status, r.err)
+	}
+
+	cancel()
+	if err := waitFor(t, done, 5*time.Second, "Serve return"); err != nil {
+		t.Errorf("Serve returned %v after a stop, want nil", err)
+	}
+	if conn, err := net.Dial("tcp", ln.Addr().String()); err == nil {
+		conn.Close()
+		t.Errorf("the listener still accepts connections after Serve returned")
+	}
+}
