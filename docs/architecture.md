@@ -9,9 +9,12 @@ command-line client. Both are written in Go, in the module
 
 | Package | Holds |
 |---|---|
+| `cmd/parley` | the `parley` program: it calls `cli.Run` and exits with its status |
 | `cmd/parleyd` | the `parleyd` program: argument parsing, signals, the start log line and the exit status |
 | `internal/buildinfo` | the version, commit and build time the binary was built with, shared by both programs |
+| `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra` |
 | `internal/server` | the hub's HTTP server: its routes and its readiness probes |
+| `test/e2e` | tests that build the binaries and run them |
 
 ## The HTTP server
 
@@ -79,6 +82,21 @@ and answers `503` with `{"status":"not ready"}` if any failed. With no probe
 registered the hub is ready. A probe's error text never goes into the
 response.
 
+## parley
+
+`cmd/parley` calls `cli.Run(ctx, os.Args[1:], os.Stdout, os.Stderr)` and passes
+its result to `os.Exit`. `Run` builds a fresh cobra command tree on each call:
+the root command `parley` with the persistent flag `--endpoint-url`, and the
+`version` subcommand. It executes the tree with the arguments, and returns `0`,
+or `2` after one `error: <message>` line on stderr when cobra cannot parse the
+arguments. Cobra's own error and usage output is silenced.
+
+`parley version` reads its build from `internal/buildinfo` and asks the hub
+for its build with a plain `net/http` client over HTTP (`GET /version`, 5 s
+timeout). `internal/cli` imports `internal/buildinfo` and nothing from
+`internal/server`, so the client carries no server code. The commands, output
+and exit statuses are described in [cli.md](cli.md).
+
 ## Build information
 
 `internal/buildinfo` has three package-level string variables, `Version`,
@@ -91,6 +109,9 @@ go build -ldflags "\
   -X github.com/agent-fox-dev/parley/internal/buildinfo.BuildTime=2026-01-02T03:04:05Z" \
   ./cmd/parleyd
 ```
+
+The same flags build `./cmd/parley`. `test/e2e` builds both programs this way
+and checks that `parley version` reports the values.
 
 `buildinfo.Get()` returns them as a `buildinfo.Info`, with the Go toolchain's
 version (`runtime.Version()`) as `GoVersion`. A value that was not set is

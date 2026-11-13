@@ -1,7 +1,7 @@
 # Configuration
 
-Parley has no configuration file yet, and `parleyd` reads no environment
-variable.
+Parley has no configuration file yet. `parleyd` reads no environment
+variable; `parley` reads one, `PARLEY_ENDPOINT_URL`.
 
 ## `parleyd`
 
@@ -12,3 +12,13 @@ variable.
 
 Both values are fixed; `parleyd` takes no flag for them. See
 [cli.md](cli.md) for how `parleyd` is started and stopped.
+
+## `parley`
+
+| Variable | Effect |
+|---|---|
+| `PARLEY_ENDPOINT_URL` | the URL of the hub, for example `http://127.0.0.1:8080`, when the flag `--endpoint-url` is absent or empty |
+
+The flag `--endpoint-url` comes first; an empty or unset `PARLEY_ENDPOINT_URL`
+gives no URL. `parley version` without a URL prints the client's build alone.
+See [cli.md](cli.md).
