@@ -11,7 +11,7 @@ command-line client. Both are written in Go, in the module
 |---|---|
 | `cmd/parley` | the `parley` program: it calls `cli.Run` and exits with its status |
 | `cmd/parleyd` | the `parleyd` program: `main` calls `hub.Run` with the process's arguments, environment and working directory and exits with its status |
-| `internal/access` | the workspace access rule, the one place that decides what a caller may do on a workspace; so far the minimal workspace record (slug, owner, org, kind, parent, status) in the transactional store, its insert and its reads |
+| `internal/access` | the workspace access rule, the one place that decides what a caller may do on a workspace; the minimal workspace record (slug, owner, org, kind, parent, status) in the transactional store, the caller's level on a workspace, the decision for a declared need and the REST access check, and the readable set for reads across workspaces |
 | `internal/buildinfo` | the version, commit and build time the binary was built with, shared by both programs |
 | `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra`, each declared through one helper ([ADR 02](adr/02-declare-every-cli-command-through-one-helper.md)), the client configuration file, the resolution of the hub URL and the credential, the one HTTP client the commands send their requests with, the printing of a command's result on stdout and of its warnings on stderr, the shared wait for a long operation (`--wait`, `--timeout`, `--poll-interval`), and the error envelopes and exit statuses every command ends with |
 | `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, and a registry of keys and whole sections that decides what the file may hold |
@@ -1282,6 +1282,40 @@ when that user's level on it, resolved by `Level` as for a caller with that
 with no record; `false` and the error when a read fails. No production code
 calls it yet; the routes whose conditions ask about another user, such as a
 change's author, will.
+
+#### Readable set
+
+`internal/access/readable.go` answers which workspaces a caller can read,
+for the reads that span workspaces (the workspace list, events, audit), so
+that they show exactly the workspaces the per-workspace decision lets
+through. `(*Service).Readable(ctx, caller)` returns an
+`access.ReadableSet{All, Entries}`:
+
+- the admin token gets `All` set and no entries; `Contains` answers yes and
+  `Level` `LevelAdmin` for every slug;
+- a user gets `Entries`, the user's level by slug. It reads the user's
+  active orgs (`Memberships.ActiveOrgIDs`), then the records the user owns
+  or that are in one of those orgs (`RecordReader.OwnedOrIn`, which brings
+  the forks of those orgs' repositories with them, a fork being in its
+  parent's org), then the forks of the repositories the user owns
+  (`RecordReader.ForksOf`). Each record, in every status, gets the level
+  the resolver of `Level` gives it, and those at `LevelNone` are left out:
+  a fork whose owner has no level on its parent, a workspace of a blocked
+  org that the user does not own. A slug appears once; an owned workspace
+  in one of the user's orgs is `LevelOwner`;
+- a caller that is neither, and a user with nothing, get the empty set and
+  no error;
+- a failed read returns the error and the empty set, never part of one.
+
+`Level` and `Readable` share one resolver (`userLevels` in `level.go`); they
+differ only in where the user's active orgs and a fork's parent come from.
+`Level` reads them from the sources as the answer needs them; `Readable`
+takes the orgs it has read and looks a parent up among the records it has
+collected, which hold every repository the user has a level on, so a parent
+that is not among them is one the user has no level on. A workspace is
+therefore in a user's set exactly when `Level` resolves a level other than
+`LevelNone` for it, with that level. No production code calls `Readable`
+yet; the workspace list, the event stream and the audit query will.
 
 ### The logger
 

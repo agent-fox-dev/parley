@@ -89,21 +89,52 @@ func (s *Service) levelOn(ctx context.Context, c Caller, rec Record) (Level, err
 		return LevelAdmin, nil
 	case c.UserID == "":
 		return LevelNone, nil
-	case rec.Kind == KindFork:
-		return s.levelOnFork(ctx, c.UserID, rec)
 	default:
-		return s.levelOnRepository(ctx, c.UserID, rec)
+		return s.userLevels(c.UserID).on(ctx, rec)
 	}
 }
 
-// levelOnRepository resolves the user userID's level on the repository
-// rec. The owner is decided before the memberships are read, so that an
-// owner's level never depends on their organizations.
-func (s *Service) levelOnRepository(ctx context.Context, userID string, rec Record) (Level, error) {
-	if userID == rec.OwnerID {
+// userLevels is the resolver for the user userID that reads the user's
+// active orgs and a fork's parent from the service's sources, each only
+// when the answer needs it.
+func (s *Service) userLevels(userID string) userLevels {
+	return userLevels{
+		userID: userID,
+		orgs: func(ctx context.Context) ([]string, error) {
+			return s.deps.Memberships.ActiveOrgIDs(ctx, userID)
+		},
+		parent: s.deps.Records.Record,
+	}
+}
+
+// userLevels resolves one user's level on a workspace. The resolution is
+// written once, here, and both Level and Readable use it, so that the
+// readable set cannot disagree with the level; they differ only in where
+// the user's active orgs and a fork's parent come from.
+type userLevels struct {
+	userID string
+	// orgs returns the ids of the active orgs the user is a member of.
+	orgs func(ctx context.Context) ([]string, error)
+	// parent reads the record of a fork's parent; see RecordReader.Record.
+	parent func(ctx context.Context, slug string) (Record, bool, error)
+}
+
+// on resolves the user's level on the workspace whose record is rec.
+func (u userLevels) on(ctx context.Context, rec Record) (Level, error) {
+	if rec.Kind == KindFork {
+		return u.onFork(ctx, rec)
+	}
+	return u.onRepository(ctx, rec)
+}
+
+// onRepository resolves the user's level on the repository rec. The owner
+// is decided before the memberships are read, so that an owner's level
+// never depends on their organizations.
+func (u userLevels) onRepository(ctx context.Context, rec Record) (Level, error) {
+	if u.userID == rec.OwnerID {
 		return LevelOwner, nil
 	}
-	orgs, err := s.deps.Memberships.ActiveOrgIDs(ctx, userID)
+	orgs, err := u.orgs(ctx)
 	if err != nil {
 		return LevelNone, fmt.Errorf("read the active orgs of the caller: %w", err)
 	}
@@ -113,13 +144,13 @@ func (s *Service) levelOnRepository(ctx context.Context, userID string, rec Reco
 	return LevelNone, nil
 }
 
-// levelOnFork resolves the user userID's level on the fork rec. A fork never
-// grants more than its parent: no level on the parent, or a parent with no
-// record, is no level on the fork, even for the fork's owner. Otherwise the
-// fork's owner and the parent's owner are owners of the fork, and every
-// other user with a level on the parent is a member.
-func (s *Service) levelOnFork(ctx context.Context, userID string, rec Record) (Level, error) {
-	parent, found, err := s.deps.Records.Record(ctx, rec.ParentSlug)
+// onFork resolves the user's level on the fork rec. A fork never grants
+// more than its parent: no level on the parent, or a parent with no record,
+// is no level on the fork, even for the fork's owner. Otherwise the fork's
+// owner and the parent's owner are owners of the fork, and every other user
+// with a level on the parent is a member.
+func (u userLevels) onFork(ctx context.Context, rec Record) (Level, error) {
+	parent, found, err := u.parent(ctx, rec.ParentSlug)
 	if err != nil {
 		return LevelNone, err
 	}
@@ -129,11 +160,11 @@ func (s *Service) levelOnFork(ctx context.Context, userID string, rec Record) (L
 	if !found || parent.Kind != KindRepository {
 		return LevelNone, nil
 	}
-	onParent, err := s.levelOnRepository(ctx, userID, parent)
+	onParent, err := u.onRepository(ctx, parent)
 	if err != nil || onParent == LevelNone {
 		return LevelNone, err
 	}
-	if userID == rec.OwnerID || userID == parent.OwnerID {
+	if u.userID == rec.OwnerID || u.userID == parent.OwnerID {
 		return LevelOwner, nil
 	}
 	return LevelMember, nil

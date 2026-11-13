@@ -158,9 +158,9 @@ func TestLevel_AFailedReadIsAnErrorWithLevelNone(t *testing.T) {
 		wantErr   bool
 		wantLevel access.Level
 	}{
-		{"the record", failingRecords{reader, []string{"acme"}}, members, byKey("u-owner"), "acme", true, access.LevelNone},
-		{"the record, for the admin token", failingRecords{reader, []string{"acme"}}, members, adminToken, "acme", true, access.LevelNone},
-		{"the fork's parent", failingRecords{reader, []string{"acme"}}, members, byKey("u-member"), "acme--m", true, access.LevelNone},
+		{"the record", failingRecords{RecordReader: reader, fail: []string{"acme"}}, members, byKey("u-owner"), "acme", true, access.LevelNone},
+		{"the record, for the admin token", failingRecords{RecordReader: reader, fail: []string{"acme"}}, members, adminToken, "acme", true, access.LevelNone},
+		{"the fork's parent", failingRecords{RecordReader: reader, fail: []string{"acme"}}, members, byKey("u-member"), "acme--m", true, access.LevelNone},
 		{"the memberships", reader, failingMemberships, byKey("u-member"), "acme", true, access.LevelNone},
 		{"the memberships, on a fork", reader, failingMemberships, byKey("u-member"), "acme--m", true, access.LevelNone},
 		// The owner is decided before any membership read.
@@ -198,7 +198,7 @@ func TestCanWrite_AnswersYesExactlyForAnOwnerOfTheWorkspace(t *testing.T) {
 			t.Errorf("CanWrite(%s, %s) = %t, %v, want %t and no error", c.user, c.slug, got, err, c.want)
 		}
 	}
-	failing := newService(failingRecords{access.StoreRecords(st.Main()), []string{"acme"}}, memberships{})
+	failing := newService(failingRecords{RecordReader: access.StoreRecords(st.Main()), fail: []string{"acme"}}, memberships{})
 	if got, err := failing.CanWrite(context.Background(), "u-owner", "acme"); got || !errors.Is(err, errRead) {
 		t.Errorf("CanWrite with a failed read = %t, %v, want false and the read's error", got, err)
 	}

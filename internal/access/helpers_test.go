@@ -84,10 +84,12 @@ func (m memberships) ActiveOrgIDs(_ context.Context, userID string) ([]string, e
 var errRead = errors.New("disk I/O error at /data/parley.db")
 
 // failingRecords reads through RecordReader, except the record of a slug in
-// fail, whose read fails with errRead.
+// fail, and the list of owned-or-in records or of forks when failOwned or
+// failForks is set, whose reads fail with errRead.
 type failingRecords struct {
 	access.RecordReader
-	fail []string
+	fail                 []string
+	failOwned, failForks bool
 }
 
 func (f failingRecords) Record(ctx context.Context, slug string) (access.Record, bool, error) {
@@ -95,6 +97,20 @@ func (f failingRecords) Record(ctx context.Context, slug string) (access.Record,
 		return access.Record{}, false, errRead
 	}
 	return f.RecordReader.Record(ctx, slug)
+}
+
+func (f failingRecords) OwnedOrIn(ctx context.Context, ownerID string, orgIDs []string) ([]access.Record, error) {
+	if f.failOwned {
+		return nil, errRead
+	}
+	return f.RecordReader.OwnedOrIn(ctx, ownerID, orgIDs)
+}
+
+func (f failingRecords) ForksOf(ctx context.Context, parents []string) ([]access.Record, error) {
+	if f.failForks {
+		return nil, errRead
+	}
+	return f.RecordReader.ForksOf(ctx, parents)
 }
 
 // failingMemberships is a membership source whose every read fails with
