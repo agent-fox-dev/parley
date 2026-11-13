@@ -102,8 +102,8 @@ func newRootCommand(opts options) *cobra.Command {
 	root.CompletionOptions = cobra.CompletionOptions{DisableDefaultCmd: true}
 	// Every command inherits the global flags and this handler of a flag
 	// that is unknown or does not parse.
-	root.PersistentFlags().String("endpoint-url", "", "URL of the hub (default: $"+endpointURLEnv+")")
-	root.PersistentFlags().String("api-key", "", "credential presented to the hub; parley login stores it (- reads it from stdin)")
+	root.PersistentFlags().String("endpoint-url", "", "URL of the hub (default: $"+endpointURLEnv+", then endpoint_url in the config file)")
+	root.PersistentFlags().String("api-key", "", "credential presented to the hub (default: $"+apiKeyEnv+", then api_key in the config file); parley login takes it from this flag alone and stores it (- reads it from stdin)")
 	root.PersistentFlags().Bool("json", false, "print the help as JSON")
 	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return usageError("%v", err) })
 

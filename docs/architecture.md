@@ -12,7 +12,7 @@ command-line client. Both are written in Go, in the module
 | `cmd/parley` | the `parley` program: it calls `cli.Run` and exits with its status |
 | `cmd/parleyd` | the `parleyd` program: `main` calls `hub.Run` with the process's arguments, environment and working directory and exits with its status |
 | `internal/buildinfo` | the version, commit and build time the binary was built with, shared by both programs |
-| `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra`, each declared through one helper ([ADR 02](adr/02-declare-every-cli-command-through-one-helper.md)), and the error envelopes and exit statuses every command ends with |
+| `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra`, each declared through one helper ([ADR 02](adr/02-declare-every-cli-command-through-one-helper.md)), the client configuration file, the resolution of the hub URL and the credential, the one HTTP client the commands send their requests with, and the error envelopes and exit statuses every command ends with |
 | `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, and a registry of keys and whole sections that decides what the file may hold |
 | `internal/hub` | the composition of the `parleyd` process: argument parsing, the scrubbing logger, the fixed start order, the bootstrap of the admin token, the HTTP server's options, the idempotency records in the transactional store, signals and the stop, and the `backup` command; the one place later packages plug their parts in ([ADR 01](adr/01-compose-the-hub-in-one-package.md)) |
 | `internal/maintenance` | the maintenance loop: a registry of named tasks, and `Loop`, which runs one pass at once and one at each tick of an hourly timer, the tasks of a pass one after the other in a fixed order, and logs a failing task without stopping the others |
@@ -843,6 +843,26 @@ root is a group too, and its flag error handler turns every flag that is
 unknown or does not parse, on any command, into a `usage_error`.
 `parley version` is declared through `declare`.
 
+Before the run step of a command whose `auth` is `user` or `admin`,
+`declare` resolves its settings with `resolveSettings`
+(`internal/cli/config.go`): the hub URL from the first non-empty of the
+global flag `--endpoint-url`, `PARLEY_ENDPOINT_URL` and the file's
+`endpoint_url`, the credential from `--api-key`, `PARLEY_API_KEY` and
+`api_key`. It calls `readConfig` only when the flags and the environment
+leave one empty. A missing setting, a file that cannot be parsed and a hub
+URL that is not an absolute `http` or `https` URL with a host
+(`checkHubURL`) are `client_error`s, returned before the run step starts,
+so no request is sent. The resolved settings build the call's `client`
+(`internal/cli/client.go`), the one HTTP client of the commands:
+`newClient(hubURL, credential)` drops the URL's trailing slashes, and
+`request(ctx, method, path, query, body)` sends to
+`<hub URL>/api/v1<path>` with `Authorization: Bearer <credential>` (none
+when the credential is empty), `Accept: application/json`, and the body
+encoded as JSON with `Content-Type: application/json` only when there is
+one, under a 30 s timeout, and returns the status and the whole body. A
+command whose `auth` is `none` gets no client: it needs no credential and
+resolves what it does need itself.
+
 `internal/cli/errors.go` holds the two kinds of error a command ends with.
 `hubError` is an error envelope the hub answered, with the HTTP status and
 the body's bytes as received, which `printError` writes unchanged. `cliError`
@@ -890,9 +910,11 @@ user are saved as in the key flow. Both flows send their requests through
 one helper (`hubCall`, 30 s timeout) that returns a hub's error envelope as
 a `hubError`, as it was received.
 
-`parley version` reads its build from `internal/buildinfo` and asks the hub
-for its build with a plain `net/http` client over HTTP (`GET /version`, 5 s
-timeout). `internal/cli` imports `internal/buildinfo` and nothing from
+`parley version` reads its build from `internal/buildinfo`, takes the hub URL
+from `--endpoint-url`, `PARLEY_ENDPOINT_URL` and then `readConfig` (a file it
+cannot parse is a warning, not a failure), and asks the hub for its build
+with a plain `net/http` client over HTTP (`GET /version`, outside `/api/v1`,
+no credential, 5 s timeout). `internal/cli` imports `internal/buildinfo` and nothing from
 `internal/server`, so the client carries no server code. The commands, output
 and exit statuses are described in [cli.md](cli.md).
 

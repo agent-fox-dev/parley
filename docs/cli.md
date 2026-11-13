@@ -324,8 +324,8 @@ Available Commands:
   version     Print the client's build and, given a hub URL, the hub's build
 
 Flags:
-      --api-key string        credential presented to the hub; parley login stores it (- reads it from stdin)
-      --endpoint-url string   URL of the hub (default: $PARLEY_ENDPOINT_URL)
+      --api-key string        credential presented to the hub (default: $PARLEY_API_KEY, then api_key in the config file); parley login takes it from this flag alone and stores it (- reads it from stdin)
+      --endpoint-url string   URL of the hub (default: $PARLEY_ENDPOINT_URL, then endpoint_url in the config file)
   -h, --help                  help for parley
       --json                  print the help as JSON
 
@@ -338,10 +338,78 @@ Every command takes the global flags, before or after its own words.
 
 | Flag | Effect |
 |---|---|
-| `--endpoint-url <url>` | the URL of the hub, for example `http://127.0.0.1:8080`. When it is absent or empty, `PARLEY_ENDPOINT_URL` gives it, and for `parley login` then the key `endpoint_url` of the client configuration file (see [configuration.md](configuration.md#parley)) |
-| `--api-key <credential>` | the credential presented to the hub. `parley login --api-key` stores it (see [With a credential](#with-a-credential---api-key)); no other command sends one yet |
-| `--json` | accepted on every command; it has no effect yet |
+| `--endpoint-url <url>` | the URL of the hub, for example `http://127.0.0.1:8080`. When it is absent or empty, `PARLEY_ENDPOINT_URL` gives it, then the key `endpoint_url` of the client configuration file (see [Settings](#settings-the-hub-url-and-the-credential)) |
+| `--api-key <credential>` | the credential presented to the hub as `Authorization: Bearer`. When it is absent or empty, `PARLEY_API_KEY` gives it, then the key `api_key` of the client configuration file. `parley login --api-key` stores it and takes it from this flag alone (see [With a credential](#with-a-credential---api-key)) |
+| `--json` | accepted on every command; it changes neither the request a command sends nor what it prints |
 | `-h`, `--help` | print the help of the command on stdout and exit `0` |
+
+A global flag may stand before, between or after the command's words, with
+its value as the next word or after `=`: `parley --endpoint-url <url> version`,
+`parley version --endpoint-url <url>` and `parley version --endpoint-url=<url>`
+are the same command.
+
+### Settings: the hub URL and the credential
+
+A command that calls the hub's REST API as a user or an admin needs two
+settings, and takes each from the first source that gives it a non-empty
+value:
+
+| Setting | Flag | Variable | Key of the client configuration file |
+|---|---|---|---|
+| hub URL | `--endpoint-url` | `PARLEY_ENDPOINT_URL` | `endpoint_url` |
+| credential | `--api-key` | `PARLEY_API_KEY` | `api_key` |
+
+An empty flag or an empty variable is passed over for the next source.
+Values are taken as given: white space is not trimmed. The configuration
+file (see [configuration.md](configuration.md#the-client-configuration-file))
+is read only when the flags and the variables leave one of the two settings
+empty, so a command given both by flags or variables runs whatever the file
+holds. When it is read, a file that cannot be read, is not valid TOML or
+holds `endpoint_url`, `api_key` or `user_id` with a value that is not a
+string fails the command before any request with a `client_error` naming
+the file's path. A missing file, and a missing home directory when
+`PARLEY_CONFIG_DIR` is unset or empty, count as an empty file; reading
+creates neither the directory nor the file.
+
+A setting no source gives fails the command before any request, with a
+`client_error` whose message names the flag, the variable and the
+configuration file of each missing setting (the file is
+`~/.parley/config.toml` when there is no home directory):
+
+```json
+{
+  "error": {
+    "code": 0,
+    "message": "no hub URL: pass --endpoint-url, set PARLEY_ENDPOINT_URL or set endpoint_url in /home/alice/.parley/config.toml; no credential: pass --api-key, set PARLEY_API_KEY or set api_key in /home/alice/.parley/config.toml",
+    "error_type": "client_error"
+  }
+}
+```
+
+The hub URL must be an absolute URL with the scheme `http` or `https` and a
+host; anything else (`localhost:8080`, `ftp://host`, `http://`, `/api`)
+fails before any request:
+
+```json
+{
+  "error": {
+    "code": 0,
+    "message": "the hub URL \"localhost:8080\" is not an absolute http or https URL with a host",
+    "error_type": "client_error"
+  }
+}
+```
+
+Every request goes to `<hub URL>/api/v1<path>`, with every trailing slash of
+the hub URL removed and a path it carries kept
+(`https://host/parley` sends to `https://host/parley/api/v1/…`), with the
+command's method and query string, the header
+`Authorization: Bearer <credential>`, and `Accept: application/json`. A
+request with a body sends it as JSON with `Content-Type: application/json`;
+one without sends neither a body nor `Content-Type`.
+
+`parley version` and `parley login` need no credential and read the hub URL
+themselves, as their sections say; help needs neither setting.
 
 ### `parley version`
 
@@ -363,8 +431,12 @@ prints the client's build alone:
 }
 ```
 
-With a hub URL it sends `GET <hub URL>/version` (a trailing slash on the URL is
-dropped) without an `Authorization` header and with a timeout of 5 seconds.
+It takes the hub URL from the first non-empty of `--endpoint-url`,
+`PARLEY_ENDPOINT_URL` and the key `endpoint_url` of the client configuration
+file, which it reads only when the flag and the variable give none. With a
+hub URL it sends `GET <hub URL>/version` (trailing slashes on the URL are
+dropped) without an `Authorization` header, even when the file holds an
+`api_key`, and with a timeout of 5 seconds.
 When the hub answers `200` with a JSON object, the document also holds the
 hub's build in `server`:
 
@@ -392,6 +464,18 @@ prints the document without `server`:
 warning: cannot read the hub's version from http://127.0.0.1:1: Get "http://127.0.0.1:1/version": dial tcp 127.0.0.1:1: connect: connection refused
 ```
 
+When it reads the configuration file and the file cannot be read or parsed,
+`parley version` writes one warning line that names the file to stderr,
+prints the client's build alone and exits `0`:
+
+```
+warning: the config file /home/alice/.parley/config.toml is not valid TOML: line 1, column 8; printing the client's build alone
+```
+
+A hub URL that is not an absolute `http` or `https` URL is not refused
+either: the request fails and `parley version` warns as above, with exit
+status `0`.
+
 `parley version` takes no arguments: `parley version extra` is a
 `usage_error` with exit status `2`.
 
@@ -407,8 +491,8 @@ Flags:
       --provider string   identity provider of the browser login (default "github")
 
 Global Flags:
-      --api-key string        credential presented to the hub; parley login stores it (- reads it from stdin)
-      --endpoint-url string   URL of the hub (default: $PARLEY_ENDPOINT_URL)
+      --api-key string        credential presented to the hub (default: $PARLEY_API_KEY, then api_key in the config file); parley login takes it from this flag alone and stores it (- reads it from stdin)
+      --endpoint-url string   URL of the hub (default: $PARLEY_ENDPOINT_URL, then endpoint_url in the config file)
       --json                  print the help as JSON
 ```
 

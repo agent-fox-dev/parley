@@ -93,16 +93,42 @@ func withProbes(opts options, more ...func() *cobra.Command) options {
 	return opts
 }
 
-// sendProbeRequest is the run step of the probe commands: it sends one GET to
-// the hub PARLEY_ENDPOINT_URL names, so a test that counts the hub's requests
-// sees whether the run step was reached.
+// sendProbeRequest is the run step of the probe commands: it sends the
+// declared method and path, its :name filled in, through the shared client
+// and writes the hub's body to stdout as received.
 func sendProbeRequest(c *call) error {
-	resp, err := http.Get(os.Getenv("PARLEY_ENDPOINT_URL") + "/api/v1/things/" + url.PathEscape(c.args["name"]))
+	path := strings.Replace(c.decl.Path, ":name", url.PathEscape(c.args["name"]), 1)
+	resp, err := c.client.request(c.ctx, c.decl.Method, path, nil, nil)
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
+	c.stdout.Write(resp.body)
 	return nil
+}
+
+// runProbes runs parley with the probe commands added and args.
+func runProbes(t *testing.T, args ...string) (int, string, string) {
+	t.Helper()
+	return runCLIWith(t, withProbes(defaultOptions()), args...)
+}
+
+// thingHub is a stub hub that answers GET /api/v1/things/x, what "probe get
+// x" sends, with 200 and body.
+func thingHub(t *testing.T, body string) *stubHub {
+	t.Helper()
+	return newStubHub(t).answer(http.MethodGet, "/api/v1/things/x", http.StatusOK, body)
+}
+
+// writeConfigFile writes content to config.toml in dir, creating dir, and
+// returns the file's path.
+func writeConfigFile(t *testing.T, dir, content string) string {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "config.toml")
+	writeFile(content)(t, path)
+	return path
 }
 
 // probeReturning builds "probe outcome", a command of auth none whose run
@@ -156,7 +182,11 @@ type stubAnswer struct {
 
 type stubRequest struct {
 	method, path, body string
-	header             http.Header
+	// rawPath is the path as it was sent, percent-encoding included, and
+	// query the query string.
+	rawPath, query string
+	contentLength  int64
+	header         http.Header
 }
 
 func newStubHub(t *testing.T) *stubHub {
@@ -165,7 +195,11 @@ func newStubHub(t *testing.T) *stubHub {
 	h.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		h.mu.Lock()
-		h.requests = append(h.requests, stubRequest{method: r.Method, path: r.URL.Path, body: string(body), header: r.Header.Clone()})
+		h.requests = append(h.requests, stubRequest{
+			method: r.Method, path: r.URL.Path, body: string(body),
+			rawPath: r.URL.EscapedPath(), query: r.URL.RawQuery, contentLength: r.ContentLength,
+			header: r.Header.Clone(),
+		})
 		a, ok := h.answers[r.Method+" "+r.URL.Path]
 		h.mu.Unlock()
 		if !ok {

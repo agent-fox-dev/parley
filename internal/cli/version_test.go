@@ -68,7 +68,10 @@ func TestVersion_PrintsTheClientAndTheHubBuild(t *testing.T) {
 		// nil; "A" and "B" stand for the URLs of the two hubs.
 		flag *string
 		// env is PARLEY_ENDPOINT_URL, which is unset when env is nil.
-		env  *string
+		env *string
+		// file is endpoint_url of the configuration file, which also holds
+		// an api_key; there is no file when file is nil.
+		file *string
 		want string
 	}{
 		{name: "flag only", flag: new("A"), want: "A"},
@@ -76,6 +79,10 @@ func TestVersion_PrintsTheClientAndTheHubBuild(t *testing.T) {
 		{name: "flag before environment", flag: new("A"), env: new("B"), want: "A"},
 		{name: "empty flag falls back to environment", flag: new(""), env: new("B"), want: "B"},
 		{name: "trailing slash", flag: new("A/"), want: "A"},
+		{name: "configuration file only", file: new("A/"), want: "A"},
+		{name: "flag before the configuration file", flag: new("B"), file: new("A"), want: "B"},
+		{name: "environment before the configuration file", env: new("B"), file: new("A"), want: "B"},
+		{name: "empty environment falls back to the configuration file", env: new(""), file: new("A"), want: "A"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -91,6 +98,11 @@ func TestVersion_PrintsTheClientAndTheHubBuild(t *testing.T) {
 			unsetEnv(t, "PARLEY_ENDPOINT_URL")
 			if tt.env != nil {
 				t.Setenv("PARLEY_ENDPOINT_URL", resolve(*tt.env))
+			}
+			dir := t.TempDir()
+			t.Setenv("PARLEY_CONFIG_DIR", dir)
+			if tt.file != nil {
+				writeConfigFile(t, dir, "endpoint_url = \""+resolve(*tt.file)+"\"\napi_key = \"k\"\n")
 			}
 
 			code, stdout, stderr := runCLI(t, args...)
@@ -169,6 +181,7 @@ func TestVersion_PrintsTheClientBuildAloneWithoutAHubURL(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			setBuildValues(t, "1.4.0", "3f2a1bc")
+			t.Setenv("PARLEY_CONFIG_DIR", t.TempDir())
 			unsetEnv(t, "PARLEY_ENDPOINT_URL")
 			if tt.env != nil {
 				t.Setenv("PARLEY_ENDPOINT_URL", *tt.env)
@@ -264,5 +277,25 @@ func TestVersion_WarnsAndPrintsTheClientBuildWhenTheHubCannotBeRead(t *testing.T
 				t.Errorf("the command took %v, want at most 6s", elapsed)
 			}
 		})
+	}
+}
+
+// The test sets environment variables and build values, so it must not run
+// in parallel.
+func TestVersion_WarnsAndPrintsTheClientBuildWhenTheConfigFileCannotBeParsed(t *testing.T) {
+	setBuildValues(t, "1.4.0", "3f2a1bc")
+	dir := loginEnv(t)
+	path := writeConfigFile(t, dir, "not = [toml")
+
+	code, stdout, stderr := runCLI(t, "version")
+
+	if code != 0 {
+		t.Errorf("Run returned %d, want 0", code)
+	}
+	if want := "{\n  \"cli\": {\n    \"version\": \"1.4.0\",\n    \"commit\": \"3f2a1bc\"\n  }\n}\n"; stdout != want {
+		t.Errorf("stdout = %q, want %q", stdout, want)
+	}
+	if lines := nonEmptyLines(stderr); len(lines) != 1 || !strings.HasPrefix(lines[0], "warning: ") || !strings.Contains(lines[0], path) {
+		t.Errorf("stderr = %q, want one line that begins with %q and names %s", stderr, "warning: ", path)
 	}
 }

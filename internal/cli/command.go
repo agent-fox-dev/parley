@@ -59,6 +59,10 @@ type call struct {
 	args           map[string]string
 	stdout, stderr io.Writer
 	opts           options
+	// client sends the command's requests to the hub with the settings
+	// resolved for it. It is nil for a command whose auth is none, which
+	// needs no credential and resolves what it does need itself.
+	client *client
 }
 
 // The annotations a declared command or a group carries.
@@ -82,14 +86,11 @@ func declare(decl command) *cobra.Command {
 		Args:        checkArgs(decl.Args),
 		Annotations: map[string]string{declarationAnnotation: string(encoded)},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if decl.Run == nil {
-				return fmt.Errorf("%s has no run step", cmd.CommandPath())
-			}
 			named := make(map[string]string, len(args))
 			for i, value := range args {
 				named[decl.Args[i].Name] = value
 			}
-			return decl.Run(&call{
+			c := &call{
 				ctx:    cmd.Context(),
 				cmd:    cmd,
 				decl:   decl,
@@ -97,7 +98,20 @@ func declare(decl command) *cobra.Command {
 				stdout: cmd.OutOrStdout(),
 				stderr: cmd.ErrOrStderr(),
 				opts:   optionsFrom(cmd.Context()),
-			})
+			}
+			// Both settings are resolved before the run step, so a command
+			// that lacks one fails before it sends anything.
+			if decl.Auth != authNone {
+				s, err := resolveSettings(cmd)
+				if err != nil {
+					return err
+				}
+				c.client = newClient(s.hubURL, s.credential)
+			}
+			if decl.Run == nil {
+				return fmt.Errorf("%s has no run step", cmd.CommandPath())
+			}
+			return decl.Run(c)
 		},
 	}
 	if decl.Flags != nil {

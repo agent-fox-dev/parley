@@ -52,9 +52,15 @@ func newVersionCommand() *cobra.Command {
 			info := buildinfo.Get()
 			doc := versionDocument{CLI: clientBuild{Version: info.Version, Commit: info.Commit}}
 
-			hubURL := globalFlag(c.cmd, "endpoint-url")
+			hubURL := firstNonEmpty(globalFlag(c.cmd, "endpoint-url"), os.Getenv(endpointURLEnv))
 			if hubURL == "" {
-				hubURL = os.Getenv(endpointURLEnv)
+				file, err := readConfig()
+				if err != nil {
+					// parley version always succeeds, so a file it cannot
+					// parse only costs it the hub URL.
+					fmt.Fprintf(c.stderr, "warning: %v; printing the client's build alone\n", err)
+				}
+				hubURL = file.EndpointURL
 			}
 			if hubURL != "" {
 				server, err := hubVersion(c.ctx, hubURL, c.opts.versionTimeout)

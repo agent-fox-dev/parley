@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -125,6 +126,40 @@ func TestRun_RefusesWhatItCannotParseWithAUsageErrorBeforeAnyRequest(t *testing.
 			}
 			if n := len(hub.recorded()); n != 0 {
 				t.Errorf("the hub got %d requests, want none", n)
+			}
+		})
+	}
+}
+
+// The test sets environment variables, so it must not run in parallel.
+func TestRun_AcceptsTheGlobalFlagsInAnyPosition(t *testing.T) {
+	loginEnv(t)
+	hub := thingHub(t, `{"name":"x"}`)
+	first := []string{"--endpoint-url", hub.URL, "--api-key", "k", "probe", "get", "x"}
+	tests := [][]string{
+		first,
+		{"probe", "--api-key", "k", "get", "x", "--endpoint-url", hub.URL},
+		{"probe", "get", "x", "--endpoint-url=" + hub.URL, "--api-key=k"},
+		append(slices.Clone(first), "--json"),
+	}
+	var firstStdout string
+	for i, args := range tests {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			before := len(hub.recorded())
+
+			code, stdout, stderr := runProbes(t, args...)
+
+			if code != 0 {
+				t.Fatalf("exit status = %d, want 0; stderr %q", code, stderr)
+			}
+			got := hub.recorded()[before:]
+			if len(got) != 1 || got[0].method != http.MethodGet || got[0].path != "/api/v1/things/x" || got[0].header.Get("Authorization") != "Bearer k" {
+				t.Errorf("the hub got %v, want one GET /api/v1/things/x with Authorization Bearer k", got)
+			}
+			if i == 0 {
+				firstStdout = stdout
+			} else if stdout != firstStdout {
+				t.Errorf("stdout = %q, want %q as without the change of order", stdout, firstStdout)
 			}
 		})
 	}
