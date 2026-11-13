@@ -12,7 +12,56 @@ The hub, `parleyd`, answers the routes below over HTTP. The REST API under
   `Content-Type: application/json; charset=utf-8`.
 - An unknown path or a wrong method gets the Go standard library router's own
   answer: `404 Not Found` or `405 Method Not Allowed` with a plain-text body.
-  The JSON error envelope is not in place yet.
+  The error envelope below is not used for them yet.
+
+## Errors
+
+Every error of the REST API is answered with one JSON envelope, sent with
+`Content-Type: application/json; charset=utf-8`:
+
+```json
+{"error":{"code":409,"message":"workspace is busy","error_type":"conflict"}}
+```
+
+| Member | Value |
+|---|---|
+| `code` | a number, always equal to the response's HTTP status |
+| `message` | a non-empty message for people; do not branch on it |
+| `error_type` | a non-empty, machine-readable type; branch on this and the status |
+
+An error can carry extra members inside `error`, after the three above: a
+named member such as `oldest_seq`, or a `details` object. An extra member
+never replaces `code`, `message` or `error_type`.
+
+```json
+{"error":{"code":410,"message":"the cursor is too old","error_type":"cursor_expired","oldest_seq":17}}
+```
+
+The catalogue of error types and the status each is answered with:
+
+| `error_type` | Status |
+|---|---|
+| `invalid_request` | `400` |
+| `unauthenticated` | `401` |
+| `forbidden` | `403` |
+| `insufficient_scope` | `403` |
+| `token_bound` | `403` |
+| `path_not_allowed` | `403` |
+| `not_found` | `404` |
+| `method_not_allowed` | `405` |
+| `conflict` | `409` |
+| `workspace_archived` | `409` |
+| `gone` | `410` |
+| `payload_too_large` | `413` |
+| `unsupported_media_type` | `415` |
+| `rate_limited` | `429` |
+| `internal` | `500` |
+| `upstream_error` | `502` |
+| `unavailable` | `503` |
+
+A feature can answer a type of its own outside this table (for example
+`workspace_busy` with `409`); its section of this page names the type and its
+status. The envelope's shape is the same for every type.
 
 ## `GET /healthz`
 

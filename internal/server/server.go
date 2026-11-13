@@ -4,7 +4,6 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -182,7 +181,7 @@ type versionDocument struct {
 }
 
 func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, statusDocument{Status: "ok"})
+	WriteJSON(w, http.StatusOK, statusDocument{Status: "ok"})
 }
 
 // readyz calls every probe, even after one has failed, so each probe sees
@@ -196,27 +195,18 @@ func (s *Server) readyz(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if !ready {
-		writeJSON(w, http.StatusServiceUnavailable, statusDocument{Status: "not ready"})
+		WriteJSON(w, http.StatusServiceUnavailable, statusDocument{Status: "not ready"})
 		return
 	}
-	writeJSON(w, http.StatusOK, statusDocument{Status: "ready"})
+	WriteJSON(w, http.StatusOK, statusDocument{Status: "ready"})
 }
 
 func (s *Server) version(w http.ResponseWriter, _ *http.Request) {
 	info := buildinfo.Get()
-	writeJSON(w, http.StatusOK, versionDocument{
+	WriteJSON(w, http.StatusOK, versionDocument{
 		Version:   info.Version,
 		Commit:    info.Commit,
 		BuildTime: info.BuildTime,
 		GoVersion: info.GoVersion,
 	})
-}
-
-// writeJSON answers status with v encoded as JSON.
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	// The status line is already sent; a failed write means the client went
-	// away, and there is no one left to tell.
-	_ = json.NewEncoder(w).Encode(v)
 }
