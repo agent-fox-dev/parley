@@ -813,7 +813,10 @@ response.
 its result to `os.Exit`. `Run` is `cli.RunWith` with zero `cli.Hooks`;
 `RunWith` lets a caller that runs the client in-process, such as an
 end-to-end test, replace what it takes from the process (`Hooks.Stdin`, where
-`parley login --api-key -` reads the credential). It builds a fresh cobra
+`parley login --api-key -` reads the credential; `Hooks.OpenBrowser`, which
+opens the sign-in page, by default the system's opener in
+`internal/cli/browser.go`; and `Hooks.LoginWait`, how long the browser login
+waits for the redirect, by default 120 s). It builds a fresh cobra
 command tree on each call: the root command `parley` with the persistent flag
 `--endpoint-url`, and the `version` and `login` subcommands. It executes the
 tree with the arguments, and returns `0`, or `2` after one `error: <message>`
@@ -830,6 +833,21 @@ flag, `PARLEY_ENDPOINT_URL` and the file, and asks the hub who the credential
 belongs to with `GET /api/v1/user` (30 s timeout). On `200` it sets
 `endpoint_url`, `api_key` and `user_id` in the map and saves it: a temporary
 file with mode `0600` in the same directory, renamed over `config.toml`.
+
+Without `--api-key`, `parley login` signs in through the browser
+(`browserLogin` in `internal/cli/login.go`): it validates `--expires`,
+reads the config file and resolves the hub URL as above, takes the
+provider's `authorize_url` from `GET /api/v1/auth/providers`, listens on
+`127.0.0.1:0`, and opens the `authorize_url` with `redirect_uri` (that
+listener's `/callback`) and a 32-hex-character `state` from `crypto/rand`
+added. A `net/http` server on the listener serves `GET /callback` once: it
+checks the state in constant time, answers the browser with an HTML page,
+and hands the code back; the server is shut down and the listener closed on
+every way out, including the wait's expiry. The code goes to
+`POST /api/v1/auth/callback` without a credential, and the answer's key and
+user are saved as in the key flow. Both flows send their requests through
+one helper (`hubCall`, 30 s timeout) that returns a hub's error envelope as
+it was received.
 
 `parley version` reads its build from `internal/buildinfo` and asks the hub
 for its build with a plain `net/http` client over HTTP (`GET /version`, 5 s

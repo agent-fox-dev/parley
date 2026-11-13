@@ -24,10 +24,15 @@ type options struct {
 	versionTimeout time.Duration
 	// stdin is where parley login --api-key - reads the credential.
 	stdin io.Reader
+	// openBrowser opens a URL in the user's browser.
+	openBrowser func(url string) error
+	// loginWait bounds how long parley login waits for the browser's
+	// redirect.
+	loginWait time.Duration
 }
 
 func defaultOptions() options {
-	return options{versionTimeout: 5 * time.Second, stdin: os.Stdin}
+	return options{versionTimeout: 5 * time.Second, stdin: os.Stdin, openBrowser: openSystemBrowser, loginWait: 120 * time.Second}
 }
 
 // Hooks replace what parley takes from the process, for a caller that runs it
@@ -36,6 +41,12 @@ type Hooks struct {
 	// Stdin is where parley login --api-key - reads the credential
 	// (default os.Stdin).
 	Stdin io.Reader
+	// OpenBrowser opens the provider's sign-in page for parley login
+	// (default: the system's opener, see openSystemBrowser).
+	OpenBrowser func(url string) error
+	// LoginWait bounds how long parley login waits for the browser to come
+	// back (default 120 s).
+	LoginWait time.Duration
 }
 
 // Run is parley: it runs the command args name, writes its output to stdout
@@ -49,6 +60,12 @@ func RunWith(ctx context.Context, args []string, stdout, stderr io.Writer, h Hoo
 	opts := defaultOptions()
 	if h.Stdin != nil {
 		opts.stdin = h.Stdin
+	}
+	if h.OpenBrowser != nil {
+		opts.openBrowser = h.OpenBrowser
+	}
+	if h.LoginWait > 0 {
+		opts.loginWait = h.LoginWait
 	}
 	return run(ctx, args, stdout, stderr, opts)
 }

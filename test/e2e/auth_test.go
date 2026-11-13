@@ -42,6 +42,19 @@ func getAuthorized(t *testing.T, url, authorization string) (int, map[string]any
 	return res.StatusCode, body
 }
 
+// addWhoami adds the non-public route GET /api/v1/test/whoami, which
+// answers the caller's principal.
+func addWhoami(c *hub.Composition) {
+	c.AddRoute(server.Route{Method: http.MethodGet, Pattern: "/test/whoami", Handler: func(w http.ResponseWriter, r *http.Request) error {
+		p, ok := identity.PrincipalOf(r.Context())
+		if !ok {
+			return server.Internal("no principal")
+		}
+		server.WriteJSON(w, http.StatusOK, p)
+		return nil
+	}})
+}
+
 func TestAuth_TheOperatorCallsTheHubWithTheAdminToken(t *testing.T) {
 	dir := t.TempDir()
 	writeConfig(t, dir, "[server]\nbind = \"127.0.0.1\"\nport = 0\n")
@@ -59,16 +72,7 @@ func TestAuth_TheOperatorCallsTheHubWithTheAdminToken(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s := serve(t, hub.Options{Env: env, WorkDir: dir, Compose: func(c *hub.Composition) {
-		c.AddRoute(server.Route{Method: http.MethodGet, Pattern: "/test/whoami", Handler: func(w http.ResponseWriter, r *http.Request) error {
-			p, ok := identity.PrincipalOf(r.Context())
-			if !ok {
-				return server.Internal("no principal")
-			}
-			server.WriteJSON(w, http.StatusOK, p)
-			return nil
-		}})
-	}})
+	s := serve(t, hub.Options{Env: env, WorkDir: dir, Compose: addWhoami})
 	whoami := s.url("/api/v1/test/whoami")
 
 	code, body := getAuthorized(t, whoami, "Bearer "+token)

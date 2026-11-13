@@ -5,15 +5,19 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"io/fs"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/agent-fox-dev/parley/internal/buildinfo"
@@ -80,16 +84,17 @@ type stubAnswer struct {
 }
 
 type stubRequest struct {
-	method, path string
-	header       http.Header
+	method, path, body string
+	header             http.Header
 }
 
 func newStubHub(t *testing.T) *stubHub {
 	t.Helper()
 	h := &stubHub{answers: map[string]stubAnswer{}}
 	h.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
 		h.mu.Lock()
-		h.requests = append(h.requests, stubRequest{method: r.Method, path: r.URL.Path, header: r.Header.Clone()})
+		h.requests = append(h.requests, stubRequest{method: r.Method, path: r.URL.Path, body: string(body), header: r.Header.Clone()})
 		a, ok := h.answers[r.Method+" "+r.URL.Path]
 		h.mu.Unlock()
 		if !ok {
@@ -231,4 +236,140 @@ func wantAbsent(t *testing.T, path string) {
 	if _, err := os.Lstat(path); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("%s exists (or cannot be checked: %v), want it absent", path, err)
 	}
+}
+
+// The browser login's fixtures: the authorize URL the stub hub lists for
+// github, the key its callback issues and its callback answer.
+const (
+	testAuthorizeURL = "https://idp.example/authorize?client_id=gh-id&scope=user%3Aemail"
+	testIssuedKey    = "parley_wxyz9876_ZYXWVUTSRQponmlkjihgfedcba987654"
+	testCallback     = `{"user":` + testUser + `,"api_key":{"key":"` + testIssuedKey + `","key_id":"wxyz9876","expires_at":null}}`
+)
+
+// providersAnswer is GET /auth/providers listing the providers given as
+// name and authorize URL pairs.
+func providersAnswer(nameAndURL ...string) string {
+	type item struct {
+		Name         string `json:"name"`
+		AuthorizeURL string `json:"authorize_url"`
+	}
+	items := []item{}
+	for i := 0; i+1 < len(nameAndURL); i += 2 {
+		items = append(items, item{nameAndURL[i], nameAndURL[i+1]})
+	}
+	body, _ := json.Marshal(map[string]any{"items": items, "next_cursor": nil})
+	return string(body)
+}
+
+// browserHub is a stub hub that lists github with testAuthorizeURL and
+// answers the callback with testCallback.
+func browserHub(t *testing.T) *stubHub {
+	t.Helper()
+	return newStubHub(t).
+		answer(http.MethodGet, "/api/v1/auth/providers", http.StatusOK, providersAnswer("github", testAuthorizeURL)).
+		answer(http.MethodPost, "/api/v1/auth/callback", http.StatusOK, testCallback)
+}
+
+// fakeBrowser is the browser opener of a test. It records the URLs it is
+// given and whether the redirect_uri's port took a connection then; with a
+// query it plays the browser and sends GET redirect_uri?<query(state)>,
+// recording the answer; with fail it opens nothing and returns fail.
+type fakeBrowser struct {
+	query func(state string) string
+	fail  error
+
+	urls        []string
+	reachable   bool
+	status      int
+	contentType string
+}
+
+func (b *fakeBrowser) open(rawURL string) error {
+	b.urls = append(b.urls, rawURL)
+	redirect := b.redirectURI()
+	if u, err := url.Parse(redirect); err == nil {
+		if c, err := net.Dial("tcp", u.Host); err == nil {
+			b.reachable = true
+			c.Close()
+		}
+	}
+	if b.fail != nil || b.query == nil {
+		return b.fail
+	}
+	res, err := http.Get(redirect + "?" + b.query(b.state()))
+	if err != nil {
+		return err
+	}
+	res.Body.Close()
+	b.status, b.contentType = res.StatusCode, res.Header.Get("Content-Type")
+	return nil
+}
+
+// last is the last URL the browser was given, parsed.
+func (b *fakeBrowser) last() *url.URL {
+	if len(b.urls) == 0 {
+		return &url.URL{}
+	}
+	u, _ := url.Parse(b.urls[len(b.urls)-1])
+	return u
+}
+
+func (b *fakeBrowser) redirectURI() string { return b.last().Query().Get("redirect_uri") }
+func (b *fakeBrowser) state() string       { return b.last().Query().Get("state") }
+
+// approve is the query of a redirect the provider sends on approval: the
+// code c1 with the state it was given.
+func approve(state string) string { return "code=c1&state=" + state }
+
+// runLogin runs parley login with b as the browser opener and wait as the
+// time it waits for the redirect, with args after "login".
+func runLogin(t *testing.T, b *fakeBrowser, wait time.Duration, args ...string) (int, string, string) {
+	t.Helper()
+	opts := defaultOptions()
+	opts.openBrowser, opts.loginWait = b.open, wait
+	return runCLIWith(t, opts, append([]string{"login"}, args...)...)
+}
+
+// wantClosed fails the test when the host of rawURL still takes a TCP
+// connection.
+func wantClosed(t *testing.T, rawURL string) {
+	t.Helper()
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		t.Fatalf("no host in %q", rawURL)
+	}
+	if c, err := net.Dial("tcp", u.Host); err == nil {
+		c.Close()
+		t.Errorf("%s still takes connections", u.Host)
+	}
+}
+
+// callbacks is how many requests the stub hub got for the callback.
+func (h *stubHub) callbacks() int {
+	n := 0
+	for _, r := range h.recorded() {
+		if r.path == "/api/v1/auth/callback" {
+			n++
+		}
+	}
+	return n
+}
+
+// syncBuffer is a bytes.Buffer a running login may write to while the test
+// reads it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }

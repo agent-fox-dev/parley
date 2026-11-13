@@ -413,8 +413,72 @@ fails before any request:
 ```
 
 Only the flag `--api-key` selects the key flow; `PARLEY_API_KEY` and the
-file's `api_key` do not. Without `--api-key`, `parley login` fails with a
-`client_error`, since this build has no browser login yet.
+file's `api_key` do not. Without `--api-key`, `parley login` signs in
+through the browser.
+
+#### Through the browser
+
+`parley login` without `--api-key` signs the user in at an identity
+provider and has the hub issue a new API key. `--expires` sets the key's
+lifetime in days and must be `0` (no expiry), `30`, `60` or `90` (the
+default); any other value is a `usage_error` before the config file is read
+or any request is sent:
+
+```json
+{"error":{"code":0,"message":"--expires must be 0, 30, 60 or 90, got \"45\"","error_type":"usage_error"}}
+```
+
+The login then:
+
+1. sends `GET <hub URL>/api/v1/auth/providers` without an `Authorization`
+   header and takes the item whose `name` is `--provider` (`github` by
+   default). A provider the hub does not list fails the login, naming the
+   ones it does:
+
+   ```json
+   {"error":{"code":0,"message":"the hub does not offer the identity provider \"google\"; it offers github","error_type":"client_error"}}
+   ```
+
+2. listens on `127.0.0.1` on a free port and opens in the browser the
+   provider's `authorize_url` with two query parameters added, keeping the
+   ones it has: `redirect_uri=http://127.0.0.1:<port>/callback` and `state`,
+   32 random hexadecimal characters drawn for this login. The browser is
+   opened with `open` on macOS, `xdg-open` on Linux and
+   `rundll32 url.dll,FileProtocolHandler` on Windows. When that fails
+   (no opener, or one that exits with an error within 5 seconds), the URL is
+   written to stderr and the login keeps waiting, so it can be opened by
+   hand:
+
+   ```
+   Cannot open a browser (exec: "xdg-open": executable file not found in $PATH). Open this URL to sign in:
+   https://github.com/login/oauth/authorize?client_id=gh-id&redirect_uri=http%3A%2F%2F127.0.0.1%3A53124%2Fcallback&scope=user%3Aemail&state=9f86d081884c7d659a2feaa0c55ad015
+   ```
+
+3. waits up to 120 seconds for the provider to send the browser back to
+   `GET /callback` on that port, and serves that one request. A request
+   that carries the same `state` (compared in constant time) and a `code`
+   is answered `200` with a short HTML page saying the sign-in worked. A
+   different or missing `state`, an `error` parameter or a missing `code`
+   is answered `400` with a short HTML page saying it failed, and fails the
+   login with a `client_error`, without calling the hub. When no request
+   comes within 120 seconds the login fails with a `client_error`. The
+   listener is closed on every way out.
+
+4. sends `POST <hub URL>/api/v1/auth/callback` without an `Authorization`
+   header and with the body
+   `{"provider":…,"code":…,"redirect_uri":…,"expires":…}`, the
+   `redirect_uri` being the one it gave the provider (see
+   [api.md](api.md)). On `200` it saves `endpoint_url`, the new key
+   (`api_key.key`) and the user's `id` in the config file, prints the
+   `user` alone on stdout, indented by two spaces and followed by a
+   newline, writes `Logged in as <username>` to stderr and exits `0`. The
+   key is never printed.
+
+When the hub answers either request with an error envelope, for example
+`429` on the provider list, or `401` (the provider rejected the code),
+`403` (`user is blocked`), `409` or `502` on the callback, `parley login`
+writes that envelope to stderr exactly as received, saves nothing and
+exits `1`.
 
 #### With a credential: `--api-key`
 
@@ -460,17 +524,24 @@ exits `1`:
 
 Every failure prints nothing on stdout. A failure on the client's side
 writes one error envelope with `code` `0` to stderr and exits `2`; its
-`error_type` is `usage_error` for an empty credential and `client_error`
-for everything else: a config file that cannot be read or is not valid TOML
-(the message gives the line and column, not the text), no hub URL, a hub
-that cannot be reached or does not answer within 30 seconds, an answer that
-is neither a JSON object with an `id` (on `200`) nor an error envelope, and
-a config file that cannot be written after the hub accepted the
-credential. In that last case the credential stays valid and is not saved:
+`error_type` is `usage_error` for an empty credential and a bad `--expires`,
+and `client_error` for everything else: a config file that cannot be read
+or is not valid TOML (the message gives the line and column, not the text),
+no hub URL, a hub that cannot be reached or does not answer within 30
+seconds, an answer that is neither what the request expects (on `200`: a
+JSON object with an `id`, a provider list, a callback answer with a key)
+nor an error envelope, a provider the hub does not list, a browser that
+comes back with the wrong state, an error or no code, or does not come
+back within 120 seconds, and a config file that cannot be written after
+the hub accepted the credential or issued the key. In that last case the
+credential stays valid and is not saved:
 
 ```json
 {"error":{"code":0,"message":"cannot reach the hub: Get \"http://127.0.0.1:1/api/v1/user\": dial tcp 127.0.0.1:1: connect: connection refused","error_type":"client_error"}}
 {"error":{"code":0,"message":"the hub accepted the credential, but it was not saved to /home/alice/.parley/config.toml: open /home/alice/.parley/.config.toml.1234567: permission denied","error_type":"client_error"}}
+{"error":{"code":0,"message":"the hub issued an API key, but it was not saved to /home/alice/.parley/config.toml: open /home/alice/.parley/.config.toml.1234567: permission denied","error_type":"client_error"}}
+{"error":{"code":0,"message":"the sign-in failed: the browser came back without the state this login sent","error_type":"client_error"}}
+{"error":{"code":0,"message":"the browser did not come back from the sign-in within 2m0s","error_type":"client_error"}}
 ```
 
 Nothing is saved on any failure: the config file is neither created nor
@@ -480,6 +551,6 @@ changed.
 
 | Status | When |
 |---|---|
-| `0` | help, `parley version`, whether or not the hub answered, or a `parley login` that saved the credential |
+| `0` | help, `parley version`, whether or not the hub answered, or a `parley login` that saved the credential or the new API key |
 | `1` | `parley login`: the hub answered with an error envelope, which is written to stderr as received |
 | `2` | an unknown command or flag, or an argument a command does not take; `parley` writes one line `error: <message>` to stderr, for example `error: unknown command "nope" for "parley"`. For `parley login` also a failure on the client's side, reported as an error envelope with `code` `0` (see [Failures](#failures)) |
