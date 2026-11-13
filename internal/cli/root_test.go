@@ -47,15 +47,29 @@ func TestRun_EndsWithTheExitStatusOfTheOutcome(t *testing.T) {
 	}
 }
 
+// The configuration file is not TOML, so a command that read it would fail
+// with a client error. Without the environment variables every command would
+// have to read it; with them, one that got past parsing would send a request.
 // The test sets environment variables, so it must not run in parallel.
 func TestRun_RefusesWhatItCannotParseWithAUsageErrorBeforeAnyRequest(t *testing.T) {
 	hub := newStubHub(t)
 	dir := t.TempDir()
 	writeConfigFile(t, dir, "endpoint_url = = not TOML\n")
 	t.Setenv("PARLEY_CONFIG_DIR", dir)
-	t.Setenv("PARLEY_ENDPOINT_URL", hub.URL)
-	t.Setenv("PARLEY_API_KEY", testAPIKey)
 
+	settings := []struct {
+		name string
+		set  func(t *testing.T)
+	}{
+		{"settings from the environment", func(t *testing.T) {
+			t.Setenv("PARLEY_ENDPOINT_URL", hub.URL)
+			t.Setenv("PARLEY_API_KEY", testAPIKey)
+		}},
+		{"settings from the unreadable file", func(t *testing.T) {
+			unsetEnv(t, "PARLEY_ENDPOINT_URL")
+			unsetEnv(t, "PARLEY_API_KEY")
+		}},
+	}
 	tests := []struct {
 		args []string
 		// names is a text the message must hold, if any.
@@ -71,32 +85,37 @@ func TestRun_RefusesWhatItCannotParseWithAUsageErrorBeforeAnyRequest(t *testing.
 		{[]string{"version", "extra"}, "extra"},
 		{[]string{"probe", "admin", "purge"}, "--confirm"},
 	}
-	for _, tt := range tests {
-		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
-			code, stdout, stderr := runCLIWith(t, withProbes(defaultOptions(), probeAdmin), tt.args...)
+	for _, source := range settings {
+		t.Run(source.name, func(t *testing.T) {
+			source.set(t)
+			for _, tt := range tests {
+				t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
+					code, stdout, stderr := runCLIWith(t, withProbes(defaultOptions(), probeAdmin), tt.args...)
 
-			if code != 2 {
-				t.Errorf("exit status = %d, want 2", code)
-			}
-			if stdout != "" {
-				t.Errorf("stdout = %q, want it empty", stdout)
-			}
-			var doc struct {
-				Error struct {
-					Code      *int   `json:"code"`
-					Message   string `json:"message"`
-					ErrorType string `json:"error_type"`
-				} `json:"error"`
-			}
-			oneJSONDocument(t, stderr, &doc)
-			if doc.Error.Code == nil || *doc.Error.Code != 0 || doc.Error.ErrorType != "usage_error" {
-				t.Errorf("stderr = %q, want an envelope with code 0 and error_type usage_error", stderr)
-			}
-			if !strings.Contains(doc.Error.Message, tt.names) {
-				t.Errorf("message %q does not name %q", doc.Error.Message, tt.names)
-			}
-			if n := len(hub.recorded()); n != 0 {
-				t.Errorf("the hub got %d requests, want none", n)
+					if code != 2 {
+						t.Errorf("exit status = %d, want 2", code)
+					}
+					if stdout != "" {
+						t.Errorf("stdout = %q, want it empty", stdout)
+					}
+					var doc struct {
+						Error struct {
+							Code      *int   `json:"code"`
+							Message   string `json:"message"`
+							ErrorType string `json:"error_type"`
+						} `json:"error"`
+					}
+					oneJSONDocument(t, stderr, &doc)
+					if doc.Error.Code == nil || *doc.Error.Code != 0 || doc.Error.ErrorType != "usage_error" {
+						t.Errorf("stderr = %q, want an envelope with code 0 and error_type usage_error", stderr)
+					}
+					if !strings.Contains(doc.Error.Message, tt.names) {
+						t.Errorf("message %q does not name %q", doc.Error.Message, tt.names)
+					}
+					if n := len(hub.recorded()); n != 0 {
+						t.Errorf("the hub got %d requests, want none", n)
+					}
+				})
 			}
 		})
 	}
