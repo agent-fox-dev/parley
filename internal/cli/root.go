@@ -27,10 +27,19 @@ type options struct {
 	// extra builds commands added to the root on each run, beside parley's
 	// own; tests add probe commands with it.
 	extra []func() *cobra.Command
+	// requestTimeout bounds each request to the hub of a command that
+	// states no timeout of its own (defaultRequestTimeout).
+	requestTimeout time.Duration
 }
 
 func defaultOptions() options {
-	return options{versionTimeout: 5 * time.Second, stdin: os.Stdin, openBrowser: openSystemBrowser, loginWait: 120 * time.Second}
+	return options{
+		versionTimeout: 5 * time.Second,
+		stdin:          os.Stdin,
+		openBrowser:    openSystemBrowser,
+		loginWait:      120 * time.Second,
+		requestTimeout: defaultRequestTimeout,
+	}
 }
 
 // Hooks replace what parley takes from the process, for a caller that runs it
@@ -107,7 +116,7 @@ func newRootCommand(opts options) *cobra.Command {
 	root.PersistentFlags().Bool("json", false, "print the help as JSON")
 	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return usageError("%v", err) })
 
-	root.AddCommand(newVersionCommand(), newLoginCommand(opts))
+	root.AddCommand(newVersionCommand(), newLoginCommand())
 	for _, build := range opts.extra {
 		root.AddCommand(build())
 	}

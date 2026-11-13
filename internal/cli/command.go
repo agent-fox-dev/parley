@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -55,6 +56,9 @@ type command struct {
 	ShowsOnce bool `json:"-"`
 	// FailOn are the command's --fail-on-… conditions.
 	FailOn []failOn `json:"-"`
+	// Timeout, when not zero, bounds each of the command's requests in
+	// place of the default of 30 seconds.
+	Timeout time.Duration `json:"-"`
 }
 
 // failOn is a --fail-on-<Name> flag: a condition over the command's result
@@ -83,6 +87,16 @@ type call struct {
 	// resolved for it. It is nil for a command whose auth is none, which
 	// needs no credential and resolves what it does need itself.
 	client *client
+}
+
+// newClient is the client of the hub at hubURL presenting credential, with
+// the command's request timeout: the one it declares, else the default.
+func (c *call) newClient(hubURL, credential string) *client {
+	timeout := c.opts.requestTimeout
+	if c.decl.Timeout > 0 {
+		timeout = c.decl.Timeout
+	}
+	return newClient(hubURL, credential, timeout)
 }
 
 // The annotations a declared command or a group carries.
@@ -126,7 +140,7 @@ func declare(decl command) *cobra.Command {
 				if err != nil {
 					return err
 				}
-				c.client = newClient(s.hubURL, s.credential)
+				c.client = c.newClient(s.hubURL, s.credential)
 			}
 			if decl.Run == nil {
 				return sendAndPrint(c)

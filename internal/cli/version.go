@@ -5,11 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/agent-fox-dev/parley/internal/buildinfo"
 	"github.com/spf13/cobra"
@@ -18,9 +16,6 @@ import (
 // endpointURLEnv names the variable that gives the hub URL when the flag
 // --endpoint-url does not.
 const endpointURLEnv = "PARLEY_ENDPOINT_URL"
-
-// maxVersionBody bounds how much of the hub's answer is read.
-const maxVersionBody = 1 << 20
 
 // versionDocument is what parley version prints.
 type versionDocument struct {
@@ -63,7 +58,10 @@ func newVersionCommand() *cobra.Command {
 				hubURL = file.EndpointURL
 			}
 			if hubURL != "" {
-				server, err := hubVersion(c.ctx, hubURL, c.opts.versionTimeout)
+				// No credential: GET /version needs none. The command's own
+				// timeout is shorter than the default, so that a hub that
+				// does not answer costs a few seconds and not thirty.
+				server, err := hubVersion(c.ctx, newClient(hubURL, "", c.opts.versionTimeout))
 				if err != nil {
 					// The client's own build is still worth printing, so a hub
 					// that cannot be read is a warning and not a failure.
@@ -83,27 +81,18 @@ func newVersionCommand() *cobra.Command {
 	})
 }
 
-// hubVersion asks the hub at hubURL for its build, without a credential.
-func hubVersion(ctx context.Context, hubURL string, timeout time.Duration) (*serverBuild, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(hubURL, "/")+"/version", nil)
+// hubVersion asks the hub of hub for its build, with GET /version, which
+// lies outside /api/v1.
+func hubVersion(ctx context.Context, hub *client) (*serverBuild, error) {
+	resp, err := hub.send(ctx, apiRequest{method: http.MethodGet, path: "/version", outsideAPI: true})
 	if err != nil {
 		return nil, err
 	}
-	client := &http.Client{Timeout: timeout}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("the hub answered %s", resp.Status)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxVersionBody))
-	if err != nil {
-		return nil, fmt.Errorf("read the answer: %w", err)
+	if resp.status != http.StatusOK {
+		return nil, fmt.Errorf("the hub answered %d", resp.status)
 	}
 	var server *serverBuild
-	if err := json.Unmarshal(body, &server); err != nil {
+	if err := json.Unmarshal(resp.body, &server); err != nil {
 		return nil, fmt.Errorf("decode the answer: %w", err)
 	}
 	if server == nil {

@@ -69,30 +69,32 @@ func sendAndPrint(c *call) error {
 }
 
 // routePath is path with each :param segment replaced by the argument of
-// that name, encoded as one path segment.
+// that name, percent-encoded as one segment: a / in it becomes %2F, and ?,
+// #, % and spaces are encoded too, so the hub receives exactly the
+// segments of the route. An argument that is . or .. is encoded as %2E
+// and %2E%2E, because a dot segment would be read as a step of the path.
 func routePath(path string, args map[string]string) string {
 	segments := strings.Split(path, "/")
 	for i, s := range segments {
 		if name, ok := strings.CutPrefix(s, ":"); ok {
-			segments[i] = url.PathEscape(args[name])
+			segments[i] = pathSegment(args[name])
 		}
 	}
 	return strings.Join(segments, "/")
 }
 
-// printAnswer prints the hub's answer to the command's request: a success
-// as the result, an error envelope as a hubError, which run prints on
-// stderr.
-func (c *call) printAnswer(resp *response) error {
-	switch {
-	case resp.status >= 400:
-		if isHubEnvelope(resp.body) {
-			return &hubError{status: resp.status, body: resp.body}
-		}
-		return clientError("the hub answered %d without an error envelope", resp.status)
-	case resp.status < 200 || resp.status >= 300:
-		return clientError("the hub answered %d, which is neither a success nor an error", resp.status)
+// pathSegment is value percent-encoded as one path segment.
+func pathSegment(value string) string {
+	if value == "." || value == ".." {
+		return strings.ReplaceAll(value, ".", "%2E")
 	}
+	return url.PathEscape(value)
+}
+
+// printAnswer prints the hub's answer to the command's request, a success
+// the client has checked already: a body as the result, no body as {} or
+// the command's confirmation.
+func (c *call) printAnswer(resp *response) error {
 	body := resp.body
 	if len(bytes.TrimSpace(body)) == 0 {
 		// A success without a body still prints one document, so a script
@@ -107,9 +109,6 @@ func (c *call) printAnswer(resp *response) error {
 			}
 			body = confirmation
 		}
-	}
-	if !json.Valid(body) {
-		return clientError("the hub answered %d with a body that is not JSON", resp.status)
 	}
 	return c.printResult(body)
 }

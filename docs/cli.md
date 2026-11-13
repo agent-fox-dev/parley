@@ -408,6 +408,53 @@ command's method and query string, the header
 request with a body sends it as JSON with `Content-Type: application/json`;
 one without sends neither a body nor `Content-Type`.
 
+A value from the command line that fills a segment of the path (a name, a
+slug, a branch) is percent-encoded as one segment: a `/` in it is sent as
+`%2F`, and `?`, `#`, `%` and spaces are encoded too, so `parley … get
+'feature/x y'` sends `…/feature%2Fx%20y`. A value that is `.` or `..` is
+sent as `%2E` or `%2E%2E`.
+
+Each request has 30 seconds to complete, from connecting to reading the
+whole answer, unless the command states another timeout (`parley version`:
+5 seconds; the callback of `parley login`: 60 seconds). A request that has
+not completed by then is abandoned with a `client_error`:
+
+```json
+{
+  "error": {
+    "code": 0,
+    "message": "the hub at https://hub.example gave no complete answer within 30s",
+    "error_type": "client_error"
+  }
+}
+```
+
+Every request is sent exactly once. `parley` does not send it again after
+a `429`, a `5xx`, a timeout or a broken connection, and does not act on
+`Retry-After`; the error goes to stderr and the command ends with its exit
+status, so a script decides whether to try again.
+
+A hub that cannot be reached (the connection is refused, the host name does
+not resolve, the TLS handshake fails) is a `client_error` whose message
+names the hub URL:
+
+```json
+{
+  "error": {
+    "code": 0,
+    "message": "cannot reach the hub at http://no-such-host.invalid: dial tcp: lookup no-such-host.invalid: no such host",
+    "error_type": "client_error"
+  }
+}
+```
+
+An answer that is not the hub's REST API's is a `client_error` whose message
+names the HTTP status, because it came from something else (a proxy, a wrong
+URL): a status of `400` or above whose body is not an error envelope (a JSON
+object with an `error` member holding `error_type`), a `2xx` status whose
+body is neither empty nor JSON (`the hub answered 200 with a body that is
+not JSON`), and a status outside `2xx` below `400`.
+
 `parley version` and `parley login` need no credential and read the hub URL
 themselves, as their sections say; help needs neither setting.
 
@@ -461,7 +508,7 @@ or it answers a status other than `200` or a body that is not a JSON object,
 prints the document without `server`:
 
 ```
-warning: cannot read the hub's version from http://127.0.0.1:1: Get "http://127.0.0.1:1/version": dial tcp 127.0.0.1:1: connect: connection refused
+warning: cannot read the hub's version from http://127.0.0.1:1: cannot reach the hub at http://127.0.0.1:1: dial tcp 127.0.0.1:1: connect: connection refused
 ```
 
 When it reads the configuration file and the file cannot be read or parsed,
@@ -504,7 +551,10 @@ or holds `endpoint_url`, `api_key` or `user_id` with a value that is not a
 string fails the login before any request, leaving the file as it is. It
 then takes the hub URL from the first non-empty of `--endpoint-url`,
 `PARLEY_ENDPOINT_URL` and the file's `endpoint_url`, and drops trailing
-slashes from it. With none it fails before any request:
+slashes from it. A hub URL that is not an absolute `http` or `https` URL
+with a host fails before any request, as for every command (see
+[Settings](#settings-the-hub-url-and-the-credential)). With none it fails
+before any request:
 
 ```json
 {
@@ -574,7 +624,7 @@ The login then:
    `redirect_uri` being the one it gave the provider (see
    [api.md](api.md)), and waits up to 60 seconds for the answer, since the
    hub may itself wait on the identity provider for up to three calls of
-   15 seconds each. On `200` it saves `endpoint_url`, the new key
+   15 seconds each. On a `2xx` answer it saves `endpoint_url`, the new key
    (`api_key.key`) and the user's `id` in the config file, prints the
    `user` alone on stdout, indented by two spaces and followed by a
    newline, writes `Logged in as <username>` to stderr and exits `0`. The
@@ -597,8 +647,8 @@ effect here.
 
 It sends `GET <hub URL>/api/v1/user` with `Authorization: Bearer
 <credential>` and a timeout of 30 seconds, and nothing else, so no key is
-created or revoked. When the hub answers `200` with a JSON object that has
-an `id`, it saves the file, prints the User as one JSON document on stdout,
+created or revoked. When the hub answers a `2xx` status with a JSON object
+that has an `id`, it saves the file, prints the User as one JSON document on stdout,
 indented by two spaces and followed by a newline, writes
 `Logged in as <username>` to stderr and exits `0`:
 
@@ -645,8 +695,8 @@ line and column, not the text) or holds a known key with a value that is
 not a string, no home directory to find the config file in, no hub URL, a
 hub that cannot be reached or does not answer within 30 seconds (60
 seconds for the callback), an answer that is neither what the request
-expects (on `200`: a JSON object with an `id`, a provider list, a callback
-answer with a key) nor an error envelope, a provider the hub does not list, a browser that
+expects (on a `2xx` status: a JSON object with an `id`, a provider list, a
+callback answer with a key) nor an error envelope holding `error_type`, a provider the hub does not list, a browser that
 comes back with the wrong state, an error or no code, or does not come
 back within 120 seconds, and a config file that cannot be written after
 the hub accepted the credential or issued the key. In that last case the
@@ -656,7 +706,7 @@ credential stays valid and is not saved:
 {
   "error": {
     "code": 0,
-    "message": "cannot reach the hub: Get \"http://127.0.0.1:1/api/v1/user\": dial tcp 127.0.0.1:1: connect: connection refused",
+    "message": "cannot reach the hub at http://127.0.0.1:1: dial tcp 127.0.0.1:1: connect: connection refused",
     "error_type": "client_error"
   }
 }

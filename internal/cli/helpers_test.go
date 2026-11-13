@@ -179,6 +179,7 @@ type stubHub struct {
 
 	mu       sync.Mutex
 	answers  map[string]stubAnswer
+	handlers map[string]http.HandlerFunc
 	requests []stubRequest
 }
 
@@ -198,7 +199,7 @@ type stubRequest struct {
 
 func newStubHub(t *testing.T) *stubHub {
 	t.Helper()
-	h := &stubHub{answers: map[string]stubAnswer{}}
+	h := &stubHub{answers: map[string]stubAnswer{}, handlers: map[string]http.HandlerFunc{}}
 	h.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		h.mu.Lock()
@@ -208,9 +209,14 @@ func newStubHub(t *testing.T) *stubHub {
 			header: r.Header.Clone(),
 		})
 		a, ok := h.answers[r.Method+" "+r.URL.Path]
+		handler := h.handlers[r.Method+" "+r.URL.Path]
 		h.mu.Unlock()
 		if !ok {
 			a = stubAnswer{http.StatusNotFound, `{"error":{"code":404,"message":"not found","error_type":"not_found"}}` + "\n"}
+		}
+		if handler != nil {
+			handler(w, r)
+			return
 		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.WriteHeader(a.status)
@@ -226,6 +232,47 @@ func (h *stubHub) answer(method, path string, status int, body string) *stubHub 
 	defer h.mu.Unlock()
 	h.answers[method+" "+path] = stubAnswer{status, body}
 	return h
+}
+
+// handle has handler answer method and path, for an answer status and body
+// cannot describe.
+func (h *stubHub) handle(method, path string, handler http.HandlerFunc) *stubHub {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.handlers[method+" "+path] = handler
+	return h
+}
+
+// answerAfter is a handler that answers 200 with an empty object after d,
+// or returns as soon as the client gives up.
+func answerAfter(d time.Duration) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(d):
+			w.Write([]byte("{}"))
+		case <-r.Context().Done():
+		}
+	}
+}
+
+// closeWithoutAnswer is a handler that closes the connection without
+// writing a byte of an answer.
+func closeWithoutAnswer(w http.ResponseWriter, _ *http.Request) {
+	conn, _, err := http.NewResponseController(w).Hijack()
+	if err == nil {
+		conn.Close()
+	}
+}
+
+// closedPortURL is the URL of a loopback port nothing listens on.
+func closedPortURL(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln.Close()
+	return "http://" + ln.Addr().String()
 }
 
 func (h *stubHub) recorded() []stubRequest {

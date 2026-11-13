@@ -841,7 +841,7 @@ group, which prints its help without a word and refuses a word that is none
 of its children as a `usage_error` (cobra alone would print the help); the
 root is a group too, and its flag error handler turns every flag that is
 unknown or does not parse, on any command, into a `usage_error`.
-`parley version` is declared through `declare`.
+`parley version` and `parley login` are declared through `declare`.
 
 Before the run step of a command whose `auth` is `user` or `admin`,
 `declare` resolves its settings with `resolveSettings`
@@ -853,15 +853,37 @@ leave one empty. A missing setting, a file that cannot be parsed and a hub
 URL that is not an absolute `http` or `https` URL with a host
 (`checkHubURL`) are `client_error`s, returned before the run step starts,
 so no request is sent. The resolved settings build the call's `client`
-(`internal/cli/client.go`), the one HTTP client of the commands:
-`newClient(hubURL, credential)` drops the URL's trailing slashes, and
-`request(ctx, method, path, query, body)` sends to
-`<hub URL>/api/v1<path>` with `Authorization: Bearer <credential>` (none
-when the credential is empty), `Accept: application/json`, and the body
-encoded as JSON with `Content-Type: application/json` only when there is
-one, under a 30 s timeout, and returns the status and the whole body. A
-command whose `auth` is `none` gets no client: it needs no credential and
-resolves what it does need itself.
+(`internal/cli/client.go`) with `call.newClient`, which gives it the
+declaration's `Timeout` or else `options.requestTimeout`
+(`defaultRequestTimeout`, 30 s; tests shorten it). A command whose `auth` is
+`none` gets no client: it needs no credential and builds one itself for the
+hub URL it resolves.
+
+`client` is the one HTTP client of the commands, `parley login` and
+`parley version` included. `newClient(hubURL, credential, timeout)` drops
+the URL's trailing slashes. An `apiRequest` holds the method, the path
+(relative to `/api/v1`, or with `outsideAPI` to the hub URL itself, as
+`GET /version` is), the query, the body and an optional timeout of its own.
+`raw(ctx, r)` sends it to `<hub URL>/api/v1<path>` with
+`Authorization: Bearer <credential>` (none when the credential is empty),
+`Accept: application/json`, and the body encoded as JSON with
+`Content-Type: application/json` only when there is one, and returns the
+status and the whole body whatever they hold, for a command whose output is
+not one JSON document. The timeout is a context around connecting, sending
+and reading the whole body; when it runs out the answer is a `client_error`
+(`the hub at <hub URL> gave no complete answer within <timeout>`), and any
+other failure to connect or read is a `client_error` naming the hub URL
+(`cannot reach the hub at <hub URL>: <reason>`). `send(ctx, r)` is `raw`
+that accepts only an answer of the REST API: a status of `400` or above
+whose body is an object with an `error` member holding `error_type`
+(`isHubEnvelope`, in `errors.go`) becomes a `hubError`; any other status
+outside `2xx`, and a `2xx` body that is neither empty nor JSON, a
+`client_error` naming the status. `request(ctx, method, path, query, body)`
+is `send` for the common case. Each client has its own transport, a clone
+of `http.DefaultTransport` with keep-alives disabled: Go's transport can
+send a request again on a new connection when a reused one breaks, and the
+hub may have received it the first time, so every connection serves one
+request and nothing in the client retries one.
 
 `internal/cli/errors.go` holds the two kinds of error a command ends with.
 `hubError` is an error envelope the hub answered, with the HTTP status and
@@ -878,12 +900,10 @@ and any other error as a `client_error` with its text as the message.
 
 `internal/cli/output.go` prints what a command answers. A command declared
 without a run step gets the default one, `sendAndPrint`: it fills each
-`:param` segment of `Path` with the argument of that name (`routePath`),
-sends `Method` to it through the call's client and passes the answer to
-`printAnswer`. A status of `400` or above whose body is an object with an
-`error` member holding `error_type` (`isHubEnvelope`, in `errors.go`)
-becomes a `hubError`; any other status outside `2xx`, and a `2xx` body that
-is not JSON, a `client_error` naming the status. A `2xx` answer without a
+`:param` segment of `Path` with the argument of that name, percent-encoded
+as one segment (`routePath`, `pathSegment`: `url.PathEscape`, and `.` and
+`..` as `%2E` and `%2E%2E`), sends `Method` to it with the call's client's
+`send` and passes the success to `printAnswer`. A `2xx` answer without a
 body is replaced by `{}`, or by the document the declaration's `Confirm`
 builds. `printResult` then writes the result with `writeResult`, which
 compacts the body and indents it by two spaces with `json.Indent`, never
@@ -894,7 +914,8 @@ flag `--fail-on-<Name>` (registered by `declare`) is given, returns
 `condition_not_met` with the condition's message when `Check` says it holds
 in the result, so the result is on stdout before `run` prints the error.
 `warn` and `progress` write a plain line to stderr, a warning prefixed with
-`warning: `; `parley version` writes its warnings with `warn`.
+`warning: `; `parley version` writes its warnings with `warn`. `parley
+login` prints the user with `printResult`.
 
 `internal/cli/config.go` is the one implementation of the client
 configuration file. `configPath` gives `$PARLEY_CONFIG_DIR/config.toml`, or
@@ -914,8 +935,11 @@ file left as it was.
 `parley login --api-key`, with the global flag (`internal/cli/login.go`),
 reads the client configuration file with `readConfig`, resolves the hub URL
 from the flag, `PARLEY_ENDPOINT_URL` and the file, and asks the hub who the
-credential belongs to with `GET /api/v1/user` (30 s timeout). On `200` it
-saves `endpoint_url`, `api_key` and `user_id` with `saveConfig`.
+credential belongs to with `GET /api/v1/user` through a `client` that
+presents it (30 s timeout). On a `2xx` answer it saves `endpoint_url`,
+`api_key` and `user_id` with `saveConfig`. A hub URL that is not an absolute
+`http` or `https` URL with a host is refused with `checkHubURL`, as for
+every command.
 
 Without `--api-key`, `parley login` signs in through the browser
 (`browserLogin` in `internal/cli/login.go`): it validates `--expires`,
@@ -929,14 +953,18 @@ and hands the code back; the server is shut down and the listener closed on
 every way out, including the wait's expiry. The code goes to
 `POST /api/v1/auth/callback` without a credential, and the answer's key and
 user are saved as in the key flow. Both flows send their requests through
-one helper (`hubCall`, 30 s timeout) that returns a hub's error envelope as
-a `hubError`, as it was received.
+the shared `client` with its `request` and `send`; the requests before the
+credential is known carry no `Authorization` header, and the callback states
+its own timeout of 60 s. A hub's error envelope comes back as a `hubError`,
+as it was received.
 
 `parley version` reads its build from `internal/buildinfo`, takes the hub URL
 from `--endpoint-url`, `PARLEY_ENDPOINT_URL` and then `readConfig` (a file it
 cannot parse is a warning, not a failure), and asks the hub for its build
-with a plain `net/http` client over HTTP (`GET /version`, outside `/api/v1`,
-no credential, 5 s timeout). `internal/cli` imports `internal/buildinfo` and nothing from
+through the shared `client` (`GET /version` with `outsideAPI`, no
+credential, its own 5 s timeout from `options.versionTimeout`); every
+failure of that request, and an answer other than `200` with a JSON object,
+is a warning. `internal/cli` imports `internal/buildinfo` and nothing from
 `internal/server`, so the client carries no server code. The commands, output
 and exit statuses are described in [cli.md](cli.md).
 
