@@ -20,11 +20,12 @@ beyond the ids, which the server does not read
 The package's first task lists "create a user" among the store functions it
 adds. The package's design makes one exported function create a user: the
 one that creates the user, the personal org and the membership together,
-so that no code path creates a user without a personal org. That function
-is built with the first login (the package's fifth task), and no other
-user-creation function is added before it. Until then the tests of
-`internal/identity` seed users with an `INSERT` of their own, in
-`internal/identity/testhub_test.go`.
+so that no code path creates a user without a personal org. That function,
+`identity.CreateUserAndPersonalOrg`, is built with the first login (the
+package's fifth task) and is the one exported way to create a user. The
+tests of `internal/identity` seed bare users, without a personal org,
+directly with an `INSERT` in `internal/identity/testhub_test.go`, because
+their fixtures need users that the first login would never create.
 
 ## The providers' public endpoints stay in internal/config
 

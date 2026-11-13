@@ -468,7 +468,9 @@ The login then:
    header and with the body
    `{"provider":…,"code":…,"redirect_uri":…,"expires":…}`, the
    `redirect_uri` being the one it gave the provider (see
-   [api.md](api.md)). On `200` it saves `endpoint_url`, the new key
+   [api.md](api.md)), and waits up to 60 seconds for the answer, since the
+   hub may itself wait on the identity provider for up to three calls of
+   15 seconds each. On `200` it saves `endpoint_url`, the new key
    (`api_key.key`) and the user's `id` in the config file, prints the
    `user` alone on stdout, indented by two spaces and followed by a
    newline, writes `Logged in as <username>` to stderr and exits `0`. The
@@ -524,13 +526,15 @@ exits `1`:
 
 Every failure prints nothing on stdout. A failure on the client's side
 writes one error envelope with `code` `0` to stderr and exits `2`; its
-`error_type` is `usage_error` for an empty credential and a bad `--expires`,
-and `client_error` for everything else: a config file that cannot be read
-or is not valid TOML (the message gives the line and column, not the text),
-no hub URL, a hub that cannot be reached or does not answer within 30
-seconds, an answer that is neither what the request expects (on `200`: a
-JSON object with an `id`, a provider list, a callback answer with a key)
-nor an error envelope, a provider the hub does not list, a browser that
+`error_type` is `usage_error` for an unknown flag, a flag without its
+value, a positional argument, an empty credential and a bad `--expires`,
+none of which sends a request, and `client_error` for everything else: a
+config file that cannot be read or is not valid TOML (the message gives the
+line and column, not the text), no hub URL, a hub that cannot be reached or
+does not answer within 30 seconds (60 seconds for the callback), an
+answer that is neither what the request expects (on `200`: a JSON object
+with an `id`, a provider list, a callback answer with a key) nor an error
+envelope, a provider the hub does not list, a browser that
 comes back with the wrong state, an error or no code, or does not come
 back within 120 seconds, and a config file that cannot be written after
 the hub accepted the credential or issued the key. In that last case the
@@ -553,4 +557,4 @@ changed.
 |---|---|
 | `0` | help, `parley version`, whether or not the hub answered, or a `parley login` that saved the credential or the new API key |
 | `1` | `parley login`: the hub answered with an error envelope, which is written to stderr as received |
-| `2` | an unknown command or flag, or an argument a command does not take; `parley` writes one line `error: <message>` to stderr, for example `error: unknown command "nope" for "parley"`. For `parley login` also a failure on the client's side, reported as an error envelope with `code` `0` (see [Failures](#failures)) |
+| `2` | an unknown command or flag, or an argument a command does not take; `parley` writes one line `error: <message>` to stderr, for example `error: unknown command "nope" for "parley"`. `parley login` instead reports a bad flag or argument, and any other failure on the client's side, as an error envelope with `code` `0`, for example `{"error":{"code":0,"message":"unknown flag: --nope","error_type":"usage_error"}}` (see [Failures](#failures)) |

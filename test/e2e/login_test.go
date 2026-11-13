@@ -161,8 +161,9 @@ func TestLogin_ADeveloperSignsInForTheFirstTimeAndTheSavedKeyWorks(t *testing.T)
 	if who, _ := body["user"].(map[string]any); code != http.StatusOK || body["type"] != "api_key" || who["id"] != user["id"] {
 		t.Errorf("whoami with the saved key: %d %v, want 200 with type api_key and user %v", code, body, user["id"])
 	}
-	if code, _ := getAuthorized(t, whoami, ""); code != http.StatusUnauthorized {
-		t.Errorf("whoami without a credential: %d, want 401", code)
+	code, body = getAuthorized(t, whoami, "")
+	if e, _ := body["error"].(map[string]any); code != http.StatusUnauthorized || e["message"] != "authentication required" {
+		t.Errorf("whoami without a credential: %d %v, want 401 %q", code, body, "authentication required")
 	}
 	if n := countRows(t, db, "users"); n != 1 {
 		t.Errorf("%d users, want 1", n)

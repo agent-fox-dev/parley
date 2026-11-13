@@ -21,8 +21,15 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// loginRequestTimeout bounds the login's request to the hub.
+// loginRequestTimeout bounds the login's requests to the hub other than the
+// callback: GET /api/v1/user and GET /api/v1/auth/providers.
 const loginRequestTimeout = 30 * time.Second
+
+// callbackRequestTimeout bounds POST /api/v1/auth/callback. Before it answers,
+// the hub may make up to three calls to the identity provider (token, user,
+// e-mails) of up to 15 seconds each, so the 30 seconds of the other requests
+// could give up on a sign-in the hub then completes.
+const callbackRequestTimeout = 60 * time.Second
 
 // maxLoginBody bounds how much of the hub's answer, and of stdin, is read.
 const maxLoginBody = 1 << 20
@@ -76,7 +83,14 @@ func newLoginCommand(endpointURL *string, opts options) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "login",
 		Short: "Sign in to the hub and save the hub URL and the credential",
-		Args:  cobra.NoArgs,
+		// A bad flag or argument fails like a bad --expires: a usage_error
+		// envelope, not the one error line of the other commands.
+		Args: func(cmd *cobra.Command, args []string) error {
+			if err := cobra.NoArgs(cmd, args); err != nil {
+				return usageError("%v", err)
+			}
+			return nil
+		},
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			// Only the flag selects the key flow; --provider and --expires
 			// belong to the browser flow.
@@ -132,6 +146,7 @@ func newLoginCommand(endpointURL *string, opts options) *cobra.Command {
 	cmd.Flags().StringVar(&provider, "provider", "github", "identity provider of the browser login")
 	cmd.Flags().StringVar(&expires, "expires", "90", "days the browser login's API key lives: 0, 30, 60 or 90 (0: no expiry)")
 	cmd.Flags().StringVar(&apiKey, "api-key", "", "store this credential instead of signing in through the browser (- reads it from stdin)")
+	cmd.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return usageError("%v", err) })
 	return cmd
 }
 
@@ -174,7 +189,7 @@ type loginUser struct {
 
 // hubUser asks the hub at hubURL who cred belongs to, with GET /api/v1/user.
 func hubUser(ctx context.Context, hubURL, cred string) (loginUser, error) {
-	body, err := hubCall(ctx, http.MethodGet, hubURL+"/api/v1/user", cred, nil)
+	body, err := hubCall(ctx, http.MethodGet, hubURL+"/api/v1/user", cred, nil, loginRequestTimeout)
 	if err != nil {
 		return loginUser{}, err
 	}
@@ -182,10 +197,11 @@ func hubUser(ctx context.Context, hubURL, cred string) (loginUser, error) {
 }
 
 // hubCall sends a request to the hub, with cred as the bearer credential
-// unless it is empty and with body as JSON unless it is nil, and returns the
-// body of a 200 answer. A hub's error envelope comes back as a loginError
-// with the envelope's bytes; any other failure is a client_error.
-func hubCall(ctx context.Context, method, target, cred string, body []byte) ([]byte, error) {
+// unless it is empty and with body as JSON unless it is nil, waits up to
+// timeout, and returns the body of a 200 answer. A hub's error envelope comes
+// back as a loginError with the envelope's bytes; any other failure is a
+// client_error.
+func hubCall(ctx context.Context, method, target, cred string, body []byte, timeout time.Duration) ([]byte, error) {
 	var payload io.Reader
 	if body != nil {
 		payload = bytes.NewReader(body)
@@ -201,7 +217,7 @@ func hubCall(ctx context.Context, method, target, cred string, body []byte) ([]b
 		req.Header.Set("Content-Type", "application/json")
 	}
 	req.Header.Set("Accept", "application/json")
-	resp, err := (&http.Client{Timeout: loginRequestTimeout}).Do(req)
+	resp, err := (&http.Client{Timeout: timeout}).Do(req)
 	if err != nil {
 		return nil, clientError("cannot reach the hub: %v", err)
 	}
@@ -306,7 +322,7 @@ func browserLogin(ctx context.Context, hubURL, provider string, days int, opts o
 	if err != nil {
 		return "", loginUser{}, clientError("cannot encode the sign-in: %v", err)
 	}
-	body, err := hubCall(ctx, http.MethodPost, hubURL+"/api/v1/auth/callback", "", payload)
+	body, err := hubCall(ctx, http.MethodPost, hubURL+"/api/v1/auth/callback", "", payload, callbackRequestTimeout)
 	if err != nil {
 		return "", loginUser{}, err
 	}
@@ -329,7 +345,7 @@ func browserLogin(ctx context.Context, hubURL, provider string, days int, opts o
 // hubProvider returns the authorize_url of the identity provider name from
 // the hub's GET /api/v1/auth/providers, which takes no credential.
 func hubProvider(ctx context.Context, hubURL, name string) (string, error) {
-	body, err := hubCall(ctx, http.MethodGet, hubURL+"/api/v1/auth/providers", "", nil)
+	body, err := hubCall(ctx, http.MethodGet, hubURL+"/api/v1/auth/providers", "", nil, loginRequestTimeout)
 	if err != nil {
 		return "", err
 	}

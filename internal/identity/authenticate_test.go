@@ -12,26 +12,6 @@ import (
 	"github.com/agent-fox-dev/parley/internal/identity"
 )
 
-// aliceHub is a bootstrapped test hub where the user alice (role user,
-// status active) holds a live API key and a live PAT with permissions
-// [git:read], paths [docs/**] and no workspace.
-type aliceHub struct {
-	*testHub
-	alice    identity.User
-	key, pat string
-	keyRec   identity.APIKey
-	patRec   identity.PAT
-}
-
-func newAliceHub(t *testing.T) aliceHub {
-	t.Helper()
-	h := aliceHub{testHub: newTestHub(t)}
-	h.alice = h.seedUser("alice")
-	h.key, h.keyRec = h.seedKey(h.alice.ID, 90)
-	h.pat, h.patRec = h.seedPAT(identity.PATSpec{UserID: h.alice.ID, Permissions: []string{"git:read"}, Paths: []string{"docs/**"}})
-	return h
-}
-
 func TestAuthenticate_ReportsTheCallerOfEachCredentialType(t *testing.T) {
 	t.Parallel()
 	h := newAliceHub(t)
@@ -166,18 +146,6 @@ func TestAuthenticate_RefusesTheAdminTokenOnARouteThatNeedsAUser(t *testing.T) {
 	}
 	if r := h.get("/api/v1/test/whoami", "Bearer "+h.adminToken); r.status != http.StatusOK {
 		t.Errorf("admin token on a route that needs no user: %d %s, want 200", r.status, r.body)
-	}
-}
-
-// credentialKinds are the credentials that have a state of their own.
-var credentialKinds = []string{"API key", "PAT"}
-
-// checkRefusal reports when r is not the error status, error_type and
-// message given.
-func checkRefusal(t *testing.T, what string, r response, status int, errorType, message string) {
-	t.Helper()
-	if r.status != status || r.errorField("error_type") != errorType || r.errorField("message") != message {
-		t.Errorf("%s: answer = %d %s, want %d %s %q", what, r.status, r.body, status, errorType, message)
 	}
 }
 

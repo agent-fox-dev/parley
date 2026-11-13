@@ -80,88 +80,6 @@ func TestLogin_ReadsTheCredentialFromStdin(t *testing.T) {
 	}
 }
 
-func TestLogin_PrintsTheHubsErrorAndSavesNothing(t *testing.T) {
-	answers := []struct {
-		name   string
-		status int
-		body   string
-	}{
-		{"invalid credentials", 401, `{"error":{"code":401,"message":"invalid credentials","error_type":"unauthenticated"}}` + "\n"},
-		{"the admin token", 403, `{"error":{"code":403,"message":"this route needs a user","error_type":"forbidden"}}` + "\n"},
-		{"a PAT without users:read", 403, `{"error":{"code":403,"message":"the token lacks the scope users:read","error_type":"insufficient_scope"}}` + "\n"},
-	}
-	for _, a := range answers {
-		for _, existing := range []bool{false, true} {
-			t.Run(a.name+map[bool]string{false: "", true: ", existing file"}[existing], func(t *testing.T) {
-				dir := loginEnv(t)
-				path := filepath.Join(dir, "config.toml")
-				before := []byte("endpoint_url = \"http://old\"\napi_key = \"old\"\n")
-				if existing {
-					os.MkdirAll(dir, 0o700)
-					os.WriteFile(path, before, 0o600)
-				}
-				hub := newStubHub(t).answer(http.MethodGet, "/api/v1/user", a.status, a.body)
-
-				code, stdout, stderr := runCLI(t, "login", "--api-key", testAPIKey, "--endpoint-url", hub.URL)
-
-				if code != 1 {
-					t.Errorf("exit status = %d, want 1", code)
-				}
-				if stderr != a.body {
-					t.Errorf("stderr = %q, want the hub's envelope as received, %q", stderr, a.body)
-				}
-				if stdout != "" {
-					t.Errorf("stdout = %q, want it empty", stdout)
-				}
-				if !existing {
-					wantAbsent(t, path)
-				} else if got, _ := os.ReadFile(path); !bytes.Equal(got, before) {
-					t.Errorf("config file = %q, want its bytes unchanged, %q", got, before)
-				}
-			})
-		}
-	}
-}
-
-func TestLogin_FailsOnTheClientSideWhenItCannotReadAnAnswer(t *testing.T) {
-	tests := []struct {
-		name string
-		// answer is the stub's answer to GET /api/v1/user; endpoint, when
-		// set, replaces the stub's URL.
-		answer   stubAnswer
-		endpoint string
-		apiKey   string
-		stdin    string
-		want     string
-	}{
-		{name: "unreachable hub", endpoint: "http://127.0.0.1:1", apiKey: testAPIKey, want: "client_error"},
-		{name: "200 that is not JSON", answer: stubAnswer{200, "hello"}, apiKey: testAPIKey, want: "client_error"},
-		{name: "200 with a JSON array", answer: stubAnswer{200, "[]"}, apiKey: testAPIKey, want: "client_error"},
-		{name: "502 without an envelope", answer: stubAnswer{502, "<html>bad gateway</html>"}, apiKey: testAPIKey, want: "client_error"},
-		{name: "empty credential", answer: stubAnswer{200, testUser}, apiKey: "", want: "usage_error"},
-		{name: "empty stdin", answer: stubAnswer{200, testUser}, apiKey: "-", stdin: "", want: "usage_error"},
-		{name: "blank stdin", answer: stubAnswer{200, testUser}, apiKey: "-", stdin: " \n", want: "usage_error"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			dir := loginEnv(t)
-			hub := newStubHub(t).answer(http.MethodGet, "/api/v1/user", tt.answer.status, tt.answer.body)
-			endpoint := hub.URL
-			if tt.endpoint != "" {
-				endpoint = tt.endpoint
-			}
-
-			code, stdout, stderr := runWithStdin(t, tt.stdin, "login", "--api-key", tt.apiKey, "--endpoint-url", endpoint)
-
-			wantClientFailure(t, code, stdout, stderr, tt.want)
-			wantAbsent(t, dir)
-			if n := len(hub.recorded()); tt.want == "usage_error" && n != 0 {
-				t.Errorf("the hub got %d requests, want none", n)
-			}
-		})
-	}
-}
-
 func TestLogin_TakesTheHubURLFromTheFlagTheEnvironmentOrTheFile(t *testing.T) {
 	tests := []struct {
 		name string
@@ -200,24 +118,6 @@ func TestLogin_TakesTheHubURLFromTheFlagTheEnvironmentOrTheFile(t *testing.T) {
 					t.Errorf("hub %s got %v, want one request to /api/v1/user", name, reqs)
 				}
 			}
-		})
-	}
-}
-
-func TestLogin_FailsWithoutAHubURL(t *testing.T) {
-	for _, args := range [][]string{{"login"}, {"login", "--api-key", testAPIKey}} {
-		t.Run(strings.Join(args, " "), func(t *testing.T) {
-			dir := loginEnv(t)
-
-			code, stdout, stderr := runCLI(t, args...)
-
-			message := wantClientFailure(t, code, stdout, stderr, "client_error")
-			for _, name := range []string{"--endpoint-url", "PARLEY_ENDPOINT_URL", "endpoint_url"} {
-				if !strings.Contains(message, name) {
-					t.Errorf("message %q does not name %s", message, name)
-				}
-			}
-			wantAbsent(t, dir)
 		})
 	}
 }
@@ -428,81 +328,130 @@ func TestLogin_GivesUpWhenNoRedirectArrives(t *testing.T) {
 	wantAbsent(t, dir)
 }
 
-func TestLogin_PrintsTheHubsErrorOfABrowserLoginAndSavesNothing(t *testing.T) {
+// keyLogin is the arguments of a login with a credential; a login without
+// them signs in through the browser.
+var keyLogin = []string{"--api-key", testAPIKey}
+
+// hubURLSources are the three places a login takes the hub URL from.
+var hubURLSources = []string{"--endpoint-url", "PARLEY_ENDPOINT_URL", "endpoint_url"}
+
+func TestLogin_PrintsTheHubsErrorAsReceivedAndSavesNothing(t *testing.T) {
 	envelope := func(code int, message, errorType string) string {
 		return fmt.Sprintf(`{"error":{"code":%d,"message":%q,"error_type":%q}}`, code, message, errorType) + "\n"
 	}
 	tests := []struct {
-		name, path string
-		status     int
-		body       string
+		name string
+		// args follow "login --endpoint-url <hub>"; the hub answers method
+		// and path with status and body.
+		args         []string
+		method, path string
+		status       int
+		body         string
 	}{
-		{"providers rate limited", "/api/v1/auth/providers", 429, envelope(429, "too many requests", "rate_limited")},
-		{"callback invalid", "/api/v1/auth/callback", 400, envelope(400, "redirect_uri is not allowed", "invalid_request")},
-		{"callback rejected", "/api/v1/auth/callback", 401, envelope(401, "the identity provider rejected the code", "unauthenticated")},
-		{"callback blocked", "/api/v1/auth/callback", 403, envelope(403, "user is blocked", "forbidden")},
-		{"callback conflict", "/api/v1/auth/callback", 409, envelope(409, "the e-mail belongs to another user", "conflict")},
-		{"callback upstream", "/api/v1/auth/callback", 502, envelope(502, "the identity provider failed", "upstream_error")},
+		{"invalid credentials", keyLogin, http.MethodGet, "/api/v1/user", 401, envelope(401, "invalid credentials", "unauthenticated")},
+		{"the admin token", keyLogin, http.MethodGet, "/api/v1/user", 403, envelope(403, "this route needs a user", "forbidden")},
+		{"a PAT without users:read", keyLogin, http.MethodGet, "/api/v1/user", 403, envelope(403, "the token lacks the scope users:read", "insufficient_scope")},
+		{"providers rate limited", nil, http.MethodGet, "/api/v1/auth/providers", 429, envelope(429, "too many requests", "rate_limited")},
+		{"callback invalid", nil, http.MethodPost, "/api/v1/auth/callback", 400, envelope(400, "redirect_uri is not allowed", "invalid_request")},
+		{"callback rejected", nil, http.MethodPost, "/api/v1/auth/callback", 401, envelope(401, "the identity provider rejected the code", "unauthenticated")},
+		{"callback blocked", nil, http.MethodPost, "/api/v1/auth/callback", 403, envelope(403, "user is blocked", "forbidden")},
+		{"callback conflict", nil, http.MethodPost, "/api/v1/auth/callback", 409, envelope(409, "the e-mail belongs to another user", "conflict")},
+		{"callback upstream", nil, http.MethodPost, "/api/v1/auth/callback", 502, envelope(502, "the identity provider failed", "upstream_error")},
 	}
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			dir := loginEnv(t)
-			method := map[bool]string{true: http.MethodGet, false: http.MethodPost}[strings.HasSuffix(tt.path, "providers")]
-			hub := browserHub(t).answer(method, tt.path, tt.status, tt.body)
-			b := &fakeBrowser{query: approve}
+		for _, existing := range []bool{false, true} {
+			t.Run(tt.name+map[bool]string{false: "", true: ", existing file"}[existing], func(t *testing.T) {
+				dir := loginEnv(t)
+				path := filepath.Join(dir, "config.toml")
+				before := []byte("endpoint_url = \"http://old\"\napi_key = \"old\"\n")
+				if existing {
+					os.MkdirAll(dir, 0o700)
+					os.WriteFile(path, before, 0o600)
+				}
+				hub := browserHub(t).answer(tt.method, tt.path, tt.status, tt.body)
+				b := &fakeBrowser{query: approve}
 
-			code, stdout, stderr := runLogin(t, b, testWait, "--endpoint-url", hub.URL)
+				code, stdout, stderr := runLogin(t, b, testWait, append([]string{"--endpoint-url", hub.URL}, tt.args...)...)
 
-			if code != 1 {
-				t.Errorf("exit status = %d, want 1", code)
-			}
-			if !strings.HasSuffix(stderr, tt.body) {
-				t.Errorf("stderr = %q, want it to end with the hub's envelope as received, %q", stderr, tt.body)
-			}
-			if stdout != "" {
-				t.Errorf("stdout = %q, want it empty", stdout)
-			}
-			wantAbsent(t, dir)
-			if method == http.MethodGet && len(b.urls) != 0 {
-				t.Errorf("the opener was called %d times, want none", len(b.urls))
-			}
-		})
+				if code != 1 {
+					t.Errorf("exit status = %d, want 1", code)
+				}
+				if stderr != tt.body {
+					t.Errorf("stderr = %q, want the hub's envelope as received, %q", stderr, tt.body)
+				}
+				if stdout != "" {
+					t.Errorf("stdout = %q, want it empty", stdout)
+				}
+				if !existing {
+					wantAbsent(t, dir)
+				} else if got, _ := os.ReadFile(path); !bytes.Equal(got, before) {
+					t.Errorf("config file = %q, want its bytes unchanged, %q", got, before)
+				}
+				if tt.path != "/api/v1/auth/callback" && len(b.urls) != 0 {
+					t.Errorf("the opener was called %d times, want none", len(b.urls))
+				}
+			})
+		}
 	}
 }
 
-func TestLogin_FailsBeforeOpeningTheBrowser(t *testing.T) {
+func TestLogin_ReportsAFailureOnTheClientSideAndSavesNothing(t *testing.T) {
 	tests := []struct {
-		name     string
+		name string
+		// args follow "login --endpoint-url <endpoint>", or "login" alone
+		// with noHubURL; endpoint, when set, replaces the stub's URL.
+		args     []string
 		endpoint string
-		// providers, when set, replaces the stub's provider list answer.
-		providers *stubAnswer
-		args      []string
-		want      string
-		// mentions is a text the message must hold.
-		mentions string
+		noHubURL bool
+		// answer, when set, replaces the stub's answer to GET path.
+		path   string
+		answer *stubAnswer
+		stdin  string
+		want   string
+		// mentions are texts the message must hold.
+		mentions []string
 	}{
-		{name: "unreachable hub", endpoint: "http://127.0.0.1:1", want: "client_error"},
-		{name: "provider list not JSON", providers: &stubAnswer{200, "hello"}, want: "client_error"},
-		{name: "provider not listed", args: []string{"--provider", "google"}, want: "client_error", mentions: "github"},
-		{name: "no provider listed", providers: &stubAnswer{200, providersAnswer()}, want: "client_error"},
+		{name: "key: no hub URL", args: keyLogin, noHubURL: true, want: "client_error", mentions: hubURLSources},
+		{name: "browser: no hub URL", noHubURL: true, want: "client_error", mentions: hubURLSources},
+		{name: "key: unreachable hub", args: keyLogin, endpoint: "http://127.0.0.1:1", want: "client_error"},
+		{name: "browser: unreachable hub", endpoint: "http://127.0.0.1:1", want: "client_error"},
+		{name: "key: user not JSON", args: keyLogin, path: "/api/v1/user", answer: &stubAnswer{200, "hello"}, want: "client_error"},
+		{name: "browser: provider list not JSON", path: "/api/v1/auth/providers", answer: &stubAnswer{200, "hello"}, want: "client_error"},
+		{name: "key: user a JSON array", args: keyLogin, path: "/api/v1/user", answer: &stubAnswer{200, "[]"}, want: "client_error"},
+		{name: "key: 502 without an envelope", args: keyLogin, path: "/api/v1/user", answer: &stubAnswer{502, "<html>bad gateway</html>"}, want: "client_error"},
+		{name: "browser: provider not listed", args: []string{"--provider", "google"}, want: "client_error", mentions: []string{"github"}},
+		{name: "browser: no provider listed", path: "/api/v1/auth/providers", answer: &stubAnswer{200, providersAnswer()}, want: "client_error"},
+		{name: "empty credential", args: []string{"--api-key", ""}, want: "usage_error"},
+		{name: "empty stdin", args: []string{"--api-key", "-"}, stdin: "", want: "usage_error"},
+		{name: "blank stdin", args: []string{"--api-key", "-"}, stdin: " \n", want: "usage_error"},
 		{name: "--expires 45", args: []string{"--expires", "45"}, want: "usage_error"},
 		{name: "--expires x", args: []string{"--expires", "x"}, want: "usage_error"},
+		{name: "unknown flag", args: []string{"--nope"}, want: "usage_error"},
+		{name: "extra argument", args: []string{"extra"}, want: "usage_error"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			dir := loginEnv(t)
-			hub := browserHub(t)
-			if tt.providers != nil {
-				hub.answer(http.MethodGet, "/api/v1/auth/providers", tt.providers.status, tt.providers.body)
+			hub := browserHub(t).answer(http.MethodGet, "/api/v1/user", http.StatusOK, testUser)
+			if tt.answer != nil {
+				hub.answer(http.MethodGet, tt.path, tt.answer.status, tt.answer.body)
 			}
-			endpoint := cmp.Or(tt.endpoint, hub.URL)
 			b := &fakeBrowser{query: approve}
+			opts := defaultOptions()
+			opts.stdin, opts.openBrowser, opts.loginWait = strings.NewReader(tt.stdin), b.open, testWait
 
-			code, stdout, stderr := runLogin(t, b, testWait, append([]string{"--endpoint-url", endpoint}, tt.args...)...)
+			args := []string{"login"}
+			if !tt.noHubURL {
+				args = append(args, "--endpoint-url", cmp.Or(tt.endpoint, hub.URL))
+			}
+
+			code, stdout, stderr := runCLIWith(t, opts, append(args, tt.args...)...)
 
 			message := wantClientFailure(t, code, stdout, stderr, tt.want)
-			if !strings.Contains(message, tt.mentions) {
-				t.Errorf("message %q does not name %q", message, tt.mentions)
+			for _, name := range tt.mentions {
+				if !strings.Contains(message, name) {
+					t.Errorf("message %q does not name %s", message, name)
+				}
 			}
 			if len(b.urls) != 0 {
 				t.Errorf("the opener was called %d times, want none", len(b.urls))

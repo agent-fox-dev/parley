@@ -2,7 +2,6 @@ package identity_test
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"maps"
 	"net/http"
@@ -11,77 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agent-fox-dev/parley/internal/config"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/server/timefmt"
 )
-
-// loginBody is a callback body the provider stub accepts.
-var loginBody = map[string]any{"provider": "github", "code": "c", "redirect_uri": "http://127.0.0.1:5000/callback"}
-
-// newLoginHub is a test hub with github configured whose provider answers
-// the identity id.
-func newLoginHub(t *testing.T, id identity.Identity, opts ...hubOption) *testHub {
-	t.Helper()
-	opts = append(opts, withProviders(config.Provider{Name: "github", ClientID: "gh-id", ClientSecret: "gh-secret"}))
-	h := newTestHub(t, opts...)
-	h.provider.set(id, nil)
-	return h
-}
-
-// records counts the users, orgs, memberships, API keys and revoked API
-// keys in the hub's store, to show that a refused login changed nothing.
-func (h *testHub) records() []int {
-	h.t.Helper()
-	var out []int
-	for _, q := range []string{`users`, `orgs`, `memberships`, `api_keys`, `api_keys WHERE revoked_at IS NOT NULL`} {
-		out = append(out, h.count(`SELECT count(*) FROM `+q))
-	}
-	return out
-}
-
-// newOAuthHub is a test hub whose real provider client reads identities from
-// a fake provider configured as the providers names (github when none); its
-// user URL answers alice, with the github id 123 and the e-mail a@x.
-func newOAuthHub(t *testing.T, timeout time.Duration, names []string, opts ...hubOption) (*testHub, *fakeProvider) {
-	t.Helper()
-	f := newFakeProvider(t)
-	f.answer(fakeUserPath, http.StatusOK, map[string]any{"id": 123, "login": "alice", "email": "a@x"})
-	if len(names) == 0 {
-		names = []string{"github"}
-	}
-	return newTestHub(t, append(opts, withOAuth(f, timeout, names...))...), f
-}
-
-// newIdentity is a github identity no user has.
-func newIdentity(username, email string) identity.Identity {
-	return identity.Identity{Provider: "github", ProviderID: "123", Username: username, FullName: "Alice A", Email: email}
-}
-
-// orgOf returns the name, slug, status and member ids of the org owned by
-// userID.
-func (h *testHub) orgOf(userID string) (name, slug, status string, members []string) {
-	h.t.Helper()
-	ctx, db := context.Background(), h.st.Main()
-	var id string
-	err := db.QueryRowContext(ctx, `SELECT id, name, slug, status FROM orgs WHERE owner_id = ?`, userID).Scan(&id, &name, &slug, &status)
-	if err != nil {
-		h.t.Fatalf("read the org of %s: %v", userID, err)
-	}
-	rows, err := db.QueryContext(ctx, `SELECT user_id FROM memberships WHERE org_id = ?`, id)
-	if err != nil {
-		h.t.Fatalf("read the members of %s: %v", id, err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var m string
-		if err := rows.Scan(&m); err != nil {
-			h.t.Fatalf("read a member of %s: %v", id, err)
-		}
-		members = append(members, m)
-	}
-	return name, slug, status, members
-}
 
 func TestCallback_CreatesTheUserThePersonalOrgAndAKeyAtAFirstLogin(t *testing.T) {
 	t.Parallel()
@@ -121,8 +52,10 @@ func TestCallback_CreatesTheUserThePersonalOrgAndAKeyAtAFirstLogin(t *testing.T)
 			if want := timefmt.Format(h.now().Add(90 * 24 * time.Hour)); key["expires_at"] != want {
 				t.Errorf("api_key.expires_at = %v, want %s", key["expires_at"], want)
 			}
-			if n := h.count(`SELECT count(*) FROM orgs`); n != 1 {
-				t.Errorf("%d orgs, want 1", n)
+			for _, table := range []string{"users", "orgs", "memberships"} {
+				if n := h.count(`SELECT count(*) FROM ` + table); n != 1 {
+					t.Errorf("%d %s, want 1", n, table)
+				}
 			}
 			name, slug, status, members := h.orgOf(userID)
 			if name != tc.username || slug != tc.slug || status != "active" || !slices.Equal(members, []string{userID}) {
@@ -262,31 +195,6 @@ func TestCallback_RefusesAFirstLoginThatBreaksUniquenessAndCreatesNothing(t *tes
 			}
 		})
 	}
-}
-
-// seedAlice stores alice as an earlier login left her: the github identity
-// 123, the e-mail a@x, the role admin and the full name Custom, with her
-// personal org and no key.
-func (h *testHub) seedAlice() identity.User {
-	h.t.Helper()
-	var u identity.User
-	h.tx(func(tx *sql.Tx) (err error) {
-		u, _, err = identity.CreateUserAndPersonalOrg(context.Background(), tx, identity.NewUser{
-			Username: "alice", Email: "a@x", FullName: "Custom", Provider: "github", ProviderID: "123", CreatedAt: h.now(),
-		}, identity.RoleAdmin)
-		return err
-	})
-	return u
-}
-
-// storedUser reads the user userID from the hub's store.
-func (h *testHub) storedUser(userID string) identity.User {
-	h.t.Helper()
-	u, err := identity.UserByID(context.Background(), h.st.Main(), userID)
-	if err != nil {
-		h.t.Fatalf("read user %s: %v", userID, err)
-	}
-	return u
 }
 
 func TestCallback_RefreshesAnExistingUserAndKeepsTheRest(t *testing.T) {
