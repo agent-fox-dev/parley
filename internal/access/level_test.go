@@ -179,3 +179,27 @@ func TestLevel_AFailedReadIsAnErrorWithLevelNone(t *testing.T) {
 		}
 	}
 }
+
+func TestCanWrite_AnswersYesExactlyForAnOwnerOfTheWorkspace(t *testing.T) {
+	t.Parallel()
+	st, svc := levelWorld(t)
+	for _, c := range []struct {
+		user, slug string
+		want       bool
+	}{
+		{"u-owner", "acme", true},
+		{"u-member", "acme", false},
+		{"u-stranger", "acme", false},
+		{"u-member", "acme--m", true},
+		{"u-owner", "acme--m", true},
+		{"u-owner", "nope", false},
+	} {
+		if got, err := svc.CanWrite(context.Background(), c.user, c.slug); got != c.want || err != nil {
+			t.Errorf("CanWrite(%s, %s) = %t, %v, want %t and no error", c.user, c.slug, got, err, c.want)
+		}
+	}
+	failing := newService(failingRecords{access.StoreRecords(st.Main()), []string{"acme"}}, memberships{})
+	if got, err := failing.CanWrite(context.Background(), "u-owner", "acme"); got || !errors.Is(err, errRead) {
+		t.Errorf("CanWrite with a failed read = %t, %v, want false and the read's error", got, err)
+	}
+}

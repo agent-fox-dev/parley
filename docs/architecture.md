@@ -1266,6 +1266,23 @@ parameter, and an error from `Decide` are returned as plain errors, which
 the pipeline logs and answers `500 internal` with `internal error`. No
 route declares the mark yet.
 
+The check never reads the request's method: a route that needs `read`
+grants a member with `POST`, `PATCH`, `PUT` or `DELETE` exactly as with
+`GET`, because a member's own contributions (forks, changes, verdicts,
+claims) change state on routes that need `read`, and those routes check
+their own conditions. The decision `access.DecisionOf(r)` returns holds the
+caller's level and all six fields of the record as read while deciding, so
+such a condition (the fork's owner, its parent, its kind) needs no second
+lookup.
+
+`(*Service).CanWrite(ctx, userID, slug)` answers whether a named user, who
+need not be the caller, has write access to a workspace: `true` exactly
+when that user's level on it, resolved by `Level` as for a caller with that
+`UserID`, is `LevelOwner`; `false` for `LevelMember`, `LevelNone` and a slug
+with no record; `false` and the error when a read fails. No production code
+calls it yet; the routes whose conditions ask about another user, such as a
+change's author, will.
+
 ### The logger
 
 `hub.NewLogger(w, level, scrubber)` returns a `*slog.Logger` with

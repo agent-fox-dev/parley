@@ -2,6 +2,7 @@ package access_test
 
 import (
 	"bytes"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -172,6 +173,35 @@ func TestCheck_AnswersAnInvisibleWorkspaceByteForByteAsOneThatDoesNotExist(t *te
 	for _, caller := range []string{"u-stranger", "u-owner"} {
 		for _, slug := range []string{"ACME", "a--b--c", strings.Repeat("a", 300), "%2e%2e"} {
 			same(caller, slug)
+		}
+	}
+}
+
+func TestCheck_GrantsAMemberAReadRouteWithAnyMethodAndGivesTheHandlerTheRecordAsStored(t *testing.T) {
+	t.Parallel()
+	st := openStore(t, t.TempDir())
+	stored := map[string]access.Record{
+		"acme":    repo("acme", "u-owner", "o1", access.StatusReady),
+		"acme--m": fork("acme--m", "u-member", "o1", "acme"),
+	}
+	seed(t, st, stored["acme"], stored["acme--m"])
+	p := newProbe(newService(access.StoreRecords(st.Main()), memberships{of: map[string][]string{"u-member": {"o1"}}, active: []string{"o1"}}))
+	methods := []string{http.MethodPost, http.MethodPatch, http.MethodPut, http.MethodDelete, http.MethodGet}
+	for _, method := range methods {
+		p.routeFor(method, "/workspaces/:slug/contrib", "read")
+	}
+
+	// A member's own contributions change state on routes that need read:
+	// the method decides nothing, and the handler reads the facts its own
+	// condition needs from the decision.
+	for slug, want := range map[string]access.Level{"acme": access.LevelMember, "acme--m": access.LevelOwner} {
+		for _, method := range methods {
+			before := p.calls.Load()
+			a := p.call(method, "u-member", "/workspaces/"+slug+"/contrib")
+			e := decode(t, a)
+			if a.status != 200 || e.Level != want || e.Record != stored[slug] || p.calls.Load() != before+1 {
+				t.Errorf("u-member %s %s = %d %s, want 200 with level %q and the record %+v, handler run once", method, slug, a.status, a.body, want, stored[slug])
+			}
 		}
 	}
 }

@@ -142,8 +142,13 @@ func newProbe(svc *access.Service) *probe {
 
 // route registers a probe route GET pattern that declares need.
 func (p *probe) route(pattern, need string) {
+	p.routeFor(http.MethodGet, pattern, need)
+}
+
+// routeFor registers a probe route method pattern that declares need.
+func (p *probe) routeFor(method, pattern, need string) {
 	p.srv.Register(server.Route{
-		Method: http.MethodGet, Pattern: pattern, Marks: map[string]string{access.MarkNeed: need},
+		Method: method, Pattern: pattern, Marks: map[string]string{access.MarkNeed: need},
 		Handler: func(w http.ResponseWriter, r *http.Request) error {
 			p.calls.Add(1)
 			d, ok := access.DecisionOf(r)
@@ -163,9 +168,15 @@ type answer struct {
 	body        []byte
 }
 
-// get calls path, under /api/v1, as caller ("" for none).
+// get calls GET path, under /api/v1, as caller ("" for none).
 func (p *probe) get(caller, path string) answer {
-	r := httptest.NewRequest(http.MethodGet, "/api/v1"+path, nil)
+	return p.call(http.MethodGet, caller, path)
+}
+
+// call calls method path, under /api/v1, as caller ("" for none), without
+// a body.
+func (p *probe) call(method, caller, path string) answer {
+	r := httptest.NewRequest(method, "/api/v1"+path, nil)
 	if caller != "" {
 		r.Header.Set("X-Caller", caller)
 	}

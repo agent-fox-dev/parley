@@ -37,6 +37,11 @@ type decisionKey struct{}
 // read are errors, which the pipeline answers 500 internal without their
 // text. Routes without the mark it lets through.
 //
+// The request's method plays no part: a route that needs read grants a
+// member with POST, PATCH, PUT or DELETE as with GET, because a member's own
+// contributions (forks, changes, verdicts, claims) change state on routes
+// that need read, and those routes check their own conditions.
+//
 // It runs in the access position, after the scope check and before the
 // idempotency stage, so that a replayed create is authorised too.
 func (s *Service) Check(r *http.Request) error {
@@ -72,8 +77,10 @@ func (s *Service) Check(r *http.Request) error {
 }
 
 // DecisionOf returns the decision that granted the request r access to its
-// workspace. It reports false on a route that declares no need, and before
-// the access check has run.
+// workspace: the caller's level and the workspace's record as read while
+// deciding, so that a route's own condition (the fork's owner, its parent,
+// its kind) reads them without a second lookup. It reports false on a route
+// that declares no need, and before the access check has run.
 func DecisionOf(r *http.Request) (Decision, bool) {
 	v, _ := server.Attached(r, decisionKey{})
 	d, ok := v.(Decision)

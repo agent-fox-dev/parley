@@ -138,3 +138,17 @@ func (s *Service) levelOnFork(ctx context.Context, userID string, rec Record) (L
 	}
 	return LevelMember, nil
 }
+
+// CanWrite reports whether the user userID, who need not be the caller of
+// the request at hand, has write access to the workspace slug: exactly when
+// their level on it is owner. A member, a user with no level and a slug with
+// no record are no. The routes whose conditions ask about someone other than
+// the caller, such as the author of a change, use it. A failed read is false
+// with the error.
+func (s *Service) CanWrite(ctx context.Context, userID, slug string) (bool, error) {
+	level, _, _, err := s.Level(ctx, Caller{UserID: userID}, slug)
+	if err != nil {
+		return false, err
+	}
+	return level == LevelOwner, nil
+}
