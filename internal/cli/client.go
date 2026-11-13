@@ -20,6 +20,12 @@ const apiPrefix = "/api/v1"
 // another. Runs take it from options.requestTimeout, which tests shorten.
 const defaultRequestTimeout = 30 * time.Second
 
+// maxAnswerSize bounds the answer send reads, in bytes. A JSON document of
+// the hub's REST API is far smaller; a URL that points elsewhere could
+// stream without end, and the CLI would hold all of it in memory until the
+// request timed out.
+const maxAnswerSize = 8 << 20
+
 // client sends a command's requests to the hub. Every command that calls
 // the hub sends through it, so every request reaches the hub alike: once,
 // within its timeout, and with every failure a client_error.
@@ -82,6 +88,10 @@ type apiRequest struct {
 	body any
 	// timeout, when not zero, replaces the client's for this request.
 	timeout time.Duration
+	// maxAnswer, when not zero, bounds the answer's body in bytes: a larger
+	// one is a client_error naming the status, reported as soon as the
+	// bound is passed.
+	maxAnswer int64
 }
 
 // response is the hub's answer to one request: its status and its whole
@@ -101,8 +111,9 @@ func (c *client) request(ctx context.Context, method, path string, query url.Val
 // body is empty or JSON. An error envelope the hub answered is a hubError.
 // Any other answer is a client_error naming the status, because it did not
 // come from the hub's REST API (a proxy, a wrong URL), and so is every
-// failure raw reports.
+// failure raw reports and an answer larger than maxAnswerSize.
 func (c *client) send(ctx context.Context, r apiRequest) (*response, error) {
+	r.maxAnswer = maxAnswerSize
 	resp, err := c.raw(ctx, r)
 	if err != nil {
 		return nil, err
@@ -125,7 +136,9 @@ func (c *client) send(ctx context.Context, r apiRequest) (*response, error) {
 // body hold, for a command whose output is not one JSON document. Failing
 // to connect (refused, a host name that does not resolve, a TLS handshake)
 // is a client_error naming the hub URL, and so is an answer not read whole
-// within the timeout.
+// within the timeout, or larger than r.maxAnswer when it states one. Without
+// a bound the answer is read whole, as large as it is: a command whose
+// output is not one JSON document, a download say, decides its own.
 func (c *client) raw(ctx context.Context, r apiRequest) (*response, error) {
 	target := c.hubURL + r.path
 	if !r.outsideAPI {
@@ -168,9 +181,16 @@ func (c *client) raw(ctx context.Context, r apiRequest) (*response, error) {
 	defer resp.Body.Close()
 	// The timeout runs on while the body is read, so a hub that stalls in
 	// the middle of its answer is abandoned too.
-	answer, err := io.ReadAll(resp.Body)
+	body := io.Reader(resp.Body)
+	if r.maxAnswer > 0 {
+		body = io.LimitReader(resp.Body, r.maxAnswer+1)
+	}
+	answer, err := io.ReadAll(body)
 	if err != nil {
 		return nil, c.failure(ctx, reqCtx, timeout, "cannot read the answer of", err)
+	}
+	if r.maxAnswer > 0 && int64(len(answer)) > r.maxAnswer {
+		return nil, clientError("the hub answered %d with a body larger than %d bytes", resp.StatusCode, r.maxAnswer)
 	}
 	return &response{status: resp.StatusCode, body: answer}, nil
 }
