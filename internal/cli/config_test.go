@@ -255,8 +255,18 @@ func TestSaveConfig_ReplacesTheFileAndKeepsTheKeysItDoesNotKnow(t *testing.T) {
 }
 
 func TestSaveConfig_FailsAndLeavesWhatWasThere(t *testing.T) {
+	// A umask without the owner's write bit makes the save create a
+	// directory it cannot write into, so it fails after creating it.
+	readOnlyNewDirs := func(t *testing.T, dir, path string) {
+		if os.Geteuid() == 0 {
+			t.Skip("root writes into a read-only directory")
+		}
+		old := syscall.Umask(0o277)
+		t.Cleanup(func() { syscall.Umask(old) })
+	}
 	for _, tc := range []struct {
 		name   string
+		sub    string // the config directory, within the test's directory
 		noHome bool
 		setup  func(t *testing.T, dir, path string)
 	}{
@@ -276,11 +286,13 @@ func TestSaveConfig_FailsAndLeavesWhatWasThere(t *testing.T) {
 			writeFile("not = [toml")(t, path)
 		}},
 		{name: "no home directory", noHome: true},
+		{name: "a new directory it cannot write into", sub: "new", setup: readOnlyNewDirs},
+		{name: "a new directory it cannot create within a new one", sub: filepath.Join("new", "dir"), setup: readOnlyNewDirs},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
-			path := filepath.Join(dir, "config.toml")
-			t.Setenv("PARLEY_CONFIG_DIR", dir)
+			path := filepath.Join(dir, tc.sub, "config.toml")
+			t.Setenv("PARLEY_CONFIG_DIR", filepath.Join(dir, tc.sub))
 			if tc.noHome {
 				unsetEnv(t, "PARLEY_CONFIG_DIR")
 				unsetEnv(t, "HOME")
