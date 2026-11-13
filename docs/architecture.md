@@ -14,6 +14,7 @@ command-line client. Both are written in Go, in the module
 | `internal/buildinfo` | the version, commit and build time the binary was built with, shared by both programs |
 | `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra` |
 | `internal/scrub` | the one scrubbing function for text that leaves the hub: `Scrubber.Scrub` replaces registered secret values and the hub's own credential formats by `[redacted]`, removes user information from URLs and cuts the text to 1024 bytes; a leaf package that imports nothing of the project |
+| `internal/store` | the hub's two embedded SQLite stores (`modernc.org/sqlite`, no cgo): `Open` creates the data directory and the workspace root, opens the transactional store and the analytical store (`analytics.db` beside it) and applies the registered schema steps; `Tx` runs a transaction of the transactional store |
 | `internal/server` | the hub's HTTP server: its built-in routes, the REST API's route registration and check pipeline, the error envelope, request ids, response headers and the access log, list paging, idempotency keys, and the readiness probes |
 | `internal/server/timefmt` | the one timestamp format (`Format`, and the response member type `Time`) and the one duration grammar (`ParseDuration`); a leaf package that imports nothing of the project, so that the configuration loader can use it as well as the REST API |
 | `test/e2e` | tests that build the binaries and run them |
@@ -337,6 +338,48 @@ until `ctx` is cancelled. Then it stops in this order:
    wait for those handlers to return.
 
 `Serve` returns `nil` after a stop, whether or not the grace passed.
+
+## The stores
+
+`store.Open(ctx, store.Options{DatabasePath, WorkspaceRoot}, steps)` returns a
+`*store.Store`. It:
+
+1. refuses a step list with a step without a name or a function, with an
+   unknown target, or with a name given twice, before it creates anything;
+2. creates the data directory (the directory of `DatabasePath`) and
+   `WorkspaceRoot`, with missing parents, with mode 0700; a directory that
+   exists keeps its mode;
+3. refuses a store file that exists, is not empty and does not begin with
+   SQLite's header, by reading it only, so the file keeps its bytes; both files
+   are looked at before either is opened;
+4. opens the transactional store at `DatabasePath` and the analytical store at
+   `store.AnalyticsFile` (`analytics.db`) in the same directory, each with
+   `busy_timeout` 10000 ms, `journal_mode` WAL, `foreign_keys` on and
+   `_txlock=immediate` (every transaction takes the write lock when it
+   begins);
+5. applies, in registration order, every step its target store (`store.Main`
+   or `store.Analytics`) has not recorded in its `schema_steps` table, each in
+   one transaction together with its record. A step that returns an error or
+   panics is rolled back, no later step runs, and `Open` fails with an error
+   naming the step; the steps before it stay applied and are skipped on the
+   next open.
+
+Every failure returns no store and an error naming the path or the step.
+
+A `store.Step` is `{Name, Target, Apply func(ctx, *sql.Tx) error}`. Its name
+is what the store records, so a step is never renamed.
+
+`(*Store).Tx(ctx, fn)` runs `fn` in a transaction of the transactional store:
+it commits when `fn` returns nil, and rolls back when `fn` returns an error
+(returned as it is) or panics (returned as an error carrying the panic value).
+Transactions of `Tx` take one token in turn, so the process's writers wait for
+each other in memory and never fail with "database is locked"; `fn` must not
+call `Tx` again. `Main()` and `Analytics()` return the two `*sql.DB` handles:
+the first for reading, the second for the packages that read and write the
+analytical store directly. `Ping` returns nil when both stores answer
+`SELECT 1`, and an error naming the store that did not. `Close` closes both;
+a second `Close` returns nil, and `Tx` and `Ping` return `store.ErrClosed`
+after it.
 
 ## parleyd
 
