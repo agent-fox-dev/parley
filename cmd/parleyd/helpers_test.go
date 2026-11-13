@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -108,4 +109,18 @@ func (r *running) exitCode(t *testing.T, within time.Duration) int {
 		t.Fatalf("run did not return within %v", within)
 		return -1
 	}
+}
+
+// getJSON sends GET url, decodes its JSON body into v and returns the status.
+func getJSON(t *testing.T, url string, v any) int {
+	t.Helper()
+	res, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("GET %s: %v", url, err)
+	}
+	defer res.Body.Close()
+	if err := json.NewDecoder(res.Body).Decode(v); err != nil {
+		t.Fatalf("GET %s: body is not JSON: %v", url, err)
+	}
+	return res.StatusCode
 }

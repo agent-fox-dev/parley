@@ -3,14 +3,19 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
 	"os"
+	"reflect"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/agent-fox-dev/parley/internal/cli"
 )
 
 func TestRun_ListensAndLogsTheBoundAddress(t *testing.T) {
@@ -170,5 +175,52 @@ func TestRun_ExitsZeroWhenTheGraceExpires(t *testing.T) {
 	}
 	if got, err := io.ReadAll(conn); len(got) != 0 || err != nil {
 		t.Errorf("unfinished request read %q (error %v), want its connection closed with no response", got, err)
+	}
+}
+
+// An operator starts the hub, a developer reads its version with the real
+// client, and the operator stops the hub with SIGTERM. The test signals its
+// own process, so it must not run in parallel; see TestRun_StopsOnASignal.
+func TestRun_ServesTheClientUntilStopped(t *testing.T) {
+	t.Setenv("PARLEY_ENDPOINT_URL", "")
+	os.Unsetenv("PARLEY_ENDPOINT_URL")
+	r := startRun(t, time.Second)
+	hub := "http://" + r.addr
+
+	for path, want := range map[string]string{"/healthz": "ok", "/readyz": "ready"} {
+		var doc struct{ Status string }
+		if status := getJSON(t, hub+path, &doc); status != http.StatusOK || doc.Status != want {
+			t.Errorf("GET %s = %d %q, want 200 %q", path, status, doc.Status, want)
+		}
+	}
+	var served map[string]any
+	if status := getJSON(t, hub+"/version", &served); status != http.StatusOK {
+		t.Fatalf("GET /version status = %d, want 200", status)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := cli.Run(context.Background(), []string{"version", "--endpoint-url", hub}, &stdout, &stderr); code != 0 {
+		t.Errorf("parley version returned %d, want 0; stderr = %q", code, stderr.String())
+	}
+	var printed struct{ Server map[string]any }
+	if err := json.Unmarshal(stdout.Bytes(), &printed); err != nil {
+		t.Fatalf("parley version printed %q, not a JSON document: %v", stdout.String(), err)
+	}
+	if !reflect.DeepEqual(printed.Server, served) {
+		t.Errorf("parley version printed server %v, want the hub's answer %v", printed.Server, served)
+	}
+	if printed.Server["go_version"] != runtime.Version() {
+		t.Errorf("server go_version = %v, want %s", printed.Server["go_version"], runtime.Version())
+	}
+
+	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatalf("send SIGTERM: %v", err)
+	}
+	if code := r.exitCode(t, time.Second); code != 0 {
+		t.Errorf("run returned %d after SIGTERM, want 0", code)
+	}
+	if conn, err := net.Dial("tcp", r.addr); err == nil {
+		conn.Close()
+		t.Errorf("a connection to %s was accepted after run returned", r.addr)
 	}
 }
