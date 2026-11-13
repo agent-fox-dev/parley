@@ -3,101 +3,41 @@ package e2e
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"maps"
-	"os"
-	"path/filepath"
 	"slices"
 	"testing"
-	"time"
 
 	"github.com/agent-fox-dev/parley/internal/cli"
-	"github.com/agent-fox-dev/parley/internal/config"
-	"github.com/agent-fox-dev/parley/internal/hub"
+	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/identity"
-	"github.com/agent-fox-dev/parley/internal/store"
 )
 
 // The tests of this file set environment variables, so they must not run in
 // parallel.
 
-// identityHub is a running hub bootstrapped with an admin token, and its
-// store, which the tests use for what no route does: issuing an API key the
-// way a login does, and seeding users.
-type identityHub struct {
-	url, token string
-	store      *store.Store
-}
+// identityHub is a hub bootstrapped with an admin token.
+type identityHub struct{ *hubtest.Hub }
 
-// startIdentityHub bootstraps a hub with an admin token, then serves it on a
-// free loopback port. The client runs with an empty configuration directory,
-// so every command takes the hub URL and the credential from its flags.
+// startIdentityHub starts a hub bootstrapped with an admin token. The client
+// runs with an empty configuration directory, so every command takes the
+// hub URL and the credential from its flags.
 func startIdentityHub(t *testing.T) *identityHub {
 	t.Helper()
-	dir := t.TempDir()
-	writeConfig(t, dir, "[server]\nbind = \"127.0.0.1\"\nport = 0\n")
-	env := config.MapEnv(map[string]string{"XDG_CONFIG_HOME": dir, "XDG_DATA_HOME": dir})
-	var out, errb lockedBuffer
-	if code := hub.Run(context.Background(), hub.Options{
-		Args: []string{"--admin-email", "boss@example.com"}, Env: env, WorkDir: dir, Stdout: &out, Stderr: &errb,
-	}); code != 0 {
-		t.Fatalf("bootstrap returned %d, want 0; stderr = %q", code, errb.String())
-	}
-	tokenFile := filepath.Join(dir, "admin_token")
-	token, err := os.ReadFile(tokenFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(tokenFile); err != nil {
-		t.Fatal(err)
-	}
-	h := &identityHub{token: string(token)}
-	s := serve(t, hub.Options{Env: env, WorkDir: dir, Compose: func(c *hub.Composition) {
-		c.AddStartHook("test-store", func(_ context.Context, rt *hub.Runtime) error {
-			h.store = rt.Store
-			return nil
-		})
-	}})
-	h.url = s.url("")
+	h := &identityHub{hubtest.Start(t, nil)}
 	clientEnv(t, t.TempDir())
 	return h
 }
 
-// issueKey issues an API key for the user username, with the function of
-// internal/identity a login issues its key with.
+// issueKey issues an API key for the user username, as a login does.
 func (h *identityHub) issueKey(t *testing.T, username string) string {
 	t.Helper()
-	ctx := context.Background()
-	u, err := identity.UserBySelector(ctx, h.store.Main(), username)
+	u, err := identity.UserBySelector(context.Background(), h.Store.Main(), username)
 	if err != nil {
 		t.Fatalf("read user %s: %v", username, err)
 	}
-	var key string
-	err = h.store.Tx(ctx, func(tx *sql.Tx) (err error) {
-		key, _, err = identity.IssueAPIKey(ctx, tx, u.ID, 0, time.Now())
-		return err
-	})
-	if err != nil {
-		t.Fatalf("issue a key for %s: %v", username, err)
-	}
-	return key
-}
-
-// createUser stores the user username with role user and a personal org.
-func (h *identityHub) createUser(t *testing.T, username string) {
-	t.Helper()
-	ctx := context.Background()
-	err := h.store.Tx(ctx, func(tx *sql.Tx) error {
-		_, _, err := identity.CreateUserAndPersonalOrg(ctx, tx, identity.NewUser{
-			Username: username, Email: username + "@example.com", Provider: "github", ProviderID: username, CreatedAt: time.Now(),
-		}, identity.RoleUser)
-		return err
-	})
-	if err != nil {
-		t.Fatalf("create user %s: %v", username, err)
-	}
+	return h.IssueKey(t, u.ID)
 }
 
 // ran is what one run of parley did.
@@ -130,7 +70,7 @@ func (r ran) errorType(t *testing.T) any {
 func (h *identityHub) cli(t *testing.T, credential string, args ...string) ran {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
-	args = append([]string{"--endpoint-url", h.url, "--api-key", credential}, args...)
+	args = append([]string{"--endpoint-url", h.URL(""), "--api-key", credential}, args...)
 	code := cli.Run(context.Background(), args, &stdout, &stderr)
 	return ran{code, stdout.String(), stderr.String()}
 }
@@ -159,7 +99,7 @@ func itemValues(t *testing.T, r ran, member string) []any {
 
 func TestIdentity_AnOperatorSetsUpATeamAndAMemberSeesTheirOrg(t *testing.T) {
 	h := startIdentityHub(t)
-	admin := h.token
+	admin := h.Token
 
 	for _, u := range []string{"alice", "bob"} {
 		h.must(t, admin, "admin", "users", "create", "--username", u, "--email", u+"@example.com",
@@ -205,9 +145,9 @@ func TestIdentity_AnOperatorSetsUpATeamAndAMemberSeesTheirOrg(t *testing.T) {
 
 func TestIdentity_TheLastActiveAdminCanBeNeitherDemotedNorDeleted(t *testing.T) {
 	h := startIdentityHub(t)
-	admin := h.token
-	h.createUser(t, "alice")
-	h.createUser(t, "bob")
+	admin := h.Token
+	h.CreateUser(t, "alice")
+	h.CreateUser(t, "bob")
 
 	if u := h.must(t, admin, "admin", "users", "promote", "alice").json(t); u["role"] != "admin" {
 		t.Fatalf("promote alice printed %v, want role admin", u)

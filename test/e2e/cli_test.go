@@ -21,6 +21,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/cli"
 	"github.com/agent-fox-dev/parley/internal/config"
 	"github.com/agent-fox-dev/parley/internal/hub"
+	"github.com/agent-fox-dev/parley/internal/hubtest"
 )
 
 // The tests of this file set environment variables, so they must not run in
@@ -33,7 +34,7 @@ func serveHub(t *testing.T) string {
 	dir := t.TempDir()
 	writeConfig(t, dir, "[server]\nbind = \"127.0.0.1\"\nport = 0\n")
 	env := config.MapEnv(map[string]string{"XDG_CONFIG_HOME": dir, "XDG_DATA_HOME": dir})
-	return serve(t, hub.Options{Env: env, WorkDir: dir}).url("")
+	return hubtest.Serve(t, hub.Options{Env: env, WorkDir: dir}).URL("")
 }
 
 // clientEnv points PARLEY_CONFIG_DIR at configDir and unsets

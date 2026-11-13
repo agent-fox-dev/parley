@@ -14,6 +14,7 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/config"
 	"github.com/agent-fox-dev/parley/internal/hub"
+	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/server"
 )
@@ -60,7 +61,7 @@ func TestAuth_TheOperatorCallsTheHubWithTheAdminToken(t *testing.T) {
 	writeConfig(t, dir, "[server]\nbind = \"127.0.0.1\"\nport = 0\n")
 	env := config.MapEnv(map[string]string{"XDG_CONFIG_HOME": dir, "XDG_DATA_HOME": dir})
 
-	var out, errb lockedBuffer
+	var out, errb hubtest.LogBuffer
 	if code := hub.Run(context.Background(), hub.Options{
 		Args: []string{"--admin-email", "boss@x.io"}, Env: env, WorkDir: dir, Stdout: &out, Stderr: &errb,
 	}); code != 0 {
@@ -72,8 +73,8 @@ func TestAuth_TheOperatorCallsTheHubWithTheAdminToken(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s := serve(t, hub.Options{Env: env, WorkDir: dir, Compose: addWhoami})
-	whoami := s.url("/api/v1/test/whoami")
+	s := hubtest.Serve(t, hub.Options{Env: env, WorkDir: dir, Compose: addWhoami})
+	whoami := s.URL("/api/v1/test/whoami")
 
 	code, body := getAuthorized(t, whoami, "Bearer "+token)
 	if code != http.StatusOK || body["type"] != "admin" || body["credential_id"] != "admin" || body["user"] != nil {
@@ -95,8 +96,8 @@ func TestAuth_TheOperatorCallsTheHubWithTheAdminToken(t *testing.T) {
 		}
 	}
 
-	s.cancel()
-	if code := s.exitCode(t, 5*time.Second); code != 0 {
+	s.Stop()
+	if code := s.ExitCode(t, 5*time.Second); code != 0 {
 		t.Errorf("the hub returned %d after a stop, want 0", code)
 	}
 	hexPart := []byte(strings.TrimPrefix(token, "parley_admin_"))
