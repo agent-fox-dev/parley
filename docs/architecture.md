@@ -1208,6 +1208,15 @@ commands with `--include-blocked` share the run step `sendIncludeBlocked`
 (`admin_users.go`), and `parley admin orgs create` and `update` send a
 member only when its flag is given (`addChanged` in `admin_orgs.go`).
 
+`parley admin keys` (`admin_keys.go`, also in `parley admin`) is declarations
+alone too. `parley keys` (`keys.go`) is `list`, a declaration, and `refresh`
+and `revoke`, whose run steps take the route's `:key_id` from the command's
+own credential (`apiKeyID`, which repeats the hub's API key format, since
+the client does not import the hub's code) and refuse any other credential
+before sending. After the hub's answer is printed, `refresh` saves the new
+key and `revoke` clears `api_key` and `user_id` through `saveConfig`, both
+only in a config file that already exists, so neither creates one.
+
 Help lives in `internal/cli/help.go`. `installHelp` keeps cobra's own text
 help, sets the root's help function, which `--help` on any command and a
 group run without a word reach, and replaces cobra's help command with

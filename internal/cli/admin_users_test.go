@@ -67,6 +67,10 @@ func TestIdentityCommands_RefuseABadCommandLineAndSendNothing(t *testing.T) {
 		{[]string{"admin", "orgs", "create", "--slug", "a"}, "parley admin orgs create", "--name"},
 		{[]string{"admin", "orgs", "update", "acme"}, "parley admin orgs update", "--name or --url"},
 		{[]string{"admin", "orgs", "members", "add", "acme"}, "parley admin orgs members add", "<user>"},
+		{[]string{"admin", "keys", "list"}, "parley admin keys list", "<user>"},
+		{[]string{"admin", "keys", "revoke", "alice"}, "parley admin keys revoke", "<key_id>"},
+		{[]string{"keys", "list", "x"}, "parley keys list", `"x"`},
+		{[]string{"keys", "refresh", "x"}, "parley keys refresh", `"x"`},
 	}
 	for _, tt := range tests {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {

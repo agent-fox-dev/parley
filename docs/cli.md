@@ -320,8 +320,9 @@ Usage:
   parley [command]
 
 Available Commands:
-  admin       Administer the hub's users and organizations
+  admin       Administer the hub's users, organizations and API keys
   help        Print the help of parley or of a command
+  keys        List, refresh and revoke your API keys
   login       Sign in to the hub and save the hub URL and the credential
   orgs        List and read the organizations you belong to
   user        Read and update your own profile
@@ -935,6 +936,81 @@ status `2`, and sends no request:
   }
 }
 ```
+
+### `parley keys` and `parley admin keys`
+
+These commands call the [API key routes](api.md#get-apiv1userkeys) of the
+hub and print its answer as described under [Output](#output); an error the
+hub answers is written to stderr as received, with exit status `1`. A group
+run without a command, `parley keys` or `parley admin keys`, prints its help
+and exits `0`.
+
+| Command | Request |
+|---|---|
+| `parley keys list` | `GET /api/v1/user/keys` |
+| `parley keys refresh` | `POST /api/v1/user/keys/<key_id>/refresh`, without a body |
+| `parley keys revoke` | `DELETE /api/v1/user/keys/<key_id>` |
+| `parley admin keys list <user>` | `GET /api/v1/users/<user>/keys` |
+| `parley admin keys revoke <user> <key_id>` | `DELETE /api/v1/users/<user>/keys/<key_id>` |
+
+`parley admin keys` takes `<user>` as the other admin commands do (see
+[User selectors](api.md#user-selectors)), and sends `<user>` and `<key_id>`
+each as one percent-encoded path segment: `a/b` is sent as `a%2Fb`. Run with
+a number of arguments other than the ones it takes, a command is a
+`usage_error` with exit status `2` and sends no request.
+
+`parley keys refresh` and `parley keys revoke` act on the API key the command
+presents, the credential resolved as described under
+[Settings](#settings-the-hub-url-and-the-credential), and take its
+`<key_id>` from it: an API key is `parley_<key id>_<secret>`, an 8-character
+key id and a 32-character secret over `0-9`, `A-Z` and `a-z`. Any other
+credential, a personal access token or the admin token among them, is a
+`client_error` with exit status `2`, and the command sends no request:
+
+```json
+{
+  "error": {
+    "code": 0,
+    "message": "parley keys refresh needs an API key (parley_<key id>_<secret>) as the credential, and the credential given is not one",
+    "error_type": "client_error"
+  }
+}
+```
+
+`parley keys refresh` prints the hub's answer, `{"key", "key_id",
+"expires_at"}`, writes the show-once warning on stderr
+
+```
+warning: this value is shown once and will not be shown again
+```
+
+and then saves the new `key` as `api_key` in the config file, keeping
+`endpoint_url`, `user_id` and every other key of the file, with mode `0600`;
+it exits `0`. The hub has replaced the key once it answers, so the old key
+no longer works. When the config file does not exist (the credential came
+from `--api-key` or `PARLEY_API_KEY`), or cannot be written, the command
+creates and changes no file, and after the printed answer it writes on
+stderr
+
+```
+warning: the new key was not saved; it is printed above, and parley login --api-key - saves it
+```
+
+followed by a `client_error` envelope whose message begins with `the new key
+was not saved: ` and gives the reason, for example `there is no config file
+/home/alice/.parley/config.toml`; the exit status is `2`.
+
+`parley keys revoke` prints the revoked key the hub answers, then, when the
+config file exists, sets its `api_key` and `user_id` to the empty string,
+keeping `endpoint_url` and every other key, and writes on stderr
+
+```
+warning: the API key is revoked; run parley login to sign in again
+```
+
+It exits `0`; without a config file it writes no file. When the hub answers
+an error, the error is written to stderr as received, the exit status is
+`1`, and the config file is left as it was.
 
 ### Output
 
