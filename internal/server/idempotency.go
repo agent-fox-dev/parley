@@ -20,6 +20,13 @@ import (
 // is treated as absent.
 const idempotencyTTL = 24 * time.Hour
 
+// idempotencySweepInterval is the shortest time between two sweeps of the
+// expired records. A sweep of the in-memory store visits every record, so
+// running it on every write would make each create cost time in proportion
+// to the last day's records; an expired record left until the next sweep is
+// never replayed, because serveCreate checks its age.
+const idempotencySweepInterval = time.Minute
+
 // maxIdempotencyKey is the longest Idempotency-Key accepted, in characters.
 const maxIdempotencyKey = 255
 
@@ -128,11 +135,27 @@ func idempotencyCaller(c Caller) string {
 	}
 }
 
-// idempotency is the server's idempotency state: the record store and the
-// gate that orders concurrent requests with one key.
+// idempotency is the server's idempotency state: the record store, the
+// gate that orders concurrent requests with one key and the time of the last
+// sweep of the expired records.
 type idempotency struct {
 	store IdempotencyStore
 	gate  keyGate
+
+	mu    sync.Mutex
+	swept time.Time // when the last sweep started; zero before the first
+}
+
+// sweepDue reports whether the expired records are to be swept at now, and
+// if so takes the sweep, so that concurrent writes do not sweep twice.
+func (i *idempotency) sweepDue(now time.Time) bool {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if !i.swept.IsZero() && now.Sub(i.swept) < idempotencySweepInterval {
+		return false
+	}
+	i.swept = now
+	return true
 }
 
 func newIdempotency(store IdempotencyStore) *idempotency {
@@ -225,10 +248,13 @@ func (s *Server) serveCreate(w http.ResponseWriter, r *http.Request, rt Route) e
 	return nil
 }
 
-// writeRecord removes the expired records, then writes rec.
+// writeRecord removes the expired records, at most once a sweep interval,
+// then writes rec.
 func (s *Server) writeRecord(ctx context.Context, rec IdempotencyRecord) error {
-	if err := s.idem.store.DeleteExpired(ctx, rec.WrittenAt.Add(-idempotencyTTL)); err != nil {
-		return fmt.Errorf("delete expired idempotency records: %w", err)
+	if s.idem.sweepDue(rec.WrittenAt) {
+		if err := s.idem.store.DeleteExpired(ctx, rec.WrittenAt.Add(-idempotencyTTL)); err != nil {
+			return fmt.Errorf("delete expired idempotency records: %w", err)
+		}
 	}
 	if err := s.idem.store.Write(ctx, rec); err != nil {
 		return fmt.Errorf("write idempotency record: %w", err)

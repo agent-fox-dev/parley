@@ -686,3 +686,45 @@ func TestIdempotency_KeepsCallersWithoutAUserApart(t *testing.T) {
 		t.Errorf("store holds %d records, want 2 (none for a caller with no identity)", got)
 	}
 }
+
+// sweepCountingStore is an in-memory store that counts the sweeps of expired
+// records.
+type sweepCountingStore struct {
+	*MemoryIdempotencyStore
+	sweeps atomic.Int64
+}
+
+func (s *sweepCountingStore) DeleteExpired(ctx context.Context, cutoff time.Time) error {
+	s.sweeps.Add(1)
+	return s.MemoryIdempotencyStore.DeleteExpired(ctx, cutoff)
+}
+
+func TestIdempotency_SweepsExpiredRecordsAtMostOnceAMinute(t *testing.T) {
+	t.Parallel()
+	f := newCreateFixture()
+	store := &sweepCountingStore{MemoryIdempotencyStore: f.store}
+	f.s = New(Options{Now: f.clock.Now, IdempotencyStore: store, Logger: f.log.logger()})
+	f.s.SetAuthenticator(func(*http.Request) (Caller, error) { return idempotencyCallers["Bearer u1"], nil })
+	f.s.Register(f.createRoute("/things"))
+
+	steps := []struct {
+		advance time.Duration
+		sweeps  int64
+	}{
+		{0, 1},
+		{30 * time.Second, 1},
+		{29 * time.Second, 1},
+		{time.Second, 2},
+		{59 * time.Second, 2},
+		{time.Hour, 3},
+	}
+	for i, step := range steps {
+		f.clock.Advance(step.advance)
+		if rec := f.post("/api/v1/things", "Bearer u1", `{"name":"a"}`, "k"+strconv.Itoa(i)); rec.Code != http.StatusCreated {
+			t.Fatalf("create %d: status = %d, want 201", i+1, rec.Code)
+		}
+		if n := store.sweeps.Load(); n != step.sweeps {
+			t.Errorf("after create %d: %d sweeps, want %d", i+1, n, step.sweeps)
+		}
+	}
+}
