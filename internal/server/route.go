@@ -8,6 +8,7 @@ import (
 	"path"
 	"slices"
 	"strings"
+	"sync"
 )
 
 // apiMount is the fixed path every REST API route is registered under.
@@ -171,7 +172,8 @@ func validMethod(m string) bool {
 }
 
 // serveRoute returns the router's handler for rt: it records the matched
-// route in the request's context and runs the pipeline.
+// route and an empty holder for the checks' attachments in the request's
+// context and runs the pipeline.
 func (s *Server) serveRoute(rt Route, names []string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		params := make(map[string]string, len(names))
@@ -179,8 +181,9 @@ func (s *Server) serveRoute(rt Route, names []string) http.Handler {
 			params[name] = r.PathValue(name)
 		}
 		m := Matched{Method: rt.Method, Pattern: rt.Pattern, Route: rt, Params: params}
-		r = r.WithContext(context.WithValue(r.Context(), matchedKey{}, m))
-		s.runPipeline(w, r, rt)
+		ctx := context.WithValue(r.Context(), matchedKey{}, m)
+		ctx = context.WithValue(ctx, attachedKey{}, &attachments{})
+		s.runPipeline(w, r.WithContext(ctx), rt)
 	})
 }
 
@@ -279,4 +282,46 @@ func (h *headerRecorder) WriteHeader(status int) {
 func (h *headerRecorder) Write(b []byte) (int, error) {
 	h.WriteHeader(http.StatusOK)
 	return len(b), nil
+}
+
+type attachedKey struct{}
+
+// attachments are the values the checks of one request attached for the
+// checks after them and the handler. A check returns only an error, so it
+// cannot hand on a context of its own; the route's handler puts this holder
+// in the request's context before the pipeline runs instead (ADR 04).
+type attachments struct {
+	mu     sync.Mutex
+	values map[any]any
+}
+
+// Attach leaves value under key on the request r, for the later checks and
+// the handler of the same request, which read it with Attached. A check
+// uses it to hand on what it found, such as the access it granted. Outside
+// a request to a REST route it does nothing. Like a context key, key should
+// be of an unexported type of the package that attaches.
+func Attach(r *http.Request, key, value any) {
+	a, ok := r.Context().Value(attachedKey{}).(*attachments)
+	if !ok {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.values == nil {
+		a.values = make(map[any]any)
+	}
+	a.values[key] = value
+}
+
+// Attached returns the value a check of the request r attached under key.
+// It reports false when none did, and outside a request to a REST route.
+func Attached(r *http.Request, key any) (any, bool) {
+	a, ok := r.Context().Value(attachedKey{}).(*attachments)
+	if !ok {
+		return nil, false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	v, ok := a.values[key]
+	return v, ok
 }

@@ -352,3 +352,28 @@ func deleteOrg(ctx context.Context, tx *sql.Tx, id string) error {
 	}
 	return nil
 }
+
+// ActiveOrgIDs returns, by id, the ids of the orgs with status active of
+// which the user userID is a member; none for a user of no org or no user.
+// A blocked org is left out, so that its memberships grant nothing while it
+// is blocked; a deleted org has no memberships left.
+func ActiveOrgIDs(ctx context.Context, q RowsQuerier, userID string) ([]string, error) {
+	rows, err := q.QueryContext(ctx, `SELECT o.id FROM memberships m JOIN orgs o ON o.id = m.org_id
+WHERE m.user_id = ? AND o.status = ? ORDER BY o.id`, userID, StatusActive)
+	if err != nil {
+		return nil, fmt.Errorf("read the active orgs of a user: %w", err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("read the active orgs of a user: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read the active orgs of a user: %w", err)
+	}
+	return ids, nil
+}

@@ -54,10 +54,14 @@ that fails answers the request, and no later check or the handler runs.
    guard.
 6. The scope check: `403 insufficient_scope` for a PAT whose permissions
    do not satisfy the scope the route declares (see [Scopes](#scopes)).
-7. The access checks, among them the admin check of the admin routes:
-   `403 forbidden` with the message `this route needs an admin` for every
+7. The access checks: first the admin check of the admin routes, `403
+   forbidden` with the message `this route needs an admin` for every
    caller but the admin token and an API key whose user has the role
-   `admin` (see [Admin routes](#admin-routes)).
+   `admin` (see [Admin routes](#admin-routes)); then the workspace access
+   check of the workspace routes, `404 not_found` with the message
+   `workspace not found` for a caller who cannot read the workspace, or
+   `403 forbidden` for an org member on a route that needs more than read
+   (see [Workspace access](#workspace-access)).
 8. On a create route, the `Idempotency-Key`: `400 invalid_request` for a bad
    key, `409 conflict` for a key used with another body, or a replay, as in
    [Idempotency](#idempotency).
@@ -971,6 +975,59 @@ The admin routes so far: `POST /api/v1/users`, `GET /api/v1/users`,
 `DELETE /api/v1/orgs/{id}`. `GET /api/v1/orgs/{id}` and
 `GET /api/v1/orgs/{id}/members` are not: a member reads an org and its
 member list too (see [`GET /api/v1/orgs/{id}`](#get-apiv1orgsid)).
+
+## Workspace access
+
+A route that names a workspace by its slug, as in
+`/api/v1/workspaces/{slug}/...`, declares what it needs of its caller:
+`read`, `write` or `owner`. The workspace access check decides from the
+caller's level on the workspace:
+
+| Level | Who | `read` | `write`, `owner` |
+|---|---|---|---|
+| `admin` | the admin token, on every workspace | granted | granted |
+| `owner` | the user who owns the workspace; on a task fork also the owner of its parent | granted | granted |
+| `member` | a member of the workspace's org while the org is active | granted | `403 forbidden` |
+| none | everyone else | `404 not_found` | `404 not_found` |
+
+A user's level is the same by API key and by PAT, and the role `admin`
+gives a user no level. A task fork never opens more than its parent: a user
+with no level on the parent has none on the fork, even the user who created
+it. The workspace's status does not change the level: a member is refused a
+`write` or `owner` route of an archived workspace as of any other, and the
+route checks the status after access. A route that needs `read` lets a
+member through whatever its method, so that members can contribute.
+
+A caller with no level is answered exactly as for a slug that names no
+workspace, with the same status and the same bytes, whatever the route
+needs, the workspace's status or its kind:
+
+```json
+{"error":{"code":404,"message":"workspace not found","error_type":"not_found"}}
+```
+
+The slug's shape is not checked first: a string that cannot be a slug, or
+that differs from one only in case, is a workspace that does not exist. (A
+path segment `.` or `..` never reaches a route: such a path is not clean
+and is answered the generic `404 not_found` with the message `not found`,
+as in [Routes and matching](#routes-and-matching); no slug can be either.) So a
+caller cannot tell an existing workspace they may not read from a missing
+one. A member on a `write` or `owner` route, who can read the workspace, is
+answered:
+
+```json
+{"error":{"code":403,"message":"org members have read-only access to this workspace","error_type":"forbidden"}}
+```
+
+A failure while deciding, such as a failed read of the store, is answered
+`500 internal` with the message `internal error`, never as a grant, and
+the answer shows neither the failure nor the workspace. In every refusal the
+route's handler does not run.
+
+The check runs in the access position of the [order of checks](#order-of-checks),
+after the admin check and before the `Idempotency-Key` of a create route, so
+a replayed create is decided again. No route declares a need yet; the
+workspace routes will.
 
 ## User selectors
 

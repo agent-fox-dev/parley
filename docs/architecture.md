@@ -11,6 +11,7 @@ command-line client. Both are written in Go, in the module
 |---|---|
 | `cmd/parley` | the `parley` program: it calls `cli.Run` and exits with its status |
 | `cmd/parleyd` | the `parleyd` program: `main` calls `hub.Run` with the process's arguments, environment and working directory and exits with its status |
+| `internal/access` | the workspace access rule, the one place that decides what a caller may do on a workspace; the minimal workspace record (slug, owner, org, kind, parent, status) in the transactional store, the caller's level on a workspace, the decision for a declared need and the REST access check, and the readable set for reads across workspaces |
 | `internal/buildinfo` | the version, commit and build time the binary was built with, shared by both programs |
 | `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra`, each declared through one helper ([ADR 02](adr/02-declare-every-cli-command-through-one-helper.md)), the client configuration file, the resolution of the hub URL and the credential, the one HTTP client the commands send their requests with, the printing of a command's result on stdout and of its warnings on stderr, the shared wait for a long operation (`--wait`, `--timeout`, `--poll-interval`), and the error envelopes and exit statuses every command ends with |
 | `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, and a registry of keys and whole sections that decides what the file may hold |
@@ -149,7 +150,14 @@ authenticator reports a `server.Caller` (`CredentialID`, and `UserID` or
 `Admin` for the admin token, and `Detail`, what the authenticator knows
 beyond the ids, which the server does not read), which the pipeline puts in
 the request's context; later checks and the handler read it with
-`server.CallerOf(r.Context())`. An `*server.Error` (also when wrapped) is
+`server.CallerOf(r.Context())`. A check returns only an error and cannot
+hand on a request of its own, so the router's handler of each REST route
+puts an empty holder in the request's context before the pipeline runs
+(ADR 04): a check leaves a value for the later checks and the handler with
+`server.Attach(r, key, value)`, and they read it with
+`server.Attached(r, key)`, which reports `false` when nothing was attached
+under `key`; outside a request to a REST route `Attach` does nothing and
+`Attached` reports `false`. Each request has its own holder. An `*server.Error` (also when wrapped) is
 written as its envelope; any other error as `500 internal` with the message
 `internal error`, and its text is logged through `Options.Logger` as an
 error line `internal error` with the `request_id` and the `error`. When the
@@ -1041,9 +1049,11 @@ when `OwnerID` is empty, `status`, `created_at`, `updated_at`);
 return an org or `identity.ErrNotFound`, comparing the slug exactly; and
 `identity.Memberships(ctx, q, orgID)` returns an org's
 `identity.Membership`s (`OrgID`, `UserID`, `CreatedAt`), oldest first, then
-by user id. It reads through an `identity.RowsQuerier`, an
-`identity.Querier` that also has `QueryContext` (the store's `*sql.DB` or a
-`*sql.Tx`).
+by user id; `identity.ActiveOrgIDs(ctx, q, userID)` returns, by id, the
+ids of the orgs with status `active` of which a user is a member, the
+membership source of the workspace access rule (see Workspace access). Both
+read through an `identity.RowsQuerier`, an `identity.Querier` that also has
+`QueryContext` (the store's `*sql.DB` or a `*sql.Tx`).
 
 `identity.OrgBySelector(ctx, q, sel)` in `orgs.go` resolves an org selector
 by its shape alone, as `UserBySelector` does a user's: a value `isUUID`
@@ -1124,6 +1134,189 @@ back, with everything earlier removers wrote through it. A package that
 keeps data for a user or an org registers its remover from its part in
 `internal/hub` through the `identity` field of `hub.Composition`, which
 `composeIdentity` sets.
+
+### Workspace access
+
+`internal/hub/access.go` adds the part `composeAccess`, after
+`composeIdentity` in `parts`. It adds the schema step `access.SchemaStep`
+(`workspace_records`), registers a zero `access.Service`, adds its
+`Check` to the access checks, after identity's admin check, and binds it in
+the start hook `access` to `access.Deps{Records:
+access.StoreRecords(rt.Store.Main()), Memberships: ...}`, the membership
+source being `identity.ActiveOrgIDs` over the same store. It registers no
+remover on the identity service: a workspace record outlives the deletion of
+its owner and of its org.
+
+The step creates the table `workspaces` in the transactional store:
+
+| Column | Holds |
+|---|---|
+| `slug` | the workspace's slug, the primary key, compared byte for byte (no case folding) |
+| `owner_id` | the id of the user who owns it; no foreign key to `users` |
+| `org_id` | the id of its org; no foreign key to `orgs` |
+| `kind` | `repository` or `fork` (a `CHECK` constraint) |
+| `parent_slug` | the slug of the repository a fork was created from; NULL for a repository, and no foreign key |
+| `status` | `pending`, `cloning`, `ready`, `failed` or `archived` (a `CHECK` constraint) |
+
+with an index on each of `owner_id`, `org_id` and `parent_slug`, for the
+list reads. A dangling `owner_id` matches no caller and a dangling `org_id`
+grants no membership, because the memberships of a deleted org are deleted
+with it.
+
+`internal/access/record.go` holds the record type `access.Record` (`Slug`,
+`OwnerID`, `OrgID`, `Kind`, `ParentSlug`, `Status`; `ParentSlug` is `""`
+for a repository and stored as NULL), the constants `KindRepository`,
+`KindFork` and `StatusPending` to `StatusArchived`, and the store functions.
+The insert takes the caller's `*sql.Tx`; the reads take a `Querier` (the
+store's `*sql.DB` or an open `*sql.Tx`):
+
+- `InsertRecord(ctx, tx, rec)` stores a record in the caller's transaction.
+  It refuses, with an error wrapping `access.ErrInvalidRecord` and without
+  writing, a record with an empty slug, owner or org, an unknown kind or
+  status, a repository with a parent, a fork without one, and a fork whose
+  parent has no record, is a fork itself or is in another org; the parent is
+  read in the same transaction. A slug that has a record already is
+  refused with `access.ErrDuplicateSlug` (the insert is `ON CONFLICT (slug)
+  DO NOTHING`), and the stored record stays as it was.
+- `RecordBySlug(ctx, q, slug)` returns the record and `true`, or `false`
+  and a nil error for any string no record has as its slug.
+- `RecordsOwnedOrIn(ctx, q, ownerID, orgIDs)` lists the records owned by a
+  user or in one of a list of orgs, and `ForksOf(ctx, q, parents)` the forks
+  of a list of parents, both ordered by slug; an empty list of parents
+  lists nothing.
+
+The rule reads records through the interface `access.RecordReader`
+(`Record`, `OwnedOrIn`, `ForksOf`), so that a test can make a read fail;
+`access.StoreRecords(q)` is the one over these functions.
+
+#### Levels
+
+`internal/access/level.go` resolves what a caller is on one workspace,
+`access.Level`: `LevelAdmin` (`"admin"`), `LevelOwner` (`"owner"`),
+`LevelMember` (`"member"`) or `LevelNone` (`""`). The caller is
+`access.Caller{Admin, UserID}`, built from the pipeline's `server.Caller`
+by `access.CallerFrom`; the kind of credential and the user's role are not
+part of it, so a user has the same level by API key as by PAT, and a user
+with the role admin has no level from the role.
+
+`(*Service).Level(ctx, caller, slug)` returns the level, the record and
+whether the slug has one. It reads the record first: a slug with no record
+is `LevelNone`, found `false` and no error, for every caller. Then:
+
+- the admin token is `LevelAdmin` on every workspace, repository or fork;
+- on a repository, a user whose id is the record's `owner_id` is
+  `LevelOwner`, decided before any membership is read; otherwise a user who
+  is a member of the record's `org_id`, as the membership source answers
+  it, is `LevelMember`; everyone else is `LevelNone`;
+- on a fork, the user's level on the parent record is resolved first, as on
+  a repository. `LevelNone` on the parent, a parent with no record, or a
+  parent that is not a repository gives `LevelNone` on the fork, even to the
+  fork's owner: a fork never grants more than its parent. Otherwise the
+  fork's owner and the parent's owner are `LevelOwner` on the fork, and
+  every other user `LevelMember`.
+
+The workspace's status is never read, so a caller has the same level in
+every status. A failed read of a record or of the memberships returns
+`LevelNone`, no record and the error, never a grant.
+
+The membership source is the narrow interface `access.Memberships`, one
+method `ActiveOrgIDs(ctx, userID)`; `access.MembershipsFunc` adapts a
+function to it. The hub wires `identity.ActiveOrgIDs(ctx, q, userID)` from
+`internal/identity/orgs.go`, which joins `memberships` with `orgs` and
+returns, by id, the ids of the orgs with status `active` the user is a
+member of. A blocked org is left out, so its members are `LevelNone` on its
+workspaces while it is blocked (its owner is not), and a deleted org has no
+memberships left, its rows being deleted with it.
+
+#### Decision and check
+
+`internal/access/decide.go` turns a level into an answer for what a route
+needs, `access.Need`: `NeedRead` (`"read"`), `NeedWrite` (`"write"`) or
+`NeedOwner` (`"owner"`). `(*Service).Decide(ctx, caller, slug, need)`
+returns an `access.Decision{Outcome, Level, Record}`, a comparable value:
+
+- level none, or a slug with no record: `Outcome` `access.NotFound`
+  (`"not_found"`) with `LevelNone` and the zero record, for every need, so
+  the decision for a workspace the caller cannot read equals the one for a
+  slug with no workspace;
+- `LevelMember` with `NeedWrite` or `NeedOwner`: `access.ReadOnly`
+  (`"read_only"`) with the level and the record;
+- everything else: `access.Granted` (`"granted"`) with the level and the
+  record.
+
+A need other than the three, and a failed read, return the zero decision
+and an error, never a grant. The slug's shape is not checked: a string that
+cannot be a slug has no record. A surface other than the REST API, such as
+the git server, calls `Decide` directly.
+
+`internal/access/middleware.go` holds the REST side. A workspace route
+declares its need in its `Marks` under `access.MarkNeed`
+(`"access.need"`), with the value `read`, `write` or `owner`, and names its
+workspace with the path parameter `slug`. `(*Service).Check` is a
+`server.Check` in the access position: on a route without the mark it
+passes; otherwise it takes the caller from `server.CallerOf` through
+`access.CallerFrom` and the slug from the matched route, and decides. A
+grant attaches the decision with `server.Attach`, and the handler reads it
+with `access.DecisionOf(r)`; `ReadOnly` is answered
+`server.Forbidden("org members have read-only access to this workspace")`
+and `NotFound` `server.NotFound("workspace not found")`, built from
+constants only, so its bytes cannot differ between an invisible workspace
+and a missing one. A caller that is neither the admin token nor a user, a
+mark other than the three needs, a marked route without a `slug`
+parameter, and an error from `Decide` are returned as plain errors, which
+the pipeline logs and answers `500 internal` with `internal error`. No
+route declares the mark yet.
+
+The check never reads the request's method: a route that needs `read`
+grants a member with `POST`, `PATCH`, `PUT` or `DELETE` exactly as with
+`GET`, because a member's own contributions (forks, changes, verdicts,
+claims) change state on routes that need `read`, and those routes check
+their own conditions. The decision `access.DecisionOf(r)` returns holds the
+caller's level and all six fields of the record as read while deciding, so
+such a condition (the fork's owner, its parent, its kind) needs no second
+lookup.
+
+`(*Service).CanWrite(ctx, userID, slug)` answers whether a named user, who
+need not be the caller, has write access to a workspace: `true` exactly
+when that user's level on it, resolved by `Level` as for a caller with that
+`UserID`, is `LevelOwner`; `false` for `LevelMember`, `LevelNone` and a slug
+with no record; `false` and the error when a read fails. No production code
+calls it yet; the routes whose conditions ask about another user, such as a
+change's author, will.
+
+#### Readable set
+
+`internal/access/readable.go` answers which workspaces a caller can read,
+for the reads that span workspaces (the workspace list, events, audit), so
+that they show exactly the workspaces the per-workspace decision lets
+through. `(*Service).Readable(ctx, caller)` returns an
+`access.ReadableSet{All, Entries}`:
+
+- the admin token gets `All` set and no entries; `Contains` answers yes and
+  `Level` `LevelAdmin` for every slug;
+- a user gets `Entries`, the user's level by slug. It reads the user's
+  active orgs (`Memberships.ActiveOrgIDs`), then the records the user owns
+  or that are in one of those orgs (`RecordReader.OwnedOrIn`, which brings
+  the forks of those orgs' repositories with them, a fork being in its
+  parent's org), then the forks of the repositories the user owns
+  (`RecordReader.ForksOf`). Each record, in every status, gets the level
+  the resolver of `Level` gives it, and those at `LevelNone` are left out:
+  a fork whose owner has no level on its parent, a workspace of a blocked
+  org that the user does not own. A slug appears once; an owned workspace
+  in one of the user's orgs is `LevelOwner`;
+- a caller that is neither, and a user with nothing, get the empty set and
+  no error;
+- a failed read returns the error and the empty set, never part of one.
+
+`Level` and `Readable` share one resolver (`userLevels` in `level.go`); they
+differ only in where the user's active orgs and a fork's parent come from.
+`Level` reads them from the sources as the answer needs them; `Readable`
+takes the orgs it has read and looks a parent up among the records it has
+collected, which hold every repository the user has a level on, so a parent
+that is not among them is one the user has no level on. A workspace is
+therefore in a user's set exactly when `Level` resolves a level other than
+`LevelNone` for it, with that level. No production code calls `Readable`
+yet; the workspace list, the event stream and the audit query will.
 
 ### The logger
 
