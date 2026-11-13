@@ -3,16 +3,22 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/agent-fox-dev/parley/internal/server"
 )
 
 // recordingHub is a hub that answers GET /version with body and records the
@@ -297,5 +303,57 @@ func TestVersion_WarnsAndPrintsTheClientBuildWhenTheConfigFileCannotBeParsed(t *
 	}
 	if lines := nonEmptyLines(stderr); len(lines) != 1 || !strings.HasPrefix(lines[0], "warning: ") || !strings.Contains(lines[0], path) {
 		t.Errorf("stderr = %q, want one line that begins with %q and names %s", stderr, "warning: ", path)
+	}
+}
+
+// The test sets environment variables, so it must not run in parallel. It
+// runs where the save is reachable: a developer's file as parley login's save
+// writes it, read by parley version against the hub's own HTTP handler on a
+// real listener.
+func TestVersion_FindsTheHubThroughTheFileTheSaveWrote(t *testing.T) {
+	hub := httptest.NewServer(server.New(server.Options{Logger: slog.New(slog.DiscardHandler)}).Handler())
+	t.Cleanup(hub.Close)
+	dir := loginEnv(t)
+	if err := saveConfig(configSettings{EndpointURL: hub.URL + "/", APIKey: testAPIKey, UserID: "u-1"}); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	path := filepath.Join(dir, "config.toml")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := http.Get(hub.URL + "/version")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(res.Body)
+	res.Body.Close()
+	if err != nil || res.StatusCode != http.StatusOK {
+		t.Fatalf("GET /version: %v, %s", err, res.Status)
+	}
+	var want map[string]any
+	if err := json.Unmarshal(body, &want); err != nil {
+		t.Fatalf("GET /version answered no JSON object: %v", err)
+	}
+
+	code, stdout, stderr := runCLI(t, "version")
+
+	if code != 0 {
+		t.Errorf("exit status = %d, want 0", code)
+	}
+	var doc struct {
+		Server map[string]any `json:"server"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &doc); err != nil || !reflect.DeepEqual(doc.Server, want) {
+		t.Errorf("stdout = %q (%v), want a server member equal to %v", stdout, err, want)
+	}
+	if stderr != "" {
+		t.Errorf("stderr = %q, want it empty", stderr)
+	}
+	if after, err := os.ReadFile(path); err != nil || !bytes.Equal(after, before) {
+		t.Errorf("config file = %q (%v), want its bytes unchanged, %q", after, err, before)
+	}
+	if got := modeOf(t, path); got != 0o600 {
+		t.Errorf("config file mode = %v, want 0600", got)
 	}
 }

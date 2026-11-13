@@ -14,12 +14,10 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"sync"
 	"testing"
 
-	"github.com/BurntSushi/toml"
 	"github.com/agent-fox-dev/parley/internal/cli"
 	"github.com/agent-fox-dev/parley/internal/config"
 	"github.com/agent-fox-dev/parley/internal/hub"
@@ -60,56 +58,6 @@ func unknownAPIKey() string {
 		return string(b)
 	}
 	return "parley_" + draw(8) + "_" + draw(32)
-}
-
-func TestCLI_VersionFindsTheHubThroughTheConfigurationFile(t *testing.T) {
-	hubURL := serveHub(t)
-	configDir := t.TempDir()
-	clientEnv(t, configDir)
-	// The file as parley login's save writes it: the three keys encoded by
-	// the same TOML encoder, mode 0600. The e2e package cannot call the
-	// unexported save, and a login saves neither a trailing slash nor a key
-	// the hub does not know (docs/errata/09_cli_foundation.md).
-	path := filepath.Join(configDir, "config.toml")
-	saved, err := toml.Marshal(map[string]any{"endpoint_url": hubURL + "/", "api_key": unknownAPIKey(), "user_id": "u-1"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, saved, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	res, err := http.Get(hubURL + "/version")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var want map[string]any
-	err = json.NewDecoder(res.Body).Decode(&want)
-	res.Body.Close()
-	if err != nil {
-		t.Fatalf("GET /version: %v", err)
-	}
-
-	var stdout, stderr bytes.Buffer
-	code := cli.Run(context.Background(), []string{"version"}, &stdout, &stderr)
-
-	if code != 0 {
-		t.Errorf("parley version returned %d, want 0", code)
-	}
-	var doc struct {
-		Server map[string]any `json:"server"`
-	}
-	if err := json.Unmarshal(stdout.Bytes(), &doc); err != nil || !reflect.DeepEqual(doc.Server, want) {
-		t.Errorf("stdout = %q (%v), want a server member equal to %v", stdout.String(), err, want)
-	}
-	if stderr.Len() != 0 {
-		t.Errorf("stderr = %q, want it empty", stderr.String())
-	}
-	if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, saved) {
-		t.Errorf("config file = %q (%v), want its bytes unchanged, %q", got, err, saved)
-	}
-	if fi, err := os.Stat(path); err != nil || fi.Mode().Perm() != 0o600 {
-		t.Errorf("config file mode: %v (%v), want 0600", fi.Mode().Perm(), err)
-	}
 }
 
 // proxied is a request the recording proxy passed to the hub, with the
