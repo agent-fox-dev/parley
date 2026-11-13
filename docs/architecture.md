@@ -645,7 +645,8 @@ a create route, the admin route `POST /users` (see
 [api.md](api.md#post-apiv1users)), a create route, the admin routes `GET /users`, `GET /users/:id`
 and `PATCH /users/:id` (see [api.md](api.md#get-apiv1users)), the admin
 routes `POST /users/:id/promote`, `/demote`, `/block` and `/unblock` (see
-[api.md](api.md#role-and-status-of-a-user)), and the
+[api.md](api.md#role-and-status-of-a-user)), the admin route
+`DELETE /users/:id` (see [api.md](api.md#delete-apiv1usersid)), and the
 caller's own profile, `GET /user`, `PATCH /user` and `GET /user/orgs` (see
 [api.md](api.md#get-apiv1user)), which need a user, the admin routes
 `POST /orgs`, `GET /orgs`, `PATCH /orgs/:id`, `PUT /orgs/:id/members/:user_id`
@@ -841,6 +842,18 @@ that read `u`; since the store admits one writer at a time, the count and
 the change cannot interleave with another demotion or deletion. Block has
 no guard.
 
+`DELETE /users/:id` (`deleteUser` in `handlers_users.go`) is an admin route.
+In one `(*store.Store).Tx` it resolves the selector (`errUserNotFound()`
+before anything else), calls `guardLastAdmin` (`409 conflict`, before any
+remover), calls the user removers through `removeUserData` in
+`removers.go`, then `deleteUser(ctx, tx, id, now)` in `users.go`. That
+function deletes the user's `api_keys` and `pats`, bound ones included, and
+`memberships`, runs `UPDATE orgs SET owner_id = NULL, updated_at = ? WHERE
+owner_id = ?` and deletes the user, each an explicit statement rather than
+left to the foreign keys' `ON DELETE` actions, so that an org's
+`updated_at` moves with its `owner_id`. The orgs are kept, so a user delete
+calls no org remover. It answers `204`.
+
 `GET /user` and `PATCH /user`, in `internal/identity/handlers_user.go`,
 carry the mark `identity.MarkNeedsUser` and declare the scopes `users:read`
 and `users:write`. Both take the caller's user from the `identity.Principal`
@@ -929,8 +942,9 @@ error`, registered on the service with
 `(*identity.Service).RegisterOrgRemover` or `RegisterUserRemover` in
 `internal/identity/removers.go`, and kept in registration order under a
 mutex ([ADR 03](adr/03-register-removers-of-owned-data-on-the-identity-service.md)).
-`removeOrgData` calls the org removers in order with the delete's
-transaction and the org's id and stops at the first error, which
+`removeOrgData` and `removeUserData` call the org or the user removers,
+a copy of the list taken under the mutex, in order with the delete's
+transaction and the id and stop at the first error, which
 `callRemovers` returns as text only, not wrapped, so that whatever a
 remover returns the delete answers `500 internal` and the transaction rolls
 back, with everything earlier removers wrote through it. A package that

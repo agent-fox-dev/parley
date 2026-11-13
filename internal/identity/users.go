@@ -142,3 +142,28 @@ func updateStatus(ctx context.Context, tx *sql.Tx, id, status string, now time.T
 	}
 	return UserByID(ctx, tx, id)
 }
+
+// deleteUser deletes the user id in tx with the user's API keys and PATs,
+// bound ones included, and memberships, and clears owner_id, with
+// updated_at now, on the orgs the user owned; the orgs are kept. Each is an
+// explicit statement rather than left to the foreign keys' actions, so that
+// the delete does not depend on them and an org's updated_at moves with
+// its owner_id.
+func deleteUser(ctx context.Context, tx *sql.Tx, id string, now time.Time) error {
+	for _, st := range []struct {
+		what, query string
+		args        []any
+	}{
+		{"delete the API keys of the user", `DELETE FROM api_keys WHERE user_id = ?`, []any{id}},
+		{"delete the PATs of the user", `DELETE FROM pats WHERE user_id = ?`, []any{id}},
+		{"delete the memberships of the user", `DELETE FROM memberships WHERE user_id = ?`, []any{id}},
+		{"clear the owner of the user's orgs", `UPDATE orgs SET owner_id = NULL, updated_at = ? WHERE owner_id = ?`,
+			[]any{now.UTC().UnixNano(), id}},
+		{"delete the user", `DELETE FROM users WHERE id = ?`, []any{id}},
+	} {
+		if _, err := tx.ExecContext(ctx, st.query, st.args...); err != nil {
+			return fmt.Errorf("%s: %w", st.what, err)
+		}
+	}
+	return nil
+}

@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"uuid"
@@ -228,7 +229,9 @@ func TestCreateUser_RefusesWhatIsTakenAndCreatesNothing(t *testing.T) {
 
 // userSelectorRoutes are the admin routes that name a user by a selector,
 // ":user" in their path, each with a body it accepts (nil for none). The
-// membership routes name the org acme, which the selector tests seed.
+// membership routes name the org acme, which the selector tests seed. The
+// user delete comes last, so that the routes before it find the user as the
+// team hub created her.
 var userSelectorRoutes = []adminRoute{
 	{http.MethodGet, "/api/v1/users/:user", nil},
 	{http.MethodPatch, "/api/v1/users/:user", map[string]any{"full_name": "x"}},
@@ -238,6 +241,30 @@ var userSelectorRoutes = []adminRoute{
 	{http.MethodPost, "/api/v1/users/:user/unblock", nil},
 	{http.MethodPut, "/api/v1/orgs/acme/members/:user", nil},
 	{http.MethodDelete, "/api/v1/orgs/acme/members/:user", nil},
+	{http.MethodDelete, "/api/v1/users/:user", nil},
+}
+
+// userDeleteRoute reports whether rt deletes the user.
+func userDeleteRoute(rt adminRoute) bool {
+	return rt.method == http.MethodDelete && rt.path == "/api/v1/users/:user"
+}
+
+// deletesAlice sends the user delete at path as the admin token and reports
+// unless the answer is 204 without a body and alice is gone: her going
+// shows that the selector reached her. It then stores alice again, the
+// record the team hub created, so that the next request finds her.
+func (h teamHub) deletesAlice(t *testing.T, path string) {
+	t.Helper()
+	if r := h.call(http.MethodDelete, path, h.admin, nil); r.status != http.StatusNoContent || len(r.body) != 0 {
+		t.Errorf("answer = %d %s, want 204 without a body", r.status, r.body)
+	}
+	if n := h.count(`SELECT count(*) FROM users WHERE id = ?`, h.alice.ID); n != 0 {
+		t.Errorf("alice is still there")
+	}
+	a := h.alice
+	h.exec(`INSERT OR IGNORE INTO users (id, username, email, full_name, role, status, provider, provider_id, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, a.ID, a.Username, a.Email, a.FullName, a.Role, a.Status, a.Provider, a.ProviderID,
+		a.CreatedAt.UnixNano(), a.UpdatedAt.UnixNano())
 }
 
 // itemIDs returns the ids of the items of a list answer.
@@ -455,6 +482,10 @@ func TestUserSelectors_ReachTheSameUserByIdEmailOrUsername(t *testing.T) {
 					h.reachesAliceInAcme(t, rt, acme, path)
 					return
 				}
+				if userDeleteRoute(rt) {
+					h.deletesAlice(t, path)
+					return
+				}
 				r := h.call(rt.method, path, h.admin, rt.body)
 				if r.status != http.StatusOK || r.json["id"] != id {
 					t.Fatalf("answer = %d %s, want 200 with alice's id %s", r.status, r.body, id)
@@ -651,5 +682,163 @@ func TestBlock_BlocksTheOnlyActiveAdmin(t *testing.T) {
 	}
 	if got := h.get("/api/v1/users", h.ka); got.status != http.StatusOK {
 		t.Errorf("GET /users with root's API key after the unblock = %d %s, want 200", got.status, got.body)
+	}
+}
+
+// deleteUser sends DELETE /users/<selector> as the admin token.
+func (h *testHub) deleteUser(selector string) response {
+	h.t.Helper()
+	return h.call(http.MethodDelete, "/api/v1/users/"+selector, "Bearer "+h.adminToken, nil)
+}
+
+func TestDeleteUser_DeletesTheUserWhateverTheRoleAndStatus(t *testing.T) {
+	t.Parallel()
+	h := newTeamHub(t)
+	mallory := h.createUser("mallory", identity.RoleUser)
+	h.setStatus(mallory.ID, identity.StatusBlocked)
+	oscar := h.createUser("oscar", identity.RoleAdmin)
+	h.setStatus(oscar.ID, identity.StatusBlocked)
+	h.createUser("ruth", identity.RoleAdmin)
+	// root stays an active admin throughout.
+	for _, c := range []struct{ name, username string }{
+		{"a user", "alice"},
+		{"a blocked user", "mallory"},
+		{"a blocked admin", "oscar"},
+		{"an active admin beside another", "ruth"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			u := h.get("/api/v1/users/"+c.username, h.admin).json
+			r := h.deleteUser(c.username)
+			if r.status != http.StatusNoContent || len(r.body) != 0 {
+				t.Fatalf("DELETE /users/%s = %d %s, want 204 without a body", c.username, r.status, r.body)
+			}
+			id := u["id"].(string)
+			for _, sel := range []string{id, u["email"].(string), c.username} {
+				checkRefusal(t, "GET /users/"+sel, h.get("/api/v1/users/"+sel, h.admin), http.StatusNotFound, "not_found",
+					"user not found")
+			}
+			if ids := itemIDs(t, h.get("/api/v1/users?include_blocked=true&limit=200", h.admin)); slices.Contains(ids, id) {
+				t.Errorf("GET /users?include_blocked=true lists the deleted user %s", id)
+			}
+		})
+	}
+}
+
+func TestDeleteUser_KeepsTheOrgsWithoutTheUserAsOwnerOrMember(t *testing.T) {
+	t.Parallel()
+	h := newTeamHub(t)
+	bob := h.createUser("bob", identity.RoleUser)
+	acme := h.seedOrg("Acme Inc", "acme")
+	h.exec(`UPDATE orgs SET owner_id = ? WHERE id = ?`, h.alice.ID, acme)
+	h.addMember(acme, h.alice.ID)
+	h.addMember(acme, bob.ID)
+	h.advance(time.Hour)
+	if r := h.deleteUser("alice"); r.status != http.StatusNoContent {
+		t.Fatalf("DELETE /users/alice = %d %s, want 204", r.status, r.body)
+	}
+	now := h.now().Format(time.RFC3339)
+	for _, slug := range []string{"alice", "acme"} {
+		r := h.get("/api/v1/orgs/"+slug, h.admin)
+		owner, present := r.json["owner_id"]
+		if r.status != http.StatusOK || !present || owner != nil || r.json["updated_at"] != now {
+			t.Errorf("GET /orgs/%s = %d %s, want 200 with owner_id null and updated_at %s", slug, r.status, r.body, now)
+		}
+	}
+	if got := itemMember(t, h.get("/api/v1/orgs/acme/members", h.admin), "username"); !slices.Equal(got, []string{"bob"}) {
+		t.Errorf("members of acme = %v, want [bob]", got)
+	}
+	if got := itemMember(t, h.get("/api/v1/orgs/alice/members", h.admin), "username"); len(got) != 0 {
+		t.Errorf("members of alice's personal org = %v, want none", got)
+	}
+	if got := h.get("/api/v1/orgs/bob", h.admin).json["owner_id"]; got != bob.ID {
+		t.Errorf("owner_id of bob's personal org = %v, want %s", got, bob.ID)
+	}
+}
+
+func TestDeleteUser_DeletesEveryCredentialOfTheUser(t *testing.T) {
+	t.Parallel()
+	h := newTeamHub(t)
+	bound, _ := h.seedPAT(identity.PATSpec{UserID: h.alice.ID, Permissions: everyScope, Workspace: "docs"})
+	if n := h.count(`SELECT count(*) FROM pats WHERE user_id = ? AND workspace IS NOT NULL`, h.alice.ID); n != 1 {
+		t.Fatalf("alice has %d bound PATs, want 1", n)
+	}
+	if r := h.deleteUser("alice"); r.status != http.StatusNoContent {
+		t.Fatalf("DELETE /users/alice = %d %s, want 204", r.status, r.body)
+	}
+	for name, cred := range map[string]string{"API key": h.ku, "PAT": h.pu, "bound PAT": "Bearer " + bound} {
+		checkRefusal(t, "GET /user with alice's "+name, h.get("/api/v1/user", cred), http.StatusUnauthorized,
+			"unauthenticated", "invalid credentials")
+	}
+	if n := h.count(`SELECT (SELECT count(*) FROM api_keys WHERE user_id = ?) + (SELECT count(*) FROM pats WHERE user_id = ?)`,
+		h.alice.ID, h.alice.ID); n != 0 {
+		t.Errorf("%d API keys and PATs of alice are stored, want none", n)
+	}
+	for name, cred := range map[string]string{"API key": h.ka, "PAT": h.pa} {
+		if r := h.get("/api/v1/user", cred); r.status != http.StatusOK {
+			t.Errorf("GET /user with root's %s = %d %s, want 200", name, r.status, r.body)
+		}
+	}
+}
+
+func TestDeleteUser_RefusesTheOnlyActiveAdminAndDeletesNothing(t *testing.T) {
+	t.Parallel()
+	h := newTeamHub(t)
+	oscar := h.createUser("oscar", identity.RoleAdmin)
+	h.setStatus(oscar.ID, identity.StatusBlocked)
+	for name, caller := range map[string]string{"admin token": h.admin, "API key of root itself": h.ka} {
+		t.Run(name, func(t *testing.T) {
+			before := h.snapshot()
+			r := h.call(http.MethodDelete, "/api/v1/users/root", caller, nil)
+			checkRefusal(t, "answer", r, http.StatusConflict, "conflict", "the user is the only active admin")
+			if h.snapshot() != before {
+				t.Errorf("the store changed")
+			}
+			if got := h.get("/api/v1/users", h.ka); got.status != http.StatusOK {
+				t.Errorf("GET /users with root's API key = %d %s, want 200", got.status, got.body)
+			}
+		})
+	}
+}
+
+func TestLastAdminGuard_RefusesOneOfTwoConcurrentChangesOfTheLastTwoAdmins(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		name         string
+		method, path string // the change of root
+		rootWins     int    // the status of root's change when it is not refused
+	}{
+		{"demote root and demote ruth", http.MethodPost, "/api/v1/users/root/demote", http.StatusOK},
+		{"delete root and demote ruth", http.MethodDelete, "/api/v1/users/root", http.StatusNoContent},
+	} {
+		for i := range 25 {
+			t.Run(fmt.Sprintf("%s/%d", c.name, i), func(t *testing.T) {
+				t.Parallel()
+				h := newTestHub(t)
+				h.createUser("root", identity.RoleAdmin)
+				h.createUser("ruth", identity.RoleAdmin)
+				admin := "Bearer " + h.adminToken
+				var root, ruth response
+				start := make(chan struct{})
+				var wg sync.WaitGroup
+				wg.Go(func() { <-start; root = h.call(c.method, c.path, admin, nil) })
+				wg.Go(func() { <-start; ruth = h.post("/api/v1/users/ruth/demote", admin) })
+				close(start)
+				wg.Wait()
+				refused := root
+				switch {
+				case root.status == c.rootWins && ruth.status == http.StatusConflict:
+					refused = ruth
+				case root.status == http.StatusConflict && ruth.status == http.StatusOK:
+				default:
+					t.Fatalf("answers = %d %s and %d %s, want one change done and the other 409", root.status, root.body,
+						ruth.status, ruth.body)
+				}
+				checkRefusal(t, "the refused change", refused, http.StatusConflict, "conflict", "the user is the only active admin")
+				if n := h.count(`SELECT count(*) FROM users WHERE role = ? AND status = ?`, identity.RoleAdmin,
+					identity.StatusActive); n != 1 {
+					t.Errorf("%d active admins remain, want 1", n)
+				}
+			})
+		}
 	}
 }

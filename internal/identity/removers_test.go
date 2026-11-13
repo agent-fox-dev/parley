@@ -88,3 +88,73 @@ func TestDeleteOrg_CallsTheOrgRemoversInOrderInTheTransactionOfTheDelete(t *test
 		})
 	}
 }
+
+func TestDeleteUser_CallsTheUserRemoversInOrderInTheTransactionOfTheDelete(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		name string
+		bErr error
+	}{
+		{"every remover succeeds", nil},
+		{"a remover fails", errors.New("b failed")},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			h, acme := newOwnedHub(t)
+			alice := h.alice.ID
+			h.exec(`UPDATE orgs SET owner_id = ? WHERE id = ?`, alice, acme)
+			h.exec(`INSERT INTO owned (owner_id) VALUES (?)`, alice)
+			var calls []string
+			orgCalls, userGone := 0, false
+			h.svc.RegisterOrgRemover(func(context.Context, *sql.Tx, string) error { orgCalls++; return nil })
+			h.svc.RegisterUserRemover(func(ctx context.Context, tx *sql.Tx, id string) error {
+				calls = append(calls, "a "+id)
+				var n int
+				if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM users WHERE id = ?`, id).Scan(&n); err != nil || n != 1 {
+					userGone = true
+				}
+				_, err := tx.ExecContext(ctx, `DELETE FROM owned WHERE owner_id = ?`, id)
+				return err
+			})
+			h.svc.RegisterUserRemover(func(_ context.Context, _ *sql.Tx, id string) error {
+				calls = append(calls, "b "+id)
+				return c.bErr
+			})
+			before := h.snapshot()
+			r := h.call(http.MethodDelete, "/api/v1/users/alice", h.admin, nil)
+			if want := []string{"a " + alice, "b " + alice}; !slices.Equal(calls, want) {
+				t.Errorf("calls = %v, want %v", calls, want)
+			}
+			if userGone {
+				t.Errorf("a remover ran after the user was removed")
+			}
+			owned := h.count(`SELECT count(*) FROM owned WHERE owner_id = ?`, alice)
+			if c.bErr != nil {
+				checkRefusal(t, "answer", r, http.StatusInternalServerError, "internal", "internal error")
+				if h.snapshot() != before || owned != 1 {
+					t.Errorf("the store changed (owned rows of alice: %d, want 1)", owned)
+				}
+			} else {
+				if r.status != http.StatusNoContent || len(r.body) != 0 {
+					t.Errorf("answer = %d %s, want 204 without a body", r.status, r.body)
+				}
+				if owned != 0 {
+					t.Errorf("owned rows of alice = %d, want the one the remover deleted gone", owned)
+				}
+				checkRefusal(t, "GET /users/alice", h.get("/api/v1/users/alice", h.admin), http.StatusNotFound, "not_found",
+					"user not found")
+			}
+			if orgCalls != 0 {
+				t.Errorf("a user delete called an org remover %d times, want none", orgCalls)
+			}
+			n := len(calls)
+			checkRefusal(t, "DELETE of a missing user", h.call(http.MethodDelete, "/api/v1/users/nobody", h.admin, nil),
+				http.StatusNotFound, "not_found", "user not found")
+			checkRefusal(t, "DELETE of the only active admin", h.call(http.MethodDelete, "/api/v1/users/root", h.admin, nil),
+				http.StatusConflict, "conflict", "the user is the only active admin")
+			if len(calls) != n {
+				t.Errorf("a refused delete called a remover: calls = %v", calls)
+			}
+		})
+	}
+}

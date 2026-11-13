@@ -40,6 +40,15 @@ func (s *Service) RegisterOrgRemover(fn Remover) {
 	s.removers.orgs = append(s.removers.orgs, fn)
 }
 
+// removeUserData calls every user remover, in registration order, with tx
+// and the user's id, and stops at the first error.
+func (s *Service) removeUserData(ctx context.Context, tx *sql.Tx, userID string) error {
+	s.removers.mu.Lock()
+	fns := slices.Clone(s.removers.user)
+	s.removers.mu.Unlock()
+	return callRemovers(ctx, tx, fns, userID)
+}
+
 // removeOrgData calls every org remover, in registration order, with tx
 // and the org's id, and stops at the first error.
 func (s *Service) removeOrgData(ctx context.Context, tx *sql.Tx, orgID string) error {

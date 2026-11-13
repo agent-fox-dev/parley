@@ -650,7 +650,7 @@ The admin routes so far: `POST /api/v1/users`, `GET /api/v1/users`,
 `GET /api/v1/users/{id}`, `PATCH /api/v1/users/{id}`,
 `POST /api/v1/users/{id}/promote`, `POST /api/v1/users/{id}/demote`,
 `POST /api/v1/users/{id}/block`, `POST /api/v1/users/{id}/unblock`,
-`POST /api/v1/orgs`, `GET /api/v1/orgs`, `PATCH /api/v1/orgs/{id}`,
+`DELETE /api/v1/users/{id}`, `POST /api/v1/orgs`, `GET /api/v1/orgs`, `PATCH /api/v1/orgs/{id}`,
 `PUT /api/v1/orgs/{id}/members/{user_id}`,
 `DELETE /api/v1/orgs/{id}/members/{user_id}`,
 `POST /api/v1/orgs/{id}/block`, `POST /api/v1/orgs/{id}/unblock` and
@@ -812,9 +812,10 @@ The hub never loses its last active admin to a demotion: demoting the only
 user with both the role `admin` and the status `active` is `409` `conflict`,
 and the role stays `admin`. Blocked admins do not count. The count and the
 demotion run in one write transaction, so of two concurrent demotions of
-the last two active admins one is refused. Blocking has no such
-safeguard, because the admin token can always unblock: blocking the only
-active admin answers `200`.
+the last two active admins one is refused; the same holds for a demotion
+and a [deletion](#delete-apiv1usersid) running together. Blocking has no
+such safeguard, because the admin token can always unblock: blocking the
+only active admin answers `200`.
 
 | Status | When |
 |---|---|
@@ -826,6 +827,41 @@ active admin answers `200`.
 ```json
 {"error":{"code":409,"message":"the user is the only active admin","error_type":"conflict"}}
 ```
+
+## `DELETE /api/v1/users/{id}`
+
+Deletes the user `{id}` names (see [User selectors](#user-selectors)),
+active or blocked, whatever the role. An admin route (see
+[Admin routes](#admin-routes)).
+
+In one transaction the hub deletes the user, every API key and every PAT of
+the user, workspace-bound ones included, and every membership of the user,
+and clears `owner_id` on the orgs the user owned. Those orgs, the user's
+personal org among them, are kept: their `owner_id` is `null` from then on
+and their `updated_at` is the time of the delete, and their other members
+stay. Afterwards the user is `404` `not_found` by id, e-mail and username
+and is gone from `GET /api/v1/users?include_blocked=true`, and a request
+with any of the user's former API keys or PATs is answered `401`
+`unauthenticated` (`invalid credentials`).
+
+The hub never loses its last active admin to a deletion: deleting the only
+user with both the role `admin` and the status `active`, also by that
+user's own API key, is `409` `conflict` and deletes nothing. The check and
+the delete run in one write transaction, like a demotion's (see
+[Role and status of a user](#role-and-status-of-a-user)).
+
+Data that other parts of the hub keep for the user is removed in the same
+transaction, before the user (see [ADR 03](adr/03-register-removers-of-owned-data-on-the-identity-service.md)).
+When that removal fails, the delete is undone as a whole, and the answer is
+`500` `internal`.
+
+| Status | When |
+|---|---|
+| `204 No Content` | the user was deleted; the body is empty |
+| `403` `forbidden` | the caller is not an admin (see [Admin routes](#admin-routes)) |
+| `404` `not_found` | no user has that id, e-mail or username (`user not found`). Nothing changes. |
+| `409` `conflict` | the user is the only active admin (`the user is the only active admin`). Nothing changes. |
+| `500` `internal` | removing data another part of the hub keeps for the user failed (`internal error`). Nothing changes. |
 
 ## Org selectors
 

@@ -27,6 +27,7 @@ var adminRoutes = []adminRoute{
 	{http.MethodPost, "/api/v1/users/:user/demote", nil},
 	{http.MethodPost, "/api/v1/users/:user/block", nil},
 	{http.MethodPost, "/api/v1/users/:user/unblock", nil},
+	{http.MethodDelete, "/api/v1/users/:user", nil},
 	{http.MethodPost, "/api/v1/orgs", newOrgBody("Zed Org", "zed-org")},
 	{http.MethodGet, "/api/v1/orgs", nil},
 	{http.MethodPatch, "/api/v1/orgs/:org", map[string]any{"url": "u"}},

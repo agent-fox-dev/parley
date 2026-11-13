@@ -3,7 +3,7 @@
   "spec_id": "05",
   "spec_name": "users_and_organizations",
   "schema_version": 3,
-  "updated_at": "2026-11-13T17:40:56Z",
+  "updated_at": "2026-11-13T17:46:26Z",
   "tasks": [
     {
       "id": 1,
@@ -35,7 +35,7 @@
     },
     {
       "id": 8,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 9,

@@ -25,6 +25,7 @@ func (s *Service) userRoutes() []server.Route {
 		{Method: http.MethodPost, Pattern: "/users/:id/demote", Marks: adminMark, Handler: s.setRole(RoleUser)},
 		{Method: http.MethodPost, Pattern: "/users/:id/block", Marks: adminMark, Handler: s.setStatus(StatusBlocked)},
 		{Method: http.MethodPost, Pattern: "/users/:id/unblock", Marks: adminMark, Handler: s.setStatus(StatusActive)},
+		{Method: http.MethodDelete, Pattern: "/users/:id", Marks: adminMark, Handler: s.deleteUser},
 	}
 }
 
@@ -235,5 +236,41 @@ func (s *Service) changeUser(w http.ResponseWriter, r *http.Request,
 		return err
 	}
 	server.WriteJSON(w, http.StatusOK, u)
+	return nil
+}
+
+// deleteUser answers DELETE /users/:id: in one store transaction it reads
+// the user the selector names, applies the last-admin guard, calls the user
+// removers with the user's id, then deletes the user with the user's API
+// keys, PATs and memberships and clears owner_id on the orgs the user
+// owned, and answers 204. The orgs are kept, so no org remover is called.
+// No user is 404 not_found and the only active admin 409 conflict, both
+// before any remover; a remover's error rolls the whole delete back and is
+// answered 500 internal.
+func (s *Service) deleteUser(w http.ResponseWriter, r *http.Request) error {
+	ctx := r.Context()
+	err := s.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+		u, err := UserBySelector(ctx, tx, server.Param(r, "id"))
+		if err != nil {
+			return err
+		}
+		if err := guardLastAdmin(ctx, tx, u); err != nil {
+			return err
+		}
+		if err := s.removeUserData(ctx, tx, u.ID); err != nil {
+			return err
+		}
+		return deleteUser(ctx, tx, u.ID, s.deps.Now())
+	})
+	if errors.Is(err, ErrNotFound) {
+		return errUserNotFound()
+	}
+	if ce := (conflictError{}); errors.As(err, &ce) {
+		return server.Conflict(ce.msg)
+	}
+	if err != nil {
+		return err
+	}
+	w.WriteHeader(http.StatusNoContent)
 	return nil
 }
