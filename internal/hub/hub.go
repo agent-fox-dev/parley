@@ -53,6 +53,7 @@ var parts = []func(*Composition){
 	composeIdempotency,
 	composeBootstrap,
 	composeIdentity,
+	composeAccess,
 }
 
 // Options are the inputs of Run. The process gives Args, Env, WorkDir,

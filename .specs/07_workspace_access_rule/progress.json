@@ -3,11 +3,11 @@
   "spec_id": "07",
   "spec_name": "workspace_access_rule",
   "schema_version": 3,
-  "updated_at": "",
+  "updated_at": "2026-11-13T22:03:23Z",
   "tasks": [
     {
       "id": 1,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 2,

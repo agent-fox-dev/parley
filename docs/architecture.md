@@ -11,6 +11,7 @@ command-line client. Both are written in Go, in the module
 |---|---|
 | `cmd/parley` | the `parley` program: it calls `cli.Run` and exits with its status |
 | `cmd/parleyd` | the `parleyd` program: `main` calls `hub.Run` with the process's arguments, environment and working directory and exits with its status |
+| `internal/access` | the workspace access rule, the one place that decides what a caller may do on a workspace; so far the minimal workspace record (slug, owner, org, kind, parent, status) in the transactional store, its insert and its reads |
 | `internal/buildinfo` | the version, commit and build time the binary was built with, shared by both programs |
 | `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra`, each declared through one helper ([ADR 02](adr/02-declare-every-cli-command-through-one-helper.md)), the client configuration file, the resolution of the hub URL and the credential, the one HTTP client the commands send their requests with, the printing of a command's result on stdout and of its warnings on stderr, the shared wait for a long operation (`--wait`, `--timeout`, `--poll-interval`), and the error envelopes and exit statuses every command ends with |
 | `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, and a registry of keys and whole sections that decides what the file may hold |
@@ -1124,6 +1125,54 @@ back, with everything earlier removers wrote through it. A package that
 keeps data for a user or an org registers its remover from its part in
 `internal/hub` through the `identity` field of `hub.Composition`, which
 `composeIdentity` sets.
+
+### Workspace access
+
+`internal/hub/access.go` adds the part `composeAccess`, after
+`composeIdentity` in `parts`. It adds the schema step `access.SchemaStep`
+(`workspace_records`) and registers no remover on the identity service: a
+workspace record outlives the deletion of its owner and of its org.
+
+The step creates the table `workspaces` in the transactional store:
+
+| Column | Holds |
+|---|---|
+| `slug` | the workspace's slug, the primary key, compared byte for byte (no case folding) |
+| `owner_id` | the id of the user who owns it; no foreign key to `users` |
+| `org_id` | the id of its org; no foreign key to `orgs` |
+| `kind` | `repository` or `fork` (a `CHECK` constraint) |
+| `parent_slug` | the slug of the repository a fork was created from; NULL for a repository, and no foreign key |
+| `status` | `pending`, `cloning`, `ready`, `failed` or `archived` (a `CHECK` constraint) |
+
+with an index on each of `owner_id`, `org_id` and `parent_slug`, for the
+list reads. A dangling `owner_id` matches no caller and a dangling `org_id`
+grants no membership, because the memberships of a deleted org are deleted
+with it.
+
+`internal/access/record.go` holds the record type `access.Record` (`Slug`,
+`OwnerID`, `OrgID`, `Kind`, `ParentSlug`, `Status`; `ParentSlug` is `""`
+for a repository and stored as NULL), the constants `KindRepository`,
+`KindFork` and `StatusPending` to `StatusArchived`, and the store functions,
+which take a `Querier` (the store's `*sql.DB` or an open `*sql.Tx`):
+
+- `InsertRecord(ctx, tx, rec)` stores a record in the caller's transaction.
+  It refuses, with an error wrapping `access.ErrInvalidRecord` and without
+  writing, a record with an empty slug, owner or org, an unknown kind or
+  status, a repository with a parent, a fork without one, and a fork whose
+  parent has no record, is a fork itself or is in another org; the parent is
+  read in the same transaction. A slug that has a record already is
+  refused with `access.ErrDuplicateSlug` (the insert is `ON CONFLICT (slug)
+  DO NOTHING`), and the stored record stays as it was.
+- `RecordBySlug(ctx, q, slug)` returns the record and `true`, or `false`
+  and a nil error for any string no record has as its slug.
+- `RecordsOwnedOrIn(ctx, q, ownerID, orgIDs)` lists the records owned by a
+  user or in one of a list of orgs, and `ForksOf(ctx, q, parents)` the forks
+  of a list of parents, both ordered by slug; an empty list of parents
+  lists nothing.
+
+The rule reads records through the interface `access.RecordReader`
+(`Record`, `OwnedOrIn`, `ForksOf`), so that a test can make a read fail;
+`access.StoreRecords(q)` is the one over these functions.
 
 ### The logger
 
