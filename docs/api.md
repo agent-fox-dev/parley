@@ -915,7 +915,11 @@ A PAT caller is held to the subset rule (see
 change adds, those of the new list the token does not have now: each must
 be in the caller's own `permissions`, compared exactly. A scope the token
 keeps, or one `DELETE` removes, is not checked; a PAT can therefore not
-widen itself either. An API key is not held to the rule.
+widen itself either. When the change adds a scope and the caller is
+limited to paths, the token's own `paths` must be covered as well: a token
+without `paths`, or with a glob none of the caller's globs covers, is
+refused, so that a PAT cannot give a scope to a token that would use it
+beyond the caller's paths. An API key is not held to the rule.
 
 The checks run in this order, the first that fails answering: the token is
 looked up (`404`, as for
@@ -931,6 +935,7 @@ authenticates, cannot be changed. A refused request changes nothing.
 | `403` `forbidden` | the caller is the admin token (`this route needs a user`) |
 | `403` `insufficient_scope` | a PAT without `tokens:write` or `tokens:manage` (`this route needs the scope tokens:write`) |
 | `403` `insufficient_scope` | a `PUT` or `PATCH` by a PAT that adds a scope it does not hold; the message names the first one (`permissions: this token does not hold "git:read"`) |
+| `403` `insufficient_scope` | a `PUT` or `PATCH` that adds a scope, by a PAT limited to paths, to a token without `paths` (`paths: this token is limited to paths, so it cannot add scopes to a token that is not`) or with a glob none of the caller's globs covers; the message names the first one (`paths: "src/**" is not covered by a glob of this token`) |
 | `404` `not_found` | the caller's user has no token with this id (`token not found`) |
 | `409` `conflict` | the token is revoked (`token is revoked`) or expired (`token is expired`) |
 

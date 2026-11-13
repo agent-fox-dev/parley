@@ -37,7 +37,7 @@ func (s *Service) tokenRoutes() []server.Route {
 // permissions with the list given, PATCH adds the scopes it does not have,
 // DELETE removes the scopes given. The checks run in a fixed order, the
 // owner lookup (404), the body (400), the subset rule on the scopes the
-// change adds for a PAT caller (403), then the token's state (409), so that
+// change adds and the token's paths for a PAT caller (403), then the token's state (409), so that
 // an answer tells nothing of a token the caller does not own and a change
 // is judged on a valid body. A change that leaves no scope revokes the
 // token in the same transaction. The answer is 200 with the token after the
@@ -61,7 +61,7 @@ func (s *Service) changeOwnTokenPermissions(w http.ResponseWriter, r *http.Reque
 		perms := changedPermissions(r.Method, cur.Permissions, given)
 		// DELETE adds nothing, so the rule never refuses it.
 		added := slices.DeleteFunc(slices.Clone(perms), func(scope string) bool { return slices.Contains(cur.Permissions, scope) })
-		if err := CheckPermissionSubset(caller, added); err != nil {
+		if err := CheckWidenSubset(caller, added, cur.Paths); err != nil {
 			return err
 		}
 		if cur.RevokedAt != nil {

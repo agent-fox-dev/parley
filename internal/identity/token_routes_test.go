@@ -634,6 +634,48 @@ func TestChangePermissions_HoldsACallingPATToTheScopesItAdds(t *testing.T) {
 	}
 }
 
+func TestChangePermissions_HoldsAPathLimitedPATToThePathsOfTheTokenItWidens(t *testing.T) {
+	t.Parallel()
+	h := newAliceHub(t)
+	for _, c := range []struct {
+		name, method string
+		paths        []string // the target's paths, nil for none
+		given        []string
+		named        string // what a refusal names, "" when the PAT may make the change
+	}{
+		{"PATCH onto a token without paths", http.MethodPatch, nil, []string{"git:write"}, "limited to paths"},
+		{"PUT adding to a token without paths", http.MethodPut, nil, []string{"vars:read", "git:write"}, "limited to paths"},
+		{"PATCH onto a token beyond its globs", http.MethodPatch, []string{"docs/*.md", "src/**"}, []string{"git:write"}, `"src/**"`},
+		{"PATCH onto a token within its globs", http.MethodPatch, []string{"docs/api/**"}, []string{"git:write"}, ""},
+		{"PATCH onto a token with the same glob", http.MethodPatch, []string{"docs/**"}, []string{"git:write"}, ""},
+		{"PUT adding nothing to a token without paths", http.MethodPut, nil, []string{"vars:read"}, ""},
+		{"DELETE from a token without paths", http.MethodDelete, nil, []string{"vars:read"}, ""},
+	} {
+		value, _ := h.seedPAT(identity.PATSpec{UserID: h.alice.ID, Permissions: []string{"tokens:write", "git:write"},
+			Paths: []string{"docs/**"}})
+		_, target := h.seedPAT(identity.PATSpec{UserID: h.alice.ID, Permissions: []string{"vars:read", "tokens:write"}, Paths: c.paths})
+		body := map[string]any{"permissions": c.given}
+		before := h.snapshot()
+		r := h.call(c.method, permissionsPath(target.TokenID), "Bearer "+value, body)
+		if c.named == "" {
+			if r.status != http.StatusOK {
+				t.Errorf("%s: answer = %d %s, want 200", c.name, r.status, r.body)
+			}
+			continue
+		}
+		msg, _ := r.errorField("message").(string)
+		if r.status != http.StatusForbidden || r.errorField("error_type") != "insufficient_scope" || !strings.Contains(msg, c.named) {
+			t.Errorf("%s: answer = %d %s, want 403 insufficient_scope naming %s", c.name, r.status, r.body, c.named)
+		}
+		if h.snapshot() != before {
+			t.Errorf("%s: the store changed", c.name)
+		}
+		if r := h.call(c.method, permissionsPath(target.TokenID), "Bearer "+h.key, body); r.status != http.StatusOK {
+			t.Errorf("%s with an API key: answer = %d %s, want 200", c.name, r.status, r.body)
+		}
+	}
+}
+
 func TestChangePermissions_RefusesARevokedOrExpiredToken(t *testing.T) {
 	t.Parallel()
 	h := newAliceHub(t)

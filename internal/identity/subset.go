@@ -24,27 +24,40 @@ import (
 // rule, and nil is returned for them. The values are expected to be
 // validated already: an invalid request is answered as invalid, not here.
 func CheckSubset(caller Principal, permissions, paths []string) error {
-	if err := CheckPermissionSubset(caller, permissions); err != nil {
+	if err := checkPermissionSubset(caller, permissions); err != nil {
 		return err
 	}
-	if caller.Type != TypePAT || caller.Paths == nil {
-		return nil
-	}
-	if paths == nil {
-		return server.InsufficientScope("paths is required: this token is limited to paths, so the token it creates must be too")
-	}
-	if g, ok := FirstUncovered(caller.Paths, paths); ok {
-		return server.InsufficientScope(fmt.Sprintf("paths: %q is not covered by a glob of this token", g))
-	}
-	return nil
+	return checkPathSubset(caller, paths,
+		"paths is required: this token is limited to paths, so the token it creates must be too")
 }
 
-// CheckPermissionSubset is the permission half of CheckSubset, for a
-// request that asks for permissions and no paths, such as adding scopes to
-// a token, whose paths do not change: the first permission, in request
-// order, that a PAT caller does not hold exactly is refused with 403
-// insufficient_scope. Other callers are not held to it.
-func CheckPermissionSubset(caller Principal, permissions []string) error {
+// CheckWidenSubset holds a PAT caller to the subset rule when it adds the
+// scopes added to an existing token whose paths are targetPaths, nil being
+// none: the change cannot touch the token's paths, so the token it leaves
+// is within the caller only if the caller holds every added scope exactly
+// and its globs cover the token's paths. Otherwise a PAT limited to paths
+// could give a scope it holds to a token without that limit, which would
+// then use the scope anywhere. A change that adds nothing, such as one that
+// removes scopes, never widens a token and is never refused.
+//
+// A refusal is 403 insufficient_scope naming the first added scope, in
+// request order, the caller does not hold, and only when every one is
+// held, the first of the token's globs none of the caller's globs covers,
+// or that the token has no path limit. Other callers are not held to it.
+func CheckWidenSubset(caller Principal, added, targetPaths []string) error {
+	if len(added) == 0 {
+		return nil
+	}
+	if err := checkPermissionSubset(caller, added); err != nil {
+		return err
+	}
+	return checkPathSubset(caller, targetPaths,
+		"paths: this token is limited to paths, so it cannot add scopes to a token that is not")
+}
+
+// checkPermissionSubset refuses the first permission, in request order,
+// that a PAT caller does not hold exactly.
+func checkPermissionSubset(caller Principal, permissions []string) error {
 	if caller.Type != TypePAT {
 		return nil
 	}
@@ -52,6 +65,22 @@ func CheckPermissionSubset(caller Principal, permissions []string) error {
 		if !slices.Contains(caller.Permissions, p) {
 			return server.InsufficientScope(fmt.Sprintf("permissions: this token does not hold %q", p))
 		}
+	}
+	return nil
+}
+
+// checkPathSubset refuses, for a PAT caller with path limits, paths that
+// are nil, with the message unlimited, or the first glob of paths that none
+// of the caller's globs covers.
+func checkPathSubset(caller Principal, paths []string, unlimited string) error {
+	if caller.Type != TypePAT || caller.Paths == nil {
+		return nil
+	}
+	if paths == nil {
+		return server.InsufficientScope(unlimited)
+	}
+	if g, ok := FirstUncovered(caller.Paths, paths); ok {
+		return server.InsufficientScope(fmt.Sprintf("paths: %q is not covered by a glob of this token", g))
 	}
 	return nil
 }
