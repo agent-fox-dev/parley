@@ -926,6 +926,26 @@ now)` in `authenticate.go`, the predicate authentication's `checkState`
 uses, so a token is `409` here exactly when it is `401` there. `paths`,
 `workspace`, `name` and `expires_at` are never written.
 
+`internal/identity/key_routes.go` holds the routes of the caller's own API
+keys, each carrying `identity.MarkNeedsUser`. `APIKey.MarshalJSON` writes
+the Key object (`key_id`, `user_id`, `expires_at`, `revoked_at`,
+`created_at`), so no answer built from a record can carry a secret.
+`GET /user/keys` declares `keys:read` and lists with `listKeys`, newest
+first (`created_at`, then `key_id`, both descending) with keyset paging on
+those two. `DELETE /user/keys/:key_id` declares `keys:manage` and revokes
+with `revokeKeyOfUser`, which sets `revoked_at` only while it is `NULL`, in
+one transaction with the owner lookup. `POST /user/keys/:key_id/refresh`
+declares no scope and is not a create route: its handler refuses any caller
+but an API key with `403 forbidden` before the lookup, refuses a revoked or
+expired key (the same `expired` predicate) with `409 conflict`, and in one
+transaction stores the hash of a new `randomString(apiKeyAlphabet,
+secretLength)` secret and the new `expires_at` with `setKeySecret`;
+authentication reads the stored hash on every request, so the old secret
+fails from the next one. Every `:key_id` route resolves the id with
+`keyOfUser`, which answers a missing key and another user's alike, `404`
+`API key not found`. `s.writeKeys(w, r, userID)` and `s.revokeKey(w, r,
+userID)` take the user id, so the admin routes reuse them.
+
 `POST /users` (`createUser`) decodes the body into a
 `map[string]json.RawMessage`, so that a missing member, `null` and a value
 of another type are told apart: `username`, `email`, `provider` and

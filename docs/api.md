@@ -670,6 +670,83 @@ membership in an active org gets `items` `[]`.
 | `403` `forbidden` | the caller is the admin token (`this route needs a user`) |
 | `403` `insufficient_scope` | a PAT without `orgs:read` or a scope that implies it (see [Scopes](#scopes)) |
 
+## `GET /api/v1/user/keys`
+
+Lists the caller's API keys, a [list](#lists) in the standard pages. The
+route needs a user, as `GET /api/v1/user` does, and declares the scope
+`keys:read` for a PAT, which `keys:manage` satisfies.
+
+The list holds every API key of the caller's user in any state: live,
+revoked and expired. It is ordered newest first: `created_at` descending,
+then `key_id` descending. Each item is a Key object, which has exactly
+`key_id`, `user_id`, `expires_at`, `revoked_at` and `created_at`, with
+`null` for what is unset; the times are RFC 3339 in UTC with whole seconds.
+No Key object carries the key's value or its secret.
+
+```json
+{"key_id":"Ab3dE5gH","user_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","expires_at":"2026-04-01T00:00:00Z","revoked_at":null,"created_at":"2026-01-01T00:00:00Z"}
+```
+
+| Status | When |
+|---|---|
+| `200 OK` | the body is a page: `items` are Key objects |
+| `400` `invalid_request` | a bad `limit` or `cursor` (see [Lists](#lists)) |
+| `403` `forbidden` | the caller is the admin token (`this route needs a user`) |
+| `403` `insufficient_scope` | a PAT without `keys:read` or `keys:manage` (`this route needs the scope keys:read`) |
+
+## `POST /api/v1/user/keys/{key_id}/refresh`
+
+Gives one of the caller's live API keys a new secret without a new login.
+The key keeps its `key_id`; its new secret is 32 characters from
+`[0-9A-Za-z]`, of which only a hash is stored, and its `expires_at` is
+`expires_days` × 24 hours after the time of the request, counted from its
+whole second, or `null` for a key that never expires. The old secret no
+longer authenticates from the next request on. The body is ignored. The
+route is not a create route: an `Idempotency-Key` is ignored, and a second
+request refreshes again.
+
+Only an API key may refresh. The route needs a user, so the admin token is
+refused by authentication, and a PAT, whatever its scopes, is answered
+`403` `forbidden` `this route needs an API key` before the key is looked
+up. A `key_id` that names no key and one that names another user's key get
+the same answer, `404` `not_found` with the message `API key not found`, so
+the answer tells nothing of other users' keys; every route under
+`/api/v1/user/keys/{key_id}` looks the key up this way. A revoked key, and
+one whose `expires_at` has come, cannot be refreshed. A refused request
+changes nothing.
+
+The answer has exactly `key`, the new value `parley_<key_id>_<secret>`,
+shown this once; `key_id`; and `expires_at`:
+
+```json
+{"key":"parley_Ab3dE5gH_0123456789abcdefghijABCDEFGHIJKL","key_id":"Ab3dE5gH","expires_at":"2026-05-01T00:00:00Z"}
+```
+
+| Status | When |
+|---|---|
+| `200 OK` | the key has a new secret; the body is `key`, `key_id` and `expires_at` |
+| `403` `forbidden` | the caller is the admin token (`this route needs a user`) or a PAT (`this route needs an API key`) |
+| `404` `not_found` | the caller's user has no key with this id (`API key not found`) |
+| `409` `conflict` | the key is revoked (`API key is revoked`) or expired (`API key is expired`) |
+
+## `DELETE /api/v1/user/keys/{key_id}`
+
+Revokes one of the caller's API keys: its `revoked_at` is set to the time
+of the request and the record is kept, so the key stays in the list and no
+longer authenticates. An expired key is revoked too, and so is the key the
+request came with. The route needs a user and declares the scope
+`keys:manage` for a PAT, checked before the key is looked up. A key that is
+already revoked is answered as it is, with its earlier `revoked_at`;
+nothing changes. A key not found is answered as for
+[`POST /api/v1/user/keys/{key_id}/refresh`](#post-apiv1userkeyskey_idrefresh).
+
+| Status | When |
+|---|---|
+| `200 OK` | the key is revoked; the body is the Key object with `revoked_at` set |
+| `403` `forbidden` | the caller is the admin token (`this route needs a user`) |
+| `403` `insufficient_scope` | a PAT without `keys:manage` (`this route needs the scope keys:manage`) |
+| `404` `not_found` | the caller's user has no key with this id (`API key not found`) |
+
 ## `POST /api/v1/user/tokens`
 
 Mints a personal access token (PAT) owned by the caller's user. The route

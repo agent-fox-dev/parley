@@ -112,6 +112,18 @@ type APIKey struct {
 	hash string
 }
 
+// MarshalJSON writes k as the REST API's Key object. The secret is not
+// part of an APIKey, so no Key object shows it.
+func (k APIKey) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		KeyID     string        `json:"key_id"`
+		UserID    string        `json:"user_id"`
+		ExpiresAt *timefmt.Time `json:"expires_at"`
+		RevokedAt *timefmt.Time `json:"revoked_at"`
+		CreatedAt timefmt.Time  `json:"created_at"`
+	}{k.KeyID, k.UserID, (*timefmt.Time)(k.ExpiresAt), (*timefmt.Time)(k.RevokedAt), timefmt.Time(k.CreatedAt)})
+}
+
 // PAT is the stored record of a personal access token; its secret is not
 // part of it.
 type PAT struct {
@@ -292,13 +304,24 @@ FROM users WHERE `+where, args...).Scan(&u.ID, &u.Username, &u.Email, &u.FullNam
 // APIKeyByID returns the record of the API key with the id keyID, or
 // ErrNotFound.
 func APIKeyByID(ctx context.Context, q Querier, keyID string) (APIKey, error) {
+	k, err := scanAPIKey(q.QueryRowContext(ctx, `SELECT `+apiKeyColumns+` FROM api_keys WHERE key_id = ?`, keyID))
+	if err != nil {
+		return APIKey{}, lookupErr("API key", err)
+	}
+	return k, nil
+}
+
+// apiKeyColumns are the columns of the api_keys table that scanAPIKey
+// reads, in its order.
+const apiKeyColumns = `key_id, user_id, secret_hash, expires_days, expires_at, revoked_at, created_at`
+
+// scanAPIKey reads an API key from a row of apiKeyColumns.
+func scanAPIKey(row interface{ Scan(dest ...any) error }) (APIKey, error) {
 	var k APIKey
 	var expires, revoked sql.NullInt64
 	var created int64
-	err := q.QueryRowContext(ctx, `SELECT key_id, user_id, secret_hash, expires_days, expires_at, revoked_at, created_at
-FROM api_keys WHERE key_id = ?`, keyID).Scan(&k.KeyID, &k.UserID, &k.hash, &k.ExpiresDays, &expires, &revoked, &created)
-	if err != nil {
-		return APIKey{}, lookupErr("API key", err)
+	if err := row.Scan(&k.KeyID, &k.UserID, &k.hash, &k.ExpiresDays, &expires, &revoked, &created); err != nil {
+		return APIKey{}, err
 	}
 	k.ExpiresAt, k.RevokedAt, k.CreatedAt = nullTime(expires), nullTime(revoked), fromNanos(created)
 	return k, nil

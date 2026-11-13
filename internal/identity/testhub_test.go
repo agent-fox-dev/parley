@@ -508,7 +508,7 @@ func checkRefusal(t *testing.T, what string, r response, status int, errorType, 
 
 // everyScope is every scope a route of the identity service declares, so
 // that a PAT holding them passes the scope check of every identity route.
-var everyScope = []string{"users:read", "users:write", "orgs:read", "tokens:read", "tokens:write", "tokens:manage"}
+var everyScope = []string{"users:read", "users:write", "orgs:read", "keys:read", "keys:manage", "tokens:read", "tokens:write", "tokens:manage"}
 
 // omitted marks a member that tokenBody leaves out.
 type omitted struct{}
@@ -548,6 +548,16 @@ func (h *testHub) storedPAT(tokenID string) identity.PAT {
 	rec, err := identity.PATByID(context.Background(), h.st.Main(), tokenID)
 	if err != nil {
 		h.t.Fatalf("read PAT %s: %v", tokenID, err)
+	}
+	return rec
+}
+
+// storedKey reads the record of the API key keyID from the hub's store.
+func (h *testHub) storedKey(keyID string) identity.APIKey {
+	h.t.Helper()
+	rec, err := identity.APIKeyByID(context.Background(), h.st.Main(), keyID)
+	if err != nil {
+		h.t.Fatalf("read API key %s: %v", keyID, err)
 	}
 	return rec
 }
