@@ -34,66 +34,16 @@ const callbackRequestTimeout = 60 * time.Second
 // maxLoginBody bounds how much of the hub's answer, and of stdin, is read.
 const maxLoginBody = 1 << 20
 
-// hubErrorExitStatus is what parley login returns when the hub refused it.
-const hubErrorExitStatus = 1
-
-// loginError is how parley login fails: run writes envelope to stderr as it
-// is and exits with status. A hub's refusal carries the hub's own envelope
-// bytes; a failure on the client's side carries one built by envelopeError.
-type loginError struct {
-	status   int
-	envelope []byte
-}
-
-func (e *loginError) Error() string { return string(bytes.TrimSpace(e.envelope)) }
-
-// errorEnvelope is the shape of the hub's error answers, which the client
-// reuses for its own failures with code 0.
-type errorEnvelope struct {
-	Error struct {
-		Code      int    `json:"code"`
-		Message   string `json:"message"`
-		ErrorType string `json:"error_type"`
-	} `json:"error"`
-}
-
-// envelopeError is a failure on the client's side, exit status 2, with an
-// envelope of code 0 and errorType.
-func envelopeError(errorType, format string, args ...any) *loginError {
-	var env errorEnvelope
-	env.Error.Message = fmt.Sprintf(format, args...)
-	env.Error.ErrorType = errorType
-	body, _ := json.Marshal(env)
-	return &loginError{status: usageExitStatus, envelope: append(body, '\n')}
-}
-
-// clientError is a failure the client cannot blame on its arguments: no hub
-// URL, an unreadable config file or answer, an unreachable hub.
-func clientError(format string, args ...any) *loginError {
-	return envelopeError("client_error", format, args...)
-}
-
-// usageError is a failure caused by the arguments.
-func usageError(format string, args ...any) *loginError {
-	return envelopeError("usage_error", format, args...)
-}
-
-func newLoginCommand(endpointURL *string, opts options) *cobra.Command {
-	var provider, expires, apiKey string
+func newLoginCommand(opts options) *cobra.Command {
+	var provider, expires string
 	cmd := &cobra.Command{
 		Use:   "login",
 		Short: "Sign in to the hub and save the hub URL and the credential",
-		// A bad flag or argument fails like a bad --expires: a usage_error
-		// envelope, not the one error line of the other commands.
-		Args: func(cmd *cobra.Command, args []string) error {
-			if err := cobra.NoArgs(cmd, args); err != nil {
-				return usageError("%v", err)
-			}
-			return nil
-		},
+		Args:  checkArgs(nil),
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			// Only the flag selects the key flow; --provider and --expires
-			// belong to the browser flow.
+			// Only the global flag --api-key selects the key flow, not
+			// PARLEY_API_KEY or the file; --provider and --expires belong to
+			// the browser flow.
 			browser := !cmd.Flags().Changed("api-key")
 			var days int
 			if browser {
@@ -113,7 +63,7 @@ func newLoginCommand(endpointURL *string, opts options) *cobra.Command {
 			if err != nil {
 				return clientError("%v", err)
 			}
-			hubURL := loginHubURL(*endpointURL, cfg)
+			hubURL := loginHubURL(globalFlag(cmd, "endpoint-url"), cfg)
 			if hubURL == "" {
 				return clientError("no hub URL: pass --endpoint-url, set %s or set %s in %s", endpointURLEnv, configEndpointURL, path)
 			}
@@ -122,7 +72,7 @@ func newLoginCommand(endpointURL *string, opts options) *cobra.Command {
 			var user loginUser
 			if browser {
 				cred, user, err = browserLogin(cmd.Context(), hubURL, provider, days, opts, cmd.ErrOrStderr())
-			} else if cred, err = loginCredential(apiKey, opts.stdin); err == nil {
+			} else if cred, err = loginCredential(globalFlag(cmd, "api-key"), opts.stdin); err == nil {
 				user, err = hubUser(cmd.Context(), hubURL, cred)
 			}
 			if err != nil {
@@ -145,8 +95,6 @@ func newLoginCommand(endpointURL *string, opts options) *cobra.Command {
 	}
 	cmd.Flags().StringVar(&provider, "provider", "github", "identity provider of the browser login")
 	cmd.Flags().StringVar(&expires, "expires", "90", "days the browser login's API key lives: 0, 30, 60 or 90 (0: no expiry)")
-	cmd.Flags().StringVar(&apiKey, "api-key", "", "store this credential instead of signing in through the browser (- reads it from stdin)")
-	cmd.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return usageError("%v", err) })
 	return cmd
 }
 
@@ -199,7 +147,7 @@ func hubUser(ctx context.Context, hubURL, cred string) (loginUser, error) {
 // hubCall sends a request to the hub, with cred as the bearer credential
 // unless it is empty and with body as JSON unless it is nil, waits up to
 // timeout, and returns the body of a 200 answer. A hub's error envelope comes
-// back as a loginError with the envelope's bytes; any other failure is a
+// back as a hubError with the envelope's bytes; any other failure is a
 // client_error.
 func hubCall(ctx context.Context, method, target, cred string, body []byte, timeout time.Duration) ([]byte, error) {
 	var payload io.Reader
@@ -228,7 +176,7 @@ func hubCall(ctx context.Context, method, target, cred string, body []byte, time
 	}
 	if resp.StatusCode != http.StatusOK {
 		if isErrorEnvelope(answer) {
-			return nil, &loginError{status: hubErrorExitStatus, envelope: answer}
+			return nil, &hubError{status: resp.StatusCode, body: answer}
 		}
 		return nil, clientError("the hub answered %s without an error envelope", resp.Status)
 	}

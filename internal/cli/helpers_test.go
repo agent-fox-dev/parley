@@ -21,6 +21,8 @@ import (
 
 	"github.com/BurntSushi/toml"
 	"github.com/agent-fox-dev/parley/internal/buildinfo"
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 // setBuildValues sets the build values of internal/buildinfo for the test and
@@ -54,6 +56,74 @@ func runCLIWith(t *testing.T, opts options, args ...string) (int, string, string
 	var stdout, stderr bytes.Buffer
 	code := run(context.Background(), args, &stdout, &stderr, opts)
 	return code, stdout.String(), stderr.String()
+}
+
+// withProbes is opts with the command group "probe" added to the tree, which
+// exists only in tests: "probe get <name>" (GET /things/:name, auth user),
+// "probe count" (an int flag --limit) and the commands more builds. The tree
+// is built afresh on every run, so more is called once per run.
+func withProbes(opts options, more ...func() *cobra.Command) options {
+	opts.extra = append(slices.Clone(opts.extra), func() *cobra.Command {
+		children := []*cobra.Command{
+			declare(command{
+				Name:        "get",
+				Description: "Get a thing",
+				Method:      http.MethodGet,
+				Path:        "/things/:name",
+				Args:        []argSpec{{Name: "name", Required: true}},
+				Auth:        authUser,
+				Run:         sendProbeRequest,
+			}),
+			declare(command{
+				Name:        "count",
+				Description: "Count the things",
+				Method:      http.MethodGet,
+				Path:        "/things",
+				Auth:        authUser,
+				Flags:       func(fs *pflag.FlagSet) { fs.Int("limit", 0, "the most things to count") },
+				Run:         sendProbeRequest,
+			}),
+		}
+		for _, build := range more {
+			children = append(children, build())
+		}
+		return group("probe", "Commands that exist only in tests", children...)
+	})
+	return opts
+}
+
+// sendProbeRequest is the run step of the probe commands: it sends one GET to
+// the hub PARLEY_ENDPOINT_URL names, so a test that counts the hub's requests
+// sees whether the run step was reached.
+func sendProbeRequest(c *call) error {
+	resp, err := http.Get(os.Getenv("PARLEY_ENDPOINT_URL") + "/api/v1/things/" + url.PathEscape(c.args["name"]))
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	return nil
+}
+
+// probeReturning builds "probe outcome", a command of auth none whose run
+// step returns err.
+func probeReturning(err error) func() *cobra.Command {
+	return func() *cobra.Command {
+		return declare(command{
+			Name:        "outcome",
+			Description: "Return a given outcome",
+			Auth:        authNone,
+			Run:         func(*call) error { return err },
+		})
+	}
+}
+
+// oneJSONDocument decodes s, which must hold exactly one JSON document and
+// nothing else (json.Unmarshal refuses anything after the first value), into v.
+func oneJSONDocument(t *testing.T, s string, v any) {
+	t.Helper()
+	if err := json.Unmarshal([]byte(s), v); err != nil {
+		t.Fatalf("not exactly one JSON document (%v): %q", err, s)
+	}
 }
 
 // nonEmptyLines splits s into its lines, without the empty ones.

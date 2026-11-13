@@ -41,26 +41,28 @@ type serverBuild struct {
 	GoVersion string `json:"go_version"`
 }
 
-func newVersionCommand(endpointURL *string, timeout time.Duration) *cobra.Command {
-	return &cobra.Command{
-		Use:   "version",
-		Short: "Print the client's build and, given a hub URL, the hub's build",
-		Args:  cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
+func newVersionCommand() *cobra.Command {
+	return declare(command{
+		Name:        "version",
+		Description: "Print the client's build and, given a hub URL, the hub's build",
+		Method:      http.MethodGet,
+		Path:        "/version",
+		Auth:        authNone,
+		Run: func(c *call) error {
 			info := buildinfo.Get()
 			doc := versionDocument{CLI: clientBuild{Version: info.Version, Commit: info.Commit}}
 
-			hubURL := *endpointURL
+			hubURL := globalFlag(c.cmd, "endpoint-url")
 			if hubURL == "" {
 				hubURL = os.Getenv(endpointURLEnv)
 			}
 			if hubURL != "" {
-				server, err := hubVersion(cmd.Context(), hubURL, timeout)
+				server, err := hubVersion(c.ctx, hubURL, c.opts.versionTimeout)
 				if err != nil {
 					// The client's own build is still worth printing, so a hub
 					// that cannot be read is a warning and not a failure.
 					reason := strings.ReplaceAll(err.Error(), "\n", " ")
-					fmt.Fprintf(cmd.ErrOrStderr(), "warning: cannot read the hub's version from %s: %s\n", hubURL, reason)
+					fmt.Fprintf(c.stderr, "warning: cannot read the hub's version from %s: %s\n", hubURL, reason)
 				}
 				doc.Server = server
 			}
@@ -69,10 +71,10 @@ func newVersionCommand(endpointURL *string, timeout time.Duration) *cobra.Comman
 			if err != nil {
 				return fmt.Errorf("encode the version document: %w", err)
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "%s\n", out)
+			fmt.Fprintf(c.stdout, "%s\n", out)
 			return nil
 		},
-	}
+	})
 }
 
 // hubVersion asks the hub at hubURL for its build, without a credential.

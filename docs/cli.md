@@ -304,6 +304,7 @@ grace starts again and the process does not exit early.
 
 ```
 Usage:
+  parley [flags]
   parley [command]
 ```
 
@@ -314,6 +315,7 @@ and exits `0`. It reads no credential and sends no request:
 parley is the command-line client of the Parley hub
 
 Usage:
+  parley [flags]
   parley [command]
 
 Available Commands:
@@ -322,17 +324,23 @@ Available Commands:
   version     Print the client's build and, given a hub URL, the hub's build
 
 Flags:
+      --api-key string        credential presented to the hub; parley login stores it (- reads it from stdin)
       --endpoint-url string   URL of the hub (default: $PARLEY_ENDPOINT_URL)
   -h, --help                  help for parley
+      --json                  print the help as JSON
 
 Use "parley [command] --help" for more information about a command.
 ```
 
 ### Global flags
 
+Every command takes the global flags, before or after its own words.
+
 | Flag | Effect |
 |---|---|
 | `--endpoint-url <url>` | the URL of the hub, for example `http://127.0.0.1:8080`. When it is absent or empty, `PARLEY_ENDPOINT_URL` gives it, and for `parley login` then the key `endpoint_url` of the client configuration file (see [configuration.md](configuration.md#parley)) |
+| `--api-key <credential>` | the credential presented to the hub. `parley login --api-key` stores it (see [With a credential](#with-a-credential---api-key)); no other command sends one yet |
+| `--json` | accepted on every command; it has no effect yet |
 | `-h`, `--help` | print the help of the command on stdout and exit `0` |
 
 ### `parley version`
@@ -384,7 +392,8 @@ prints the document without `server`:
 warning: cannot read the hub's version from http://127.0.0.1:1: Get "http://127.0.0.1:1/version": dial tcp 127.0.0.1:1: connect: connection refused
 ```
 
-`parley version` takes no arguments.
+`parley version` takes no arguments: `parley version extra` is a
+`usage_error` with exit status `2`.
 
 ### `parley login`
 
@@ -393,10 +402,14 @@ Usage:
   parley login [flags]
 
 Flags:
-      --api-key string    store this credential instead of signing in through the browser (- reads it from stdin)
       --expires string    days the browser login's API key lives: 0, 30, 60 or 90 (0: no expiry) (default "90")
   -h, --help              help for login
       --provider string   identity provider of the browser login (default "github")
+
+Global Flags:
+      --api-key string        credential presented to the hub; parley login stores it (- reads it from stdin)
+      --endpoint-url string   URL of the hub (default: $PARLEY_ENDPOINT_URL)
+      --json                  print the help as JSON
 ```
 
 `parley login` saves the hub URL, a credential and the user's id in the
@@ -409,11 +422,17 @@ file's `endpoint_url`, and drops trailing slashes from it. With none it
 fails before any request:
 
 ```json
-{"error":{"code":0,"message":"no hub URL: pass --endpoint-url, set PARLEY_ENDPOINT_URL or set endpoint_url in /home/alice/.parley/config.toml","error_type":"client_error"}}
+{
+  "error": {
+    "code": 0,
+    "message": "no hub URL: pass --endpoint-url, set PARLEY_ENDPOINT_URL or set endpoint_url in /home/alice/.parley/config.toml",
+    "error_type": "client_error"
+  }
+}
 ```
 
-Only the flag `--api-key` selects the key flow; `PARLEY_API_KEY` and the
-file's `api_key` do not. Without `--api-key`, `parley login` signs in
+Only the global flag `--api-key` selects the key flow; `PARLEY_API_KEY` and
+the file's `api_key` do not. Without `--api-key`, `parley login` signs in
 through the browser.
 
 #### Through the browser
@@ -525,7 +544,8 @@ exits `1`:
 #### Failures
 
 Every failure prints nothing on stdout. A failure on the client's side
-writes one error envelope with `code` `0` to stderr and exits `2`; its
+writes one error envelope with `code` `0` to stderr (see
+[Errors and exit statuses](#errors-and-exit-statuses)) and exits `2`; its
 `error_type` is `usage_error` for an unknown flag, a flag without its
 value, a positional argument, an empty credential and a bad `--expires`,
 none of which sends a request, and `client_error` for everything else: a
@@ -541,20 +561,77 @@ the hub accepted the credential or issued the key. In that last case the
 credential stays valid and is not saved:
 
 ```json
-{"error":{"code":0,"message":"cannot reach the hub: Get \"http://127.0.0.1:1/api/v1/user\": dial tcp 127.0.0.1:1: connect: connection refused","error_type":"client_error"}}
-{"error":{"code":0,"message":"the hub accepted the credential, but it was not saved to /home/alice/.parley/config.toml: open /home/alice/.parley/.config.toml.1234567: permission denied","error_type":"client_error"}}
-{"error":{"code":0,"message":"the hub issued an API key, but it was not saved to /home/alice/.parley/config.toml: open /home/alice/.parley/.config.toml.1234567: permission denied","error_type":"client_error"}}
-{"error":{"code":0,"message":"the sign-in failed: the browser came back without the state this login sent","error_type":"client_error"}}
-{"error":{"code":0,"message":"the browser did not come back from the sign-in within 2m0s","error_type":"client_error"}}
+{
+  "error": {
+    "code": 0,
+    "message": "cannot reach the hub: Get \"http://127.0.0.1:1/api/v1/user\": dial tcp 127.0.0.1:1: connect: connection refused",
+    "error_type": "client_error"
+  }
+}
+{
+  "error": {
+    "code": 0,
+    "message": "the hub accepted the credential, but it was not saved to /home/alice/.parley/config.toml: open /home/alice/.parley/.config.toml.1234567: permission denied",
+    "error_type": "client_error"
+  }
+}
+{
+  "error": {
+    "code": 0,
+    "message": "the hub issued an API key, but it was not saved to /home/alice/.parley/config.toml: open /home/alice/.parley/.config.toml.1234567: permission denied",
+    "error_type": "client_error"
+  }
+}
+{
+  "error": {
+    "code": 0,
+    "message": "the sign-in failed: the browser came back without the state this login sent",
+    "error_type": "client_error"
+  }
+}
+{
+  "error": {
+    "code": 0,
+    "message": "the browser did not come back from the sign-in within 2m0s",
+    "error_type": "client_error"
+  }
+}
 ```
 
 Nothing is saved on any failure: the config file is neither created nor
 changed.
 
-### Exit statuses
+### Errors and exit statuses
+
+stdout carries the result, and nothing on a failure. Every error goes to
+stderr as one error envelope, a JSON document indented by two spaces and
+followed by a newline, and nothing else: no usage text follows it. An error
+the hub answered is written as the hub sent it. An error `parley` raises
+itself has `code` `0`, a message and one of five `error_type`s:
+
+```json
+{
+  "error": {
+    "code": 0,
+    "message": "unknown command \"nosuch\" for \"parley\"",
+    "error_type": "usage_error"
+  }
+}
+```
+
+| `error_type` | When |
+|---|---|
+| `usage_error` | the command line cannot be accepted: an unknown command, at the top level or under a group, an unknown flag, a flag without its value or with a value that does not parse as the flag's type, fewer or more arguments than the command takes, or a value the command refuses (`parley login --expires 45`). It is raised before any setting is read and before any request |
+| `client_error` | a failure on the client's side that is not the command line's: for example no hub URL, a configuration file that cannot be read, a hub that cannot be reached, an answer that is not the hub's. A failure inside the CLI of no other kind is reported as a `client_error` too, with its text as the message |
+| `wait_failed` | a wait for a long operation ended in a state that is not a success |
+| `wait_timeout` | a wait for a long operation ran out of time |
+| `condition_not_met` | a `--fail-on-…` condition held in the result |
+
+The exit status follows from the error alone, on every command:
 
 | Status | When |
 |---|---|
-| `0` | help, `parley version`, whether or not the hub answered, or a `parley login` that saved the credential or the new API key |
-| `1` | `parley login`: the hub answered with an error envelope, which is written to stderr as received |
-| `2` | an unknown command or flag, or an argument a command does not take; `parley` writes one line `error: <message>` to stderr, for example `error: unknown command "nope" for "parley"`. `parley login` instead reports a bad flag or argument, and any other failure on the client's side, as an error envelope with `code` `0`, for example `{"error":{"code":0,"message":"unknown flag: --nope","error_type":"usage_error"}}` (see [Failures](#failures)) |
+| `0` | success, including help and `parley version` whether or not the hub answered |
+| `1` | the hub answered with an error envelope (written to stderr as received), or `wait_failed` or `wait_timeout` |
+| `2` | `usage_error` or `client_error` |
+| `3` | `condition_not_met` |

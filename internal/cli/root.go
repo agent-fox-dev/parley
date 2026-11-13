@@ -5,17 +5,12 @@ package cli
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"io"
 	"os"
 	"time"
 
 	"github.com/spf13/cobra"
 )
-
-// usageExitStatus is what Run returns for arguments it cannot parse.
-const usageExitStatus = 2
 
 // options holds the settings tests change; RunWith starts from
 // defaultOptions.
@@ -29,6 +24,9 @@ type options struct {
 	// loginWait bounds how long parley login waits for the browser's
 	// redirect.
 	loginWait time.Duration
+	// extra builds commands added to the root on each run, beside parley's
+	// own; tests add probe commands with it.
+	extra []func() *cobra.Command
 }
 
 func defaultOptions() options {
@@ -70,46 +68,48 @@ func RunWith(ctx context.Context, args []string, stdout, stderr io.Writer, h Hoo
 	return run(ctx, args, stdout, stderr, opts)
 }
 
+// run executes the command tree with args, prints the error the command
+// ended with, if any, as one error envelope on stderr, and returns the exit
+// status that error maps to.
 func run(ctx context.Context, args []string, stdout, stderr io.Writer, opts options) int {
 	root := newRootCommand(opts)
+	if args == nil {
+		// cobra would read the process's own arguments instead.
+		args = []string{}
+	}
 	root.SetArgs(args)
 	root.SetOut(stdout)
 	root.SetErr(stderr)
-	if err := root.ExecuteContext(ctx); err != nil {
-		// parley login reports its failures as error envelopes with their own
-		// exit statuses; everything else is one error line.
-		var le *loginError
-		if errors.As(err, &le) {
-			fmt.Fprintf(stderr, "%s", le.envelope)
-			return le.status
-		}
-		fmt.Fprintf(stderr, "error: %v\n", err)
-		return usageExitStatus
+	err := root.ExecuteContext(withOptions(ctx, opts))
+	if err != nil {
+		printError(stderr, err)
 	}
-	return 0
+	return exitCode(err)
 }
 
 // newRootCommand builds the command tree afresh, so no flag value survives
 // from one Run to the next.
 func newRootCommand(opts options) *cobra.Command {
-	var endpointURL string
-	// The root has no Run of its own, so without a subcommand cobra prints
-	// the help on stdout and succeeds.
-	root := &cobra.Command{
-		Use:   "parley",
-		Short: "parley is the command-line client of the Parley hub",
-		// Run writes its own error line; cobra's would repeat it, and its
-		// usage dump would bury it.
-		SilenceErrors: true,
-		SilenceUsage:  true,
-		// A suggestion would add lines after the one error line Run writes.
-		DisableSuggestions: true,
-		// Shell completion is not part of the client yet.
-		CompletionOptions: cobra.CompletionOptions{DisableDefaultCmd: true},
+	// Without a subcommand the root, a group, prints the help on stdout and
+	// succeeds.
+	root := group("parley", "parley is the command-line client of the Parley hub")
+	// run prints the error as an envelope, alone: cobra's own error line
+	// and usage text would make stderr more than one JSON document.
+	root.SilenceErrors = true
+	root.SilenceUsage = true
+	root.DisableSuggestions = true
+	// Shell completion is not part of the client yet.
+	root.CompletionOptions = cobra.CompletionOptions{DisableDefaultCmd: true}
+	// Every command inherits the global flags and this handler of a flag
+	// that is unknown or does not parse.
+	root.PersistentFlags().String("endpoint-url", "", "URL of the hub (default: $"+endpointURLEnv+")")
+	root.PersistentFlags().String("api-key", "", "credential presented to the hub; parley login stores it (- reads it from stdin)")
+	root.PersistentFlags().Bool("json", false, "print the help as JSON")
+	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return usageError("%v", err) })
+
+	root.AddCommand(newVersionCommand(), newLoginCommand(opts))
+	for _, build := range opts.extra {
+		root.AddCommand(build())
 	}
-	root.PersistentFlags().StringVar(&endpointURL, "endpoint-url", "",
-		"URL of the hub (default: $"+endpointURLEnv+")")
-	root.AddCommand(newVersionCommand(&endpointURL, opts.versionTimeout))
-	root.AddCommand(newLoginCommand(&endpointURL, opts))
 	return root
 }
