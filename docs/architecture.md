@@ -635,11 +635,14 @@ login `502 upstream_error`.
 The service's routes are, so far, the public `GET /auth/providers` (see
 [api.md](api.md#get-apiv1authproviders)), the public `POST
 /auth/callback` (see [api.md](api.md#post-apiv1authcallback)), which is not
-a create route, and the admin route `POST /users` (see
-[api.md](api.md#post-apiv1users)), a create route.
+a create route, the admin route `POST /users` (see
+[api.md](api.md#post-apiv1users)), a create route, and the caller's own
+profile, `GET /user` and `PATCH /user` (see
+[api.md](api.md#get-apiv1user)), which need a user.
 `(*identity.Service).Routes()` in `internal/identity/routes.go` returns
 them all: it appends the route list of each handlers file, such as
-`userRoutes()` in `internal/identity/handlers_users.go`, so the hub and the
+`userRoutes()` in `internal/identity/handlers_users.go` and
+`ownUserRoutes()` in `internal/identity/handlers_user.go`, so the hub and the
 tests register the same routes. The providers in
 `identity.Deps.Providers` come with their endpoints resolved:
 `internal/config` fills an endpoint the file does not give with the
@@ -791,6 +794,16 @@ a JSON string, else `400 invalid_request`. It then calls
 `(*store.Store).Tx`, with `CreatedAt` from `Deps.Now`, answers its
 `ErrConflict` `409 conflict` with the error's text, and answers `201` with
 the User object. It never promotes: the first-admin rule is the login's.
+
+`GET /user` and `PATCH /user`, in `internal/identity/handlers_user.go`,
+carry the mark `identity.MarkNeedsUser` and declare the scopes `users:read`
+and `users:write`. Both take the caller's user from the `identity.Principal`
+of the request. `PATCH /user` decodes the body into a
+`map[string]json.RawMessage` and needs `full_name` as a JSON string, else
+`400 invalid_request`; it stores it in one `(*store.Store).Tx` through
+`updateFullName(ctx, tx, id, fullName, now)` in
+`internal/identity/users.go`, which sets `full_name` and `updated_at` (from
+`Deps.Now`) and returns the stored user, or `identity.ErrNotFound`.
 
 `internal/identity/orgs.go` holds the org reads: `identity.Org` marshals to
 the REST API's Org object (`id`, `name`, `slug`, `url`, `owner_id`, `null`

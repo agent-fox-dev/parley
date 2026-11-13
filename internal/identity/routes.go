@@ -20,7 +20,8 @@ func (s *Service) Routes() []server.Route {
 		// Idempotency-Key is ignored rather than replayed.
 		{Method: http.MethodPost, Pattern: "/auth/callback", Public: true, Handler: s.callback},
 	}
-	return append(routes, s.userRoutes()...)
+	routes = append(routes, s.userRoutes()...)
+	return append(routes, s.ownUserRoutes()...)
 }
 
 // providerItem is one entry of GET /auth/providers.

@@ -569,6 +569,47 @@ has exactly `key`, the key `parley_<key_id>_<secret>`, shown this once;
 {"user":{"id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","username":"alice","email":"a@x","full_name":"Alice A","role":"user","status":"active","provider":"github","provider_id":"123","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"},"api_key":{"key":"parley_Ab3dE5gH_0123456789abcdefghijABCDEFGHIJKL","key_id":"Ab3dE5gH","expires_at":"2026-04-01T00:00:00Z"}}
 ```
 
+## `GET /api/v1/user`
+
+Answers the caller's own User object. The route needs a user: an API key or
+a PAT acts for its user, and the admin token, which has none, is answered
+`403` `forbidden` with the message `this route needs a user`. It declares
+the scope `users:read` for a PAT. The user is the one authentication read
+from the store for this request.
+
+| Status | When |
+|---|---|
+| `200 OK` | the body is the caller's User object |
+| `403` `forbidden` | the caller is the admin token (`this route needs a user`) |
+
+The User object has exactly `id`, `username`, `email`, `full_name`, `role`,
+`status`, `provider`, `provider_id`, `created_at` and `updated_at`;
+`created_at` and `updated_at` are RFC 3339 in UTC with whole seconds:
+
+```json
+{"id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","username":"alice","email":"alice@example.com","full_name":"","role":"user","status":"active","provider":"github","provider_id":"alice","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}
+```
+
+## `PATCH /api/v1/user`
+
+Sets the caller's own `full_name`. The route needs a user, as `GET
+/api/v1/user` does, and declares the scope `users:write` for a PAT.
+
+The body is a JSON object with the member `full_name`, required, a string;
+the empty string clears the name. Other members are ignored. The hub stores
+the string, sets `updated_at` to the time of the change and answers the
+updated User object; every other member is unchanged.
+
+| Status | When |
+|---|---|
+| `200 OK` | the name was stored; the body is the updated User object |
+| `400` `invalid_request` | `full_name` is missing (message `full_name is required`), or is not a JSON string, `null` included (message `full_name must be a string`); or the body is not a JSON object. The user is unchanged. |
+| `403` `forbidden` | the caller is the admin token (`this route needs a user`) |
+
+```json
+{"full_name":"Alice A."}
+```
+
 ## Admin routes
 
 The user and org administration routes are admin routes. Their caller must
