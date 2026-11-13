@@ -40,8 +40,8 @@ func TestFromConfig_FillsEveryKeyTheSectionDoesNotSetWithItsDefault(t *testing.T
 		{"OIDCClientID", s.OIDCClientID, ""},
 		{"OIDCClientSecretFile", s.OIDCClientSecretFile, ""},
 		{"Token", s.Token(), tokenContent},
-		{"number of credentials", len(s.Credentials), 0},
-		{"number of profiles", len(s.Profiles), 1},
+		{"number of credentials", len(s.Credentials()), 0},
+		{"number of profiles", len(s.Profiles()), 1},
 	}
 	for _, f := range fields {
 		if f.got != f.want {

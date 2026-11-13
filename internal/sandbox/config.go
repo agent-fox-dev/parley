@@ -86,10 +86,12 @@ type Settings struct {
 	// ReconcileInterval is between 10 seconds and 10 minutes.
 	ReconcileInterval time.Duration
 
-	// Profiles are the [[sandbox.profiles]] tables, in file order.
-	Profiles []Profile
-	// Credentials are the [[sandbox.credentials]] tables, in file order.
-	Credentials []Credential
+	// profiles are the [[sandbox.profiles]] tables and credentials the
+	// [[sandbox.credentials]] tables, each in name order. They are unexported
+	// so that they cannot change after the load: the lookups of profile.go
+	// return copies.
+	profiles    []Profile
+	credentials []Credential
 
 	// token and oidcClientSecret are the contents of the two secret files,
 	// unexported so that printing the settings does not print them.
@@ -106,32 +108,11 @@ func (s *Settings) Token() string { return s.token }
 // surrounding white space; empty when it is not set.
 func (s *Settings) OIDCClientSecret() string { return s.oidcClientSecret }
 
-// Profile is one [[sandbox.profiles]] table.
-type Profile struct {
-	// Name is the profile's name.
-	Name string
-}
-
-// Credential is one [[sandbox.credentials]] table.
-type Credential struct {
-	// Name is the credential's name.
-	Name string
-}
-
 // namePattern is the shape of the OpenShell workspace, a profile name and a
-// credential name.
+// credential name, and namePatternReason the failure of a value without it.
 var namePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,62}$`)
 
-// The keys a [[sandbox.profiles]] and a [[sandbox.credentials]] table may
-// hold.
-var (
-	profileKeys = []string{
-		"name", "default", "description", "image", "cpu", "memory", "gpu", "ttl", "idle_timeout",
-		"policy", "credentials", "optional_credentials", "expose_secrets", "optional_expose_secrets",
-		"hub_access", "env", "checkpoint", "allow_proposals",
-	}
-	credentialKeys = []string{"name", "provider_profile", "secret"}
-)
+const namePatternReason = "must be 1 to 63 lower-case letters, digits, _ or -, starting with a letter or a digit"
 
 // FromConfig checks the [sandbox] section of a configuration loaded with
 // the section registered (see Register) and returns its settings. Without
@@ -143,16 +124,16 @@ var (
 // zero-based index in place of a name that is missing or not a valid name)
 // or server.external_url. They come in this order: the keys of the section
 // in the order of the configuration reference, the ways to authenticate, the
-// profiles, the credentials, the section's unknown keys, then
-// server.external_url, so that the first ones survive when the error line is
-// cut. No failure quotes a value, so no message holds the content of a
+// profiles, the credentials, the profiles' references to credentials, the
+// section's unknown keys, then server.external_url, so that the first ones
+// survive when the error line is cut. No failure quotes a value, so no message holds the content of a
 // secret file or the user information of a URL.
 func FromConfig(cfg *config.Config) (*Settings, error) {
 	table, present := cfg.Section(SectionName)
 	if !present {
 		return &Settings{}, nil
 	}
-	d := &decoder{table: table, dir: cfg.Dir, known: map[string]bool{}}
+	d := &decoder{table: table, prefix: SectionName + ".", dir: cfg.Dir, known: map[string]bool{}}
 	s := &Settings{Enabled: true}
 
 	if rt, ok := d.str("runtime", "openshell"); ok && rt != "openshell" {
@@ -169,9 +150,11 @@ func FromConfig(cfg *config.Config) (*Settings, error) {
 
 	s.OpenShellWorkspace, _ = d.str("openshell_workspace", "parley")
 	if !namePattern.MatchString(s.OpenShellWorkspace) {
-		d.fail("openshell_workspace", "must be 1 to 63 lower-case letters, digits, _ or -, starting with a letter or a digit")
+		d.fail("openshell_workspace", namePatternReason)
 	}
+	maxTTLFailures := len(d.failures)
 	s.MaxTTL = d.positiveDuration("max_ttl", 24*time.Hour)
+	maxTTLOK := len(d.failures) == maxTTLFailures
 	s.IdleTimeout = d.duration("idle_timeout", 30*time.Minute)
 	maxSandboxes, maxOK := d.count("max_sandboxes", 200)
 	s.MaxSandboxes = maxSandboxes
@@ -197,12 +180,7 @@ func FromConfig(cfg *config.Config) (*Settings, error) {
 		d.fail("reconcile_interval", "must be from 10s to 10m")
 	}
 
-	for _, entry := range d.entries("profiles", profileKeys) {
-		s.Profiles = append(s.Profiles, Profile{Name: entry.name})
-	}
-	for _, entry := range d.entries("credentials", credentialKeys) {
-		s.Credentials = append(s.Credentials, Credential{Name: entry.name})
-	}
+	d.profilesAndCredentials(s, maxTTLOK)
 
 	for _, key := range slices.Sorted(maps.Keys(d.table)) {
 		if !d.known[key] {
@@ -304,6 +282,9 @@ func countTrue(bs ...bool) int {
 // decoder reads the keys of one table and collects its failures.
 type decoder struct {
 	table map[string]any
+	// prefix comes before a key in a failure: "sandbox." for the section,
+	// "sandbox.profiles[<name>]." for one of its profiles.
+	prefix string
 	// dir is the config dir, against which relative paths are resolved.
 	dir string
 	// known holds every key that was read, so that the rest are unknown.
@@ -312,7 +293,13 @@ type decoder struct {
 }
 
 func (d *decoder) fail(key, reason string) {
-	d.failures = append(d.failures, SectionName+"."+key+": "+reason)
+	d.failures = append(d.failures, d.prefix+key+": "+reason)
+}
+
+// child returns a decoder for the table of one entry of a list of tables,
+// its failures prefixed with prefix. Its failures are the caller's to take.
+func (d *decoder) child(prefix string, table map[string]any) *decoder {
+	return &decoder{table: table, prefix: prefix, dir: d.dir, known: map[string]bool{}}
 }
 
 // value returns the file's value of key and whether the file sets it.
@@ -487,7 +474,11 @@ func loopback(host string) bool {
 
 // entry is one table of a list of tables, named for its failures.
 type entry struct {
-	name  string
+	// name is the table's name when it is a string, valid or not.
+	name string
+	// label names the table in failures: its name when that is a valid name,
+	// its zero-based index otherwise.
+	label string
 	table map[string]any
 }
 
@@ -516,7 +507,7 @@ func (d *decoder) entries(key string, keys []string) []entry {
 				d.fail(key+"["+label+"]."+k, "unknown key")
 			}
 		}
-		out = append(out, entry{name: name, table: t})
+		out = append(out, entry{name: name, label: label, table: t})
 	}
 	return out
 }

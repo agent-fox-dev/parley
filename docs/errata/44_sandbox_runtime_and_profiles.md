@@ -25,15 +25,17 @@ with `Enabled` false and checks nothing.
 The failures come in a fixed order: the section's keys in the order of the
 configuration reference (`runtime`, `gateway_url`, the TLS, token and OIDC
 keys), then the count of the ways to authenticate, the remaining keys,
-`[[sandbox.profiles]]`, `[[sandbox.credentials]]`, the section's unknown keys
-in name order, and last `server.external_url`. No failure quotes a value,
+`[[sandbox.profiles]]`, `[[sandbox.credentials]]`, the profiles' references
+to credentials that do not exist, the section's unknown keys in name order,
+and last `server.external_url`. No failure quotes a value,
 durations and sizes included, so that no value a `${NAME}` reference brought
 in reaches the error line.
 
 ## Relative paths are taken from the config dir
 
-The package types `tls_cert`, `tls_key`, `tls_ca`, `token_file` and
-`oidc_client_secret_file` as paths and does not say what a relative path is
-relative to. They are resolved against the config dir, the directory
-`config.toml` was looked for in, and `Settings` holds them as absolute
-paths. The configuration reference says so.
+The package types `tls_cert`, `tls_key`, `tls_ca`, `token_file`,
+`oidc_client_secret_file` and a profile's `policy` as paths and does not say
+what a relative path is relative to. They are resolved against the config
+dir, the directory `config.toml` was looked for in, and `Settings` and
+`Profile.PolicyPath` hold them as absolute paths. The configuration
+reference says so.
