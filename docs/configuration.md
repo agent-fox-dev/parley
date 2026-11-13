@@ -121,6 +121,83 @@ The default endpoints are, for `github`,
 `https://openidconnect.googleapis.com/v1/userinfo`. The `[oauth]` section
 holds nothing else.
 
+### Sandboxes
+
+The `[sandbox]` section turns sandboxes on: a file that holds it, even
+empty, enables them, and a file without it leaves them off. An empty
+section is invalid, since `gateway_url` is required. With the section,
+`[server].external_url` must be set.
+
+```toml
+[server]
+external_url = "https://parley.example"
+
+[sandbox]
+gateway_url = "https://openshell.example:8443"
+token_file = "openshell.token"
+
+[[sandbox.profiles]]
+name = "agent"
+ttl = "4h"
+```
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `runtime` | string | `"openshell"` | the sandbox runtime; `openshell` only |
+| `gateway_url` | string | required | the OpenShell gateway: an `https` URL, or an `http` URL to `localhost`, an address in `127.0.0.0/8` or `::1`; without user information, a query, a fragment, or a path other than `/` |
+| `tls_cert`, `tls_key` | string | `""` | the client certificate and its key for mutual TLS, both or neither; each a readable file |
+| `tls_ca` | string | `""` | a readable file of CA certificates the gateway's certificate is checked against |
+| `token_file` | string | `""` | a readable file holding the bearer token; its content without surrounding white space must not be empty. It is read once, when `parleyd` starts |
+| `oidc_issuer`, `oidc_client_id`, `oidc_client_secret_file` | string | `""` | OIDC client credentials, all three or none: the issuer by the rule of `gateway_url` except that it may have a path, and a readable, non-empty file holding the client secret |
+| `openshell_workspace` | string | `"parley"` | the OpenShell workspace the hub owns: 1 to 63 lower-case letters, digits, `_` or `-`, starting with a letter or a digit |
+| `max_ttl` | duration | `"24h"` | more than `0` |
+| `idle_timeout` | duration | `"30m"` | `0` or more; `0` disables the idle stop |
+| `max_sandboxes` | integer | `200` | at least `1` |
+| `max_per_org` | integer | `100`, or `max_sandboxes` when that is smaller | at least `1` and at most `max_sandboxes` |
+| `max_per_workspace` | integer | `50` | at least `1` |
+| `max_per_user` | integer | `20` | at least `1` |
+| `allow_workspace_rules` | boolean | `true` | |
+| `max_exec_timeout` | duration | `"30m"` | more than `0` |
+| `max_concurrent_execs` | integer | `8` | at least `1` |
+| `max_transfer_size` | string | `"1GB"` | in the size format of `[server].max_body_size` |
+| `log_retention` | duration | `"7d"` | more than `0` |
+| `reconcile_interval` | duration | `"1m"` | from `10s` to `10m`, both included |
+| `[[sandbox.profiles]]` | tables | | the sandbox profiles |
+| `[[sandbox.credentials]]` | tables | none | the credentials profiles may attach |
+
+A duration is a whole number followed by one of `s`, `m`, `h` or `d` (24
+hours), such as `30m` or `7d`. Relative paths in `tls_cert`, `tls_key`,
+`tls_ca`, `token_file` and `oidc_client_secret_file` are taken from the
+config dir.
+
+Exactly one way to authenticate to the gateway is configured: mutual TLS
+(`tls_cert` with `tls_key`), `token_file`, or the three OIDC keys. `tls_ca`
+may accompany any of them. With none, or with more than one, the failure
+names `sandbox.gateway_url` and the ways found, such as
+`sandbox.gateway_url: configure exactly one way to authenticate, found:
+mutual TLS, token_file`. A pair or a triple that is incomplete names the keys
+it misses instead.
+
+A profile table may hold `name`, `default`, `description`, `image`, `cpu`,
+`memory`, `gpu`, `ttl`, `idle_timeout`, `policy`, `credentials`,
+`optional_credentials`, `expose_secrets`, `optional_expose_secrets`,
+`hub_access`, `env`, `checkpoint` and `allow_proposals`; a credential table
+`name`, `provider_profile` and `secret`.
+
+The section is checked as a whole, after the rest of the file is accepted
+and before any store is opened. Every failure is reported in one error, the
+failures separated by `; `, each naming its key: `sandbox.<key>`,
+`sandbox.profiles[<name>].<key>`, `sandbox.credentials[<name>].<key>` (the
+zero-based index in place of a name that is missing or not a valid name), or
+`server.external_url`. An unknown key in the section, a profile or a
+credential is a failure like the others. No failure quotes a value, so the
+error holds neither the content of `token_file` or
+`oidc_client_secret_file` nor the user information of a URL. For example:
+
+```
+configuration file /srv/parley/config.toml: sandbox.runtime: must be openshell; sandbox.max_ttl: must be more than 0; sandbox.reconcile_interval: must be from 10s to 10m; sandbox.gatway_url: unknown key; server.external_url: must be set when the [sandbox] section is present
+```
+
 ### Environment variables
 
 | Variable | Effect |
