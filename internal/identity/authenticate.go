@@ -69,6 +69,9 @@ type Deps struct {
 	Providers []config.Provider
 	// ExternalURL is [server].external_url, "" when unset.
 	ExternalURL string
+	// Client reads a user's identity from a provider at login; with none,
+	// a login is answered 502 upstream_error.
+	Client ProviderClient
 }
 
 // Service is the identity part of the hub: it authenticates the requests

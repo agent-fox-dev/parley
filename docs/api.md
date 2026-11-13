@@ -472,3 +472,62 @@ as `\u0026`, which decodes to `&`:
 ```json
 {"items":[{"name":"github","authorize_url":"https://github.com/login/oauth/authorize?client_id=gh-id\u0026scope=user%3Aemail"},{"name":"google","authorize_url":"https://accounts.google.com/o/oauth2/v2/auth?client_id=gg-id\u0026response_type=code\u0026scope=openid+email+profile"}],"next_cursor":null}
 ```
+
+## `POST /api/v1/auth/callback`
+
+Signs a user in with an OAuth code from an identity provider and answers
+the user with a new API key. The route is public: it needs no credential
+and does not read the `Authorization` header. It is not a create route, so
+an `Idempotency-Key` header is ignored.
+
+The body is a JSON object:
+
+| Member | Value |
+|---|---|
+| `provider` | the provider that issued the code, such as `github` |
+| `code` | the OAuth code the provider gave the client |
+| `redirect_uri` | the redirect URI the code was issued for |
+| `expires` | the key's lifetime in days; `90` when absent or `null`, and a key of `0` days never expires |
+
+The hub exchanges the code at the provider and reads the user's identity
+(provider, provider user id, username, full name, verified e-mail), then,
+in one transaction, finds the user who signs in with that provider and
+provider user id, or creates one at the first login, and issues the user
+an API key. A `parleyd` started from the command line has no provider
+client yet and answers every login `502` with `error_type`
+`upstream_error`.
+
+At a first login the hub creates:
+
+- the user, with `status` `active`, the provider's username and e-mail, and
+  the provider's display name as `full_name` (empty when it has none). When
+  another user has the username, the first free of `<name>-2` to
+  `<name>-10` is used instead. The role is `admin` when the e-mail equals
+  the `admin_email` the hub was bootstrapped with, in any letter case, and
+  no user with the role `admin` exists, whatever its status; it is `user`
+  otherwise.
+- the user's personal org: `status` `active`, named after the username and
+  owned by the user, with a slug derived from the username: lowercased,
+  every character outside `[a-z0-9_-]` replaced with `-`, runs of `-`
+  collapsed, `-` and `_` trimmed from both ends; fewer than two characters
+  left give `u-` and the first 8 characters of the user id, and a slug that
+  starts with a digit gets the prefix `u-`. When an org has that slug, the
+  first free of `<slug>-1` to `<slug>-10` is used. `Alice.Smith` gives
+  `alice-smith`, `42bob` gives `u-42bob`.
+- the user's membership of that org, and the API key.
+
+| Status | When |
+|---|---|
+| `200 OK` | the user signed in; the body is `{"user": …, "api_key": …}` |
+| `409` `conflict` | a new user cannot be created: the e-mail is another user's, an org already has the username as its name, the username and all of `<name>-2` to `<name>-10` are taken, or the slug and all of `<slug>-1` to `<slug>-10` are taken. Nothing is created. |
+| `502` `upstream_error` | the hub has no provider client |
+
+`user` is the User object (`id`, `username`, `email`, `full_name`, `role`,
+`status`, `provider`, `provider_id`, `created_at`, `updated_at`). `api_key`
+has exactly `key`, the key `parley_<key_id>_<secret>`, shown this once;
+`key_id`; and `expires_at`, the login time plus `expires` × 24 hours, or
+`null` for a key that never expires:
+
+```json
+{"user":{"id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","username":"alice","email":"a@x","full_name":"Alice A","role":"user","status":"active","provider":"github","provider_id":"123","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"},"api_key":{"key":"parley_Ab3dE5gH_0123456789abcdefghijABCDEFGHIJKL","key_id":"Ab3dE5gH","expires_at":"2026-04-01T00:00:00Z"}}
+```

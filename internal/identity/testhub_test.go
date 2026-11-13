@@ -35,6 +35,7 @@ type testHub struct {
 	srv        *server.Server
 	svc        *identity.Service
 	adminToken string // "" when the hub is not bootstrapped
+	provider   *stubProvider
 
 	mu    sync.Mutex
 	clock time.Time
@@ -82,7 +83,8 @@ func newTestHub(t *testing.T, opts ...hubOption) *testHub {
 	}
 	ctx := context.Background()
 	dir := t.TempDir()
-	h := &testHub{t: t, dataDir: filepath.Join(dir, "data"), clock: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+	h := &testHub{t: t, dataDir: filepath.Join(dir, "data"), clock: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		provider: &stubProvider{}}
 	st, err := store.Open(ctx, store.Options{
 		DatabasePath:  filepath.Join(h.dataDir, "parley.db"),
 		WorkspaceRoot: filepath.Join(dir, "workspaces"),
@@ -99,7 +101,7 @@ func newTestHub(t *testing.T, opts ...hubOption) *testHub {
 		}
 	}
 	h.svc = &identity.Service{}
-	h.svc.Bind(identity.Deps{Store: st, Now: h.now, Providers: cfg.providers, ExternalURL: cfg.externalURL})
+	h.svc.Bind(identity.Deps{Store: st, Now: h.now, Providers: cfg.providers, ExternalURL: cfg.externalURL, Client: h.provider})
 	h.srv = server.New(server.Options{Logger: slog.New(slog.DiscardHandler), RateLimitDisabled: true, Now: h.now})
 	h.srv.SetAuthenticator(h.svc.Authenticate)
 	for _, r := range h.svc.Routes() {
@@ -305,4 +307,52 @@ func (h *testHub) expireAt(credentialID string, at time.Time) {
 // setStatus sets the status of the user userID.
 func (h *testHub) setStatus(userID, status string) {
 	h.exec(`UPDATE users SET status = ? WHERE id = ?`, status, userID)
+}
+
+// stubProvider is the test hub's provider client: it answers every code
+// with the identity, or the error, that set gave it, and counts its calls.
+type stubProvider struct {
+	mu    sync.Mutex
+	id    identity.Identity
+	err   error
+	calls int
+}
+
+// set makes the provider answer id, or err when it is not nil.
+func (p *stubProvider) set(id identity.Identity, err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.id, p.err = id, err
+}
+
+// Identity implements identity.ProviderClient.
+func (p *stubProvider) Identity(context.Context, string, string, string) (identity.Identity, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls++
+	return p.id, p.err
+}
+
+// callback posts body to POST /api/v1/auth/callback.
+func (h *testHub) callback(body any) response {
+	h.t.Helper()
+	return h.do(http.MethodPost, "/api/v1/auth/callback", body, nil)
+}
+
+// count runs a SELECT count(*) query against the hub's store.
+func (h *testHub) count(query string, args ...any) int {
+	h.t.Helper()
+	var n int
+	if err := h.st.Main().QueryRowContext(context.Background(), query, args...).Scan(&n); err != nil {
+		h.t.Fatalf("%s: %v", query, err)
+	}
+	return n
+}
+
+// seedOrg stores an active org without an owner.
+func (h *testHub) seedOrg(name, slug string) {
+	h.t.Helper()
+	now := h.now().UnixNano()
+	h.exec(`INSERT INTO orgs (id, name, slug, status, created_at, updated_at) VALUES (?, ?, ?, 'active', ?, ?)`,
+		rand.Text(), name, slug, now, now)
 }

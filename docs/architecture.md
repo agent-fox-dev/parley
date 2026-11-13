@@ -625,10 +625,15 @@ method of an `identity.Service` as the pipeline's authenticator, registers
 every route of `(*identity.Service).Routes()` with `AddRoute`, and adds the
 start hook `identity`, which binds the service with
 `(*identity.Service).Bind(identity.Deps{Store, Now, Providers,
-ExternalURL})` from the `Runtime` before the hub serves its first request.
+ExternalURL, Client})` from the `Runtime` before the hub serves its first
+request. `Deps.Client` is the `identity.ProviderClient` a login reads the
+user's identity through; the hub binds none yet, and a service without one
+answers every login `502 upstream_error`.
 
 The service's routes are, so far, the public `GET /auth/providers` (see
-[api.md](api.md#get-apiv1authproviders)). The providers in
+[api.md](api.md#get-apiv1authproviders)) and the public `POST
+/auth/callback` (see [api.md](api.md#post-apiv1authcallback)), which is not
+a create route. The providers in
 `identity.Deps.Providers` come with their endpoints resolved:
 `internal/config` fills an endpoint the file does not give with the
 provider's public one, through `config.Provider.WithPublicEndpoints`, and
@@ -714,6 +719,33 @@ handlers read it with `identity.PrincipalOf(r.Context())`. A route declares
 that it needs a user with the mark `identity.MarkNeedsUser` in its
 `server.Route.Marks`; the authenticator reads it right after accepting the
 credential and answers the admin token `403 forbidden` there.
+
+The login, in `internal/identity/login.go`, decodes the callback's body,
+reads the identity through `Deps.Client` and signs the user in, in one
+`(*store.Store).Tx`: it looks the user up with `identity.UserByProvider`,
+and at a first login picks the username (the provider's, else the first
+free of `<name>-2` to `<name>-10`) and the role (`admin` when the e-mail is
+the `admin_email` of `admin_settings`, read in the same transaction,
+ignoring letter case, and no user has the role `admin`), then calls
+`identity.CreateUserAndPersonalOrg`; last it issues the API key with
+`identity.IssueAPIKey`, `expires` days (90 when absent) from the clock of
+`Deps.Now`. Any error rolls the whole transaction back.
+
+`identity.CreateUserAndPersonalOrg(ctx, tx, identity.NewUser{Username,
+Email, FullName, Provider, ProviderID, CreatedAt}, role)` is the one way a
+user is created: it writes the active user, the user's personal org (an
+`identity.Org`, active, named after the username, owned by the user) and
+the membership in the transaction it is given, and returns the user and
+the org. The org's slug comes from the pure function `slug(username,
+userID)` in `internal/identity/slug.go`, or the first of `<slug>-1` to
+`<slug>-10` no org has. User and org ids are UUID version 4 strings from
+the standard library's `uuid`. It checks before it writes, and returns an
+error that is `identity.ErrConflict` (`errors.Is`), writing nothing, when the
+username, the e-mail or the provider identity is another user's, an org has
+the username as its name, or no slug is free; a unique-constraint violation
+of SQLite on the insert is reported the same way. The callback answers that
+error `409 conflict` with its text. Its caller chooses the username and the
+role.
 
 ### The logger
 

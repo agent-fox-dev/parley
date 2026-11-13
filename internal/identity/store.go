@@ -6,13 +6,29 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
+	"uuid"
+
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 
 	"github.com/agent-fox-dev/parley/internal/server/timefmt"
 )
 
 // ErrNotFound is returned by a lookup whose record does not exist.
 var ErrNotFound = errors.New("not found")
+
+// ErrConflict is what an error of CreateUserAndPersonalOrg is, errors.Is,
+// when the user or the personal org would break a uniqueness rule. Its
+// Error text says which rule, in fixed words.
+var ErrConflict = errors.New("conflict")
+
+// conflictError is an ErrConflict with the rule it breaks.
+type conflictError struct{ msg string }
+
+func (e conflictError) Error() string        { return e.msg }
+func (e conflictError) Is(target error) bool { return target == ErrConflict }
 
 // The roles and statuses of a user.
 const (
@@ -52,6 +68,32 @@ func (u User) MarshalJSON() ([]byte, error) {
 		UpdatedAt  timefmt.Time `json:"updated_at"`
 	}{u.ID, u.Username, u.Email, u.FullName, u.Role, u.Status, u.Provider, u.ProviderID,
 		timefmt.Time(u.CreatedAt), timefmt.Time(u.UpdatedAt)})
+}
+
+// Org is an organization. A user's personal org is named after the user,
+// who owns it and is its first member.
+type Org struct {
+	ID   string
+	Name string
+	Slug string
+	URL  string
+	// OwnerID is the id of the owning user, "" when it has none.
+	OwnerID   string
+	Status    string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// NewUser is a user CreateUserAndPersonalOrg creates.
+type NewUser struct {
+	Username   string
+	Email      string
+	FullName   string
+	Provider   string
+	ProviderID string
+	// CreatedAt is the creation time of the user, the org and the
+	// membership.
+	CreatedAt time.Time
 }
 
 // APIKey is the stored record of an API key; its secret is not part of it.
@@ -196,11 +238,23 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, rec.TokenID, rec.UserID, rec.hash, rec.Name
 
 // UserByID returns the user with the id id, or ErrNotFound.
 func UserByID(ctx context.Context, q Querier, id string) (User, error) {
+	return userWhere(ctx, q, `id = ?`, id)
+}
+
+// UserByProvider returns the user who signs in as providerID at the
+// identity provider provider, or ErrNotFound.
+func UserByProvider(ctx context.Context, q Querier, provider, providerID string) (User, error) {
+	return userWhere(ctx, q, `provider = ? AND provider_id = ?`, provider, providerID)
+}
+
+// userWhere returns the user the condition where, with the arguments args,
+// selects.
+func userWhere(ctx context.Context, q Querier, where string, args ...any) (User, error) {
 	var u User
 	var created, updated int64
 	err := q.QueryRowContext(ctx, `SELECT id, username, email, full_name, role, status, provider, provider_id, created_at, updated_at
-FROM users WHERE id = ?`, id).Scan(&u.ID, &u.Username, &u.Email, &u.FullName, &u.Role, &u.Status, &u.Provider, &u.ProviderID,
-		&created, &updated)
+FROM users WHERE `+where, args...).Scan(&u.ID, &u.Username, &u.Email, &u.FullName, &u.Role, &u.Status, &u.Provider,
+		&u.ProviderID, &created, &updated)
 	if err != nil {
 		return User{}, lookupErr("user", err)
 	}
@@ -280,4 +334,102 @@ func utc(t *time.Time) *time.Time {
 	}
 	u := t.UTC()
 	return &u
+}
+
+// slugSuffixes is how many numbered slugs, <slug>-1 to <slug>-10, a
+// personal org tries after its derived one.
+const slugSuffixes = 10
+
+// CreateUserAndPersonalOrg creates, in tx, the active user nu with the role
+// role, the user's personal org and the user's membership of it. The org is
+// active, named after the username and owned by the user; its slug is
+// derived from the username (see slug), or the first free of <slug>-1 to
+// <slug>-10 when that one is taken. It returns an error that is
+// ErrConflict, and writes nothing, when the username, the e-mail or the
+// provider identity is another user's, an org has the username as its name
+// or no slug is free. The caller picks the username and the role. Names
+// compare as stored, letter case included.
+func CreateUserAndPersonalOrg(ctx context.Context, tx *sql.Tx, nu NewUser, role string) (User, Org, error) {
+	for _, c := range []struct {
+		query string
+		args  []any
+		msg   string
+	}{
+		{`SELECT count(*) FROM users WHERE username = ?`, []any{nu.Username}, "the username is taken"},
+		{`SELECT count(*) FROM users WHERE email = ?`, []any{nu.Email}, "the e-mail belongs to another user"},
+		{`SELECT count(*) FROM users WHERE provider = ? AND provider_id = ?`, []any{nu.Provider, nu.ProviderID},
+			"the identity belongs to another user"},
+		{`SELECT count(*) FROM orgs WHERE name = ?`, []any{nu.Username}, "an org has the username as its name"},
+	} {
+		taken, err := exists(ctx, tx, c.query, c.args...)
+		if err != nil {
+			return User{}, Org{}, err
+		}
+		if taken {
+			return User{}, Org{}, conflictError{c.msg}
+		}
+	}
+	now := nu.CreatedAt.UTC()
+	u := User{
+		ID: uuid.NewV4().String(), Username: nu.Username, Email: nu.Email, FullName: nu.FullName, Role: role,
+		Status: StatusActive, Provider: nu.Provider, ProviderID: nu.ProviderID, CreatedAt: now, UpdatedAt: now,
+	}
+	orgSlug, err := freeSlug(ctx, tx, slug(u.Username, u.ID))
+	if err != nil {
+		return User{}, Org{}, err
+	}
+	o := Org{ID: uuid.NewV4().String(), Name: u.Username, Slug: orgSlug, OwnerID: u.ID, Status: StatusActive,
+		CreatedAt: now, UpdatedAt: now}
+	at := now.UnixNano()
+	for _, w := range []struct {
+		what, stmt string
+		args       []any
+	}{
+		{"user", `INSERT INTO users (id, username, email, full_name, role, status, provider, provider_id, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, []any{u.ID, u.Username, u.Email, u.FullName, u.Role, u.Status, u.Provider, u.ProviderID, at, at}},
+		{"org", `INSERT INTO orgs (id, name, slug, url, owner_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			[]any{o.ID, o.Name, o.Slug, o.URL, o.OwnerID, o.Status, at, at}},
+		{"membership", `INSERT INTO memberships (org_id, user_id, created_at) VALUES (?, ?, ?)`, []any{o.ID, u.ID, at}},
+	} {
+		if _, err := tx.ExecContext(ctx, w.stmt, w.args...); err != nil {
+			// The checks above leave this only to an id drawn twice.
+			if isUniqueViolation(err) {
+				return User{}, Org{}, conflictError{"the " + w.what + " is taken"}
+			}
+			return User{}, Org{}, fmt.Errorf("store the %s: %w", w.what, err)
+		}
+	}
+	return u, o, nil
+}
+
+// freeSlug returns base, or the first of <base>-1 to <base>-10 that no org
+// has as its slug.
+func freeSlug(ctx context.Context, tx *sql.Tx, base string) (string, error) {
+	for i := 0; i <= slugSuffixes; i++ {
+		s := base
+		if i > 0 {
+			s += "-" + strconv.Itoa(i)
+		}
+		taken, err := exists(ctx, tx, `SELECT count(*) FROM orgs WHERE slug = ?`, s)
+		if err != nil || !taken {
+			return s, err
+		}
+	}
+	return "", conflictError{"no free slug is left for the org"}
+}
+
+// exists reports whether the count query returns more than zero.
+func exists(ctx context.Context, q Querier, query string, args ...any) (bool, error) {
+	var n int
+	if err := q.QueryRowContext(ctx, query, args...).Scan(&n); err != nil {
+		return false, fmt.Errorf("check uniqueness: %w", err)
+	}
+	return n > 0, nil
+}
+
+// isUniqueViolation reports whether err is SQLite refusing a duplicate of a
+// unique column or primary key.
+func isUniqueViolation(err error) bool {
+	var e *sqlite.Error
+	return errors.As(err, &e) && (e.Code() == sqlite3.SQLITE_CONSTRAINT_UNIQUE || e.Code() == sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY)
 }

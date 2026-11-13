@@ -16,6 +16,9 @@ func (s *Service) Routes() []server.Route {
 	return []server.Route{
 		{Method: http.MethodGet, Pattern: "/auth/providers", Public: true, CacheControl: "public, max-age=300",
 			Handler: s.listProviders},
+		// Not a create route: a login always issues a new key, so an
+		// Idempotency-Key is ignored rather than replayed.
+		{Method: http.MethodPost, Pattern: "/auth/callback", Public: true, Handler: s.callback},
 	}
 }
 
