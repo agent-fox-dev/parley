@@ -130,5 +130,5 @@ func newRootCommand(opts options) *cobra.Command {
 // newAdminCommand builds parley admin: the commands of the routes only an
 // admin may call.
 func newAdminCommand() *cobra.Command {
-	return group("admin", "Administer the hub's users and organizations", newAdminUsersCommand())
+	return group("admin", "Administer the hub's users and organizations", newAdminUsersCommand(), newAdminOrgsCommand())
 }

@@ -63,6 +63,10 @@ func TestIdentityCommands_RefuseABadCommandLineAndSendNothing(t *testing.T) {
 		{[]string{"orgs", "show", "a", "b"}, "parley orgs show", `"b"`},
 		{[]string{"admin", "users", "delete"}, "parley admin users delete", "<user>"},
 		{[]string{"admin", "users", "promote", "a", "b"}, "parley admin users promote", `"b"`},
+		{[]string{"admin", "orgs", "create", "--name", "A"}, "parley admin orgs create", "--slug"},
+		{[]string{"admin", "orgs", "create", "--slug", "a"}, "parley admin orgs create", "--name"},
+		{[]string{"admin", "orgs", "update", "acme"}, "parley admin orgs update", "--name or --url"},
+		{[]string{"admin", "orgs", "members", "add", "acme"}, "parley admin orgs members add", "<user>"},
 	}
 	for _, tt := range tests {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
@@ -97,6 +101,8 @@ func TestIdentityCommands_PrintTheHubsErrorEnvelopeAsReceived(t *testing.T) {
 			`{"error":{"code":403,"message":"this route needs an admin","error_type":"forbidden"}}`},
 		{[]string{"user", "show"}, http.MethodGet, "/api/v1/user", http.StatusUnauthorized,
 			`{"error":{"code":401,"message":"invalid credentials","error_type":"unauthenticated"}}`},
+		{[]string{"admin", "orgs", "create", "--name", "A", "--slug", "a"}, http.MethodPost, "/api/v1/orgs", http.StatusBadRequest,
+			`{"error":{"code":400,"message":"slug must be 1 to 128 characters of a-z, 0-9, _ and -, starting and ending with a letter or digit","error_type":"invalid_request"}}`},
 	}
 	for _, tt := range tests {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
@@ -128,6 +134,7 @@ func TestIdentityCommands_SendAUserOrOrgArgumentAsOnePathSegment(t *testing.T) {
 	}{
 		{[]string{"admin", "users", "show"}, http.MethodGet, "/api/v1/users/", 5},
 		{[]string{"orgs", "show"}, http.MethodGet, "/api/v1/orgs/", 5},
+		{[]string{"admin", "orgs", "members", "add", "acme"}, http.MethodPut, "/api/v1/orgs/acme/members/", 7},
 	}
 	args := []string{"a/b", "a+b@example.com", "a b", "x?y#z", "0f8fad5b-d9cb-469f-a165-70867728950e"}
 	for _, cmd := range commands {
