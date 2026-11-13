@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/config"
 	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/server/timefmt"
 )
@@ -16,6 +18,10 @@ import (
 // defaultKeyDays is the lifetime of the API key a login issues when the
 // request does not give one.
 const defaultKeyDays = 90
+
+// keyLifetimes are the lifetimes in days a login may ask for; 0 is a key
+// that does not expire.
+var keyLifetimes = []int{0, 30, 60, 90}
 
 // usernameSuffixes is the last numbered username, <name>-2 to <name>-10, a
 // new user tries when the provider's username is another user's.
@@ -26,7 +32,8 @@ type callbackRequest struct {
 	Provider    string `json:"provider"`
 	Code        string `json:"code"`
 	RedirectURI string `json:"redirect_uri"`
-	// Expires is the key's lifetime in days; nil when the body has none.
+	// Expires is the key's lifetime in days; nil when the body has none or
+	// null.
 	Expires *int `json:"expires"`
 }
 
@@ -44,23 +51,30 @@ type callbackAnswer struct {
 	APIKey issuedKey `json:"api_key"`
 }
 
-// callback answers POST /auth/callback: it reads the identity behind the
-// OAuth code from the provider, signs the user in and answers the user with
-// a new API key.
+// callback answers POST /auth/callback: it checks the body, reads the
+// identity behind the OAuth code from the provider, signs the user in and
+// answers the user with a new API key. A code the provider rejects is 401
+// and a provider that fails is 502, both with the fixed text of the error
+// kind, so that nothing of the provider's answer reaches the client.
 func (s *Service) callback(w http.ResponseWriter, r *http.Request) error {
 	var req callbackRequest
 	if err := server.DecodeJSON(r, &req); err != nil {
 		return err
 	}
-	days := defaultKeyDays
-	if req.Expires != nil {
-		days = *req.Expires
+	days, err := s.validCallback(req)
+	if err != nil {
+		return err
 	}
 	if s.deps.Client == nil {
-		return server.UpstreamError("the identity provider failed")
+		return server.UpstreamError(ErrUpstream.Error())
 	}
 	id, err := s.deps.Client.Identity(r.Context(), req.Provider, req.Code, req.RedirectURI)
-	if err != nil {
+	switch {
+	case errors.Is(err, ErrRejected):
+		return server.Unauthenticated(ErrRejected.Error())
+	case errors.Is(err, ErrUpstream):
+		return server.UpstreamError(ErrUpstream.Error())
+	case err != nil:
 		return err
 	}
 	u, key, rec, err := s.signIn(r.Context(), id, days)
@@ -77,6 +91,34 @@ func (s *Service) callback(w http.ResponseWriter, r *http.Request) error {
 	}
 	server.WriteJSON(w, http.StatusOK, answer)
 	return nil
+}
+
+// validCallback checks the body of a login before the provider is called,
+// since that call spends the client secret, and returns the key's lifetime
+// in days. The body's decoding has refused members of the wrong JSON type
+// already, such as a provider that is a number or an expires that is a
+// string or a fraction. The messages are fixed texts: none repeats the
+// code.
+func (s *Service) validCallback(req callbackRequest) (days int, err error) {
+	switch {
+	case req.Provider == "":
+		return 0, server.InvalidRequest("provider is required")
+	case req.Code == "":
+		return 0, server.InvalidRequest("code is required")
+	case req.RedirectURI == "":
+		return 0, server.InvalidRequest("redirect_uri is required")
+	case !slices.ContainsFunc(s.deps.Providers, func(p config.Provider) bool { return p.Name == req.Provider }):
+		return 0, server.InvalidRequest("provider is not a configured identity provider")
+	case !allowedRedirect(req.RedirectURI, s.deps.ExternalURL):
+		return 0, server.InvalidRequest("redirect_uri is not allowed: it must be http on localhost or 127.0.0.1, or on the hub's external_url")
+	}
+	if req.Expires == nil {
+		return defaultKeyDays, nil
+	}
+	if !slices.Contains(keyLifetimes, *req.Expires) {
+		return 0, server.InvalidRequest("expires must be one of 0, 30, 60 and 90")
+	}
+	return *req.Expires, nil
 }
 
 // signIn finds the user of the identity id and refreshes it, or creates the

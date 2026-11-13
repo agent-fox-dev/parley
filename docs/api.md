@@ -484,18 +484,33 @@ The body is a JSON object:
 
 | Member | Value |
 |---|---|
-| `provider` | the provider that issued the code, such as `github` |
-| `code` | the OAuth code the provider gave the client |
-| `redirect_uri` | the redirect URI the code was issued for |
-| `expires` | the key's lifetime in days; `90` when absent or `null`, and a key of `0` days never expires |
+| `provider` | required: a string naming a configured provider, such as `github` |
+| `code` | required: the OAuth code the provider gave the client, a non-empty string |
+| `redirect_uri` | required: the redirect URI the code was issued for (see below) |
+| `expires` | the key's lifetime in days: the JSON integer `0`, `30`, `60` or `90`; `90` when absent or `null`, and a key of `0` days never expires |
 
-The hub exchanges the code at the provider and reads the user's identity
-(provider, provider user id, username, full name, verified e-mail), then,
-in one transaction, finds the user who signs in with that provider and
-provider user id, or creates one at the first login, revokes the user's
-live API keys and issues the user a new one. A `parleyd` started from the command line has no provider
-client yet and answers every login `502` with `error_type`
-`upstream_error`.
+The hub checks the body before it calls the provider and answers `400`
+`invalid_request` when a required member is missing or empty, `provider`
+is not a configured provider, `expires` is another number, a fraction or a
+string (`45`, `-1`, `1.5`, `"90"`), or `redirect_uri` is not allowed. A
+`redirect_uri` is allowed when it is an absolute URL without user
+information and either has the scheme `http` and the host `localhost` or
+`127.0.0.1`, with any port and path (the listener of `parley login`), or
+has the scheme, host and port of `[server].external_url`, when that is set,
+with the scheme's default port filled in (`https://hub.example.com/x` and
+`https://hub.example.com:443/x` are the same). `https://localhost/x`,
+`http://[::1]:5000/callback`, `http://localhost@evil.example/x` and a
+relative URI are refused. An allowed `redirect_uri` is passed to the
+provider unchanged.
+
+The hub then exchanges the code at the provider and reads the user's
+identity (provider, provider user id, username, full name, verified
+e-mail), each call to the provider bounded by 15 seconds, then, in one
+transaction, finds the user who signs in with that provider and provider
+user id, or creates one at the first login, revokes the user's live API
+keys and issues the user a new one. A login the hub refuses, before or
+after the provider is called, changes nothing: no user, org, membership or
+key is created and no key is revoked.
 
 At a first login the hub creates:
 
@@ -532,9 +547,14 @@ and the user's PATs and the keys of other users are not touched.
 | Status | When |
 |---|---|
 | `200 OK` | the user signed in; the body is `{"user": …, "api_key": …}` |
+| `400` `invalid_request` | the body is not one the hub can use (see above); the provider is not called |
+| `401` `unauthenticated` | the provider rejected the code: its token URL answered a JSON object with an `error` member and a status below 500. The message is `the identity provider rejected the code`. |
 | `403` `forbidden` | the user is `blocked`; the message is `user is blocked`. Nothing changes: the user is not refreshed, no key is revoked and none is issued. |
 | `409` `conflict` | a new user cannot be created: the e-mail is another user's, an org already has the username as its name, the username and all of `<name>-2` to `<name>-10` are taken, or the slug and all of `<slug>-1` to `<slug>-10` are taken; or, at a later login, the e-mail the provider now gives is another user's. Nothing is created or changed. |
-| `502` `upstream_error` | the hub has no provider client |
+| `502` `upstream_error` | the provider failed: it could not be reached, did not answer within 15 seconds, answered a status of 500 or above, something that is not a JSON object or no access token, or an identity without a user id or a verified e-mail. The message is `the identity provider failed`. |
+
+The messages are fixed texts: they never hold the code, a client secret, an
+access token or anything the provider answered.
 
 `user` is the User object (`id`, `username`, `email`, `full_name`, `role`,
 `status`, `provider`, `provider_id`, `created_at`, `updated_at`). `api_key`

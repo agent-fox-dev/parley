@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"fmt"
 	"maps"
+	"net/http"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -25,6 +27,30 @@ func newLoginHub(t *testing.T, id identity.Identity, opts ...hubOption) *testHub
 	h := newTestHub(t, opts...)
 	h.provider.set(id, nil)
 	return h
+}
+
+// records counts the users, orgs, memberships, API keys and revoked API
+// keys in the hub's store, to show that a refused login changed nothing.
+func (h *testHub) records() []int {
+	h.t.Helper()
+	var out []int
+	for _, q := range []string{`users`, `orgs`, `memberships`, `api_keys`, `api_keys WHERE revoked_at IS NOT NULL`} {
+		out = append(out, h.count(`SELECT count(*) FROM `+q))
+	}
+	return out
+}
+
+// newOAuthHub is a test hub whose real provider client reads identities from
+// a fake provider configured as the providers names (github when none); its
+// user URL answers alice, with the github id 123 and the e-mail a@x.
+func newOAuthHub(t *testing.T, timeout time.Duration, names []string, opts ...hubOption) (*testHub, *fakeProvider) {
+	t.Helper()
+	f := newFakeProvider(t)
+	f.answer(fakeUserPath, http.StatusOK, map[string]any{"id": 123, "login": "alice", "email": "a@x"})
+	if len(names) == 0 {
+		names = []string{"github"}
+	}
+	return newTestHub(t, append(opts, withOAuth(f, timeout, names...))...), f
 }
 
 // newIdentity is a github identity no user has.
@@ -218,27 +244,20 @@ func TestCallback_RefusesAFirstLoginThatBreaksUniquenessAndCreatesNothing(t *tes
 			}
 		}},
 	}
-	counts := func(h *testHub) []int {
-		var out []int
-		for _, q := range []string{`users`, `orgs`, `memberships`, `api_keys`, `api_keys WHERE revoked_at IS NOT NULL`} {
-			out = append(out, h.count(`SELECT count(*) FROM `+q))
-		}
-		return out
-	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			h := newLoginHub(t, newIdentity("alice", "a@x"))
 			h.seedKey(h.seedUser("carol").ID, 90)
 			tc.prior(h)
-			before := counts(h)
+			before := h.records()
 
 			r := h.callback(loginBody)
 
 			if r.status != 409 || r.errorField("error_type") != "conflict" {
 				t.Errorf("answer = %d %s, want 409 conflict", r.status, r.body)
 			}
-			if after := counts(h); !slices.Equal(after, before) {
+			if after := h.records(); !slices.Equal(after, before) {
 				t.Errorf("users, orgs, memberships, keys, revoked keys = %v, want %v", after, before)
 			}
 		})
@@ -442,6 +461,179 @@ func TestCallback_RevokesTheUsersLiveKeysAndIssuesTheNewOne(t *testing.T) {
 				alice.ID, t0.UnixNano())
 			if live != 1 {
 				t.Errorf("alice has %d live keys, want 1", live)
+			}
+		})
+	}
+}
+
+func TestCallback_RefusesABodyItCannotUseBeforeCallingTheProvider(t *testing.T) {
+	t.Parallel()
+	with := func(member string, value any) map[string]any {
+		body := maps.Clone(loginBody)
+		body[member] = value
+		return body
+	}
+	without := func(member string) map[string]any {
+		body := maps.Clone(loginBody)
+		delete(body, member)
+		return body
+	}
+	cases := []struct {
+		name     string
+		body     map[string]any
+		accepted bool
+	}{
+		{"no provider", without("provider"), false},
+		{"no code", without("code"), false},
+		{"no redirect_uri", without("redirect_uri"), false},
+		{"an empty code", with("code", ""), false},
+		{"an unsupported provider", with("provider", "gitlab"), false},
+		{"a supported provider that is not configured", with("provider", "google"), false},
+		{"a provider that is not a string", with("provider", 7), false},
+		{"expires 45", with("expires", 45), false},
+		{"expires -1", with("expires", -1), false},
+		{"expires as a string", with("expires", "90"), false},
+		{"expires as a fraction", with("expires", 1.5), false},
+		{"expires null", with("expires", nil), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			h, f := newOAuthHub(t, 0, nil)
+
+			r := h.callback(tc.body)
+
+			if tc.accepted {
+				key, _ := r.json["api_key"].(map[string]any)
+				if want := timefmt.Format(h.now().Add(90 * 24 * time.Hour)); r.status != 200 || key["expires_at"] != want {
+					t.Errorf("answer = %d %s, want 200 with a key expiring at %s", r.status, r.body, want)
+				}
+				return
+			}
+			if r.status != 400 || r.errorField("error_type") != "invalid_request" {
+				t.Errorf("answer = %d %s, want 400 invalid_request", r.status, r.body)
+			}
+			if reqs := f.paths(); len(reqs) != 0 {
+				t.Errorf("the provider received %v, want no request", reqs)
+			}
+			if n := h.records(); !slices.Equal(n, []int{0, 0, 0, 0, 0}) {
+				t.Errorf("users, orgs, memberships, keys, revoked keys = %v, want none", n)
+			}
+		})
+	}
+}
+
+func TestCallback_AcceptsOnlyALoopbackOrTheHubsOwnRedirectURI(t *testing.T) {
+	t.Parallel()
+	const hub = "https://hub.example.com"
+	cases := []struct {
+		externalURL, uri string
+		accepted         bool
+	}{
+		{hub, "http://127.0.0.1:5000/callback", true},
+		{hub, "http://localhost:8123/x/y", true},
+		{hub, "http://localhost/callback", true},
+		{hub, "https://hub.example.com/cli/done", true},
+		{hub, "https://hub.example.com:443/x", true},
+		{hub, "https://127.0.0.1:5000/callback", false},
+		{hub, "https://localhost/x", false},
+		{hub, "http://hub.example.com/x", false},
+		{hub, "https://hub.example.com:8443/x", false},
+		{hub, "https://evil.example/x", false},
+		{hub, "http://127.0.0.1.evil.example/x", false},
+		{hub, "http://localhost@evil.example/x", false},
+		{hub, "https://user@hub.example.com/x", false},
+		{hub, "http://[::1]:5000/callback", false},
+		{hub, "callback", false},
+		{hub, "", false},
+		{hub, "://", false},
+		{"", "https://hub.example.com/x", false},
+		{"", "http://127.0.0.1:1/c", true},
+	}
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("external_url %q, redirect_uri %q", tc.externalURL, tc.uri), func(t *testing.T) {
+			t.Parallel()
+			h, f := newOAuthHub(t, 0, nil, withExternalURL(tc.externalURL))
+
+			r := h.callback(map[string]any{"provider": "github", "code": "c", "redirect_uri": tc.uri})
+
+			reqs := f.recorded()
+			if tc.accepted {
+				if r.status != 200 {
+					t.Errorf("answer = %d %s, want 200", r.status, r.body)
+				}
+				if len(reqs) == 0 || reqs[0].form.Get("redirect_uri") != tc.uri {
+					t.Errorf("the token URL received %v, want redirect_uri %q", reqs, tc.uri)
+				}
+				return
+			}
+			if r.status != 400 || r.errorField("error_type") != "invalid_request" {
+				t.Errorf("answer = %d %s, want 400 invalid_request", r.status, r.body)
+			}
+			if len(reqs) != 0 {
+				t.Errorf("the provider received %d requests, want none", len(reqs))
+			}
+		})
+	}
+}
+
+func TestCallback_RefusesALoginTheProviderRejectsOrFailsAndChangesNothing(t *testing.T) {
+	t.Parallel()
+	type object = map[string]any
+	hidden := object{"id": 123, "login": "alice", "email": nil}
+	cases := []struct {
+		name, provider     string
+		script             func(f *fakeProvider)
+		status             int
+		errorType, message string
+	}{
+		{"the token URL rejects the code", "github", func(f *fakeProvider) {
+			f.answer(fakeTokenPath, http.StatusOK, object{"error": "bad_verification_code"})
+		}, 401, "unauthenticated", "the identity provider rejected the code"},
+		{"the token URL answers 503", "github", func(f *fakeProvider) {
+			f.answer(fakeTokenPath, http.StatusServiceUnavailable, "boom-body")
+		}, 502, "upstream_error", "the identity provider failed"},
+		{"the token URL outlasts the timeout", "github", func(f *fakeProvider) {
+			f.delay(fakeTokenPath, 500*time.Millisecond)
+		}, 502, "upstream_error", "the identity provider failed"},
+		{"the user URL answers 500", "github", func(f *fakeProvider) {
+			f.answer(fakeUserPath, http.StatusInternalServerError, "boom-body")
+		}, 502, "upstream_error", "the identity provider failed"},
+		{"the user has no id", "github", func(f *fakeProvider) {
+			f.answer(fakeUserPath, http.StatusOK, object{"login": "alice", "email": "a@x"})
+		}, 502, "upstream_error", "the identity provider failed"},
+		{"google has not verified the e-mail", "google", func(f *fakeProvider) {
+			f.answer(fakeUserPath, http.StatusOK, object{"sub": "1099", "name": "alice", "email": "a@x", "email_verified": false})
+		}, 502, "upstream_error", "the identity provider failed"},
+		{"github hides the e-mail and lists no primary verified one", "github", func(f *fakeProvider) {
+			f.answer(fakeUserPath, http.StatusOK, hidden)
+			f.answer(fakeEmailsPath, http.StatusOK, []object{{"email": "a@x", "primary": true, "verified": false}})
+		}, 502, "upstream_error", "the identity provider failed"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			h, f := newOAuthHub(t, 50*time.Millisecond, []string{"github", "google"})
+			alice := h.seedAlice()
+			_, k1 := h.seedKey(alice.ID, 90)
+			tc.script(f)
+			before := h.records()
+
+			r := h.callback(map[string]any{"provider": tc.provider, "code": "code-1", "redirect_uri": "http://127.0.0.1:5000/callback"})
+
+			if r.status != tc.status || r.errorField("error_type") != tc.errorType || r.errorField("message") != tc.message {
+				t.Errorf("answer = %d %s, want %d %s %q", r.status, r.body, tc.status, tc.errorType, tc.message)
+			}
+			for _, s := range []string{"code-1", "gh-secret", "gg-secret", "at-1", "boom-body"} {
+				if strings.Contains(string(r.body), s) {
+					t.Errorf("answer %s holds %q", r.body, s)
+				}
+			}
+			if after := h.records(); !slices.Equal(after, before) {
+				t.Errorf("users, orgs, memberships, keys, revoked keys = %v, want %v", after, before)
+			}
+			if at := h.storedRevokedAt("API key", k1.KeyID); at != nil {
+				t.Errorf("k1 revoked at %v, want not revoked", at)
 			}
 		})
 	}

@@ -2,6 +2,7 @@ package hub
 
 import (
 	"context"
+	"net/http"
 
 	"github.com/agent-fox-dev/parley/internal/identity"
 )
@@ -11,8 +12,8 @@ import (
 // every non-public route under /api/v1 is authenticated, and registers the
 // service's routes: GET /auth/providers and POST /auth/callback. The
 // service gets its store, clock and configuration in a start hook, which
-// runs before the hub serves its first request. It is bound without a
-// provider client yet, so the hub answers every login 502 upstream_error.
+// runs before the hub serves its first request, with the client that reads
+// a user's identity from the configured providers at login.
 func composeIdentity(c *Composition) {
 	svc := &identity.Service{}
 	c.AddSchemaStep(identity.SchemaStep)
@@ -22,6 +23,7 @@ func composeIdentity(c *Composition) {
 			Now:         rt.Now,
 			Providers:   rt.Config.OAuth.Providers,
 			ExternalURL: rt.Config.Server.ExternalURL,
+			Client:      identity.NewOAuthClient(rt.Config.OAuth.Providers, http.DefaultClient, identity.DefaultProviderTimeout),
 		})
 		return nil
 	})

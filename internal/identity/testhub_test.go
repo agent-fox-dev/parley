@@ -49,6 +49,7 @@ type hubConfig struct {
 	adminEmail  string
 	providers   []config.Provider
 	externalURL string
+	client      identity.ProviderClient // nil: the stub provider
 }
 
 type hubOption func(*hubConfig)
@@ -67,6 +68,18 @@ func withProviders(ps ...config.Provider) hubOption {
 		for _, p := range ps {
 			c.providers = append(c.providers, p.WithPublicEndpoints())
 		}
+	}
+}
+
+// withOAuth configures the providers names with their endpoints on the fake
+// provider f and reads identities with the hub's own provider client, which
+// abandons a call to f after timeout (0 is the client's default).
+func withOAuth(f *fakeProvider, timeout time.Duration, names ...string) hubOption {
+	return func(c *hubConfig) {
+		for _, name := range names {
+			c.providers = append(c.providers, f.provider(name))
+		}
+		c.client = identity.NewOAuthClient(c.providers, nil, timeout)
 	}
 }
 
@@ -101,7 +114,11 @@ func newTestHub(t *testing.T, opts ...hubOption) *testHub {
 		}
 	}
 	h.svc = &identity.Service{}
-	h.svc.Bind(identity.Deps{Store: st, Now: h.now, Providers: cfg.providers, ExternalURL: cfg.externalURL, Client: h.provider})
+	client := cfg.client
+	if client == nil {
+		client = h.provider
+	}
+	h.svc.Bind(identity.Deps{Store: st, Now: h.now, Providers: cfg.providers, ExternalURL: cfg.externalURL, Client: client})
 	h.srv = server.New(server.Options{Logger: slog.New(slog.DiscardHandler), RateLimitDisabled: true, Now: h.now})
 	h.srv.SetAuthenticator(h.svc.Authenticate)
 	for _, r := range h.svc.Routes() {

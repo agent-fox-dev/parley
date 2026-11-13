@@ -1,8 +1,10 @@
 package identity_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"maps"
+	"net/http"
 	"net/url"
 	"slices"
 	"strings"
@@ -103,5 +105,39 @@ func TestProviders_ListsTheConfiguredProvidersWithTheirAuthorizeURL(t *testing.T
 				}
 			}
 		})
+	}
+}
+
+func TestPublicRoutes_AnswerTheSameWhateverTheAuthorizationHeader(t *testing.T) {
+	t.Parallel()
+	h := newTestHub(t, withProviders(config.Provider{Name: "github", ClientID: "gh-id", ClientSecret: "gh-secret"}))
+	revoked, rec := h.seedKey(h.seedUser("alice").ID, 90)
+	h.revoke(rec.KeyID)
+	routes := []struct {
+		method, path string
+		body         any
+		status       int
+	}{
+		{http.MethodGet, "/api/v1/auth/providers", nil, 200},
+		{http.MethodPost, "/api/v1/auth/callback", map[string]any{}, 400},
+	}
+	for _, rt := range routes {
+		send := func(authorization string) response {
+			header := http.Header{}
+			if authorization != "" {
+				header.Set("Authorization", authorization)
+			}
+			return h.do(rt.method, rt.path, rt.body, header)
+		}
+		absent := send("")
+		for _, authorization := range []string{"", "Bearer hello", "Bearer " + revoked, "Basic x"} {
+			r := send(authorization)
+			if r.status != rt.status || !bytes.Equal(r.body, absent.body) {
+				t.Errorf("%s %s with Authorization %q = %d %s, want %d %s", rt.method, rt.path, authorization, r.status, r.body, rt.status, absent.body)
+			}
+		}
+	}
+	if h.provider.calls != 0 {
+		t.Errorf("the provider was called %d times, want none", h.provider.calls)
 	}
 }

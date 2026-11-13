@@ -627,8 +627,10 @@ start hook `identity`, which binds the service with
 `(*identity.Service).Bind(identity.Deps{Store, Now, Providers,
 ExternalURL, Client})` from the `Runtime` before the hub serves its first
 request. `Deps.Client` is the `identity.ProviderClient` a login reads the
-user's identity through; the hub binds none yet, and a service without one
-answers every login `502 upstream_error`.
+user's identity through; the hub binds
+`identity.NewOAuthClient(rt.Config.OAuth.Providers, http.DefaultClient,
+identity.DefaultProviderTimeout)`, and a service without one answers every
+login `502 upstream_error`.
 
 The service's routes are, so far, the public `GET /auth/providers` (see
 [api.md](api.md#get-apiv1authproviders)) and the public `POST
@@ -720,8 +722,17 @@ that it needs a user with the mark `identity.MarkNeedsUser` in its
 `server.Route.Marks`; the authenticator reads it right after accepting the
 credential and answers the admin token `403 forbidden` there.
 
-The login, in `internal/identity/login.go`, decodes the callback's body,
-reads the identity through `Deps.Client` and signs the user in, in one
+The login, in `internal/identity/login.go`, decodes the callback's body
+and checks it before the provider is called: `provider`, `code` and
+`redirect_uri` are non-empty strings, `provider` is one of
+`Deps.Providers`, `expires` is absent, `null` or one of 0, 30, 60 and 90,
+and `redirect_uri` passes `allowedRedirect` in
+`internal/identity/redirect.go` (http on `localhost` or `127.0.0.1`, or the
+scheme, host and port of `Deps.ExternalURL`; never with user information);
+each violation is `400 invalid_request`. It then reads the identity through
+`Deps.Client`, answering `identity.ErrRejected` `401 unauthenticated` and
+`identity.ErrUpstream` `502 upstream_error`, each with the error's fixed
+text, and signs the user in, in one
 `(*store.Store).Tx`: it looks the user up with `identity.UserByProvider`,
 and at a first login picks the username (the provider's, else the first
 free of `<name>-2` to `<name>-10`) and the role (`admin` when the e-mail is
