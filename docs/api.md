@@ -154,6 +154,55 @@ a JSON value other than an object (an array, a string, a number, `null`), or
 has anything but white space after the object. Members the route does not
 know are ignored.
 
+## Lists
+
+Every route that answers a list answers one page of it, `200` with exactly
+these two members:
+
+```json
+{"items":[{"id":2},{"id":4}],"next_cursor":"eyJwIjo0LCJmIjoi..."}
+```
+
+| Member | Value |
+|---|---|
+| `items` | an array of the page's items, in the list's order; `[]` when the page is empty, never `null` |
+| `next_cursor` | a string when more items follow, `null` on the last page |
+
+A list request takes two query parameters:
+
+| Parameter | Meaning |
+|---|---|
+| `limit` | the most items a page holds: an integer from 1 to 200, 50 when absent |
+| `cursor` | the `next_cursor` of the previous page; absent for the first page |
+
+To read a whole list, request the first page and then repeat the same request
+with `cursor` set to the last answer's `next_cursor` until it is `null`. Every
+item that exists throughout the walk comes exactly once and in order, and the
+last page has a `null` `next_cursor` also when the item count is a multiple of
+the limit. A page continues after the last item of the previous one, so an
+item added earlier in the order during the walk neither repeats nor hides
+another.
+
+A route whose list has another default or other bounds says so in its
+section of this page; they then apply in place of 50 and 1–200.
+
+These answer `400` with `error_type` `invalid_request`, before the list is
+read:
+
+- a `limit` that is not an integer (`abc`, `1.5`, an empty value) or is
+  outside the bounds (`0`, `-1`, `201`);
+- a `cursor` that is not one the hub issued (not URL-safe base64, or not a
+  cursor document);
+- a `cursor` issued for another query: another route, another value of a path
+  parameter, or other query parameters apart from `cursor` and `limit`. The
+  same cursor with a different `limit` is accepted, so a client may change
+  the page size between pages;
+- a query string that does not parse (such as `cursor=%%%`, with an
+  unescaped `%`).
+
+A cursor is opaque: clients must not build or change one. It carries no
+grant; every page passes the full order of checks again.
+
 ## Errors
 
 Every error of the REST API is answered with one JSON envelope, sent with

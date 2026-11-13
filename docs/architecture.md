@@ -13,7 +13,7 @@ command-line client. Both are written in Go, in the module
 | `cmd/parleyd` | the `parleyd` program: argument parsing, signals, the start log line and the exit status |
 | `internal/buildinfo` | the version, commit and build time the binary was built with, shared by both programs |
 | `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra` |
-| `internal/server` | the hub's HTTP server: its built-in routes, the REST API's route registration and check pipeline, the error envelope, request ids, response headers and the access log, and the readiness probes |
+| `internal/server` | the hub's HTTP server: its built-in routes, the REST API's route registration and check pipeline, the error envelope, request ids, response headers and the access log, list paging, and the readiness probes |
 | `test/e2e` | tests that build the binaries and run them |
 
 ## The HTTP server
@@ -172,6 +172,30 @@ the dispatcher before it, so none of them is counted.
 A handler decodes a JSON body with `server.DecodeJSON(r, &v)`, which
 returns `400 invalid_request` for an empty body, invalid JSON, a value that
 is not an object or data after the object, and ignores unknown members.
+
+A list handler pages through `internal/server/list.go`:
+
+1. `server.ReadPage(r, bounds...)` reads `limit` and `cursor` from the query
+   and returns a `server.Page`, or a `400 invalid_request` error that the
+   handler returns before it reads its collection. The limit defaults to 50
+   within 1–200; a route with other bounds passes its own
+   `server.PageBounds{Default, Min, Max}` as the argument (there is no `Route`
+   field for it).
+2. `(server.Page).After(&pos)` decodes the position the page continues after
+   into a value of the handler's own type, the keyset of its total order, and
+   reports false on the first page.
+3. The handler fetches up to `page.Limit+1` items after that position and
+   calls `server.WritePage(w, page, items, position)`, which writes the first
+   `Limit` items as `items` (`[]` for none) and, when the extra item exists,
+   `next_cursor` from `position` of the last item written, else `null`.
+
+A cursor is the unpadded URL-safe base64 form of the JSON document
+`{"p": <position>, "f": <fingerprint>}`. The fingerprint is a truncated
+SHA-256 of the matched route's method and pattern as registered, its path
+parameter values and every query parameter except `cursor` and `limit`, so a
+cursor is refused on another query but accepted with another limit. Cursors
+are not signed: a cursor grants nothing, since every page passes the full
+order of checks again.
 
 The installed checks are copied under a read lock at the start of each
 request, and no lock is held while a check or a handler runs, so a request
