@@ -56,11 +56,14 @@ func (k Key) id() string { return k.Section + "." + k.Name }
 // it holds the repeatable [[oauth.providers]] table.
 const oauthSection = "oauth"
 
-// Registry holds the keys a load accepts. Keys are registered before the
-// load, from one goroutine; the strictness of the file is decided here, not by
-// struct tags, because every package adds keys of its own.
+// Registry holds the keys and the whole sections a load accepts. They are
+// registered before the load, from one goroutine; the strictness of the file
+// is decided here, not by struct tags, because every package adds keys of its
+// own.
 type Registry struct {
 	keys map[string]map[string]Key
+	// sections holds the validator of each section registered as a whole.
+	sections map[string]func(map[string]any) error
 	// errs remembers refused registrations: a package that registers at
 	// start-up may ignore Register's error, and the load must still fail.
 	errs []error
@@ -69,7 +72,7 @@ type Registry struct {
 // NewRegistry returns a registry holding the keys the configuration loader
 // owns: those of [server], [database], [workspace], [logging] and [limits].
 func NewRegistry() *Registry {
-	r := &Registry{keys: map[string]map[string]Key{}}
+	r := &Registry{keys: map[string]map[string]Key{}, sections: map[string]func(map[string]any) error{}}
 	for _, k := range ownKeys {
 		// A refusal is remembered and fails the load; the loader's own keys
 		// are fixed and well formed, so there is none.
@@ -95,6 +98,8 @@ func (r *Registry) register(k Key) error {
 		return fmt.Errorf("configuration key %q: section and name must not be empty", k.id())
 	case k.Section == oauthSection:
 		return fmt.Errorf("configuration key %s: section [%s] is owned by the configuration loader", k.id(), oauthSection)
+	case r.sections[k.Section] != nil:
+		return fmt.Errorf("configuration key %s: section [%s] is registered as a whole", k.id(), k.Section)
 	case r.keys[k.Section][k.Name].Type != 0:
 		return fmt.Errorf("configuration key %s is registered twice", k.id())
 	}
@@ -107,6 +112,42 @@ func (r *Registry) register(k Key) error {
 		r.keys[k.Section] = map[string]Key{}
 	}
 	r.keys[k.Section][k.Name] = k
+	return nil
+}
+
+// RegisterSection makes a package the owner of a whole section: the load does
+// not check the section's keys against the registry and, when the file holds
+// the section, hands validate its parsed content once, with the environment
+// references in its string values replaced at any depth. Tables are
+// map[string]any, arrays of tables []map[string]any and integers int64, as
+// the TOML parser gives them. validate's error fails the load with its
+// message unchanged, so it can list every failure of the section together.
+//
+// A section is registered either key by key or as a whole, never both: a
+// section registered twice, or one in which a key is registered, is refused;
+// RegisterSection returns the error and the next Load fails with it.
+func (r *Registry) RegisterSection(name string, validate func(map[string]any) error) error {
+	err := r.registerSection(name, validate)
+	if err != nil {
+		r.errs = append(r.errs, err)
+	}
+	return err
+}
+
+func (r *Registry) registerSection(name string, validate func(map[string]any) error) error {
+	switch {
+	case name == "":
+		return errors.New("configuration section: name must not be empty")
+	case validate == nil:
+		return fmt.Errorf("configuration section [%s]: validator must not be nil", name)
+	case name == oauthSection:
+		return fmt.Errorf("configuration section [%s] is owned by the configuration loader", name)
+	case r.sections[name] != nil:
+		return fmt.Errorf("configuration section [%s] is registered twice", name)
+	case len(r.keys[name]) > 0:
+		return fmt.Errorf("configuration section [%s] cannot be registered as a whole: keys are registered in it", name)
+	}
+	r.sections[name] = validate
 	return nil
 }
 

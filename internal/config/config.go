@@ -50,6 +50,9 @@ type Config struct {
 	OAuth     OAuth
 
 	values map[string]map[string]any
+	// sections holds the content of each section registered as a whole that
+	// the file holds.
+	sections map[string]map[string]any
 }
 
 // Server holds the keys of [server].
@@ -118,6 +121,13 @@ func (c *Config) DataDir() string { return filepath.Dir(c.Database.Path) }
 // analytics.db in the data directory.
 func (c *Config) AnalyticsPath() string { return filepath.Join(c.DataDir(), "analytics.db") }
 
+// Section returns the content of a section registered as a whole, as its
+// validator was given it, and whether the file holds the section.
+func (c *Config) Section(name string) (map[string]any, bool) {
+	s, ok := c.sections[name]
+	return s, ok
+}
+
 // Value returns the value of a registered key, the file's or its default, and
 // whether the key is registered.
 func (c *Config) Value(section, name string) (any, bool) {
@@ -151,8 +161,10 @@ func Load(env Env, workDir string) (*Config, error) {
 	return NewRegistry().Load(env, workDir)
 }
 
-// Load reads the configuration file once and checks it against the
-// registered keys. The file is $XDG_CONFIG_HOME/config.toml when
+// Load reads the configuration file once, replaces the environment
+// references in its string values and checks it against the registered keys
+// and sections. A string value's ${NAME} becomes the value of the variable
+// NAME, which must be set, and $$ becomes one $. The file is $XDG_CONFIG_HOME/config.toml when
 // XDG_CONFIG_HOME is set and non-empty, and config.toml in workDir otherwise;
 // a missing file means every default. Any error refuses the whole file: Load
 // returns a configuration only when every value is valid.
@@ -175,11 +187,16 @@ func (r *Registry) Load(env Env, workDir string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	values, providers, err := r.check(tree)
+	if err := expandTree(tree, env); err != nil {
+		return nil, fmt.Errorf("configuration file %s: %w", path, err)
+	}
+	values, providers, sections, err := r.check(tree)
 	if err != nil {
 		return nil, fmt.Errorf("configuration file %s: %w", path, err)
 	}
-	return build(values, providers, path, work, lookup(env, "XDG_DATA_HOME")), nil
+	c := build(values, providers, path, work, lookup(env, "XDG_DATA_HOME"))
+	c.sections = sections
+	return c, nil
 }
 
 // lookup returns the variable's value, "" when it is unset.
@@ -225,9 +242,11 @@ func readTree(path string) (map[string]any, error) {
 }
 
 // check walks the decoded file against the registry and returns the value of
-// every registered key and the OAuth providers. It stops at the first key it
-// refuses, in the order of section and key names.
-func (r *Registry) check(tree map[string]any) (map[string]map[string]any, []Provider, error) {
+// every registered key, the OAuth providers and the content of the sections
+// registered as a whole. It stops at the first key it refuses, in the order of
+// section and key names; the validators of whole sections run only once every
+// key is accepted.
+func (r *Registry) check(tree map[string]any) (map[string]map[string]any, []Provider, map[string]map[string]any, error) {
 	values := map[string]map[string]any{}
 	for section, keys := range r.keys {
 		values[section] = map[string]any{}
@@ -236,12 +255,20 @@ func (r *Registry) check(tree map[string]any) (map[string]map[string]any, []Prov
 		}
 	}
 	var providers []Provider
+	sections := map[string]map[string]any{}
 	for _, section := range sortedKeys(tree) {
 		table, isTable := tree[section].(map[string]any)
+		if _, whole := r.sections[section]; whole {
+			if !isTable {
+				return nil, nil, nil, fmt.Errorf("%s: must be a [%s] table", section, section)
+			}
+			sections[section] = table
+			continue
+		}
 		if section == oauthSection {
 			p, err := checkOAuth(tree[section])
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 			providers = p
 			continue
@@ -249,28 +276,33 @@ func (r *Registry) check(tree map[string]any) (map[string]map[string]any, []Prov
 		keys, known := r.keys[section]
 		switch {
 		case !isTable && !known:
-			return nil, nil, fmt.Errorf("%s: unknown key: every key belongs in a [section]", section)
+			return nil, nil, nil, fmt.Errorf("%s: unknown key: every key belongs in a [section]", section)
 		case !isTable:
-			return nil, nil, fmt.Errorf("%s: must be a [%s] table", section, section)
+			return nil, nil, nil, fmt.Errorf("%s: must be a [%s] table", section, section)
 		case !known:
-			return nil, nil, fmt.Errorf("[%s]: unknown section", section)
+			return nil, nil, nil, fmt.Errorf("[%s]: unknown section", section)
 		}
 		for _, name := range sortedKeys(table) {
 			k, ok := keys[name]
 			if !ok {
-				return nil, nil, fmt.Errorf("%s.%s: unknown key", section, name)
+				return nil, nil, nil, fmt.Errorf("%s.%s: unknown key", section, name)
 			}
 			v, err := coerce(k.Type, table[name])
 			if err == nil && k.Validate != nil {
 				err = k.Validate(v)
 			}
 			if err != nil {
-				return nil, nil, fmt.Errorf("%s: %w", k.id(), err)
+				return nil, nil, nil, fmt.Errorf("%s: %w", k.id(), err)
 			}
 			values[section][name] = v
 		}
 	}
-	return values, providers, nil
+	for _, section := range sortedKeys(sections) {
+		if err := r.sections[section](sections[section]); err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	return values, providers, sections, nil
 }
 
 // The keys of a [[oauth.providers]] table and the endpoints of each provider
