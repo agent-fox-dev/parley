@@ -225,10 +225,20 @@ func parseConfig(path string) (map[string]any, error) {
 
 // replaceFile writes data to a temporary file with mode 0600 in the
 // directory of path, creating the directory with mode 0700 when it is
-// missing, and renames it over path. On failure the temporary file is
-// removed and path is left as it was.
+// missing, and renames it over path. On failure the temporary file and the
+// directories it created are removed and path is left as it was.
 func replaceFile(path string, data []byte) (err error) {
 	dir := filepath.Dir(path)
+	missing := missingDirs(dir)
+	defer func() {
+		if err != nil {
+			for _, d := range missing {
+				// Remove only takes an empty directory, so this never
+				// removes what someone else put there meanwhile.
+				_ = os.Remove(d)
+			}
+		}
+	}()
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
@@ -256,6 +266,21 @@ func replaceFile(path string, data []byte) (err error) {
 		return err
 	}
 	return os.Rename(tmp.Name(), path)
+}
+
+// missingDirs is dir and each of its ancestors that does not exist, the
+// deepest first: the directories a save would create.
+func missingDirs(dir string) []string {
+	var missing []string
+	for d := dir; ; d = filepath.Dir(d) {
+		if _, err := os.Lstat(d); !errors.Is(err, fs.ErrNotExist) {
+			return missing
+		}
+		missing = append(missing, d)
+		if filepath.Dir(d) == d {
+			return missing
+		}
+	}
 }
 
 // withoutPath is err without the operation and path a file system error adds,

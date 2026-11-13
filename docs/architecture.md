@@ -1381,8 +1381,8 @@ that keys it does not know survive, sets the three keys and encodes the map;
 it writes a temporary file in the same directory (created with mode `0700`
 when missing), syncs it, sets its mode to `0600` and renames it over
 `config.toml`. Every failure, including a file it cannot parse, is a
-`client_error` naming the path, with the temporary file removed and the old
-file left as it was; without a path, because there is no home directory,
+`client_error` naming the path, with the temporary file and the directories
+the save created removed, and the old file left as it was; without a path, because there is no home directory,
 it is `cannot save the config file: <configPath's error>`.
 
 `parley login --api-key`, with the global flag (`internal/cli/login.go`),
