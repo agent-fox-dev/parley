@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/buildinfo"
 )
@@ -188,5 +190,163 @@ func TestVersion_AnswersTheBuildValuesAndGoVersion(t *testing.T) {
 				t.Errorf("body = %v, want %v", got, want)
 			}
 		})
+	}
+}
+
+// serving is a server started by startServing on 127.0.0.1:0.
+type serving struct {
+	addr   string
+	cancel context.CancelFunc
+	// done receives what Serve returned, once.
+	done chan error
+}
+
+// startServing registers routes on a new server with the given grace, runs
+// Serve in a goroutine and waits until it has bound its listener.
+func startServing(t *testing.T, grace time.Duration, routes map[string]http.Handler) *serving {
+	t.Helper()
+	bound := make(chan net.Addr, 1)
+	s := New(Options{Addr: "127.0.0.1:0", ShutdownGrace: grace, OnListen: func(a net.Addr) { bound <- a }})
+	for pattern, h := range routes {
+		s.Handle(pattern, h)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	sv := &serving{cancel: cancel, done: make(chan error, 1)}
+	go func() { sv.done <- s.Serve(ctx) }()
+	t.Cleanup(cancel)
+
+	select {
+	case a := <-bound:
+		sv.addr = a.String()
+	case err := <-sv.done:
+		t.Fatalf("Serve returned %v before it reported a bound address", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not report a bound address within 5 s")
+	}
+	return sv
+}
+
+type getResult struct {
+	status int
+	body   string
+	err    error
+}
+
+// getAsync sends GET http://addr+path on a client of its own and delivers the
+// outcome on the returned channel.
+func getAsync(t *testing.T, addr, path string) <-chan getResult {
+	t.Helper()
+	tr := &http.Transport{}
+	t.Cleanup(tr.CloseIdleConnections)
+	client := &http.Client{Transport: tr}
+	out := make(chan getResult, 1)
+	go func() {
+		res, err := client.Get("http://" + addr + path)
+		if err != nil {
+			out <- getResult{err: err}
+			return
+		}
+		defer res.Body.Close()
+		body, err := io.ReadAll(res.Body)
+		out <- getResult{status: res.StatusCode, body: string(body), err: err}
+	}()
+	return out
+}
+
+// blockingHandler answers 200 "done" once release is closed, and closes
+// started when it has been called.
+func blockingHandler(started chan<- struct{}, release <-chan struct{}) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(started)
+		<-release
+		_, _ = io.WriteString(w, "done")
+	})
+}
+
+func waitFor[T any](t *testing.T, ch <-chan T, within time.Duration, what string) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(within):
+		t.Fatalf("%s: nothing within %v", what, within)
+		var zero T
+		return zero
+	}
+}
+
+func TestServe_StopsAcceptingAndLetsAnInFlightRequestFinish(t *testing.T) {
+	t.Parallel()
+	started, release := make(chan struct{}), make(chan struct{})
+	sv := startServing(t, 2*time.Second, map[string]http.Handler{"GET /slow": blockingHandler(started, release)})
+
+	slow := getAsync(t, sv.addr, "/slow")
+	waitFor(t, started, 5*time.Second, "slow handler start")
+
+	t0 := time.Now()
+	sv.cancel()
+
+	// The listener closes once the context is cancelled: a new connection is
+	// refused while the slow request is still being answered.
+	deadline := time.Now().Add(time.Second)
+	for {
+		conn, err := net.Dial("tcp", sv.addr)
+		if err != nil {
+			break
+		}
+		conn.Close()
+		if time.Now().After(deadline) {
+			t.Fatal("new connections still accepted 1 s after the stop")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	select {
+	case err := <-sv.done:
+		t.Fatalf("Serve returned %v while a request was in flight", err)
+	case r := <-slow:
+		t.Fatalf("the slow request finished before its handler was released: %+v", r)
+	default:
+	}
+
+	close(release)
+	r := waitFor(t, slow, 2*time.Second, "slow response")
+	if r.err != nil {
+		t.Fatalf("slow request: %v", r.err)
+	}
+	if r.status != http.StatusOK || r.body != "done" {
+		t.Errorf("slow response = %d %q, want 200 %q", r.status, r.body, "done")
+	}
+	if err := waitFor(t, sv.done, 2*time.Second, "Serve return"); err != nil {
+		t.Errorf("Serve returned %v, want nil", err)
+	}
+	if elapsed := time.Since(t0); elapsed >= 2*time.Second {
+		t.Errorf("Serve returned %v after the stop, want under 2 s", elapsed)
+	}
+}
+
+func TestServe_ClosesAStuckRequestWhenTheGraceExpires(t *testing.T) {
+	t.Parallel()
+	const grace = 100 * time.Millisecond
+	started, release := make(chan struct{}), make(chan struct{})
+	defer close(release)
+	sv := startServing(t, grace, map[string]http.Handler{"GET /stuck": blockingHandler(started, release)})
+
+	stuck := getAsync(t, sv.addr, "/stuck")
+	waitFor(t, started, 5*time.Second, "stuck handler start")
+
+	t0 := time.Now()
+	sv.cancel()
+	err := waitFor(t, sv.done, 5*time.Second, "Serve return")
+	elapsed := time.Since(t0)
+
+	if err != nil {
+		t.Errorf("Serve returned %v, want nil", err)
+	}
+	if elapsed < grace || elapsed >= grace+time.Second {
+		t.Errorf("Serve returned %v after the stop, want between %v and %v", elapsed, grace, grace+time.Second)
+	}
+	r := waitFor(t, stuck, 5*time.Second, "stuck request outcome")
+	if r.err == nil {
+		t.Errorf("stuck request got a response %d %q, want its connection closed", r.status, r.body)
 	}
 }

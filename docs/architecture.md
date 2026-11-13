@@ -9,6 +9,7 @@ command-line client. Both are written in Go, in the module
 
 | Package | Holds |
 |---|---|
+| `cmd/parleyd` | the `parleyd` program: argument parsing, signals, the start log line and the exit status |
 | `internal/buildinfo` | the version, commit and build time the binary was built with, shared by both programs |
 | `internal/server` | the hub's HTTP server: its routes and its readiness probes |
 
@@ -16,8 +17,11 @@ command-line client. Both are written in Go, in the module
 
 `server.New(server.Options)` builds the server, and `(*Server).Handler()`
 returns the `http.Handler` that serves its routes. `Options` holds the listen
-address (`Addr`), the shutdown grace (`ShutdownGrace`) and the readiness
-probes (`ReadinessProbes`).
+address (`Addr`), the shutdown grace (`ShutdownGrace`), the readiness
+probes (`ReadinessProbes`) and `OnListen`, a function `Serve` calls once with
+the address it bound (with port `0` in `Addr`, the port the system chose).
+Later packages mount their routes with `(*Server).Handle(pattern, handler)`,
+which takes the same patterns as `http.ServeMux`, before `Serve` is called.
 
 Routes are registered on a standard library `http.ServeMux` with method and
 path patterns (`GET /healthz`, `GET /readyz`, `GET /version`). Unknown paths
@@ -25,6 +29,46 @@ and wrong methods are left to the mux's own `404` and `405` answers. Every
 route writes its body through one JSON helper, which sets
 `Content-Type: application/json; charset=utf-8`. The routes are described in
 [api.md](api.md).
+
+### Serving and stopping
+
+`(*Server).Serve(ctx)` binds `Addr` with `net.Listen("tcp", …)`, returns the
+error (`listen on <addr>: …`) when it cannot, calls `OnListen`, and serves
+until `ctx` is cancelled. Then it stops in this order:
+
+1. It closes the listener, so new connections are refused.
+2. It waits up to 100 ms for connections that are accepted but whose request
+   has not been read yet. `http.Server.Shutdown` would drop those, and a
+   request the client had already sent would get no answer.
+3. It calls `http.Server.Shutdown` with a deadline of `ShutdownGrace`, which
+   waits for in-flight requests to finish and closes idle connections.
+4. When the grace passes first, it calls `http.Server.Close`, which closes the
+   remaining connections; their clients get no response. `Serve` does not
+   wait for those handlers to return.
+
+`Serve` returns `nil` after a stop, whether or not the grace passed.
+
+## parleyd
+
+`cmd/parleyd` holds `main` and a `run` function that does the work:
+`run(ctx, args, addr, grace, stdout, stderr)` returns the exit status, and
+`main` calls it with the defaults `0.0.0.0:8080` and 15 seconds and passes the
+result to `os.Exit`. Tests call `run` with `127.0.0.1:0` and a grace of
+milliseconds. `run`:
+
+1. parses the arguments with the standard `flag` package (`--help` prints the
+   usage on stdout and returns `0`; an unknown flag or any positional
+   argument prints an error and the usage on stderr and returns `2`);
+2. derives the serving context with `signal.NotifyContext` for `SIGTERM` and
+   `SIGINT`, before the listener is bound;
+3. builds the server and calls `Serve`, with an `OnListen` that writes the
+   start line, a JSON object with `"msg":"listening"` and the bound
+   `"addr"`, to stderr with `log/slog`'s JSON handler;
+4. returns `1` after one `cannot listen` error line when the address cannot
+   be bound, and `0` when `Serve` returns after a stop.
+
+The flags, exit statuses and log lines are described in [cli.md](cli.md),
+the fixed address and grace in [configuration.md](configuration.md).
 
 ### Readiness probes
 
@@ -45,7 +89,7 @@ go build -ldflags "\
   -X github.com/agent-fox-dev/parley/internal/buildinfo.Version=1.4.0 \
   -X github.com/agent-fox-dev/parley/internal/buildinfo.Commit=3f2a1bc \
   -X github.com/agent-fox-dev/parley/internal/buildinfo.BuildTime=2026-01-02T03:04:05Z" \
-  <package>
+  ./cmd/parleyd
 ```
 
 `buildinfo.Get()` returns them as a `buildinfo.Info`, with the Go toolchain's

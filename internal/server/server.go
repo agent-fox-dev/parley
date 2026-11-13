@@ -5,7 +5,11 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/buildinfo"
@@ -24,6 +28,9 @@ type Options struct {
 	// ReadinessProbes are called on every GET /readyz; with none, the hub is
 	// ready.
 	ReadinessProbes []Probe
+	// OnListen, when set, is called once by Serve with the address it bound,
+	// before it serves; with port 0 in Addr it carries the chosen port.
+	OnListen func(net.Addr)
 }
 
 // Server is the hub's HTTP server.
@@ -45,6 +52,106 @@ func New(opts Options) *Server {
 // Handler returns the handler that serves every route of the server.
 func (s *Server) Handler() http.Handler {
 	return s.mux
+}
+
+// Handle registers h for pattern on the server's router, with the pattern
+// syntax of http.ServeMux. Routes are registered before Serve is called.
+func (s *Server) Handle(pattern string, h http.Handler) {
+	s.mux.Handle(pattern, h)
+}
+
+// newConnWait is how long a stop waits for connections that are accepted but
+// whose request has not been read yet: http.Server.Shutdown drops those, so a
+// request the client has already sent would get no answer.
+const newConnWait = 100 * time.Millisecond
+
+// Serve binds Options.Addr and serves until ctx is cancelled. It returns the
+// error when the address cannot be bound. On cancellation it stops accepting
+// connections and gives in-flight requests up to Options.ShutdownGrace to
+// finish; when the grace passes it closes the connections that remain,
+// without waiting for their handlers. A stop returns nil either way.
+func (s *Server) Serve(ctx context.Context) error {
+	ln, err := net.Listen("tcp", s.opts.Addr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", s.opts.Addr, err)
+	}
+	if s.opts.OnListen != nil {
+		s.opts.OnListen(ln.Addr())
+	}
+
+	conns := newConnTracker()
+	srv := &http.Server{Handler: s.mux, ConnState: conns.track}
+	served := make(chan error, 1)
+	go func() { served <- srv.Serve(ln) }()
+
+	select {
+	case err := <-served:
+		_ = srv.Close()
+		return fmt.Errorf("serve on %s: %w", ln.Addr(), err)
+	case <-ctx.Done():
+	}
+
+	// Closing the listener ends srv.Serve with an accept error, the expected
+	// end here and not a failure; served is buffered, so its goroutine ends
+	// without a reader.
+	_ = ln.Close()
+	conns.waitForRequests(newConnWait)
+
+	graceCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.opts.ShutdownGrace)
+	defer cancel()
+	if err := srv.Shutdown(graceCtx); errors.Is(err, context.DeadlineExceeded) {
+		// Close drops the remaining connections; their handlers are left to
+		// end on their own.
+		_ = srv.Close()
+	}
+	return nil
+}
+
+// connTracker knows which connections are accepted but have not had a
+// request read yet (http.StateNew).
+type connTracker struct {
+	mu      sync.Mutex
+	fresh   map[net.Conn]struct{}
+	changed chan struct{}
+}
+
+func newConnTracker() *connTracker {
+	return &connTracker{fresh: make(map[net.Conn]struct{}), changed: make(chan struct{}, 1)}
+}
+
+// track is the http.Server ConnState hook.
+func (c *connTracker) track(conn net.Conn, state http.ConnState) {
+	c.mu.Lock()
+	if state == http.StateNew {
+		c.fresh[conn] = struct{}{}
+	} else {
+		delete(c.fresh, conn)
+	}
+	c.mu.Unlock()
+	select {
+	case c.changed <- struct{}{}:
+	default:
+	}
+}
+
+func (c *connTracker) anyFresh() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.fresh) > 0
+}
+
+// waitForRequests waits until no connection is waiting for its first request
+// to be read, or for at most limit.
+func (c *connTracker) waitForRequests(limit time.Duration) {
+	timer := time.NewTimer(limit)
+	defer timer.Stop()
+	for c.anyFresh() {
+		select {
+		case <-c.changed:
+		case <-timer.C:
+			return
+		}
+	}
 }
 
 type statusDocument struct {
