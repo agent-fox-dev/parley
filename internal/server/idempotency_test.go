@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"errors"
 	"net/http"
@@ -27,17 +28,19 @@ var idempotencyCallers = map[string]Caller{
 }
 
 // createFixture is a server with a clock the test moves, an in-memory record
-// store the test reads and a handler that counts its calls.
+// store the test reads, a log the test reads and a handler that counts its
+// calls.
 type createFixture struct {
 	s     *Server
 	store *MemoryIdempotencyStore
 	clock *testClock
+	log   *logBuffer
 	calls atomic.Int64
 }
 
 func newCreateFixture() *createFixture {
-	f := &createFixture{store: NewMemoryIdempotencyStore(), clock: newTestClock()}
-	f.s = New(Options{Now: f.clock.Now, IdempotencyStore: f.store})
+	f := &createFixture{store: NewMemoryIdempotencyStore(), clock: newTestClock(), log: &logBuffer{}}
+	f.s = New(Options{Now: f.clock.Now, IdempotencyStore: f.store, Logger: f.log.logger()})
 	f.s.SetAuthenticator(func(r *http.Request) (Caller, error) {
 		c, ok := idempotencyCallers[r.Header.Get("Authorization")]
 		if !ok {
@@ -83,6 +86,17 @@ func (f *createFixture) records() []IdempotencyRecord {
 		recs = append(recs, rec)
 	}
 	return recs
+}
+
+// gateRefs returns how many requests hold or await the gate slot of id.
+func (f *createFixture) gateRefs(id recordKey) int {
+	g := &f.s.idem.gate
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if slot := g.held[id]; slot != nil {
+		return slot.refs
+	}
+	return 0
 }
 
 // recordKeys returns the keys of every record the store holds.
@@ -484,6 +498,58 @@ func TestIdempotency_DoesNotHoldARequestWithAnotherKeyOrCaller(t *testing.T) {
 	close(release)
 	if code := waitFor(t, held, 5*time.Second, "held request answered"); code != http.StatusCreated {
 		t.Errorf("held request status = %d, want 201", code)
+	}
+}
+
+func TestIdempotency_LeavesARequestWhoseClientLeftTheGateUnanswered(t *testing.T) {
+	t.Parallel()
+	f := newCreateFixture()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	f.s.Register(Route{
+		Method: http.MethodPost, Pattern: "/things", Create: true,
+		Handler: func(w http.ResponseWriter, r *http.Request) error {
+			once.Do(func() {
+				close(entered)
+				<-release
+			})
+			return f.create(w, r)
+		},
+	})
+	held := make(chan int, 1)
+	go func() { held <- f.post("/api/v1/things", "Bearer u1", `{"name":"a"}`, "k").Code }()
+	waitFor(t, entered, 5*time.Second, "held handler entered")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	header := http.Header{"Content-Type": {"application/json"}, "Authorization": {"Bearer u1"}, "Idempotency-Key": {"k"}}
+	r := newRequest(http.MethodPost, "/api/v1/things", header, `{"name":"a"}`).WithContext(ctx)
+	waiter := make(chan *httptest.ResponseRecorder, 1)
+	go func() { waiter <- do(f.s.Handler(), r) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for f.gateRefs(recordKey{key: "k", caller: "user:u1", route: "POST /api/v1/things"}) < 2 {
+		if time.Now().After(deadline) {
+			t.Fatal("the second request never waited at the gate")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	rec := waitFor(t, waiter, 5*time.Second, "the waiting request returned")
+	if rec.Code == http.StatusInternalServerError || rec.Body.Len() != 0 {
+		t.Errorf("the request whose client left was answered %d %q, want no answer", rec.Code, rec.Body.String())
+	}
+	for _, line := range f.log.lines() {
+		if doc := decodeLine(t, line); doc["level"] == "ERROR" {
+			t.Errorf("logged %s, want no error line for a client that left", line)
+		}
+	}
+
+	close(release)
+	if code := waitFor(t, held, 5*time.Second, "held request answered"); code != http.StatusCreated {
+		t.Errorf("held request status = %d, want 201", code)
+	}
+	if c := f.calls.Load(); c != 1 {
+		t.Errorf("handler ran %d times, want 1", c)
 	}
 }
 

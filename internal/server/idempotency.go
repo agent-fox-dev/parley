@@ -168,7 +168,15 @@ func (s *Server) serveCreate(w http.ResponseWriter, r *http.Request, rt Route) e
 	// that a second one sees the first one's record instead of creating too.
 	release, err := s.idem.gate.lock(r.Context(), id)
 	if err != nil {
-		return fmt.Errorf("wait for idempotency key: %w", err)
+		// The wait ends early only when the request's context does: the
+		// client went away. Nobody is left to read an answer, and the hub
+		// did not fail, so the request ends unanswered and is not logged
+		// as an error.
+		s.logger.LogAttrs(r.Context(), slog.LevelDebug, "request ended while waiting for idempotency key",
+			slog.String("request_id", RequestID(r.Context())),
+			slog.String("error", err.Error()),
+		)
+		return nil
 	}
 	defer release()
 
