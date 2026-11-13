@@ -1042,9 +1042,11 @@ when `OwnerID` is empty, `status`, `created_at`, `updated_at`);
 return an org or `identity.ErrNotFound`, comparing the slug exactly; and
 `identity.Memberships(ctx, q, orgID)` returns an org's
 `identity.Membership`s (`OrgID`, `UserID`, `CreatedAt`), oldest first, then
-by user id. It reads through an `identity.RowsQuerier`, an
-`identity.Querier` that also has `QueryContext` (the store's `*sql.DB` or a
-`*sql.Tx`).
+by user id; `identity.ActiveOrgIDs(ctx, q, userID)` returns, by id, the
+ids of the orgs with status `active` of which a user is a member, the
+membership source of the workspace access rule (see Workspace access). Both
+read through an `identity.RowsQuerier`, an `identity.Querier` that also has
+`QueryContext` (the store's `*sql.DB` or a `*sql.Tx`).
 
 `identity.OrgBySelector(ctx, q, sel)` in `orgs.go` resolves an org selector
 by its shape alone, as `UserBySelector` does a user's: a value `isUUID`
@@ -1130,8 +1132,12 @@ keeps data for a user or an org registers its remover from its part in
 
 `internal/hub/access.go` adds the part `composeAccess`, after
 `composeIdentity` in `parts`. It adds the schema step `access.SchemaStep`
-(`workspace_records`) and registers no remover on the identity service: a
-workspace record outlives the deletion of its owner and of its org.
+(`workspace_records`), registers a zero `access.Service`, and binds it in
+the start hook `access` to `access.Deps{Records:
+access.StoreRecords(rt.Store.Main()), Memberships: ...}`, the membership
+source being `identity.ActiveOrgIDs` over the same store. It registers no
+remover on the identity service: a workspace record outlives the deletion of
+its owner and of its org.
 
 The step creates the table `workspaces` in the transactional store:
 
@@ -1173,6 +1179,45 @@ which take a `Querier` (the store's `*sql.DB` or an open `*sql.Tx`):
 The rule reads records through the interface `access.RecordReader`
 (`Record`, `OwnedOrIn`, `ForksOf`), so that a test can make a read fail;
 `access.StoreRecords(q)` is the one over these functions.
+
+#### Levels
+
+`internal/access/level.go` resolves what a caller is on one workspace,
+`access.Level`: `LevelAdmin` (`"admin"`), `LevelOwner` (`"owner"`),
+`LevelMember` (`"member"`) or `LevelNone` (`""`). The caller is
+`access.Caller{Admin, UserID}`, built from the pipeline's `server.Caller`
+by `access.CallerFrom`; the kind of credential and the user's role are not
+part of it, so a user has the same level by API key as by PAT, and a user
+with the role admin has no level from the role.
+
+`(*Service).Level(ctx, caller, slug)` returns the level, the record and
+whether the slug has one. It reads the record first: a slug with no record
+is `LevelNone`, found `false` and no error, for every caller. Then:
+
+- the admin token is `LevelAdmin` on every workspace, repository or fork;
+- on a repository, a user whose id is the record's `owner_id` is
+  `LevelOwner`, decided before any membership is read; otherwise a user who
+  is a member of the record's `org_id`, as the membership source answers
+  it, is `LevelMember`; everyone else is `LevelNone`;
+- on a fork, the user's level on the parent record is resolved first, as on
+  a repository. `LevelNone` on the parent, a parent with no record, or a
+  parent that is not a repository gives `LevelNone` on the fork, even to the
+  fork's owner: a fork never grants more than its parent. Otherwise the
+  fork's owner and the parent's owner are `LevelOwner` on the fork, and
+  every other user `LevelMember`.
+
+The workspace's status is never read, so a caller has the same level in
+every status. A failed read of a record or of the memberships returns
+`LevelNone`, no record and the error, never a grant.
+
+The membership source is the narrow interface `access.Memberships`, one
+method `ActiveOrgIDs(ctx, userID)`; `access.MembershipsFunc` adapts a
+function to it. The hub wires `identity.ActiveOrgIDs(ctx, q, userID)` from
+`internal/identity/orgs.go`, which joins `memberships` with `orgs` and
+returns, by id, the ids of the orgs with status `active` the user is a
+member of. A blocked org is left out, so its members are `LevelNone` on its
+workspaces while it is blocked (its owner is not), and a deleted org has no
+memberships left, its rows being deleted with it.
 
 ### The logger
 

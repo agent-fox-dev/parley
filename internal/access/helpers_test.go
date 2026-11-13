@@ -3,7 +3,9 @@ package access_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/agent-fox-dev/parley/internal/access"
@@ -51,4 +53,52 @@ func seed(t *testing.T, st *store.Store, recs ...access.Record) {
 			t.Fatalf("insert %+v: %v", rec, err)
 		}
 	}
+}
+
+// memberships is a membership source stub: the orgs each user is a member
+// of, of which it answers only those in active, as the real source answers
+// only active orgs.
+type memberships struct {
+	of     map[string][]string
+	active []string
+}
+
+func (m memberships) ActiveOrgIDs(_ context.Context, userID string) ([]string, error) {
+	var ids []string
+	for _, id := range m.of[userID] {
+		if slices.Contains(m.active, id) {
+			ids = append(ids, id)
+		}
+	}
+	return ids, nil
+}
+
+// errRead is the failure of the failing sources.
+var errRead = errors.New("read failed")
+
+// failingRecords reads through RecordReader, except the record of a slug in
+// fail, whose read fails with errRead.
+type failingRecords struct {
+	access.RecordReader
+	fail []string
+}
+
+func (f failingRecords) Record(ctx context.Context, slug string) (access.Record, bool, error) {
+	if slices.Contains(f.fail, slug) {
+		return access.Record{}, false, errRead
+	}
+	return f.RecordReader.Record(ctx, slug)
+}
+
+// failingMemberships is a membership source whose every read fails with
+// errRead.
+var failingMemberships = access.MembershipsFunc(func(context.Context, string) ([]string, error) {
+	return nil, errRead
+})
+
+// newService is a service bound to records and m.
+func newService(records access.RecordReader, m access.Memberships) *access.Service {
+	svc := &access.Service{}
+	svc.Bind(access.Deps{Records: records, Memberships: m})
+	return svc
 }

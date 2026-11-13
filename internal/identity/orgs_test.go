@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"slices"
 	"testing"
 	"time"
 	"uuid"
@@ -62,5 +63,30 @@ func TestOrgBySelector_LooksAValueUpByItsShapeOnly(t *testing.T) {
 				t.Errorf("OrgBySelector(%q) = %+v, %v, want the org %s", c.selector, o, err, c.want)
 			}
 		})
+	}
+}
+
+func TestActiveOrgIDs_ListsOnlyTheActiveOrgsOfWhichTheUserIsAMember(t *testing.T) {
+	t.Parallel()
+	h := newTestHub(t)
+	alice, bob := h.seedUser("alice"), h.seedUser("bob")
+	acme, beta, gone, other := h.seedOrg("Acme", "acme"), h.seedOrg("Beta", "beta"), h.seedOrg("Gone", "gone"), h.seedOrg("Other", "other")
+	for _, org := range []string{acme, beta, gone} {
+		h.addMember(org, alice.ID)
+	}
+	h.addMember(other, bob.ID)
+	h.exec(`UPDATE orgs SET status = ? WHERE id = ?`, identity.StatusBlocked, beta)
+	h.exec(`DELETE FROM orgs WHERE id = ?`, gone)
+	for _, c := range []struct {
+		name, userID string
+		want         []string
+	}{
+		{"a member of an active, a blocked and a deleted org", alice.ID, []string{acme}},
+		{"a member of another org", bob.ID, []string{other}},
+		{"a user of no org", "nobody", nil},
+	} {
+		if got, err := identity.ActiveOrgIDs(context.Background(), h.st.Main(), c.userID); err != nil || !slices.Equal(got, c.want) {
+			t.Errorf("%s: ActiveOrgIDs = %v, %v, want %v", c.name, got, err, c.want)
+		}
 	}
 }
