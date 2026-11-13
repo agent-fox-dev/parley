@@ -10,7 +10,9 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/config"
 	"github.com/agent-fox-dev/parley/internal/hub"
@@ -207,6 +209,14 @@ func TestRun_StopsTheStartAtTheFirstFailingStage(t *testing.T) {
 				hooks(row)(c)
 			}}
 		}},
+		{"maintenance task registered twice", "data", func(t *testing.T, row string) arrangement {
+			return arrangement{dir: workDir(t, localConfig), want: "retention", compose: func(c *hub.Composition) {
+				noop := func(context.Context, *hub.Runtime) error { return nil }
+				c.AddMaintenanceTask("retention", noop)
+				c.AddMaintenanceTask("retention", noop)
+				hooks(row)(c)
+			}}
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -243,6 +253,31 @@ func TestRun_StopsTheStartAtTheFirstFailingStage(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestRun_RunsAMaintenancePassAtEachTickOfItsInterval(t *testing.T) {
+	t.Parallel()
+	var passes atomic.Int32
+	r := startHub(t, hub.Options{
+		WorkDir:             workDir(t, localConfig),
+		MaintenanceInterval: 10 * time.Millisecond,
+		Compose: func(c *hub.Composition) {
+			c.AddMaintenanceTask("retention", func(context.Context, *hub.Runtime) error {
+				passes.Add(1)
+				return nil
+			})
+		},
+	})
+
+	eventually(t, "three passes run", func() bool { return passes.Load() >= 3 })
+	if code := r.stop(t); code != 0 {
+		t.Errorf("Run returned %d after a stop, want 0", code)
+	}
+	n := passes.Load()
+	time.Sleep(30 * time.Millisecond)
+	if got := passes.Load(); got != n {
+		t.Errorf("%d passes ran after Run returned", got-n)
 	}
 }
 

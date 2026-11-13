@@ -15,6 +15,7 @@ command-line client. Both are written in Go, in the module
 | `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra` |
 | `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, and a registry of keys and whole sections that decides what the file may hold |
 | `internal/hub` | the composition of the `parleyd` process: argument parsing, the scrubbing logger, the fixed start order, the bootstrap of the admin token, the HTTP server's options, the idempotency records in the transactional store, signals and the stop; the one place later packages plug their parts in ([ADR 01](adr/01-compose-the-hub-in-one-package.md)) |
+| `internal/maintenance` | the maintenance loop: a registry of named tasks, and `Loop`, which runs one pass at once and one at each tick of an hourly timer, the tasks of a pass one after the other in a fixed order, and logs a failing task without stopping the others |
 | `internal/identity` | who may use the hub: the admin settings in the transactional store (the bootstrap e-mail and the admin token's hash), the generation and hashing of admin tokens, and `VerifyAdminToken`, which compares a presented token's hash with the stored one in constant time |
 | `internal/scrub` | the one scrubbing function for text that leaves the hub: `Scrubber.Scrub` replaces registered secret values and the hub's own credential formats by `[redacted]`, removes user information from URLs and cuts the text to 1024 bytes; a leaf package that imports nothing of the project |
 | `internal/store` | the hub's two embedded SQLite stores (`modernc.org/sqlite`, no cgo): `Open` creates the data directory and the workspace root, opens the transactional store and the analytical store (`analytics.db` beside it) and applies the registered schema steps; `Tx` runs a transaction of the transactional store |
@@ -395,8 +396,9 @@ hub.Options)` returns the exit status. `Options` holds the process's inputs,
 `Args`, `Env` (a `config.Env`, the shape of `os.LookupEnv`), `WorkDir`,
 `Stdout` and `Stderr`, and the fields tests set and `parleyd` leaves zero:
 `Compose` (parts added after the hub's own), `Port` (replaces
-`[server].port`), `Now` (the hub's clock) and `RequestGrace` (replaces
-`hub.DefaultRequestGrace`, 15 seconds). `cmd/parleyd`'s `run(ctx, args, env,
+`[server].port`), `Now` (the hub's clock), `RequestGrace` (replaces
+`hub.DefaultRequestGrace`, 15 seconds) and `MaintenanceInterval` (replaces
+`maintenance.Interval`, one hour, the time between two maintenance passes). `cmd/parleyd`'s `run(ctx, args, env,
 wd, stdout, stderr)` builds the options and calls `Run`; `main` passes
 `os.Args[1:]`, `os.LookupEnv` and the working directory.
 
@@ -413,7 +415,7 @@ appends it there ([ADR 01](adr/01-compose-the-hub-in-one-package.md)).
 | `RegisterKey(config.Key)`, `RegisterSection(name, validate)` | configuration keys and whole sections |
 | `AddSchemaStep(store.Step)` | schema steps, applied in the order they were added |
 | `AddStartHook(name, func(ctx, *hub.Runtime) error)` | start work, run in order, each to completion |
-| `AddMaintenanceTask(name, func(ctx, *hub.Runtime) error)` | maintenance tasks |
+| `AddMaintenanceTask(name, func(ctx, *hub.Runtime) error)` | maintenance tasks (see [The maintenance loop](#the-maintenance-loop)) |
 | `AddRoute(server.Route)`, `Handle(pattern, handler)` | REST routes and surfaces outside the REST API |
 | `SetAuthenticator`, `SetBindingGuard`, `SetScopeCheck`, `AddAccessCheck` | the checks of the pipeline's positions |
 
@@ -456,21 +458,47 @@ failure:
 8. build the server from `hub.ServerOptions(cfg, st)`, with the bound
    listener, the request grace, the clock and the logger, and install the
    composition's routes and checks;
-9. start the maintenance pass in the background: every task once, in the
-   order they were added; a task that fails or panics is logged as
-   `maintenance task failed` with its `task` and `error`, and the next one
-   runs;
+9. start the maintenance loop in the background, without waiting for its
+   first pass (see [The maintenance loop](#the-maintenance-loop));
 10. `Serve`, whose `OnListen` writes the `listening` line with `addr`,
     `config` (`cfg.Path`) and `data_dir` (`cfg.DataDir()`).
 
-The listener is bound before the maintenance pass starts, so that a bind
+The listener is bound before the maintenance loop starts, so that a bind
 failure is the only line of a failed start. A failure before listening is
 one line at error level, `cannot start` with the cause in `error`, or
 `cannot listen` with `addr` and `error`; the stores are closed when they were
 open, and `Run` returns `1`. The first signal, or the cancellation of `ctx`,
 stops the server (see [Serving and stopping](#serving-and-stopping)); the
-maintenance pass's context is cancelled and it gets up to 15 seconds to end;
+maintenance loop's context is cancelled and it gets up to 15 seconds to end;
 the stores are closed last, and `Run` returns `0`.
+
+### The maintenance loop
+
+`internal/maintenance` holds a `Registry` of tasks, each a name and a
+`maintenance.Task` (`func(ctx) error`); `Register` refuses an empty name, a
+nil function and a name registered before, with an error that names it, and
+keeps the first task. The composition's `AddMaintenanceTask` registers on the
+hub's registry, so a refused task is a start error like any other refused
+registration.
+
+`maintenance.New(reg, logger)` builds a `Loop` over the registered tasks.
+`(*Loop).Run(ctx, ticks)` runs one pass at once and one at each tick it
+receives; the hub passes the channel of a `time.Ticker` of
+`maintenance.Interval`, one hour, which no configuration key changes
+(`Options.MaintenanceInterval` replaces it in tests). A pass
+(`(*Loop).Pass`) runs the tasks one after the other: those registered under
+`retention`, `secret_reencryption`, `claim_cleanup`,
+`forge_delivery_pruning`, `token_binding_sweep`, `patch_purge`,
+`fork_expiry` and `sandbox_record_cleanup` in that order, a name nobody
+registered skipped, then every task registered under another name in the
+order it was registered. Passes never overlap: a tick that arrives while a
+pass runs is received and dropped, and the next pass starts at the next
+tick. A task that returns an error or panics is logged at error level as
+`maintenance task failed` with `task` and `error` (its text passed through
+the scrubber), and the pass goes on with the next task. When `ctx` is
+cancelled the running task's context is done, no further task or pass
+starts, and `Run` returns once the running task has returned; a task that
+ends with an error after the cancellation is not logged as failed.
 
 `hub.ServerOptions(cfg, st)` returns the options that come from the
 configuration and the stores: `MaxBodySize` from `[server].max_body_size`,

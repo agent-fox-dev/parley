@@ -1,6 +1,6 @@
 // Package hub composes the parleyd process. Run parses parleyd's arguments,
 // loads the configuration, opens the stores, runs the start hooks, starts the
-// maintenance pass and serves until it is stopped, in that fixed order.
+// maintenance loop and serves until it is stopped, in that fixed order.
 //
 // It is the one place where the hub's packages plug in: each registers its
 // configuration keys, schema steps, start hooks, maintenance tasks, routes and
@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/config"
+	"github.com/agent-fox-dev/parley/internal/maintenance"
 	"github.com/agent-fox-dev/parley/internal/scrub"
 	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/store"
@@ -32,7 +33,7 @@ import (
 // DefaultRequestGrace is how long in-flight requests get to finish on a stop.
 const DefaultRequestGrace = 15 * time.Second
 
-// maintenanceGrace is how long a stop waits for the maintenance pass to end
+// maintenanceGrace is how long a stop waits for the maintenance loop to end
 // once its context is cancelled.
 const maintenanceGrace = 15 * time.Second
 
@@ -70,6 +71,9 @@ type Options struct {
 	Now func() time.Time
 	// RequestGrace replaces DefaultRequestGrace when it is not zero.
 	RequestGrace time.Duration
+	// MaintenanceInterval replaces maintenance.Interval, the time between two
+	// maintenance passes, when it is not zero.
+	MaintenanceInterval time.Duration
 }
 
 // Runtime is what the hub hands the parts it runs: the loaded configuration,
@@ -82,7 +86,7 @@ type Runtime struct {
 	Now      func() time.Time
 }
 
-// namedFunc is a start hook or a maintenance task.
+// namedFunc is a start hook.
 type namedFunc struct {
 	name string
 	fn   func(context.Context, *Runtime) error
@@ -101,7 +105,7 @@ type Composition struct {
 	registry      *config.Registry
 	steps         []store.Step
 	hooks         []namedFunc
-	tasks         []namedFunc
+	tasks         *maintenance.Registry
 	routes        []server.Route
 	mounts        []mount
 	authenticator server.Authenticator
@@ -113,7 +117,7 @@ type Composition struct {
 }
 
 func newComposition() *Composition {
-	return &Composition{registry: config.NewRegistry(), runtime: &Runtime{}}
+	return &Composition{registry: config.NewRegistry(), tasks: maintenance.NewRegistry(), runtime: &Runtime{}}
 }
 
 // Runtime returns the runtime the hub fills once the stores are open, before
@@ -147,33 +151,39 @@ func (c *Composition) AddSchemaStep(s store.Step) {
 // bound; an error from one stops the start, and no later hook runs. The
 // error is logged with the hook's name.
 func (c *Composition) AddStartHook(name string, fn func(context.Context, *Runtime) error) {
-	c.hooks = c.addNamed("start hook", c.hooks, name, fn)
-}
-
-// AddMaintenanceTask adds a maintenance task. The hub runs the tasks once in
-// the background after the start hooks, in the order they were added, and
-// cancels the context of the running one when it stops. A task's error is
-// logged with its name and does not stop the others.
-func (c *Composition) AddMaintenanceTask(name string, fn func(context.Context, *Runtime) error) {
-	c.tasks = c.addNamed("maintenance task", c.tasks, name, fn)
-}
-
-func (c *Composition) addNamed(kind string, list []namedFunc, name string, fn func(context.Context, *Runtime) error) []namedFunc {
 	switch {
 	case name == "":
-		c.errs = append(c.errs, fmt.Errorf("a %s has no name", kind))
-		return list
+		c.errs = append(c.errs, errors.New("a start hook has no name"))
+		return
 	case fn == nil:
-		c.errs = append(c.errs, fmt.Errorf("%s %q has no function", kind, name))
-		return list
+		c.errs = append(c.errs, fmt.Errorf("start hook %q has no function", name))
+		return
 	}
-	for _, f := range list {
-		if f.name == name {
-			c.errs = append(c.errs, fmt.Errorf("%s %q is registered twice", kind, name))
-			return list
+	for _, h := range c.hooks {
+		if h.name == name {
+			c.errs = append(c.errs, fmt.Errorf("start hook %q is registered twice", name))
+			return
 		}
 	}
-	return append(list, namedFunc{name, fn})
+	c.hooks = append(c.hooks, namedFunc{name, fn})
+}
+
+// AddMaintenanceTask adds a maintenance task under name (see
+// maintenance.Registry.Register). The hub's maintenance loop runs one pass
+// right after the start hooks and one every hour; a pass runs the tasks one
+// after the other, those under the names the maintenance package knows in its
+// fixed order, then the others in the order they were added. A task's error
+// or panic is logged with its name and does not stop the others; its context
+// is cancelled when the hub stops.
+func (c *Composition) AddMaintenanceTask(name string, fn func(context.Context, *Runtime) error) {
+	var task maintenance.Task
+	if fn != nil {
+		rt := c.runtime
+		task = func(ctx context.Context) error { return fn(ctx, rt) }
+	}
+	if err := c.tasks.Register(name, task); err != nil {
+		c.errs = append(c.errs, err)
+	}
 }
 
 // AddRoute adds a REST API route (see server.Server.Register). An invalid or
@@ -346,7 +356,7 @@ type run struct {
 // The start runs in this order and stops at the first failure: load the
 // configuration, open the stores, the bootstrap (which may end the run
 // after writing the admin token file), the start hooks in the order
-// they were added, bind the listener, start the maintenance pass, then write
+// they were added, bind the listener, start the maintenance loop, then write
 // the listening line and serve. A failure is one error line on Stderr; what
 // was opened is closed. The hub serves until ctx is cancelled or the process
 // receives SIGTERM or SIGINT.
@@ -459,7 +469,7 @@ func (r *run) start(ctx context.Context, c *Composition, cfg *config.Config, st 
 		port = *r.opts.Port
 	}
 	addr := net.JoinHostPort(cfg.Server.Bind, strconv.Itoa(port))
-	// The listener is bound before the maintenance pass starts, so that a
+	// The listener is bound before the maintenance loop starts, so that a
 	// bind failure stops the start before any background work has run.
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -485,11 +495,11 @@ func (r *run) start(ctx context.Context, c *Composition, cfg *config.Config, st 
 		return r.fail(err)
 	}
 
-	passDone := firstPass(serveCtx, rt, c.tasks)
+	loopDone := r.startMaintenance(serveCtx, c.tasks)
 	err = srv.Serve(serveCtx)
 	stop()
 	select {
-	case <-passDone:
+	case <-loopDone:
 	case <-time.After(maintenanceGrace):
 	}
 	if err != nil {
@@ -499,31 +509,22 @@ func (r *run) start(ctx context.Context, c *Composition, cfg *config.Config, st 
 	return 0
 }
 
-// firstPass runs every maintenance task once, in the order they were added,
-// in the background, and closes the returned channel when it has ended. A
-// task that fails or panics is logged and the next one runs; once ctx is
-// cancelled no further task starts.
-func firstPass(ctx context.Context, rt *Runtime, tasks []namedFunc) <-chan struct{} {
+// startMaintenance starts the maintenance loop over tasks in the background,
+// without waiting for its first pass, with a ticker of maintenance.Interval
+// or Options.MaintenanceInterval. The returned channel is closed once the
+// loop has returned after ctx is cancelled.
+func (r *run) startMaintenance(ctx context.Context, tasks *maintenance.Registry) <-chan struct{} {
+	interval := r.opts.MaintenanceInterval
+	if interval <= 0 {
+		interval = maintenance.Interval
+	}
+	loop := maintenance.New(tasks, r.logger)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		for _, t := range tasks {
-			if ctx.Err() != nil {
-				return
-			}
-			if err := runTask(ctx, rt, t); err != nil && ctx.Err() == nil {
-				rt.Logger.Error("maintenance task failed", "task", t.name, "error", err.Error())
-			}
-		}
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		loop.Run(ctx, ticker.C)
 	}()
 	return done
-}
-
-func runTask(ctx context.Context, rt *Runtime, t namedFunc) (err error) {
-	defer func() {
-		if p := recover(); p != nil {
-			err = fmt.Errorf("panic: %v", p)
-		}
-	}()
-	return t.fn(ctx, rt)
 }

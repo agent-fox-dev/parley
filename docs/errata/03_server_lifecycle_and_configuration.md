@@ -14,11 +14,11 @@ minute. `server.Options.RequestsPerMinute` reads 0 as its default, 600 (see
 package's check names, 600 by default and 7 when configured, are passed as
 they are; a third row of the check's table covers 0.
 
-## The listener is bound before the maintenance pass starts
+## The listener is bound before the maintenance loop starts
 
 The package orders the start as "start the maintenance loop, and only then
 bind the listener". `hub.Run` binds the socket right after the last start
-hook, then starts the maintenance pass in the background, then writes the
+hook, then starts the maintenance loop in the background, then writes the
 `listening` line and serves (`internal/hub/hub.go`, `start`). What the order
 is for still holds: no connection is accepted before the last start hook has
 returned, and the first pass does not delay serving. Binding first means a

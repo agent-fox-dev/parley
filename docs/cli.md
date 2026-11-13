@@ -119,8 +119,9 @@ the file and exits `1`. While the file is there, a start without
 4. it runs the start work the hub's parts registered, in order, each to
    completion;
 5. it binds `[server].bind`:`[server].port`;
-6. it starts the maintenance work in the background, without waiting for
-   it;
+6. it starts the maintenance loop in the background, without waiting for
+   its first pass: one pass at once and one every hour, each running the
+   registered maintenance tasks one after the other;
 7. it writes the `listening` line and serves.
 
 A failure in stages 1 to 5 writes exactly one error line to stderr, closes
@@ -180,8 +181,9 @@ goroutine's `stack`:
 {"time":"2026-11-13T10:12:09.551873+01:00","level":"ERROR","msg":"internal error","request_id":"0b5c6f2e-8d1a-4c3b-9e7f-2a4d6c8e0f13","error":"open workspace: permission denied"}
 ```
 
-A maintenance task that fails writes one line with the task's name and does
-not stop the others:
+A maintenance task that returns an error or panics writes one line with the
+task's name and the scrubbed error, and does not stop the others; it runs
+again in the next hourly pass:
 
 ```json
 {"time":"2026-11-13T10:13:00.000000+01:00","level":"ERROR","msg":"maintenance task failed","task":"claim_cleanup","error":"remove claim: database is locked"}
@@ -207,7 +209,8 @@ When it cannot bind the address the line is `cannot listen`:
 On `SIGTERM` or `SIGINT` `parleyd` stops accepting connections, lets the
 requests in flight finish for up to 15 seconds, closes the connections of the
 requests that are still running after that, cancels the running
-maintenance work and waits up to 15 seconds for it to end, closes the stores
+maintenance task and starts no further one, waits up to 15 seconds for it
+to end, closes the stores
 and exits `0`. A further signal
 during the stop changes nothing.
 
