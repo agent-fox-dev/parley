@@ -820,6 +820,31 @@ route without a scope, the admin token and an API key pass, and a PAT whose
 before the access checks and the handler, so a refused token learns nothing
 about the resource it addressed.
 
+`internal/identity/pathglob.go` is the one implementation of a token's path
+limits, pure functions with no state. `identity.ValidatePaths(v)` checks a
+`paths` value as `encoding/json` decoded it (or a `[]string`): `nil` is no
+path limit and returns `nil`; otherwise an array of 1 to 50 strings, each 1
+to 255 characters and not starting with `/`, returned in the order given
+with duplicates kept, or an error whose text names the entry it refuses
+(`paths[1] is not a string`). `identity.MatchPath(glob, path)` matches the
+whole path, case-sensitively: `*` is any run without `/`, `**` any run
+including `/` (both may be empty, and both are wildcards wherever they
+stand), a run of three or more asterisks reads as `**`, and every other
+character, `?`, `[` and `\` included, is itself. `identity.MatchAny(globs,
+path)` is the check of a token's list: a `nil` list allows every path,
+otherwise one glob must match. The parts that refuse a write outside a
+token's paths (git push, the SCM write API, opening changes and auto-land)
+call `MatchAny` with the `Paths` of the request's `identity.Principal` and
+match no glob of their own. `identity.Covers(c, g)` is the cover test that
+minting holds a path-limited token to: `c` equals `g`, or `c` read as a
+pattern matches the text of `g`, where a `*` of `c` takes no `/` and no
+asterisk of a `**` in `g`, and a `**` of `c` takes anything, so `c` matches
+every path `g` does. `identity.CoveredByAny(globs, g)` and
+`identity.FirstUncovered(held, requested)` (the first requested glob no held
+glob covers, and `true`) apply it to lists, a `nil` list covering
+everything. Matching and covering are one pass over the subject per element
+of the glob, never exponential.
+
 `POST /users` (`createUser`) decodes the body into a
 `map[string]json.RawMessage`, so that a missing member, `null` and a value
 of another type are told apart: `username`, `email`, `provider` and
