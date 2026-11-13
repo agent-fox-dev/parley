@@ -53,7 +53,10 @@ that fails answers the request, and no later check or the handler runs.
 5. The route's own feature check, where it declares one, then the binding
    guard.
 6. The scope check.
-7. The access checks.
+7. The access checks, among them the admin check of the admin routes:
+   `403 forbidden` with the message `this route needs an admin` for every
+   caller but the admin token and an API key whose user has the role
+   `admin` (see [Admin routes](#admin-routes)).
 8. On a create route, the `Idempotency-Key`: `400 invalid_request` for a bad
    key, `409 conflict` for a key used with another body, or a replay, as in
    [Idempotency](#idempotency).
@@ -564,4 +567,72 @@ has exactly `key`, the key `parley_<key_id>_<secret>`, shown this once;
 
 ```json
 {"user":{"id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","username":"alice","email":"a@x","full_name":"Alice A","role":"user","status":"active","provider":"github","provider_id":"123","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"},"api_key":{"key":"parley_Ab3dE5gH_0123456789abcdefghijABCDEFGHIJKL","key_id":"Ab3dE5gH","expires_at":"2026-04-01T00:00:00Z"}}
+```
+
+## Admin routes
+
+The user and org administration routes are admin routes. Their caller must
+be the admin token or an API key whose user has the role `admin`; every
+other caller, a PAT included, also a PAT of an admin, is answered `403`
+`forbidden` with the message `this route needs an admin`:
+
+```json
+{"error":{"code":403,"message":"this route needs an admin","error_type":"forbidden"}}
+```
+
+The check runs in the access position of the [order of checks](#order-of-checks):
+after authentication, the rate limit and the body's size and content type,
+and before the route validates its body or looks up anything its path
+names. So a refused request gets the same `403` whatever its body and
+whatever it names, and changes nothing. The role is read from the store on
+every request: an API key whose user loses the role `admin` is refused from
+its next request on, and one whose user gains it passes.
+
+The admin routes so far: `POST /api/v1/users`.
+
+## `POST /api/v1/users`
+
+Creates a user without OAuth, with the user's personal org. An admin route
+(see [Admin routes](#admin-routes)) and a create route, so it accepts an
+`Idempotency-Key`.
+
+The body is a JSON object:
+
+| Member | Value |
+|---|---|
+| `username` | required: a non-empty string |
+| `email` | required: a non-empty string |
+| `provider` | required: a non-empty string, the identity provider the user will sign in with |
+| `provider_id` | required: a non-empty string, the user's id at that provider |
+| `full_name` | a string; the empty string when absent |
+
+In one transaction the hub creates:
+
+- the user, with a new UUID as `id`, the role `user` and the status
+  `active`. The role is `user` also when the e-mail is the hub's bootstrap
+  `admin_email`: only a first login promotes.
+- the user's personal org: `status` `active`, named after the username,
+  owned by the user, with the slug the first login derives (see
+  [`POST /api/v1/auth/callback`](#post-apiv1authcallback)): `Alice.Smith`
+  gives `alice-smith`, `42bob` gives `u-42bob`, `-_ab_-` gives `ab` and `a`
+  gives `u-` and the first 8 characters of the user id. When an org has
+  that slug, the first free of `<slug>-1` to `<slug>-10` is used.
+- the user's membership of that org.
+
+`created_at` and `updated_at` of all three are the time of the request.
+Usernames, e-mails, provider identities and org names are compared as
+stored, letter case included.
+
+| Status | When |
+|---|---|
+| `201 Created` | the user was created; the body is the User object |
+| `400` `invalid_request` | a required member is missing or the empty string (message `<member> is required`), or a member of the table is not a JSON string, `null` included (message `<member> must be a string`); or the body is not a JSON object. Nothing is created. |
+| `403` `forbidden` | the caller is not an admin (see [Admin routes](#admin-routes)) |
+| `409` `conflict` | the username, the e-mail or the pair of `provider` and `provider_id` is another user's, an org already has the username as its name, or the slug and all of `<slug>-1` to `<slug>-10` are taken. The message says which, in fixed words, such as `the username is taken`. Nothing is created. |
+
+The User object has exactly `id`, `username`, `email`, `full_name`, `role`,
+`status`, `provider`, `provider_id`, `created_at` and `updated_at`:
+
+```json
+{"id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","username":"carol","email":"carol@example.com","full_name":"Carol C","role":"user","status":"active","provider":"github","provider_id":"1","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}
 ```

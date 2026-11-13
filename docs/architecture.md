@@ -621,8 +621,8 @@ without running a start hook or binding the listener.
 `internal/hub/identity.go` adds the part `composeIdentity`, after
 `composeBootstrap` in `parts`. It adds the schema step
 `identity.SchemaStep` (`identity_records`), installs the `Authenticate`
-method of an `identity.Service` as the pipeline's authenticator, registers
-every route of `(*identity.Service).Routes()` with `AddRoute`, and adds the
+method of an `identity.Service` as the pipeline's authenticator, adds its
+`AdminCheck` method with `AddAccessCheck`, registers every route of `(*identity.Service).Routes()` with `AddRoute`, and adds the
 start hook `identity`, which binds the service with
 `(*identity.Service).Bind(identity.Deps{Store, Now, Providers,
 ExternalURL, Client})` from the `Runtime` before the hub serves its first
@@ -633,9 +633,14 @@ identity.DefaultProviderTimeout)`, and a service without one answers every
 login `502 upstream_error`.
 
 The service's routes are, so far, the public `GET /auth/providers` (see
-[api.md](api.md#get-apiv1authproviders)) and the public `POST
+[api.md](api.md#get-apiv1authproviders)), the public `POST
 /auth/callback` (see [api.md](api.md#post-apiv1authcallback)), which is not
-a create route. The providers in
+a create route, and the admin route `POST /users` (see
+[api.md](api.md#post-apiv1users)), a create route.
+`(*identity.Service).Routes()` in `internal/identity/routes.go` returns
+them all: it appends the route list of each handlers file, such as
+`userRoutes()` in `internal/identity/handlers_users.go`, so the hub and the
+tests register the same routes. The providers in
 `identity.Deps.Providers` come with their endpoints resolved:
 `internal/config` fills an endpoint the file does not give with the
 provider's public one, through `config.Provider.WithPublicEndpoints`, and
@@ -764,6 +769,39 @@ the username as its name, or no slug is free; a unique-constraint violation
 of SQLite on the insert is reported the same way. The callback answers that
 error `409 conflict` with its text. Its caller chooses the username and the
 role.
+
+The admin routes carry the mark `identity.MarkAdmin` (`identity.admin`) in
+their `server.Route.Marks` and declare no scope. `(*identity.Service).AdminCheck`,
+in `internal/identity/admincheck.go`, is an access check: on a route without
+the mark it lets the request through; on one with it, it passes the
+`identity.Principal` whose `Type` is `admin`, or `api_key` with a `User`
+whose `Role` is `admin`, and answers every other caller, PATs included,
+`server.Forbidden("this route needs an admin")`. It reads the role of the
+`Principal` the authenticator built for this request from the store, so a
+change of role holds from the next request on. Because it runs in the access
+position, after the body's size and media type and before the handler, a
+refused request is not validated, looks nothing up and changes nothing.
+
+`POST /users` (`createUser`) decodes the body into a
+`map[string]json.RawMessage`, so that a missing member, `null` and a value
+of another type are told apart: `username`, `email`, `provider` and
+`provider_id` must be non-empty JSON strings and `full_name`, when present,
+a JSON string, else `400 invalid_request`. It then calls
+`identity.CreateUserAndPersonalOrg` with the role `user` in one
+`(*store.Store).Tx`, with `CreatedAt` from `Deps.Now`, answers its
+`ErrConflict` `409 conflict` with the error's text, and answers `201` with
+the User object. It never promotes: the first-admin rule is the login's.
+
+`internal/identity/orgs.go` holds the org reads: `identity.Org` marshals to
+the REST API's Org object (`id`, `name`, `slug`, `url`, `owner_id`, `null`
+when `OwnerID` is empty, `status`, `created_at`, `updated_at`);
+`identity.OrgByID(ctx, q, id)` and `identity.OrgBySlug(ctx, q, slug)`
+return an org or `identity.ErrNotFound`, comparing the slug exactly; and
+`identity.Memberships(ctx, q, orgID)` returns an org's
+`identity.Membership`s (`OrgID`, `UserID`, `CreatedAt`), oldest first, then
+by user id. It reads through an `identity.RowsQuerier`, an
+`identity.Querier` that also has `QueryContext` (the store's `*sql.DB` or a
+`*sql.Tx`).
 
 ### The logger
 
