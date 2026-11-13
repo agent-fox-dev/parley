@@ -10,6 +10,7 @@ import (
 )
 
 func TestRegistry_HandsAWholeSectionToItsValidator(t *testing.T) {
+	t.Parallel()
 	sandbox := "[sandbox]\ngateway_url = \"https://${HOST}\"\nanything = 1\n" +
 		"[sandbox.profiles.default]\nimage = \"img\"\n" +
 		"[[sandbox.credentials]]\nname = \"a\"\ntoken = \"pa$$${SECRET}\"\n"
@@ -37,6 +38,7 @@ func TestRegistry_HandsAWholeSectionToItsValidator(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			var calls []map[string]any
 			reg := config.NewRegistry()
 			if err := reg.RegisterSection("sandbox", func(section map[string]any) error {
@@ -76,6 +78,7 @@ func TestRegistry_HandsAWholeSectionToItsValidator(t *testing.T) {
 }
 
 func TestRegistry_FailsTheLoadWithTheSectionValidatorsError(t *testing.T) {
+	t.Parallel()
 	msg := "sandbox.gateway_url: missing; sandbox.profiles[default].image: empty; sandbox.nosuch: unknown key"
 	calls := 0
 	reg := config.NewRegistry()
@@ -98,33 +101,39 @@ func TestRegistry_FailsTheLoadWithTheSectionValidatorsError(t *testing.T) {
 }
 
 func TestRegistry_RefusesAConflictingSectionRegistration(t *testing.T) {
+	t.Parallel()
+	// Each file holds the section concerned and is valid for the
+	// registrations that are accepted, so that only the refused one can
+	// fail the load, and a validator that ran would be called.
 	cases := []struct {
 		name     string
 		section  string
+		file     string
 		register func(reg *config.Registry, v func(map[string]any) error)
 	}{
-		{"section registered twice", "sandbox", func(reg *config.Registry, v func(map[string]any) error) {
+		{"section registered twice", "sandbox", "[sandbox]\nx = 1\n", func(reg *config.Registry, v func(map[string]any) error) {
 			_ = reg.RegisterSection("sandbox", v)
 			_ = reg.RegisterSection("sandbox", v)
 		}},
-		{"section of a registered key", "forks", func(reg *config.Registry, v func(map[string]any) error) {
+		{"section of a registered key", "forks", "[forks]\ndefault_ttl = \"1d\"\n", func(reg *config.Registry, v func(map[string]any) error) {
 			_ = reg.Register(config.Key{Section: "forks", Name: "default_ttl", Type: config.String, Default: "7d"})
 			_ = reg.RegisterSection("forks", v)
 		}},
-		{"key in a registered section", "sandbox", func(reg *config.Registry, v func(map[string]any) error) {
+		{"key in a registered section", "sandbox", "[sandbox]\nx = 1\n", func(reg *config.Registry, v func(map[string]any) error) {
 			_ = reg.RegisterSection("sandbox", v)
 			_ = reg.Register(config.Key{Section: "sandbox", Name: "x", Type: config.Int, Default: 0})
 		}},
-		{"section the loader owns keys in", "server", func(reg *config.Registry, v func(map[string]any) error) {
+		{"section the loader owns keys in", "server", "[server]\nport = 1\n", func(reg *config.Registry, v func(map[string]any) error) {
 			_ = reg.RegisterSection("server", v)
 		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			calls := 0
 			reg := config.NewRegistry()
 			tc.register(reg, func(map[string]any) error { calls++; return nil })
-			cfg, err := reg.Load(noEnv(), t.TempDir())
+			cfg, err := reg.Load(noEnv(), dirWith(t, tc.file))
 			if cfg != nil || err == nil {
 				t.Fatalf("Load = %v, %v; want no configuration and an error", cfg, err)
 			}

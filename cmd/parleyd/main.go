@@ -22,12 +22,7 @@ func main() {
 	os.Exit(run(context.Background(), os.Args[1:], os.LookupEnv, wd, os.Stdout, os.Stderr))
 }
 
-// run is parleyd: hub.Run with the process's inputs. tune lets tests change
-// the hub's test options, such as its time limits; main passes none.
-func run(ctx context.Context, args []string, env config.Env, wd string, stdout, stderr io.Writer, tune ...func(*hub.Options)) int {
-	opts := hub.Options{Args: args, Env: env, WorkDir: wd, Stdout: stdout, Stderr: stderr}
-	for _, f := range tune {
-		f(&opts)
-	}
-	return hub.Run(ctx, opts)
+// run is parleyd: hub.Run with the process's inputs.
+func run(ctx context.Context, args []string, env config.Env, wd string, stdout, stderr io.Writer) int {
+	return hub.Run(ctx, hub.Options{Args: args, Env: env, WorkDir: wd, Stdout: stdout, Stderr: stderr})
 }

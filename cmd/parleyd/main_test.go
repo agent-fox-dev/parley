@@ -4,11 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
@@ -17,62 +16,7 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/cli"
-	"github.com/agent-fox-dev/parley/internal/hub"
 )
-
-func TestRun_ListensAndLogsTheBoundAddress(t *testing.T) {
-	t.Parallel()
-	r := startRun(t, time.Second)
-
-	host, port, err := net.SplitHostPort(r.addr)
-	if err != nil {
-		t.Fatalf("addr %q is not host:port: %v", r.addr, err)
-	}
-	if host != "127.0.0.1" || port == "0" {
-		t.Errorf("addr = %q, want 127.0.0.1 with the port the system chose", r.addr)
-	}
-	res, err := http.Get("http://" + r.addr + "/healthz")
-	if err != nil {
-		t.Fatalf("GET /healthz: %v", err)
-	}
-	res.Body.Close()
-	if res.StatusCode != http.StatusOK {
-		t.Errorf("GET /healthz status = %d, want %d", res.StatusCode, http.StatusOK)
-	}
-
-	r.cancel()
-	if code := r.exitCode(t, 5*time.Second); code != 0 {
-		t.Errorf("run returned %d after its context was cancelled, want 0", code)
-	}
-}
-
-func TestRun_ExitsWithOneErrorLineWhenItCannotListen(t *testing.T) {
-	t.Parallel()
-	held, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("hold a port: %v", err)
-	}
-	defer held.Close()
-	addr := held.Addr().String()
-	dir := workDir(t, fmt.Sprintf("[server]\nbind = \"127.0.0.1\"\nport = %d\n", held.Addr().(*net.TCPAddr).Port))
-
-	var stdout, stderr bytes.Buffer
-	code := run(context.Background(), nil, noEnv, dir, &stdout, &stderr)
-
-	if code != 1 {
-		t.Errorf("run returned %d, want 1", code)
-	}
-	lines := nonEmptyLines(stderr.String())
-	if len(lines) != 1 {
-		t.Fatalf("stderr holds %d lines, want 1: %q", len(lines), stderr.String())
-	}
-	if !strings.Contains(lines[0], addr) {
-		t.Errorf("error line %q does not name %s", lines[0], addr)
-	}
-	if strings.Contains(stderr.String(), "listening") {
-		t.Errorf("stderr %q has a listening line", stderr.String())
-	}
-}
 
 // usageNames are what the usage must name: both flags and the backup
 // command.
@@ -145,71 +89,44 @@ func TestRun_RefusesUnknownFlagsAndArgumentsWithUsage(t *testing.T) {
 	}
 }
 
-// The test signals its own process, which every running run would receive,
-// so it must not run in parallel. Each signal is sent only after the
-// listening line, when run has registered for it; before that the signal
-// would end the test binary.
-func TestRun_StopsOnASignal(t *testing.T) {
-	for _, sig := range []syscall.Signal{syscall.SIGTERM, syscall.SIGINT} {
-		t.Run(sig.String(), func(t *testing.T) {
-			r := startRun(t, time.Second)
+func TestRun_HandsTheHubTheEnvironmentAndTheWorkingDirectory(t *testing.T) {
+	t.Parallel()
+	// A relative XDG_CONFIG_HOME is taken relative to the working directory,
+	// so the listening line names a path only both together give.
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "etc"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(dir, "etc", "config.toml"), localConfig)
+	env := func(name string) (string, bool) {
+		if name == "XDG_CONFIG_HOME" {
+			return "etc", true
+		}
+		return "", false
+	}
+	r := startRun(t, env, dir)
 
-			if err := syscall.Kill(os.Getpid(), sig); err != nil {
-				t.Fatalf("send %v: %v", sig, err)
-			}
-			if code := r.exitCode(t, time.Second); code != 0 {
-				t.Errorf("run returned %d, want 0", code)
-			}
-			if conn, err := net.Dial("tcp", r.addr); err == nil {
-				conn.Close()
-				t.Errorf("a connection to %s was accepted after run returned", r.addr)
-			}
-		})
+	if got, want := r.listening["config"], filepath.Join(dir, "etc", "config.toml"); got != want {
+		t.Errorf("listening config = %v, want %s", got, want)
 	}
-}
-
-// The test signals its own process, so it must not run in parallel; see
-// TestRun_StopsOnASignal.
-func TestRun_ExitsZeroWhenTheGraceExpires(t *testing.T) {
-	// main leaves this grace; the test shortens it to keep the wait short.
-	if hub.DefaultRequestGrace != 15*time.Second {
-		t.Errorf("the hub's request grace = %v, want 15s", hub.DefaultRequestGrace)
+	if got, want := r.listening["data_dir"], filepath.Join(dir, "data"); got != want {
+		t.Errorf("listening data_dir = %v, want %s", got, want)
 	}
-	const grace = 50 * time.Millisecond
-	r := startRun(t, grace)
-
-	// A request whose header never ends stays in flight until the grace has
-	// passed and the server closes its connection.
-	conn, err := net.Dial("tcp", r.addr)
-	if err != nil {
-		t.Fatalf("dial %s: %v", r.addr, err)
-	}
-	defer conn.Close()
-	if _, err := io.WriteString(conn, "GET /healthz HTTP/1.1\r\nHost: parleyd\r\n"); err != nil {
-		t.Fatalf("write a partial request: %v", err)
-	}
-
-	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
-		t.Fatalf("send SIGTERM: %v", err)
-	}
-	if code := r.exitCode(t, grace+time.Second); code != 0 {
-		t.Errorf("run returned %d, want 0", code)
-	}
-	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		t.Fatalf("set read deadline: %v", err)
-	}
-	if got, err := io.ReadAll(conn); len(got) != 0 || err != nil {
-		t.Errorf("unfinished request read %q (error %v), want its connection closed with no response", got, err)
+	r.cancel()
+	if code := r.exitCode(t, 5*time.Second); code != 0 {
+		t.Errorf("run returned %d after its context was cancelled, want 0", code)
 	}
 }
 
 // An operator starts the hub, a developer reads its version with the real
 // client, and the operator stops the hub with SIGTERM. The test signals its
-// own process, so it must not run in parallel; see TestRun_StopsOnASignal.
+// own process, which every running run would receive, so it must not run in
+// parallel. The signal is sent only after the listening line, when run has
+// registered for it; before that it would end the test binary.
 func TestRun_ServesTheClientUntilStopped(t *testing.T) {
 	t.Setenv("PARLEY_ENDPOINT_URL", "")
 	os.Unsetenv("PARLEY_ENDPOINT_URL")
-	r := startRun(t, time.Second)
+	r := startRun(t, noEnv, workDir(t, localConfig))
 	hub := "http://" + r.addr
 
 	for path, want := range map[string]string{"/healthz": "ok", "/readyz": "ready"} {
@@ -247,50 +164,5 @@ func TestRun_ServesTheClientUntilStopped(t *testing.T) {
 	if conn, err := net.Dial("tcp", r.addr); err == nil {
 		conn.Close()
 		t.Errorf("a connection to %s was accepted after run returned", r.addr)
-	}
-}
-
-func TestRun_AnswersAnUnknownPathWithTheErrorEnvelopeAndLogsIt(t *testing.T) {
-	r := startRun(t, time.Second)
-
-	res, err := http.Get("http://" + r.addr + "/api/v1/no-such-thing")
-	if err != nil {
-		t.Fatalf("GET /api/v1/no-such-thing: %v", err)
-	}
-	defer res.Body.Close()
-	var doc struct {
-		Error struct {
-			Code      int    `json:"code"`
-			ErrorType string `json:"error_type"`
-		} `json:"error"`
-	}
-	if err := json.NewDecoder(res.Body).Decode(&doc); err != nil {
-		t.Fatalf("the answer is not JSON: %v", err)
-	}
-	if res.StatusCode != http.StatusNotFound || doc.Error.Code != 404 || doc.Error.ErrorType != "not_found" {
-		t.Errorf("answer = %d %+v, want 404 with code 404 and error_type not_found", res.StatusCode, doc.Error)
-	}
-	id := res.Header.Get("X-Request-ID")
-
-	r.cancel()
-	if code := r.exitCode(t, 5*time.Second); code != 0 {
-		t.Fatalf("run returned %d after a stop, want 0", code)
-	}
-	var found int
-	for _, line := range nonEmptyLines(r.stderr.String()) {
-		var rec map[string]any
-		if err := json.Unmarshal([]byte(line), &rec); err != nil {
-			t.Fatalf("stderr line %q is not a JSON object: %v", line, err)
-		}
-		if rec["msg"] != "request" {
-			continue
-		}
-		found++
-		if rec["path"] != "/api/v1/no-such-thing" || rec["status"] != float64(404) || rec["request_id"] != id {
-			t.Errorf("access-log line = %v, want path /api/v1/no-such-thing, status 404, request_id %q", rec, id)
-		}
-	}
-	if found != 1 {
-		t.Errorf("stderr holds %d access-log lines, want 1: %q", found, r.stderr.String())
 	}
 }

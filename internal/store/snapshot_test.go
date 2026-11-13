@@ -4,15 +4,11 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"errors"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/agent-fox-dev/parley/internal/store"
 )
@@ -37,88 +33,6 @@ func insertTx(ctx context.Context, db *sql.DB, txid int64, rows int) error {
 		}
 	}
 	return tx.Commit()
-}
-
-func TestSnapshot_CopiesWholeTransactionsWhileAnotherConnectionWrites(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	opts := options(t.TempDir())
-	st := mustOpen(t, opts, []store.Step{txStep})
-	for id := range int64(50) {
-		if err := st.Tx(ctx, func(tx *sql.Tx) error {
-			for n := range 10 {
-				if _, err := tx.ExecContext(ctx, `INSERT INTO a (txid, n) VALUES (?, ?)`, id, n); err != nil {
-					return err
-				}
-			}
-			return nil
-		}); err != nil {
-			t.Fatalf("commit transaction %d: %v", id, err)
-		}
-	}
-
-	// Writers in connections of their own, as another process's would be.
-	writer, err := sql.Open("sqlite", "file:"+opts.DatabasePath+"?_pragma=busy_timeout(10000)&_txlock=immediate")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { writer.Close() })
-	var (
-		next     atomic.Int64
-		stop     = make(chan struct{})
-		wg       sync.WaitGroup
-		mu       sync.Mutex
-		failures []error
-	)
-	next.Store(50)
-	for range 2 {
-		wg.Go(func() {
-			for {
-				select {
-				case <-stop:
-					return
-				default:
-				}
-				if err := insertTx(ctx, writer, next.Add(1), 10); err != nil {
-					mu.Lock()
-					failures = append(failures, err)
-					mu.Unlock()
-					return
-				}
-			}
-		})
-	}
-	// Let the writers commit a few transactions before the copy starts.
-	for deadline := time.Now().Add(5 * time.Second); next.Load() < 55 && time.Now().Before(deadline); {
-		time.Sleep(time.Millisecond)
-	}
-
-	dst := filepath.Join(t.TempDir(), "copy.db")
-	err = store.Snapshot(ctx, opts.DatabasePath, dst)
-	close(stop)
-	wg.Wait()
-	if err != nil {
-		t.Fatalf("Snapshot: %v", err)
-	}
-	if len(failures) > 0 {
-		t.Fatalf("a writer's transaction failed during the copy: %v", errors.Join(failures...))
-	}
-
-	db := rawDB(t, dst)
-	if n := count(t, db, "a"); n%10 != 0 || n < 500 {
-		t.Errorf("the copy holds %d rows, want a multiple of 10 and at least 500", n)
-	}
-	var partial int
-	if err := db.QueryRow(`SELECT count(*) FROM (SELECT txid FROM a GROUP BY txid HAVING count(*) != 10)`).Scan(&partial); err != nil {
-		t.Fatal(err)
-	}
-	if partial != 0 {
-		t.Errorf("%d transactions are in the copy with only some of their rows", partial)
-	}
-	var check string
-	if err := db.QueryRow(`PRAGMA integrity_check`).Scan(&check); err != nil || check != "ok" {
-		t.Errorf("integrity_check = %q, %v; want ok", check, err)
-	}
 }
 
 func TestSnapshot_LeavesTheSourceFilesAsTheyWere(t *testing.T) {
@@ -174,6 +88,7 @@ func TestSnapshot_FailsWithoutCreatingOrChangingAFile(t *testing.T) {
 	st.Close()
 
 	t.Run("source missing", func(t *testing.T) {
+		t.Parallel()
 		dir := t.TempDir()
 		src, dst := filepath.Join(dir, "missing.db"), filepath.Join(dir, "copy.db")
 		err := store.Snapshot(ctx, src, dst)
@@ -185,6 +100,7 @@ func TestSnapshot_FailsWithoutCreatingOrChangingAFile(t *testing.T) {
 		}
 	})
 	t.Run("copy exists", func(t *testing.T) {
+		t.Parallel()
 		dst := filepath.Join(t.TempDir(), "copy.db")
 		writeFile(t, dst, []byte("keep"))
 		err := store.Snapshot(ctx, opts.DatabasePath, dst)

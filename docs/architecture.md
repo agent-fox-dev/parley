@@ -503,8 +503,10 @@ the first failure:
 
 1. check that the database file, `analytics.db` and the workspace root
    exist, so that a backup run where no hub ever started creates no database;
-2. check the target: a directory inside the workspace root (which it would
-   copy into itself), a path that is not a directory and a non-empty
+2. check the target, a relative one taken relative to `WorkDir`, which
+   `Run` makes absolute first: a directory inside the workspace root (which
+   it would copy into itself) or inside the data directory (which a backup
+   leaves untouched), a path that is not a directory and a non-empty
    directory are refused; a missing one is created with `os.Mkdir` and mode
    0700, its parent not;
 3. copy the transactional store under the database file's own name and the
@@ -606,7 +608,9 @@ hash back.
 The bootstrap stage reads the settings and, by the table in
 [cli.md](cli.md#the-admin-token), issues a token whose `deliver` writes it
 to `<config dir>/admin_token` (a 0600 temporary file in the config dir,
-synced and renamed over the path), refuses with an error naming the file
+synced and renamed over the path; a file already there is first given a
+second name by a hard link, put back when the transaction then fails to
+commit and removed once it has committed), refuses with an error naming the file
 while a bootstrapped hub's file exists, or goes on to the start hooks. After
 writing the file it logs the path at warn level and `Run` returns `0`
 without running a start hook or binding the listener.
@@ -619,8 +623,13 @@ without running a start hook or binding the listener.
 and error; lines below the configured level are dropped. Its `ReplaceAttr`,
 which the JSON handler calls for the message and every attribute, those of
 `With` and of groups included, passes every string value and the text of
-every `error` value through `scrubber.Scrub`; keys, `time` and `level` are
-written as they are. `Run` builds it on `Stderr` before the configuration is
+every `error` value through `scrubber.Scrub`. Any other value is scrubbed
+as its `fmt` text (a `[]byte` as text): when scrubbing changes that text
+(it removes something, or cuts a text of more than 1024 bytes), the
+scrubbed text is written in the value's place, and otherwise the value keeps
+its JSON form. The values of an `http.Header`'s `Authorization` and
+`Proxy-Authorization` headers are written as `[redacted]`, whatever their
+shape. Keys, `time` and `level` are written as they are. `Run` builds it on `Stderr` before the configuration is
 loaded, at info, sets its level once the configuration is loaded, installs it
 with `slog.SetDefault`, and hands it to the server as `Options.Logger`.
 

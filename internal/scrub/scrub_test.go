@@ -41,6 +41,7 @@ func apiKey(r *rand.Rand) string {
 }
 
 func TestScrubReplacesSecretValues(t *testing.T) {
+	t.Parallel()
 	s := scrub.New()
 	for _, v := range []string{"hunter2-token", "hunter2", "", "red"} {
 		s.Add(v)
@@ -57,12 +58,14 @@ func TestScrubReplacesSecretValues(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			if got := s.Scrub(tt.input, "once-only"); got != tt.want {
 				t.Errorf("Scrub(%q) = %q, want %q", tt.input, got, tt.want)
 			}
 		})
 	}
 	t.Run("a call value applies to its call only", func(t *testing.T) {
+		t.Parallel()
 		if got := s.Scrub("x once-only y"); got != "x once-only y" {
 			t.Errorf("Scrub without the call value = %q, want the text unchanged", got)
 		}
@@ -70,6 +73,7 @@ func TestScrubReplacesSecretValues(t *testing.T) {
 }
 
 func TestScrubReplacesHubCredentials(t *testing.T) {
+	t.Parallel()
 	r := rand.New(rand.NewPCG(1, 2))
 	a, p, k := adminToken(r), personalAccessToken(r), apiKey(r)
 	tests := []struct {
@@ -86,6 +90,7 @@ func TestScrubReplacesHubCredentials(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			if got := scrub.New().Scrub(tt.input); got != tt.want {
 				t.Errorf("Scrub(%q) = %q, want %q", tt.input, got, tt.want)
 			}
@@ -94,6 +99,7 @@ func TestScrubReplacesHubCredentials(t *testing.T) {
 }
 
 func TestScrubRemovesURLUserInformation(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name, input, want string
 	}{
@@ -109,6 +115,7 @@ func TestScrubRemovesURLUserInformation(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			if got := scrub.New().Scrub(tt.input); got != tt.want {
 				t.Errorf("Scrub(%q) = %q, want %q", tt.input, got, tt.want)
 			}
@@ -117,6 +124,7 @@ func TestScrubRemovesURLUserInformation(t *testing.T) {
 }
 
 func TestScrubCutsLongResults(t *testing.T) {
+	t.Parallel()
 	a := func(n int) string { return strings.Repeat("a", n) }
 	tests := []struct {
 		name    string
@@ -132,6 +140,7 @@ func TestScrubCutsLongResults(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			out := scrub.New().Scrub(tt.input)
 			if len(out) != tt.wantLen {
 				t.Errorf("len = %d, want %d", len(out), tt.wantLen)
@@ -145,6 +154,7 @@ func TestScrubCutsLongResults(t *testing.T) {
 		})
 	}
 	t.Run("a value across the limit is replaced before the cut", func(t *testing.T) {
+		t.Parallel()
 		s := scrub.New()
 		s.Add("SECRETSECRET")
 		out := s.Scrub(a(1018) + "SECRETSECRET" + "tail")
@@ -158,6 +168,7 @@ func TestScrubCutsLongResults(t *testing.T) {
 }
 
 func TestScrubReturnsTheMarkerWhenARemovalLeavesASecret(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name   string
 		values []string
@@ -168,6 +179,7 @@ func TestScrubReturnsTheMarkerWhenARemovalLeavesASecret(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			s := scrub.New()
 			for _, v := range tt.values {
 				s.Add(v)
@@ -255,6 +267,7 @@ func cornerCases() []propertyCase {
 }
 
 func TestScrubbedTextIsBoundedCleanAndStable(t *testing.T) {
+	t.Parallel()
 	r := rand.New(rand.NewPCG(2026, 11))
 	cases := cornerCases()
 	for range 2000 {

@@ -108,12 +108,16 @@ Otherwise it writes one line, `backup failed` with the cause in `error`,
 and exits `1`. It refuses, writing nothing, an invalid configuration (the
 error names the key), a missing database file (it names the path and
 creates no database), a directory that is not empty, a path that is not a
-directory, and a directory inside the workspace root:
+directory, and a directory inside the workspace root or inside the data
+directory (the directory of `[database].path`):
 
 ```json
 {"time":"2026-11-13T13:44:22.522501+01:00","level":"ERROR","msg":"backup failed","error":"database file /srv/parley/data/parley.db does not exist"}
 {"time":"2026-11-13T13:44:23.075944+01:00","level":"ERROR","msg":"backup failed","error":"backup directory /srv/backups/2026-11-13 is not empty"}
+{"time":"2026-11-13T13:44:23.081202+01:00","level":"ERROR","msg":"backup failed","error":"backup directory /srv/parley/data/snapshot is inside the data directory /srv/parley/data"}
 ```
+
+A relative directory is taken relative to the working directory.
 
 When a copy fails part-way, for example on a file under the workspace root
 it cannot read, it removes everything it wrote (the directory too, when it
@@ -189,8 +193,10 @@ line has `time`, `level` and `msg`. `level` is `TRACE`, `DEBUG`, `INFO`,
 written, and with `trace` every line is. Before the configuration is loaded
 the level is `info`.
 
-The message and every string attribute of every line, and the text of an
-error attribute, are scrubbed before the line is written: the
+The message and every attribute of every line are scrubbed before the line
+is written (an error as its text; a value that is neither a string nor an
+error as its printed text, which takes the value's place when scrubbing
+changes it): the
 `client_secret` of every configured OAuth provider, other secret values the
 hub knows and the hub's own credentials (admin tokens, personal access
 tokens and API keys) become `[redacted]`, the user information is removed
@@ -198,7 +204,8 @@ from URLs (`https://u:p@host/x` becomes `https://host/x`), and each value is
 cut to at most 1024 bytes. A value from which a secret cannot be removed
 cleanly is replaced by `[redacted]` as a whole. Attribute names, `time` and
 `level` are written as they are. No `Authorization` header and no request
-body is logged.
+body is logged; a set of HTTP headers given to the logger shows its
+`Authorization` and `Proxy-Authorization` values as `[redacted]`.
 
 Once it listens it writes:
 

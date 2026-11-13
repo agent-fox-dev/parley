@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io/fs"
 	"maps"
 	"net/http"
@@ -216,47 +217,87 @@ func TestRun_RefusesATargetThatIsNotAnEmptyDirectoryAndWritesNothing(t *testing.
 	t.Parallel()
 	d := startDataHub(t).stopped(t)
 	data := tree(t, d.dir)
+	// Without symbolic links in either path, so that resolving the links of
+	// the relative paths cannot make them absolute.
+	cwd, err := os.Getwd()
+	if err == nil {
+		cwd, err = filepath.EvalSymlinks(cwd)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	realDir, err := filepath.EvalSymlinks(d.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, tc := range []struct {
-		name    string
-		arrange func(t *testing.T) string
+		name string
+		// relative runs the backup from a relative working directory with
+		// the target relative to it.
+		relative bool
+		arrange  func(t *testing.T) string
 	}{
-		{"a directory holding a file", func(t *testing.T) string {
+		{"a directory holding a file", false, func(t *testing.T) string {
 			target := t.TempDir()
 			writeFile(t, filepath.Join(target, "keep"), "kept")
 			return target
 		}},
-		{"a directory holding an empty directory", func(t *testing.T) string {
+		{"a directory holding an empty directory", false, func(t *testing.T) string {
 			target := t.TempDir()
 			if err := os.Mkdir(filepath.Join(target, "sub"), 0o755); err != nil {
 				t.Fatal(err)
 			}
 			return target
 		}},
-		{"a regular file", func(t *testing.T) string {
+		{"a regular file", false, func(t *testing.T) string {
 			target := filepath.Join(t.TempDir(), "file")
 			writeFile(t, target, "not a directory")
 			return target
 		}},
-		{"a missing directory inside the workspace root", func(t *testing.T) string {
+		{"a missing directory inside the workspace root", false, func(t *testing.T) string {
 			return filepath.Join(d.workspaceRoot(), "snapshot")
+		}},
+		{"a missing directory inside the workspace root, from a relative working directory", true, func(t *testing.T) string {
+			return filepath.Join(realDir, "data", "workspaces", "snapshot")
+		}},
+		{"a missing directory inside the data directory", false, func(t *testing.T) string {
+			return filepath.Join(filepath.Dir(d.dbPath()), "snapshot")
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			target := tc.arrange(t)
 			before := tree(t, target)
 
-			res := d.backup(t, target)
+			opts := hub.Options{WorkDir: d.dir, Args: []string{"backup", target}}
+			if tc.relative {
+				opts.WorkDir = relativeTo(t, cwd, realDir)
+				opts.Args[1] = relativeTo(t, realDir, target)
+			}
+			res := runToEnd(t, opts)
 
 			if res.code != 1 {
 				t.Errorf("backup returned %d, want 1", res.code)
 			}
-			if lines := nonEmptyLines(res.stderr); len(lines) != 1 || !strings.Contains(lines[0], target) {
-				t.Errorf("stderr = %q, want one line naming %s", res.stderr, target)
+			// The refusal, not a copy that failed and was removed.
+			lines := nonEmptyLines(res.stderr)
+			if len(lines) != 1 || !strings.HasPrefix(fmt.Sprint(decodeLine(t, lines[0])["error"]), "backup directory "+target+" ") {
+				t.Errorf("stderr = %q, want one line refusing backup directory %s", res.stderr, target)
 			}
 			checkSameTree(t, "the target", target, before)
 			checkSameTree(t, "the hub's working directory", d.dir, data)
 		})
 	}
+}
+
+// relativeTo returns path relative to base.
+func relativeTo(t *testing.T, base, path string) string {
+	t.Helper()
+	rel, err := filepath.Rel(base, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rel
 }
 
 func TestRun_BacksUpOnlyWholeTransactionsWhileTheHubCommits(t *testing.T) {

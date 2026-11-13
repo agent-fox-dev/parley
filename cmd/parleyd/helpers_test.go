@@ -11,8 +11,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/agent-fox-dev/parley/internal/hub"
 )
 
 // localConfig makes parleyd listen on a port the system chooses, on the
@@ -22,13 +20,19 @@ const localConfig = "[server]\nbind = \"127.0.0.1\"\nport = 0\n"
 // noEnv is an empty environment.
 func noEnv(string) (string, bool) { return "", false }
 
+// writeFile writes text to the file at path.
+func writeFile(t *testing.T, path, text string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(text), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
 // workDir returns a new working directory holding config.toml with text.
 func workDir(t *testing.T, text string) string {
 	t.Helper()
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(text), 0o644); err != nil {
-		t.Fatalf("write config.toml: %v", err)
-	}
+	writeFile(t, filepath.Join(dir, "config.toml"), text)
 	return dir
 }
 
@@ -44,11 +48,6 @@ func listDir(t *testing.T, dir string) []string {
 		names = append(names, e.Name())
 	}
 	return names
-}
-
-// withGrace shortens the time in-flight requests get on a stop.
-func withGrace(grace time.Duration) func(*hub.Options) {
-	return func(o *hub.Options) { o.RequestGrace = grace }
 }
 
 // syncBuffer is a bytes.Buffer that run may write to while the test reads it.
@@ -113,33 +112,30 @@ func nonEmptyLines(s string) []string {
 
 // running is a run started by startRun.
 type running struct {
-	addr   string
-	stderr *syncBuffer
-	cancel context.CancelFunc
+	addr string
+	// listening is the run's listening line.
+	listening map[string]any
+	cancel    context.CancelFunc
 	// code receives run's exit status, once.
 	code chan int
 }
 
-// startRun calls run with no arguments in a working directory whose
-// configuration listens on 127.0.0.1:0, in a goroutine, waits for its
-// listening line and returns the address that line names.
-func startRun(t *testing.T, grace time.Duration) *running {
+// startRun calls run with no arguments, the environment env and the working
+// directory dir, in a goroutine, waits for its listening line and returns
+// the address that line names.
+func startRun(t *testing.T, env func(string) (string, bool), dir string) *running {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	r := &running{stderr: newSyncBuffer(), cancel: cancel, code: make(chan int, 1)}
-	dir := workDir(t, localConfig)
-	go func() { r.code <- run(ctx, nil, noEnv, dir, &bytes.Buffer{}, r.stderr, withGrace(grace)) }()
+	r := &running{cancel: cancel, code: make(chan int, 1)}
+	stderr := newSyncBuffer()
+	go func() { r.code <- run(ctx, nil, env, dir, &bytes.Buffer{}, stderr) }()
 	t.Cleanup(cancel)
 
-	line := r.stderr.lineWith(t, `"msg":"listening"`)
-	var rec struct {
-		Msg  string `json:"msg"`
-		Addr string `json:"addr"`
-	}
-	if err := json.Unmarshal([]byte(line), &rec); err != nil {
+	line := stderr.lineWith(t, `"msg":"listening"`)
+	if err := json.Unmarshal([]byte(line), &r.listening); err != nil {
 		t.Fatalf("listening line %q is not a JSON object: %v", line, err)
 	}
-	r.addr = rec.Addr
+	r.addr, _ = r.listening["addr"].(string)
 	return r
 }
 

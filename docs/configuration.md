@@ -30,8 +30,12 @@ file to be written.
 The file is TOML and is checked strictly: invalid TOML, a section or a key
 no part of the hub registers, and a value of the wrong type or out of range
 each stop the start with exit status `1` and one error line that names the
-line or the key (`section.key`). The values of the file are never quoted in
-an error. For example:
+line or the key (`section.key`). An error about a key does not quote the
+key's value; the one exception is a provider `name` given twice, which can
+only be `github` or `google`. An error about invalid TOML carries the TOML
+parser's own message, which can quote the text at the mistake, such as
+`expected value but found "hunter2" instead` for an unquoted string. For
+example:
 
 ```json
 {"time":"2026-11-13T13:11:38.609972+01:00","level":"ERROR","msg":"cannot start","error":"configuration file /srv/parley/config.toml: server.prot: unknown key"}
@@ -54,8 +58,10 @@ variable cannot add, remove or rename a key.
 
 A reference to a variable that is not set (set to the empty string is set),
 a `${` without a closing `}`, and a name that is not a letter or `_` followed
-by letters, digits or `_`, are errors of the key that holds them; the error
-names the key and the variable, never a value.
+by letters, digits or `_`, are errors of the key that holds them. The error
+names the key. For a variable that is not set, it also names the variable.
+For a malformed name, it quotes the reference as written, such as `${A B}`.
+It never quotes a variable's value.
 
 ### Keys
 

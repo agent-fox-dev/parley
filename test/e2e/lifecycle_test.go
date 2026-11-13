@@ -168,22 +168,7 @@ func TestLifecycle_FirstBootHandsOutTheAdminTokenThenServesAndStopsOnSIGTERM(t *
 	}
 	outputs = append(outputs, out1.String(), err1.String())
 	tokenFile := filepath.Join(dir, "admin_token")
-	info, err := os.Stat(tokenFile)
-	if err != nil {
-		t.Fatalf("the admin token file: %v", err)
-	}
-	if mode := info.Mode().Perm(); mode != 0o600 {
-		t.Errorf("admin_token has mode %o, want 600", mode)
-	}
-	raw, err := os.ReadFile(tokenFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	token := string(raw)
-	sum := sha256.Sum256(raw)
-	if got := storedTokenHash(t, dir); got != hex.EncodeToString(sum[:]) {
-		t.Errorf("stored hash = %q, want the SHA-256 of the token file", got)
-	}
+	token := checkTokenFile(t, tokenFile, dir)
 
 	// Second run: refused while the file exists.
 	var out2, err2 lockedBuffer
@@ -214,10 +199,7 @@ func TestLifecycle_FirstBootHandsOutTheAdminTokenThenServesAndStopsOnSIGTERM(t *
 	if got := status(t, s.url("/readyz")); got != http.StatusOK {
 		t.Errorf("GET /readyz = %d, want 200", got)
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	for tasks.Load() < 1 && time.Now().Before(deadline) {
-		time.Sleep(2 * time.Millisecond)
-	}
+	waitUntil(5*time.Second, func() bool { return tasks.Load() >= 1 })
 	if hooks.Load() != 1 || tasks.Load() != 1 {
 		t.Errorf("start hook called %d times and maintenance task %d times, want 1 and 1", hooks.Load(), tasks.Load())
 	}
@@ -283,38 +265,8 @@ func TestLifecycle_BacksUpARunningHubAndAHubStartsOnTheSnapshot(t *testing.T) {
 			t.Fatalf("commit before the backup: %v", err)
 		}
 	}
-	repo := filepath.Join(dir, "data", "workspaces", "r.git")
-	if err := os.MkdirAll(filepath.Dir(repo), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	git(t, filepath.Dir(repo), "init", "--quiet", "--bare", "--initial-branch=main", repo)
-	clone := t.TempDir()
-	git(t, clone, "init", "--quiet", "--initial-branch=main")
-	for _, msg := range []string{"one", "two"} {
-		if err := os.WriteFile(filepath.Join(clone, "file"), []byte(msg), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		git(t, clone, "add", "file")
-		git(t, clone, "commit", "--quiet", "-m", msg)
-	}
-	git(t, clone, "push", "--quiet", repo, "main")
-
-	stopWriter := make(chan struct{})
-	writerErr := make(chan error, 1)
-	go func() {
-		for txn := 10; ; txn++ {
-			select {
-			case <-stopWriter:
-				writerErr <- nil
-				return
-			default:
-			}
-			if err := commit(txn); err != nil {
-				writerErr <- err
-				return
-			}
-		}
-	}()
+	bareRepo(t, filepath.Join(dir, "data", "workspaces", "r.git"))
+	stopWriter := keepCommitting(10, commit)
 
 	target := filepath.Join(t.TempDir(), "snapshot")
 	var out, errb lockedBuffer
@@ -328,8 +280,7 @@ func TestLifecycle_BacksUpARunningHubAndAHubStartsOnTheSnapshot(t *testing.T) {
 	if got := status(t, hub1.url("/readyz")); got != http.StatusOK {
 		t.Errorf("GET /readyz of the running hub = %d after the backup, want 200", got)
 	}
-	close(stopWriter)
-	if err := <-writerErr; err != nil {
+	if err := stopWriter(); err != nil {
 		t.Errorf("the writer failed during the backup: %v", err)
 	}
 	for _, name := range []string{"parley.db", "analytics.db", "workspaces"} {
@@ -354,16 +305,7 @@ func TestLifecycle_BacksUpARunningHubAndAHubStartsOnTheSnapshot(t *testing.T) {
 		t.Errorf("the hub on the snapshot returned %d after a stop, want 0", code)
 	}
 
-	db, err := sql.Open("sqlite", "file:"+filepath.Join(target, "parley.db")+"?mode=ro")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	var n int
-	if err := db.QueryRow("SELECT count(*) FROM a").Scan(&n); err != nil {
-		t.Fatalf("count the rows of the snapshot: %v", err)
-	}
-	if n%10 != 0 || n < 100 {
+	if n := countRows(t, filepath.Join(target, "parley.db"), "a"); n%10 != 0 || n < 100 {
 		t.Errorf("the snapshot holds %d rows, want a multiple of 10 and at least 100", n)
 	}
 	git(t, filepath.Join(target, "workspaces", "r.git"), "fsck", "--no-progress")
@@ -372,6 +314,96 @@ func TestLifecycle_BacksUpARunningHubAndAHubStartsOnTheSnapshot(t *testing.T) {
 	if code := hub1.exitCode(t, 5*time.Second); code != 0 {
 		t.Errorf("the first hub returned %d after a stop, want 0", code)
 	}
+}
+
+// checkTokenFile checks the admin token file at path, written by the hub
+// whose data directory is dataDir: mode 0600 and a content whose SHA-256 is
+// the stored hash. It returns the token.
+func checkTokenFile(t *testing.T, path, dataDir string) string {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("the admin token file: %v", err)
+	}
+	if mode := info.Mode().Perm(); mode != 0o600 {
+		t.Errorf("admin_token has mode %o, want 600", mode)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(raw)
+	if got := storedTokenHash(t, dataDir); got != hex.EncodeToString(sum[:]) {
+		t.Errorf("stored hash = %q, want the SHA-256 of the token file", got)
+	}
+	return string(raw)
+}
+
+// waitUntil polls cond until it holds or within has passed.
+func waitUntil(within time.Duration, cond func() bool) {
+	for deadline := time.Now().Add(within); !cond() && time.Now().Before(deadline); {
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// bareRepo creates a bare repository at path holding two commits on main.
+func bareRepo(t *testing.T, path string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	git(t, filepath.Dir(path), "init", "--quiet", "--bare", "--initial-branch=main", path)
+	clone := t.TempDir()
+	git(t, clone, "init", "--quiet", "--initial-branch=main")
+	for _, msg := range []string{"one", "two"} {
+		if err := os.WriteFile(filepath.Join(clone, "file"), []byte(msg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		git(t, clone, "add", "file")
+		git(t, clone, "commit", "--quiet", "-m", msg)
+	}
+	git(t, clone, "push", "--quiet", path, "main")
+}
+
+// keepCommitting calls commit with first, first+1, ... in a goroutine until
+// the returned function is called, which returns the first error of commit.
+func keepCommitting(first int, commit func(txn int) error) (stop func() error) {
+	done := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		for txn := first; ; txn++ {
+			select {
+			case <-done:
+				result <- nil
+				return
+			default:
+			}
+			if err := commit(txn); err != nil {
+				result <- err
+				return
+			}
+		}
+	}()
+	return func() error {
+		close(done)
+		return <-result
+	}
+}
+
+// countRows counts the rows of table in the store file at path, opened
+// read-only.
+func countRows(t *testing.T, path, table string) int {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRow("SELECT count(*) FROM " + table).Scan(&n); err != nil {
+		t.Fatalf("count the rows of %s in %s: %v", table, path, err)
+	}
+	return n
 }
 
 // writeConfig writes config.toml with text into dir.

@@ -116,6 +116,7 @@ func modeOf(t *testing.T, path string) os.FileMode {
 }
 
 func TestOpen_CreatesTheDirectoriesAndBothStores(t *testing.T) {
+	t.Parallel()
 	tmp := t.TempDir()
 	ctx := context.Background()
 	st, err := store.Open(ctx, store.Options{
@@ -159,6 +160,7 @@ func TestOpen_CreatesTheDirectoriesAndBothStores(t *testing.T) {
 }
 
 func TestOpen_OpensBothStoresInWALModeWithForeignKeys(t *testing.T) {
+	t.Parallel()
 	st := mustOpen(t, options(t.TempDir()), nil)
 	for name, db := range map[string]*sql.DB{"transactional": st.Main(), "analytical": st.Analytics()} {
 		var mode string
@@ -179,6 +181,7 @@ func TestOpen_OpensBothStoresInWALModeWithForeignKeys(t *testing.T) {
 }
 
 func TestOpen_AppliesOnlyTheSchemaStepsNotYetRecorded(t *testing.T) {
+	t.Parallel()
 	opts := options(t.TempDir())
 	ctx := context.Background()
 	rec := &recorder{}
@@ -231,6 +234,7 @@ func TestOpen_AppliesOnlyTheSchemaStepsNotYetRecorded(t *testing.T) {
 }
 
 func TestOpen_StopsAtAFailingSchemaStep(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name  string
 		apply func(ctx context.Context, tx *sql.Tx) error
@@ -250,6 +254,7 @@ func TestOpen_StopsAtAFailingSchemaStep(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			opts := options(t.TempDir())
 			ctx := context.Background()
 			rec := &recorder{}
@@ -293,25 +298,32 @@ func TestOpen_StopsAtAFailingSchemaStep(t *testing.T) {
 }
 
 func TestOpen_RefusesAnInvalidStepListBeforeApplyingAnything(t *testing.T) {
-	rec := &recorder{}
+	t.Parallel()
 	tests := []struct {
 		name  string
-		steps []store.Step
+		steps func(rec *recorder) []store.Step
 		want  string
 	}{
-		{"duplicated name", []store.Step{
-			rec.step("dup", store.Main, `CREATE TABLE a (id INTEGER)`),
-			rec.step("dup", store.Analytics, `CREATE TABLE b (id INTEGER)`),
+		{"duplicated name", func(rec *recorder) []store.Step {
+			return []store.Step{
+				rec.step("dup", store.Main, `CREATE TABLE a (id INTEGER)`),
+				rec.step("dup", store.Analytics, `CREATE TABLE b (id INTEGER)`),
+			}
 		}, "dup"},
-		{"empty name", []store.Step{rec.step("", store.Main, `CREATE TABLE a (id INTEGER)`)}, "name"},
-		{"no function", []store.Step{{Name: "nofn", Target: store.Main}}, "nofn"},
-		{"unknown target", []store.Step{rec.step("where", store.Target(9), `CREATE TABLE a (id INTEGER)`)}, "where"},
+		{"empty name", func(rec *recorder) []store.Step {
+			return []store.Step{rec.step("", store.Main, `CREATE TABLE a (id INTEGER)`)}
+		}, "name"},
+		{"no function", func(*recorder) []store.Step { return []store.Step{{Name: "nofn", Target: store.Main}} }, "nofn"},
+		{"unknown target", func(rec *recorder) []store.Step {
+			return []store.Step{rec.step("where", store.Target(9), `CREATE TABLE a (id INTEGER)`)}
+		}, "where"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			rec.reset()
+			t.Parallel()
+			rec := &recorder{}
 			opts := options(t.TempDir())
-			st, err := store.Open(context.Background(), opts, tt.steps)
+			st, err := store.Open(context.Background(), opts, tt.steps(rec))
 			if st != nil {
 				st.Close()
 				t.Fatal("Open returned a store for an invalid step list")
@@ -330,13 +342,15 @@ func TestOpen_RefusesAnInvalidStepListBeforeApplyingAnything(t *testing.T) {
 }
 
 func TestTx_CommitsOnNilAndDiscardsOnErrorOrPanic(t *testing.T) {
+	t.Parallel()
 	errBoom := errors.New("boom")
-	insertTwo := func(ctx context.Context, tx *sql.Tx) {
+	insertTwo := func(ctx context.Context, tx *sql.Tx) error {
 		for range 2 {
 			if _, err := tx.ExecContext(ctx, `INSERT INTO a (v) VALUES ('r')`); err != nil {
-				t.Fatalf("insert: %v", err)
+				return fmt.Errorf("insert: %w", err)
 			}
 		}
+		return nil
 	}
 	tests := []struct {
 		name      string
@@ -345,21 +359,31 @@ func TestTx_CommitsOnNilAndDiscardsOnErrorOrPanic(t *testing.T) {
 		check     func(t *testing.T, err error)
 	}{
 		{"returns nil", func(ctx context.Context) func(*sql.Tx) error {
-			return func(tx *sql.Tx) error { insertTwo(ctx, tx); return nil }
+			return func(tx *sql.Tx) error { return insertTwo(ctx, tx) }
 		}, 2, func(t *testing.T, err error) {
 			if err != nil {
 				t.Errorf("Tx = %v, want nil", err)
 			}
 		}},
 		{"returns an error", func(ctx context.Context) func(*sql.Tx) error {
-			return func(tx *sql.Tx) error { insertTwo(ctx, tx); return errBoom }
+			return func(tx *sql.Tx) error {
+				if err := insertTwo(ctx, tx); err != nil {
+					return err
+				}
+				return errBoom
+			}
 		}, 0, func(t *testing.T, err error) {
 			if !errors.Is(err, errBoom) {
 				t.Errorf("Tx = %v, want the function's error", err)
 			}
 		}},
 		{"panics", func(ctx context.Context) func(*sql.Tx) error {
-			return func(tx *sql.Tx) error { insertTwo(ctx, tx); panic("x marks the spot") }
+			return func(tx *sql.Tx) error {
+				if err := insertTwo(ctx, tx); err != nil {
+					return err
+				}
+				panic("x marks the spot")
+			}
 		}, 0, func(t *testing.T, err error) {
 			if err == nil || !strings.Contains(err.Error(), "x marks the spot") {
 				t.Errorf("Tx = %v, want an error carrying the panic value", err)
@@ -368,6 +392,7 @@ func TestTx_CommitsOnNilAndDiscardsOnErrorOrPanic(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			ctx := context.Background()
 			st := openWithTableA(t)
 			tt.check(t, st.Tx(ctx, tt.fn(ctx)))
@@ -386,6 +411,7 @@ func TestTx_CommitsOnNilAndDiscardsOnErrorOrPanic(t *testing.T) {
 }
 
 func TestTx_ConcurrentTransactionsAllComplete(t *testing.T) {
+	t.Parallel()
 	const workers, perWorker = 32, 25
 	ctx := context.Background()
 	st := openWithTableA(t)
@@ -415,6 +441,7 @@ func TestTx_ConcurrentTransactionsAllComplete(t *testing.T) {
 }
 
 func TestOpen_FailsWithoutCreatingOrChangingAStoreFile(t *testing.T) {
+	t.Parallel()
 	notADatabase := bytes.Repeat([]byte("not a database"), 4096/len("not a database")+1)[:4096]
 	tests := []struct {
 		name string
@@ -454,6 +481,7 @@ func TestOpen_FailsWithoutCreatingOrChangingAStoreFile(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			tmp := t.TempDir()
 			opts, failing := tt.setup(t, tmp)
 			before := storeFiles(t, filepath.Dir(opts.DatabasePath))
@@ -480,6 +508,7 @@ func TestOpen_FailsWithoutCreatingOrChangingAStoreFile(t *testing.T) {
 }
 
 func TestStore_PingAndCloseReportAStoreThatNoLongerAnswers(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	tests := []struct {
 		name  string
@@ -492,6 +521,7 @@ func TestStore_PingAndCloseReportAStoreThatNoLongerAnswers(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			st := openWithTableA(t)
 			if err := st.Ping(ctx); err != nil {
 				t.Fatalf("Ping before closing: %v", err)

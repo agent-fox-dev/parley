@@ -114,6 +114,7 @@ func TestVerifyAdminToken_AcceptsOnlyTheStoredToken(t *testing.T) {
 		{"empty token", bootstrapped, "", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			got, err := identity.VerifyAdminToken(ctx, tc.st, tc.presented)
 			if err != nil {
 				t.Fatalf("VerifyAdminToken: %v", err)

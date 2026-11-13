@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"syscall"
 	"time"
@@ -389,6 +390,12 @@ func Run(ctx context.Context, opts Options) int {
 	cmd, status, ok := parseArgs(opts.Args, stdout, stderr)
 	if !ok {
 		return status
+	}
+	// Once, so that every path resolved against it is absolute: a relative
+	// directory would make the checks of where a path lies fail open. When
+	// it cannot be made absolute, the configuration load reports it.
+	if wd, err := filepath.Abs(opts.WorkDir); err == nil {
+		opts.WorkDir = wd
 	}
 	r := &run{opts: opts, cmd: cmd, level: new(slog.LevelVar), scrubber: scrub.New()}
 	// The logger exists before the configuration is loaded, at info, so that

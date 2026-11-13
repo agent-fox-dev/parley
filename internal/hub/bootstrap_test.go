@@ -372,6 +372,48 @@ func TestRun_StoresNothingWhenTheTokenFileCannotBeWritten(t *testing.T) {
 	}
 }
 
+// failingCommit adds a schema step after which a change of the stored admin
+// token hash breaks a deferred foreign key, so that the transaction of a
+// reset fails at its commit, after the token file was written.
+func failingCommit(c *hub.Composition) {
+	c.AddSchemaStep(execStep("fail_reset_commit", store.Main, `
+CREATE TABLE parent (id INTEGER PRIMARY KEY);
+CREATE TABLE child (parent_id INTEGER REFERENCES parent (id) DEFERRABLE INITIALLY DEFERRED);
+CREATE TRIGGER orphan AFTER UPDATE OF token_hash ON admin_settings BEGIN
+	INSERT INTO child (parent_id) VALUES (1);
+END`))
+}
+
+func TestRun_KeepsTheOldTokenFileWhenTheResetCannotCommit(t *testing.T) {
+	t.Parallel()
+	dir := workDir(t, localConfig)
+	path := filepath.Join(dir, "admin_token")
+	if res := runToEnd(t, hub.Options{WorkDir: dir, Args: []string{"--admin-email", "a@x"}, Compose: failingCommit}); res.code != 0 {
+		t.Fatalf("first bootstrap returned %d; stderr = %q", res.code, res.stderr)
+	}
+	old := readToken(t, path)
+	before := storedAdmin(t, dir)
+	entries := dirNames(t, dir)
+
+	res := runToEnd(t, hub.Options{WorkDir: dir, Args: []string{"--reset-admin-token"}, Compose: failingCommit})
+
+	if res.code != 1 {
+		t.Errorf("Run returned %d, want 1; stderr = %q", res.code, res.stderr)
+	}
+	if lines := nonEmptyLines(res.stderr); len(lines) != 1 || !strings.Contains(lines[0], "commit") {
+		t.Errorf("stderr = %q, want one line naming the failed commit", res.stderr)
+	}
+	if got := readToken(t, path); got != old {
+		t.Errorf("token file holds %q after the failed reset, want the old token", got)
+	}
+	if s := storedAdmin(t, dir); s != before || s.TokenHash != hashOf(old) {
+		t.Errorf("admin settings = %+v, want them unchanged, %+v, with the old token's hash", s, before)
+	}
+	if got := dirNames(t, dir); !slices.Equal(got, entries) {
+		t.Errorf("config dir holds %v after the run, want %v", got, entries)
+	}
+}
+
 // dirNames lists the names in dir.
 func dirNames(t *testing.T, dir string) []string {
 	t.Helper()

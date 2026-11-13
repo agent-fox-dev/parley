@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -136,11 +135,6 @@ func TestRun_WritesOneListeningLineWithTheAddressConfigAndDataDirectory(t *testi
 
 func TestRun_StopsTheStartAtTheFirstFailingStage(t *testing.T) {
 	t.Parallel()
-	type arrangement struct {
-		dir     string
-		compose func(*hub.Composition)
-		want    string
-	}
 	var log callLog // every row's calls, prefixed by the row's name
 	hooks := func(row string) func(*hub.Composition) {
 		return func(c *hub.Composition) {
@@ -154,78 +148,7 @@ func TestRun_StopsTheStartAtTheFirstFailingStage(t *testing.T) {
 			})
 		}
 	}
-	for _, tc := range []struct {
-		name string
-		// mustNotExist is a path, under the row's directory, that a stage
-		// which must not have run would have created.
-		mustNotExist string
-		arrange      func(t *testing.T, row string) arrangement
-	}{
-		{"invalid configuration", "data", func(t *testing.T, row string) arrangement {
-			return arrangement{dir: workDir(t, "[server]\nprot = 1\n"), compose: hooks(row), want: "server.prot"}
-		}},
-		{"data directory under a regular file", "", func(t *testing.T, row string) arrangement {
-			dir := t.TempDir()
-			blocker := filepath.Join(dir, "blocker")
-			writeFile(t, blocker, "a file, not a directory")
-			writeFile(t, filepath.Join(dir, "config.toml"), localConfig+"[database]\npath = \""+filepath.Join(blocker, "parley.db")+"\"\n")
-			return arrangement{dir: dir, compose: hooks(row), want: blocker}
-		}},
-		{"failing schema step", "", func(t *testing.T, row string) arrangement {
-			return arrangement{dir: workDir(t, localConfig), want: "boom", compose: func(c *hub.Composition) {
-				c.AddSchemaStep(store.Step{Name: "boom", Target: store.Main, Apply: func(context.Context, *sql.Tx) error {
-					return errors.New("no such table")
-				}})
-				hooks(row)(c)
-			}}
-		}},
-		{"failing start hook", "", func(t *testing.T, row string) arrangement {
-			return arrangement{dir: workDir(t, localConfig), want: "resume-clones", compose: func(c *hub.Composition) {
-				c.AddStartHook("resume-clones", func(context.Context, *hub.Runtime) error {
-					return errors.New("disk gone")
-				})
-				hooks(row)(c)
-			}}
-		}},
-		{"listen address in use", "", func(t *testing.T, row string) arrangement {
-			held, err := net.Listen("tcp", "127.0.0.1:0")
-			if err != nil {
-				t.Fatalf("hold a port: %v", err)
-			}
-			t.Cleanup(func() { held.Close() })
-			port := held.Addr().(*net.TCPAddr).Port
-			// The hook runs before the bind, so only the task must not run.
-			return arrangement{
-				dir:     workDir(t, "[server]\nbind = \"127.0.0.1\"\nport = "+itoa(port)+"\n"),
-				compose: func(c *hub.Composition) { hooks(row)(c) },
-				want:    held.Addr().String(),
-			}
-		}},
-		{"start hook registered twice", "data", func(t *testing.T, row string) arrangement {
-			return arrangement{dir: workDir(t, localConfig), want: "twice", compose: func(c *hub.Composition) {
-				noop := func(context.Context, *hub.Runtime) error { return nil }
-				c.AddStartHook("twice", noop)
-				c.AddStartHook("twice", noop)
-				hooks(row)(c)
-			}}
-		}},
-		{"maintenance task registered twice", "data", func(t *testing.T, row string) arrangement {
-			return arrangement{dir: workDir(t, localConfig), want: "retention", compose: func(c *hub.Composition) {
-				noop := func(context.Context, *hub.Runtime) error { return nil }
-				c.AddMaintenanceTask("retention", noop)
-				c.AddMaintenanceTask("retention", noop)
-				hooks(row)(c)
-			}}
-		}},
-		{"background work registered twice", "data", func(t *testing.T, row string) arrangement {
-			return arrangement{dir: workDir(t, localConfig), want: "event_streams", compose: func(c *hub.Composition) {
-				noop := func(context.Context, *hub.Runtime) {}
-				c.AddBackgroundWork("event_streams", time.Second, noop)
-				c.AddBackgroundWork("event_streams", time.Second, noop)
-				hooks(row)(c)
-			}}
-		}},
-	} {
+	for _, tc := range failingStarts(hooks) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			a := tc.arrange(t, tc.name)
@@ -264,28 +187,90 @@ func TestRun_StopsTheStartAtTheFirstFailingStage(t *testing.T) {
 	}
 }
 
-func TestRun_RunsAMaintenancePassAtEachTickOfItsInterval(t *testing.T) {
-	t.Parallel()
-	var passes atomic.Int32
-	r := startHub(t, hub.Options{
-		WorkDir:             workDir(t, localConfig),
-		MaintenanceInterval: 10 * time.Millisecond,
-		Compose: func(c *hub.Composition) {
-			c.AddMaintenanceTask("retention", func(context.Context, *hub.Runtime) error {
-				passes.Add(1)
-				return nil
-			})
-		},
-	})
+// failedStart is how a start that fails at one stage is arranged: the
+// working directory, the parts it adds and what its error line must name.
+type failedStart struct {
+	dir     string
+	compose func(*hub.Composition)
+	want    string
+}
 
-	eventually(t, "three passes run", func() bool { return passes.Load() >= 3 })
-	if code := r.stop(t); code != 0 {
-		t.Errorf("Run returned %d after a stop, want 0", code)
-	}
-	n := passes.Load()
-	time.Sleep(30 * time.Millisecond)
-	if got := passes.Load(); got != n {
-		t.Errorf("%d passes ran after Run returned", got-n)
+// failingStart is a row of TestRun_StopsTheStartAtTheFirstFailingStage.
+type failingStart struct {
+	name string
+	// mustNotExist is a path, under the row's directory, that a stage which
+	// must not have run would have created.
+	mustNotExist string
+	arrange      func(t *testing.T, row string) failedStart
+}
+
+// failingStarts returns a start failing at each stage; hooks(row) adds the
+// row's start hook and maintenance task, which record their calls.
+func failingStarts(hooks func(row string) func(*hub.Composition)) []failingStart {
+	noop := func(context.Context, *hub.Runtime) error { return nil }
+	return []failingStart{
+		{"invalid configuration", "data", func(t *testing.T, row string) failedStart {
+			return failedStart{dir: workDir(t, "[server]\nprot = 1\n"), compose: hooks(row), want: "server.prot"}
+		}},
+		{"data directory under a regular file", "", func(t *testing.T, row string) failedStart {
+			dir := t.TempDir()
+			blocker := filepath.Join(dir, "blocker")
+			writeFile(t, blocker, "a file, not a directory")
+			writeFile(t, filepath.Join(dir, "config.toml"), localConfig+"[database]\npath = \""+filepath.Join(blocker, "parley.db")+"\"\n")
+			return failedStart{dir: dir, compose: hooks(row), want: blocker}
+		}},
+		{"failing schema step", "", func(t *testing.T, row string) failedStart {
+			return failedStart{dir: workDir(t, localConfig), want: "boom", compose: func(c *hub.Composition) {
+				c.AddSchemaStep(store.Step{Name: "boom", Target: store.Main, Apply: func(context.Context, *sql.Tx) error {
+					return errors.New("no such table")
+				}})
+				hooks(row)(c)
+			}}
+		}},
+		{"failing start hook", "", func(t *testing.T, row string) failedStart {
+			return failedStart{dir: workDir(t, localConfig), want: "resume-clones", compose: func(c *hub.Composition) {
+				c.AddStartHook("resume-clones", func(context.Context, *hub.Runtime) error {
+					return errors.New("disk gone")
+				})
+				hooks(row)(c)
+			}}
+		}},
+		{"listen address in use", "", func(t *testing.T, row string) failedStart {
+			held, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatalf("hold a port: %v", err)
+			}
+			t.Cleanup(func() { held.Close() })
+			port := held.Addr().(*net.TCPAddr).Port
+			// The hook runs before the bind, so only the task must not run.
+			return failedStart{
+				dir:     workDir(t, "[server]\nbind = \"127.0.0.1\"\nport = "+itoa(port)+"\n"),
+				compose: hooks(row),
+				want:    held.Addr().String(),
+			}
+		}},
+		{"start hook registered twice", "data", func(t *testing.T, row string) failedStart {
+			return failedStart{dir: workDir(t, localConfig), want: "twice", compose: func(c *hub.Composition) {
+				c.AddStartHook("twice", noop)
+				c.AddStartHook("twice", noop)
+				hooks(row)(c)
+			}}
+		}},
+		{"maintenance task registered twice", "data", func(t *testing.T, row string) failedStart {
+			return failedStart{dir: workDir(t, localConfig), want: "retention", compose: func(c *hub.Composition) {
+				c.AddMaintenanceTask("retention", noop)
+				c.AddMaintenanceTask("retention", noop)
+				hooks(row)(c)
+			}}
+		}},
+		{"background work registered twice", "data", func(t *testing.T, row string) failedStart {
+			return failedStart{dir: workDir(t, localConfig), want: "event_streams", compose: func(c *hub.Composition) {
+				work := func(context.Context, *hub.Runtime) {}
+				c.AddBackgroundWork("event_streams", time.Second, work)
+				c.AddBackgroundWork("event_streams", time.Second, work)
+				hooks(row)(c)
+			}}
+		}},
 	}
 }
 
@@ -421,10 +406,11 @@ func TestRun_LogsAFailingMaintenanceTaskAtEveryPassAndKeepsServing(t *testing.T)
 			})
 		}
 	}
+	const interval = 100 * time.Millisecond
 	var rt *hub.Runtime
 	r := startHub(t, hub.Options{
 		WorkDir:             workDir(t, localConfig),
-		MaintenanceInterval: 100 * time.Millisecond,
+		MaintenanceInterval: interval,
 		Compose: func(c *hub.Composition) {
 			rt = c.Runtime()
 			c.AddSchemaStep(store.Step{Name: "test_passes", Target: store.Main, Apply: func(ctx context.Context, tx *sql.Tx) error {
@@ -471,5 +457,12 @@ func TestRun_LogsAFailingMaintenanceTaskAtEveryPassAndKeepsServing(t *testing.T)
 	}
 	if code := r.stop(t); code != 0 {
 		t.Errorf("Run returned %d after a stop, want 0", code)
+	}
+	// Each pass logs the failing task, so a pass at a tick after the stop
+	// would add a line.
+	n := len(failures())
+	time.Sleep(interval + interval/2)
+	if got := len(failures()); got != n {
+		t.Errorf("%d passes ran after Run returned", got-n)
 	}
 }

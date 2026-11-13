@@ -32,7 +32,7 @@ func (r *run) backup(ctx context.Context) int {
 	if err := checkSources(cfg); err != nil {
 		return r.backupFailed(err)
 	}
-	created, err := prepareTarget(target, cfg.Workspace.Path)
+	created, err := prepareTarget(target, cfg.Workspace.Path, cfg.DataDir())
 	if err != nil {
 		return r.backupFailed(err)
 	}
@@ -81,11 +81,17 @@ func checkSources(cfg *config.Config) error {
 // prepareTarget makes sure target is an empty directory, creating it with
 // mode 0700 when it is missing, and reports whether it created it. It
 // refuses, writing nothing, a target that is a non-empty directory, that is
-// not a directory, or that lies inside the workspace root, which the backup
-// would copy into itself.
-func prepareTarget(target, workspaceRoot string) (created bool, err error) {
-	if inside(resolve(target), resolve(workspaceRoot)) || inside(target, workspaceRoot) {
-		return false, fmt.Errorf("backup directory %s is inside the workspace root %s", target, workspaceRoot)
+// not a directory, that lies inside the workspace root, which the backup
+// would copy into itself, or that lies inside the data directory, which a
+// backup leaves untouched.
+func prepareTarget(target, workspaceRoot, dataDir string) (created bool, err error) {
+	for _, dir := range []struct{ what, path string }{
+		{"the workspace root", workspaceRoot},
+		{"the data directory", dataDir},
+	} {
+		if inside(resolve(target), resolve(dir.path)) || inside(target, dir.path) {
+			return false, fmt.Errorf("backup directory %s is inside %s %s", target, dir.what, dir.path)
+		}
 	}
 	fi, err := os.Stat(target)
 	switch {

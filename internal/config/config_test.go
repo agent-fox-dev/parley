@@ -28,6 +28,7 @@ func writeFile(t *testing.T, path, text string) {
 func noEnv() config.Env { return config.MapEnv(nil) }
 
 func TestLoad_ReadsTheFileFromXDGConfigHomeOrTheWorkingDirectory(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name     string
 		xdg      *string // nil: unset; points at "" or "xdg"
@@ -42,6 +43,7 @@ func TestLoad_ReadsTheFileFromXDGConfigHomeOrTheWorkingDirectory(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			work := dirWith(t, "[server]\nport = 1111\n")
 			xdg := t.TempDir()
 			if tc.xdgFile {
@@ -78,6 +80,7 @@ func TestLoad_ReadsTheFileFromXDGConfigHomeOrTheWorkingDirectory(t *testing.T) {
 func ptr(s string) *string { return &s }
 
 func TestLoad_UsesTheDefaultOfEveryKeyTheFileDoesNotSet(t *testing.T) {
+	t.Parallel()
 	cases := map[string]*string{
 		"no file":             nil,
 		"an empty file":       ptr(""),
@@ -85,6 +88,7 @@ func TestLoad_UsesTheDefaultOfEveryKeyTheFileDoesNotSet(t *testing.T) {
 	}
 	for name, text := range cases {
 		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 			dir := t.TempDir()
 			if text != nil {
 				writeFile(t, filepath.Join(dir, "config.toml"), *text)
@@ -119,6 +123,7 @@ func TestLoad_UsesTheDefaultOfEveryKeyTheFileDoesNotSet(t *testing.T) {
 }
 
 func TestLoad_ReturnsTheValuesTheFileSets(t *testing.T) {
+	t.Parallel()
 	port := func(c *config.Config) any { return c.Server.Port }
 	bodySize := func(c *config.Config) any { return c.Server.MaxBodySize }
 	level := func(c *config.Config) any { return c.Logging.Level }
@@ -149,6 +154,7 @@ func TestLoad_ReturnsTheValuesTheFileSets(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.file, func(t *testing.T) {
+			t.Parallel()
 			cfg, err := config.Load(noEnv(), dirWith(t, tc.file))
 			if err != nil {
 				t.Fatal(err)
@@ -161,6 +167,7 @@ func TestLoad_ReturnsTheValuesTheFileSets(t *testing.T) {
 }
 
 func TestLoad_RefusesTheWholeFileAndNamesTheOffendingKey(t *testing.T) {
+	t.Parallel()
 	const provider = "[[oauth.providers]]\nname = 'github'\nclient_id = 'a'\nclient_secret = 'b'\n"
 	cases := []struct{ file, want string }{
 		{"[server\nport = 1", "line 1"},
@@ -196,6 +203,7 @@ func TestLoad_RefusesTheWholeFileAndNamesTheOffendingKey(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.file, func(t *testing.T) {
+			t.Parallel()
 			cfg, err := config.Load(noEnv(), dirWith(t, tc.file))
 			if cfg != nil {
 				t.Errorf("returned a configuration: %+v", cfg)
@@ -208,6 +216,7 @@ func TestLoad_RefusesTheWholeFileAndNamesTheOffendingKey(t *testing.T) {
 }
 
 func TestLoad_ReturnsTheOAuthProvidersInFileOrderWithTheirEndpoints(t *testing.T) {
+	t.Parallel()
 	github := config.Provider{
 		Name: "github", ClientID: "gh-id", ClientSecret: "gh-secret",
 		AuthorizeURL: "https://github.com/login/oauth/authorize",
@@ -242,6 +251,7 @@ func TestLoad_ReturnsTheOAuthProvidersInFileOrderWithTheirEndpoints(t *testing.T
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			cfg, err := config.Load(noEnv(), dirWith(t, tc.file))
 			if err != nil {
 				t.Fatal(err)
@@ -268,6 +278,7 @@ func atLeast(n int) func(any) error {
 }
 
 func TestRegistry_LoadsTheKeysOtherPackagesRegister(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name      string
 		file      *string
@@ -284,6 +295,7 @@ func TestRegistry_LoadsTheKeysOtherPackagesRegister(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			reg := config.NewRegistry()
 			if err := reg.Register(config.Key{Section: "forks", Name: "max_per_workspace", Type: config.Int, Default: 200, Validate: atLeast(1)}); err != nil {
 				t.Fatal(err)
@@ -319,6 +331,7 @@ func TestRegistry_LoadsTheKeysOtherPackagesRegister(t *testing.T) {
 }
 
 func TestRegistry_RefusesAKeyRegisteredTwice(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name  string
 		key   config.Key
@@ -329,6 +342,7 @@ func TestRegistry_RefusesAKeyRegisteredTwice(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			reg := config.NewRegistry()
 			if tc.twice {
 				if err := reg.Register(tc.key); err != nil {
@@ -348,6 +362,7 @@ func TestRegistry_RefusesAKeyRegisteredTwice(t *testing.T) {
 }
 
 func TestLoad_FailsWhenTheFileExistsButCannotBeRead(t *testing.T) {
+	t.Parallel()
 	cases := map[string]func(t *testing.T, path string){
 		"a directory": func(t *testing.T, path string) {
 			if err := os.Mkdir(path, 0o700); err != nil {
@@ -366,6 +381,7 @@ func TestLoad_FailsWhenTheFileExistsButCannotBeRead(t *testing.T) {
 	}
 	for name, setup := range cases {
 		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 			dir := t.TempDir()
 			path := filepath.Join(dir, "config.toml")
 			setup(t, path)
@@ -378,6 +394,7 @@ func TestLoad_FailsWhenTheFileExistsButCannotBeRead(t *testing.T) {
 }
 
 func TestLoad_ResolvesTheDatabaseAndWorkspacePaths(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name          string
 		xdg           *string // nil: unset; "xdg": the test's directory
@@ -394,6 +411,7 @@ func TestLoad_ResolvesTheDatabaseAndWorkspacePaths(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			var file strings.Builder
 			if tc.db != "" {
 				file.WriteString("[database]\npath = '" + tc.db + "'\n")

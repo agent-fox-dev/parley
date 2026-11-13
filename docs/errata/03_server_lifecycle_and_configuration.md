@@ -44,6 +44,18 @@ through the scrubber, and the scrubber cuts its result to 1024 bytes. So
 every string value of a log line is at most 1024 bytes, the `stack` of the
 `panic` line of package 02 included.
 
+## The logger also scrubs values that are not strings
+
+The package names the message and the string attributes. `hub.NewLogger`
+also scrubs every other attribute value: an error as its text, and any
+other value (a named string type, a `[]string`, an `http.Header`, a
+`[]byte` as text, a struct) as its `fmt` text, which is written in the
+value's place when scrubbing changes it; a value that holds no secret and
+whose text is at most 1024 bytes keeps its JSON form, and a longer one is
+written as its text cut to 1024 bytes. The values of an `http.Header`'s
+`Authorization` and `Proxy-Authorization` headers are written as
+`[redacted]` whatever their shape.
+
 ## parleyd backup refuses a few more targets and sources
 
 The package says `parleyd backup <directory>` refuses a non-empty directory
@@ -53,6 +65,13 @@ naming the database path when the database file does not exist.
 
 - refuses a target inside the workspace root, before writing anything: the
   copy of the workspace root would copy the snapshot into itself;
+- refuses a target inside the data directory (the directory of
+  `[database].path`), before writing anything, with the same one error
+  line naming the target: the package says a backup writes nothing under
+  the data directory, and the snapshot is written there only if the
+  target lies inside it. A relative target is resolved against the
+  working directory, which `hub.Run` makes absolute first, so that both
+  refusals hold for a relative working directory too;
 - creates a missing target with `os.Mkdir`, not its missing parents, and
   fails naming the target when the parent does not exist: what a failed
   backup wrote is removed, and parents it had created would be left behind;
@@ -84,8 +103,10 @@ write-ahead log.
 - The check of the readiness probe obtains the stores from a start hook,
   which receives the hub's runtime, and closes one of them through
   `(*store.Store).Analytics()` or `(*store.Store).Main()`.
-- The table of the check of the refused backup targets has a fourth row, a
-  missing directory inside the workspace root, for the refusal above. The
+- The table of the check of the refused backup targets has three more
+  rows for the refusals above: a missing directory inside the workspace
+  root, the same from a relative working directory with a relative
+  target, and a missing directory inside the data directory. The
   empty-workspace-root case of the check of the repository copy runs in the
   same test, on the same data, before the repositories are created.
 - The end-to-end flows of the first boot and of the backup, in
