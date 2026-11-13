@@ -29,6 +29,24 @@ import (
 	"github.com/spf13/pflag"
 )
 
+// TestMain runs the package's tests with an empty configuration directory of
+// their own and without the user's PARLEY_ENDPOINT_URL and PARLEY_API_KEY, so
+// a test that sets no environment variable reads none of the user's settings
+// and can run in parallel, taking its settings from flags (onHub).
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "parley-cli-test-")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	os.Setenv(configDirEnv, dir)
+	os.Unsetenv(endpointURLEnv)
+	os.Unsetenv(apiKeyEnv)
+	code := m.Run()
+	os.RemoveAll(dir)
+	os.Exit(code)
+}
+
 // setBuildValues sets the build values of internal/buildinfo for the test and
 // restores them after it. A test that calls it must not run in parallel.
 func setBuildValues(t *testing.T, version, commit string) {
@@ -246,6 +264,13 @@ func probeEnv(t *testing.T, hubURL string) {
 	t.Setenv("PARLEY_CONFIG_DIR", t.TempDir())
 	t.Setenv("PARLEY_ENDPOINT_URL", hubURL)
 	t.Setenv("PARLEY_API_KEY", "k")
+}
+
+// onHub is args followed by the flags that point the command at hubURL with
+// the credential k. A test that gives its settings this way, not through
+// probeEnv, can run in parallel.
+func onHub(hubURL string, args ...string) []string {
+	return append(args, "--endpoint-url", hubURL, "--api-key", "k")
 }
 
 // indented is the JSON document body as parley prints it: compacted, then

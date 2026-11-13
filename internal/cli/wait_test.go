@@ -155,6 +155,7 @@ func TestWait_RefusesADurationItCannotReadBeforeAnyRequest(t *testing.T) {
 }
 
 func TestWait_PrintsTheFinalRecordOnceTheOperationSucceeds(t *testing.T) {
+	t.Parallel()
 	const interval = 20 * time.Millisecond
 	tests := []struct {
 		name   string
@@ -168,10 +169,10 @@ func TestWait_PrintsTheFinalRecordOnceTheOperationSucceeds(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			hub := jobHub(t, tt.start, jobStates(tt.states...)...)
-			probeEnv(t, hub.URL)
 
-			code, stdout, stderr := runCLIWith(t, waitOptions(interval), "probe", "run", "--wait", "--timeout", "5s")
+			code, stdout, stderr := runCLIWith(t, waitOptions(interval), onHub(hub.URL, "probe", "run", "--wait", "--timeout", "5s")...)
 
 			if code != 0 {
 				t.Fatalf("exit status = %d, want 0; stderr %q", code, stderr)
@@ -203,6 +204,7 @@ func TestWait_PrintsTheFinalRecordOnceTheOperationSucceeds(t *testing.T) {
 }
 
 func TestWait_PrintsTheFinalRecordAndFailsWhenTheOperationEndsUnsuccessfully(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		start  string
 		states []string
@@ -213,10 +215,10 @@ func TestWait_PrintsTheFinalRecordAndFailsWhenTheOperationEndsUnsuccessfully(t *
 	}
 	for _, tt := range tests {
 		t.Run(strings.Join(append([]string{tt.start}, tt.states...), " "), func(t *testing.T) {
+			t.Parallel()
 			hub := jobHub(t, tt.start, jobStates(tt.states...)...)
-			probeEnv(t, hub.URL)
 
-			code, stdout, stderr := runCLIWith(t, waitOptions(20*time.Millisecond), "probe", "run", "--wait")
+			code, stdout, stderr := runCLIWith(t, waitOptions(20*time.Millisecond), onHub(hub.URL, "probe", "run", "--wait")...)
 
 			if code != 1 {
 				t.Errorf("exit status = %d, want 1", code)
@@ -241,7 +243,7 @@ func TestWait_PrintsTheFinalRecordAndFailsWhenTheOperationEndsUnsuccessfully(t *
 }
 
 func TestWait_TimesOutWithoutPrintingOrChangingTheOperation(t *testing.T) {
-	loginEnv(t)
+	t.Parallel()
 	tests := []struct {
 		name  string
 		polls []http.HandlerFunc
@@ -253,13 +255,13 @@ func TestWait_TimesOutWithoutPrintingOrChangingTheOperation(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Each case takes the one second of its timeout, so the cases
-			// run side by side; the settings are flags, not variables.
+			// run side by side.
 			t.Parallel()
 			hub := jobHub(t, "queued", tt.polls...)
 
 			start := time.Now()
 			code, stdout, stderr := runCLIWith(t, waitOptions(50*time.Millisecond),
-				"probe", "run", "--wait", "--timeout", "1s", "--endpoint-url", hub.URL, "--api-key", "k")
+				onHub(hub.URL, "probe", "run", "--wait", "--timeout", "1s")...)
 			took := time.Since(start)
 
 			if code != 1 {
@@ -293,6 +295,7 @@ func TestWait_TimesOutWithoutPrintingOrChangingTheOperation(t *testing.T) {
 }
 
 func TestWait_EndsWithTheHubsErrorWhenAPollIsAnsweredWithOne(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		status   int
@@ -304,10 +307,10 @@ func TestWait_EndsWithTheHubsErrorWhenAPollIsAnsweredWithOne(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			hub := jobHub(t, "queued", append(jobStates("running"), answerWith(tt.status, tt.envelope))...)
-			probeEnv(t, hub.URL)
 
-			code, stdout, stderr := runCLIWith(t, waitOptions(20*time.Millisecond), "probe", "run", "--wait")
+			code, stdout, stderr := runCLIWith(t, waitOptions(20*time.Millisecond), onHub(hub.URL, "probe", "run", "--wait")...)
 
 			if code != 1 {
 				t.Errorf("exit status = %d, want 1", code)
@@ -327,6 +330,7 @@ func TestWait_EndsWithTheHubsErrorWhenAPollIsAnsweredWithOne(t *testing.T) {
 }
 
 func TestWait_EndsWithAClientErrorWhenAPollFailsOnTheClientSide(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		// second answers the second poll; nil closes the hub's listener
@@ -343,6 +347,7 @@ func TestWait_EndsWithAClientErrorWhenAPollFailsOnTheClientSide(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			var hub *stubHub
 			polls := jobStates("running")
 			if tt.second == nil {
@@ -355,13 +360,12 @@ func TestWait_EndsWithAClientErrorWhenAPollFailsOnTheClientSide(t *testing.T) {
 				polls = append(polls, tt.second)
 			}
 			hub = jobHub(t, "queued", polls...)
-			probeEnv(t, hub.URL)
 			opts := waitOptions(20 * time.Millisecond)
 			if tt.requestTimeout > 0 {
 				opts.requestTimeout = tt.requestTimeout
 			}
 
-			code, stdout, stderr := runCLIWith(t, opts, "probe", "run", "--wait", "--timeout", "5s")
+			code, stdout, stderr := runCLIWith(t, opts, onHub(hub.URL, "probe", "run", "--wait", "--timeout", "5s")...)
 
 			message := wantClientFailure(t, code, stdout, lastDocument(stderr), "client_error")
 			if !strings.Contains(message, tt.inMessage) {
@@ -409,6 +413,7 @@ func probeSync() *cobra.Command {
 }
 
 func TestWait_PrintsTheDocumentACommandBuildsFromTheFinalRecord(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		final     string
 		code      int
@@ -419,10 +424,10 @@ func TestWait_PrintsTheDocumentACommandBuildsFromTheFinalRecord(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.final, func(t *testing.T) {
+			t.Parallel()
 			hub := jobHub(t, "queued", jobStates("running", tt.final)...)
-			probeEnv(t, hub.URL)
 
-			code, stdout, stderr := runCLIWith(t, waitOptions(20*time.Millisecond, probeSync), "probe", "sync", "--wait")
+			code, stdout, stderr := runCLIWith(t, waitOptions(20*time.Millisecond, probeSync), onHub(hub.URL, "probe", "sync", "--wait")...)
 
 			if code != tt.code {
 				t.Errorf("exit status = %d, want %d; stderr %q", code, tt.code, stderr)
