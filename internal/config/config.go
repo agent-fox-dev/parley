@@ -355,7 +355,7 @@ func checkOAuth(raw any) ([]Provider, error) {
 			fields[name] = s
 		}
 		name := fields["name"]
-		endpoints, ok := defaultEndpoints[name]
+		_, ok := defaultEndpoints[name]
 		switch {
 		case !ok:
 			return nil, fmt.Errorf("%s.name: must be github or google", prefix)
@@ -366,12 +366,11 @@ func checkOAuth(raw any) ([]Provider, error) {
 		case fields["client_secret"] == "":
 			return nil, fmt.Errorf("%s.client_secret: must not be empty", prefix)
 		}
-		for j, key := range providerKeys[3:] {
-			s, given := fields[key]
-			if !given {
-				fields[key] = endpoints[j]
-			} else if err := httpURL(s); err != nil {
-				return nil, fmt.Errorf("%s.%s: %w", prefix, key, err)
+		for _, key := range providerKeys[3:] {
+			if s, given := fields[key]; given {
+				if err := httpURL(s); err != nil {
+					return nil, fmt.Errorf("%s.%s: %w", prefix, key, err)
+				}
 			}
 		}
 		providers = append(providers, Provider{
@@ -381,9 +380,26 @@ func checkOAuth(raw any) ([]Provider, error) {
 			AuthorizeURL: fields["authorize_url"],
 			TokenURL:     fields["token_url"],
 			UserinfoURL:  fields["userinfo_url"],
-		})
+		}.WithPublicEndpoints())
 	}
 	return providers, nil
+}
+
+// WithPublicEndpoints returns p with each endpoint it leaves empty set to
+// the public endpoint of its provider, as Load returns a provider whose
+// table does not give that endpoint. A provider the hub cannot log in with
+// is returned unchanged.
+func (p Provider) WithPublicEndpoints() Provider {
+	endpoints, ok := defaultEndpoints[p.Name]
+	if !ok {
+		return p
+	}
+	for i, field := range []*string{&p.AuthorizeURL, &p.TokenURL, &p.UserinfoURL} {
+		if *field == "" {
+			*field = endpoints[i]
+		}
+	}
+	return p
 }
 
 // tables returns v as a list of tables: [[name]] tables decode as one Go

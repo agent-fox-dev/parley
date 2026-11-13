@@ -16,7 +16,7 @@ command-line client. Both are written in Go, in the module
 | `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, and a registry of keys and whole sections that decides what the file may hold |
 | `internal/hub` | the composition of the `parleyd` process: argument parsing, the scrubbing logger, the fixed start order, the bootstrap of the admin token, the HTTP server's options, the idempotency records in the transactional store, signals and the stop, and the `backup` command; the one place later packages plug their parts in ([ADR 01](adr/01-compose-the-hub-in-one-package.md)) |
 | `internal/maintenance` | the maintenance loop: a registry of named tasks, and `Loop`, which runs one pass at once and one at each tick of an hourly timer, the tasks of a pass one after the other in a fixed order, and logs a failing task without stopping the others |
-| `internal/identity` | who may use the hub: the admin settings in the transactional store (the bootstrap e-mail and the admin token's hash), the generation and hashing of admin tokens, and `VerifyAdminToken`, which compares a presented token's hash with the stored one in constant time |
+| `internal/identity` | who may use the hub: the admin settings in the transactional store (the bootstrap e-mail and the admin token's hash), the generation and hashing of admin tokens, and `VerifyAdminToken`, which compares a presented token's hash with the stored one in constant time; the identity records (users, orgs, memberships, API keys, PATs), the generation of API keys and PATs, and `Service`, the pipeline's authenticator |
 | `internal/scrub` | the one scrubbing function for text that leaves the hub: `Scrubber.Scrub` replaces registered secret values and the hub's own credential formats by `[redacted]`, removes user information from URLs and cuts the text to 1024 bytes; a leaf package that imports nothing of the project |
 | `internal/store` | the hub's two embedded SQLite stores (`modernc.org/sqlite`, no cgo): `Open` creates the data directory and the workspace root, opens the transactional store and the analytical store (`analytics.db` beside it) and applies the registered schema steps; `Tx` runs a transaction of the transactional store; `Snapshot` writes a consistent copy of one store file without changing it |
 | `internal/server` | the hub's HTTP server: its built-in routes, the REST API's route registration and check pipeline, the error envelope, request ids, response headers and the access log, list paging, idempotency keys, and the readiness probes |
@@ -146,8 +146,9 @@ A public route skips authentication and step 4. The access position holds a
 list: every check added with `AddAccessCheck` runs, in the order it was
 added, and decides from the matched route whether it applies. The
 authenticator reports a `server.Caller` (`CredentialID`, and `UserID` or
-`Admin` for the admin token), which the pipeline puts in the request's
-context; later checks and the handler read it with
+`Admin` for the admin token, and `Detail`, what the authenticator knows
+beyond the ids, which the server does not read), which the pipeline puts in
+the request's context; later checks and the handler read it with
 `server.CallerOf(r.Context())`. An `*server.Error` (also when wrapped) is
 written as its envelope; any other error as `500 internal` with the message
 `internal error`, and its text is logged through `Options.Logger` as an
@@ -615,6 +616,155 @@ while a bootstrapped hub's file exists, or goes on to the start hooks. After
 writing the file it logs the path at warn level and `Run` returns `0`
 without running a start hook or binding the listener.
 
+### Identity
+
+`internal/hub/identity.go` adds the part `composeIdentity`, after
+`composeBootstrap` in `parts`. It adds the schema step
+`identity.SchemaStep` (`identity_records`), installs the `Authenticate`
+method of an `identity.Service` as the pipeline's authenticator, registers
+every route of `(*identity.Service).Routes()` with `AddRoute`, and adds the
+start hook `identity`, which binds the service with
+`(*identity.Service).Bind(identity.Deps{Store, Now, Providers,
+ExternalURL, Client})` from the `Runtime` before the hub serves its first
+request. `Deps.Client` is the `identity.ProviderClient` a login reads the
+user's identity through; the hub binds
+`identity.NewOAuthClient(rt.Config.OAuth.Providers, http.DefaultClient,
+identity.DefaultProviderTimeout)`, and a service without one answers every
+login `502 upstream_error`.
+
+The service's routes are, so far, the public `GET /auth/providers` (see
+[api.md](api.md#get-apiv1authproviders)) and the public `POST
+/auth/callback` (see [api.md](api.md#post-apiv1authcallback)), which is not
+a create route. The providers in
+`identity.Deps.Providers` come with their endpoints resolved:
+`internal/config` fills an endpoint the file does not give with the
+provider's public one, through `config.Provider.WithPublicEndpoints`, and
+holds the only table of those endpoints. `internal/identity/provider.go`
+holds what the configuration does not: the providers the hub can log in
+with, the scopes it asks each for and Google's extra `response_type=code`.
+
+`internal/identity/oauth.go` reads a user's identity from a provider, with
+the standard library only. `identity.NewOAuthClient(providers, hc,
+timeout)` returns an `*identity.OAuthClient`, the `identity.ProviderClient`
+whose `Identity(ctx, provider, code, redirectURI)` returns an
+`identity.Identity` (`Provider`, `ProviderID`, `Username`, `FullName`,
+`Email`). It exchanges the code with one form-encoded `POST` to the token
+URL (`client_id`, `client_secret`, `code`, `redirect_uri`,
+`grant_type=authorization_code`, `Accept: application/json`), then reads
+the user URL with `Authorization: Bearer <access token>`. For GitHub the id
+is the decimal `id`, the username `login` and the full name `name`; when
+the profile's `email` is null or empty it reads the user URL with `/emails`
+appended and takes the entry whose `primary` and `verified` are both true.
+For Google the id is `sub`, `name` is both the username and the full name,
+and `email` counts only when `email_verified` is true. The username is
+trimmed, and an empty one becomes `<provider>-<provider id>`; the full name
+is the provider's as given.
+Every error is `identity.ErrRejected` (the token endpoint answered a JSON
+object with an `error` member and a status below 500) or
+`identity.ErrUpstream` (everything else: no connection, a timeout, a status
+of 500 or above, a body that is not the expected JSON, no access token, a
+user or e-mail list answer other than `200`, no user id, no verified
+address), and its text is fixed words only, never the code, the client
+secret, the access token or the provider's body. Each call to the provider
+is bounded by the timeout (0 is `identity.DefaultProviderTimeout`, 15
+seconds); when it passes, the request's context ends and the transport
+closes the connection. `hc` nil is `http.DefaultClient`.
+
+The schema step creates, in the transactional store:
+
+| Table | Columns |
+|---|---|
+| `users` | `id` (primary key), `username` (unique), `email` (unique), `full_name`, `role` (`user` or `admin`), `status` (`active` or `blocked`), `provider` and `provider_id` (unique as a pair), `created_at`, `updated_at` |
+| `orgs` | `id` (primary key), `name` (unique), `slug` (unique), `url`, `owner_id` (set to NULL when that user is deleted), `status`, `created_at`, `updated_at` |
+| `memberships` | `org_id` and `user_id` (primary key as a pair; deleted with the org or the user), `created_at` |
+| `api_keys` | `key_id` (primary key), `user_id` (deleted with the user), `secret_hash`, `expires_days`, `expires_at`, `revoked_at`, `created_at` |
+| `pats` | `token_id` (primary key), `user_id` (deleted with the user), `secret_hash`, `name`, `permissions` (a JSON array), `paths` (a JSON array, NULL without path limits), `workspace` (NULL when not bound), `expires_at`, `revoked_at`, `created_at` |
+
+Timestamps are nanoseconds since the Unix epoch, UTC; `expires_at` and
+`revoked_at` are NULL when unset. `secret_hash` is the lowercase hex SHA-256
+of the secret part of the credential; the secret is never stored.
+
+`identity.IssueAPIKey(ctx, tx, userID, expiresDays, now)` and
+`identity.StorePAT(ctx, tx, identity.PATSpec{UserID, Name, Permissions,
+Paths, Workspace, ExpiresAt, CreatedAt})` generate a credential from
+`crypto/rand` (an API key `parley_<8>_<32>` over `[0-9A-Za-z]`, a PAT
+`parley_pat_<8>_<32>` over `[a-z0-9]`, each character drawn uniformly),
+draw the id again while it is taken, store the record in the transaction
+they are given and return the credential, which is shown once, with its
+record (`identity.APIKey`, `identity.PAT`). An API key expires `expiresDays`
+× 24 hours after `now`, never with 0. `StorePAT` validates nothing beyond
+the record's shape. `identity.UserByID`, `identity.APIKeyByID` and
+`identity.PATByID` read a record through an `identity.Querier` (the store's
+`*sql.DB` or a `*sql.Tx`) and return `identity.ErrNotFound` when there is
+none. `identity.User` marshals to the REST API's User object.
+
+`(*identity.Service).Authenticate` reads the `Authorization` header (see
+[api.md](api.md#authentication)), and `(*identity.Service).VerifyCredential(ctx,
+credential)` checks the credential, the same check for a credential read
+elsewhere: it recognises the format, verifies an admin token with
+`identity.VerifyAdminToken`, or looks the key or PAT up by its id and
+compares the SHA-256 of the presented secret with the stored hash with
+`crypto/subtle.ConstantTimeCompare`, against a fixed dummy hash when the id
+is unknown, so that an unknown id and a wrong secret take the same path.
+Only after the secret matched does it look at the credential's state, in
+this order: `revoked_at` set is `401 credential revoked`, the clock of
+`identity.Deps.Now` at or after `expires_at` is `401 credential expired`,
+and a user whose status is `blocked` is `403 user is blocked`. It reads the
+record and the user from the store on every call and caches nothing.
+It returns an `identity.Principal` (`Type` `admin`, `api_key` or `pat`,
+`CredentialID`, the `User`, and a PAT's `Permissions`, `Paths` and
+`Workspace`) or the `*server.Error` that answers the request. The
+authenticator reports a `server.Caller` whose `CredentialID` is `admin`, the
+`key_id` or the `token_id`, whose `UserID` is the user's id, whose `Admin`
+marks the admin token, and whose `Detail` holds the `Principal`; checks and
+handlers read it with `identity.PrincipalOf(r.Context())`. A route declares
+that it needs a user with the mark `identity.MarkNeedsUser` in its
+`server.Route.Marks`; the authenticator reads it right after accepting the
+credential and answers the admin token `403 forbidden` there.
+
+The login, in `internal/identity/login.go`, decodes the callback's body
+and checks it before the provider is called: `provider`, `code` and
+`redirect_uri` are non-empty strings, `provider` is one of
+`Deps.Providers`, `expires` is absent, `null` or one of 0, 30, 60 and 90,
+and `redirect_uri` passes `allowedRedirect` in
+`internal/identity/redirect.go` (http on `localhost` or `127.0.0.1`, or the
+scheme, host and port of `Deps.ExternalURL`; never with user information);
+each violation is `400 invalid_request`. It then reads the identity through
+`Deps.Client`, answering `identity.ErrRejected` `401 unauthenticated` and
+`identity.ErrUpstream` `502 upstream_error`, each with the error's fixed
+text, and signs the user in, in one
+`(*store.Store).Tx`: it looks the user up with `identity.UserByProvider`,
+and at a first login picks the username (the provider's, else the first
+free of `<name>-2` to `<name>-10`) and the role (`admin` when the e-mail is
+the `admin_email` of `admin_settings`, read in the same transaction,
+ignoring letter case, and no user has the role `admin`), then calls
+`identity.CreateUserAndPersonalOrg`. A user it finds is refreshed instead:
+a blocked user is answered `server.Forbidden("user is blocked")`, an e-mail
+another user has is an `ErrConflict`, a username another user has keeps
+the old one, and the new e-mail, username and `updated_at` are written;
+role, full name, creation time and the personal org are left alone. Then,
+for a new and an existing user alike, it sets `revoked_at` on every API key
+of the user with `revoked_at` NULL and `expires_at` NULL or after the
+login time, and last it issues the API key with `identity.IssueAPIKey`,
+`expires` days (90 when absent) from the clock of `Deps.Now`. Any error
+rolls the whole transaction back.
+
+`identity.CreateUserAndPersonalOrg(ctx, tx, identity.NewUser{Username,
+Email, FullName, Provider, ProviderID, CreatedAt}, role)` is the one way a
+user is created: it writes the active user, the user's personal org (an
+`identity.Org`, active, named after the username, owned by the user) and
+the membership in the transaction it is given, and returns the user and
+the org. The org's slug comes from the pure function `slug(username,
+userID)` in `internal/identity/slug.go`, or the first of `<slug>-1` to
+`<slug>-10` no org has. User and org ids are UUID version 4 strings from
+the standard library's `uuid`. It checks before it writes, and returns an
+error that is `identity.ErrConflict` (`errors.Is`), writing nothing, when the
+username, the e-mail or the provider identity is another user's, an org has
+the username as its name, or no slug is free; a unique-constraint violation
+of SQLite on the insert is reported the same way. The callback answers that
+error `409 conflict` with its text. Its caller chooses the username and the
+role.
+
 ### The logger
 
 `hub.NewLogger(w, level, scrubber)` returns a `*slog.Logger` with
@@ -660,11 +810,44 @@ response.
 ## parley
 
 `cmd/parley` calls `cli.Run(ctx, os.Args[1:], os.Stdout, os.Stderr)` and passes
-its result to `os.Exit`. `Run` builds a fresh cobra command tree on each call:
-the root command `parley` with the persistent flag `--endpoint-url`, and the
-`version` subcommand. It executes the tree with the arguments, and returns `0`,
-or `2` after one `error: <message>` line on stderr when cobra cannot parse the
-arguments. Cobra's own error and usage output is silenced.
+its result to `os.Exit`. `Run` is `cli.RunWith` with zero `cli.Hooks`;
+`RunWith` lets a caller that runs the client in-process, such as an
+end-to-end test, replace what it takes from the process (`Hooks.Stdin`, where
+`parley login --api-key -` reads the credential; `Hooks.OpenBrowser`, which
+opens the sign-in page, by default the system's opener in
+`internal/cli/browser.go`; and `Hooks.LoginWait`, how long the browser login
+waits for the redirect, by default 120 s). It builds a fresh cobra
+command tree on each call: the root command `parley` with the persistent flag
+`--endpoint-url`, and the `version` and `login` subcommands. It executes the
+tree with the arguments, and returns `0`, or `2` after one `error: <message>`
+line on stderr when cobra cannot parse the arguments. Cobra's own error and
+usage output is silenced. `parley login` fails with its own error type
+(`internal/cli/login.go`), an exit status and the error envelope to write;
+`run` writes that envelope to stderr as it is and returns its status.
+
+`parley login --api-key` (`internal/cli/login.go`) reads the client
+configuration file (`internal/cli/config.go`: `$PARLEY_CONFIG_DIR/config.toml`
+or `~/.parley/config.toml`, decoded with `github.com/BurntSushi/toml` into a
+map, so that keys it does not know survive), resolves the hub URL from the
+flag, `PARLEY_ENDPOINT_URL` and the file, and asks the hub who the credential
+belongs to with `GET /api/v1/user` (30 s timeout). On `200` it sets
+`endpoint_url`, `api_key` and `user_id` in the map and saves it: a temporary
+file with mode `0600` in the same directory, renamed over `config.toml`.
+
+Without `--api-key`, `parley login` signs in through the browser
+(`browserLogin` in `internal/cli/login.go`): it validates `--expires`,
+reads the config file and resolves the hub URL as above, takes the
+provider's `authorize_url` from `GET /api/v1/auth/providers`, listens on
+`127.0.0.1:0`, and opens the `authorize_url` with `redirect_uri` (that
+listener's `/callback`) and a 32-hex-character `state` from `crypto/rand`
+added. A `net/http` server on the listener serves `GET /callback` once: it
+checks the state in constant time, answers the browser with an HTML page,
+and hands the code back; the server is shut down and the listener closed on
+every way out, including the wait's expiry. The code goes to
+`POST /api/v1/auth/callback` without a credential, and the answer's key and
+user are saved as in the key flow. Both flows send their requests through
+one helper (`hubCall`, 30 s timeout) that returns a hub's error envelope as
+it was received.
 
 `parley version` reads its build from `internal/buildinfo` and asks the hub
 for its build with a plain `net/http` client over HTTP (`GET /version`, 5 s

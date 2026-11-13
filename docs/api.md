@@ -1,9 +1,9 @@
 # API reference
 
 The hub, `parleyd`, answers the routes below over HTTP. The REST API is
-mounted at `/api/v1`; no feature has registered a route there yet, so this
-page describes the rules every REST route follows and the three built-in
-routes. It grows as features land.
+mounted at `/api/v1`. This page describes the rules every REST route
+follows, the three built-in routes and the REST routes registered so far. It
+grows as features land.
 
 ## Conventions so far
 
@@ -44,9 +44,9 @@ A request to a REST route passes these checks in this order. The first one
 that fails answers the request, and no later check or the handler runs.
 
 1. Route matching: `404 not_found` or `405 method_not_allowed`, as above.
-2. Authentication. A route that is not public needs a credential. While the
-   hub has no authenticator, which is the case in this version, every route
-   that is not public is answered `401` with `error_type` `unauthenticated`.
+2. Authentication. A route that is not public needs a credential, as in
+   [Authentication](#authentication): `401 unauthenticated`, or `403
+   forbidden` for the admin token on a route that needs a user.
 3. The rate limit: `429 rate_limited`, as in [Rate limit](#rate-limit).
 4. The body size, then the content type: `413` or `415`, as in
    [Request bodies](#request-bodies).
@@ -69,6 +69,55 @@ writes them to its log with the request id that the response carries in
 `X-Request-ID`, and goes on serving other requests. When a handler has
 already started its answer before it fails, the answer is left as it is: the
 error is written to the log with the request id, not appended to the body.
+
+## Authentication
+
+Every route under `/api/v1` that is not public needs a credential, sent as
+
+```
+Authorization: Bearer <credential>
+```
+
+The scheme `Bearer` is matched in any letter case and followed by one or
+more spaces; white space around the credential is ignored. A credential in a
+query parameter, a cookie or any other header is not read.
+
+The hub knows three credentials, each recognised by its exact format:
+
+| Credential | Format | Credential id |
+|---|---|---|
+| admin token | `parley_admin_` and 64 characters of `[0-9a-f]` | `admin` |
+| API key | `parley_<key_id>_<secret>`: 8 and 32 characters of `[0-9A-Za-z]` | the `key_id` |
+| personal access token (PAT) | `parley_pat_<token_id>_<secret>`: 8 and 32 characters of `[a-z0-9]` | the `token_id` |
+
+The admin token has no user; an API key and a PAT act for the user they
+belong to, and a PAT also carries its permissions, its path limits and the
+workspace it is bound to. The hub stores the SHA-256 of each secret, never
+the secret, and compares hashes in constant time.
+
+A request that does not pass is answered before any later check runs, with
+the first of these that applies, in the order of the table. The state of an
+API key or PAT (revoked, expired, its user blocked) is looked at only after
+its secret matched, so a wrong secret is answered `invalid credentials`
+whatever that state, with the same body as an unknown id. The credential and
+its user are read on every request: a revocation, a block or an unblock
+holds from the next request on, and blocking a user changes none of the
+user's credentials.
+
+| Status | `error_type` | `message` | When |
+|---|---|---|---|
+| `401` | `unauthenticated` | `authentication required` | no `Authorization` header, another scheme (such as `Basic`), an empty credential, or a credential of none of the three formats |
+| `401` | `unauthenticated` | `invalid credentials` | an API key or PAT whose id is not stored or whose secret does not match, an admin-format token that is not the admin token, or any admin-format token on a hub that is not bootstrapped; the answer is the same whichever part was wrong |
+| `401` | `unauthenticated` | `credential revoked` | an API key or PAT whose secret matches and that is revoked |
+| `401` | `unauthenticated` | `credential expired` | an API key or PAT whose secret matches, that is not revoked, and whose `expires_at` is at or before the current time; one without `expires_at` never expires |
+| `403` | `forbidden` | `user is blocked` | a live API key or PAT whose user's status is `blocked` |
+| `403` | `forbidden` | `this route needs a user` | the admin token on a route that needs a user; an API key or a PAT passes there |
+
+```json
+{"error":{"code":401,"message":"invalid credentials","error_type":"unauthenticated"}}
+```
+
+The rate limit counts an authenticated request against its credential id.
 
 ## Request ids and response headers
 
@@ -392,3 +441,127 @@ Example:
 ```
 
 How the build values are set is in [architecture.md](architecture.md#build-information).
+
+## `GET /api/v1/auth/providers`
+
+The identity providers the hub is configured with, for a client that starts
+a login. The route is public: it needs no credential and does not read the
+`Authorization` header.
+
+| Status | Body |
+|---|---|
+| `200 OK` | a [list](#lists) of the configured providers, ordered by name |
+
+The answer carries `Cache-Control: public, max-age=300`. An item has exactly
+these members:
+
+| Member | Value |
+|---|---|
+| `name` | `github` or `google` |
+| `authorize_url` | where the client sends the browser: the provider's authorize endpoint with the hub's `client_id` and the scopes the hub needs |
+
+The authorize endpoint is the provider's `authorize_url` from the
+configuration, or its public one (see
+[configuration.md](configuration.md#oauth-providers)). Its query parameters
+are `client_id` and `scope` (`user:email` for `github`, `openid email
+profile` for `google`), and `response_type=code` for `google`. A client
+secret is never part of the answer, in the body or a header. With no
+provider configured, `items` is `[]`. The hub writes `&` in a JSON string
+as `\u0026`, which decodes to `&`:
+
+```json
+{"items":[{"name":"github","authorize_url":"https://github.com/login/oauth/authorize?client_id=gh-id\u0026scope=user%3Aemail"},{"name":"google","authorize_url":"https://accounts.google.com/o/oauth2/v2/auth?client_id=gg-id\u0026response_type=code\u0026scope=openid+email+profile"}],"next_cursor":null}
+```
+
+## `POST /api/v1/auth/callback`
+
+Signs a user in with an OAuth code from an identity provider and answers
+the user with a new API key. The route is public: it needs no credential
+and does not read the `Authorization` header. It is not a create route, so
+an `Idempotency-Key` header is ignored.
+
+The body is a JSON object:
+
+| Member | Value |
+|---|---|
+| `provider` | required: a string naming a configured provider, such as `github` |
+| `code` | required: the OAuth code the provider gave the client, a non-empty string |
+| `redirect_uri` | required: the redirect URI the code was issued for (see below) |
+| `expires` | the key's lifetime in days: the JSON integer `0`, `30`, `60` or `90`; `90` when absent or `null`, and a key of `0` days never expires |
+
+The hub checks the body before it calls the provider and answers `400`
+`invalid_request` when a required member is missing or empty, `provider`
+is not a configured provider, `expires` is another number, a fraction or a
+string (`45`, `-1`, `1.5`, `"90"`), or `redirect_uri` is not allowed. A
+`redirect_uri` is allowed when it is an absolute URL without user
+information and either has the scheme `http` and the host `localhost` or
+`127.0.0.1`, with any port and path (the listener of `parley login`), or
+has the scheme, host and port of `[server].external_url`, when that is set,
+with the scheme's default port filled in (`https://hub.example.com/x` and
+`https://hub.example.com:443/x` are the same). `https://localhost/x`,
+`http://[::1]:5000/callback`, `http://localhost@evil.example/x` and a
+relative URI are refused. An allowed `redirect_uri` is passed to the
+provider unchanged.
+
+The hub then exchanges the code at the provider and reads the user's
+identity (provider, provider user id, username, full name, verified
+e-mail), each call to the provider bounded by 15 seconds, then, in one
+transaction, finds the user who signs in with that provider and provider
+user id, or creates one at the first login, revokes the user's live API
+keys and issues the user a new one. A login the hub refuses, before or
+after the provider is called, changes nothing: no user, org, membership or
+key is created and no key is revoked.
+
+At a first login the hub creates:
+
+- the user, with `status` `active`, the provider's username and e-mail, and
+  the provider's display name as `full_name` (empty when it has none). When
+  another user has the username, the first free of `<name>-2` to
+  `<name>-10` is used instead. The role is `admin` when the e-mail equals
+  the `admin_email` the hub was bootstrapped with, in any letter case, and
+  no user with the role `admin` exists, whatever its status; it is `user`
+  otherwise.
+- the user's personal org: `status` `active`, named after the username and
+  owned by the user, with a slug derived from the username: lowercased,
+  every character outside `[a-z0-9_-]` replaced with `-`, runs of `-`
+  collapsed, `-` and `_` trimmed from both ends; fewer than two characters
+  left give `u-` and the first 8 characters of the user id, and a slug that
+  starts with a digit gets the prefix `u-`. When an org has that slug, the
+  first free of `<slug>-1` to `<slug>-10` is used. `Alice.Smith` gives
+  `alice-smith`, `42bob` gives `u-42bob`.
+- the user's membership of that org, and the API key.
+
+At a later login of an `active` user the hub refreshes the user's `email`
+and `username` from the provider and sets `updated_at` to the login time.
+When another user has the new username, the old username is kept and the
+login goes on. The user's `id`, `role`, `full_name`, `created_at` and
+personal org (its name and slug included) stay as they are.
+
+At every login, a first one included, the hub sets `revoked_at` to the
+login time on every API key of the user that is neither revoked nor
+expired, then issues the new key, so the user holds exactly one live key.
+Those keys are answered `401` `credential revoked` from then on. A key
+revoked earlier keeps its `revoked_at`, an expired key is left as it is,
+and the user's PATs and the keys of other users are not touched.
+
+| Status | When |
+|---|---|
+| `200 OK` | the user signed in; the body is `{"user": …, "api_key": …}` |
+| `400` `invalid_request` | the body is not one the hub can use (see above); the provider is not called |
+| `401` `unauthenticated` | the provider rejected the code: its token URL answered a JSON object with an `error` member and a status below 500. The message is `the identity provider rejected the code`. |
+| `403` `forbidden` | the user is `blocked`; the message is `user is blocked`. Nothing changes: the user is not refreshed, no key is revoked and none is issued. |
+| `409` `conflict` | a new user cannot be created: the e-mail is another user's, an org already has the username as its name, the username and all of `<name>-2` to `<name>-10` are taken, or the slug and all of `<slug>-1` to `<slug>-10` are taken; or, at a later login, the e-mail the provider now gives is another user's. Nothing is created or changed. |
+| `502` `upstream_error` | the provider failed: it could not be reached, did not answer within 15 seconds, answered a status of 500 or above, something that is not a JSON object or no access token, or an identity without a user id or a verified e-mail. The message is `the identity provider failed`. |
+
+The messages are fixed texts: they never hold the code, a client secret, an
+access token or anything the provider answered.
+
+`user` is the User object (`id`, `username`, `email`, `full_name`, `role`,
+`status`, `provider`, `provider_id`, `created_at`, `updated_at`). `api_key`
+has exactly `key`, the key `parley_<key_id>_<secret>`, shown this once;
+`key_id`; and `expires_at`, the login time plus `expires` × 24 hours, or
+`null` for a key that never expires:
+
+```json
+{"user":{"id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","username":"alice","email":"a@x","full_name":"Alice A","role":"user","status":"active","provider":"github","provider_id":"123","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"},"api_key":{"key":"parley_Ab3dE5gH_0123456789abcdefghijABCDEFGHIJKL","key_id":"Ab3dE5gH","expires_at":"2026-04-01T00:00:00Z"}}
+```
