@@ -178,6 +178,15 @@ names `sandbox.gateway_url` and the ways found, such as
 mutual TLS, token_file`. A pair or a triple that is incomplete names the keys
 it misses instead.
 
+The hub connects to the gateway's host and port (443 when `gateway_url`
+gives none), over TLS for an `https` URL and without it for an `http` one.
+With mutual TLS it presents the client certificate; with `token_file` it
+sends the file's content as a bearer token, also over `http` to a loopback
+gateway; with OIDC it obtains a token from `oidc_issuer` with the client
+credentials grant on its first call to the gateway and renews it before it
+expires. The hub supports the OpenShell releases from `0.1.0`, included, to
+`0.2.0`, excluded.
+
 A profile is the template of a sandbox. Its table may hold these keys and
 no other:
 

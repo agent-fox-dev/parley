@@ -21,6 +21,8 @@ command-line client. Both are written in Go, in the module
 | `internal/identity` | who may use the hub: the admin settings in the transactional store (the bootstrap e-mail and the admin token's hash), the generation and hashing of admin tokens, and `VerifyAdminToken`, which compares a presented token's hash with the stored one in constant time; the identity records (users, orgs, memberships, API keys, PATs), the generation of API keys and PATs, and `Service`, the pipeline's authenticator |
 | `internal/sandbox` | the hub's side of the sandbox feature: `Register` makes it the owner of the whole `[sandbox]` section of the configuration, and `FromConfig` checks that section after the load, with the config dir and `[server].external_url` in view, and returns its `Settings` with every default filled in, or one error listing every failure; the `Settings` give the profiles and the configured credentials by name (`Profile`, `DefaultProfile`, `Credential`) and in name order (`Profiles`, `Credentials`), as copies, so that they do not change after the load |
 | `internal/sandbox/runtime` | the hub's one boundary to the sandbox runtime: the `Client` interface with every operation the sandbox packages call, the plain data it exchanges, the four error kinds (`ErrNotFound`, `ErrInvalid`, `ErrUnsupported`, `ErrUnavailable`), the reachability flag (`Reachability`) and the metrics recorder (`Recorder`, `NopRecorder`) it reports to; it imports nothing of the project |
+| `internal/sandbox/runtime/openshell` | the runtime client over the OpenShell Go SDK (`github.com/ai-openshell/sdk-go`, package `openshell/v1`), the only package that imports the SDK: `BuildConfig` turns the checked `[sandbox]` section into the SDK's configuration, `New` builds the client of a section and `NewWithClient` the client over a given SDK client, such as the SDK's in-memory one |
+| `internal/sandbox/runtime/openshell/openshelltest` | test support, imported by test code only: `Gateway`, which stands in for the OpenShell gateway: the SDK's in-memory client with provider profiles kept per workspace and a switch that makes it unreachable and reachable again |
 | `internal/sandbox/runtime/runtimetest` | test support, imported by test code only: `Fake`, the in-memory runtime and the only test double of the runtime, with its test controls, and `RunContract`, the contract tests every implementation of the runtime client passes |
 | `internal/scrub` | the one scrubbing function for text that leaves the hub: `Scrubber.Scrub` replaces registered secret values and the hub's own credential formats by `[redacted]`, removes user information from URLs and cuts the text to 1024 bytes; a leaf package that imports nothing of the project |
 | `internal/store` | the hub's two embedded SQLite stores (`modernc.org/sqlite`, no cgo): `Open` creates the data directory and the workspace root, opens the transactional store and the analytical store (`analytics.db` beside it) and applies the registered schema steps; `Tx` runs a transaction of the transactional store; `Snapshot` writes a consistent copy of one store file without changing it |
@@ -1450,6 +1452,82 @@ way to reject policy values and to add a proposal. The assertions about an
 operation that returns `ErrUnsupported` are skipped, so the contract holds
 for a runtime that lacks the operation. `(*Fake).Backend()` gives the fake
 in that form.
+
+### The OpenShell implementation
+
+`openshell.New(settings, openshell.Deps{Scrubber, Recorder, Dial})` builds
+the client the hub uses. It registers the gateway token and the OIDC client
+secret with the scrubber, builds the SDK configuration with
+`openshell.BuildConfig(settings)` and the SDK client with `Deps.Dial`
+(`v1.NewClient` when nil), which connects on the first call, and acts in
+`openshell_workspace`. `openshell.NewWithClient(sdkClient, workspace, deps)`
+builds the client over an SDK client the caller has, such as the SDK's
+in-memory `fake.NewClient()`; closing that SDK client makes every later
+operation fail as `ErrUnavailable`.
+
+`BuildConfig` takes the address from `gateway_url`: its host and port, 443
+by default, with the `http://` scheme kept for a loopback gateway, which is
+how the SDK is told to connect without TLS. Mutual TLS gives the SDK the
+certificate and key files and no token source; `token_file` gives a static
+bearer token; the OIDC keys give the SDK's client-credentials token source,
+which obtains a token on the first call and renews it before it expires;
+`tls_ca` is the only CA the gateway's certificate is checked against. Over
+`http` to a loopback gateway the token is sent without TLS, which the SDK
+otherwise refuses.
+
+Every operation passes the workspace to its SDK call. An operation that
+does not stream runs with a context that ends after 30 seconds or with the
+caller's, whichever is sooner, and the client stops waiting for the SDK when
+it ends; `ExecStream`, `ExecInteractive`, `Upload` and `Download` run with
+the caller's context. The SDK's errors map to the kinds as follows: its
+not-found is `ErrNotFound`; an invalid argument, a resource that exists
+already and a conflict are `ErrInvalid` with the gateway's message and the
+fields it names; a call that is not implemented, and a file transfer in an
+SDK built without its transport, are `ErrUnsupported`; everything else, a
+refused connection, an unauthenticated or refused credential, a server error
+and a call that did not end in time included, is `ErrUnavailable`. Every
+error's text is scrubbed.
+
+The SDK in `go.mod` (v0.1.8) has no call for `ValidatePolicy`, `GetPolicy`,
+`WatchSandboxes` (it watches one named sandbox), `RunMain`, `MakeDir`,
+`Stat`, `Walk` and `Logs` (its logs are the gateway's and the supervisor's
+log lines), nor for `Exec` and `ExecStream` with input on stdin; they answer
+`ErrUnsupported` without calling it. Where it has a call but cannot carry a
+part of the request, the part is not sent: `CreateSandbox` sends no working
+directory and no base document (the SDK takes typed policy rules: the
+protected and added rules go as named network rules, and a rule its network
+rule cannot hold is `ErrUnsupported`), and `StartSandbox` sends neither the
+policy nor the environment, so the sandbox keeps those the gateway holds.
+`InstallProviderProfile` installs a profile with one credential named after
+the profile; the SDK's profile endpoint is a host, a port and a protocol,
+which takes the endpoint's scheme, and has no path, so an endpoint's paths
+are not sent and the credential is authorized on every path of its host. `EnsureProvider` stores the value under the one credential
+of the provider's profile. `AttachProvider` first reads the provider in the
+workspace, so a provider of another workspace is not found.
+`ListProposals` reads the pending draft chunks of every sandbox of the
+workspace; `AddPolicyRule` uses the SDK's merge operation that adds a named
+network rule. `Upload` and `Download` go through a temporary file, because
+the SDK transfers from and to local paths. A sandbox's state follows its
+phase: `Ready` is `running`; `Stopping`, `Stopped`, `Suspending`,
+`Suspended`, `Completed`, `Error` and `Deleting` are `stopped`; a sandbox
+waiting to restart is `restarting`; the rest is `pending`. The SDK reports
+nothing of the working directory, which counts as present while the sandbox
+exists.
+
+The contract tests run against this implementation over the SDK's in-memory
+client, which keeps no provider profiles and answers its profile, exec, file
+and policy draft calls as not implemented, so the assertions about those
+operations are skipped there.
+
+`openshelltest.New(opts...)` (`internal/sandbox/runtime/openshell/openshelltest`,
+test support) returns a `Gateway`: a `v1.ClientInterface` that stands in for
+the gateway in the tests of this implementation, of the hub and end to end.
+It runs over `fake.NewClient(opts...)` (`Fake()` returns it), keeps provider
+profiles per workspace (`AddProfile` preloads one, `Profile` reads back what
+was installed) and can be made unreachable and reachable again
+(`SetUnreachable`), every call then failing as unavailable; `Close` closes
+the in-memory client for good. `runtimetest.Fake` stays the double of the
+runtime that the other sandbox packages test against.
 
 ## parley
 
