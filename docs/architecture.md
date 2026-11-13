@@ -13,7 +13,7 @@ command-line client. Both are written in Go, in the module
 | `cmd/parleyd` | the `parleyd` program: argument parsing, signals, the start log line and the exit status |
 | `internal/buildinfo` | the version, commit and build time the binary was built with, shared by both programs |
 | `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra` |
-| `internal/server` | the hub's HTTP server: its routes and its readiness probes |
+| `internal/server` | the hub's HTTP server: its built-in routes, the REST API's route registration and check pipeline, the error envelope, and the readiness probes |
 | `test/e2e` | tests that build the binaries and run them |
 
 ## The HTTP server
@@ -23,15 +23,85 @@ returns the `http.Handler` that serves its routes. `Options` holds the listen
 address (`Addr`), the shutdown grace (`ShutdownGrace`), the readiness
 probes (`ReadinessProbes`) and `OnListen`, a function `Serve` calls once with
 the address it bound (with port `0` in `Addr`, the port the system chose).
-Later packages mount their routes with `(*Server).Handle(pattern, handler)`,
-which takes the same patterns as `http.ServeMux`, before `Serve` is called.
+`Serve` serves `Handler()`, so the running hub and in-process tests answer
+the same way.
 
-Routes are registered on a standard library `http.ServeMux` with method and
-path patterns (`GET /healthz`, `GET /readyz`, `GET /version`). Unknown paths
-and wrong methods are left to the mux's own `404` and `405` answers. Every
-route writes its body through one JSON helper, which sets
+Every route is registered on one standard library `http.ServeMux` with
+method and path patterns: the built-in `GET /healthz`, `GET /readyz` and
+`GET /version`, the REST API routes, and surfaces outside the REST API that
+later packages mount with `(*Server).Handle(pattern, handler)`, which takes
+the mux's own patterns and bypasses the REST API's checks. Success bodies are
+written with `server.WriteJSON`, errors with `server.WriteError`, both with
 `Content-Type: application/json; charset=utf-8`. The routes are described in
 [api.md](api.md).
+
+### Dispatch
+
+`Handler()` returns a dispatcher in front of the mux. The mux alone would
+redirect a path that is not clean (`//x`, `/a/../x`) or that lacks the
+trailing slash of a subtree pattern, and would answer an unknown path or a
+wrong method in plain text. The dispatcher answers a path that is not clean
+with the `404 not_found` envelope, asks the mux (`ServeMux.Handler`) which
+pattern matches, and answers no match with the `404 not_found` envelope, or
+with `405 method_not_allowed` and the mux's `Allow` list when the path is
+registered under other methods. It removes the `HEAD` that the mux adds for
+every `GET` pattern unless a `HEAD` pattern exists for the path. A redirect
+the mux would send for a missing trailing slash is a `404` too. Everything
+else goes to `ServeMux.ServeHTTP`.
+
+### REST routes
+
+A feature registers a REST route with `(*Server).Register(server.Route)`.
+`Route.Method` is an upper-case method, `Route.Pattern` a path relative to
+`/api/v1` with `:name` parameters (`/workspaces/:slug/tokens`), and
+`Route.Handler` a `server.HandlerFunc`,
+`func(http.ResponseWriter, *http.Request) error`: it writes its own response
+on success, and an error it returns is written as the envelope. The route's
+declarations are `Public`, `Create` with its `ShowOnce` members, its own
+`MaxBodySize`, `ContentType` and `CacheControl`, its `Feature` check, the one
+`Scope` a personal access token needs (a name the server does not interpret)
+and `Marks`, named values whose meaning the installed checks define.
+`Register` turns the pattern into the mux's form
+(`POST /api/v1/workspaces/{slug}/tokens`) and panics on a pattern that does
+not start with a slash, ends in one, has an empty, `.` or `..` segment, a
+brace, or a parameter without a valid name or named twice, on a method that
+is not upper-case letters, on a missing handler and on a route already
+registered.
+
+Each check and the handler read the route their request matched with
+`server.MatchedRoute(r)`: a `server.Matched` with the method and pattern as
+registered, the `Route` and the path parameter values (`Params`);
+`server.Param(r, name)` returns one value.
+
+### The check pipeline
+
+After the mux has matched a REST route, the pipeline runs the route's checks
+in a fixed order and stops at the first error:
+
+1. authentication, through the installed `server.Authenticator`,
+   `func(*http.Request) (server.Caller, error)`; with none installed, a route
+   that is not public is answered `401 unauthenticated`;
+2. the rate-limit stage, which passes every request in this version;
+3. the body stage, which passes every request in this version;
+4. the route's `Feature` check, the binding guard (`SetBindingGuard`), the
+   scope check (`SetScopeCheck`) and the access checks (`AddAccessCheck`), in
+   that order; each is a `server.Check`, `func(*http.Request) error`, and an
+   empty position passes;
+5. the handler.
+
+A public route skips authentication and step 4. The access position holds a
+list: every check added with `AddAccessCheck` runs, in the order it was
+added, and decides from the matched route whether it applies. The
+authenticator reports a `server.Caller` (`CredentialID`, and `UserID` or
+`Admin` for the admin token), which the pipeline puts in the request's
+context; later checks and the handler read it with
+`server.CallerOf(r.Context())`. An `*server.Error` (also when wrapped) is
+written as its envelope; any other error as `500 internal` with the message
+`internal error`.
+
+The installed checks are copied under a read lock at the start of each
+request, and no lock is held while a check or a handler runs, so a request
+blocked in its handler never holds up another one.
 
 ### Serving and stopping
 

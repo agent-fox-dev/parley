@@ -1,18 +1,59 @@
 # API reference
 
-The hub, `parleyd`, answers the routes below over HTTP. The REST API under
-`/api/v1` does not exist yet; this page grows as it lands.
+The hub, `parleyd`, answers the routes below over HTTP. The REST API is
+mounted at `/api/v1`; no feature has registered a route there yet, so this
+page describes the rules every REST route follows and the three built-in
+routes. It grows as features land.
 
 ## Conventions so far
 
-- The three routes below need no credential. They never read the
-  `Authorization` header, so a request with or without one, valid or not, gets
-  the same answer.
+- The three built-in routes (`/healthz`, `/readyz`, `/version`) need no
+  credential. They never read the `Authorization` header, so a request with
+  or without one, valid or not, gets the same answer.
 - Every body is one JSON object, sent with
   `Content-Type: application/json; charset=utf-8`.
-- An unknown path or a wrong method gets the Go standard library router's own
-  answer: `404 Not Found` or `405 Method Not Allowed` with a plain-text body.
-  The error envelope below is not used for them yet.
+
+## Routes and matching
+
+Every REST route lives under the fixed mount `/api/v1`. A route has a method
+and a path with named parameters, such as `GET /api/v1/workspaces/{slug}`.
+Paths are matched exactly, and a path that does not match is never
+redirected:
+
+| Request | Answer |
+|---|---|
+| a path no route matches, under `/api/v1` or anywhere else on the hub | `404` with `error_type` `not_found` |
+| a path that differs from a route only by a trailing slash (`/api/v1/things/` for `/api/v1/things`) | `404` `not_found` |
+| a path with a doubled slash, `.` or `..` segment (`//api/v1/things`, `/api/v1/./things`) | `404` `not_found` |
+| a known path with a method no route of that path has | `405` with `error_type` `method_not_allowed` and an `Allow` header |
+
+Both answers use the error envelope below and come before any credential is
+looked at, so they are the same with no credential, a valid one or a bogus
+one. `Allow` lists the methods registered for the path, joined by `, `, for
+example `Allow: GET, POST`. A route registered for `GET` also answers `HEAD`
+with the same status and headers and no body; `HEAD` is listed in `Allow`
+only when a route registers it itself.
+
+## Order of checks
+
+A request to a REST route passes these checks in this order. The first one
+that fails answers the request, and no later check or the handler runs.
+
+1. Route matching: `404 not_found` or `405 method_not_allowed`, as above.
+2. Authentication. A route that is not public needs a credential. While the
+   hub has no authenticator, which is the case in this version, every route
+   that is not public is answered `401` with `error_type` `unauthenticated`.
+3. The rate limit (not enforced yet).
+4. The body size and content type (not enforced yet).
+5. The route's own feature check, where it declares one, then the binding
+   guard.
+6. The scope check.
+7. The access checks.
+8. The route's handler.
+
+A public route skips steps 2 and 5 to 7. An error the hub did not expect is
+answered `500` with `error_type` `internal` and the message `internal error`;
+its details stay out of the response.
 
 ## Errors
 

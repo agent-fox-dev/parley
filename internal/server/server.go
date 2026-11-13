@@ -36,12 +36,20 @@ type Options struct {
 type Server struct {
 	opts Options
 	mux  *http.ServeMux
+
+	routesMu sync.Mutex
+	// routes holds the REST API routes registered, as "METHOD path" in the
+	// router's syntax.
+	routes map[string]struct{}
+
+	posMu sync.RWMutex
+	pos   positions
 }
 
 // New builds a Server from opts and registers its built-in routes. Unknown
-// paths and wrong methods get the standard library router's own answers.
+// paths and wrong methods are answered with the error envelope.
 func New(opts Options) *Server {
-	s := &Server{opts: opts, mux: http.NewServeMux()}
+	s := &Server{opts: opts, mux: http.NewServeMux(), routes: make(map[string]struct{})}
 	s.mux.HandleFunc("GET /healthz", s.healthz)
 	s.mux.HandleFunc("GET /readyz", s.readyz)
 	s.mux.HandleFunc("GET /version", s.version)
@@ -50,11 +58,13 @@ func New(opts Options) *Server {
 
 // Handler returns the handler that serves every route of the server.
 func (s *Server) Handler() http.Handler {
-	return s.mux
+	return http.HandlerFunc(s.dispatch)
 }
 
 // Handle registers h for pattern on the server's router, with the pattern
-// syntax of http.ServeMux. Routes are registered before Serve is called.
+// syntax of http.ServeMux, for a surface outside the REST API. Its requests
+// do not pass the REST API's checks. Routes are registered before Serve is
+// called.
 func (s *Server) Handle(pattern string, h http.Handler) {
 	s.mux.Handle(pattern, h)
 }
@@ -79,7 +89,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 
 	conns := newConnTracker()
-	srv := &http.Server{Handler: s.mux, ConnState: conns.track}
+	srv := &http.Server{Handler: s.Handler(), ConnState: conns.track}
 	served := make(chan error, 1)
 	go func() { served <- srv.Serve(trackingListener{ln, conns}) }()
 
