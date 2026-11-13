@@ -152,6 +152,9 @@ func (s *Server) pipeline(w http.ResponseWriter, r *http.Request, rt Route) erro
 		}
 	}
 
+	if rt.Create {
+		return s.serveCreate(w, r, rt)
+	}
 	return rt.Handler(w, r)
 }
 

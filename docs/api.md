@@ -52,7 +52,10 @@ that fails answers the request, and no later check or the handler runs.
    guard.
 6. The scope check.
 7. The access checks.
-8. The route's handler.
+8. On a create route, the `Idempotency-Key`: `400 invalid_request` for a bad
+   key, `409 conflict` for a key used with another body, or a replay, as in
+   [Idempotency](#idempotency).
+9. The route's handler.
 
 A public route skips steps 2 and 5 to 7; it keeps the rate limit, counted
 by client address, and the body checks.
@@ -202,6 +205,50 @@ read:
 
 A cursor is opaque: clients must not build or change one. It carries no
 grant; every page passes the full order of checks again.
+
+## Idempotency
+
+A `POST` that creates a resource accepts an `Idempotency-Key` header, so a
+client that lost the answer can send the request again without creating a
+second resource. A route's section of this page says when it is such a
+create route; on every other route the header is ignored, however often it
+is sent.
+
+| Request to a create route | Answer |
+|---|---|
+| no `Idempotency-Key` header | the handler's answer; nothing is recorded |
+| an `Idempotency-Key` that is empty or longer than 255 characters | `400` with `error_type` `invalid_request`; the handler does not run |
+| a key of 1 to 255 characters not recorded for this caller and request | the handler's answer, unchanged; a `2xx` answer is recorded |
+| a recorded key, with the same body as the recorded request | `200` with the recorded body; the handler does not run |
+| a recorded key, with another body | `409` with `error_type` `conflict`; the handler does not run and the record stays as it was |
+
+- A record belongs to the key, the caller (the user, or the admin token) and
+  the request: the method and the request path. The same key sent by another
+  user, by the admin token, to another route or to another path of the same
+  route (`/api/v1/owners/a/things` and `/api/v1/owners/b/things`) is a new
+  request.
+- "The same body" means the same bytes: a body with the members in another
+  order or with other white space is another body.
+- A replay answers `200`, not the original `201` or `202`, with the
+  original body and `Content-Type: application/json; charset=utf-8`.
+- Only a `2xx` answer is recorded. After a `400`, `409`, `500` or any other
+  failure, from the handler or from a check, the same key runs the handler
+  again.
+- A record is replayed for 24 hours. A record 24 hours old or older is
+  treated as absent, so the request runs the handler and is recorded anew.
+- A secret that a create route shows only once (a token, for example) is in
+  the first answer only. The route's section names such members; they are
+  removed before the answer is recorded, so a replay leaves them out and
+  keeps every other member.
+- While a request with a key is running, other requests with the same key,
+  caller and request path wait for it. When it succeeds they are answered as
+  replays; when it fails, one of them runs next. Requests with other keys
+  never wait for each other.
+- The key is checked after authentication and every other check, so a replay
+  is authorised like the original request. A public create route ignores the
+  header, since it has no caller to record it for.
+- The records are kept in memory in this version and are lost when `parleyd`
+  restarts.
 
 ## Errors
 

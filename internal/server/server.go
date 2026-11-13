@@ -41,7 +41,8 @@ type Options struct {
 	// RateLimitDisabled turns the rate limit off, whatever RequestsPerMinute
 	// says.
 	RateLimitDisabled bool
-	// Now is the clock of the rate limit; nil means time.Now.
+	// Now is the clock of the rate limit and of the idempotency records' age;
+	// nil means time.Now.
 	Now func() time.Time
 	// Logger receives the access log and the causes of internal errors; nil
 	// means slog.Default().
@@ -49,6 +50,9 @@ type Options struct {
 	// LogHealthProbes writes access-log lines for /healthz and /readyz, at
 	// debug level; without it they get none.
 	LogHealthProbes bool
+	// IdempotencyStore keeps the records of creates sent with an
+	// Idempotency-Key; nil means an in-memory store, emptied at restart.
+	IdempotencyStore IdempotencyStore
 }
 
 // Server is the hub's HTTP server.
@@ -66,6 +70,8 @@ type Server struct {
 
 	limiter *Limiter
 	logger  *slog.Logger
+	now     func() time.Time
+	idem    *idempotency
 }
 
 // New builds a Server from opts and registers its built-in routes. Unknown
@@ -77,9 +83,14 @@ func New(opts Options) *Server {
 		routes:  make(map[string]struct{}),
 		limiter: newServerLimiter(opts),
 		logger:  opts.Logger,
+		now:     opts.Now,
+		idem:    newIdempotency(opts.IdempotencyStore),
 	}
 	if s.logger == nil {
 		s.logger = slog.Default()
+	}
+	if s.now == nil {
+		s.now = time.Now
 	}
 	s.mux.HandleFunc("GET /healthz", s.healthz)
 	s.mux.HandleFunc("GET /readyz", s.readyz)

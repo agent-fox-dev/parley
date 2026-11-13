@@ -13,7 +13,7 @@ command-line client. Both are written in Go, in the module
 | `cmd/parleyd` | the `parleyd` program: argument parsing, signals, the start log line and the exit status |
 | `internal/buildinfo` | the version, commit and build time the binary was built with, shared by both programs |
 | `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra` |
-| `internal/server` | the hub's HTTP server: its built-in routes, the REST API's route registration and check pipeline, the error envelope, request ids, response headers and the access log, list paging, and the readiness probes |
+| `internal/server` | the hub's HTTP server: its built-in routes, the REST API's route registration and check pipeline, the error envelope, request ids, response headers and the access log, list paging, idempotency keys, and the readiness probes |
 | `test/e2e` | tests that build the binaries and run them |
 
 ## The HTTP server
@@ -24,8 +24,10 @@ address (`Addr`), the shutdown grace (`ShutdownGrace`), the readiness
 probes (`ReadinessProbes`) and `OnListen`, a function `Serve` calls once with
 the address it bound (with port `0` in `Addr`, the port the system chose),
 the REST body limit (`MaxBodySize`), the rate limit (`RequestsPerMinute`,
-`RateLimitDisabled`, and `Now`, the clock it reads, which tests replace), the
-`Logger` (a `*slog.Logger`; nil means `slog.Default()`) and `LogHealthProbes`.
+`RateLimitDisabled`, and `Now`, the clock it and the idempotency records
+read, which tests replace), the `Logger` (a `*slog.Logger`; nil means
+`slog.Default()`), `LogHealthProbes` and the `IdempotencyStore` (nil means
+an in-memory store).
 `Serve` serves `Handler()`, so the running hub and in-process tests answer
 the same way.
 
@@ -129,7 +131,9 @@ in a fixed order and stops at the first error:
    scope check (`SetScopeCheck`) and the access checks (`AddAccessCheck`), in
    that order; each is a `server.Check`, `func(*http.Request) error`, and an
    empty position passes;
-5. the handler.
+5. on a route declared `Create`, the idempotency stage
+   (`internal/server/idempotency.go`), described below;
+6. the handler.
 
 A public route skips authentication and step 4. The access position holds a
 list: every check added with `AddAccessCheck` runs, in the order it was
@@ -196,6 +200,86 @@ parameter values and every query parameter except `cursor` and `limit`, so a
 cursor is refused on another query but accepted with another limit. Cursors
 are not signed: a cursor grants nothing, since every page passes the full
 order of checks again.
+
+The idempotency stage runs on create routes only, after every check, so a
+replay is authenticated and authorised like the request it repeats. A
+request without an `Idempotency-Key` header, and every request to a public
+route, which has no caller to record for, goes straight to the handler. A key that is empty or longer
+than 255 characters (counted in characters, not bytes) is `400
+invalid_request`. Otherwise the record is identified by three strings: the
+key, the caller (`user:<UserID>`, or `admin-token` when `Caller.Admin`) and
+the route (the method, one space and the concrete `r.URL.Path`, such as
+`POST /api/v1/workspaces/w1/tokens`). The stage then:
+
+1. takes the per-record gate for that identity (below);
+2. finds the record; one whose `WrittenAt` is 24 hours or more before
+   `Options.Now()` is treated as absent. A valid record with the SHA-256 of
+   the buffered request body is replayed as `200` with its body and
+   `Content-Type: application/json; charset=utf-8`; one with another hash is
+   `409 conflict`, and the record is left as it is;
+3. otherwise runs the handler through a writer that passes the response
+   through unchanged and keeps a copy of its status and body (it has
+   `Unwrap()`, so the status-capturing writer of the headers middleware below
+   it and `http.ResponseController` keep working);
+4. when the handler returned no error and answered `2xx`, removes the route's
+   `ShowOnce` members from a copy of the body (a member name, or a dotted path
+   into nested objects such as `token.token`; a path the body lacks is
+   skipped; an object it changes is re-encoded with its members in sorted
+   order and without white space, and every value kept is unchanged), calls
+   `DeleteExpired` with the cutoff `now - 24h` and then `Write`s the record.
+   A body that is not a JSON object while `ShowOnce` names members, or a store
+   error, is logged as `idempotency record not written` with the
+   `request_id` and the `error`, and nothing is recorded: the caller already
+   has the handler's answer;
+5. records nothing for any other status or for an error.
+
+The records live behind `server.IdempotencyStore`, which package 03
+implements over its transactional store and installs as
+`Options.IdempotencyStore`:
+
+```go
+type IdempotencyStore interface {
+	Find(ctx context.Context, key, caller, route string) (IdempotencyRecord, bool, error)
+	Write(ctx context.Context, rec IdempotencyRecord) error
+	DeleteExpired(ctx context.Context, cutoff time.Time) error
+}
+
+type IdempotencyRecord struct {
+	Key         string            // the Idempotency-Key, 1–255 characters
+	Caller      string            // "user:<id>" or "admin-token"
+	Route       string            // "POST /api/v1/..." with the concrete path
+	RequestHash [sha256.Size]byte // SHA-256 of the request body's bytes
+	Body        []byte            // the response body without its show-once members
+	WrittenAt   time.Time         // the server's clock when written
+}
+```
+
+- `Find` returns the record whose `Key`, `Caller` and `Route` are all equal
+  to its arguments, and `false` when there is none. It may return an
+  expired record that is not deleted yet; the server decides from
+  `WrittenAt` and never replays it.
+- `Write` stores the record, replacing any record with the same `Key`,
+  `Caller` and `Route` (a key whose record expired is recorded anew).
+- `DeleteExpired` removes every record whose `WrittenAt` is at or before
+  `cutoff`, that is, every record 24 hours old or older.
+- An error from `Find` ends the request as `500 internal`; an error from
+  `DeleteExpired` or `Write` is logged, as above. Every method must be safe
+  for concurrent use. The stage calls only these three methods and keeps no
+  record of its own.
+
+`server.NewMemoryIdempotencyStore()` is the in-memory implementation and the
+server's default; its records are lost when the process ends.
+
+The gate that orders requests with one identity is in memory in either case,
+since the hub is one process: a map from (key, caller, route) to a slot with
+a one-token channel and a count of the requests holding or awaiting it. A
+request takes the token before it reads the store and gives it back after the
+record is written or the request has failed, so a request waiting on the same
+identity sees the record when the first one succeeded, and exactly one waiter
+runs the handler when it failed. The map's mutex is held only to find or drop
+a slot, never while a request waits or runs, so requests with different keys,
+callers or paths never wait for each other; a slot is dropped when its count
+reaches zero. A waiting request whose client goes away stops waiting.
 
 The installed checks are copied under a read lock at the start of each
 request, and no lock is held while a check or a handler runs, so a request
