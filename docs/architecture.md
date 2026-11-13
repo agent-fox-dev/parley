@@ -82,7 +82,15 @@ in a fixed order and stops at the first error:
    `func(*http.Request) (server.Caller, error)`; with none installed, a route
    that is not public is answered `401 unauthenticated`;
 2. the rate-limit stage, which passes every request in this version;
-3. the body stage, which passes every request in this version;
+3. the body stage (`internal/server/body.go`): it reads the whole body, up to
+   one byte past the limit that applies (the route's `MaxBodySize`, else
+   `Options.MaxBodySize`, else 1048576 bytes), answers `413
+   payload_too_large` when the declared length or the bytes read exceed it,
+   then, for a non-empty `POST`, `PUT` or `PATCH` body, answers `415
+   unsupported_media_type` unless the `Content-Type` media type is the
+   route's `ContentType` or, when it states none, `application/json`. The
+   buffered bytes replace the request's body and stay in its context, so a
+   later stage can read them without consuming the body the handler reads;
 4. the route's `Feature` check, the binding guard (`SetBindingGuard`), the
    scope check (`SetScopeCheck`) and the access checks (`AddAccessCheck`), in
    that order; each is a `server.Check`, `func(*http.Request) error`, and an
@@ -98,6 +106,10 @@ context; later checks and the handler read it with
 `server.CallerOf(r.Context())`. An `*server.Error` (also when wrapped) is
 written as its envelope; any other error as `500 internal` with the message
 `internal error`.
+
+A handler decodes a JSON body with `server.DecodeJSON(r, &v)`, which
+returns `400 invalid_request` for an empty body, invalid JSON, a value that
+is not an object or data after the object, and ignores unknown members.
 
 The installed checks are copied under a read lock at the start of each
 request, and no lock is held while a check or a handler runs, so a request

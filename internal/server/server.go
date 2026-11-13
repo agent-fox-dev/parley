@@ -30,6 +30,9 @@ type Options struct {
 	// OnListen, when set, is called once by Serve with the address it bound,
 	// before it serves; with port 0 in Addr it carries the chosen port.
 	OnListen func(net.Addr)
+	// MaxBodySize is the body limit of a REST API request in bytes, for a
+	// route that states none of its own; 0 means 1048576 (1 MiB).
+	MaxBodySize int64
 }
 
 // Server is the hub's HTTP server.

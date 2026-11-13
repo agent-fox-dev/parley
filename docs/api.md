@@ -44,7 +44,8 @@ that fails answers the request, and no later check or the handler runs.
    hub has no authenticator, which is the case in this version, every route
    that is not public is answered `401` with `error_type` `unauthenticated`.
 3. The rate limit (not enforced yet).
-4. The body size and content type (not enforced yet).
+4. The body size, then the content type: `413` or `415`, as in
+   [Request bodies](#request-bodies).
 5. The route's own feature check, where it declares one, then the binding
    guard.
 6. The scope check.
@@ -54,6 +55,39 @@ that fails answers the request, and no later check or the handler runs.
 A public route skips steps 2 and 5 to 7. An error the hub did not expect is
 answered `500` with `error_type` `internal` and the message `internal error`;
 its details stay out of the response.
+
+## Request bodies
+
+The hub reads the whole body of a REST request before any check after the
+rate limit runs, so these answers come before the feature check, the binding
+guard, the scope check, the access checks and the handler:
+
+| Request | Answer |
+|---|---|
+| a body over the body limit, with or without a declared `Content-Length`, whatever its `Content-Type` | `413` with `error_type` `payload_too_large` |
+| a `POST`, `PUT` or `PATCH` with a body within the limit and a `Content-Type` that is missing or is not `application/json` | `415` with `error_type` `unsupported_media_type` |
+
+- The body limit is 1048576 bytes (1 MiB); a body of exactly the limit is
+  accepted. A route can state a limit of its own, which then applies in place
+  of the hub's; its section of this page says so.
+- The size is checked before the content type, so an oversized body is `413`
+  even when its type is wrong.
+- The media type is compared without regard to letter case or parameters:
+  `application/json`, `Application/JSON` and
+  `application/json; charset=utf-8` are all accepted.
+- A request without a body passes both checks whatever its `Content-Type`
+  says.
+- A route can state another request media type, such as `text/plain`, which
+  it then accepts in place of `application/json`; the body limit still
+  applies.
+- `GET`, `DELETE` and other methods are not checked for a content type, but
+  their body is still bounded by the limit.
+
+A route whose body is JSON takes one JSON object. It answers `400` with
+`error_type` `invalid_request` when the body is empty, is not valid JSON, is
+a JSON value other than an object (an array, a string, a number, `null`), or
+has anything but white space after the object. Members the route does not
+know are ignored.
 
 ## Errors
 

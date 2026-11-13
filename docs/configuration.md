@@ -9,8 +9,9 @@ variable; `parley` reads one, `PARLEY_ENDPOINT_URL`.
 |---|---|
 | Listen address | `0.0.0.0:8080` (all interfaces, port 8080) |
 | Shutdown grace | 15 seconds: how long in-flight requests get to finish after `SIGTERM` or `SIGINT` |
+| Body limit | 1048576 bytes (1 MiB): the largest REST request body; a larger one is answered `413` (see [api.md](api.md#request-bodies)) |
 
-Both values are fixed; `parleyd` takes no flag for them. See
+These values are fixed; `parleyd` takes no flag for them. See
 [cli.md](cli.md) for how `parleyd` is started and stopped.
 
 ## `parley`

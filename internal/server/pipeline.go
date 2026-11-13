@@ -134,9 +134,6 @@ func (s *Server) pipeline(w http.ResponseWriter, r *http.Request, rt Route) erro
 // rateLimit is the rate-limit stage; it passes every request for now.
 func (s *Server) rateLimit(*http.Request) error { return nil }
 
-// readBody is the body stage; it passes every request unchanged for now.
-func (s *Server) readBody(r *http.Request) (*http.Request, error) { return r, nil }
-
 // writeErr answers err: an *Error as its envelope, anything else as an
 // internal error whose text stays out of the response.
 func writeErr(w http.ResponseWriter, err error) {
