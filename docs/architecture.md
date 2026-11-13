@@ -810,11 +810,26 @@ response.
 ## parley
 
 `cmd/parley` calls `cli.Run(ctx, os.Args[1:], os.Stdout, os.Stderr)` and passes
-its result to `os.Exit`. `Run` builds a fresh cobra command tree on each call:
-the root command `parley` with the persistent flag `--endpoint-url`, and the
-`version` subcommand. It executes the tree with the arguments, and returns `0`,
-or `2` after one `error: <message>` line on stderr when cobra cannot parse the
-arguments. Cobra's own error and usage output is silenced.
+its result to `os.Exit`. `Run` is `cli.RunWith` with zero `cli.Hooks`;
+`RunWith` lets a caller that runs the client in-process, such as an
+end-to-end test, replace what it takes from the process (`Hooks.Stdin`, where
+`parley login --api-key -` reads the credential). It builds a fresh cobra
+command tree on each call: the root command `parley` with the persistent flag
+`--endpoint-url`, and the `version` and `login` subcommands. It executes the
+tree with the arguments, and returns `0`, or `2` after one `error: <message>`
+line on stderr when cobra cannot parse the arguments. Cobra's own error and
+usage output is silenced. `parley login` fails with its own error type
+(`internal/cli/login.go`), an exit status and the error envelope to write;
+`run` writes that envelope to stderr as it is and returns its status.
+
+`parley login --api-key` (`internal/cli/login.go`) reads the client
+configuration file (`internal/cli/config.go`: `$PARLEY_CONFIG_DIR/config.toml`
+or `~/.parley/config.toml`, decoded with `github.com/BurntSushi/toml` into a
+map, so that keys it does not know survive), resolves the hub URL from the
+flag, `PARLEY_ENDPOINT_URL` and the file, and asks the hub who the credential
+belongs to with `GET /api/v1/user` (30 s timeout). On `200` it sets
+`endpoint_url`, `api_key` and `user_id` in the map and saves it: a temporary
+file with mode `0600` in the same directory, renamed over `config.toml`.
 
 `parley version` reads its build from `internal/buildinfo` and asks the hub
 for its build with a plain `net/http` client over HTTP (`GET /version`, 5 s

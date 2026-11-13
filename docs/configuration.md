@@ -1,8 +1,9 @@
 # Configuration
 
 `parleyd` reads one configuration file, `config.toml`, and the environment
-variables named below. `parley` reads one environment variable,
-`PARLEY_ENDPOINT_URL`.
+variables named below. `parley` reads the environment variables
+`PARLEY_ENDPOINT_URL` and `PARLEY_CONFIG_DIR`, and `parley login` writes its
+own configuration file, also named `config.toml` (see [`parley`](#parley)).
 
 ## `parleyd`
 
@@ -144,7 +145,38 @@ See [cli.md](cli.md) for how `parleyd` is started and stopped.
 | Variable | Effect |
 |---|---|
 | `PARLEY_ENDPOINT_URL` | the URL of the hub, for example `http://127.0.0.1:8080`, when the flag `--endpoint-url` is absent or empty |
+| `PARLEY_CONFIG_DIR` | the directory of the client configuration file, when set and not empty; otherwise `.parley` in the home directory (`$HOME`) |
 
 The flag `--endpoint-url` comes first; an empty or unset `PARLEY_ENDPOINT_URL`
 gives no URL. `parley version` without a URL prints the client's build alone.
 See [cli.md](cli.md).
+
+### The client configuration file
+
+The client configuration file is `config.toml` in the client's config
+directory: `$PARLEY_CONFIG_DIR/config.toml`, or `~/.parley/config.toml`. It
+is TOML and holds the hub URL and the credential, so it is private:
+
+| Key | Value |
+|---|---|
+| `endpoint_url` | the hub URL, without trailing slashes; `parley login` uses it when neither `--endpoint-url` nor `PARLEY_ENDPOINT_URL` gives one |
+| `api_key` | the credential of the last login, an API key or a personal access token |
+| `user_id` | the `id` of the user the credential belongs to |
+
+For example:
+
+```toml
+api_key = "parley_abcd1234_0123456789abcdefghijABCDEFGHIJ01"
+endpoint_url = "http://127.0.0.1:8080"
+user_id = "0b5c6f2e-8d1a-4c3b-9e7f-2a4d6c8e0f13"
+```
+
+`parley login` reads the file before it sends anything (a missing file is
+empty; one that is not valid TOML fails the login and is left as it is),
+and after a successful login sets these three keys and writes the file
+again. It keeps every other key and table with its value, but not comments
+or the order of the keys. It writes a temporary file with mode `0600` in the
+same directory and renames it over `config.toml`, so the file is replaced
+as a whole and ends with mode `0600`; a missing config directory is created
+with mode `0700`. `parley login` does not read `api_key`, and
+`PARLEY_API_KEY` does not change it. See [cli.md](cli.md#parley-login).
