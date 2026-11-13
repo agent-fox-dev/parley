@@ -19,12 +19,9 @@ until it receives `SIGTERM` or `SIGINT`.
 
 | Flag | Effect |
 |---|---|
-| `--admin-email <address>` | takes one value; `--admin-email` without one is a usage error, and `--admin-email=` counts as not given |
-| `--reset-admin-token` | a boolean flag |
+| `--admin-email <address>` | on a hub that has no admin token yet, store the address, write a new admin token to the token file and exit `0` without serving (see [The admin token](#the-admin-token)); ignored once the hub has one. It takes one value; `--admin-email` without one is a usage error, and `--admin-email=` counts as not given |
+| `--reset-admin-token` | write a new admin token to the token file, replacing the stored one, and exit `0` without serving |
 | `-h`, `--help` | print the usage on stdout and exit `0` without reading the configuration or listening |
-
-`parleyd` accepts `--admin-email` and `--reset-admin-token`; in this version
-they change nothing about the start, which serves as without them.
 
 `--help` prints:
 
@@ -69,6 +66,46 @@ In this version `parleyd backup <directory>` writes one error line,
 `backup <directory>: the backup command is not available yet`, and exits
 `1` without reading the configuration or touching the data.
 
+### The admin token
+
+A new hub has no users, so its operator administers it with an admin token.
+The hub stores only the token's SHA-256 hash and the address given with
+`--admin-email`; the token itself is written to the file `admin_token` in
+the config dir (the directory `config.toml` is looked for in, see
+[configuration.md](configuration.md#the-configuration-file)), with mode
+`0600`, as `parley_admin_` followed by 64 lowercase hex characters and no
+trailing newline. The token is never written to stdout, to stderr or under
+the data directory.
+
+After the stores are open and before any start work runs, `parleyd`
+decides:
+
+| Flags | Hub | What happens |
+|---|---|---|
+| `--reset-admin-token` | any | a new token replaces the stored one; the address of `--admin-email` is stored too when the hub had no token before. The token file is written, over one that is there, and `parleyd` exits `0` |
+| `--admin-email <address>` | no token stored | the address and the new token's hash are stored, the token file is written, over a leftover one, and `parleyd` exits `0` |
+| none | no token stored | `parleyd` starts and serves without a token |
+| none or `--admin-email` | a token stored, token file there | `parleyd` refuses to start: one error line naming the file, exit `1` |
+| none or `--admin-email` | a token stored, no token file | `parleyd` starts and serves; `--admin-email` is ignored |
+
+A run that writes the token file logs its absolute path at warn level and
+exits `0` without listening or running any start work:
+
+```json
+{"time":"2026-11-13T13:20:41.118034+01:00","level":"WARN","msg":"admin token written: save the token and delete the file","path":"/srv/parley/admin_token"}
+```
+
+Save the token and delete the file: the hub does not start while the file
+is there. The hash and the file are written together, so when the file
+cannot be written (a missing config dir, no permission, a directory in its
+place) nothing is stored, and `parleyd` writes one `cannot start` line naming
+the file and exits `1`. While the file is there, a start without
+`--reset-admin-token` writes:
+
+```json
+{"time":"2026-11-13T13:21:02.530118+01:00","level":"ERROR","msg":"cannot start","error":"admin token file /srv/parley/admin_token exists: save the token, delete the file and start the hub again"}
+```
+
 ### The start
 
 `parleyd` starts in this order and stops at the first stage that fails:
@@ -76,14 +113,17 @@ In this version `parleyd backup <directory>` writes one error line,
 1. it loads and checks the configuration;
 2. it creates the data directory and the workspace root when they are
    missing, opens both stores and brings them to the current schema;
-3. it runs the start work the hub's parts registered, in order, each to
+3. the bootstrap: it writes the admin token file and exits, refuses to
+   start while the file is there, or goes on (see
+   [The admin token](#the-admin-token));
+4. it runs the start work the hub's parts registered, in order, each to
    completion;
-4. it binds `[server].bind`:`[server].port`;
-5. it starts the maintenance work in the background, without waiting for
+5. it binds `[server].bind`:`[server].port`;
+6. it starts the maintenance work in the background, without waiting for
    it;
-6. it writes the `listening` line and serves.
+7. it writes the `listening` line and serves.
 
-A failure in stages 1 to 4 writes exactly one error line to stderr, closes
+A failure in stages 1 to 5 writes exactly one error line to stderr, closes
 the stores when they were open, and exits `1` without listening.
 
 ### Log lines
@@ -149,7 +189,8 @@ not stop the others:
 
 When the start fails before listening it writes one line and exits `1`.
 The line is `cannot start` with the cause in `error`, which names the
-configuration key, the path, the schema step or the start work that failed:
+configuration key, the path, the schema step, the admin token file or the
+start work that failed:
 
 ```json
 {"time":"2026-11-13T13:11:38.609972+01:00","level":"ERROR","msg":"cannot start","error":"configuration file /srv/parley/config.toml: server.prot: unknown key"}
@@ -174,8 +215,8 @@ during the stop changes nothing.
 
 | Status | When |
 |---|---|
-| `0` | `--help`, or a stop by `SIGTERM` or `SIGINT`, whether or not the grace passed |
-| `1` | the start failed before listening (the configuration, the data, a schema step, the start work or the listen address), or `backup` |
+| `0` | `--help`, a run that wrote the admin token file, or a stop by `SIGTERM` or `SIGINT`, whether or not the grace passed |
+| `1` | the start failed before listening (the configuration, the data, a schema step, the admin token file that could not be written or is still there, the start work or the listen address), or `backup` |
 | `2` | a usage error: an unknown flag, `--admin-email` without a value, a positional argument other than `backup`, or `backup` without exactly one directory |
 
 ## `parley`

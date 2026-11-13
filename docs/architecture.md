@@ -14,7 +14,8 @@ command-line client. Both are written in Go, in the module
 | `internal/buildinfo` | the version, commit and build time the binary was built with, shared by both programs |
 | `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra` |
 | `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, and a registry of keys and whole sections that decides what the file may hold |
-| `internal/hub` | the composition of the `parleyd` process: argument parsing, the scrubbing logger, the fixed start order, the HTTP server's options, the idempotency records in the transactional store, signals and the stop; the one place later packages plug their parts in ([ADR 01](adr/01-compose-the-hub-in-one-package.md)) |
+| `internal/hub` | the composition of the `parleyd` process: argument parsing, the scrubbing logger, the fixed start order, the bootstrap of the admin token, the HTTP server's options, the idempotency records in the transactional store, signals and the stop; the one place later packages plug their parts in ([ADR 01](adr/01-compose-the-hub-in-one-package.md)) |
+| `internal/identity` | who may use the hub: the admin settings in the transactional store (the bootstrap e-mail and the admin token's hash), the generation and hashing of admin tokens, and `VerifyAdminToken`, which compares a presented token's hash with the stored one in constant time |
 | `internal/scrub` | the one scrubbing function for text that leaves the hub: `Scrubber.Scrub` replaces registered secret values and the hub's own credential formats by `[redacted]`, removes user information from URLs and cuts the text to 1024 bytes; a leaf package that imports nothing of the project |
 | `internal/store` | the hub's two embedded SQLite stores (`modernc.org/sqlite`, no cgo): `Open` creates the data directory and the workspace root, opens the transactional store and the analytical store (`analytics.db` beside it) and applies the registered schema steps; `Tx` runs a transaction of the transactional store |
 | `internal/server` | the hub's HTTP server: its built-in routes, the REST API's route registration and check pipeline, the error envelope, request ids, response headers and the access log, list paging, idempotency keys, and the readiness probes |
@@ -443,7 +444,9 @@ failure:
    `[logging].level`, and register every OAuth provider's `client_secret`
    with the scrubber;
 3. open the stores with the composition's schema steps (`store.Open`);
-4. the bootstrap stage, which does nothing in this version;
+4. the bootstrap (`internal/hub/bootstrap.go`), which may end the run with
+   `0` after writing the admin token file, or refuse the start (see
+   [Bootstrap](#bootstrap));
 5. the start hooks, in the order they were added, each to completion, with
    `Run`'s context;
 6. catch `SIGTERM` and `SIGINT` with `signal.Notify` on a channel kept
@@ -477,6 +480,32 @@ configuration and the stores: `MaxBodySize` from `[server].max_body_size`,
 `[logging].log_health_probes`, one readiness probe, `st.Ping`, which fails
 while either store does not answer a query, and the store-backed
 `IdempotencyStore`.
+
+### Bootstrap
+
+`internal/hub/bootstrap.go` adds the part `composeBootstrap`, after
+`composeIdempotency` in `parts`, which adds the schema step
+`identity.AdminSettingsStep`: a table `admin_settings` with one row (`id` 1,
+`email`, `token_hash`) that exists once the hub is bootstrapped.
+`identity.AdminSettings(ctx, st)` returns the row as an `identity.Admin`, the
+zero value when none is stored. `identity.GenerateAdminToken` returns
+`parley_admin_` and 32 bytes of `crypto/rand` as 64 lowercase hex
+characters; `identity.HashAdminToken` is the lowercase hex SHA-256 of the
+whole token; `identity.VerifyAdminToken(ctx, st, token)` reports whether
+the token's hash is the stored one, compared with
+`crypto/subtle.ConstantTimeCompare`, and false when none is stored.
+`identity.IssueAdminToken(ctx, st, email, deliver)` generates a token,
+upserts its hash (the e-mail only when the row is new) and calls `deliver`
+with the token inside the same `Tx`, so an error from `deliver` rolls the
+hash back.
+
+The bootstrap stage reads the settings and, by the table in
+[cli.md](cli.md#the-admin-token), issues a token whose `deliver` writes it
+to `<config dir>/admin_token` (a 0600 temporary file in the config dir,
+synced and renamed over the path), refuses with an error naming the file
+while a bootstrapped hub's file exists, or goes on to the start hooks. After
+writing the file it logs the path at warn level and `Run` returns `0`
+without running a start hook or binding the listener.
 
 ### The logger
 

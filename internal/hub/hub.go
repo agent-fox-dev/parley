@@ -43,6 +43,7 @@ const maintenanceGrace = 15 * time.Second
 // down in one place.
 var parts = []func(*Composition){
 	composeIdempotency,
+	composeBootstrap,
 }
 
 // Options are the inputs of Run. The process gives Args, Env, WorkDir,
@@ -338,11 +339,13 @@ type run struct {
 }
 
 // Run is parleyd: it parses opts.Args and starts the hub, and returns the
-// exit status: 0 after --help or a stop, 1 when the start fails, 2 for a
-// usage error. A usage error loads, opens and creates nothing.
+// exit status: 0 after --help, after the bootstrap wrote the admin token
+// file, or after a stop; 1 when the start fails; 2 for a usage error. A usage
+// error loads, opens and creates nothing.
 //
 // The start runs in this order and stops at the first failure: load the
-// configuration, open the stores, the bootstrap, the start hooks in the order
+// configuration, open the stores, the bootstrap (which may end the run
+// after writing the admin token file), the start hooks in the order
 // they were added, bind the listener, start the maintenance pass, then write
 // the listening line and serve. A failure is one error line on Stderr; what
 // was opened is closed. The hub serves until ctx is cancelled or the process
@@ -494,12 +497,6 @@ func (r *run) start(ctx context.Context, c *Composition, cfg *config.Config, st 
 		return 1
 	}
 	return 0
-}
-
-// bootstrap is the start stage between opening the stores and the start
-// hooks. It reports done when the run ends after it, without serving.
-func bootstrap(context.Context, *Runtime, command) (done bool, err error) {
-	return false, nil
 }
 
 // firstPass runs every maintenance task once, in the order they were added,

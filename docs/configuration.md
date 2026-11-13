@@ -20,6 +20,13 @@ looked for in is the *config dir*. The `config` member of the `listening`
 line is the absolute path that was looked for, also when the file does not
 exist (see [cli.md](cli.md#log-lines)).
 
+The config dir also receives the admin token file, `admin_token` (mode
+`0600`), when `parleyd` runs with `--admin-email` on a new hub or with
+`--reset-admin-token`. It holds the hub's admin token in clear text; save the
+token and delete the file, since the hub does not start while it is there
+(see [cli.md](cli.md#the-admin-token)). The config dir must exist for the
+file to be written.
+
 The file is TOML and is checked strictly: invalid TOML, a section or a key
 no part of the hub registers, and a value of the wrong type or out of range
 each stop the start with exit status `1` and one error line that names the
