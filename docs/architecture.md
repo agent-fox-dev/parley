@@ -16,7 +16,7 @@ command-line client. Both are written in Go, in the module
 | `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, and a registry of keys and whole sections that decides what the file may hold |
 | `internal/hub` | the composition of the `parleyd` process: argument parsing, the scrubbing logger, the fixed start order, the bootstrap of the admin token, the HTTP server's options, the idempotency records in the transactional store, signals and the stop, and the `backup` command; the one place later packages plug their parts in ([ADR 01](adr/01-compose-the-hub-in-one-package.md)) |
 | `internal/maintenance` | the maintenance loop: a registry of named tasks, and `Loop`, which runs one pass at once and one at each tick of an hourly timer, the tasks of a pass one after the other in a fixed order, and logs a failing task without stopping the others |
-| `internal/identity` | who may use the hub: the admin settings in the transactional store (the bootstrap e-mail and the admin token's hash), the generation and hashing of admin tokens, and `VerifyAdminToken`, which compares a presented token's hash with the stored one in constant time |
+| `internal/identity` | who may use the hub: the admin settings in the transactional store (the bootstrap e-mail and the admin token's hash), the generation and hashing of admin tokens, and `VerifyAdminToken`, which compares a presented token's hash with the stored one in constant time; the identity records (users, orgs, memberships, API keys, PATs), the generation of API keys and PATs, and `Service`, the pipeline's authenticator |
 | `internal/scrub` | the one scrubbing function for text that leaves the hub: `Scrubber.Scrub` replaces registered secret values and the hub's own credential formats by `[redacted]`, removes user information from URLs and cuts the text to 1024 bytes; a leaf package that imports nothing of the project |
 | `internal/store` | the hub's two embedded SQLite stores (`modernc.org/sqlite`, no cgo): `Open` creates the data directory and the workspace root, opens the transactional store and the analytical store (`analytics.db` beside it) and applies the registered schema steps; `Tx` runs a transaction of the transactional store; `Snapshot` writes a consistent copy of one store file without changing it |
 | `internal/server` | the hub's HTTP server: its built-in routes, the REST API's route registration and check pipeline, the error envelope, request ids, response headers and the access log, list paging, idempotency keys, and the readiness probes |
@@ -146,8 +146,9 @@ A public route skips authentication and step 4. The access position holds a
 list: every check added with `AddAccessCheck` runs, in the order it was
 added, and decides from the matched route whether it applies. The
 authenticator reports a `server.Caller` (`CredentialID`, and `UserID` or
-`Admin` for the admin token), which the pipeline puts in the request's
-context; later checks and the handler read it with
+`Admin` for the admin token, and `Detail`, what the authenticator knows
+beyond the ids, which the server does not read), which the pipeline puts in
+the request's context; later checks and the handler read it with
 `server.CallerOf(r.Context())`. An `*server.Error` (also when wrapped) is
 written as its envelope; any other error as `500 internal` with the message
 `internal error`, and its text is logged through `Options.Logger` as an
@@ -614,6 +615,63 @@ commit and removed once it has committed), refuses with an error naming the file
 while a bootstrapped hub's file exists, or goes on to the start hooks. After
 writing the file it logs the path at warn level and `Run` returns `0`
 without running a start hook or binding the listener.
+
+### Identity
+
+`internal/hub/identity.go` adds the part `composeIdentity`, after
+`composeBootstrap` in `parts`. It adds the schema step
+`identity.SchemaStep` (`identity_records`), installs the `Authenticate`
+method of an `identity.Service` as the pipeline's authenticator, and adds the
+start hook `identity`, which binds the service with
+`(*identity.Service).Bind(identity.Deps{Store, Now, Providers,
+ExternalURL})` from the `Runtime` before the hub serves its first request.
+
+The schema step creates, in the transactional store:
+
+| Table | Columns |
+|---|---|
+| `users` | `id` (primary key), `username` (unique), `email` (unique), `full_name`, `role` (`user` or `admin`), `status` (`active` or `blocked`), `provider` and `provider_id` (unique as a pair), `created_at`, `updated_at` |
+| `orgs` | `id` (primary key), `name` (unique), `slug` (unique), `url`, `owner_id` (set to NULL when that user is deleted), `status`, `created_at`, `updated_at` |
+| `memberships` | `org_id` and `user_id` (primary key as a pair; deleted with the org or the user), `created_at` |
+| `api_keys` | `key_id` (primary key), `user_id` (deleted with the user), `secret_hash`, `expires_days`, `expires_at`, `revoked_at`, `created_at` |
+| `pats` | `token_id` (primary key), `user_id` (deleted with the user), `secret_hash`, `name`, `permissions` (a JSON array), `paths` (a JSON array, NULL without path limits), `workspace` (NULL when not bound), `expires_at`, `revoked_at`, `created_at` |
+
+Timestamps are nanoseconds since the Unix epoch, UTC; `expires_at` and
+`revoked_at` are NULL when unset. `secret_hash` is the lowercase hex SHA-256
+of the secret part of the credential; the secret is never stored.
+
+`identity.IssueAPIKey(ctx, tx, userID, expiresDays, now)` and
+`identity.StorePAT(ctx, tx, identity.PATSpec{UserID, Name, Permissions,
+Paths, Workspace, ExpiresAt, CreatedAt})` generate a credential from
+`crypto/rand` (an API key `parley_<8>_<32>` over `[0-9A-Za-z]`, a PAT
+`parley_pat_<8>_<32>` over `[a-z0-9]`, each character drawn uniformly),
+draw the id again while it is taken, store the record in the transaction
+they are given and return the credential, which is shown once, with its
+record (`identity.APIKey`, `identity.PAT`). An API key expires `expiresDays`
+× 24 hours after `now`, never with 0. `StorePAT` validates nothing beyond
+the record's shape. `identity.UserByID`, `identity.APIKeyByID` and
+`identity.PATByID` read a record through an `identity.Querier` (the store's
+`*sql.DB` or a `*sql.Tx`) and return `identity.ErrNotFound` when there is
+none. `identity.User` marshals to the REST API's User object.
+
+`(*identity.Service).Authenticate` reads the `Authorization` header (see
+[api.md](api.md#authentication)), and `(*identity.Service).VerifyCredential(ctx,
+credential)` checks the credential, the same check for a credential read
+elsewhere: it recognises the format, verifies an admin token with
+`identity.VerifyAdminToken`, or looks the key or PAT up by its id and
+compares the SHA-256 of the presented secret with the stored hash with
+`crypto/subtle.ConstantTimeCompare`, against a fixed dummy hash when the id
+is unknown, so that an unknown id and a wrong secret take the same path.
+It returns an `identity.Principal` (`Type` `admin`, `api_key` or `pat`,
+`CredentialID`, the `User`, and a PAT's `Permissions`, `Paths` and
+`Workspace`) or the `*server.Error` that answers the request. The
+authenticator reports a `server.Caller` whose `CredentialID` is `admin`, the
+`key_id` or the `token_id`, whose `UserID` is the user's id, whose `Admin`
+marks the admin token, and whose `Detail` holds the `Principal`; checks and
+handlers read it with `identity.PrincipalOf(r.Context())`. A route declares
+that it needs a user with the mark `identity.MarkNeedsUser` in its
+`server.Route.Marks`; the authenticator reads it right after accepting the
+credential and answers the admin token `403 forbidden` there.
 
 ### The logger
 

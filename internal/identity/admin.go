@@ -1,7 +1,10 @@
-// Package identity holds who may use the hub. For now it holds the admin
-// token that a new hub hands its operator: the hub stores only the token's
-// hash and the address of the admin who bootstrapped it, and the token
-// itself exists only in the file the operator is told to delete.
+// Package identity holds who may use the hub: the admin token that a new
+// hub hands its operator, the users and their orgs, the API keys and the
+// personal access tokens (PATs), and the authenticator that tells, for every
+// request to a non-public route, which of them is calling. The hub stores
+// only the hash of a secret: the admin token exists only in the file the
+// operator is told to delete, and an API key or PAT only in the answer that
+// issued it.
 package identity
 
 import (

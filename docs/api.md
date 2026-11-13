@@ -44,9 +44,9 @@ A request to a REST route passes these checks in this order. The first one
 that fails answers the request, and no later check or the handler runs.
 
 1. Route matching: `404 not_found` or `405 method_not_allowed`, as above.
-2. Authentication. A route that is not public needs a credential. While the
-   hub has no authenticator, which is the case in this version, every route
-   that is not public is answered `401` with `error_type` `unauthenticated`.
+2. Authentication. A route that is not public needs a credential, as in
+   [Authentication](#authentication): `401 unauthenticated`, or `403
+   forbidden` for the admin token on a route that needs a user.
 3. The rate limit: `429 rate_limited`, as in [Rate limit](#rate-limit).
 4. The body size, then the content type: `413` or `415`, as in
    [Request bodies](#request-bodies).
@@ -69,6 +69,46 @@ writes them to its log with the request id that the response carries in
 `X-Request-ID`, and goes on serving other requests. When a handler has
 already started its answer before it fails, the answer is left as it is: the
 error is written to the log with the request id, not appended to the body.
+
+## Authentication
+
+Every route under `/api/v1` that is not public needs a credential, sent as
+
+```
+Authorization: Bearer <credential>
+```
+
+The scheme `Bearer` is matched in any letter case and followed by one or
+more spaces; white space around the credential is ignored. A credential in a
+query parameter, a cookie or any other header is not read.
+
+The hub knows three credentials, each recognised by its exact format:
+
+| Credential | Format | Credential id |
+|---|---|---|
+| admin token | `parley_admin_` and 64 characters of `[0-9a-f]` | `admin` |
+| API key | `parley_<key_id>_<secret>`: 8 and 32 characters of `[0-9A-Za-z]` | the `key_id` |
+| personal access token (PAT) | `parley_pat_<token_id>_<secret>`: 8 and 32 characters of `[a-z0-9]` | the `token_id` |
+
+The admin token has no user; an API key and a PAT act for the user they
+belong to, and a PAT also carries its permissions, its path limits and the
+workspace it is bound to. The hub stores the SHA-256 of each secret, never
+the secret, and compares hashes in constant time.
+
+A request that does not pass is answered before any later check runs, with
+one of these:
+
+| Status | `error_type` | `message` | When |
+|---|---|---|---|
+| `401` | `unauthenticated` | `authentication required` | no `Authorization` header, another scheme (such as `Basic`), an empty credential, or a credential of none of the three formats |
+| `401` | `unauthenticated` | `invalid credentials` | an API key or PAT whose id is not stored or whose secret does not match, an admin-format token that is not the admin token, or any admin-format token on a hub that is not bootstrapped; the answer is the same whichever part was wrong |
+| `403` | `forbidden` | `this route needs a user` | the admin token on a route that needs a user; an API key or a PAT passes there |
+
+```json
+{"error":{"code":401,"message":"invalid credentials","error_type":"unauthenticated"}}
+```
+
+The rate limit counts an authenticated request against its credential id.
 
 ## Request ids and response headers
 

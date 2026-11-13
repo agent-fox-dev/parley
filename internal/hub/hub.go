@@ -51,6 +51,7 @@ const DefaultLoopGrace = 15 * time.Second
 var parts = []func(*Composition){
 	composeIdempotency,
 	composeBootstrap,
+	composeIdentity,
 }
 
 // Options are the inputs of Run. The process gives Args, Env, WorkDir,

@@ -29,6 +29,10 @@ type Caller struct {
 	UserID string
 	// Admin marks the admin token.
 	Admin bool
+	// Detail is what the authenticator knows about the caller beyond the
+	// ids, for the checks and handlers of the package that installed it. The
+	// server does not read it.
+	Detail any
 }
 
 type callerKey struct{}
