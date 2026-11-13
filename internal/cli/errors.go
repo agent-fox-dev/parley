@@ -101,6 +101,17 @@ func exitCode(err error) int {
 	return exitClientError
 }
 
+// isHubEnvelope tells whether body is the hub's error envelope: a JSON
+// object whose error member is an object holding error_type.
+func isHubEnvelope(body []byte) bool {
+	var doc struct {
+		Error *struct {
+			ErrorType *string `json:"error_type"`
+		} `json:"error"`
+	}
+	return json.Unmarshal(body, &doc) == nil && doc.Error != nil && doc.Error.ErrorType != nil
+}
+
 // cliEnvelope is the error envelope of an error the CLI raises itself, in the
 // hub's shape with code 0.
 type cliEnvelope struct {
@@ -117,7 +128,13 @@ type cliEnvelope struct {
 func printError(w io.Writer, err error) {
 	var he *hubError
 	if errors.As(err, &he) {
-		fmt.Fprintf(w, "%s", he.body)
+		// Re-indented, not decoded and encoded again, so that the member
+		// order and the extra members stay as the hub sent them.
+		out, err := indentJSON(he.body)
+		if err != nil {
+			out = he.body
+		}
+		fmt.Fprintf(w, "%s", out)
 		return
 	}
 	var env cliEnvelope

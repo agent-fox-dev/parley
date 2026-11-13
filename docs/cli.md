@@ -583,8 +583,8 @@ The login then:
 When the hub answers either request with an error envelope, for example
 `429` on the provider list, or `401` (the provider rejected the code),
 `403` (`user is blocked`), `409` or `502` on the callback, `parley login`
-writes that envelope to stderr exactly as received, saves nothing and
-exits `1`.
+writes that envelope to stderr as received, indented by two spaces (see
+[Output](#output)), saves nothing and exits `1`.
 
 #### With a credential: `--api-key`
 
@@ -619,11 +619,17 @@ indented by two spaces and followed by a newline, writes
 
 When the hub answers with an error envelope, for example `401` for a
 credential it does not know, or `403` for the admin token, `parley login`
-writes that envelope to stderr exactly as received, saves nothing and
-exits `1`:
+writes that envelope to stderr as received, indented by two spaces, saves
+nothing and exits `1`:
 
 ```json
-{"error":{"code":401,"message":"invalid credentials","error_type":"unauthenticated"}}
+{
+  "error": {
+    "code": 401,
+    "message": "invalid credentials",
+    "error_type": "unauthenticated"
+  }
+}
 ```
 
 #### Failures
@@ -687,13 +693,65 @@ credential stays valid and is not saved:
 Nothing is saved on any failure: the config file is neither created nor
 changed.
 
+### Output
+
+stdout carries exactly one JSON document, indented by two spaces and
+followed by one newline, or nothing. A command that calls one route prints
+the hub's answer to a `2xx` status as that document. The body is indented
+again without being decoded, so the order of its members and the text of
+its numbers stay as the hub sent them: the hub's
+`{"id":"x","n":1.50,"big":12345678901234567890}` is printed as
+
+```json
+{
+  "id": "x",
+  "n": 1.50,
+  "big": 12345678901234567890
+}
+```
+
+A `2xx` answer without a body (a `204`, or an empty `200`) prints `{}`, or
+the confirmation document of a command that states one, in the same form,
+for example:
+
+```json
+{
+  "status": "deleted",
+  "slug": "demo"
+}
+```
+
+stderr carries everything else. An error is one JSON document (see
+[Errors and exit statuses](#errors-and-exit-statuses)); warnings, hints
+and progress are plain text lines, and a warning begins with `warning: `.
+A command whose result carries a secret the hub shows only once (a token or
+key value) prints the result unchanged and then writes the line
+
+```
+warning: this value is shown once and will not be shown again
+```
+
+to stderr. It writes no such line when the hub answers an error.
+
+A command with a `--fail-on-…` flag, given the flag, checks the flag's
+condition in the result. When the condition holds, it prints the result on
+stdout as for a success, then writes a `condition_not_met` error with the
+command's message to stderr and exits `3`. When the flag is not given, or
+the condition does not hold, it prints the result, writes nothing to stderr
+and exits `0`.
+
 ### Errors and exit statuses
 
-stdout carries the result, and nothing on a failure. Every error goes to
-stderr as one error envelope, a JSON document indented by two spaces and
-followed by a newline, and nothing else: no usage text follows it. An error
-the hub answered is written as the hub sent it. An error `parley` raises
-itself has `code` `0`, a message and one of five `error_type`s:
+stdout carries the result, and nothing on a failure, except the result a
+`--fail-on-…` condition held in. Every error goes to stderr as one error
+envelope, a JSON document indented by two spaces and followed by a newline,
+and nothing else: no usage text follows it. An error envelope the hub
+answered (a status of `400` or above whose body is a JSON object with an
+`error` member holding `error_type`) is written as the hub sent it, indented
+again by two spaces without being decoded: its `code` is the HTTP status,
+and members such as `error.details` or `error.oldest_seq` are kept with
+their values and in their order. An error `parley` raises itself has `code`
+`0`, a message and one of five `error_type`s:
 
 ```json
 {

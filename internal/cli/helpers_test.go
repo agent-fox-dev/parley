@@ -73,7 +73,6 @@ func withProbes(opts options, more ...func() *cobra.Command) options {
 				Path:        "/things/:name",
 				Args:        []argSpec{{Name: "name", Required: true}},
 				Auth:        authUser,
-				Run:         sendProbeRequest,
 			}),
 			declare(command{
 				Name:        "count",
@@ -82,7 +81,6 @@ func withProbes(opts options, more ...func() *cobra.Command) options {
 				Path:        "/things",
 				Auth:        authUser,
 				Flags:       func(fs *pflag.FlagSet) { fs.Int("limit", 0, "the most things to count") },
-				Run:         sendProbeRequest,
 			}),
 		}
 		for _, build := range more {
@@ -91,19 +89,6 @@ func withProbes(opts options, more ...func() *cobra.Command) options {
 		return group("probe", "Commands that exist only in tests", children...)
 	})
 	return opts
-}
-
-// sendProbeRequest is the run step of the probe commands: it sends the
-// declared method and path, its :name filled in, through the shared client
-// and writes the hub's body to stdout as received.
-func sendProbeRequest(c *call) error {
-	path := strings.Replace(c.decl.Path, ":name", url.PathEscape(c.args["name"]), 1)
-	resp, err := c.client.request(c.ctx, c.decl.Method, path, nil, nil)
-	if err != nil {
-		return err
-	}
-	c.stdout.Write(resp.body)
-	return nil
 }
 
 // runProbes runs parley with the probe commands added and args.
@@ -117,6 +102,28 @@ func runProbes(t *testing.T, args ...string) (int, string, string) {
 func thingHub(t *testing.T, body string) *stubHub {
 	t.Helper()
 	return newStubHub(t).answer(http.MethodGet, "/api/v1/things/x", http.StatusOK, body)
+}
+
+// probeEnv points PARLEY_CONFIG_DIR at an empty directory and
+// PARLEY_ENDPOINT_URL and PARLEY_API_KEY at hubURL and the credential k. A
+// test that calls it must not run in parallel.
+func probeEnv(t *testing.T, hubURL string) {
+	t.Helper()
+	t.Setenv("PARLEY_CONFIG_DIR", t.TempDir())
+	t.Setenv("PARLEY_ENDPOINT_URL", hubURL)
+	t.Setenv("PARLEY_API_KEY", "k")
+}
+
+// indented is the JSON document body as parley prints it: compacted, then
+// indented by 2 spaces, with one newline after it.
+func indented(t *testing.T, body string) string {
+	t.Helper()
+	var compact, out bytes.Buffer
+	if err := json.Compact(&compact, []byte(body)); err != nil {
+		t.Fatalf("not JSON (%v): %q", err, body)
+	}
+	json.Indent(&out, compact.Bytes(), "", "  ")
+	return out.String() + "\n"
 }
 
 // writeConfigFile writes content to config.toml in dir, creating dir, and

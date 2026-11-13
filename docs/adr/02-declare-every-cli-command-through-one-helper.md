@@ -39,12 +39,21 @@ and every command group through `group`; the root command is a group too.
   inherits, turns a flag that is unknown or does not parse into a
   `usage_error`. All of these happen before a run step starts, so a usage
   error reads no setting and sends no request.
+- A command that declares no run step gets the default one: it sends its
+  `Method` to its `Path` through the shared client and prints the hub's
+  answer with the shared printer (`internal/cli/output.go`). What a command
+  adds to the printing is declared too: `Confirm`, the document a success
+  without a body prints in place of `{}`; `ShowsOnce`, which adds the
+  show-once warning after the result; and `FailOn`, the `--fail-on-…` flags
+  whose condition, when it holds, ends the command with `condition_not_met`
+  once the result is printed.
 - A run step returns an error and never writes one. `run` in
   `internal/cli/root.go` prints the error with `printError` and returns
   `exitCode(err)`, both in `internal/cli/errors.go`. Cobra's own error and
   usage output is silenced, so stderr holds the envelope alone.
 - There are two kinds of error. `hubError` is the hub's error envelope, kept
-  as received; it maps to exit status `1`. `cliError` is an error the CLI
+  as received and printed indented again by two spaces, never decoded, so its
+  members and their order reach stderr unchanged; it maps to exit status `1`. `cliError` is an error the CLI
   raises itself, of one of five types, each with its constructor:
   `usage_error` and `client_error` map to `2`, `wait_failed` and
   `wait_timeout` to `1`, `condition_not_met` to `3`. It is printed as

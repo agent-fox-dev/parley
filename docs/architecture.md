@@ -12,7 +12,7 @@ command-line client. Both are written in Go, in the module
 | `cmd/parley` | the `parley` program: it calls `cli.Run` and exits with its status |
 | `cmd/parleyd` | the `parleyd` program: `main` calls `hub.Run` with the process's arguments, environment and working directory and exits with its status |
 | `internal/buildinfo` | the version, commit and build time the binary was built with, shared by both programs |
-| `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra`, each declared through one helper ([ADR 02](adr/02-declare-every-cli-command-through-one-helper.md)), the client configuration file, the resolution of the hub URL and the credential, the one HTTP client the commands send their requests with, and the error envelopes and exit statuses every command ends with |
+| `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra`, each declared through one helper ([ADR 02](adr/02-declare-every-cli-command-through-one-helper.md)), the client configuration file, the resolution of the hub URL and the credential, the one HTTP client the commands send their requests with, the printing of a command's result on stdout and of its warnings on stderr, and the error envelopes and exit statuses every command ends with |
 | `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, and a registry of keys and whole sections that decides what the file may hold |
 | `internal/hub` | the composition of the `parleyd` process: argument parsing, the scrubbing logger, the fixed start order, the bootstrap of the admin token, the HTTP server's options, the idempotency records in the transactional store, signals and the stop, and the `backup` command; the one place later packages plug their parts in ([ADR 01](adr/01-compose-the-hub-in-one-package.md)) |
 | `internal/maintenance` | the maintenance loop: a registry of named tasks, and `Loop`, which runs one pass at once and one at each tick of an hourly timer, the tasks of a pass one after the other in a fixed order, and logs a failing task without stopping the others |
@@ -865,7 +865,9 @@ resolves what it does need itself.
 
 `internal/cli/errors.go` holds the two kinds of error a command ends with.
 `hubError` is an error envelope the hub answered, with the HTTP status and
-the body's bytes as received, which `printError` writes unchanged. `cliError`
+the body's bytes as received, which `printError` writes indented again by
+two spaces with `json.Indent`, so its member order and extra members stay
+as the hub sent them. `cliError`
 is an error the CLI raises itself, built by `usageError`, `clientError`,
 `waitFailed`, `waitTimeout` and `conditionNotMet`; `printError` writes it as
 `{"error":{"code":0,"message":…,"error_type":…}}` indented by two spaces,
@@ -873,6 +875,26 @@ and any other error as a `client_error` with its text as the message.
 `exitCode` maps no error to `0`, a `hubError`, `wait_failed` and
 `wait_timeout` to `1`, `condition_not_met` to `3` and everything else to
 `2`. `parley login` returns these errors too.
+
+`internal/cli/output.go` prints what a command answers. A command declared
+without a run step gets the default one, `sendAndPrint`: it fills each
+`:param` segment of `Path` with the argument of that name (`routePath`),
+sends `Method` to it through the call's client and passes the answer to
+`printAnswer`. A status of `400` or above whose body is an object with an
+`error` member holding `error_type` (`isHubEnvelope`, in `errors.go`)
+becomes a `hubError`; any other status outside `2xx`, and a `2xx` body that
+is not JSON, a `client_error` naming the status. A `2xx` answer without a
+body is replaced by `{}`, or by the document the declaration's `Confirm`
+builds. `printResult` then writes the result with `writeResult`, which
+compacts the body and indents it by two spaces with `json.Indent`, never
+decoding it, and adds one newline; writes the line `warning: this value is
+shown once and will not be shown again` to stderr for a declaration marked
+`ShowsOnce`; and, for each of the declaration's `FailOn` conditions whose
+flag `--fail-on-<Name>` (registered by `declare`) is given, returns
+`condition_not_met` with the condition's message when `Check` says it holds
+in the result, so the result is on stdout before `run` prints the error.
+`warn` and `progress` write a plain line to stderr, a warning prefixed with
+`warning: `; `parley version` writes its warnings with `warn`.
 
 `internal/cli/config.go` is the one implementation of the client
 configuration file. `configPath` gives `$PARLEY_CONFIG_DIR/config.toml`, or

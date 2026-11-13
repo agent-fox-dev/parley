@@ -376,8 +376,8 @@ func TestLogin_PrintsTheHubsErrorAsReceivedAndSavesNothing(t *testing.T) {
 				if code != 1 {
 					t.Errorf("exit status = %d, want 1", code)
 				}
-				if stderr != tt.body {
-					t.Errorf("stderr = %q, want the hub's envelope as received, %q", stderr, tt.body)
+				if want := indented(t, tt.body); stderr != want {
+					t.Errorf("stderr = %q, want the hub's envelope as received, indented, %q", stderr, want)
 				}
 				if stdout != "" {
 					t.Errorf("stdout = %q, want it empty", stdout)

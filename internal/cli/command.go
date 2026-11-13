@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"strings"
 
@@ -45,8 +44,29 @@ type command struct {
 	// Flags adds the command's own flags, if it has any.
 	Flags func(fs *pflag.FlagSet) `json:"-"`
 	// Run is the command's run step; it runs only once the command line
-	// has been accepted.
+	// has been accepted. Without one, the command sends Method and Path
+	// and prints the hub's answer.
 	Run func(c *call) error `json:"-"`
+	// Confirm builds the document a success without a body prints in
+	// place of {}.
+	Confirm func(c *call) any `json:"-"`
+	// ShowsOnce marks a command whose result carries a secret the hub
+	// shows only this once.
+	ShowsOnce bool `json:"-"`
+	// FailOn are the command's --fail-on-… conditions.
+	FailOn []failOn `json:"-"`
+}
+
+// failOn is a --fail-on-<Name> flag: a condition over the command's result
+// that, when the flag is given and the condition holds, ends the command
+// with condition_not_met once the result is printed.
+type failOn struct {
+	// Name follows "fail-on-" in the flag's name.
+	Name        string
+	Description string
+	// Check reports whether the condition holds in result, the document
+	// printed on stdout, and the message of condition_not_met when it does.
+	Check func(result []byte) (holds bool, message string)
 }
 
 // call is one run of a declared command.
@@ -109,13 +129,16 @@ func declare(decl command) *cobra.Command {
 				c.client = newClient(s.hubURL, s.credential)
 			}
 			if decl.Run == nil {
-				return fmt.Errorf("%s has no run step", cmd.CommandPath())
+				return sendAndPrint(c)
 			}
 			return decl.Run(c)
 		},
 	}
 	if decl.Flags != nil {
 		decl.Flags(cmd.Flags())
+	}
+	for _, f := range decl.FailOn {
+		cmd.Flags().Bool(f.flag(), false, f.Description)
 	}
 	return cmd
 }

@@ -58,7 +58,7 @@ func newVersionCommand() *cobra.Command {
 				if err != nil {
 					// parley version always succeeds, so a file it cannot
 					// parse only costs it the hub URL.
-					fmt.Fprintf(c.stderr, "warning: %v; printing the client's build alone\n", err)
+					warn(c.stderr, "%v; printing the client's build alone", err)
 				}
 				hubURL = file.EndpointURL
 			}
@@ -68,7 +68,7 @@ func newVersionCommand() *cobra.Command {
 					// The client's own build is still worth printing, so a hub
 					// that cannot be read is a warning and not a failure.
 					reason := strings.ReplaceAll(err.Error(), "\n", " ")
-					fmt.Fprintf(c.stderr, "warning: cannot read the hub's version from %s: %s\n", hubURL, reason)
+					warn(c.stderr, "cannot read the hub's version from %s: %s", hubURL, reason)
 				}
 				doc.Server = server
 			}
