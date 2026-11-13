@@ -292,7 +292,11 @@ identity sees the record when the first one succeeded, and exactly one waiter
 runs the handler when it failed. The map's mutex is held only to find or drop
 a slot, never while a request waits or runs, so requests with different keys,
 callers or paths never wait for each other; a slot is dropped when its count
-reaches zero. A waiting request whose client goes away stops waiting.
+reaches zero. A waiting request whose client goes away (its context ends)
+stops waiting and ends unanswered: nothing is written, nothing is logged at
+error level, and a debug line `request ended while waiting for idempotency key`
+carries the `request_id` and the `error`. Its access-log line shows status
+`200`, the status of a request that wrote nothing.
 
 The installed checks are copied under a read lock at the start of each
 request, and no lock is held while a check or a handler runs, so a request
