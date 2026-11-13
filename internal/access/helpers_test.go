@@ -220,3 +220,32 @@ func decode(t *testing.T, a answer) envelope {
 	}
 	return e
 }
+
+// readLog records, in order, the reads of the sources it wraps: "record"
+// for the record of one slug, "orgs" for a user's active orgs.
+type readLog struct {
+	reads []string
+}
+
+// records wraps r so that its record reads are logged.
+func (l *readLog) records(r access.RecordReader) access.RecordReader {
+	return loggedRecords{RecordReader: r, log: l}
+}
+
+// memberships wraps m so that its reads are logged.
+func (l *readLog) memberships(m access.Memberships) access.Memberships {
+	return access.MembershipsFunc(func(ctx context.Context, userID string) ([]string, error) {
+		l.reads = append(l.reads, "orgs")
+		return m.ActiveOrgIDs(ctx, userID)
+	})
+}
+
+type loggedRecords struct {
+	access.RecordReader
+	log *readLog
+}
+
+func (r loggedRecords) Record(ctx context.Context, slug string) (access.Record, bool, error) {
+	r.log.reads = append(r.log.reads, "record")
+	return r.RecordReader.Record(ctx, slug)
+}

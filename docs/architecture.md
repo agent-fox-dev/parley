@@ -1210,7 +1210,12 @@ with the role admin has no level from the role.
 
 `(*Service).Level(ctx, caller, slug)` returns the level, the record and
 whether the slug has one. It reads the record first: a slug with no record
-is `LevelNone`, found `false` and no error, for every caller. Then:
+is `LevelNone` and found `false`, for every caller. For a user, though, a
+missing slug still reads the user's active orgs, as a repository the user
+cannot see would, and returns that read's error if it fails. A missing slug
+therefore costs the same reads as an invisible repository, and fails the
+same way. An invisible fork costs one record read more (its parent), and
+that difference is not matched. Then:
 
 - the admin token is `LevelAdmin` on every workspace, repository or fork;
 - on a repository, a user whose id is the record's `owner_id` is

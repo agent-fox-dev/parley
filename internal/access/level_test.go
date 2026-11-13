@@ -3,6 +3,7 @@ package access_test
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 
 	"github.com/agent-fox-dev/parley/internal/access"
@@ -166,6 +167,9 @@ func TestLevel_AFailedReadIsAnErrorWithLevelNone(t *testing.T) {
 		{"the fork's parent", failingRecords{RecordReader: reader, fail: []string{"acme"}}, members, byKey("u-member"), "acme--m", true, access.LevelNone},
 		{"the memberships", reader, failingMemberships, byKey("u-member"), "acme", true, access.LevelNone},
 		{"the memberships, on a fork", reader, failingMemberships, byKey("u-member"), "acme--m", true, access.LevelNone},
+		// A missing slug fails as an invisible repository does, or the
+		// failure would tell the two apart.
+		{"the memberships, on a missing slug", reader, failingMemberships, byKey("u-member"), "does-not-exist", true, access.LevelNone},
 		// The owner is decided before any membership read.
 		{"the memberships, for the owner", reader, failingMemberships, byKey("u-owner"), "acme", false, access.LevelOwner},
 		{"the memberships, for the admin token", reader, failingMemberships, adminToken, "acme", false, access.LevelAdmin},
@@ -179,6 +183,38 @@ func TestLevel_AFailedReadIsAnErrorWithLevelNone(t *testing.T) {
 		}
 		if err != nil || got != c.wantLevel {
 			t.Errorf("a failed read of %s = %q, %v, want %q and no error", c.name, got, err, c.wantLevel)
+		}
+	}
+}
+
+// A caller with no level on a repository must not learn that it exists from
+// the work its lookup costs, so a missing slug is resolved with the same
+// reads as a repository the caller cannot see.
+func TestLevel_ReadsTheSameSourcesForAMissingSlugAsForAnInvisibleRepository(t *testing.T) {
+	t.Parallel()
+	st, _ := levelWorld(t)
+	members := memberships{of: map[string][]string{"u-other": {"o1"}}, active: []string{"o1", "o2"}}
+	reads := func(caller server.Caller, slug string) []string {
+		log := &readLog{}
+		svc := newService(log.records(access.StoreRecords(st.Main())), log.memberships(members))
+		got, _, _, err := svc.Level(context.Background(), access.CallerFrom(caller), slug)
+		if err != nil || got != access.LevelNone {
+			t.Fatalf("Level on %s = %q, %v, want none and no error", slug, got, err)
+		}
+		return log.reads
+	}
+	for _, c := range []struct {
+		name   string
+		caller server.Caller
+	}{
+		{"a user of no org", byKey("u-stranger")},
+		{"a member of another org", byKey("u-other")},
+		{"a caller with no user", server.Caller{CredentialID: "anonymous"}},
+	} {
+		// solo belongs to u-owner and o2, in which neither user is a member.
+		invisible, missing := reads(c.caller, "solo"), reads(c.caller, "does-not-exist")
+		if !slices.Equal(missing, invisible) {
+			t.Errorf("%s: a missing slug reads %v, an invisible repository %v, want the same", c.name, missing, invisible)
 		}
 	}
 }

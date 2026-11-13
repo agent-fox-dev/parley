@@ -62,8 +62,9 @@ func (s *Service) Bind(d Deps) {
 
 // Level resolves the caller c's level on the workspace slug and returns it
 // with the workspace's record. A slug with no record is LevelNone with found
-// = false and no error, whoever asks. A failed read is LevelNone, no record
-// and the error, never a grant.
+// = false, whoever asks; for a user it still costs the reads of a repository
+// the user cannot see, so it also fails when they fail. A failed read is
+// LevelNone, no record and the error, never a grant.
 //
 // The workspace's status is not read: a caller has the same level in every
 // status, and the routes check the status after the access step.
@@ -73,13 +74,28 @@ func (s *Service) Level(ctx context.Context, c Caller, slug string) (Level, Reco
 		return LevelNone, Record{}, false, err
 	}
 	if !found {
-		return LevelNone, Record{}, false, nil
+		return LevelNone, Record{}, false, s.readAsInvisible(ctx, c)
 	}
 	level, err := s.levelOn(ctx, c, rec)
 	if err != nil {
 		return LevelNone, Record{}, false, err
 	}
 	return level, rec, true, nil
+}
+
+// readAsInvisible does, for a slug with no record, the reads that resolving
+// c's level on a repository c cannot see would do, and returns their error.
+// A user is not told that a repository exists by a lookup that answers the
+// same bytes but costs a membership read more. A fork the user cannot see
+// costs one record read more again (its parent's), which is not matched.
+func (s *Service) readAsInvisible(ctx context.Context, c Caller) error {
+	if c.Admin || c.UserID == "" {
+		return nil
+	}
+	if _, err := s.userLevels(c.UserID).orgs(ctx); err != nil {
+		return fmt.Errorf("read the active orgs of the caller: %w", err)
+	}
+	return nil
 }
 
 // levelOn resolves c's level on the workspace whose record is rec.
