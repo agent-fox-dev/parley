@@ -116,6 +116,7 @@ func newRootCommand(opts options) *cobra.Command {
 	root.PersistentFlags().Bool("json", false, "print the help as JSON")
 	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return usageError("%v", err) })
 
+	installHelp(root)
 	root.AddCommand(newVersionCommand(), newLoginCommand())
 	for _, build := range opts.extra {
 		root.AddCommand(build())

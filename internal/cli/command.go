@@ -25,6 +25,9 @@ const (
 type argSpec struct {
 	Name     string `json:"name"`
 	Required bool   `json:"required"`
+	// Repeats marks the last argument as taking every remaining word,
+	// joined by single spaces.
+	Repeats bool `json:"-"`
 }
 
 // command is the declaration of one parley command: everything that differs
@@ -117,12 +120,18 @@ func declare(decl command) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:         useLine(decl),
 		Short:       decl.Description,
-		Args:        checkArgs(decl.Args),
+		Args:        checkCommandLine(decl.Args),
 		Annotations: map[string]string{declarationAnnotation: string(encoded)},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			named := make(map[string]string, len(args))
-			for i, value := range args {
-				named[decl.Args[i].Name] = value
+			for i, spec := range decl.Args {
+				switch {
+				case i >= len(args):
+				case spec.Repeats:
+					named[spec.Name] = strings.Join(args[i:], " ")
+				default:
+					named[spec.Name] = args[i]
+				}
 			}
 			c := &call{
 				ctx:    cmd.Context(),
@@ -157,6 +166,22 @@ func declare(decl command) *cobra.Command {
 	return cmd
 }
 
+// declarationOf is the declaration declare kept in cmd, or the zero
+// declaration for a command not built by declare.
+func declarationOf(cmd *cobra.Command) command {
+	var decl command
+	if encoded, ok := cmd.Annotations[declarationAnnotation]; ok {
+		// declare wrote it, so it decodes.
+		_ = json.Unmarshal([]byte(encoded), &decl)
+	}
+	return decl
+}
+
+// isGroup tells whether cmd is a command group built by group.
+func isGroup(cmd *cobra.Command) bool {
+	return cmd.Annotations[groupAnnotation] == "true"
+}
+
 // group builds a command group: a command that only holds children. Run
 // alone it prints its help; given a word that is none of its children, it
 // fails with a usage error, where cobra would print the help.
@@ -180,27 +205,63 @@ func group(name, description string, children ...*cobra.Command) *cobra.Command 
 }
 
 // useLine is the command's name followed by its arguments, <required> and
-// [optional].
+// [optional], with ... after one that repeats.
 func useLine(decl command) string {
 	words := []string{decl.Name}
 	for _, a := range decl.Args {
+		word := "[" + a.Name + "]"
 		if a.Required {
-			words = append(words, "<"+a.Name+">")
-		} else {
-			words = append(words, "["+a.Name+"]")
+			word = "<" + a.Name + ">"
 		}
+		if a.Repeats {
+			word += "..."
+		}
+		words = append(words, word)
 	}
 	return strings.Join(words, " ")
 }
 
+// checkCommandLine refuses, as a usage error, fewer arguments than specs
+// requires, more than it names, and a required flag that is not given.
+// cobra checks required flags itself only after this, with an error of no
+// kind, so the check is here, before any run step.
+func checkCommandLine(specs []argSpec) cobra.PositionalArgs {
+	countArgs := checkArgs(specs)
+	return func(cmd *cobra.Command, args []string) error {
+		if err := countArgs(cmd, args); err != nil {
+			return err
+		}
+		var missing []string
+		cmd.Flags().VisitAll(func(f *pflag.Flag) {
+			if isRequired(f) && !f.Changed {
+				missing = append(missing, "--"+f.Name)
+			}
+		})
+		if len(missing) > 0 {
+			return usageError("%s needs the flag %s", cmd.CommandPath(), strings.Join(missing, " and "))
+		}
+		return nil
+	}
+}
+
+// isRequired tells whether f was marked required with cobra.MarkFlagRequired.
+func isRequired(f *pflag.Flag) bool {
+	required := f.Annotations[cobra.BashCompOneRequiredFlag]
+	return len(required) > 0 && required[0] == "true"
+}
+
 // checkArgs refuses fewer arguments than specs requires and more than it
-// names, as a usage error.
+// names, as a usage error. A last argument that repeats takes any number of
+// words.
 func checkArgs(specs []argSpec) cobra.PositionalArgs {
 	return func(cmd *cobra.Command, args []string) error {
 		for i, spec := range specs {
 			if spec.Required && i >= len(args) {
 				return usageError("%s needs the argument <%s>", cmd.CommandPath(), spec.Name)
 			}
+		}
+		if n := len(specs); n > 0 && specs[n-1].Repeats {
+			return nil
 		}
 		if len(args) > len(specs) {
 			if len(specs) == 0 {

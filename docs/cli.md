@@ -308,8 +308,9 @@ Usage:
   parley [command]
 ```
 
-Run without arguments (or with `--help`), `parley` prints its help on stdout
-and exits `0`. It reads no credential and sends no request:
+Run without arguments (or with `--help`, or as `parley help`), `parley`
+prints its help on stdout and exits `0`. It reads no credential and sends no
+request (see [Help](#help)):
 
 ```
 parley is the command-line client of the Parley hub
@@ -319,7 +320,7 @@ Usage:
   parley [command]
 
 Available Commands:
-  help        Help about any command
+  help        Print the help of parley or of a command
   login       Sign in to the hub and save the hub URL and the credential
   version     Print the client's build and, given a hub URL, the hub's build
 
@@ -340,13 +341,102 @@ Every command takes the global flags, before or after its own words.
 |---|---|
 | `--endpoint-url <url>` | the URL of the hub, for example `http://127.0.0.1:8080`. When it is absent or empty, `PARLEY_ENDPOINT_URL` gives it, then the key `endpoint_url` of the client configuration file (see [Settings](#settings-the-hub-url-and-the-credential)) |
 | `--api-key <credential>` | the credential presented to the hub as `Authorization: Bearer`. When it is absent or empty, `PARLEY_API_KEY` gives it, then the key `api_key` of the client configuration file. `parley login --api-key` stores it and takes it from this flag alone (see [With a credential](#with-a-credential---api-key)) |
-| `--json` | accepted on every command; it changes neither the request a command sends nor what it prints |
-| `-h`, `--help` | print the help of the command on stdout and exit `0` |
+| `--json` | with `--help` or `parley help`, print the help as one JSON document (see [Help](#help)). Accepted on every command; without help it changes neither the request a command sends nor what it prints |
+| `-h`, `--help` | print the help of the command on stdout and exit `0` (see [Help](#help)) |
 
 A global flag may stand before, between or after the command's words, with
 its value as the next word or after `=`: `parley --endpoint-url <url> version`,
 `parley version --endpoint-url <url>` and `parley version --endpoint-url=<url>`
 are the same command.
+
+### Help
+
+```
+Usage:
+  parley help [command]... [flags]
+```
+
+Help is printed on stdout with exit status `0`, and it never reads a
+setting, never reads the client configuration file (a file that is not
+valid TOML does not matter to it) and never sends a request. It comes in
+three forms:
+
+- `parley` without arguments, and a command group without a subcommand,
+  print the help of the root or of the group, which lists each of its
+  direct subcommands with its description;
+- `parley <words> --help` prints the help of the command `<words>` names:
+  its description, its usage line with its arguments (`<name>` required,
+  `[name]` optional), its own flags with their defaults and the global
+  flags. A flag the command requires need not be given;
+- `parley help <words>` prints exactly what `parley <words> --help` prints,
+  and `parley help` alone the help of the root.
+
+With the global flag `--json`, each form prints one JSON document instead,
+indented by two spaces and followed by a newline, built from the command's
+declaration. For a command that is not a group it is one object:
+
+```json
+{
+  "name": "version",
+  "description": "Print the client's build and, given a hub URL, the hub's build",
+  "method": "GET",
+  "path": "/version",
+  "args": [],
+  "flags": [
+    {
+      "name": "api-key",
+      "type": "string",
+      "required": false,
+      "default": "",
+      "description": "credential presented to the hub (default: $PARLEY_API_KEY, then api_key in the config file); parley login takes it from this flag alone and stores it (- reads it from stdin)"
+    },
+    {
+      "name": "endpoint-url",
+      "type": "string",
+      "required": false,
+      "default": "",
+      "description": "URL of the hub (default: $PARLEY_ENDPOINT_URL, then endpoint_url in the config file)"
+    },
+    {
+      "name": "json",
+      "type": "bool",
+      "required": false,
+      "default": "false",
+      "description": "print the help as JSON"
+    }
+  ],
+  "auth": "none"
+}
+```
+
+| Member | Value |
+|---|---|
+| `name` | the command's words after `parley`, joined by single spaces (`help`, `version`) |
+| `description` | the command's description |
+| `method`, `path` | the route the command calls, `path` relative to `/api/v1` with `:param` for its parameters (`parley version`'s `/version` lies outside it); both `null` for a command that calls no single route (`help`, `login`) |
+| `args` | the positional arguments in order, each `{"name", "required"}`; `[]` for none |
+| `flags` | every flag the command takes, sorted by `name`: its own flags (its `--fail-on-…` flags included) and the three global flags `api-key`, `endpoint-url` and `json`, not `--help`. Each is `{"name"` (without dashes)`, "type"` (the flag library's name for it: `string`, `bool`, `int`, …)`, "required", "default"` (as a string)`, "description"}` |
+| `auth` | `none`: the command needs neither a hub URL nor a credential before it runs (`help`, `version`, `login`); `user` or `admin`: it needs both |
+
+For a command group, and for `parley` itself (`parley help --json`,
+`parley --help --json`, `parley --json`), the document is
+`{"commands": [...]}`: the object of every command under the group or the
+root that is not itself a group, at any depth, sorted by `name`; a group
+appears only in the names of its commands.
+
+`parley help` with words that name no command fails with a `usage_error`
+naming the first word it cannot place, with or without `--json`, and prints
+nothing on stdout:
+
+```json
+{
+  "error": {
+    "code": 0,
+    "message": "unknown command \"nosuch\" for \"parley\"",
+    "error_type": "usage_error"
+  }
+}
+```
 
 ### Settings: the hub URL and the credential
 
@@ -815,7 +905,7 @@ their values and in their order. An error `parley` raises itself has `code`
 
 | `error_type` | When |
 |---|---|
-| `usage_error` | the command line cannot be accepted: an unknown command, at the top level or under a group, an unknown flag, a flag without its value or with a value that does not parse as the flag's type, fewer or more arguments than the command takes, or a value the command refuses (`parley login --expires 45`). It is raised before any setting is read and before any request |
+| `usage_error` | the command line cannot be accepted: an unknown command, at the top level or under a group, an unknown flag, a flag without its value or with a value that does not parse as the flag's type, fewer or more arguments than the command takes, a flag the command requires that is not given, `parley help` with words that name no command, or a value the command refuses (`parley login --expires 45`). It is raised before any setting is read and before any request |
 | `client_error` | a failure on the client's side that is not the command line's: for example no hub URL, a configuration file that cannot be read, a hub that cannot be reached, an answer that is not the hub's. A failure inside the CLI of no other kind is reported as a `client_error` too, with its text as the message |
 | `wait_failed` | a wait for a long operation ended in a state that is not a success |
 | `wait_timeout` | a wait for a long operation ran out of time |

@@ -818,8 +818,8 @@ opens the sign-in page, by default the system's opener in
 `internal/cli/browser.go`; and `Hooks.LoginWait`, how long the browser login
 waits for the redirect, by default 120 s). It builds a fresh cobra
 command tree on each call: the root command `parley` with the persistent
-global flags `--endpoint-url`, `--api-key` and `--json`, and the `version`
-and `login` subcommands, plus the commands the unexported `options.extra`
+global flags `--endpoint-url`, `--api-key` and `--json`, and the `help`,
+`version` and `login` subcommands, plus the commands the unexported `options.extra`
 builds, which tests use to add probe commands. It executes the tree with the
 arguments; when a command returns an error, `run` writes it to stderr with
 `printError` and returns `exitCode(err)` (both in `internal/cli/errors.go`).
@@ -834,7 +834,10 @@ A command is declared through one helper, `declare` in
 route), its named arguments (`argSpec`), its `auth` level (`none`, `user`,
 `admin`), its own flags and its run step. `declare` keeps the declaration as
 JSON in the cobra command's `Annotations` (`parley.declaration`), refuses a
-wrong number of arguments as a `usage_error`, and runs the run step with a
+wrong number of arguments, and a flag marked required with
+`cobra.MarkFlagRequired` that is not given, as a `usage_error`
+(`checkCommandLine`, which runs before cobra's own check of required flags,
+whose error has no kind), and runs the run step with a
 `call`: the context, the arguments by name, stdout, stderr and the run's
 options, which `run` passes down in the context. `group` builds a command
 group, which prints its help without a word and refuses a word that is none
@@ -842,6 +845,24 @@ of its children as a `usage_error` (cobra alone would print the help); the
 root is a group too, and its flag error handler turns every flag that is
 unknown or does not parse, on any command, into a `usage_error`.
 `parley version` and `parley login` are declared through `declare`.
+
+Help lives in `internal/cli/help.go`. `installHelp` keeps cobra's own text
+help, sets the root's help function, which `--help` on any command and a
+group run without a word reach, and replaces cobra's help command with
+`help [command]...`, declared through `declare` (auth `none`, no route; its
+argument `Repeats`, taking every remaining word). The help command finds its
+words with the root's `Find`; words left over are a `usage_error` naming
+the first, and otherwise it prints what `--help` on that command prints,
+after adding cobra's `--help` flag to it as cobra does when it runs it. With
+the global `--json` the help is one JSON document instead: `describe`
+builds a command's object from its declaration (`declarationOf`, which
+decodes the `parley.declaration` annotation; an undeclared command has an
+empty description and auth), with `method` and `path` `null` when empty and
+`flagsOf` listing its local and inherited flags sorted by name, without the
+flags cobra adds itself; for a group (`isGroup`, the `parley.group`
+annotation), the root included, `describeAll` lists every command under it
+that is not a group, at any depth, sorted by name. Help resolves no setting,
+reads no file and sends no request.
 
 Before the run step of a command whose `auth` is `user` or `admin`,
 `declare` resolves its settings with `resolveSettings`

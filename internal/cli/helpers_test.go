@@ -60,35 +60,69 @@ func runCLIWith(t *testing.T, opts options, args ...string) (int, string, string
 }
 
 // withProbes is opts with the command group "probe" added to the tree, which
-// exists only in tests: "probe get <name>" (GET /things/:name, auth user),
-// "probe count" (an int flag --limit) and the commands more builds. The tree
-// is built afresh on every run, so more is called once per run.
+// exists only in tests: "probe get <name>", "probe count" and the commands
+// more builds.
 func withProbes(opts options, more ...func() *cobra.Command) options {
+	return withProbeGroup(opts, append([]func() *cobra.Command{probeGet, probeCount}, more...)...)
+}
+
+// withProbeGroup is opts with the command group "probe" holding exactly the
+// commands children builds. The tree is built afresh on every run, so each
+// builder is called once per run.
+func withProbeGroup(opts options, children ...func() *cobra.Command) options {
 	opts.extra = append(slices.Clone(opts.extra), func() *cobra.Command {
-		children := []*cobra.Command{
-			declare(command{
-				Name:        "get",
-				Description: "Get a thing",
-				Method:      http.MethodGet,
-				Path:        "/things/:name",
-				Args:        []argSpec{{Name: "name", Required: true}},
-				Auth:        authUser,
-			}),
-			declare(command{
-				Name:        "count",
-				Description: "Count the things",
-				Method:      http.MethodGet,
-				Path:        "/things",
-				Auth:        authUser,
-				Flags:       func(fs *pflag.FlagSet) { fs.Int("limit", 0, "the most things to count") },
-			}),
+		built := make([]*cobra.Command, 0, len(children))
+		for _, build := range children {
+			built = append(built, build())
 		}
-		for _, build := range more {
-			children = append(children, build())
-		}
-		return group("probe", "Commands that exist only in tests", children...)
+		return group("probe", "Commands that exist only in tests", built...)
 	})
 	return opts
+}
+
+// probeGet builds "probe get <name>": GET /things/:name, auth user, with an
+// int flag --limit whose default is 50.
+func probeGet() *cobra.Command {
+	return declare(command{
+		Name:        "get",
+		Description: "Get a thing",
+		Method:      http.MethodGet,
+		Path:        "/things/:name",
+		Args:        []argSpec{{Name: "name", Required: true}},
+		Auth:        authUser,
+		Flags:       func(fs *pflag.FlagSet) { fs.Int("limit", 50, "the most things to get") },
+	})
+}
+
+// probeCount builds "probe count": GET /things, auth user, with an int flag
+// --limit.
+func probeCount() *cobra.Command {
+	return declare(command{
+		Name:        "count",
+		Description: "Count the things",
+		Method:      http.MethodGet,
+		Path:        "/things",
+		Auth:        authUser,
+		Flags:       func(fs *pflag.FlagSet) { fs.Int("limit", 0, "the most things to count") },
+	})
+}
+
+// probeAdmin builds the group "probe admin" holding "purge [reason]":
+// DELETE /things, auth admin, with a bool flag --confirm it requires.
+func probeAdmin() *cobra.Command {
+	purge := declare(command{
+		Name:        "purge",
+		Description: "Purge the things",
+		Method:      http.MethodDelete,
+		Path:        "/things",
+		Args:        []argSpec{{Name: "reason"}},
+		Auth:        authAdmin,
+		Flags: func(fs *pflag.FlagSet) {
+			fs.Bool("confirm", false, "confirm the purge")
+			cobra.MarkFlagRequired(fs, "confirm")
+		},
+	})
+	return group("admin", "Administer the things", purge)
 }
 
 // runProbes runs parley with the probe commands added and args.

@@ -31,9 +31,13 @@ and every command group through `group`; the root command is a group too.
   differs from the others; later fields add what some commands need.
 - `declare` keeps the declaration, as JSON, in the cobra command's
   `Annotations` under `parley.declaration`, so that what describes the
-  command (its help, for one) is built from the same value it runs from.
+  command is built from the same value it runs from: its JSON help
+  (`parley help <command> --json`) is the declaration's description,
+  route, arguments and `auth`, with the flags the command takes.
 - `declare` sets cobra's `Args` from the declared arguments, and a
-  wrong number of them is a `usage_error`. `group` refuses any word that
+  wrong number of them is a `usage_error`, as is a flag marked required
+  (`cobra.MarkFlagRequired`) that is not given; cobra's own check of
+  required flags would come later and return an error of no kind. `group` refuses any word that
   is not one of its children as a `usage_error`, and prints its help when
   it is given none. The root's flag error handler, which every command
   inherits, turns a flag that is unknown or does not parse into a
