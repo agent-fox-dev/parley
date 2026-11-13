@@ -100,4 +100,10 @@ grepping for declarations.
   is `.golangci.yml`.
 - Spec packages live in `.specs/`; the product PRD is split per section in
   `docs/prd/`.
-- No shared test helpers exist yet. Name them here when the first ones land.
+- Shared test helpers live in `internal/hubtest`, imported by test code
+  only: `hubtest.Start` bootstraps a hub with an admin token and serves it
+  in-process on a free loopback port (its `Hub` has `Token`, `Store`,
+  `URL(path)`, `CreateUser` and `IssueKey`), `hubtest.Serve` runs a hub
+  with the options a test gives until the test ends, and `hubtest.LogBuffer`
+  is the buffer a running hub may write its log to while the test reads it.
+  A test that needs a running hub starts it with these.

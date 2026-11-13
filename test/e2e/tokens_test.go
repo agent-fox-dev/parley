@@ -54,9 +54,9 @@ func itemByID(t *testing.T, r ran, id string, value any) map[string]any {
 
 func TestTokens_ADeveloperMintsAPathScopedTokenThatAnAgentNarrowsAndTheDeveloperRevokes(t *testing.T) {
 	h := startIdentityHub(t)
-	h.createUser(t, "alice")
+	h.CreateUser(t, "alice")
 	key := h.issueKey(t, "alice")
-	tokens := h.url + "/api/v1/user/tokens"
+	tokens := h.URL("") + "/api/v1/user/tokens"
 
 	created := h.must(t, key, "tokens", "create", "--name", "ci", "--permissions", "git:read,tokens:manage", "--paths", "docs/**")
 	if !strings.Contains(created.stderr, "not be shown again") {
@@ -99,12 +99,12 @@ func TestTokens_ADeveloperMintsAPathScopedTokenThatAnAgentNarrowsAndTheDeveloper
 
 func TestTokens_AnOperatorRevokesAUsersToken(t *testing.T) {
 	h := startIdentityHub(t)
-	h.createUser(t, "alice")
+	h.CreateUser(t, "alice")
 	pat := h.must(t, h.issueKey(t, "alice"), "tokens", "create", "--name", "ops", "--permissions", "users:read").json(t)
 	bearer := "Bearer " + pat["token"].(string)
-	user := h.url + "/api/v1/user"
+	user := h.URL("") + "/api/v1/user"
 
-	items := itemValues(t, h.must(t, h.token, "admin", "tokens", "list", "alice"), "revoked_at")
+	items := itemValues(t, h.must(t, h.Token, "admin", "tokens", "list", "alice"), "revoked_at")
 	if len(items) != 1 || items[0] != nil {
 		t.Fatalf("alice's tokens as the operator sees them: revoked_at = %v, want one live token", items)
 	}
@@ -112,10 +112,10 @@ func TestTokens_AnOperatorRevokesAUsersToken(t *testing.T) {
 		t.Fatalf("GET /api/v1/user with alice's token = %d, want 200", status)
 	}
 
-	if r := h.must(t, h.token, "admin", "tokens", "revoke", "alice", pat["token_id"].(string)).json(t); r["revoked_at"] == nil {
+	if r := h.must(t, h.Token, "admin", "tokens", "revoke", "alice", pat["token_id"].(string)).json(t); r["revoked_at"] == nil {
 		t.Errorf("admin tokens revoke printed %v, want revoked_at set", r)
 	}
-	if got := itemValues(t, h.must(t, h.token, "admin", "tokens", "list", "alice"), "revoked_at"); len(got) != 1 || got[0] == nil {
+	if got := itemValues(t, h.must(t, h.Token, "admin", "tokens", "list", "alice"), "revoked_at"); len(got) != 1 || got[0] == nil {
 		t.Errorf("alice's tokens after the revocation: revoked_at = %v, want it set", got)
 	}
 	if status, _ := getAuthorized(t, user, bearer); status != http.StatusUnauthorized {

@@ -1,12 +1,10 @@
 package e2e
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"net"
 	"net/http"
@@ -14,7 +12,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -22,6 +19,7 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/config"
 	"github.com/agent-fox-dev/parley/internal/hub"
+	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/store"
 
@@ -32,85 +30,6 @@ import (
 // the flag and signal handling cmd/parleyd hands the process's inputs to.
 // They are not parallel: the first-boot flow sends SIGTERM to the test
 // process, and every running hub catches it.
-
-// lockedBuffer is a bytes.Buffer a hub may write to while the test reads it.
-type lockedBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (b *lockedBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
-}
-
-func (b *lockedBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
-}
-
-// served is a hub running in a goroutine.
-type served struct {
-	stderr *lockedBuffer
-	code   chan int
-	cancel context.CancelFunc
-	// listening is the hub's listening line.
-	listening map[string]any
-}
-
-// serve runs hub.Run with opts and waits up to 5 s for its listening line.
-func serve(t *testing.T, opts hub.Options) *served {
-	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	s := &served{stderr: &lockedBuffer{}, code: make(chan int, 1), cancel: cancel}
-	opts.Stderr = s.stderr
-	go func() { s.code <- hub.Run(ctx, opts) }()
-	t.Cleanup(func() {
-		cancel()
-		select {
-		case <-s.code:
-		case <-time.After(5 * time.Second):
-		}
-	})
-	deadline := time.Now().Add(5 * time.Second)
-	for s.listening == nil {
-		for line := range strings.SplitSeq(s.stderr.String(), "\n") {
-			var rec map[string]any
-			if json.Unmarshal([]byte(line), &rec) == nil && rec["msg"] == "listening" {
-				s.listening = rec
-			}
-		}
-		if s.listening != nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("no listening line within 5 s; stderr = %q", s.stderr.String())
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	return s
-}
-
-// url is the hub's URL for path.
-func (s *served) url(path string) string {
-	addr, _ := s.listening["addr"].(string)
-	return "http://" + addr + path
-}
-
-// exitCode waits up to within for Run to return and gives its status.
-func (s *served) exitCode(t *testing.T, within time.Duration) int {
-	t.Helper()
-	select {
-	case code := <-s.code:
-		s.code <- code // the cleanup reads it again
-		return code
-	case <-time.After(within):
-		t.Fatalf("Run did not return within %v", within)
-		return -1
-	}
-}
 
 // status sends GET url and returns the response status.
 func status(t *testing.T, url string) int {
@@ -160,7 +79,7 @@ func TestLifecycle_FirstBootHandsOutTheAdminTokenThenServesAndStopsOnSIGTERM(t *
 	var outputs []string
 
 	// First run: bootstrap.
-	var out1, err1 lockedBuffer
+	var out1, err1 hubtest.LogBuffer
 	o := opts("--admin-email", "a@x")
 	o.Stdout, o.Stderr = &out1, &err1
 	if code := hub.Run(context.Background(), o); code != 0 {
@@ -171,7 +90,7 @@ func TestLifecycle_FirstBootHandsOutTheAdminTokenThenServesAndStopsOnSIGTERM(t *
 	token := checkTokenFile(t, tokenFile, dir)
 
 	// Second run: refused while the file exists.
-	var out2, err2 lockedBuffer
+	var out2, err2 hubtest.LogBuffer
 	o = opts()
 	o.Stdout, o.Stderr = &out2, &err2
 	if code := hub.Run(context.Background(), o); code != 1 {
@@ -186,17 +105,17 @@ func TestLifecycle_FirstBootHandsOutTheAdminTokenThenServesAndStopsOnSIGTERM(t *
 	if err := os.Remove(tokenFile); err != nil {
 		t.Fatal(err)
 	}
-	var out3 lockedBuffer
+	var out3 hubtest.LogBuffer
 	o = opts()
 	o.Stdout = &out3
-	s := serve(t, o)
-	if got, want := s.listening["config"], filepath.Join(dir, "config.toml"); got != want {
+	s := hubtest.Serve(t, o)
+	if got, want := s.Listening["config"], filepath.Join(dir, "config.toml"); got != want {
 		t.Errorf("listening config = %v, want %s", got, want)
 	}
-	if got := s.listening["data_dir"]; got != dir {
+	if got := s.Listening["data_dir"]; got != dir {
 		t.Errorf("listening data_dir = %v, want %s", got, dir)
 	}
-	if got := status(t, s.url("/readyz")); got != http.StatusOK {
+	if got := status(t, s.URL("/readyz")); got != http.StatusOK {
 		t.Errorf("GET /readyz = %d, want 200", got)
 	}
 	waitUntil(5*time.Second, func() bool { return tasks.Load() >= 1 })
@@ -206,15 +125,15 @@ func TestLifecycle_FirstBootHandsOutTheAdminTokenThenServesAndStopsOnSIGTERM(t *
 	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
 		t.Fatal(err)
 	}
-	if code := s.exitCode(t, 2*time.Second); code != 0 {
+	if code := s.ExitCode(t, 2*time.Second); code != 0 {
 		t.Errorf("Run returned %d after SIGTERM, want 0", code)
 	}
-	addr, _ := s.listening["addr"].(string)
+	addr, _ := s.Listening["addr"].(string)
 	if conn, err := net.Dial("tcp", addr); err == nil {
 		conn.Close()
 		t.Errorf("%s accepts connections after the stop", addr)
 	}
-	outputs = append(outputs, out3.String(), s.stderr.String())
+	outputs = append(outputs, out3.String(), s.Log.String())
 
 	hexPart := strings.TrimPrefix(token, "parley_admin_")
 	for _, text := range outputs {
@@ -249,7 +168,7 @@ func TestLifecycle_BacksUpARunningHubAndAHubStartsOnTheSnapshot(t *testing.T) {
 	}
 
 	var rt1 *hub.Runtime
-	hub1 := serve(t, hub.Options{WorkDir: dir, Env: env, Compose: compose(&rt1)})
+	hub1 := hubtest.Serve(t, hub.Options{WorkDir: dir, Env: env, Compose: compose(&rt1)})
 	commit := func(txn int) error {
 		return rt1.Store.Tx(context.Background(), func(tx *sql.Tx) error {
 			for n := range 10 {
@@ -269,7 +188,7 @@ func TestLifecycle_BacksUpARunningHubAndAHubStartsOnTheSnapshot(t *testing.T) {
 	stopWriter := keepCommitting(10, commit)
 
 	target := filepath.Join(t.TempDir(), "snapshot")
-	var out, errb lockedBuffer
+	var out, errb hubtest.LogBuffer
 	code := hub.Run(context.Background(), hub.Options{
 		Args: []string{"backup", target}, Env: env, WorkDir: dir, Stdout: &out, Stderr: &errb,
 		Compose: compose(new(*hub.Runtime)),
@@ -277,7 +196,7 @@ func TestLifecycle_BacksUpARunningHubAndAHubStartsOnTheSnapshot(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("parleyd backup returned %d, want 0; stderr = %q", code, errb.String())
 	}
-	if got := status(t, hub1.url("/readyz")); got != http.StatusOK {
+	if got := status(t, hub1.URL("/readyz")); got != http.StatusOK {
 		t.Errorf("GET /readyz of the running hub = %d after the backup, want 200", got)
 	}
 	if err := stopWriter(); err != nil {
@@ -293,15 +212,15 @@ func TestLifecycle_BacksUpARunningHubAndAHubStartsOnTheSnapshot(t *testing.T) {
 	writeConfig(t, dir2, "[server]\nbind = \"127.0.0.1\"\nport = 0\n\n[database]\npath = \""+
 		filepath.Join(target, "parley.db")+"\"\n\n[workspace]\npath = \""+filepath.Join(target, "workspaces")+"\"\n")
 	appliedBefore := applied.Load()
-	hub2 := serve(t, hub.Options{WorkDir: dir2, Env: env, Compose: compose(new(*hub.Runtime))})
-	if got := status(t, hub2.url("/readyz")); got != http.StatusOK {
+	hub2 := hubtest.Serve(t, hub.Options{WorkDir: dir2, Env: env, Compose: compose(new(*hub.Runtime))})
+	if got := status(t, hub2.URL("/readyz")); got != http.StatusOK {
 		t.Errorf("GET /readyz of the hub on the snapshot = %d, want 200", got)
 	}
 	if applied.Load() != appliedBefore {
 		t.Errorf("the hub on the snapshot applied a schema step")
 	}
-	hub2.cancel()
-	if code := hub2.exitCode(t, 5*time.Second); code != 0 {
+	hub2.Stop()
+	if code := hub2.ExitCode(t, 5*time.Second); code != 0 {
 		t.Errorf("the hub on the snapshot returned %d after a stop, want 0", code)
 	}
 
@@ -310,8 +229,8 @@ func TestLifecycle_BacksUpARunningHubAndAHubStartsOnTheSnapshot(t *testing.T) {
 	}
 	git(t, filepath.Join(target, "workspaces", "r.git"), "fsck", "--no-progress")
 
-	hub1.cancel()
-	if code := hub1.exitCode(t, 5*time.Second); code != 0 {
+	hub1.Stop()
+	if code := hub1.ExitCode(t, 5*time.Second); code != 0 {
 		t.Errorf("the first hub returned %d after a stop, want 0", code)
 	}
 }

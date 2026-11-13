@@ -20,6 +20,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/cli"
 	"github.com/agent-fox-dev/parley/internal/config"
 	"github.com/agent-fox-dev/parley/internal/hub"
+	"github.com/agent-fox-dev/parley/internal/hubtest"
 )
 
 // fakeGitHub is GitHub's sign-in as a browser and the hub meet it: an
@@ -97,8 +98,8 @@ func startLoginHub(t *testing.T) (hubURL, dbPath string) {
 		"authorize_url = %q\ntoken_url = %q\nuserinfo_url = %q\n",
 		gh.URL+"/login/oauth/authorize", gh.URL+"/login/oauth/access_token", gh.URL+"/user"))
 	env := config.MapEnv(map[string]string{"XDG_CONFIG_HOME": dir, "XDG_DATA_HOME": dir})
-	s := serve(t, hub.Options{Env: env, WorkDir: dir, Compose: addWhoami})
-	return s.url(""), filepath.Join(dir, "parley.db")
+	s := hubtest.Serve(t, hub.Options{Env: env, WorkDir: dir, Compose: addWhoami})
+	return s.URL(""), filepath.Join(dir, "parley.db")
 }
 
 // browserLogin runs parley login against hubURL with configDir as

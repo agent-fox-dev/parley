@@ -18,9 +18,9 @@ import (
 
 func TestKeys_ADeveloperRefreshesTheKeyOnTheirMachine(t *testing.T) {
 	h := startIdentityHub(t)
-	h.createUser(t, "alice")
+	h.CreateUser(t, "alice")
 	old := h.issueKey(t, "alice")
-	alice, err := identity.UserBySelector(context.Background(), h.store.Main(), "alice")
+	alice, err := identity.UserBySelector(context.Background(), h.Store.Main(), "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -28,7 +28,7 @@ func TestKeys_ADeveloperRefreshesTheKeyOnTheirMachine(t *testing.T) {
 	// no flag or variable in its way.
 	dir := t.TempDir()
 	clientEnv(t, dir)
-	writeConfig(t, dir, "endpoint_url = '"+h.url+"'\napi_key = '"+old+"'\nuser_id = '"+alice.ID+"'\n")
+	writeConfig(t, dir, "endpoint_url = '"+h.URL("")+"'\napi_key = '"+old+"'\nuser_id = '"+alice.ID+"'\n")
 	parley := func(args ...string) ran {
 		var stdout, stderr bytes.Buffer
 		code := cli.Run(context.Background(), args, &stdout, &stderr)
@@ -52,7 +52,7 @@ func TestKeys_ADeveloperRefreshesTheKeyOnTheirMachine(t *testing.T) {
 		t.Errorf("the config file's api_key = %q, want the new key %v", saved["api_key"], out["key"])
 	}
 
-	if status, _ := getAuthorized(t, h.url+"/api/v1/user/keys", "Bearer "+old); status != http.StatusUnauthorized {
+	if status, _ := getAuthorized(t, h.URL("")+"/api/v1/user/keys", "Bearer "+old); status != http.StatusUnauthorized {
 		t.Errorf("GET /api/v1/user/keys with the old key = %d, want 401", status)
 	}
 	list := parley("keys", "list")
