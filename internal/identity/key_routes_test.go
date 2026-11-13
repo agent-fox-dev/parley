@@ -118,7 +118,7 @@ func TestRefreshKey_RefusesAPATAndTheAdminTokenBeforeTheLookup(t *testing.T) {
 			}
 		}
 	}
-	if got := h.get("/api/v1/test/whoami", "Bearer "+h.key).status; got != http.StatusOK {
+	if got := h.whoamiStatus(h.key); got != http.StatusOK {
 		t.Errorf("whoami with alice's key = %d, want 200", got)
 	}
 }
@@ -217,7 +217,7 @@ func TestOwnKeyRoutes_AnswerAMissingAndAnotherUsersKeyAlike(t *testing.T) {
 			t.Errorf("%s: the store changed", what)
 		}
 	}
-	if got := h.get("/api/v1/test/whoami", "Bearer "+bobKey).status; got != http.StatusOK {
+	if got := h.whoamiStatus(bobKey); got != http.StatusOK {
 		t.Errorf("whoami with bob's key = %d, want 200", got)
 	}
 }

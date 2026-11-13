@@ -15,6 +15,7 @@ const (
 	configuredKey   = "parley_Ab3dE6gH_0123456789abcdefghijABCDEFGHIJ01"
 	configuredKeyID = "Ab3dE6gH"
 	refreshedKey    = "parley_Ab3dE6gH_ZYXWVUTSRQponmlkjihgfedcba987654"
+	otherKey        = "parley_Qr5sT7uV_abcdefghijABCDEFGHIJ0123456789kl"
 	refreshAnswer   = `{"key":"` + refreshedKey + `","key_id":"` + configuredKeyID + `","expires_at":"2027-02-11T10:00:00Z"}`
 	revokedKey      = `{"key_id":"` + configuredKeyID + `","user_id":"u-1","expires_at":null,"revoked_at":"2026-11-13T10:00:00Z","created_at":"2026-11-01T10:00:00Z"}`
 )
@@ -62,11 +63,6 @@ func wantOneRequest(t *testing.T, hub *stubHub, method, rawPath string) {
 }
 
 // The test sets environment variables, so it must not run in parallel.
-func TestKeysList_SendsOneRequestAndPrintsTheAnswer(t *testing.T) {
-	wantSends(t, []string{"keys", "list"}, sentRequest{method: http.MethodGet, rawPath: "/api/v1/user/keys"})
-}
-
-// The test sets environment variables, so it must not run in parallel.
 func TestKeysRefresh_PrintsTheNewKeyAndSavesItInTheConfigFile(t *testing.T) {
 	hub := newStubHub(t).answer(http.MethodPost, "/api/v1/user/keys/"+configuredKeyID+"/refresh", http.StatusOK, refreshAnswer)
 	path := keysEnv(t, hub, configuredKey)
@@ -99,6 +95,8 @@ func TestKeysRefresh_ReportsANewKeyItCannotSave(t *testing.T) {
 		// setup prepares the environment and returns the config file's
 		// path.
 		setup func(t *testing.T, hub *stubHub) string
+		// args are the global flags the command line adds.
+		args []string
 	}{
 		{"the config directory is read-only", func(t *testing.T, hub *stubHub) string {
 			if os.Geteuid() == 0 {
@@ -111,8 +109,16 @@ func TestKeysRefresh_ReportsANewKeyItCannotSave(t *testing.T) {
 			}
 			t.Cleanup(func() { os.Chmod(dir, 0o700) })
 			return path
-		}},
-		{"there is no config file", noConfigEnv},
+		}, nil},
+		{"there is no config file", noConfigEnv, nil},
+		{"the config file holds another key, the key used is given by --api-key", func(t *testing.T, hub *stubHub) string {
+			return keysEnv(t, hub, otherKey)
+		}, []string{"--api-key", configuredKey}},
+		{"the config file holds another key, the key used is given by PARLEY_API_KEY", func(t *testing.T, hub *stubHub) string {
+			path := keysEnv(t, hub, otherKey)
+			t.Setenv("PARLEY_API_KEY", configuredKey)
+			return path
+		}, nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -120,7 +126,7 @@ func TestKeysRefresh_ReportsANewKeyItCannotSave(t *testing.T) {
 			path := tt.setup(t, hub)
 			before := snapshot(t, filepath.Dir(path))
 
-			code, stdout, stderr := runCLI(t, "keys", "refresh")
+			code, stdout, stderr := runCLI(t, append([]string{"keys", "refresh"}, tt.args...)...)
 
 			if code != 2 {
 				t.Errorf("exit status = %d, want 2", code)
@@ -182,23 +188,32 @@ func TestKeysRevoke_RevokesTheConfiguredKeyAndClearsItFromTheConfigFile(t *testi
 		// noFile gives the settings through the environment, without a
 		// config file.
 		noFile bool
+		// fileKey is the API key of the config file when it is not the key
+		// revoked, which --api-key then gives.
+		fileKey string
 	}{
 		{name: "with a config file", status: http.StatusOK, answer: revokedKey},
 		{name: "without a config file", status: http.StatusOK, answer: revokedKey, noFile: true},
+		{name: "the config file holds another key", status: http.StatusOK, answer: revokedKey, fileKey: otherKey},
 		{name: "the hub answers an error", status: http.StatusNotFound, answer: notFound},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			hub := newStubHub(t).answer(http.MethodDelete, "/api/v1/user/keys/"+configuredKeyID, tt.status, tt.answer)
 			var path string
-			if tt.noFile {
+			args := []string{"keys", "revoke"}
+			switch {
+			case tt.noFile:
 				path = noConfigEnv(t, hub)
-			} else {
+			case tt.fileKey != "":
+				path = keysEnv(t, hub, tt.fileKey)
+				args = append(args, "--api-key", configuredKey)
+			default:
 				path = keysEnv(t, hub, configuredKey)
 			}
 			before := snapshot(t, filepath.Dir(path))
 
-			code, stdout, stderr := runCLI(t, "keys", "revoke")
+			code, stdout, stderr := runCLI(t, args...)
 
 			wantOneRequest(t, hub, http.MethodDelete, "/api/v1/user/keys/"+configuredKeyID)
 			if tt.status != http.StatusOK {
@@ -221,6 +236,15 @@ func TestKeysRevoke_RevokesTheConfiguredKeyAndClearsItFromTheConfigFile(t *testi
 			}
 			if want := indented(t, tt.answer); stdout != want {
 				t.Errorf("stdout = %q, want %q", stdout, want)
+			}
+			if tt.fileKey != "" {
+				if stderr != "" {
+					t.Errorf("stderr = %q, want it empty", stderr)
+				}
+				if after := snapshot(t, filepath.Dir(path)); !reflect.DeepEqual(after, before) {
+					t.Errorf("the config directory changed:\nbefore %v\nafter  %v", before, after)
+				}
+				return
 			}
 			if !strings.Contains(stderr, "parley login") {
 				t.Errorf("stderr = %q, want it to tell the user to run parley login", stderr)

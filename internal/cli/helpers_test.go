@@ -799,14 +799,21 @@ func wantSends(t *testing.T, args []string, want sentRequest) {
 		}
 		return
 	}
+	wantJSONBody(t, got.body, want.body)
+}
+
+// wantJSONBody fails the test unless got is the JSON document want, compared
+// by value.
+func wantJSONBody(t *testing.T, got, want string) {
+	t.Helper()
 	var gotBody, wantBody any
-	if err := json.Unmarshal([]byte(got.body), &gotBody); err != nil {
-		t.Fatalf("body %q is not JSON: %v", got.body, err)
+	if err := json.Unmarshal([]byte(got), &gotBody); err != nil {
+		t.Fatalf("body %q is not JSON: %v", got, err)
 	}
-	if err := json.Unmarshal([]byte(want.body), &wantBody); err != nil {
+	if err := json.Unmarshal([]byte(want), &wantBody); err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(gotBody, wantBody) {
-		t.Errorf("body = %s, want %s", got.body, want.body)
+		t.Errorf("body = %s, want %s", got, want)
 	}
 }

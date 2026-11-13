@@ -2,7 +2,6 @@ package identity_test
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"net/http"
 	"reflect"
@@ -11,35 +10,6 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/identity"
 )
-
-// begin opens a transaction of the hub's store that the test commits or
-// rolls back itself.
-func (h *testHub) begin() *sql.Tx {
-	h.t.Helper()
-	tx, err := h.st.Main().BeginTx(context.Background(), nil)
-	if err != nil {
-		h.t.Fatalf("begin: %v", err)
-	}
-	return tx
-}
-
-// end commits tx, or rolls it back when commit is false.
-func (h *testHub) end(tx *sql.Tx, commit bool) {
-	h.t.Helper()
-	end := tx.Rollback
-	if commit {
-		end = tx.Commit
-	}
-	if err := end(); err != nil {
-		h.t.Fatalf("end the transaction: %v", err)
-	}
-}
-
-// whoamiStatus is the status GET /test/whoami answers the PAT value.
-func (h *testHub) whoamiStatus(value string) int {
-	h.t.Helper()
-	return h.get("/api/v1/test/whoami", "Bearer "+value).status
-}
 
 func TestRevokeTokenByID_RevokesThroughTheCallersTransaction(t *testing.T) {
 	t.Parallel()

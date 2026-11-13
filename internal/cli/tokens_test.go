@@ -1,9 +1,7 @@
 package cli
 
 import (
-	"encoding/json"
 	"net/http"
-	"reflect"
 	"strings"
 	"testing"
 )
@@ -18,22 +16,6 @@ const mintedToken = `{"token":"parley_pat_k3x9q2mz_0123456789abcdefghijklmnopqrs
 func tokenRevokedAt(revokedAt string) string {
 	return `{"token_id":"k3x9q2mz","name":"ci","permissions":[],"paths":null,"workspace":null,` +
 		`"expires_at":null,"revoked_at":` + revokedAt + `,"created_at":"2026-11-13T10:00:00Z"}`
-}
-
-// wantJSONBody fails the test unless got is the JSON document want, compared
-// by value.
-func wantJSONBody(t *testing.T, got, want string) {
-	t.Helper()
-	var gotBody, wantBody any
-	if err := json.Unmarshal([]byte(got), &gotBody); err != nil {
-		t.Fatalf("body %q is not JSON: %v", got, err)
-	}
-	if err := json.Unmarshal([]byte(want), &wantBody); err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(gotBody, wantBody) {
-		t.Errorf("body = %s, want %s", got, want)
-	}
 }
 
 // The test sets environment variables, so it must not run in parallel.
@@ -81,16 +63,25 @@ func TestTokensCreate_SendsTheTokenAndWarnsItsValueIsShownOnce(t *testing.T) {
 }
 
 // The test sets environment variables, so it must not run in parallel.
-func TestTokensCommands_SendOneRequestAndPrintTheAnswer(t *testing.T) {
+func TestKeyAndTokenCommands_SendOneRequestAndPrintTheAnswer(t *testing.T) {
 	tests := []struct {
 		args []string
 		want sentRequest
 	}{
+		{[]string{"keys", "list"}, sentRequest{method: http.MethodGet, rawPath: "/api/v1/user/keys"}},
 		{[]string{"tokens", "list"}, sentRequest{method: http.MethodGet, rawPath: "/api/v1/user/tokens"}},
 		{[]string{"tokens", "show", "k3x9q2mz"}, sentRequest{method: http.MethodGet, rawPath: "/api/v1/user/tokens/k3x9q2mz"}},
 		{[]string{"tokens", "revoke", "k3x9q2mz"}, sentRequest{method: http.MethodDelete, rawPath: "/api/v1/user/tokens/k3x9q2mz"}},
 		{[]string{"tokens", "replace", "k3x9q2mz", "--permissions", ""},
 			sentRequest{method: http.MethodPut, rawPath: "/api/v1/user/tokens/k3x9q2mz/permissions", body: `{"permissions":[]}`}},
+		{[]string{"admin", "keys", "list", "alice"}, sentRequest{method: http.MethodGet, rawPath: "/api/v1/users/alice/keys"}},
+		{[]string{"admin", "keys", "list", "a/b"}, sentRequest{method: http.MethodGet, rawPath: "/api/v1/users/a%2Fb/keys"}},
+		{[]string{"admin", "keys", "revoke", "alice", "Ab3dE6gH"}, sentRequest{method: http.MethodDelete, rawPath: "/api/v1/users/alice/keys/Ab3dE6gH"}},
+		{[]string{"admin", "keys", "revoke", "a/b", "k?1"}, sentRequest{method: http.MethodDelete, rawPath: "/api/v1/users/a%2Fb/keys/k%3F1"}},
+		{[]string{"admin", "tokens", "list", "alice"}, sentRequest{method: http.MethodGet, rawPath: "/api/v1/users/alice/tokens"}},
+		{[]string{"admin", "tokens", "list", "a/b"}, sentRequest{method: http.MethodGet, rawPath: "/api/v1/users/a%2Fb/tokens"}},
+		{[]string{"admin", "tokens", "revoke", "alice", "k3x9q2mz"}, sentRequest{method: http.MethodDelete, rawPath: "/api/v1/users/alice/tokens/k3x9q2mz"}},
+		{[]string{"admin", "tokens", "revoke", "a/b", "k?1"}, sentRequest{method: http.MethodDelete, rawPath: "/api/v1/users/a%2Fb/tokens/k%3F1"}},
 	}
 	for _, tt := range tests {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {

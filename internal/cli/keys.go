@@ -81,9 +81,10 @@ func sendForConfiguredKey(c *call) (*response, error) {
 
 // refreshKey is the run step of parley keys refresh: it asks the hub for a
 // new secret of the key, prints the answer with the show-once warning, and
-// saves the new key as api_key of the config file. The hub has replaced the
-// key once it answers, so a key that cannot be saved is still printed, and
-// the command then fails with a client error.
+// saves the new key as api_key of the config file when the file holds the
+// key that was refreshed. The hub has replaced the key once it answers, so a
+// key that cannot be saved is still printed, and the command then fails with
+// a client error.
 func refreshKey(c *call) error {
 	resp, err := sendForConfiguredKey(c)
 	if err != nil {
@@ -100,7 +101,7 @@ func refreshKey(c *call) error {
 		err = errors.New("the hub's answer holds no key")
 	}
 	if err == nil {
-		err = saveRefreshedKey(answer.Key)
+		err = saveRefreshedKey(c.client.credential, answer.Key)
 	}
 	if err != nil {
 		warn(c.stderr, "the new key was not saved; it is printed above, and parley login --api-key - saves it")
@@ -109,11 +110,13 @@ func refreshKey(c *call) error {
 	return nil
 }
 
-// saveRefreshedKey sets api_key of the config file to key and keeps every
-// other key. Only a file that exists is written: a credential given by the
-// flag or the environment has no file to go to, and creating one is not
-// the refresh's to do.
-func saveRefreshedKey(key string) error {
+// saveRefreshedKey sets api_key of the config file to key, in place of used,
+// the key that was refreshed, and keeps every other key. Only a file that
+// exists and holds used is written: a credential given by the flag or the
+// environment may have no file to go to, or a file that holds another key
+// the refresh did not touch, and creating or overwriting one is not the
+// refresh's to do.
+func saveRefreshedKey(used, key string) error {
 	exists, err := configFileExists()
 	if err != nil {
 		return err
@@ -125,13 +128,18 @@ func saveRefreshedKey(key string) error {
 	if err != nil {
 		return err
 	}
+	if file.APIKey != used {
+		return fmt.Errorf("the config file %s holds another API key", configPathForMessage())
+	}
 	return saveConfig(configSettings{EndpointURL: file.EndpointURL, APIKey: key, UserID: file.UserID})
 }
 
-// revokeKey is the run step of parley keys revoke: it revokes the key, prints
-// the hub's answer, clears api_key and user_id of a config file that exists,
-// which now hold a key that no longer works, and tells the user to sign in
-// again. An error the hub answers leaves the file as it was.
+// revokeKey is the run step of parley keys revoke: it revokes the key and
+// prints the hub's answer. A config file that holds the revoked key has its
+// api_key and user_id cleared, since they no longer work, and the user is
+// told to sign in again, as when there is no config file. A config file that
+// holds another key is left as it is, and that key still signs the user in.
+// An error the hub answers leaves the file as it was.
 func revokeKey(c *call) error {
 	resp, err := sendForConfiguredKey(c)
 	if err != nil {
@@ -144,6 +152,9 @@ func revokeKey(c *call) error {
 	if err == nil && exists {
 		var file configSettings
 		if file, err = readConfig(); err == nil {
+			if file.APIKey != "" && file.APIKey != c.client.credential {
+				return nil
+			}
 			err = saveConfig(configSettings{EndpointURL: file.EndpointURL})
 		}
 	}

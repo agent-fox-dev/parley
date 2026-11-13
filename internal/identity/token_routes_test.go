@@ -95,8 +95,17 @@ func TestCreateToken_KeepsTheNameAndThePathsAsGiven(t *testing.T) {
 				t.Errorf("name, paths = %v, %v, want %v, %v", r.json["name"], r.json["paths"], body["name"], want)
 			}
 			id, _ := r.json["token_id"].(string)
-			if got, want := h.get(tokenPath(id), "Bearer "+h.key).json, withoutMembers(r.json, "token"); !reflect.DeepEqual(got, want) {
+			want := withoutMembers(r.json, "token")
+			if got := h.get(tokenPath(id), "Bearer "+h.key).json; !reflect.DeepEqual(got, want) {
 				t.Errorf("GET /user/tokens/%s = %v, want the created token %v", id, got, want)
+			}
+			list := h.get("/api/v1/user/tokens", "Bearer "+h.key)
+			i := slices.Index(itemValues(t, list, "token_id"), id)
+			if i < 0 {
+				t.Fatalf("GET /user/tokens = %d %s, want an item of the token %s", list.status, list.body, id)
+			}
+			if got := list.json["items"].([]any)[i]; !reflect.DeepEqual(got, want) {
+				t.Errorf("GET /user/tokens: item %v, want the created token %v", got, want)
 			}
 		})
 	}
@@ -132,7 +141,7 @@ func TestCreateToken_SetsExpiresAtFromTheLifetimeInDays(t *testing.T) {
 		want   int
 	}{{-time.Second, http.StatusOK}, {0, http.StatusUnauthorized}, {time.Second, http.StatusUnauthorized}} {
 		h.advance(at.Add(c.offset).Sub(h.now()))
-		if got := h.get("/api/v1/test/whoami", "Bearer "+token).status; got != c.want {
+		if got := h.whoamiStatus(token); got != c.want {
 			t.Errorf("at expires_at %+v: whoami = %d, want %d", c.offset, got, c.want)
 		}
 	}
@@ -372,7 +381,7 @@ func TestRevokeToken_SetsRevokedAtAndTheTokenStopsAuthenticating(t *testing.T) {
 			t.Errorf("%s: DELETE = %d %s, want 200 with %v", c.name, r.status, r.body, want)
 		}
 		if c.value != "" {
-			if got := h.get("/api/v1/test/whoami", "Bearer "+c.value).status; got != http.StatusUnauthorized {
+			if got := h.whoamiStatus(c.value); got != http.StatusUnauthorized {
 				t.Errorf("%s: whoami with the revoked token = %d, want 401", c.name, got)
 			}
 		}
@@ -546,7 +555,7 @@ func TestChangePermissions_RevokesATokenLeftWithoutScopes(t *testing.T) {
 		if r.status != http.StatusOK || !reflect.DeepEqual(r.json["permissions"], []any{}) || r.json["revoked_at"] != h.now().Format(time.RFC3339) {
 			t.Errorf("%s: answer = %d %s, want 200 with permissions [] and revoked_at %s", c.name, r.status, r.body, h.now().Format(time.RFC3339))
 		}
-		if got := h.get("/api/v1/test/whoami", "Bearer "+value).status; got != http.StatusUnauthorized {
+		if got := h.whoamiStatus(value); got != http.StatusUnauthorized {
 			t.Errorf("%s: whoami with the token = %d, want 401", c.name, got)
 		}
 	}

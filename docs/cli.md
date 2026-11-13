@@ -987,11 +987,14 @@ warning: this value is shown once and will not be shown again
 
 and then saves the new `key` as `api_key` in the config file, keeping
 `endpoint_url`, `user_id` and every other key of the file, with mode `0600`;
-it exits `0`. The hub has replaced the key once it answers, so the old key
-no longer works. When the config file does not exist (the credential came
-from `--api-key` or `PARLEY_API_KEY`), or cannot be written, the command
-creates and changes no file, and after the printed answer it writes on
-stderr
+it exits `0`. The old key stops working as soon as the hub answers, so if
+the answer is lost on the way, the new key is lost with it: sign in again
+with `parley login`. When the config file does not exist (the credential
+came from `--api-key` or `PARLEY_API_KEY`), holds an `api_key` other than
+the refreshed key (the credential came from `--api-key` or `PARLEY_API_KEY`,
+and the file's own key, which the refresh did not touch, is left in place),
+or cannot be written, the command creates and changes no file, and after the
+printed answer it writes on stderr
 
 ```
 warning: the new key was not saved; it is printed above, and parley login --api-key - saves it
@@ -999,19 +1002,26 @@ warning: the new key was not saved; it is printed above, and parley login --api-
 
 followed by a `client_error` envelope whose message begins with `the new key
 was not saved: ` and gives the reason, for example `there is no config file
-/home/alice/.parley/config.toml`; the exit status is `2`.
+/home/alice/.parley/config.toml` or `the config file
+/home/alice/.parley/config.toml holds another API key`; the exit status is
+`2`.
 
 `parley keys revoke` prints the revoked key the hub answers, then, when the
-config file exists, sets its `api_key` and `user_id` to the empty string,
-keeping `endpoint_url` and every other key, and writes on stderr
+config file exists and its `api_key` is the revoked key (or empty), sets its
+`api_key` and `user_id` to the empty string, keeping `endpoint_url` and
+every other key, and writes on stderr
 
 ```
 warning: the API key is revoked; run parley login to sign in again
 ```
 
-It exits `0`; without a config file it writes no file. When the hub answers
-an error, the error is written to stderr as received, the exit status is
-`1`, and the config file is left as it was.
+It exits `0`; without a config file it writes no file and still writes the
+warning.
+When the config file holds another API key (the revoked key came from
+`--api-key` or `PARLEY_API_KEY`), the file is left as it was, since its key
+still works, nothing is written on stderr, and the exit status is `0`. When
+the hub answers an error, the error is written to stderr as received, the
+exit status is `1`, and the config file is left as it was.
 
 ### `parley tokens` and `parley admin tokens`
 

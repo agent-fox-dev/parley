@@ -81,6 +81,8 @@ func TestSatisfies_FollowsTheImplicationRules(t *testing.T) {
 // check in the server's pipeline, with a stub authenticator reporting the
 // caller and, after the scope position, an access check that answers 404
 // for the id "missing", as a lookup of a resource that does not exist would.
+// A caller that is the zero Principal is reported without one, as an
+// authenticator other than the identity service's would.
 func TestScopeCheck_HoldsOnlyAPATToTheDeclaredScopeBeforeAnyLaterCheck(t *testing.T) {
 	t.Parallel()
 	pat := func(perms ...string) identity.Principal {
@@ -115,11 +117,17 @@ func TestScopeCheck_HoldsOnlyAPATToTheDeclaredScopeBeforeAnyLaterCheck(t *testin
 		{"a PAT without the scope, the resource present", pat("git:read"), "git:write", "present"},
 		{"a PAT without the scope, the resource missing", pat("git:read"), "git:write", "missing"},
 	}
+	failures := []call{
+		{"a caller without a principal on a route that declares a scope", identity.Principal{}, "git:read", "present"},
+	}
 	run := func(t *testing.T, c call) (r response, handled, laterChecks int64) {
 		var handlerCalls, checkCalls atomic.Int64
 		srv := server.New(server.Options{Logger: slog.New(slog.DiscardHandler), RateLimitDisabled: true})
 		srv.SetAuthenticator(func(*http.Request) (server.Caller, error) {
 			p := c.caller
+			if p.Type == "" {
+				return server.Caller{CredentialID: "c1"}, nil
+			}
 			return server.Caller{CredentialID: p.CredentialID, Admin: p.Type == identity.TypeAdmin, Detail: &p}, nil
 		})
 		srv.SetScopeCheck(identity.ScopeCheck)
@@ -158,6 +166,18 @@ func TestScopeCheck_HoldsOnlyAPATToTheDeclaredScopeBeforeAnyLaterCheck(t *testin
 			if r.status != http.StatusForbidden || r.errorField("error_type") != "insufficient_scope" ||
 				r.errorField("code") != float64(http.StatusForbidden) || !strings.Contains(msg, c.scope) {
 				t.Errorf("answer = %d %s, want 403 insufficient_scope with code 403 naming %s", r.status, r.body, c.scope)
+			}
+			if handled != 0 || later != 0 {
+				t.Errorf("the handler ran %d times and the later check %d times, want 0 and 0", handled, later)
+			}
+		})
+	}
+	for _, c := range failures {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			r, handled, later := run(t, c)
+			if r.status != http.StatusInternalServerError || r.errorField("error_type") != "internal" {
+				t.Errorf("answer = %d %s, want 500 internal", r.status, r.body)
 			}
 			if handled != 0 || later != 0 {
 				t.Errorf("the handler ran %d times and the later check %d times, want 0 and 0", handled, later)

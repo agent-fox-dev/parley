@@ -819,9 +819,12 @@ reads the `Scope` of `server.MatchedRoute(r).Route`, the one declaration a
 route of any part makes, and the `identity.Principal` of the request: a
 route without a scope, the admin token and an API key pass, and a PAT whose
 `Permissions` do not satisfy the scope is answered
-`server.InsufficientScope("this route needs the scope <scope>")`. It runs
-before the access checks and the handler, so a refused token learns nothing
-about the resource it addressed.
+`server.InsufficientScope("this route needs the scope <scope>")`. A route
+that declares a scope and whose request carries no `identity.Principal` (an
+authenticator other than the identity service's) fails closed with
+`server.Internal("the scope check found no authenticated principal")`
+rather than passing. It runs before the access checks and the handler, so a
+refused token learns nothing about the resource it addressed.
 
 `internal/identity/pathglob.go` is the one implementation of a token's path
 limits, pure functions with no state. `identity.ValidatePaths(v)` checks a

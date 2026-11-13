@@ -219,11 +219,40 @@ func (h *testHub) get(path, authorization string) response {
 	return h.do(http.MethodGet, path, nil, header)
 }
 
+// whoamiStatus is the status GET /test/whoami answers the credential value.
+func (h *testHub) whoamiStatus(value string) int {
+	h.t.Helper()
+	return h.get("/api/v1/test/whoami", "Bearer "+value).status
+}
+
 // tx runs fn in a transaction of the hub's store.
 func (h *testHub) tx(fn func(*sql.Tx) error) {
 	h.t.Helper()
 	if err := h.st.Tx(context.Background(), fn); err != nil {
 		h.t.Fatalf("store transaction: %v", err)
+	}
+}
+
+// begin opens a transaction of the hub's store that the test commits or
+// rolls back itself.
+func (h *testHub) begin() *sql.Tx {
+	h.t.Helper()
+	tx, err := h.st.Main().BeginTx(context.Background(), nil)
+	if err != nil {
+		h.t.Fatalf("begin: %v", err)
+	}
+	return tx
+}
+
+// end commits tx, or rolls it back when commit is false.
+func (h *testHub) end(tx *sql.Tx, commit bool) {
+	h.t.Helper()
+	end := tx.Rollback
+	if commit {
+		end = tx.Commit
+	}
+	if err := end(); err != nil {
+		h.t.Fatalf("end the transaction: %v", err)
 	}
 }
 

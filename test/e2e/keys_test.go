@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"net/http"
-	"os"
 	"path/filepath"
 	"testing"
 
@@ -29,8 +28,7 @@ func TestKeys_ADeveloperRefreshesTheKeyOnTheirMachine(t *testing.T) {
 	// no flag or variable in its way.
 	dir := t.TempDir()
 	clientEnv(t, dir)
-	file := filepath.Join(dir, "config.toml")
-	writeTOML(t, file, map[string]string{"endpoint_url": h.url, "api_key": old, "user_id": alice.ID})
+	writeConfig(t, dir, "endpoint_url = '"+h.url+"'\napi_key = '"+old+"'\nuser_id = '"+alice.ID+"'\n")
 	parley := func(args ...string) ran {
 		var stdout, stderr bytes.Buffer
 		code := cli.Run(context.Background(), args, &stdout, &stderr)
@@ -47,7 +45,7 @@ func TestKeys_ADeveloperRefreshesTheKeyOnTheirMachine(t *testing.T) {
 		t.Errorf("keys refresh printed %v, want a new key with key_id %s", out, keyID)
 	}
 	var saved map[string]string
-	if _, err := toml.DecodeFile(file, &saved); err != nil {
+	if _, err := toml.DecodeFile(filepath.Join(dir, "config.toml"), &saved); err != nil {
 		t.Fatal(err)
 	}
 	if saved["api_key"] != out["key"] || saved["api_key"] == old {
@@ -64,17 +62,5 @@ func TestKeys_ADeveloperRefreshesTheKeyOnTheirMachine(t *testing.T) {
 	ids, revoked := itemValues(t, list, "key_id"), itemValues(t, list, "revoked_at")
 	if len(ids) != 1 || ids[0] != keyID || revoked[0] != nil {
 		t.Errorf("keys list = key_ids %v, revoked_at %v; want the one key %s, not revoked", ids, revoked, keyID)
-	}
-}
-
-// writeTOML writes values to path as a TOML file with mode 0600.
-func writeTOML(t *testing.T, path string, values map[string]string) {
-	t.Helper()
-	var b bytes.Buffer
-	if err := toml.NewEncoder(&b).Encode(values); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, b.Bytes(), 0o600); err != nil {
-		t.Fatal(err)
 	}
 }

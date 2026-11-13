@@ -76,16 +76,22 @@ func Satisfies(held []string, needed string) bool {
 // its route declared at registration (server.Route.Scope) and answers 403
 // insufficient_scope, naming that scope, when the token's permissions do not
 // satisfy it. The admin token and API keys carry no scopes and pass, as does
-// any caller on a route that declares none. It runs before the access checks
-// and the handler, so a token without the scope learns nothing about the
-// resource it addressed, not even whether it exists.
+// any caller on a route that declares none. A route that declares a scope
+// and has no principal of the identity service fails closed with an
+// internal error: the check cannot tell whether the caller holds the scope.
+// It runs before the access checks and the handler, so a token without the
+// scope learns nothing about the resource it addressed, not even whether it
+// exists.
 func ScopeCheck(r *http.Request) error {
 	m, ok := server.MatchedRoute(r)
 	if !ok || m.Route.Scope == "" {
 		return nil
 	}
 	p, ok := PrincipalOf(r.Context())
-	if !ok || p.Type != TypePAT || Satisfies(p.Permissions, m.Route.Scope) {
+	if !ok {
+		return server.Internal("the scope check found no authenticated principal")
+	}
+	if p.Type != TypePAT || Satisfies(p.Permissions, m.Route.Scope) {
 		return nil
 	}
 	return server.InsufficientScope("this route needs the scope " + m.Route.Scope)
