@@ -37,19 +37,7 @@ func (s *Service) listOwnKeys(w http.ResponseWriter, r *http.Request) error {
 // writeKeys answers a page of the API keys of the user userID in any
 // state, newest first: created_at descending, then key_id descending.
 func (s *Service) writeKeys(w http.ResponseWriter, r *http.Request, userID string) error {
-	page, err := server.ReadPage(r)
-	if err != nil {
-		return err
-	}
-	after, err := pageAfter[keyPosition](page)
-	if err != nil {
-		return err
-	}
-	keys, err := listKeys(r.Context(), s.deps.Store.Main(), userID, after, page.Limit+1)
-	if err != nil {
-		return err
-	}
-	return server.WritePage(w, page, keys, APIKey.position)
+	return keyTable.writePage(w, r, s.deps.Store.Main(), userID)
 }
 
 // refreshOwnKey answers POST /user/keys/:key_id/refresh: it gives the
@@ -71,7 +59,7 @@ func (s *Service) refreshOwnKey(w http.ResponseWriter, r *http.Request) error {
 	now := s.deps.Now()
 	var answer issuedKey
 	err := s.deps.Store.Tx(r.Context(), func(tx *sql.Tx) error {
-		k, err := keyOfUser(r.Context(), tx, caller.User.ID, server.Param(r, "key_id"))
+		k, err := keyTable.ofUser(r.Context(), tx, caller.User.ID, server.Param(r, "key_id"))
 		if err != nil {
 			return err
 		}
@@ -130,17 +118,6 @@ func (s *Service) revokeKey(w http.ResponseWriter, r *http.Request, userID strin
 // own, whether it exists or not.
 func errKeyNotFound() error { return server.NotFound("API key not found") }
 
-// keyOfUser returns the API key keyID when the user userID owns it. A key
-// that does not exist and one of another user are both errKeyNotFound, so
-// that the answer tells nothing of other users' keys.
-func keyOfUser(ctx context.Context, q Querier, userID, keyID string) (APIKey, error) {
-	k, err := APIKeyByID(ctx, q, keyID)
-	if errors.Is(err, ErrNotFound) || err == nil && k.UserID != userID {
-		return APIKey{}, errKeyNotFound()
-	}
-	return k, err
-}
-
 // keyExpiry returns the expiry of a key refreshed now with the lifetime
 // days: days × 24 hours after the whole second of now, or nil for 0, a key
 // that never expires.
@@ -167,7 +144,7 @@ func setKeySecret(ctx context.Context, tx *sql.Tx, keyID, hash string, expiresAt
 // keeps its first revoked_at, and returns its record as stored then; a key
 // the user does not own is errKeyNotFound.
 func revokeKeyOfUser(ctx context.Context, tx *sql.Tx, userID, keyID string, now time.Time) (APIKey, error) {
-	if _, err := keyOfUser(ctx, tx, userID, keyID); err != nil {
+	if _, err := keyTable.ofUser(ctx, tx, userID, keyID); err != nil {
 		return APIKey{}, err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE api_keys SET revoked_at = ? WHERE key_id = ? AND revoked_at IS NULL`,
@@ -175,45 +152,4 @@ func revokeKeyOfUser(ctx context.Context, tx *sql.Tx, userID, keyID string, now 
 		return APIKey{}, fmt.Errorf("revoke API key %s: %w", keyID, err)
 	}
 	return APIKeyByID(ctx, tx, keyID)
-}
-
-// keyPosition is the position of a key in a list of keys: newest first,
-// created_at descending, then key_id descending, so that keys created at
-// the same instant keep one order across pages.
-type keyPosition struct {
-	CreatedAt int64  `json:"c"`
-	ID        string `json:"id"`
-}
-
-// position returns the position of k in a list of keys.
-func (k APIKey) position() any { return keyPosition{CreatedAt: k.CreatedAt.UnixNano(), ID: k.KeyID} }
-
-// listKeys returns up to limit API keys of the user userID in any state, in
-// the order of a list of keys, after the position after when it is not
-// nil.
-func listKeys(ctx context.Context, q RowsQuerier, userID string, after *keyPosition, limit int) ([]APIKey, error) {
-	query := `SELECT ` + apiKeyColumns + ` FROM api_keys WHERE user_id = ?`
-	args := []any{userID}
-	if after != nil {
-		query += ` AND (created_at < ? OR created_at = ? AND key_id < ?)`
-		args = append(args, after.CreatedAt, after.CreatedAt, after.ID)
-	}
-	query += ` ORDER BY created_at DESC, key_id DESC LIMIT ?`
-	rows, err := q.QueryContext(ctx, query, append(args, limit)...)
-	if err != nil {
-		return nil, fmt.Errorf("list the API keys: %w", err)
-	}
-	defer rows.Close()
-	var keys []APIKey
-	for rows.Next() {
-		k, err := scanAPIKey(rows)
-		if err != nil {
-			return nil, fmt.Errorf("list the API keys: %w", err)
-		}
-		keys = append(keys, k)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list the API keys: %w", err)
-	}
-	return keys, nil
 }
