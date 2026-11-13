@@ -210,63 +210,11 @@ func tokenExpiry(days *int, now time.Time) (*time.Time, error) {
 // own, whether it exists or not.
 func errTokenNotFound() error { return server.NotFound("token not found") }
 
-// tokenOfUser returns the PAT tokenID when the user userID owns it. A token
-// that does not exist and one of another user are both errTokenNotFound,
-// so that the answer tells nothing of other users' tokens.
-func tokenOfUser(ctx context.Context, q Querier, userID, tokenID string) (PAT, error) {
-	p, err := PATByID(ctx, q, tokenID)
-	if errors.Is(err, ErrNotFound) || err == nil && p.UserID != userID {
-		return PAT{}, errTokenNotFound()
-	}
-	return p, err
-}
-
-// tokenPosition is the position of a token in a list of tokens: newest
-// first, created_at descending, then token_id descending, so that tokens
-// created at the same instant keep one order across pages.
-type tokenPosition struct {
-	CreatedAt int64  `json:"c"`
-	ID        string `json:"id"`
-}
-
-// position returns the position of p in a list of tokens.
-func (p PAT) position() any { return tokenPosition{CreatedAt: p.CreatedAt.UnixNano(), ID: p.TokenID} }
-
-// listTokens returns up to limit PATs of the user userID in any state, bound
-// ones included, in the order of a list of tokens, after the position after
-// when it is not nil.
-func listTokens(ctx context.Context, q RowsQuerier, userID string, after *tokenPosition, limit int) ([]PAT, error) {
-	query := `SELECT ` + patColumns + ` FROM pats WHERE user_id = ?`
-	args := []any{userID}
-	if after != nil {
-		query += ` AND (created_at < ? OR created_at = ? AND token_id < ?)`
-		args = append(args, after.CreatedAt, after.CreatedAt, after.ID)
-	}
-	query += ` ORDER BY created_at DESC, token_id DESC LIMIT ?`
-	rows, err := q.QueryContext(ctx, query, append(args, limit)...)
-	if err != nil {
-		return nil, fmt.Errorf("list the PATs: %w", err)
-	}
-	defer rows.Close()
-	var pats []PAT
-	for rows.Next() {
-		p, err := scanPAT(rows)
-		if err != nil {
-			return nil, fmt.Errorf("list the PATs: %w", err)
-		}
-		pats = append(pats, p)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list the PATs: %w", err)
-	}
-	return pats, nil
-}
-
 // revokeTokenOfUser revokes the PAT tokenID of the user userID in tx, as
 // RevokeTokenByID does, and returns its record as stored then; a token the
 // user does not own is errTokenNotFound.
 func revokeTokenOfUser(ctx context.Context, tx *sql.Tx, userID, tokenID string, now time.Time) (PAT, error) {
-	if _, err := tokenOfUser(ctx, tx, userID, tokenID); err != nil {
+	if _, err := tokenTable.ofUser(ctx, tx, userID, tokenID); err != nil {
 		return PAT{}, err
 	}
 	if err := RevokeTokenByID(ctx, tx, tokenID, now); err != nil {

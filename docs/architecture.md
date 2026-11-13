@@ -910,12 +910,16 @@ to `at` kept to whole seconds and nothing else. Both write through the
 transaction they are given without committing, check no owner, write no
 event and return `ErrNotFound` for an unknown id: they are for hub-internal
 callers (the hub credential of a sandbox), which change a token together
-with changes of their own. The routes look a token up with `tokenOfUser`,
-which answers a missing token and another user's alike, `404` `token not
-found`, and list a user's tokens with `listTokens`, newest first
-(`created_at`, then `token_id`, both descending) with keyset paging on
-those two; the admin routes call the same functions with the selected
-user's id. `GET /user/tokens` and `GET /user/tokens/:token_id` declare
+with changes of their own. Keys and tokens share one lookup by owner and
+one list, in `internal/identity/owned.go`: `ownedTable[T]` names a
+credential table (`keyTable` for `api_keys`, `tokenTable` for `pats`), its
+`ofUser` answers a missing credential and another user's alike with the
+table's `404` (`API key not found`, `token not found`), and its `writePage`
+answers a page of one user's credentials in any state, newest first
+(`created_at`, then the id, both descending) with keyset paging on those
+two. The token routes look a token up with `tokenTable.ofUser` and list
+with `tokenTable.writePage`; the admin routes call the same functions with
+the selected user's id. `GET /user/tokens` and `GET /user/tokens/:token_id` declare
 `tokens:read`, `DELETE /user/tokens/:token_id` declares `tokens:manage`
 and revokes through `RevokeTokenByID` after the owner lookup, in one
 transaction; every `/user/tokens` route carries `identity.MarkNeedsUser`,
@@ -924,7 +928,7 @@ again.
 
 `PUT`, `PATCH` and `DELETE /user/tokens/:token_id/permissions` share one
 handler, `changeOwnTokenPermissions`, declaring `tokens:write`. In one
-`(*store.Store).Tx` it looks the token up with `tokenOfUser` (404), reads
+`(*store.Store).Tx` it looks the token up with `tokenTable.ofUser` (404), reads
 the body's `permissions` with `permissionsChangeOf` (400; registered scopes
 for `PUT` and `PATCH`, at least one entry for `PATCH` and `DELETE`),
 computes the new list with `changedPermissions` (`PUT` the list without
@@ -943,9 +947,8 @@ uses, so a token is `409` here exactly when it is `401` there. `paths`,
 keys, each carrying `identity.MarkNeedsUser`. `APIKey.MarshalJSON` writes
 the Key object (`key_id`, `user_id`, `expires_at`, `revoked_at`,
 `created_at`), so no answer built from a record can carry a secret.
-`GET /user/keys` declares `keys:read` and lists with `listKeys`, newest
-first (`created_at`, then `key_id`, both descending) with keyset paging on
-those two. `DELETE /user/keys/:key_id` declares `keys:manage` and revokes
+`GET /user/keys` declares `keys:read` and lists with `keyTable.writePage`,
+newest first (`created_at`, then `key_id`, both descending). `DELETE /user/keys/:key_id` declares `keys:manage` and revokes
 with `revokeKeyOfUser`, which sets `revoked_at` only while it is `NULL`, in
 one transaction with the owner lookup. `POST /user/keys/:key_id/refresh`
 declares no scope and is not a create route: its handler refuses any caller
@@ -955,7 +958,7 @@ transaction stores the hash of a new `randomString(apiKeyAlphabet,
 secretLength)` secret and the new `expires_at` with `setKeySecret`;
 authentication reads the stored hash on every request, so the old secret
 fails from the next one. Every `:key_id` route resolves the id with
-`keyOfUser`, which answers a missing key and another user's alike, `404`
+`keyTable.ofUser`, which answers a missing key and another user's alike, `404`
 `API key not found`. `s.writeKeys(w, r, userID)` and `s.revokeKey(w, r,
 userID)` take the user id, so the admin routes reuse them.
 

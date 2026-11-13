@@ -120,19 +120,7 @@ func (s *Service) listOwnTokens(w http.ResponseWriter, r *http.Request) error {
 // bound ones included, newest first: created_at descending, then token_id
 // descending.
 func (s *Service) writeTokens(w http.ResponseWriter, r *http.Request, userID string) error {
-	page, err := server.ReadPage(r)
-	if err != nil {
-		return err
-	}
-	after, err := pageAfter[tokenPosition](page)
-	if err != nil {
-		return err
-	}
-	pats, err := listTokens(r.Context(), s.deps.Store.Main(), userID, after, page.Limit+1)
-	if err != nil {
-		return err
-	}
-	return server.WritePage(w, page, pats, PAT.position)
+	return tokenTable.writePage(w, r, s.deps.Store.Main(), userID)
 }
 
 // ownToken returns the caller's token the path's token_id names, or
@@ -144,7 +132,7 @@ func ownToken(r *http.Request, q Querier) (PAT, error) {
 	if err != nil {
 		return PAT{}, err
 	}
-	return tokenOfUser(r.Context(), q, caller.ID, server.Param(r, "token_id"))
+	return tokenTable.ofUser(r.Context(), q, caller.ID, server.Param(r, "token_id"))
 }
 
 // getOwnToken answers GET /user/tokens/:token_id with the caller's token,
