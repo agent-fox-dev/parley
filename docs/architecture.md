@@ -14,11 +14,11 @@ command-line client. Both are written in Go, in the module
 | `internal/buildinfo` | the version, commit and build time the binary was built with, shared by both programs |
 | `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra` |
 | `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, and a registry of keys and whole sections that decides what the file may hold |
-| `internal/hub` | the composition of the `parleyd` process: argument parsing, the scrubbing logger, the fixed start order, the bootstrap of the admin token, the HTTP server's options, the idempotency records in the transactional store, signals and the stop; the one place later packages plug their parts in ([ADR 01](adr/01-compose-the-hub-in-one-package.md)) |
+| `internal/hub` | the composition of the `parleyd` process: argument parsing, the scrubbing logger, the fixed start order, the bootstrap of the admin token, the HTTP server's options, the idempotency records in the transactional store, signals and the stop, and the `backup` command; the one place later packages plug their parts in ([ADR 01](adr/01-compose-the-hub-in-one-package.md)) |
 | `internal/maintenance` | the maintenance loop: a registry of named tasks, and `Loop`, which runs one pass at once and one at each tick of an hourly timer, the tasks of a pass one after the other in a fixed order, and logs a failing task without stopping the others |
 | `internal/identity` | who may use the hub: the admin settings in the transactional store (the bootstrap e-mail and the admin token's hash), the generation and hashing of admin tokens, and `VerifyAdminToken`, which compares a presented token's hash with the stored one in constant time |
 | `internal/scrub` | the one scrubbing function for text that leaves the hub: `Scrubber.Scrub` replaces registered secret values and the hub's own credential formats by `[redacted]`, removes user information from URLs and cuts the text to 1024 bytes; a leaf package that imports nothing of the project |
-| `internal/store` | the hub's two embedded SQLite stores (`modernc.org/sqlite`, no cgo): `Open` creates the data directory and the workspace root, opens the transactional store and the analytical store (`analytics.db` beside it) and applies the registered schema steps; `Tx` runs a transaction of the transactional store |
+| `internal/store` | the hub's two embedded SQLite stores (`modernc.org/sqlite`, no cgo): `Open` creates the data directory and the workspace root, opens the transactional store and the analytical store (`analytics.db` beside it) and applies the registered schema steps; `Tx` runs a transaction of the transactional store; `Snapshot` writes a consistent copy of one store file without changing it |
 | `internal/server` | the hub's HTTP server: its built-in routes, the REST API's route registration and check pipeline, the error envelope, request ids, response headers and the access log, list paging, idempotency keys, and the readiness probes |
 | `internal/server/timefmt` | the one timestamp format (`Format`, and the response member type `Time`) and the one duration grammar (`ParseDuration`); a leaf package that imports nothing of the project, so that the configuration loader can use it as well as the REST API |
 | `test/e2e` | tests that build the binaries and run them |
@@ -388,6 +388,18 @@ analytical store directly. `Ping` returns nil when both stores answer
 a second `Close` returns nil, and `Tx` and `Ping` return `store.ErrClosed`
 after it.
 
+`store.Snapshot(ctx, src, dst)` writes a copy of the store file `src` to the
+new file `dst` with `VACUUM INTO`, which reads the source in one read
+transaction: the copy holds every transaction committed before it began,
+each whole, while other connections, of this process or another, go on
+committing, and it has no write-ahead log. The source is opened read-only
+(`mode=ro`), so the engine never checkpoints its write-ahead log. A source
+without a write-ahead log (a store no connection has open) is read with
+`immutable=1` as well, because a read-only connection would leave an empty
+`-wal` and a `-shm` file beside it; when a log appears or the file changes
+during that copy, the copy is discarded and taken again read-only. `dst`
+must not exist, and a failure removes what was written of it.
+
 ## The hub
 
 `internal/hub` composes the `parleyd` process, so that `cmd/parleyd` stays a
@@ -440,9 +452,10 @@ notification, a channel the hub closes once when the stop begins.
 `Run` parses the arguments with the standard `flag` package first: `--help`
 prints the usage on stdout and returns `0`; an unknown flag,
 `--admin-email` without a value, a positional argument other than `backup`,
-and `backup` without exactly one directory print the usage on stderr and
-return `2`. None of these loads, opens or creates anything. `backup
-<directory>` writes one error line and returns `1`.
+`backup` without exactly one directory, and `backup` with `--admin-email` or
+`--reset-admin-token` print the usage on stderr and return `2`. None of these
+loads, opens or creates anything. `backup <directory>` runs
+[the backup](#the-backup) instead of the start.
 
 Then it builds the logger and starts in this order, stopping at the first
 failure:
@@ -478,6 +491,34 @@ one line at error level, `cannot start` with the cause in `error`, or
 `cannot listen` with `addr` and `error`; the stores are closed when they were
 open, and `Run` returns `1`. The first signal, or the cancellation of `ctx`,
 begins [the stop](#the-stop).
+
+### The backup
+
+`parleyd backup <directory>` (`internal/hub/backup.go`) composes the hub and
+loads the configuration as the start does (steps 1 and 2), so the keys and
+sections the parts register apply, and then only reads the data: it opens no
+store for writing, applies no schema step, runs no bootstrap, start hook or
+maintenance task, catches no signal and binds nothing. In order, stopping at
+the first failure:
+
+1. check that the database file, `analytics.db` and the workspace root
+   exist, so that a backup run where no hub ever started creates no database;
+2. check the target: a directory inside the workspace root (which it would
+   copy into itself), a path that is not a directory and a non-empty
+   directory are refused; a missing one is created with `os.Mkdir` and mode
+   0700, its parent not;
+3. copy the transactional store under the database file's own name and the
+   analytical store as `analytics.db`, each with `store.Snapshot`;
+4. copy the workspace root under its own name, keeping relative paths, file
+   permission bits and symbolic links; the `objects` directory of each git
+   directory (one that holds a `HEAD` file) is copied after the rest of the
+   tree, so its refs, `packed-refs` and `HEAD` are read before its objects
+   and every copied ref points at a copied object.
+
+A failure after the target was created or written to removes what the
+backup wrote (the target itself when it created it, else its entries) and
+logs one `backup failed` line naming the cause; `Run` returns `1`. Success
+logs `backup written` with `dir` and returns `0`, with nothing on stdout.
 
 ### The stop
 

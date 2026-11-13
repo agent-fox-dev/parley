@@ -44,6 +44,28 @@ through the scrubber, and the scrubber cuts its result to 1024 bytes. So
 every string value of a log line is at most 1024 bytes, the `stack` of the
 `panic` line of package 02 included.
 
+## parleyd backup refuses a few more targets and sources
+
+The package says `parleyd backup <directory>` refuses a non-empty directory
+or a path that is not a directory, creates a missing directory, and fails
+naming the database path when the database file does not exist.
+`internal/hub/backup.go` also:
+
+- refuses a target inside the workspace root, before writing anything: the
+  copy of the workspace root would copy the snapshot into itself;
+- creates a missing target with `os.Mkdir`, not its missing parents, and
+  fails naming the target when the parent does not exist: what a failed
+  backup wrote is removed, and parents it had created would be left behind;
+- fails, before writing anything, when `analytics.db` or the workspace root
+  does not exist, as for the database file, naming the path;
+- fails, naming the path, on an entry of the workspace root that is not a
+  regular file, a directory or a symbolic link (a socket, a device), rather
+  than leave it out of the snapshot.
+
+The copied directories of the workspace root get mode 0700; files keep their
+permission bits. The store copies are single database files without a
+write-ahead log.
+
 ## Where the checks of a few criteria live
 
 - The rejected-arguments table of package 01 in
@@ -62,3 +84,7 @@ every string value of a log line is at most 1024 bytes, the `stack` of the
 - The check of the readiness probe obtains the stores from a start hook,
   which receives the hub's runtime, and closes one of them through
   `(*store.Store).Analytics()` or `(*store.Store).Main()`.
+- The table of the check of the refused backup targets has a fourth row, a
+  missing directory inside the workspace root, for the refusal above. The
+  empty-workspace-root case of the check of the repository copy runs in the
+  same test, on the same data, before the repositories are created.

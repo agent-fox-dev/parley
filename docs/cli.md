@@ -45,8 +45,9 @@ Flags:
 ```
 
 A flag it does not define, `--admin-email` without a value, a positional
-argument other than `backup`, and `backup` followed by no directory or by
-more than one argument, print one error line, then the same usage, on
+argument other than `backup`, `backup` followed by no directory or by
+more than one argument, and `backup` with `--admin-email` or
+`--reset-admin-token`, print one error line, then the same usage, on
 stderr, and exit `2` without reading the configuration, creating anything
 or listening:
 
@@ -62,9 +63,61 @@ second argument of `backup`.
 
 ### `parleyd backup <directory>`
 
-In this version `parleyd backup <directory>` writes one error line,
-`backup <directory>: the backup command is not available yet`, and exits
-`1` without reading the configuration or touching the data.
+`parleyd backup <directory>` writes a snapshot of the hub's data into
+`<directory>`, whether or not a hub is running on that data. Run it with the
+environment and working directory of the hub: it reads `config.toml` exactly
+as the hub does, so it finds the same data. A relative `<directory>` is
+resolved against the working directory.
+
+`<directory>` must be an empty directory or not exist; a missing one is
+created with mode `0700` (its parent is not). The snapshot holds three
+entries:
+
+| Entry | What |
+|---|---|
+| the database file's own name (`parley.db` by default) | a copy of the transactional store |
+| `analytics.db` | a copy of the analytical store |
+| the workspace root's own name (`workspaces` by default) | a copy of every file, directory and symbolic link under the workspace root, with the same relative paths |
+
+Each store is copied first, as one read of the engine (SQLite's
+`VACUUM INTO`): the copy holds every transaction committed before the copy
+began, each with all of its rows, while the hub goes on committing, and it
+is a single database file without a write-ahead log. The workspace root is
+copied next; within each git repository the refs, `packed-refs` and `HEAD`
+are copied before the objects, so every copied ref points at a copied
+object.
+
+The command only reads the hub's data: it binds no listener, runs no
+bootstrap, start work or maintenance task, applies no schema step and
+writes nothing under the data directory or the config dir, not even the
+write-ahead log of a stopped store. `--admin-email` or
+`--reset-admin-token` together with `backup` is a usage error (exit `2`):
+
+```
+parleyd: backup does not take --admin-email or --reset-admin-token
+```
+
+On success it writes one log line naming the directory, nothing on stdout,
+and exits `0`:
+
+```json
+{"time":"2026-11-13T13:44:23.060364+01:00","level":"INFO","msg":"backup written","dir":"/srv/backups/2026-11-13"}
+```
+
+Otherwise it writes one line, `backup failed` with the cause in `error`,
+and exits `1`. It refuses, writing nothing, an invalid configuration (the
+error names the key), a missing database file (it names the path and
+creates no database), a directory that is not empty, a path that is not a
+directory, and a directory inside the workspace root:
+
+```json
+{"time":"2026-11-13T13:44:22.522501+01:00","level":"ERROR","msg":"backup failed","error":"database file /srv/parley/data/parley.db does not exist"}
+{"time":"2026-11-13T13:44:23.075944+01:00","level":"ERROR","msg":"backup failed","error":"backup directory /srv/backups/2026-11-13 is not empty"}
+```
+
+When a copy fails part-way, for example on a file under the workspace root
+it cannot read, it removes everything it wrote (the directory too, when it
+created it), and the line names the path that failed.
 
 ### The admin token
 
@@ -213,6 +266,10 @@ When it cannot bind the address the line is `cannot listen`:
 {"time":"2026-11-13T10:11:41.348421+01:00","level":"ERROR","msg":"cannot listen","addr":"0.0.0.0:8080","error":"listen tcp 0.0.0.0:8080: bind: address already in use"}
 ```
 
+`parleyd backup` writes `backup written` with `dir` on success, or
+`backup failed` with `error` (see
+[`parleyd backup <directory>`](#parleyd-backup-directory)).
+
 ### Signals
 
 On `SIGTERM` or `SIGINT` `parleyd` stops accepting connections, tells the
@@ -232,9 +289,9 @@ grace starts again and the process does not exit early.
 
 | Status | When |
 |---|---|
-| `0` | `--help`, a run that wrote the admin token file, or a stop by `SIGTERM` or `SIGINT`, whether or not the grace passed |
-| `1` | the start failed before listening (the configuration, the data, a schema step, the admin token file that could not be written or is still there, the start work or the listen address), or `backup` |
-| `2` | a usage error: an unknown flag, `--admin-email` without a value, a positional argument other than `backup`, or `backup` without exactly one directory |
+| `0` | `--help`, a run that wrote the admin token file, a written backup, or a stop by `SIGTERM` or `SIGINT`, whether or not the grace passed |
+| `1` | the start failed before listening (the configuration, the data, a schema step, the admin token file that could not be written or is still there, the start work or the listen address), or `backup` failed (see [`parleyd backup <directory>`](#parleyd-backup-directory)) |
+| `2` | a usage error: an unknown flag, `--admin-email` without a value, a positional argument other than `backup`, `backup` without exactly one directory, or `backup` with `--admin-email` or `--reset-admin-token` |
 
 ## `parley`
 

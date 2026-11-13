@@ -337,6 +337,9 @@ func parseArgs(args []string, stdout, stderr io.Writer) (cmd command, status int
 	case len(rest) != 2:
 		fmt.Fprintf(stderr, "parleyd: backup takes one directory, got %d arguments\n\n%s", len(rest)-1, usage)
 		return cmd, 2, false
+	case cmd.adminEmail != "" || cmd.resetAdminToken:
+		fmt.Fprintf(stderr, "parleyd: backup does not take --admin-email or --reset-admin-token\n\n%s", usage)
+		return cmd, 2, false
 	}
 	cmd.backup, cmd.backupDir = true, rest[1]
 	return cmd, 0, true
@@ -361,10 +364,12 @@ type run struct {
 	scrubber *scrub.Scrubber
 }
 
-// Run is parleyd: it parses opts.Args and starts the hub, and returns the
-// exit status: 0 after --help, after the bootstrap wrote the admin token
-// file, or after a stop; 1 when the start fails; 2 for a usage error. A usage
-// error loads, opens and creates nothing.
+// Run is parleyd: it parses opts.Args and starts the hub, or with the
+// arguments backup <directory> writes a snapshot of the hub's data into the
+// directory, and returns the exit status: 0 after --help, after the bootstrap
+// wrote the admin token file, after a stop, or after a written backup; 1
+// when the start or the backup fails; 2 for a usage error. A usage error
+// loads, opens and creates nothing.
 //
 // The start runs in this order and stops at the first failure: load the
 // configuration, open the stores, the bootstrap (which may end the run
@@ -391,7 +396,7 @@ func Run(ctx context.Context, opts Options) int {
 	r.logger = newLogger(stderr, r.level, r.scrubber)
 	slog.SetDefault(r.logger)
 	if cmd.backup {
-		return r.fail(fmt.Errorf("backup %s: the backup command is not available yet", cmd.backupDir))
+		return r.backup(ctx)
 	}
 	return r.serve(ctx)
 }
@@ -409,9 +414,10 @@ func (r *run) fail(err error) int {
 	return 1
 }
 
-// serve composes the hub, loads the configuration and opens the stores, and
-// closes them once the hub has stopped or its start has failed.
-func (r *run) serve(ctx context.Context) int {
+// configure composes the hub and loads the configuration with the keys and
+// sections the composition registered, then sets the logger's level and
+// hands the scrubber the configured secrets.
+func (r *run) configure() (*Composition, *config.Config, error) {
 	c := newComposition()
 	for _, part := range parts {
 		part(c)
@@ -420,18 +426,26 @@ func (r *run) serve(ctx context.Context) int {
 		r.opts.Compose(c)
 	}
 	if err := c.check(); err != nil {
-		return r.fail(err)
+		return nil, nil, err
 	}
-
 	cfg, err := c.registry.Load(r.opts.Env, r.opts.WorkDir)
 	if err != nil {
-		return r.fail(err)
+		return nil, nil, err
 	}
 	r.level.Set(parseLevel(cfg.Logging.Level))
 	for _, p := range cfg.OAuth.Providers {
 		r.scrubber.Add(p.ClientSecret)
 	}
+	return c, cfg, nil
+}
 
+// serve composes the hub, loads the configuration and opens the stores, and
+// closes them once the hub has stopped or its start has failed.
+func (r *run) serve(ctx context.Context) int {
+	c, cfg, err := r.configure()
+	if err != nil {
+		return r.fail(err)
+	}
 	st, err := store.Open(ctx, store.Options{DatabasePath: cfg.Database.Path, WorkspaceRoot: cfg.Workspace.Path}, c.steps)
 	if err != nil {
 		return r.fail(err)
