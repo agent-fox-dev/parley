@@ -21,7 +21,8 @@ func (s *Service) Routes() []server.Route {
 		{Method: http.MethodPost, Pattern: "/auth/callback", Public: true, Handler: s.callback},
 	}
 	routes = append(routes, s.userRoutes()...)
-	return append(routes, s.ownUserRoutes()...)
+	routes = append(routes, s.ownUserRoutes()...)
+	return append(routes, s.orgRoutes()...)
 }
 
 // providerItem is one entry of GET /auth/providers.

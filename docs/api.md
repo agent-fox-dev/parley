@@ -632,7 +632,10 @@ its next request on, and one whose user gains it passes.
 The admin routes so far: `POST /api/v1/users`, `GET /api/v1/users`,
 `GET /api/v1/users/{id}`, `PATCH /api/v1/users/{id}`,
 `POST /api/v1/users/{id}/promote`, `POST /api/v1/users/{id}/demote`,
-`POST /api/v1/users/{id}/block` and `POST /api/v1/users/{id}/unblock`.
+`POST /api/v1/users/{id}/block`, `POST /api/v1/users/{id}/unblock`,
+`POST /api/v1/orgs`, `GET /api/v1/orgs` and `PATCH /api/v1/orgs/{id}`.
+`GET /api/v1/orgs/{id}` is not one: a member reads an org too (see
+[`GET /api/v1/orgs/{id}`](#get-apiv1orgsid)).
 
 ## User selectors
 
@@ -800,4 +803,120 @@ active admin answers `200`.
 
 ```json
 {"error":{"code":409,"message":"the user is the only active admin","error_type":"conflict"}}
+```
+
+## Org selectors
+
+A route with an org in its path, `/api/v1/orgs/{id}`, takes the org's id or
+its slug there, and its shape alone decides which one it is:
+
+| Value | Looked up as |
+|---|---|
+| a UUID in its hyphenated form, 36 characters (`0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d`) | the org's `id`, and nothing else |
+| every other value (`acme`) | the org's `slug` |
+
+The comparison is exact, letter case included: `ACME` does not name `acme`,
+and an org's `name` never names it. A value that names no org is answered
+`404` `not_found` with the message `org not found`, and nothing changes:
+
+```json
+{"error":{"code":404,"message":"org not found","error_type":"not_found"}}
+```
+
+## `POST /api/v1/orgs`
+
+Creates an org. An admin route (see [Admin routes](#admin-routes)) and a
+create route, so it accepts an `Idempotency-Key`.
+
+The body is a JSON object:
+
+| Member | Value |
+|---|---|
+| `name` | required: a string that is not empty once trimmed of leading and trailing white space; stored trimmed |
+| `slug` | required: 1 to 128 characters of `a`-`z`, `0`-`9`, `_` and `-` that start and end with a letter or digit |
+| `url` | a string; the empty string when absent |
+| `owner_id` | a string, the `id` of an existing user (not a username or an e-mail); no owner when absent |
+
+The org is created with a new UUID as `id`, the status `active` and
+`created_at` and `updated_at` the time of the request. It has no member,
+also when it has an owner: the owner is informational. Names and slugs are
+compared as stored, letter case included, so `acme inc` is free beside
+`Acme Inc`.
+
+| Status | When |
+|---|---|
+| `201 Created` | the org was created; the body is the Org object |
+| `400` `invalid_request` | `name` or `slug` is missing (`name is required`, `slug is required`); a member of the table is not a JSON string, `null` included (`<member> must be a string`); the name is white space only (`name must not be empty`); the slug has another form (`slug must be 1 to 128 characters of a-z, 0-9, _ and -, starting and ending with a letter or digit`); `owner_id` is not the id of a user (`owner_id is not the id of a user`); or the body is not a JSON object. Nothing is created. |
+| `403` `forbidden` | the caller is not an admin (see [Admin routes](#admin-routes)) |
+| `409` `conflict` | another org has the trimmed name (`an org has the name`) or the slug (`an org has the slug`). Nothing is created. |
+
+```json
+{"name":"Acme Inc","slug":"acme","url":"https://acme.example"}
+```
+
+The Org object has exactly `id`, `name`, `slug`, `url`, `owner_id`,
+`status`, `created_at` and `updated_at`; `owner_id` is `null` when the org
+has no owner:
+
+```json
+{"id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","name":"Acme Inc","slug":"acme","url":"https://acme.example","owner_id":null,"status":"active","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}
+```
+
+## `GET /api/v1/orgs`
+
+Lists the orgs, a [list](#lists) in the standard pages. An admin route
+(see [Admin routes](#admin-routes)).
+
+The list holds the orgs with the status `active`, ordered by `name`
+ascending, compared byte by byte, so `Zed` comes before `alpha`. With the
+query parameter `include_blocked=true` it holds the blocked orgs too, in the
+same order; any other value, such as `false` or `1`, is the same as none. A
+`cursor` belongs to its value of `include_blocked`.
+
+| Status | When |
+|---|---|
+| `200 OK` | the body is a page: `items` are Org objects |
+| `400` `invalid_request` | a bad `limit` or `cursor` (see [Lists](#lists)) |
+| `403` `forbidden` | the caller is not an admin (see [Admin routes](#admin-routes)) |
+
+## `GET /api/v1/orgs/{id}`
+
+Answers the Org object of the org `{id}` names (see
+[Org selectors](#org-selectors)). Every authenticated caller may send it;
+it declares the scope `orgs:read` for a PAT. An admin, the admin token or an
+API key whose user has the role `admin`, receives any org, a blocked one
+with the status `blocked`. Every other caller, a PAT of an admin included,
+receives the org only when the caller's user is a member of it and the org
+is `active`; otherwise the answer is the one for an org that does not
+exist, so a caller cannot tell an org it may not read from a missing one.
+
+| Status | When |
+|---|---|
+| `200 OK` | the body is the Org object |
+| `404` `not_found` | no org has that id or slug, or the caller is not an admin and is not a member of the org or the org is blocked (`org not found`) |
+
+## `PATCH /api/v1/orgs/{id}`
+
+Sets the `name`, the `url` or both of the org `{id}` names (see
+[Org selectors](#org-selectors)). An admin route (see
+[Admin routes](#admin-routes)).
+
+The body is a JSON object with `name`, a string that is not empty once
+trimmed, stored trimmed, and `url`, a string, the empty string included; at
+least one of them. A `slug` member is ignored like any other unknown
+member: the slug never changes. The body is checked before the org is
+looked up. The hub stores the members sent, sets `updated_at` to the time
+of the change and answers the updated Org object; every other member is
+unchanged. The org's own current name is accepted.
+
+| Status | When |
+|---|---|
+| `200 OK` | the org was updated; the body is the updated Org object |
+| `400` `invalid_request` | neither `name` nor `url` is sent (`name or url is required`), one is not a JSON string, `null` included (`<member> must be a string`), or the name is white space only (`name must not be empty`); or the body is not a JSON object. The org is unchanged. |
+| `403` `forbidden` | the caller is not an admin (see [Admin routes](#admin-routes)) |
+| `404` `not_found` | no org has that id or slug (`org not found`) |
+| `409` `conflict` | another org has the trimmed name (`an org has the name`). The org is unchanged, its `url` included. |
+
+```json
+{"name":"Acme Corp","url":"https://acme.example"}
 ```

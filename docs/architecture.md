@@ -641,11 +641,14 @@ and `PATCH /users/:id` (see [api.md](api.md#get-apiv1users)), the admin
 routes `POST /users/:id/promote`, `/demote`, `/block` and `/unblock` (see
 [api.md](api.md#role-and-status-of-a-user)), and the
 caller's own profile, `GET /user` and `PATCH /user` (see
-[api.md](api.md#get-apiv1user)), which need a user.
+[api.md](api.md#get-apiv1user)), which need a user, the admin routes
+`POST /orgs`, `GET /orgs` and `PATCH /orgs/:id`, and `GET /orgs/:id`, which
+an admin or a member reads (see [api.md](api.md#post-apiv1orgs)).
 `(*identity.Service).Routes()` in `internal/identity/routes.go` returns
 them all: it appends the route list of each handlers file, such as
 `userRoutes()` in `internal/identity/handlers_users.go` and
-`ownUserRoutes()` in `internal/identity/handlers_user.go`, so the hub and the
+`ownUserRoutes()` in `internal/identity/handlers_user.go` and `orgRoutes()` in
+`internal/identity/handlers_orgs.go`, so the hub and the
 tests register the same routes. The providers in
 `identity.Deps.Providers` come with their endpoints resolved:
 `internal/config` fills an endpoint the file does not give with the
@@ -850,6 +853,30 @@ return an org or `identity.ErrNotFound`, comparing the slug exactly; and
 by user id. It reads through an `identity.RowsQuerier`, an
 `identity.Querier` that also has `QueryContext` (the store's `*sql.DB` or a
 `*sql.Tx`).
+
+`identity.OrgBySelector(ctx, q, sel)` in `orgs.go` resolves an org selector
+by its shape alone, as `UserBySelector` does a user's: a value `isUUID`
+accepts is looked up as the `id`, every other value as the `slug`, exactly,
+and `identity.ErrNotFound` is returned without a second lookup. The org
+routes are `orgRoutes()` in `internal/identity/handlers_orgs.go`, which
+`Routes()` appends. `POST /orgs`, `GET /orgs` and `PATCH /orgs/:id` are admin
+routes. `POST /orgs` (`createOrg`) decodes the body into raw members, trims
+the name (`orgNameMember`), checks the slug against `^[a-z0-9](?:[a-z0-9_-]{0,126}[a-z0-9])?$`
+(`validSlug`), and in one `(*store.Store).Tx` reads the `owner_id` with
+`UserByID` (not found is `400`) and calls `createOrg(ctx, tx, o)`, which
+answers a taken name or slug with a conflict and inserts the org with a
+new UUID, `owner_id` NULL when there is none, and no membership.
+`PATCH /orgs/:id` checks the body first, then resolves the selector and
+calls `updateOrg(ctx, tx, id, name, url, now)`, which refuses a name another
+org has (`id <> ?`) and sets only the members given and `updated_at`.
+`GET /orgs` reads one page with `listOrgs(ctx, q, includeBlocked, after,
+limit)`: `ORDER BY name`, continuing after the position `{name}` of the
+cursor. `GET /orgs/:id` carries no admin mark and declares the scope
+`orgs:read`; it goes through `visibleOrg(r)`, the one rule for reading an
+org: an admin (`isAdmin`) reads every org, any other caller an active org
+of which its user is a member (`isMember`), and every other case, a missing
+org included, is the one answer `errOrgNotFound()`, `404 not_found` with the
+message `org not found`.
 
 ### The logger
 
