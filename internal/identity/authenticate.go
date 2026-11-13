@@ -205,10 +205,18 @@ func (s *Service) checkState(revokedAt, expiresAt *time.Time) error {
 	if revokedAt != nil {
 		return server.Unauthenticated("credential revoked")
 	}
-	if expiresAt != nil && !s.deps.Now().Before(*expiresAt) {
+	if expired(expiresAt, s.deps.Now()) {
 		return server.Unauthenticated("credential expired")
 	}
 	return nil
+}
+
+// expired reports whether a credential with the expiry expiresAt, nil for
+// none, is expired at now: from its expires_at on. It is the one rule, so
+// that a route refusing an expired credential and authentication never
+// disagree.
+func expired(expiresAt *time.Time, now time.Time) bool {
+	return expiresAt != nil && !now.Before(*expiresAt)
 }
 
 // withUser fills in the user the credential of p acts for, and refuses a

@@ -10,8 +10,9 @@ import (
 )
 
 // adminRoute is a route behind the admin check. In its path, ":user"
-// stands for a user selector and ":org" for an org selector; body is a body
-// the route accepts, nil for a route that takes none.
+// stands for a user selector, ":org" for an org selector and ":key" and
+// ":token" for the id of an API key and a PAT; body is a body the route
+// accepts, nil for a route that takes none.
 type adminRoute struct {
 	method, path string
 	body         any
@@ -28,6 +29,10 @@ var adminRoutes = []adminRoute{
 	{http.MethodPost, "/api/v1/users/:user/block", nil},
 	{http.MethodPost, "/api/v1/users/:user/unblock", nil},
 	{http.MethodDelete, "/api/v1/users/:user", nil},
+	{http.MethodGet, "/api/v1/users/:user/keys", nil},
+	{http.MethodGet, "/api/v1/users/:user/tokens", nil},
+	{http.MethodDelete, "/api/v1/users/:user/keys/:key", nil},
+	{http.MethodDelete, "/api/v1/users/:user/tokens/:token", nil},
 	{http.MethodPost, "/api/v1/orgs", newOrgBody("Zed Org", "zed-org")},
 	{http.MethodGet, "/api/v1/orgs", nil},
 	{http.MethodPatch, "/api/v1/orgs/:org", map[string]any{"url": "u"}},
@@ -44,17 +49,20 @@ func newUserBody(username string) map[string]any {
 		"provider_id": username + "-id"}
 }
 
-// adminTargets name what an admin route's selectors point at: alice and
-// her personal org, which exist, or a user and an org that do not.
-var adminTargets = map[string]*strings.Replacer{
-	"existing target": strings.NewReplacer(":user", "alice", ":org", "alice"),
-	"missing target":  strings.NewReplacer(":user", "nobody", ":org", "nope"),
-}
-
 func TestAdminCheck_RefusesEveryCallerButAnAdminBeforeAnythingElse(t *testing.T) {
 	t.Parallel()
 	h := newTeamHub(t)
-	callers := map[string]string{"API key of a user": h.ku, "PAT of a user": h.pu, "PAT of an admin": h.pa}
+	bobKey, _ := h.seedCredential("API key", h.createUser("bob", identity.RoleUser).ID)
+	everyScopePAT, _ := h.seedPAT(identity.PATSpec{UserID: h.root.ID, Permissions: identity.RegisteredScopes()})
+	callers := map[string]string{"API key of a user": h.ku, "API key of another user": "Bearer " + bobKey,
+		"PAT of a user": h.pu, "PAT of an admin": h.pa, "PAT of an admin holding every scope": "Bearer " + everyScopePAT}
+	// adminTargets name what an admin route's selectors point at: alice,
+	// her personal org, her API key and her PAT, which exist, or ones that
+	// do not.
+	adminTargets := map[string]*strings.Replacer{
+		"existing target": strings.NewReplacer(":user", "alice", ":org", "alice", ":key", h.kuID, ":token", h.puID),
+		"missing target":  strings.NewReplacer(":user", "nobody", ":org", "nope", ":key", "zzzzzzzz", ":token", "zzzzzzzz"),
+	}
 	for _, rt := range adminRoutes {
 		bodies := map[string]any{"no body": nil}
 		if rt.method != http.MethodGet && rt.method != http.MethodDelete {

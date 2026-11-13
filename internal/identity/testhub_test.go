@@ -26,8 +26,8 @@ import (
 )
 
 // testHub is the request pipeline of internal/server with the identity
-// service, its admin check and its routes installed, as the hub composes
-// them, over a store in t.TempDir(), served
+// service, the scope check, the admin check and the service's routes
+// installed, as the hub composes them, over a store in t.TempDir(), served
 // in-process. It also registers two non-public test routes: GET
 // /api/v1/test/whoami answers the caller's Principal, and GET
 // /api/v1/test/me, declared as needing a user, answers 200. Both count
@@ -125,6 +125,7 @@ func newTestHub(t *testing.T, opts ...hubOption) *testHub {
 	h.svc.Bind(identity.Deps{Store: st, Now: h.now, Providers: cfg.providers, ExternalURL: cfg.externalURL, Client: client})
 	h.srv = server.New(server.Options{Logger: slog.New(slog.DiscardHandler), RateLimitDisabled: true, Now: h.now})
 	h.srv.SetAuthenticator(h.svc.Authenticate)
+	h.srv.SetScopeCheck(identity.ScopeCheck)
 	h.srv.AddAccessCheck(h.svc.AdminCheck)
 	for _, r := range h.svc.Routes() {
 		h.srv.Register(r)
@@ -218,11 +219,40 @@ func (h *testHub) get(path, authorization string) response {
 	return h.do(http.MethodGet, path, nil, header)
 }
 
+// whoamiStatus is the status GET /test/whoami answers the credential value.
+func (h *testHub) whoamiStatus(value string) int {
+	h.t.Helper()
+	return h.get("/api/v1/test/whoami", "Bearer "+value).status
+}
+
 // tx runs fn in a transaction of the hub's store.
 func (h *testHub) tx(fn func(*sql.Tx) error) {
 	h.t.Helper()
 	if err := h.st.Tx(context.Background(), fn); err != nil {
 		h.t.Fatalf("store transaction: %v", err)
+	}
+}
+
+// begin opens a transaction of the hub's store that the test commits or
+// rolls back itself.
+func (h *testHub) begin() *sql.Tx {
+	h.t.Helper()
+	tx, err := h.st.Main().BeginTx(context.Background(), nil)
+	if err != nil {
+		h.t.Fatalf("begin: %v", err)
+	}
+	return tx
+}
+
+// end commits tx, or rolls it back when commit is false.
+func (h *testHub) end(tx *sql.Tx, commit bool) {
+	h.t.Helper()
+	end := tx.Rollback
+	if commit {
+		end = tx.Commit
+	}
+	if err := end(); err != nil {
+		h.t.Fatalf("end the transaction: %v", err)
 	}
 }
 
@@ -506,8 +536,60 @@ func checkRefusal(t *testing.T, what string, r response, status int, errorType, 
 }
 
 // everyScope is every scope a route of the identity service declares, so
-// that a PAT holding them passes any scope check a test installs.
-var everyScope = []string{"users:read", "users:write", "orgs:read"}
+// that a PAT holding them passes the scope check of every identity route.
+var everyScope = []string{"users:read", "users:write", "orgs:read", "keys:read", "keys:manage", "tokens:read", "tokens:write", "tokens:manage"}
+
+// omitted marks a member that tokenBody leaves out.
+type omitted struct{}
+
+// tokenBody is a valid body of POST /user/tokens, the name ci with the
+// permissions [git:read], with the members of set put in; a member set to
+// omitted{} is left out.
+func tokenBody(set map[string]any) map[string]any {
+	body := map[string]any{"name": "ci", "permissions": []string{"git:read"}}
+	for k, v := range set {
+		if _, gone := v.(omitted); gone {
+			delete(body, k)
+		} else {
+			body[k] = v
+		}
+	}
+	return body
+}
+
+// createToken sends body to POST /api/v1/user/tokens with authorization as
+// the Authorization header.
+func (h *testHub) createToken(authorization string, body any) response {
+	h.t.Helper()
+	return h.call(http.MethodPost, "/api/v1/user/tokens", authorization, body)
+}
+
+// tokenCount counts the PATs of the user userID in the hub's store, revoked
+// and expired ones included.
+func (h *testHub) tokenCount(userID string) int {
+	h.t.Helper()
+	return h.count(`SELECT count(*) FROM pats WHERE user_id = ?`, userID)
+}
+
+// storedPAT reads the record of the PAT tokenID from the hub's store.
+func (h *testHub) storedPAT(tokenID string) identity.PAT {
+	h.t.Helper()
+	rec, err := identity.PATByID(context.Background(), h.st.Main(), tokenID)
+	if err != nil {
+		h.t.Fatalf("read PAT %s: %v", tokenID, err)
+	}
+	return rec
+}
+
+// storedKey reads the record of the API key keyID from the hub's store.
+func (h *testHub) storedKey(keyID string) identity.APIKey {
+	h.t.Helper()
+	rec, err := identity.APIKeyByID(context.Background(), h.st.Main(), keyID)
+	if err != nil {
+		h.t.Fatalf("read API key %s: %v", keyID, err)
+	}
+	return rec
+}
 
 // teamHub is a bootstrapped test hub with two users, each created with a
 // personal org through identity.CreateUserAndPersonalOrg: root, role admin,
@@ -515,11 +597,13 @@ var everyScope = []string{"users:read", "users:write", "orgs:read"}
 // both active and signing in with github. Its callers are the values of an
 // Authorization header: admin is the admin token, ka and ku are live API
 // keys of root and alice, and pa and pu live PATs of root and alice holding
-// everyScope. None of them expires.
+// everyScope. None of them expires. kuID and puID are the ids of ku and
+// pu.
 type teamHub struct {
 	*testHub
 	root, alice           identity.User
 	admin, ka, ku, pa, pu string
+	kuID, puID            string
 }
 
 // newTeamHub builds a team hub; opts are newTestHub's.
@@ -531,9 +615,10 @@ func newTeamHub(t *testing.T, opts ...hubOption) teamHub {
 	bearer := func(credential string) string { return "Bearer " + credential }
 	h.admin = bearer(h.adminToken)
 	h.ka, _ = h.seedKey(h.root.ID, 0)
-	h.ku, _ = h.seedKey(h.alice.ID, 0)
+	ku, kuRec := h.seedKey(h.alice.ID, 0)
 	h.pa, _ = h.seedPAT(identity.PATSpec{UserID: h.root.ID, Permissions: everyScope})
-	h.pu, _ = h.seedPAT(identity.PATSpec{UserID: h.alice.ID, Permissions: everyScope})
+	pu, puRec := h.seedPAT(identity.PATSpec{UserID: h.alice.ID, Permissions: everyScope})
+	h.ku, h.pu, h.kuID, h.puID = ku, pu, kuRec.KeyID, puRec.TokenID
 	h.ka, h.ku, h.pa, h.pu = bearer(h.ka), bearer(h.ku), bearer(h.pa), bearer(h.pu)
 	return h
 }
@@ -563,6 +648,19 @@ func (h *testHub) call(method, path, authorization string, body any) response {
 		header.Set("Authorization", authorization)
 	}
 	return h.do(method, path, body, header)
+}
+
+// needsScope registers a stub route that declares scope and answers 200,
+// and returns its path, so that a test can ask whether a token passes the
+// scope check for scope.
+func (h *testHub) needsScope(scope string) string {
+	pattern := "/test/needs/" + strings.ReplaceAll(scope, ":", "-")
+	h.srv.Register(server.Route{Method: http.MethodGet, Pattern: pattern, Scope: scope,
+		Handler: func(w http.ResponseWriter, r *http.Request) error {
+			server.WriteJSON(w, http.StatusOK, map[string]any{})
+			return nil
+		}})
+	return "/api/v1" + pattern
 }
 
 // snapshot reads every row of the users, orgs, memberships, API keys and

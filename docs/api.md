@@ -52,7 +52,8 @@ that fails answers the request, and no later check or the handler runs.
    [Request bodies](#request-bodies).
 5. The route's own feature check, where it declares one, then the binding
    guard.
-6. The scope check.
+6. The scope check: `403 insufficient_scope` for a PAT whose permissions
+   do not satisfy the scope the route declares (see [Scopes](#scopes)).
 7. The access checks, among them the admin check of the admin routes:
    `403 forbidden` with the message `this route needs an admin` for every
    caller but the admin token and an API key whose user has the role
@@ -121,6 +122,45 @@ user's credentials.
 ```
 
 The rate limit counts an authenticated request against its credential id.
+
+## Scopes
+
+A route may declare one scope that a PAT needs to call it; each route's
+section names it. The admin token and API keys carry no scopes and are never
+held to one, and a route that declares none is open to a PAT whatever its
+permissions. These 32 names are the registered scopes, matched exactly, in
+case and without trimming; any other string is not a scope:
+
+`users:read`, `users:write`, `orgs:read`, `keys:read`, `keys:manage`,
+`tokens:read`, `tokens:write`, `tokens:manage`, `workspaces:read`,
+`workspaces:write`, `git:read`, `git:write`, `changes:read`,
+`changes:write`, `changes:approve`, `checks:write`, `patches:read`,
+`patches:write`, `rebuilds:read`, `rebuilds:write`, `secrets:read`,
+`secrets:write`, `vars:read`, `vars:write`, `forge:read`, `forge:write`,
+`sandboxes:read`, `sandboxes:write`, `audit:read`, `audit:write`,
+`sessions:read`, `sessions:write`.
+
+A PAT passes a route's scope check when it holds the declared scope itself
+or a scope that implies it:
+
+| The route needs | Also satisfied by |
+|---|---|
+| `R:read`, for an area `R` that has `R:write` | `R:write` |
+| `keys:read` | `keys:manage` |
+| `tokens:read` | `tokens:write`, `tokens:manage` |
+| `tokens:write` | `tokens:manage` |
+
+Nothing else implies anything: `changes:approve` and `checks:write` are
+satisfied only by themselves and satisfy no other check, so `changes:write`
+does not let a token approve a change.
+
+A PAT that fails the check is answered before the access checks, request
+validation and the handler run, so the answer is the same whether or not
+the resource it addresses exists, and nothing changes:
+
+```json
+{"error":{"code":403,"message":"this route needs the scope users:read","error_type":"insufficient_scope"}}
+```
 
 ## Request ids and response headers
 
@@ -581,6 +621,7 @@ from the store for this request.
 |---|---|
 | `200 OK` | the body is the caller's User object |
 | `403` `forbidden` | the caller is the admin token (`this route needs a user`) |
+| `403` `insufficient_scope` | a PAT without `users:read` or a scope that implies it (see [Scopes](#scopes)) |
 
 The User object has exactly `id`, `username`, `email`, `full_name`, `role`,
 `status`, `provider`, `provider_id`, `created_at` and `updated_at`;
@@ -605,6 +646,7 @@ updated User object; every other member is unchanged.
 | `200 OK` | the name was stored; the body is the updated User object |
 | `400` `invalid_request` | `full_name` is missing (message `full_name is required`), or is not a JSON string, `null` included (message `full_name must be a string`); or the body is not a JSON object. The user is unchanged. |
 | `403` `forbidden` | the caller is the admin token (`this route needs a user`) |
+| `403` `insufficient_scope` | a PAT without `users:write` or a scope that implies it (see [Scopes](#scopes)) |
 
 ```json
 {"full_name":"Alice A."}
@@ -626,6 +668,271 @@ membership in an active org gets `items` `[]`.
 | `200 OK` | the body is a page: `items` are Org objects (see [`POST /api/v1/orgs`](#post-apiv1orgs)) |
 | `400` `invalid_request` | a bad `limit` or `cursor` (see [Lists](#lists)) |
 | `403` `forbidden` | the caller is the admin token (`this route needs a user`) |
+| `403` `insufficient_scope` | a PAT without `orgs:read` or a scope that implies it (see [Scopes](#scopes)) |
+
+## `GET /api/v1/user/keys`
+
+Lists the caller's API keys, a [list](#lists) in the standard pages. The
+route needs a user, as `GET /api/v1/user` does, and declares the scope
+`keys:read` for a PAT, which `keys:manage` satisfies.
+
+The list holds every API key of the caller's user in any state: live,
+revoked and expired. It is ordered newest first: `created_at` descending,
+then `key_id` descending. Each item is a Key object, which has exactly
+`key_id`, `user_id`, `expires_at`, `revoked_at` and `created_at`, with
+`null` for what is unset; the times are RFC 3339 in UTC with whole seconds.
+No Key object carries the key's value or its secret.
+
+```json
+{"key_id":"Ab3dE5gH","user_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","expires_at":"2026-04-01T00:00:00Z","revoked_at":null,"created_at":"2026-01-01T00:00:00Z"}
+```
+
+| Status | When |
+|---|---|
+| `200 OK` | the body is a page: `items` are Key objects |
+| `400` `invalid_request` | a bad `limit` or `cursor` (see [Lists](#lists)) |
+| `403` `forbidden` | the caller is the admin token (`this route needs a user`) |
+| `403` `insufficient_scope` | a PAT without `keys:read` or `keys:manage` (`this route needs the scope keys:read`) |
+
+## `POST /api/v1/user/keys/{key_id}/refresh`
+
+Gives one of the caller's live API keys a new secret without a new login.
+The key keeps its `key_id`; its new secret is 32 characters from
+`[0-9A-Za-z]`, of which only a hash is stored, and its `expires_at` is
+`expires_days` × 24 hours after the time of the request, counted from its
+whole second, or `null` for a key that never expires. The old secret no
+longer authenticates from the next request on. The body is ignored. The
+route is not a create route: an `Idempotency-Key` is ignored, and a second
+request refreshes again.
+
+Only an API key may refresh. The route needs a user, so the admin token is
+refused by authentication, and a PAT, whatever its scopes, is answered
+`403` `forbidden` `this route needs an API key` before the key is looked
+up. A `key_id` that names no key and one that names another user's key get
+the same answer, `404` `not_found` with the message `API key not found`, so
+the answer tells nothing of other users' keys; every route under
+`/api/v1/user/keys/{key_id}` looks the key up this way. A revoked key, and
+one whose `expires_at` has come, cannot be refreshed. A refused request
+changes nothing.
+
+The answer has exactly `key`, the new value `parley_<key_id>_<secret>`,
+shown this once; `key_id`; and `expires_at`:
+
+```json
+{"key":"parley_Ab3dE5gH_0123456789abcdefghijABCDEFGHIJKL","key_id":"Ab3dE5gH","expires_at":"2026-05-01T00:00:00Z"}
+```
+
+| Status | When |
+|---|---|
+| `200 OK` | the key has a new secret; the body is `key`, `key_id` and `expires_at` |
+| `403` `forbidden` | the caller is the admin token (`this route needs a user`) or a PAT (`this route needs an API key`) |
+| `404` `not_found` | the caller's user has no key with this id (`API key not found`) |
+| `409` `conflict` | the key is revoked (`API key is revoked`) or expired (`API key is expired`) |
+
+## `DELETE /api/v1/user/keys/{key_id}`
+
+Revokes one of the caller's API keys: its `revoked_at` is set to the time
+of the request and the record is kept, so the key stays in the list and no
+longer authenticates. An expired key is revoked too, and so is the key the
+request came with. The route needs a user and declares the scope
+`keys:manage` for a PAT, checked before the key is looked up. A key that is
+already revoked is answered as it is, with its earlier `revoked_at`;
+nothing changes. A key not found is answered as for
+[`POST /api/v1/user/keys/{key_id}/refresh`](#post-apiv1userkeyskey_idrefresh).
+
+| Status | When |
+|---|---|
+| `200 OK` | the key is revoked; the body is the Key object with `revoked_at` set |
+| `403` `forbidden` | the caller is the admin token (`this route needs a user`) |
+| `403` `insufficient_scope` | a PAT without `keys:manage` (`this route needs the scope keys:manage`) |
+| `404` `not_found` | the caller's user has no key with this id (`API key not found`) |
+
+## `POST /api/v1/user/tokens`
+
+Mints a personal access token (PAT) owned by the caller's user. The route
+needs a user, as `GET /api/v1/user` does, so an API key or a PAT may call
+it, and declares the scope `tokens:manage` for a PAT: a PAT without it is
+refused before the body is read, also when the body is invalid. It is a
+create route (see [Idempotency](#idempotency)).
+
+The body is a JSON object; other members are ignored:
+
+| Member | Required | Value |
+|---|---|---|
+| `name` | yes | a string of 1 to 255 characters |
+| `permissions` | yes | an array of at least one registered scope (see [Scopes](#scopes)), matched exactly; a duplicate is dropped and the order kept |
+| `paths` | no | `null`, or an array of 1 to 50 globs, each a string of 1 to 255 characters that does not start with `/`; stored in the order given, duplicates kept. Absent or `null`, the token has no path limits. |
+| `expires` | no | the lifetime in days, one of the integers `0`, `30`, `60` and `90`; `0` never expires; absent, `90` |
+
+A token's `paths` limits the files its writes may touch. In a glob, `*`
+matches any run of characters without `/`, `**` any run including `/`,
+both possibly empty, and every other character itself, case-sensitively;
+the glob must match the whole repository path. `docs/**` matches
+`docs/a.md` and `docs/api/b.md` but not `docs`; `src/*.go` matches
+`src/main.go` but not `src/x/y.go`. A token without `paths` may write any
+path.
+
+The token gets a new `token_id` of 8 and a secret of 32 characters from
+`[a-z0-9]`; only a hash of the secret is stored. `expires_at` is `expires` ×
+24 hours after the time of the request, counted from its whole second, and
+from that instant on the token no longer authenticates; it is `null` for
+`0`. `workspace` is `null`: a token minted here is not bound to a
+workspace.
+
+A PAT caller is held to the subset rule: it can mint a token only within
+what it holds itself, so that a token never creates a stronger one. Each
+requested permission must be in the caller's own `permissions`, compared
+exactly, without the implication rules of [Scopes](#scopes): a PAT with
+`git:write` cannot mint one with `git:read`. A caller with `paths` must
+send `paths` (absent or `null` is refused), and each requested glob must be
+covered by one of the caller's globs: the caller's glob matches every path
+the requested one can match, where a `*` of the caller's glob covers no `/`
+and no `**` (`src/**` covers `src/api/*.go` and `src/**`; `docs/*` does not
+cover `docs/**`). A caller without `paths` may ask for any `paths` or none.
+The rule runs after the body is validated, so a body that is invalid and
+also asks for more than the caller holds is answered `400`. An API key is
+not held to it: it may mint any registered scopes and any valid `paths`.
+
+| Status | When |
+|---|---|
+| `201 Created` | the token was minted; the body is the Token object and `token` |
+| `200 OK` | a replay of a recorded `Idempotency-Key` with the same body: the first answer without `token`; nothing is minted |
+| `400` `invalid_request` | a member is missing, of another type or out of range; nothing is minted. The messages: `name must be a string`, `name must be 1 to 255 characters`, `permissions must be an array of strings`, `permissions must hold at least one scope`, `permissions: "git:admin" is not a registered scope`, `paths must be an array of strings`, `paths must hold at least one glob; omit it for no path limit`, `paths holds 51 globs, at most 50 are allowed`, `paths[0] is empty`, `paths[0] is longer than 255 characters`, `paths[0] "/src/**" starts with /; globs are relative to the repository root`, `expires must be one of 0, 30, 60 and 90` |
+| `403` `forbidden` | the caller is the admin token (`this route needs a user`) |
+| `403` `insufficient_scope` | a PAT without `tokens:manage` (`this route needs the scope tokens:manage`) |
+| `403` `insufficient_scope` | a valid body beyond what the calling PAT holds; nothing is minted. The message names the first requested permission, in request order, the PAT does not hold (`permissions: this token does not hold "git:read"`); when it holds them all, the first requested glob none of its globs covers (`paths: "lib/**" is not covered by a glob of this token`), or, for a PAT with `paths` and a body without, `paths is required: this token is limited to paths, so the token it creates must be too` |
+
+```json
+{"name":"ci","permissions":["git:write","changes:write"],"paths":["docs/**","src/*.go"],"expires":90}
+```
+
+The Token object has exactly `token_id`, `user_id`, `name`, `permissions`,
+`paths`, `workspace`, `expires_at`, `revoked_at` and `created_at`, with
+`null` for what is unset; the times are RFC 3339 in UTC with whole seconds.
+The answer that minted the token adds `token`, the value
+`parley_pat_<token_id>_<secret>`, shown this once: no other answer carries
+it, a replay included.
+
+```json
+{"token_id":"k3x9m2pq","user_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","name":"ci","permissions":["git:write","changes:write"],"paths":["docs/**","src/*.go"],"workspace":null,"expires_at":"2026-04-01T00:00:00Z","revoked_at":null,"created_at":"2026-01-01T00:00:00Z","token":"parley_pat_k3x9m2pq_0123456789abcdefghijklmnopqrstuv"}
+```
+
+## `GET /api/v1/user/tokens`
+
+Lists the caller's personal access tokens, a [list](#lists) in the standard
+pages. The route needs a user, as `GET /api/v1/user` does, and declares the
+scope `tokens:read` for a PAT, which `tokens:write` and `tokens:manage`
+satisfy.
+
+The list holds every PAT of the caller's user in any state: live, revoked
+and expired, and the tokens bound to a workspace too. It is ordered newest
+first: `created_at` descending, then `token_id` descending. Each item is a
+Token object (see [`POST /api/v1/user/tokens`](#post-apiv1usertokens)),
+without the token's value.
+
+| Status | When |
+|---|---|
+| `200 OK` | the body is a page: `items` are Token objects |
+| `400` `invalid_request` | a bad `limit` or `cursor` (see [Lists](#lists)) |
+| `403` `forbidden` | the caller is the admin token (`this route needs a user`) |
+| `403` `insufficient_scope` | a PAT without `tokens:read` or a scope that implies it (`this route needs the scope tokens:read`) |
+
+## `GET /api/v1/user/tokens/{token_id}`
+
+Answers one of the caller's PATs, in any state, as a Token object without
+the token's value. The route needs a user and declares the scope
+`tokens:read` for a PAT, checked before the token is looked up, so a
+refused PAT is answered alike for a token that exists and one that does
+not.
+
+A `token_id` that names no token and one that names another user's token
+get the same answer, `404` `not_found` with the message `token not found`,
+so the answer tells nothing of other users' tokens. Every route under
+`/api/v1/user/tokens/{token_id}` looks the token up this way.
+
+```json
+{"error":{"code":404,"message":"token not found","error_type":"not_found"}}
+```
+
+| Status | When |
+|---|---|
+| `200 OK` | the body is the Token object |
+| `403` `forbidden` | the caller is the admin token (`this route needs a user`) |
+| `403` `insufficient_scope` | a PAT without `tokens:read` or a scope that implies it (`this route needs the scope tokens:read`) |
+| `404` `not_found` | the caller's user has no token with this id (`token not found`) |
+
+## `DELETE /api/v1/user/tokens/{token_id}`
+
+Revokes one of the caller's PATs: its `revoked_at` is set to the time of
+the request and the record is kept, so the token stays in the list and no
+longer authenticates. An expired token is revoked too, and so is the token
+the request came with. The route needs a user and declares the scope
+`tokens:manage` for a PAT, checked before the token is looked up. A token
+that is already revoked is answered as it is, with its earlier
+`revoked_at`; nothing changes. A token not found is answered as for
+`GET /api/v1/user/tokens/{token_id}`.
+
+| Status | When |
+|---|---|
+| `200 OK` | the token is revoked; the body is the Token object with `revoked_at` set |
+| `403` `forbidden` | the caller is the admin token (`this route needs a user`) |
+| `403` `insufficient_scope` | a PAT without `tokens:manage` (`this route needs the scope tokens:manage`) |
+| `404` `not_found` | the caller's user has no token with this id (`token not found`) |
+
+## `PUT`, `PATCH`, `DELETE /api/v1/user/tokens/{token_id}/permissions`
+
+Changes the permissions of one of the caller's PATs without issuing a new
+value: `PUT` replaces them with the list given, a duplicate dropped and the
+order kept; `PATCH` appends the scopes the token does not have yet, in the
+order given, after the ones it has; `DELETE` removes the scopes given and
+ignores every string the token does not have, registered or not. From the
+next request on, the token is scope-checked against its new permissions.
+The routes need a user and declare the scope `tokens:write` for a PAT,
+which `tokens:manage` satisfies, checked before the token is looked up.
+
+The body is a JSON object with the member `permissions`, an array of
+strings; other members are ignored, `paths` and `workspace` among them. A
+change never alters the token's `paths`, `workspace`, `name` or
+`expires_at`.
+
+```json
+{"permissions":["git:read","changes:write"]}
+```
+
+| Method | `permissions` |
+|---|---|
+| `PUT` | registered scopes; may be empty |
+| `PATCH` | at least one registered scope |
+| `DELETE` | at least one string |
+
+A change that leaves the token with no scope, a `PUT` with `[]` or a
+`DELETE` of every scope it has, stores `permissions` `[]` and revokes the
+token in the same transaction: `revoked_at` is the time of the request, and
+the token no longer authenticates.
+
+A PAT caller is held to the subset rule (see
+[`POST /api/v1/user/tokens`](#post-apiv1usertokens)) for the scopes the
+change adds, those of the new list the token does not have now: each must
+be in the caller's own `permissions`, compared exactly. A scope the token
+keeps, or one `DELETE` removes, is not checked; a PAT can therefore not
+widen itself either. An API key is not held to the rule.
+
+The checks run in this order, the first that fails answering: the token is
+looked up (`404`, as for
+`GET /api/v1/user/tokens/{token_id}`), the body is validated (`400`), the
+subset rule (`403`), then the token's state (`409`): a revoked token, and
+one whose `expires_at` has come, the instant from which it no longer
+authenticates, cannot be changed. A refused request changes nothing.
+
+| Status | When |
+|---|---|
+| `200 OK` | the permissions are changed; the body is the Token object after the change |
+| `400` `invalid_request` | the body has no `permissions` or not an array of strings (`permissions must be an array of strings`), a `PUT` or `PATCH` names a string that is not a registered scope (`permissions: "git:admin" is not a registered scope`), or a `PATCH` or `DELETE` sends `[]` (`permissions must hold at least one scope`) |
+| `403` `forbidden` | the caller is the admin token (`this route needs a user`) |
+| `403` `insufficient_scope` | a PAT without `tokens:write` or `tokens:manage` (`this route needs the scope tokens:write`) |
+| `403` `insufficient_scope` | a `PUT` or `PATCH` by a PAT that adds a scope it does not hold; the message names the first one (`permissions: this token does not hold "git:read"`) |
+| `404` `not_found` | the caller's user has no token with this id (`token not found`) |
+| `409` `conflict` | the token is revoked (`token is revoked`) or expired (`token is expired`) |
 
 ## Admin routes
 
@@ -650,7 +957,9 @@ The admin routes so far: `POST /api/v1/users`, `GET /api/v1/users`,
 `GET /api/v1/users/{id}`, `PATCH /api/v1/users/{id}`,
 `POST /api/v1/users/{id}/promote`, `POST /api/v1/users/{id}/demote`,
 `POST /api/v1/users/{id}/block`, `POST /api/v1/users/{id}/unblock`,
-`DELETE /api/v1/users/{id}`, `POST /api/v1/orgs`, `GET /api/v1/orgs`, `PATCH /api/v1/orgs/{id}`,
+`DELETE /api/v1/users/{id}`, `GET /api/v1/users/{id}/keys`,
+`GET /api/v1/users/{id}/tokens`, `DELETE /api/v1/users/{id}/keys/{key_id}`,
+`DELETE /api/v1/users/{id}/tokens/{token_id}`, `POST /api/v1/orgs`, `GET /api/v1/orgs`, `PATCH /api/v1/orgs/{id}`,
 `PUT /api/v1/orgs/{id}/members/{user_id}`,
 `DELETE /api/v1/orgs/{id}/members/{user_id}`,
 `POST /api/v1/orgs/{id}/block`, `POST /api/v1/orgs/{id}/unblock` and
@@ -865,6 +1174,46 @@ When that removal fails, the delete is undone as a whole, and the answer is
 | `409` `conflict` | the user is the only active admin (`the user is the only active admin`). Nothing changes. |
 | `500` `internal` | removing data another part of the hub keeps for the user failed (`internal error`). Nothing changes. |
 
+## Keys and tokens of a user
+
+`GET /api/v1/users/{id}/keys`, `GET /api/v1/users/{id}/tokens`,
+`DELETE /api/v1/users/{id}/keys/{key_id}` and
+`DELETE /api/v1/users/{id}/tokens/{token_id}` let an admin see and revoke
+the API keys and PATs of any user, without the user. They are admin routes
+(see [Admin routes](#admin-routes)) and declare no scope: every PAT, a PAT
+of an admin holding every scope included, is answered `403` `forbidden`
+(`this route needs an admin`), as is an API key whose user has the role
+`user`, also on that user's own keys and tokens. `{id}` is a user selector
+(see [User selectors](#user-selectors)), resolved before anything else the
+path names.
+
+Each answers what the route of the caller's own keys or tokens answers, for
+the user `{id}` names:
+
+- `GET /api/v1/users/{id}/keys` is a [list](#lists) of every API key of the
+  user in any state, newest first, as
+  [`GET /api/v1/user/keys`](#get-apiv1userkeys) lists them.
+- `GET /api/v1/users/{id}/tokens` is a list of every PAT of the user in any
+  state, workspace-bound ones included, newest first, as
+  [`GET /api/v1/user/tokens`](#get-apiv1usertokens) lists them, without the
+  tokens' values.
+- `DELETE /api/v1/users/{id}/keys/{key_id}` and
+  `DELETE /api/v1/users/{id}/tokens/{token_id}` revoke the key or token as
+  [`DELETE /api/v1/user/keys/{key_id}`](#delete-apiv1userkeyskey_id) and
+  [`DELETE /api/v1/user/tokens/{token_id}`](#delete-apiv1usertokenstoken_id)
+  do: `revoked_at` is set to the time of the request, an expired one
+  included, and the credential no longer authenticates; one already revoked
+  is answered as it is, with its earlier `revoked_at`. A `key_id` or
+  `token_id` that names nothing and one that names another user's key or
+  token get the same `404`.
+
+| Status | When |
+|---|---|
+| `200 OK` | a list: the body is a page whose `items` are Key or Token objects; a revocation: the body is the Key or Token object with `revoked_at` set |
+| `400` `invalid_request` | a list with a bad `limit` or `cursor` (see [Lists](#lists)) |
+| `403` `forbidden` | the caller is not an admin (`this route needs an admin`). Nothing changes. |
+| `404` `not_found` | no user has that id, e-mail or username (`user not found`); the user has no API key with this id (`API key not found`); the user has no token with this id (`token not found`). Nothing changes. |
+
 ## Org selectors
 
 A route with an org in its path, `/api/v1/orgs/{id}`, takes the org's id or
@@ -953,6 +1302,7 @@ exist, so a caller cannot tell an org it may not read from a missing one.
 | Status | When |
 |---|---|
 | `200 OK` | the body is the Org object |
+| `403` `insufficient_scope` | a PAT without `orgs:read` or a scope that implies it (see [Scopes](#scopes)) |
 | `404` `not_found` | no org has that id or slug, or the caller is not an admin and is not a member of the org or the org is blocked (`org not found`) |
 
 ## `PATCH /api/v1/orgs/{id}`
@@ -1002,7 +1352,8 @@ user's). An org without members gets `items` `[]`.
 | Status | When |
 |---|---|
 | `200 OK` | the body is a page of member items |
-| `400` `invalid_request` | a bad `limit` or `cursor` (see [Lists](#lists)), checked first, for an org that does not exist too |
+| `403` `insufficient_scope` | a PAT without `orgs:read` or a scope that implies it (see [Scopes](#scopes)), checked before anything else |
+| `400` `invalid_request` | a bad `limit` or `cursor` (see [Lists](#lists)), checked first after the scope, for an org that does not exist too |
 | `404` `not_found` | the `limit` and `cursor` are good, and no org has that id or slug, or the caller is not an admin and is not a member of the org or the org is blocked (`org not found`) |
 
 ```json

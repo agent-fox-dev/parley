@@ -627,7 +627,8 @@ without running a start hook or binding the listener.
 `internal/hub/identity.go` adds the part `composeIdentity`, after
 `composeBootstrap` in `parts`. It adds the schema step
 `identity.SchemaStep` (`identity_records`), installs the `Authenticate`
-method of an `identity.Service` as the pipeline's authenticator, adds its
+method of an `identity.Service` as the pipeline's authenticator, installs
+`identity.ScopeCheck` with `SetScopeCheck`, adds the service's
 `AdminCheck` method with `AddAccessCheck`, registers every route of `(*identity.Service).Routes()` with `AddRoute`, and adds the
 start hook `identity`, which binds the service with
 `(*identity.Service).Bind(identity.Deps{Store, Now, Providers,
@@ -646,7 +647,10 @@ a create route, the admin route `POST /users` (see
 and `PATCH /users/:id` (see [api.md](api.md#get-apiv1users)), the admin
 routes `POST /users/:id/promote`, `/demote`, `/block` and `/unblock` (see
 [api.md](api.md#role-and-status-of-a-user)), the admin route
-`DELETE /users/:id` (see [api.md](api.md#delete-apiv1usersid)), and the
+`DELETE /users/:id` (see [api.md](api.md#delete-apiv1usersid)), the admin
+routes `GET /users/:id/keys`, `GET /users/:id/tokens`,
+`DELETE /users/:id/keys/:key_id` and `DELETE /users/:id/tokens/:token_id`
+(see [api.md](api.md#keys-and-tokens-of-a-user)), and the
 caller's own profile, `GET /user`, `PATCH /user` and `GET /user/orgs` (see
 [api.md](api.md#get-apiv1user)), which need a user, the admin routes
 `POST /orgs`, a create route, `GET /orgs`, `PATCH /orgs/:id`,
@@ -800,6 +804,161 @@ whose `Role` is `admin`, and answers every other caller, PATs included,
 change of role holds from the next request on. Because it runs in the access
 position, after the body's size and media type and before the handler, a
 refused request is not validated, looks nothing up and changes nothing.
+
+`internal/identity/scope.go` holds the scope registry and the scope check.
+`identity.RegisteredScopes()` returns a copy of the 32 registered scopes in
+their documented order, and `identity.IsRegisteredScope(s)` tells a
+registered name from any other string, exactly. `identity.Satisfies(held,
+needed)` is the one implication rule: `needed` itself, `R:write` for an
+`R:read` where both are registered, `keys:manage` for `keys:read`, and
+`tokens:manage` for `tokens:write` and `tokens:read`; nothing else, so
+`changes:approve` and `checks:write` are granted only by name.
+`identity.ScopeCheck` is a package-level `server.Check`, since it needs no
+service state, which the hub installs in the pipeline's scope position. It
+reads the `Scope` of `server.MatchedRoute(r).Route`, the one declaration a
+route of any part makes, and the `identity.Principal` of the request: a
+route without a scope, the admin token and an API key pass, and a PAT whose
+`Permissions` do not satisfy the scope is answered
+`server.InsufficientScope("this route needs the scope <scope>")`. A route
+that declares a scope and whose request carries no `identity.Principal` (an
+authenticator other than the identity service's) fails closed with
+`server.Internal("the scope check found no authenticated principal")`
+rather than passing. It runs before the access checks and the handler, so a
+refused token learns nothing about the resource it addressed.
+
+`internal/identity/pathglob.go` is the one implementation of a token's path
+limits, pure functions with no state. `identity.ValidatePaths(v)` checks a
+`paths` value as `encoding/json` decoded it (or a `[]string`): `nil` is no
+path limit and returns `nil`; otherwise an array of 1 to 50 strings, each 1
+to 255 characters and not starting with `/`, returned in the order given
+with duplicates kept, or an error whose text names the entry it refuses
+(`paths[1] is not a string`). `identity.MatchPath(glob, path)` matches the
+whole path, case-sensitively: `*` is any run without `/`, `**` any run
+including `/` (both may be empty, and both are wildcards wherever they
+stand), a run of three or more asterisks reads as `**`, and every other
+character, `?`, `[` and `\` included, is itself. `identity.MatchAny(globs,
+path)` is the check of a token's list: a `nil` list allows every path,
+otherwise one glob must match. The parts that refuse a write outside a
+token's paths (git push, the SCM write API, opening changes and auto-land)
+call `MatchAny` with the `Paths` of the request's `identity.Principal` and
+match no glob of their own. `identity.Covers(c, g)` is the cover test that
+minting holds a path-limited token to: `c` equals `g`, or `c` read as a
+pattern matches the text of `g`, where a `*` of `c` takes no `/` and no
+asterisk of a `**` in `g`, and a `**` of `c` takes anything, so `c` matches
+every path `g` does. `identity.CoveredByAny(globs, g)` and
+`identity.FirstUncovered(held, requested)` (the first requested glob no held
+glob covers, and `true`) apply it to lists, a `nil` list covering
+everything. Matching and covering are one pass over the subject per element
+of the glob, never exponential.
+
+`internal/identity/token.go` holds minting, the one way a PAT is created.
+`identity.MintPAT(ctx, tx, caller, req, now)` takes the caller's
+`identity.Principal`, an `identity.MintRequest{Name, Permissions, Paths,
+Expires *int, ExpiresAt *time.Time, Workspace}` and the clock's `now`, and
+writes through the transaction it is given without committing, so a caller
+can mint a token together with changes of its own. It validates the values
+(`Name` 1 to 255 characters, `Permissions` at least one registered scope,
+duplicates dropped and the order kept, `Paths` through `ValidatePaths`,
+`Expires` 0, 30, 60 or 90 with `nil` meaning 90), each failure a
+`400 invalid_request` that stores nothing, then applies the subset rule
+(`CheckSubset`, below), then stores the token with
+`StorePAT` for `caller.User`, created at `now`. `expires_at` is `Expires` ×
+24 hours after `now` truncated to whole seconds, or `nil` for 0, so the
+instant the API shows is the instant the token stops authenticating; a
+hub-internal caller sets `ExpiresAt` instead, kept to whole seconds.
+`Workspace` is `""` on `POST /user/tokens`; binding a token is the
+workspace-token minting component's, which calls `MintPAT` with it.
+`identity.PAT` marshals to the REST API's Token object (`token_id`,
+`user_id`, `name`, `permissions`, `paths`, `workspace`, `expires_at`,
+`revoked_at`, `created_at`, `null` for what is unset), which never holds
+the token's value; only the creation answer adds `token`.
+
+`internal/identity/subset.go` holds the subset rule, so that every way of
+creating or widening a token applies the same code.
+`identity.CheckSubset(caller, permissions, paths)` returns `nil` unless
+`caller.Type` is `TypePAT`; for a PAT it returns a `403
+insufficient_scope` `*server.Error` naming the first requested permission,
+in request order, that is not in `caller.Permissions` (exact membership, no
+implication), else, when `caller.Paths` is not `nil`, saying `paths` is
+required for a `nil` request or naming the first requested glob
+`FirstUncovered` reports. `identity.CheckPermissionSubset(caller,
+permissions)` is its permission half alone, for a request that changes a
+token's permissions and not its paths (it is passed only the scopes being
+added). Both expect validated values: validation answers first.
+
+`POST /user/tokens`, in `internal/identity/token_routes.go`, is a create
+route with `ShowOnce: []string{"token"}`, so a replay under the same
+`Idempotency-Key` answers `200` without the value. It declares the scope
+`tokens:manage`, which the scope check holds a PAT to before the body is
+read, and carries `identity.MarkNeedsUser`. Its handler decodes the body
+into a `map[string]json.RawMessage` and checks only each member's JSON type
+(`name` a string, `permissions` and `paths` arrays of strings, `paths` also
+`null`, `expires` an integer), leaving the values to `MintPAT`, and runs
+`MintPAT` in one `(*store.Store).Tx` with `Deps.Now()`.
+
+`token.go` also holds the reads and revocations of PATs.
+`identity.RevokeTokenByID(ctx, tx, tokenID, now)` sets `revoked_at` to
+`now` when it is `NULL`, so a revoked token keeps its first `revoked_at`,
+and `identity.SetTokenExpiryByID(ctx, tx, tokenID, at)` sets `expires_at`
+to `at` kept to whole seconds and nothing else. Both write through the
+transaction they are given without committing, check no owner, write no
+event and return `ErrNotFound` for an unknown id: they are for hub-internal
+callers (the hub credential of a sandbox), which change a token together
+with changes of their own. The routes look a token up with `tokenOfUser`,
+which answers a missing token and another user's alike, `404` `token not
+found`, and list a user's tokens with `listTokens`, newest first
+(`created_at`, then `token_id`, both descending) with keyset paging on
+those two; the admin routes call the same functions with the selected
+user's id. `GET /user/tokens` and `GET /user/tokens/:token_id` declare
+`tokens:read`, `DELETE /user/tokens/:token_id` declares `tokens:manage`
+and revokes through `RevokeTokenByID` after the owner lookup, in one
+transaction; every `/user/tokens` route carries `identity.MarkNeedsUser`,
+so the admin token is refused by authentication and no handler refuses it
+again.
+
+`PUT`, `PATCH` and `DELETE /user/tokens/:token_id/permissions` share one
+handler, `changeOwnTokenPermissions`, declaring `tokens:write`. In one
+`(*store.Store).Tx` it looks the token up with `tokenOfUser` (404), reads
+the body's `permissions` with `permissionsChangeOf` (400; registered scopes
+for `PUT` and `PATCH`, at least one entry for `PATCH` and `DELETE`),
+computes the new list with `changedPermissions` (`PUT` the list without
+duplicates, `PATCH` the current list with the new scopes appended, `DELETE`
+the current list without the given ones), passes the scopes the new list
+adds to the token's current ones to `CheckPermissionSubset` (403), refuses a
+revoked or expired token with `409 conflict`, and writes with
+`setTokenPermissions`, which stores `[]` and sets `revoked_at` in the same
+`UPDATE` when the list is empty. Expiry is decided by `expired(expiresAt,
+now)` in `authenticate.go`, the predicate authentication's `checkState`
+uses, so a token is `409` here exactly when it is `401` there. `paths`,
+`workspace`, `name` and `expires_at` are never written.
+
+`internal/identity/key_routes.go` holds the routes of the caller's own API
+keys, each carrying `identity.MarkNeedsUser`. `APIKey.MarshalJSON` writes
+the Key object (`key_id`, `user_id`, `expires_at`, `revoked_at`,
+`created_at`), so no answer built from a record can carry a secret.
+`GET /user/keys` declares `keys:read` and lists with `listKeys`, newest
+first (`created_at`, then `key_id`, both descending) with keyset paging on
+those two. `DELETE /user/keys/:key_id` declares `keys:manage` and revokes
+with `revokeKeyOfUser`, which sets `revoked_at` only while it is `NULL`, in
+one transaction with the owner lookup. `POST /user/keys/:key_id/refresh`
+declares no scope and is not a create route: its handler refuses any caller
+but an API key with `403 forbidden` before the lookup, refuses a revoked or
+expired key (the same `expired` predicate) with `409 conflict`, and in one
+transaction stores the hash of a new `randomString(apiKeyAlphabet,
+secretLength)` secret and the new `expires_at` with `setKeySecret`;
+authentication reads the stored hash on every request, so the old secret
+fails from the next one. Every `:key_id` route resolves the id with
+`keyOfUser`, which answers a missing key and another user's alike, `404`
+`API key not found`. `s.writeKeys(w, r, userID)` and `s.revokeKey(w, r,
+userID)` take the user id, so the admin routes reuse them.
+
+`internal/identity/admin_credential_routes.go` holds the admin routes of
+any user's keys and tokens. They carry the admin mark and declare no
+scope, so the admin check refuses every PAT. Each handler is
+`forSelectedUser` around `writeKeys`, `writeTokens`, `revokeKey` or
+`revokeToken`: it resolves the path's `:id` with `UserBySelector`
+(`404 user not found`) and passes the user's id on, so an admin's list and
+revocation run the same code, and give the same answers, as the user's own.
 
 `POST /users` (`createUser`) decodes the body into a
 `map[string]json.RawMessage`, so that a missing member, `null` and a value
@@ -1051,6 +1210,25 @@ step that builds them from its flags and sends them with `sendWith`
 commands with `--include-blocked` share the run step `sendIncludeBlocked`
 (`admin_users.go`), and `parley admin orgs create` and `update` send a
 member only when its flag is given (`addChanged` in `admin_orgs.go`).
+
+`parley admin keys` (`admin_keys.go`, also in `parley admin`) is declarations
+alone too. `parley keys` (`keys.go`) is `list`, a declaration, and `refresh`
+and `revoke`, whose run steps take the route's `:key_id` from the command's
+own credential (`apiKeyID`, which repeats the hub's API key format, since
+the client does not import the hub's code) and refuse any other credential
+before sending. After the hub's answer is printed, `refresh` saves the new
+key and `revoke` clears `api_key` and `user_id` through `saveConfig`, both
+only in a config file that already exists, so neither creates one.
+
+`parley admin tokens` (`admin_tokens.go`, also in `parley admin`) is
+declarations alone. `parley tokens` (`tokens.go`) is `list`, `show` and
+`revoke`, declarations, and `create`, `replace`, `add` and `remove`, whose
+run steps build the body from the flags: `splitList` splits `--permissions`
+and each `--paths` value at every comma, without the quoting of pflag's
+comma-separated flags, and `create` sends `paths` only when `--paths` is
+given and declares `ShowsOnce`. `changePermissions` builds the three
+permission commands; after the answer is printed, `replace` and `remove`
+note on stderr a Token whose `revoked_at` is not null.
 
 Help lives in `internal/cli/help.go`. `installHelp` keeps cobra's own text
 help, sets the root's help function, which `--help` on any command and a

@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/identity"
-	"github.com/agent-fox-dev/parley/internal/server"
 )
 
 // needsUserRoute is a route that needs a user, with a body it accepts, nil
@@ -27,6 +26,16 @@ var needsUserRoutes = []needsUserRoute{
 	{http.MethodGet, "/api/v1/user", nil},
 	{http.MethodPatch, "/api/v1/user", map[string]any{"full_name": "x"}},
 	{http.MethodGet, "/api/v1/user/orgs", nil},
+	{http.MethodGet, "/api/v1/user/keys", nil},
+	{http.MethodPost, "/api/v1/user/keys/x/refresh", nil},
+	{http.MethodDelete, "/api/v1/user/keys/x", nil},
+	{http.MethodPost, "/api/v1/user/tokens", tokenBody(nil)},
+	{http.MethodGet, "/api/v1/user/tokens", nil},
+	{http.MethodGet, "/api/v1/user/tokens/x", nil},
+	{http.MethodDelete, "/api/v1/user/tokens/x", nil},
+	{http.MethodPut, "/api/v1/user/tokens/x/permissions", map[string]any{"permissions": []string{"git:read"}}},
+	{http.MethodPatch, "/api/v1/user/tokens/x/permissions", map[string]any{"permissions": []string{"git:read"}}},
+	{http.MethodDelete, "/api/v1/user/tokens/x/permissions", map[string]any{"permissions": []string{"git:read"}}},
 }
 
 // wholeSecondsUTC is an RFC 3339 time in UTC with whole seconds.
@@ -173,17 +182,6 @@ func TestOwnOrgs_ListsTheActiveOrgsOfTheCallerByName(t *testing.T) {
 func TestScopes_RefuseAPATWithoutTheDeclaredScopeBeforeAnythingElse(t *testing.T) {
 	t.Parallel()
 	h := newTeamHub(t)
-	// The production scope check, which is not part of this service,
-	// compares with the implication rules; this one compares the declared
-	// scope with the PAT's own.
-	h.srv.SetScopeCheck(func(r *http.Request) error {
-		p, _ := identity.PrincipalOf(r.Context())
-		m, _ := server.MatchedRoute(r)
-		if p.Type == identity.TypePAT && m.Route.Scope != "" && !slices.Contains(p.Permissions, m.Route.Scope) {
-			return server.InsufficientScope("the token does not hold the scope " + m.Route.Scope)
-		}
-		return nil
-	})
 	for _, c := range []struct {
 		method, path, scope string
 		body                any
@@ -195,14 +193,12 @@ func TestScopes_RefuseAPATWithoutTheDeclaredScopeBeforeAnythingElse(t *testing.T
 		{http.MethodGet, "/api/v1/orgs/alice/members", "orgs:read", nil},
 	} {
 		t.Run(c.method+" "+c.path, func(t *testing.T) {
-			others := slices.DeleteFunc(slices.Clone(everyScope), func(s string) bool { return s == c.scope })
+			others := slices.DeleteFunc(slices.Clone(everyScope), func(s string) bool { return identity.Satisfies([]string{s}, c.scope) })
 			without, _ := h.seedPAT(identity.PATSpec{UserID: h.alice.ID, Permissions: others})
 			only, _ := h.seedPAT(identity.PATSpec{UserID: h.alice.ID, Permissions: []string{c.scope}})
 			before := h.snapshot()
 			r := h.call(c.method, c.path, "Bearer "+without, c.body)
-			if r.status != http.StatusForbidden || r.errorField("error_type") != "insufficient_scope" {
-				t.Errorf("without %s: answer = %d %s, want 403 insufficient_scope", c.scope, r.status, r.body)
-			}
+			checkRefusal(t, "without "+c.scope, r, http.StatusForbidden, "insufficient_scope", "this route needs the scope "+c.scope)
 			if h.snapshot() != before {
 				t.Errorf("without %s: the store changed", c.scope)
 			}

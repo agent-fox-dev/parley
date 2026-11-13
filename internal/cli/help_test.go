@@ -96,7 +96,9 @@ func TestHelp_PrintsTheHelpOfTheRootOrAGroupGivenNoCommand(t *testing.T) {
 		subcommands map[string]string
 	}{
 		{nil, map[string]string{
-			"admin":   "Administer the hub's users and organizations",
+			"admin":   "Administer the hub's users, organizations, API keys and access tokens",
+			"keys":    "List, refresh and revoke your API keys",
+			"tokens":  "Create, read, change and revoke your personal access tokens",
 			"help":    "Print the help of parley or of a command",
 			"login":   "Sign in to the hub and save the hub URL and the credential",
 			"orgs":    "List and read the organizations you belong to",

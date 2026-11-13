@@ -320,10 +320,12 @@ Usage:
   parley [command]
 
 Available Commands:
-  admin       Administer the hub's users and organizations
+  admin       Administer the hub's users, organizations, API keys and access tokens
   help        Print the help of parley or of a command
+  keys        List, refresh and revoke your API keys
   login       Sign in to the hub and save the hub URL and the credential
   orgs        List and read the organizations you belong to
+  tokens      Create, read, change and revoke your personal access tokens
   user        Read and update your own profile
   version     Print the client's build and, given a hub URL, the hub's build
 
@@ -931,6 +933,170 @@ status `2`, and sends no request:
   "error": {
     "code": 0,
     "message": "parley user update needs the flag --full-name",
+    "error_type": "usage_error"
+  }
+}
+```
+
+### `parley keys` and `parley admin keys`
+
+These commands call the [API key routes](api.md#get-apiv1userkeys) of the
+hub and print its answer as described under [Output](#output); an error the
+hub answers is written to stderr as received, with exit status `1`. A group
+run without a command, `parley keys` or `parley admin keys`, prints its help
+and exits `0`.
+
+| Command | Request |
+|---|---|
+| `parley keys list` | `GET /api/v1/user/keys` |
+| `parley keys refresh` | `POST /api/v1/user/keys/<key_id>/refresh`, without a body |
+| `parley keys revoke` | `DELETE /api/v1/user/keys/<key_id>` |
+| `parley admin keys list <user>` | `GET /api/v1/users/<user>/keys` |
+| `parley admin keys revoke <user> <key_id>` | `DELETE /api/v1/users/<user>/keys/<key_id>` |
+
+`parley admin keys` takes `<user>` as the other admin commands do (see
+[User selectors](api.md#user-selectors)), and sends `<user>` and `<key_id>`
+each as one percent-encoded path segment: `a/b` is sent as `a%2Fb`. Run with
+a number of arguments other than the ones it takes, a command is a
+`usage_error` with exit status `2` and sends no request.
+
+`parley keys refresh` and `parley keys revoke` act on the API key the command
+presents, the credential resolved as described under
+[Settings](#settings-the-hub-url-and-the-credential), and take its
+`<key_id>` from it: an API key is `parley_<key id>_<secret>`, an 8-character
+key id and a 32-character secret over `0-9`, `A-Z` and `a-z`. Any other
+credential, a personal access token or the admin token among them, is a
+`client_error` with exit status `2`, and the command sends no request:
+
+```json
+{
+  "error": {
+    "code": 0,
+    "message": "parley keys refresh needs an API key (parley_<key id>_<secret>) as the credential, and the credential given is not one",
+    "error_type": "client_error"
+  }
+}
+```
+
+`parley keys refresh` prints the hub's answer, `{"key", "key_id",
+"expires_at"}`, writes the show-once warning on stderr
+
+```
+warning: this value is shown once and will not be shown again
+```
+
+and then saves the new `key` as `api_key` in the config file, keeping
+`endpoint_url`, `user_id` and every other key of the file, with mode `0600`;
+it exits `0`. The old key stops working as soon as the hub answers, so if
+the answer is lost on the way, the new key is lost with it: sign in again
+with `parley login`. When the config file does not exist (the credential
+came from `--api-key` or `PARLEY_API_KEY`), holds an `api_key` other than
+the refreshed key (the credential came from `--api-key` or `PARLEY_API_KEY`,
+and the file's own key, which the refresh did not touch, is left in place),
+or cannot be written, the command creates and changes no file, and after the
+printed answer it writes on stderr
+
+```
+warning: the new key was not saved; it is printed above, and parley login --api-key - saves it
+```
+
+followed by a `client_error` envelope whose message begins with `the new key
+was not saved: ` and gives the reason, for example `there is no config file
+/home/alice/.parley/config.toml` or `the config file
+/home/alice/.parley/config.toml holds another API key`; the exit status is
+`2`.
+
+`parley keys revoke` prints the revoked key the hub answers, then, when the
+config file exists and its `api_key` is the revoked key (or empty), sets its
+`api_key` and `user_id` to the empty string, keeping `endpoint_url` and
+every other key, and writes on stderr
+
+```
+warning: the API key is revoked; run parley login to sign in again
+```
+
+It exits `0`; without a config file it writes no file and still writes the
+warning.
+When the config file holds another API key (the revoked key came from
+`--api-key` or `PARLEY_API_KEY`), the file is left as it was, since its key
+still works, nothing is written on stderr, and the exit status is `0`. When
+the hub answers an error, the error is written to stderr as received, the
+exit status is `1`, and the config file is left as it was.
+
+### `parley tokens` and `parley admin tokens`
+
+These commands call the [personal access token routes](api.md#post-apiv1usertokens)
+of the hub and print its answer as described under [Output](#output); an
+error the hub answers is written to stderr as received, with exit status
+`1`. A group run without a command, `parley tokens` or
+`parley admin tokens`, prints its help and exits `0`.
+
+| Command | Request |
+|---|---|
+| `parley tokens list` | `GET /api/v1/user/tokens` |
+| `parley tokens create --name <name> --permissions <scopes> [--paths <globs>]... [--expires <days>]` | `POST /api/v1/user/tokens` with the members `name`, `permissions` and `expires`, and `paths` only when `--paths` is given |
+| `parley tokens show <token_id>` | `GET /api/v1/user/tokens/<token_id>` |
+| `parley tokens revoke <token_id>` | `DELETE /api/v1/user/tokens/<token_id>` |
+| `parley tokens replace <token_id> --permissions <scopes>` | `PUT /api/v1/user/tokens/<token_id>/permissions` with `{"permissions": [...]}` |
+| `parley tokens add <token_id> --permissions <scopes>` | `PATCH /api/v1/user/tokens/<token_id>/permissions` with `{"permissions": [...]}` |
+| `parley tokens remove <token_id> --permissions <scopes>` | `DELETE /api/v1/user/tokens/<token_id>/permissions` with `{"permissions": [...]}` |
+| `parley admin tokens list <user>` | `GET /api/v1/users/<user>/tokens` |
+| `parley admin tokens revoke <user> <token_id>` | `DELETE /api/v1/users/<user>/tokens/<token_id>` |
+
+`--permissions` and `--paths` take lists separated by commas, split at
+every comma as given, without quoting, so a glob keeps every other
+character; an empty value is the empty list, so `--permissions ""` sends
+`[]`. `--paths` may be
+given more than once: the lists of all its values are sent as one array,
+in the order given, so `--paths 'docs/**,src/*.go' --paths README.md`
+sends `["docs/**","src/*.go","README.md"]`. `--expires` is the lifetime in
+days, an integer, `90` when the flag is not given. The client sends scope
+names, globs and lifetimes as given and leaves them to the hub to judge.
+For example,
+
+```
+parley tokens create --name ci --permissions git:read,changes:write --paths 'docs/**' --expires 30
+```
+
+sends
+
+```json
+{"expires":30,"name":"ci","paths":["docs/**"],"permissions":["git:read","changes:write"]}
+```
+
+`parley tokens create` prints the hub's answer, the Token with its `token`,
+and writes the show-once warning on stderr:
+
+```
+warning: this value is shown once and will not be shown again
+```
+
+`parley tokens replace` and `parley tokens remove` print the Token after
+the change; when its `revoked_at` is not `null`, because the change left
+the token without scopes, they then write on stderr
+
+```
+warning: the token was revoked: it has no permissions left
+```
+
+and exit `0`. `parley tokens add` writes no such note.
+
+`parley admin tokens` takes `<user>` as the other admin commands do (see
+[User selectors](api.md#user-selectors)). Every command sends `<user>` and
+`<token_id>` each as one percent-encoded path segment: `a/b` is sent as
+`a%2Fb`.
+
+A command run without one of its required flags (`--name` and
+`--permissions` on `parley tokens create`; `--permissions` on `replace`,
+`add` and `remove`), with a number of arguments other than the ones it
+takes, or with an `--expires` that is not an integer is a `usage_error`
+with exit status `2`, and sends no request:
+
+```json
+{
+  "error": {
+    "code": 0,
+    "message": "invalid argument \"soon\" for \"--expires\" flag: strconv.ParseInt: parsing \"soon\": invalid syntax",
     "error_type": "usage_error"
   }
 }

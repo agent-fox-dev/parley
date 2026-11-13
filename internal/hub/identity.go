@@ -9,8 +9,10 @@ import (
 
 // composeIdentity adds the identity records to the transactional store,
 // installs the identity service as the pipeline's authenticator, so that
-// every non-public route under /api/v1 is authenticated, adds its admin
-// check to the access checks, and registers the service's routes: GET
+// every non-public route under /api/v1 is authenticated, installs the scope
+// check, which holds a PAT to the scope each route of every part declares,
+// adds the service's admin check to the access checks, and registers the
+// service's routes: GET
 // /auth/providers, POST /auth/callback and the user, org and membership
 // routes of Service.Routes. The service gets its store, clock and
 // configuration in a start hook, which runs before the hub serves its first
@@ -32,6 +34,7 @@ func composeIdentity(c *Composition) {
 		return nil
 	})
 	c.SetAuthenticator(svc.Authenticate)
+	c.SetScopeCheck(identity.ScopeCheck)
 	c.AddAccessCheck(svc.AdminCheck)
 	for _, r := range svc.Routes() {
 		c.AddRoute(r)
