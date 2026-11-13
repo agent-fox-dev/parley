@@ -845,6 +845,37 @@ glob covers, and `true`) apply it to lists, a `nil` list covering
 everything. Matching and covering are one pass over the subject per element
 of the glob, never exponential.
 
+`internal/identity/token.go` holds minting, the one way a PAT is created.
+`identity.MintPAT(ctx, tx, caller, req, now)` takes the caller's
+`identity.Principal`, an `identity.MintRequest{Name, Permissions, Paths,
+Expires *int, ExpiresAt *time.Time, Workspace}` and the clock's `now`, and
+writes through the transaction it is given without committing, so a caller
+can mint a token together with changes of its own. It validates the values
+(`Name` 1 to 255 characters, `Permissions` at least one registered scope,
+duplicates dropped and the order kept, `Paths` through `ValidatePaths`,
+`Expires` 0, 30, 60 or 90 with `nil` meaning 90), each failure a
+`400 invalid_request` that stores nothing, then stores the token with
+`StorePAT` for `caller.User`, created at `now`. `expires_at` is `Expires` ×
+24 hours after `now` truncated to whole seconds, or `nil` for 0, so the
+instant the API shows is the instant the token stops authenticating; a
+hub-internal caller sets `ExpiresAt` instead, kept to whole seconds.
+`Workspace` is `""` on `POST /user/tokens`; binding a token is the
+workspace-token minting component's, which calls `MintPAT` with it.
+`identity.PAT` marshals to the REST API's Token object (`token_id`,
+`user_id`, `name`, `permissions`, `paths`, `workspace`, `expires_at`,
+`revoked_at`, `created_at`, `null` for what is unset), which never holds
+the token's value; only the creation answer adds `token`.
+
+`POST /user/tokens`, in `internal/identity/token_routes.go`, is a create
+route with `ShowOnce: []string{"token"}`, so a replay under the same
+`Idempotency-Key` answers `200` without the value. It declares the scope
+`tokens:manage`, which the scope check holds a PAT to before the body is
+read, and carries `identity.MarkNeedsUser`. Its handler decodes the body
+into a `map[string]json.RawMessage` and checks only each member's JSON type
+(`name` a string, `permissions` and `paths` arrays of strings, `paths` also
+`null`, `expires` an integer), leaving the values to `MintPAT`, and runs
+`MintPAT` in one `(*store.Store).Tx` with `Deps.Now()`.
+
 `POST /users` (`createUser`) decodes the body into a
 `map[string]json.RawMessage`, so that a missing member, `null` and a value
 of another type are told apart: `username`, `email`, `provider` and

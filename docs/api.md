@@ -670,6 +670,61 @@ membership in an active org gets `items` `[]`.
 | `403` `forbidden` | the caller is the admin token (`this route needs a user`) |
 | `403` `insufficient_scope` | a PAT without `orgs:read` or a scope that implies it (see [Scopes](#scopes)) |
 
+## `POST /api/v1/user/tokens`
+
+Mints a personal access token (PAT) owned by the caller's user. The route
+needs a user, as `GET /api/v1/user` does, so an API key or a PAT may call
+it, and declares the scope `tokens:manage` for a PAT: a PAT without it is
+refused before the body is read, also when the body is invalid. It is a
+create route (see [Idempotency](#idempotency)).
+
+The body is a JSON object; other members are ignored:
+
+| Member | Required | Value |
+|---|---|---|
+| `name` | yes | a string of 1 to 255 characters |
+| `permissions` | yes | an array of at least one registered scope (see [Scopes](#scopes)), matched exactly; a duplicate is dropped and the order kept |
+| `paths` | no | `null`, or an array of 1 to 50 globs, each a string of 1 to 255 characters that does not start with `/`; stored in the order given, duplicates kept. Absent or `null`, the token has no path limits. |
+| `expires` | no | the lifetime in days, one of the integers `0`, `30`, `60` and `90`; `0` never expires; absent, `90` |
+
+A token's `paths` limits the files its writes may touch. In a glob, `*`
+matches any run of characters without `/`, `**` any run including `/`,
+both possibly empty, and every other character itself, case-sensitively;
+the glob must match the whole repository path. `docs/**` matches
+`docs/a.md` and `docs/api/b.md` but not `docs`; `src/*.go` matches
+`src/main.go` but not `src/x/y.go`. A token without `paths` may write any
+path.
+
+The token gets a new `token_id` of 8 and a secret of 32 characters from
+`[a-z0-9]`; only a hash of the secret is stored. `expires_at` is `expires` ×
+24 hours after the time of the request, counted from its whole second, and
+from that instant on the token no longer authenticates; it is `null` for
+`0`. `workspace` is `null`: a token minted here is not bound to a
+workspace.
+
+| Status | When |
+|---|---|
+| `201 Created` | the token was minted; the body is the Token object and `token` |
+| `200 OK` | a replay of a recorded `Idempotency-Key` with the same body: the first answer without `token`; nothing is minted |
+| `400` `invalid_request` | a member is missing, of another type or out of range; nothing is minted. The messages: `name must be a string`, `name must be 1 to 255 characters`, `permissions must be an array of strings`, `permissions must hold at least one scope`, `permissions: "git:admin" is not a registered scope`, `paths must be an array of strings`, `paths must hold at least one glob; omit it for no path limit`, `paths holds 51 globs, at most 50 are allowed`, `paths[0] is empty`, `paths[0] is longer than 255 characters`, `paths[0] "/src/**" starts with /; globs are relative to the repository root`, `expires must be one of 0, 30, 60 and 90` |
+| `403` `forbidden` | the caller is the admin token (`this route needs a user`) |
+| `403` `insufficient_scope` | a PAT without `tokens:manage` (`this route needs the scope tokens:manage`) |
+
+```json
+{"name":"ci","permissions":["git:write","changes:write"],"paths":["docs/**","src/*.go"],"expires":90}
+```
+
+The Token object has exactly `token_id`, `user_id`, `name`, `permissions`,
+`paths`, `workspace`, `expires_at`, `revoked_at` and `created_at`, with
+`null` for what is unset; the times are RFC 3339 in UTC with whole seconds.
+The answer that minted the token adds `token`, the value
+`parley_pat_<token_id>_<secret>`, shown this once: no other answer carries
+it, a replay included.
+
+```json
+{"token_id":"k3x9m2pq","user_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","name":"ci","permissions":["git:write","changes:write"],"paths":["docs/**","src/*.go"],"workspace":null,"expires_at":"2026-04-01T00:00:00Z","revoked_at":null,"created_at":"2026-01-01T00:00:00Z","token":"parley_pat_k3x9m2pq_0123456789abcdefghijklmnopqrstuv"}
+```
+
 ## Admin routes
 
 The user and org administration routes are admin routes. Their caller must

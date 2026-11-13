@@ -508,7 +508,39 @@ func checkRefusal(t *testing.T, what string, r response, status int, errorType, 
 
 // everyScope is every scope a route of the identity service declares, so
 // that a PAT holding them passes the scope check of every identity route.
-var everyScope = []string{"users:read", "users:write", "orgs:read"}
+var everyScope = []string{"users:read", "users:write", "orgs:read", "tokens:manage"}
+
+// omitted marks a member that tokenBody leaves out.
+type omitted struct{}
+
+// tokenBody is a valid body of POST /user/tokens, the name ci with the
+// permissions [git:read], with the members of set put in; a member set to
+// omitted{} is left out.
+func tokenBody(set map[string]any) map[string]any {
+	body := map[string]any{"name": "ci", "permissions": []string{"git:read"}}
+	for k, v := range set {
+		if _, gone := v.(omitted); gone {
+			delete(body, k)
+		} else {
+			body[k] = v
+		}
+	}
+	return body
+}
+
+// createToken sends body to POST /api/v1/user/tokens with authorization as
+// the Authorization header.
+func (h *testHub) createToken(authorization string, body any) response {
+	h.t.Helper()
+	return h.call(http.MethodPost, "/api/v1/user/tokens", authorization, body)
+}
+
+// tokenCount counts the PATs of the user userID in the hub's store, revoked
+// and expired ones included.
+func (h *testHub) tokenCount(userID string) int {
+	h.t.Helper()
+	return h.count(`SELECT count(*) FROM pats WHERE user_id = ?`, userID)
+}
 
 // teamHub is a bootstrapped test hub with two users, each created with a
 // personal org through identity.CreateUserAndPersonalOrg: root, role admin,
