@@ -71,6 +71,18 @@ func TestIdentityCommands_RefuseABadCommandLineAndSendNothing(t *testing.T) {
 		{[]string{"admin", "keys", "revoke", "alice"}, "parley admin keys revoke", "<key_id>"},
 		{[]string{"keys", "list", "x"}, "parley keys list", `"x"`},
 		{[]string{"keys", "refresh", "x"}, "parley keys refresh", `"x"`},
+		{[]string{"tokens", "create", "--permissions", "git:read"}, "parley tokens create", "--name"},
+		{[]string{"tokens", "create", "--name", "ci"}, "parley tokens create", "--permissions"},
+		{[]string{"tokens", "create", "--name", "ci", "--permissions", "git:read", "--expires", "soon"}, "--expires", `"soon"`},
+		{[]string{"tokens", "show"}, "parley tokens show", "<token_id>"},
+		{[]string{"tokens", "revoke"}, "parley tokens revoke", "<token_id>"},
+		{[]string{"tokens", "revoke", "a", "b"}, "parley tokens revoke", `"b"`},
+		{[]string{"tokens", "replace", "k3x9q2mz"}, "parley tokens replace", "--permissions"},
+		{[]string{"tokens", "add", "k3x9q2mz"}, "parley tokens add", "--permissions"},
+		{[]string{"tokens", "remove", "k3x9q2mz"}, "parley tokens remove", "--permissions"},
+		{[]string{"tokens", "add", "--permissions", "git:read"}, "parley tokens add", "<token_id>"},
+		{[]string{"admin", "tokens", "list"}, "parley admin tokens list", "<user>"},
+		{[]string{"admin", "tokens", "revoke", "alice"}, "parley admin tokens revoke", "<token_id>"},
 	}
 	for _, tt := range tests {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
@@ -107,6 +119,10 @@ func TestIdentityCommands_PrintTheHubsErrorEnvelopeAsReceived(t *testing.T) {
 			`{"error":{"code":401,"message":"invalid credentials","error_type":"unauthenticated"}}`},
 		{[]string{"admin", "orgs", "create", "--name", "A", "--slug", "a"}, http.MethodPost, "/api/v1/orgs", http.StatusBadRequest,
 			`{"error":{"code":400,"message":"slug must be 1 to 128 characters of a-z, 0-9, _ and -, starting and ending with a letter or digit","error_type":"invalid_request"}}`},
+		{[]string{"tokens", "show", "k3x9q2mz"}, http.MethodGet, "/api/v1/user/tokens/k3x9q2mz", http.StatusNotFound,
+			`{"error":{"code":404,"message":"token not found","error_type":"not_found"}}`},
+		{[]string{"admin", "tokens", "list", "alice"}, http.MethodGet, "/api/v1/users/alice/tokens", http.StatusForbidden,
+			`{"error":{"code":403,"message":"this route needs an admin","error_type":"forbidden"}}`},
 	}
 	for _, tt := range tests {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {

@@ -1217,6 +1217,16 @@ before sending. After the hub's answer is printed, `refresh` saves the new
 key and `revoke` clears `api_key` and `user_id` through `saveConfig`, both
 only in a config file that already exists, so neither creates one.
 
+`parley admin tokens` (`admin_tokens.go`, also in `parley admin`) is
+declarations alone. `parley tokens` (`tokens.go`) is `list`, `show` and
+`revoke`, declarations, and `create`, `replace`, `add` and `remove`, whose
+run steps build the body from the flags: `splitList` splits `--permissions`
+and each `--paths` value at every comma, without the quoting of pflag's
+comma-separated flags, and `create` sends `paths` only when `--paths` is
+given and declares `ShowsOnce`. `changePermissions` builds the three
+permission commands; after the answer is printed, `replace` and `remove`
+note on stderr a Token whose `revoked_at` is not null.
+
 Help lives in `internal/cli/help.go`. `installHelp` keeps cobra's own text
 help, sets the root's help function, which `--help` on any command and a
 group run without a word reach, and replaces cobra's help command with

@@ -320,11 +320,12 @@ Usage:
   parley [command]
 
 Available Commands:
-  admin       Administer the hub's users, organizations and API keys
+  admin       Administer the hub's users, organizations, API keys and access tokens
   help        Print the help of parley or of a command
   keys        List, refresh and revoke your API keys
   login       Sign in to the hub and save the hub URL and the credential
   orgs        List and read the organizations you belong to
+  tokens      Create, read, change and revoke your personal access tokens
   user        Read and update your own profile
   version     Print the client's build and, given a hub URL, the hub's build
 
@@ -1011,6 +1012,85 @@ warning: the API key is revoked; run parley login to sign in again
 It exits `0`; without a config file it writes no file. When the hub answers
 an error, the error is written to stderr as received, the exit status is
 `1`, and the config file is left as it was.
+
+### `parley tokens` and `parley admin tokens`
+
+These commands call the [personal access token routes](api.md#post-apiv1usertokens)
+of the hub and print its answer as described under [Output](#output); an
+error the hub answers is written to stderr as received, with exit status
+`1`. A group run without a command, `parley tokens` or
+`parley admin tokens`, prints its help and exits `0`.
+
+| Command | Request |
+|---|---|
+| `parley tokens list` | `GET /api/v1/user/tokens` |
+| `parley tokens create --name <name> --permissions <scopes> [--paths <globs>]... [--expires <days>]` | `POST /api/v1/user/tokens` with the members `name`, `permissions` and `expires`, and `paths` only when `--paths` is given |
+| `parley tokens show <token_id>` | `GET /api/v1/user/tokens/<token_id>` |
+| `parley tokens revoke <token_id>` | `DELETE /api/v1/user/tokens/<token_id>` |
+| `parley tokens replace <token_id> --permissions <scopes>` | `PUT /api/v1/user/tokens/<token_id>/permissions` with `{"permissions": [...]}` |
+| `parley tokens add <token_id> --permissions <scopes>` | `PATCH /api/v1/user/tokens/<token_id>/permissions` with `{"permissions": [...]}` |
+| `parley tokens remove <token_id> --permissions <scopes>` | `DELETE /api/v1/user/tokens/<token_id>/permissions` with `{"permissions": [...]}` |
+| `parley admin tokens list <user>` | `GET /api/v1/users/<user>/tokens` |
+| `parley admin tokens revoke <user> <token_id>` | `DELETE /api/v1/users/<user>/tokens/<token_id>` |
+
+`--permissions` and `--paths` take lists separated by commas, split at
+every comma as given, without quoting, so a glob keeps every other
+character; an empty value is the empty list, so `--permissions ""` sends
+`[]`. `--paths` may be
+given more than once: the lists of all its values are sent as one array,
+in the order given, so `--paths 'docs/**,src/*.go' --paths README.md`
+sends `["docs/**","src/*.go","README.md"]`. `--expires` is the lifetime in
+days, an integer, `90` when the flag is not given. The client sends scope
+names, globs and lifetimes as given and leaves them to the hub to judge.
+For example,
+
+```
+parley tokens create --name ci --permissions git:read,changes:write --paths 'docs/**' --expires 30
+```
+
+sends
+
+```json
+{"expires":30,"name":"ci","paths":["docs/**"],"permissions":["git:read","changes:write"]}
+```
+
+`parley tokens create` prints the hub's answer, the Token with its `token`,
+and writes the show-once warning on stderr:
+
+```
+warning: this value is shown once and will not be shown again
+```
+
+`parley tokens replace` and `parley tokens remove` print the Token after
+the change; when its `revoked_at` is not `null`, because the change left
+the token without scopes, they then write on stderr
+
+```
+warning: the token was revoked: it has no permissions left
+```
+
+and exit `0`. `parley tokens add` writes no such note.
+
+`parley admin tokens` takes `<user>` as the other admin commands do (see
+[User selectors](api.md#user-selectors)). Every command sends `<user>` and
+`<token_id>` each as one percent-encoded path segment: `a/b` is sent as
+`a%2Fb`.
+
+A command run without one of its required flags (`--name` and
+`--permissions` on `parley tokens create`; `--permissions` on `replace`,
+`add` and `remove`), with a number of arguments other than the ones it
+takes, or with an `--expires` that is not an integer is a `usage_error`
+with exit status `2`, and sends no request:
+
+```json
+{
+  "error": {
+    "code": 0,
+    "message": "invalid argument \"soon\" for \"--expires\" flag: strconv.ParseInt: parsing \"soon\": invalid syntax",
+    "error_type": "usage_error"
+  }
+}
+```
 
 ### Output
 
