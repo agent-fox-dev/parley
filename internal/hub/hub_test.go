@@ -13,8 +13,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/config"
 	"github.com/agent-fox-dev/parley/internal/hub"
+	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/store"
 )
 
@@ -153,7 +155,11 @@ func TestRun_StopsTheStartAtTheFirstFailingStage(t *testing.T) {
 			t.Parallel()
 			a := tc.arrange(t, tc.name)
 			var stdout, stderr syncBuffer
-			code := hub.Run(context.Background(), hub.Options{
+			// A start that wrongly succeeds serves until the deadline, and
+			// then fails the checks below instead of hanging the test.
+			ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+			defer cancel()
+			code := hub.Run(ctx, hub.Options{
 				WorkDir: a.dir, Stdout: &stdout, Stderr: &stderr, Compose: a.compose,
 			})
 
@@ -260,6 +266,16 @@ func failingStarts(hooks func(row string) func(*hub.Composition)) []failingStart
 			return failedStart{dir: workDir(t, localConfig), want: "retention", compose: func(c *hub.Composition) {
 				c.AddMaintenanceTask("retention", noop)
 				c.AddMaintenanceTask("retention", noop)
+				hooks(row)(c)
+			}}
+		}},
+		{"public route that declares a workspace need", "data", func(t *testing.T, row string) failedStart {
+			return failedStart{dir: workDir(t, localConfig), want: "GET /workspaces/:slug/notes", compose: func(c *hub.Composition) {
+				c.AddRoute(server.Route{
+					Method: http.MethodGet, Pattern: "/workspaces/:slug/notes", Public: true,
+					Marks:   map[string]string{access.MarkNeed: "read"},
+					Handler: func(w http.ResponseWriter, _ *http.Request) error { return nil },
+				})
 				hooks(row)(c)
 			}}
 		}},

@@ -456,10 +456,13 @@ maintenance tasks and background work receive it; a route handler or a check kee
 `(*Composition).Runtime()`, which the hub fills once the stores are open and
 before the first hook runs or the first request is served. A start hook or a
 maintenance task without a name or a function, or with a name already
-registered, a configuration key or section the registry refuses, and a
-route the server refuses, stop the start before anything is opened; so does
-background work without a name or a function, or with a name already
-registered. `(*Composition).ShuttingDown()` returns the shutdown
+registered, a configuration key or section the registry refuses, a
+route the server refuses, and a route that breaks a route rule a part
+added with the unexported `addRouteRule`, stop the start before anything is
+opened; so does background work without a name or a function, or with a
+name already registered. A route rule applies to every route of the
+composition, including those `Options.Compose` adds after the hub's own
+parts. `(*Composition).ShuttingDown()` returns the shutdown
 notification, a channel the hub closes once when the stop begins.
 
 ### The start
@@ -1143,7 +1146,13 @@ keeps data for a user or an org registers its remover from its part in
 `Check` to the access checks, after identity's admin check, and binds it in
 the start hook `access` to `access.Deps{Records:
 access.StoreRecords(rt.Store.Main()), Memberships: ...}`, the membership
-source being `identity.ActiveOrgIDs` over the same store. It registers no
+source being `identity.ActiveOrgIDs` over the same store. It adds the route
+rule `refusePublicNeed`: a route that is `Public` and declares
+`access.MarkNeed` stops the start with `compose the routes: <method>
+<pattern>: a public route cannot declare the workspace need access.need:
+the pipeline runs no access check on it`, because the pipeline skips the
+access checks on a public route and its handler would serve every caller
+without a decision. It registers no
 remover on the identity service: a workspace record outlives the deletion of
 its owner and of its org.
 

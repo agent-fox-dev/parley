@@ -122,6 +122,7 @@ type Composition struct {
 	hooks         []namedFunc
 	tasks         *maintenance.Registry
 	routes        []server.Route
+	routeRules    []func(server.Route) error
 	mounts        []mount
 	authenticator server.Authenticator
 	bindingGuard  server.Check
@@ -265,11 +266,26 @@ func (c *Composition) install(srv *server.Server) (err error) {
 	return nil
 }
 
-// check returns the registrations the composition refused, and installs the
-// routes on a server of its own so that a bad route stops the start before
-// anything is opened.
+// addRouteRule adds a rule every route of the composition must keep,
+// including the routes Options.Compose adds after the hub's own parts. A
+// route that breaks it stops the start.
+func (c *Composition) addRouteRule(rule func(server.Route) error) {
+	c.routeRules = append(c.routeRules, rule)
+}
+
+// check returns the registrations the composition refused and the routes
+// that break a route rule, and installs the routes on a server of its own so
+// that a bad route stops the start before anything is opened.
 func (c *Composition) check() error {
-	if err := errors.Join(c.errs...); err != nil {
+	errs := append([]error(nil), c.errs...)
+	for _, r := range c.routes {
+		for _, rule := range c.routeRules {
+			if err := rule(r); err != nil {
+				errs = append(errs, fmt.Errorf("compose the routes: %s %s: %w", r.Method, r.Pattern, err))
+			}
+		}
+	}
+	if err := errors.Join(errs...); err != nil {
 		return err
 	}
 	return c.install(server.New(server.Options{Logger: slog.New(slog.DiscardHandler)}))
