@@ -62,6 +62,10 @@ type command struct {
 	// Timeout, when not zero, bounds each of the command's requests in
 	// place of the default of 30 seconds.
 	Timeout time.Duration `json:"-"`
+	// Wait makes the command one that can wait for the operation it
+	// starts: declare gives it --wait, --timeout and --poll-interval, and
+	// its run step, unless it declares Run, is the shared wait.
+	Wait *waitFor `json:"-"`
 }
 
 // failOn is a --fail-on-<Name> flag: a condition over the command's result
@@ -151,14 +155,20 @@ func declare(decl command) *cobra.Command {
 				}
 				c.client = c.newClient(s.hubURL, s.credential)
 			}
-			if decl.Run == nil {
-				return sendAndPrint(c)
+			switch {
+			case decl.Run != nil:
+				return decl.Run(c)
+			case decl.Wait != nil:
+				return c.wait()
 			}
-			return decl.Run(c)
+			return sendAndPrint(c)
 		},
 	}
 	if decl.Flags != nil {
 		decl.Flags(cmd.Flags())
+	}
+	if decl.Wait != nil {
+		addWaitFlags(cmd.Flags())
 	}
 	for _, f := range decl.FailOn {
 		cmd.Flags().Bool(f.flag(), false, f.Description)

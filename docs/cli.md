@@ -880,6 +880,101 @@ command's message to stderr and exits `3`. When the flag is not given, or
 the condition does not hold, it prints the result, writes nothing to stderr
 and exits `0`.
 
+### Waiting
+
+A command that starts a long operation (a clone, a rebuild, a landing) can
+wait for it to end. Every such command has the same three flags:
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--wait` | `false` | wait until the operation reaches a terminal state and print its final record |
+| `--timeout <duration>` | `5m` | with `--wait`, how long to wait for the operation to end |
+| `--poll-interval <duration>` | `5s` | with `--wait`, how long to wait between two requests for the operation's state |
+
+A duration is a whole number above `0` followed by exactly one unit: `s`
+(seconds), `m` (minutes), `h` (hours) or `d` (24 hours), for example `90s`,
+`5m`, `2h` or `1d`. Leading zeros are allowed (`05s` is five seconds), as
+in the hub's own durations. Zero (`0s`, `0`), a sign (`-5s`), a fraction
+(`1.5m`), a missing or unknown unit (`5`, `5w`), spaces (`5 m`), a compound
+form (`1m30s`), an empty value and a value too large to hold are refused
+with a `usage_error` naming the flag, before any request, whether or not
+`--wait` is given:
+
+```json
+{
+  "error": {
+    "code": 0,
+    "message": "invalid argument \"0s\" for \"--timeout\" flag: want a whole number above 0 followed by s, m, h or d, such as 90s or 5m",
+    "error_type": "usage_error"
+  }
+}
+```
+
+Without `--wait` the command sends the request that starts the operation,
+prints its answer whatever state it holds, and sends nothing else;
+`--timeout` and `--poll-interval` then have no other effect.
+
+With `--wait` the command sends the same request and reads the state in
+its answer. When that state is already terminal, the wait ends without
+asking again. Otherwise it asks the hub for the operation's state one poll
+interval after the answer came, and again one interval after each answer,
+under one deadline: `--timeout` counted from the moment the start
+request's answer came. A state that is not terminal never ends the wait,
+"waiting to retry" (a job's `failed`) included. Which states are terminal,
+and which of them are a success, each command states. Each poll is an
+ordinary request: 30-second timeout, sent once.
+
+stdout receives nothing until the wait ends. stderr receives one progress
+line, `waiting: <state>`, when the wait begins and each time the state
+differs from the one before:
+
+```
+waiting: queued
+waiting: running
+waiting: done
+```
+
+The wait ends in one of these ways:
+
+| End | stdout | stderr, after the progress | Exit status |
+|---|---|---|---|
+| a terminal state that is a success | the final record | nothing | `0` |
+| a terminal state that is not a success | the final record | `wait_failed` naming the state | `1` |
+| `--timeout` passes first | nothing | `wait_timeout` | `1` |
+| a poll answered with the hub's error envelope | nothing | the envelope as received | `1` |
+| a poll that fails on the client's side: the hub cannot be reached, gives no complete answer within the request timeout, or answers something that is not the hub's | nothing | `client_error` | `2` |
+
+The errors a wait raises itself read, for example:
+
+```json
+{
+  "error": {
+    "code": 0,
+    "message": "the operation ended in the state \"dead\", which is not a success",
+    "error_type": "wait_failed"
+  }
+}
+```
+
+```json
+{
+  "error": {
+    "code": 0,
+    "message": "the operation did not end within 1s; its last state was \"running\"",
+    "error_type": "wait_timeout"
+  }
+}
+```
+
+A command that states its own final document (for example one that prints
+its answer with the final job added) prints that document in place of the
+final record, under the same rules.
+
+At the deadline a poll still in flight is abandoned, so the command
+returns within moments of the timeout. Running out of time stops only the
+waiting: the client sends no request that cancels or changes the
+operation, which goes on on the hub.
+
 ### Errors and exit statuses
 
 stdout carries the result, and nothing on a failure, except the result a
@@ -907,8 +1002,8 @@ their values and in their order. An error `parley` raises itself has `code`
 |---|---|
 | `usage_error` | the command line cannot be accepted: an unknown command, at the top level or under a group, an unknown flag, a flag without its value or with a value that does not parse as the flag's type, fewer or more arguments than the command takes, a flag the command requires that is not given, `parley help` with words that name no command, or a value the command refuses (`parley login --expires 45`). It is raised before any setting is read and before any request |
 | `client_error` | a failure on the client's side that is not the command line's: for example no hub URL, a configuration file that cannot be read, a hub that cannot be reached, an answer that is not the hub's. A failure inside the CLI of no other kind is reported as a `client_error` too, with its text as the message |
-| `wait_failed` | a wait for a long operation ended in a state that is not a success |
-| `wait_timeout` | a wait for a long operation ran out of time |
+| `wait_failed` | a wait for a long operation ended in a state that is not a success (see [Waiting](#waiting)) |
+| `wait_timeout` | a wait for a long operation ran out of time (see [Waiting](#waiting)) |
 | `condition_not_met` | a `--fail-on-…` condition held in the result |
 
 The exit status follows from the error alone, on every command:

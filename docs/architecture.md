@@ -12,7 +12,7 @@ command-line client. Both are written in Go, in the module
 | `cmd/parley` | the `parley` program: it calls `cli.Run` and exits with its status |
 | `cmd/parleyd` | the `parleyd` program: `main` calls `hub.Run` with the process's arguments, environment and working directory and exits with its status |
 | `internal/buildinfo` | the version, commit and build time the binary was built with, shared by both programs |
-| `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra`, each declared through one helper ([ADR 02](adr/02-declare-every-cli-command-through-one-helper.md)), the client configuration file, the resolution of the hub URL and the credential, the one HTTP client the commands send their requests with, the printing of a command's result on stdout and of its warnings on stderr, and the error envelopes and exit statuses every command ends with |
+| `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra`, each declared through one helper ([ADR 02](adr/02-declare-every-cli-command-through-one-helper.md)), the client configuration file, the resolution of the hub URL and the credential, the one HTTP client the commands send their requests with, the printing of a command's result on stdout and of its warnings on stderr, the shared wait for a long operation (`--wait`, `--timeout`, `--poll-interval`), and the error envelopes and exit statuses every command ends with |
 | `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, and a registry of keys and whole sections that decides what the file may hold |
 | `internal/hub` | the composition of the `parleyd` process: argument parsing, the scrubbing logger, the fixed start order, the bootstrap of the admin token, the HTTP server's options, the idempotency records in the transactional store, signals and the stop, and the `backup` command; the one place later packages plug their parts in ([ADR 01](adr/01-compose-the-hub-in-one-package.md)) |
 | `internal/maintenance` | the maintenance loop: a registry of named tasks, and `Loop`, which runs one pass at once and one at each tick of an hourly timer, the tasks of a pass one after the other in a fixed order, and logs a failing task without stopping the others |
@@ -937,6 +937,37 @@ in the result, so the result is on stdout before `run` prints the error.
 `warn` and `progress` write a plain line to stderr, a warning prefixed with
 `warning: `; `parley version` writes its warnings with `warn`. `parley
 login` prints the user with `printResult`.
+
+`internal/cli/wait.go` holds the shared wait for a long operation. A
+command declares `Wait`, a `waitFor`: `Start` (optional; the request that
+starts the operation, by default `Method` to `Path`), `Poll` (the request
+that asks for the operation's state, built from the record last received),
+`Classify` (a record's state and whether it is not terminal, `successful`
+or `unsuccessful`; `byState` builds one from a string member and the lists
+of successful and unsuccessful states) and `Document` (optional; the
+document printed in place of the final record, from the start's answer and
+the final record). `declare` registers `--wait` (bool), `--timeout` and
+`--poll-interval` (`durationValue`, a `pflag.Value` whose `Type` is
+`duration`, defaults `5m` and `5s`) and makes `call.wait` the run step of a
+command that declares no `Run`. `durationValue.Set` parses with
+`parseDuration` (a whole number above 0 and one of `s`, `m`, `h`, `d`), so
+a value it refuses is a flag that does not parse, a `usage_error` from the
+root's flag error handler before any request, with or without `--wait`.
+The client does not import the hub's `internal/server/timefmt`; the parser
+is its own. `call.wait` sends the start request through the call's client;
+without `--wait` it prints the answer with `printAnswer`. With `--wait` it
+classifies the start's record, writes `waiting: <state>` with `progress`,
+and until a record is terminal waits one poll interval (or the
+`options.pollInterval` tests set below one second), sends the poll under a
+context whose deadline is `--timeout` after the start's answer came, and
+writes `waiting: <state>` when the state changes. The final record, or
+`Document`'s document, is printed with `printResult`; an unsuccessful end
+then returns `wait_failed` naming the state. When the deadline passes,
+while sleeping or with a poll in flight (the client's error then names the
+abandoned request, not the reason), `waitEnded` returns `wait_timeout`;
+any other error of a poll (the hub's envelope, a `client_error`, a poll's
+own request timeout before the deadline) ends the wait as it is. Nothing
+is printed on stdout then, and no request cancels the operation.
 
 `internal/cli/config.go` is the one implementation of the client
 configuration file. `configPath` gives `$PARLEY_CONFIG_DIR/config.toml`, or

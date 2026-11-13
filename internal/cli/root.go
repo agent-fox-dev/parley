@@ -30,6 +30,9 @@ type options struct {
 	// requestTimeout bounds each request to the hub of a command that
 	// states no timeout of its own (defaultRequestTimeout).
 	requestTimeout time.Duration
+	// pollInterval, when not zero, replaces the --poll-interval of a wait,
+	// so that tests poll faster than the flag's smallest value, 1s.
+	pollInterval time.Duration
 }
 
 func defaultOptions() options {

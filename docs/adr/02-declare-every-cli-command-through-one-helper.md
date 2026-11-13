@@ -51,6 +51,14 @@ and every command group through `group`; the root command is a group too.
   show-once warning after the result; and `FailOn`, the `--fail-on-…` flags
   whose condition, when it holds, ends the command with `condition_not_met`
   once the result is printed.
+- A command that starts a long operation declares `Wait`: how to poll the
+  operation from its record, how to tell a record's state and whether it
+  is terminal and successful, and optionally the request that starts it
+  and the document it prints in place of the final record. `declare` then
+  gives it `--wait`, `--timeout` and `--poll-interval`, refuses a duration
+  it cannot read as a `usage_error`, and makes the shared wait its run
+  step, so the polling, the deadline, the progress lines, `wait_failed` and
+  `wait_timeout` are the same on every such command.
 - A run step returns an error and never writes one. `run` in
   `internal/cli/root.go` prints the error with `printError` and returns
   `exitCode(err)`, both in `internal/cli/errors.go`. Cobra's own error and

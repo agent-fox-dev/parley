@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"net"
@@ -125,6 +126,94 @@ func probeAdmin() *cobra.Command {
 	return group("admin", "Administer the things", purge)
 }
 
+// probeRun builds "probe run": POST /jobs starts a job, and with --wait
+// the command polls GET /jobs/:id with the id of the record. done is a
+// successful end, dead and cancelled unsuccessful ones; every other state,
+// queued, running and failed (waiting to retry) among them, is not terminal.
+func probeRun() *cobra.Command {
+	return declare(probeRunCommand())
+}
+
+func probeRunCommand() command {
+	return command{
+		Name:        "run",
+		Description: "Run a job",
+		Method:      http.MethodPost,
+		Path:        "/jobs",
+		Auth:        authUser,
+		Wait: &waitFor{
+			Poll: func(_ *call, record []byte) (apiRequest, error) {
+				var job struct {
+					ID string `json:"id"`
+				}
+				if err := json.Unmarshal(record, &job); err != nil || job.ID == "" {
+					return apiRequest{}, clientError("the job has no id")
+				}
+				return apiRequest{method: http.MethodGet, path: "/jobs/" + pathSegment(job.ID)}, nil
+			},
+			Classify: byState("state", []string{"done"}, []string{"dead", "cancelled"}),
+		},
+	}
+}
+
+// jobRecord is the record of the job j1 in state, as the hub serves it
+// the n-th time (0 for the answer to the start), so that two records of
+// one state differ.
+func jobRecord(state string, n int) string {
+	return fmt.Sprintf(`{"id":"j1","state":%q,"poll":%d}`, state, n)
+}
+
+// jobHub is a stub hub that starts the job j1 in state start on POST
+// /api/v1/jobs and answers the n-th GET /api/v1/jobs/j1 with polls[n-1],
+// the last of polls answering every later one too. Without polls a poll is
+// answered 404 with an error envelope.
+func jobHub(t *testing.T, start string, polls ...http.HandlerFunc) *stubHub {
+	t.Helper()
+	h := newStubHub(t).answer(http.MethodPost, "/api/v1/jobs", http.StatusCreated, jobRecord(start, 0))
+	if len(polls) == 0 {
+		return h
+	}
+	var mu sync.Mutex
+	n := 0
+	return h.handle(http.MethodGet, "/api/v1/jobs/j1", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		n++
+		i := min(n, len(polls)) - 1
+		mu.Unlock()
+		polls[i](w, r)
+	})
+}
+
+// jobStates are the answers of a jobHub's polls: the n-th is the record of
+// j1 in states[n-1].
+func jobStates(states ...string) []http.HandlerFunc {
+	polls := make([]http.HandlerFunc, 0, len(states))
+	for i, state := range states {
+		polls = append(polls, answerWith(http.StatusOK, jobRecord(state, i+1)))
+	}
+	return polls
+}
+
+// answerWith is a handler that answers status and body.
+func answerWith(status int, body string) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(status)
+		w.Write([]byte(body))
+	}
+}
+
+// count is how many requests with method the stub hub got.
+func (h *stubHub) count(method string) int {
+	n := 0
+	for _, r := range h.recorded() {
+		if r.method == method {
+			n++
+		}
+	}
+	return n
+}
+
 // runProbes runs parley with the probe commands added and args.
 func runProbes(t *testing.T, args ...string) (int, string, string) {
 	t.Helper()
@@ -229,18 +318,21 @@ type stubRequest struct {
 	rawPath, query string
 	contentLength  int64
 	header         http.Header
+	// at is when the request arrived.
+	at time.Time
 }
 
 func newStubHub(t *testing.T) *stubHub {
 	t.Helper()
 	h := &stubHub{answers: map[string]stubAnswer{}, handlers: map[string]http.HandlerFunc{}}
 	h.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		at := time.Now()
 		body, _ := io.ReadAll(r.Body)
 		h.mu.Lock()
 		h.requests = append(h.requests, stubRequest{
 			method: r.Method, path: r.URL.Path, body: string(body),
 			rawPath: r.URL.EscapedPath(), query: r.URL.RawQuery, contentLength: r.ContentLength,
-			header: r.Header.Clone(),
+			header: r.Header.Clone(), at: at,
 		})
 		a, ok := h.answers[r.Method+" "+r.URL.Path]
 		handler := h.handlers[r.Method+" "+r.URL.Path]
