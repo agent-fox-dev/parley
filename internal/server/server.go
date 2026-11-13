@@ -82,7 +82,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	conns := newConnTracker()
 	srv := &http.Server{Handler: s.mux, ConnState: conns.track}
 	served := make(chan error, 1)
-	go func() { served <- srv.Serve(ln) }()
+	go func() { served <- srv.Serve(trackingListener{ln, conns}) }()
 
 	select {
 	case err := <-served:
@@ -117,6 +117,22 @@ type connTracker struct {
 
 func newConnTracker() *connTracker {
 	return &connTracker{fresh: make(map[net.Conn]struct{}), changed: make(chan struct{}, 1)}
+}
+
+// trackingListener counts a connection as waiting for its first request as
+// soon as Accept returns it, before http.Server reports it as StateNew, so a
+// stop cannot miss a connection accepted just before the listener closed.
+type trackingListener struct {
+	net.Listener
+	conns *connTracker
+}
+
+func (l trackingListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err == nil {
+		l.conns.track(conn, http.StateNew)
+	}
+	return conn, err
 }
 
 // track is the http.Server ConnState hook.

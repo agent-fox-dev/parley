@@ -56,6 +56,8 @@ func newRootCommand(opts options) *cobra.Command {
 		// usage dump would bury it.
 		SilenceErrors: true,
 		SilenceUsage:  true,
+		// A suggestion would add lines after the one error line Run writes.
+		DisableSuggestions: true,
 		// Shell completion is not part of the client yet.
 		CompletionOptions: cobra.CompletionOptions{DisableDefaultCmd: true},
 	}

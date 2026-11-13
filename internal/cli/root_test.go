@@ -33,3 +33,23 @@ func TestRun_PrintsHelpWithoutArguments(t *testing.T) {
 		t.Errorf("the hub got %d requests, want 0", n)
 	}
 }
+
+func TestRun_RefusesWhatItCannotParseWithOneErrorLine(t *testing.T) {
+	t.Parallel()
+	for _, args := range [][]string{{"versio"}, {"nope"}, {"--nope"}} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			t.Parallel()
+			code, stdout, stderr := runCLI(t, args...)
+
+			if code != 2 {
+				t.Errorf("Run returned %d, want 2", code)
+			}
+			if stdout != "" {
+				t.Errorf("stdout = %q, want it empty", stdout)
+			}
+			if lines := nonEmptyLines(stderr); len(lines) != 1 || !strings.HasPrefix(stderr, "error: ") {
+				t.Errorf("stderr = %q, want one line that begins with %q", stderr, "error: ")
+			}
+		})
+	}
+}
