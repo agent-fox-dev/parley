@@ -236,7 +236,9 @@ the route (the method, one space and the concrete `r.URL.Path`, such as
    skipped; an object it changes is re-encoded with its members in sorted
    order and without white space between them, and every value kept is
    unchanged), calls
-   `DeleteExpired` with the cutoff `now - 24h` and then `Write`s the record.
+   `DeleteExpired` with the cutoff `now - 24h` when no sweep has started in
+   the last minute (a sweep of the in-memory store visits every record, so
+   it does not run on every write), and then `Write`s the record.
    A body that is not a JSON object while `ShowOnce` names members, or a store
    error, is logged as `idempotency record not written` with the
    `request_id` and the `error`, and nothing is recorded: the caller already
