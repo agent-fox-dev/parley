@@ -53,7 +53,10 @@ that fails answers the request, and no later check or the handler runs.
 5. The route's own feature check, where it declares one, then the binding
    guard.
 6. The scope check.
-7. The access checks.
+7. The access checks, among them the admin check of the admin routes:
+   `403 forbidden` with the message `this route needs an admin` for every
+   caller but the admin token and an API key whose user has the role
+   `admin` (see [Admin routes](#admin-routes)).
 8. On a create route, the `Idempotency-Key`: `400 invalid_request` for a bad
    key, `409 conflict` for a key used with another body, or a replay, as in
    [Idempotency](#idempotency).
@@ -565,3 +568,530 @@ has exactly `key`, the key `parley_<key_id>_<secret>`, shown this once;
 ```json
 {"user":{"id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","username":"alice","email":"a@x","full_name":"Alice A","role":"user","status":"active","provider":"github","provider_id":"123","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"},"api_key":{"key":"parley_Ab3dE5gH_0123456789abcdefghijABCDEFGHIJKL","key_id":"Ab3dE5gH","expires_at":"2026-04-01T00:00:00Z"}}
 ```
+
+## `GET /api/v1/user`
+
+Answers the caller's own User object. The route needs a user: an API key or
+a PAT acts for its user, and the admin token, which has none, is answered
+`403` `forbidden` with the message `this route needs a user`. It declares
+the scope `users:read` for a PAT. The user is the one authentication read
+from the store for this request.
+
+| Status | When |
+|---|---|
+| `200 OK` | the body is the caller's User object |
+| `403` `forbidden` | the caller is the admin token (`this route needs a user`) |
+
+The User object has exactly `id`, `username`, `email`, `full_name`, `role`,
+`status`, `provider`, `provider_id`, `created_at` and `updated_at`;
+`created_at` and `updated_at` are RFC 3339 in UTC with whole seconds:
+
+```json
+{"id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","username":"alice","email":"alice@example.com","full_name":"","role":"user","status":"active","provider":"github","provider_id":"alice","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}
+```
+
+## `PATCH /api/v1/user`
+
+Sets the caller's own `full_name`. The route needs a user, as `GET
+/api/v1/user` does, and declares the scope `users:write` for a PAT.
+
+The body is a JSON object with the member `full_name`, required, a string;
+the empty string clears the name. Other members are ignored. The hub stores
+the string, sets `updated_at` to the time of the change and answers the
+updated User object; every other member is unchanged.
+
+| Status | When |
+|---|---|
+| `200 OK` | the name was stored; the body is the updated User object |
+| `400` `invalid_request` | `full_name` is missing (message `full_name is required`), or is not a JSON string, `null` included (message `full_name must be a string`); or the body is not a JSON object. The user is unchanged. |
+| `403` `forbidden` | the caller is the admin token (`this route needs a user`) |
+
+```json
+{"full_name":"Alice A."}
+```
+
+## `GET /api/v1/user/orgs`
+
+Lists the orgs the caller is a member of, a [list](#lists) in the standard
+pages. The route needs a user, as `GET /api/v1/user` does, and declares the
+scope `orgs:read` for a PAT.
+
+The list holds the orgs with the status `active` of which the caller's user
+is a member, ordered by `name` ascending, compared byte by byte. Blocked
+orgs and orgs the user is not a member of are left out. A user with no
+membership in an active org gets `items` `[]`.
+
+| Status | When |
+|---|---|
+| `200 OK` | the body is a page: `items` are Org objects (see [`POST /api/v1/orgs`](#post-apiv1orgs)) |
+| `400` `invalid_request` | a bad `limit` or `cursor` (see [Lists](#lists)) |
+| `403` `forbidden` | the caller is the admin token (`this route needs a user`) |
+
+## Admin routes
+
+The user and org administration routes are admin routes. Their caller must
+be the admin token or an API key whose user has the role `admin`; every
+other caller, a PAT included, also a PAT of an admin, is answered `403`
+`forbidden` with the message `this route needs an admin`:
+
+```json
+{"error":{"code":403,"message":"this route needs an admin","error_type":"forbidden"}}
+```
+
+The check runs in the access position of the [order of checks](#order-of-checks):
+after authentication, the rate limit and the body's size and content type,
+and before the route validates its body or looks up anything its path
+names. So a refused request gets the same `403` whatever its body and
+whatever it names, and changes nothing. The role is read from the store on
+every request: an API key whose user loses the role `admin` is refused from
+its next request on, and one whose user gains it passes.
+
+The admin routes so far: `POST /api/v1/users`, `GET /api/v1/users`,
+`GET /api/v1/users/{id}`, `PATCH /api/v1/users/{id}`,
+`POST /api/v1/users/{id}/promote`, `POST /api/v1/users/{id}/demote`,
+`POST /api/v1/users/{id}/block`, `POST /api/v1/users/{id}/unblock`,
+`DELETE /api/v1/users/{id}`, `POST /api/v1/orgs`, `GET /api/v1/orgs`, `PATCH /api/v1/orgs/{id}`,
+`PUT /api/v1/orgs/{id}/members/{user_id}`,
+`DELETE /api/v1/orgs/{id}/members/{user_id}`,
+`POST /api/v1/orgs/{id}/block`, `POST /api/v1/orgs/{id}/unblock` and
+`DELETE /api/v1/orgs/{id}`. `GET /api/v1/orgs/{id}` and
+`GET /api/v1/orgs/{id}/members` are not: a member reads an org and its
+member list too (see [`GET /api/v1/orgs/{id}`](#get-apiv1orgsid)).
+
+## User selectors
+
+A route with a user in its path, `/api/v1/users/{id}` or
+`/api/v1/orgs/{id}/members/{user_id}`, takes any of the user's three names
+there, and its shape alone decides which one it is:
+
+| Value | Looked up as |
+|---|---|
+| a UUID in its hyphenated form, 36 characters (`0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d`) | the user's `id`, and nothing else |
+| any other value with an `@` (`alice@example.com`) | the user's `email`, and nothing else |
+| every other value (`alice`) | the user's `username` |
+
+The comparison is exact, letter case included: `ALICE` does not name
+`alice`. No second lookup is tried, so a user whose username has the form of
+a UUID or holds an `@` is named by the id or the e-mail. A value that names
+no user is answered `404` `not_found` with the message `user not found`,
+and nothing changes:
+
+```json
+{"error":{"code":404,"message":"user not found","error_type":"not_found"}}
+```
+
+## `POST /api/v1/users`
+
+Creates a user without OAuth, with the user's personal org. An admin route
+(see [Admin routes](#admin-routes)) and a create route, so it accepts an
+`Idempotency-Key`.
+
+The body is a JSON object:
+
+| Member | Value |
+|---|---|
+| `username` | required: a non-empty string |
+| `email` | required: a non-empty string |
+| `provider` | required: a non-empty string, the identity provider the user will sign in with |
+| `provider_id` | required: a non-empty string, the user's id at that provider |
+| `full_name` | a string; the empty string when absent |
+
+In one transaction the hub creates:
+
+- the user, with a new UUID as `id`, the role `user` and the status
+  `active`. The role is `user` also when the e-mail is the hub's bootstrap
+  `admin_email`: only a first login promotes.
+- the user's personal org: `status` `active`, named after the username,
+  owned by the user, with the slug the first login derives (see
+  [`POST /api/v1/auth/callback`](#post-apiv1authcallback)): `Alice.Smith`
+  gives `alice-smith`, `42bob` gives `u-42bob`, `-_ab_-` gives `ab` and `a`
+  gives `u-` and the first 8 characters of the user id. When an org has
+  that slug, the first free of `<slug>-1` to `<slug>-10` is used.
+- the user's membership of that org.
+
+The `created_at` and `updated_at` of the user and of the org, and the
+`created_at` of the membership, which has no `updated_at`, are the time of
+the request.
+Usernames, e-mails, provider identities and org names are compared as
+stored, letter case included.
+
+| Status | When |
+|---|---|
+| `201 Created` | the user was created; the body is the User object |
+| `400` `invalid_request` | a required member is missing or the empty string (message `<member> is required`), or a member of the table is not a JSON string, `null` included (message `<member> must be a string`); or the body is not a JSON object. Nothing is created. |
+| `403` `forbidden` | the caller is not an admin (see [Admin routes](#admin-routes)) |
+| `409` `conflict` | the username, the e-mail or the pair of `provider` and `provider_id` is another user's, an org already has the username as its name, or the slug and all of `<slug>-1` to `<slug>-10` are taken. The message says which, in fixed words, such as `the username is taken`. Nothing is created. |
+
+The User object has exactly `id`, `username`, `email`, `full_name`, `role`,
+`status`, `provider`, `provider_id`, `created_at` and `updated_at`:
+
+```json
+{"id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","username":"carol","email":"carol@example.com","full_name":"Carol C","role":"user","status":"active","provider":"github","provider_id":"1","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}
+```
+
+## `GET /api/v1/users`
+
+Lists the users, a [list](#lists) in the standard pages. An admin route
+(see [Admin routes](#admin-routes)).
+
+The list holds the users with the status `active`, newest first:
+`created_at` descending, then `id` descending. With the query parameter
+`include_blocked=true` it holds the blocked users too, in the same order;
+any other value, such as `1`, `yes` or `TRUE`, is the same as none. A
+`cursor` belongs to its value of `include_blocked`.
+
+| Status | When |
+|---|---|
+| `200 OK` | the body is a page: `items` are User objects |
+| `400` `invalid_request` | a bad `limit` or `cursor` (see [Lists](#lists)) |
+| `403` `forbidden` | the caller is not an admin (see [Admin routes](#admin-routes)) |
+
+```json
+{"items":[{"id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","username":"alice","email":"alice@example.com","full_name":"","role":"user","status":"active","provider":"github","provider_id":"alice","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}],"next_cursor":null}
+```
+
+## `GET /api/v1/users/{id}`
+
+Answers the User object of the user `{id}` names (see
+[User selectors](#user-selectors)), active or blocked. An admin route (see
+[Admin routes](#admin-routes)).
+
+| Status | When |
+|---|---|
+| `200 OK` | the body is the User object; a blocked user has the `status` `blocked` |
+| `403` `forbidden` | the caller is not an admin (see [Admin routes](#admin-routes)) |
+| `404` `not_found` | no user has that id, e-mail or username (`user not found`) |
+
+## `PATCH /api/v1/users/{id}`
+
+Sets the `full_name` of the user `{id}` names (see
+[User selectors](#user-selectors)). An admin route (see
+[Admin routes](#admin-routes)).
+
+The body follows the rule of [`PATCH /api/v1/user`](#patch-apiv1user): a
+JSON object with the member `full_name`, required, a string; the empty
+string clears the name, and other members are ignored. The body is checked
+before the user is looked up. The hub stores the string, sets `updated_at`
+to the time of the change and answers the updated User object.
+
+| Status | When |
+|---|---|
+| `200 OK` | the name was stored; the body is the updated User object |
+| `400` `invalid_request` | `full_name` is missing (`full_name is required`) or is not a JSON string, `null` included (`full_name must be a string`); or the body is not a JSON object. The user is unchanged. |
+| `403` `forbidden` | the caller is not an admin (see [Admin routes](#admin-routes)) |
+| `404` `not_found` | no user has that id, e-mail or username (`user not found`) |
+
+```json
+{"full_name":"Alice B."}
+```
+
+## Role and status of a user
+
+`POST /api/v1/users/{id}/promote`, `POST /api/v1/users/{id}/demote`,
+`POST /api/v1/users/{id}/block` and `POST /api/v1/users/{id}/unblock`
+change the role or the status of the user `{id}` names (see
+[User selectors](#user-selectors)). They are admin routes (see
+[Admin routes](#admin-routes)) and read no body.
+
+| Route | Sets |
+|---|---|
+| `POST /api/v1/users/{id}/promote` | the role `admin` |
+| `POST /api/v1/users/{id}/demote` | the role `user` |
+| `POST /api/v1/users/{id}/block` | the status `blocked` |
+| `POST /api/v1/users/{id}/unblock` | the status `active` |
+
+The hub sets `updated_at` to the time of the change and answers the
+updated User object; every other member is unchanged. A user who already
+has the requested role or status is answered as stored, `updated_at`
+included, and nothing changes.
+
+Blocking and unblocking revoke and restore no credential. While a user is
+blocked, every API key and PAT of the user is answered `403` `forbidden`
+(`user is blocked`, see [Authentication](#authentication)); once the user
+is unblocked, the same credentials pass again.
+
+The hub never loses its last active admin to a demotion: demoting the only
+user with both the role `admin` and the status `active` is `409` `conflict`,
+and the role stays `admin`. Blocked admins do not count. The count and the
+demotion run in one write transaction, so of two concurrent demotions of
+the last two active admins one is refused; the same holds for a demotion
+and a [deletion](#delete-apiv1usersid) running together. Blocking has no
+such safeguard, because the admin token can always unblock: blocking the
+only active admin answers `200`.
+
+| Status | When |
+|---|---|
+| `200 OK` | the role or status is set, or was already; the body is the User object |
+| `403` `forbidden` | the caller is not an admin (see [Admin routes](#admin-routes)) |
+| `404` `not_found` | no user has that id, e-mail or username (`user not found`) |
+| `409` `conflict` | demote only: the user is the only active admin (`the user is the only active admin`). The role is unchanged. |
+
+```json
+{"error":{"code":409,"message":"the user is the only active admin","error_type":"conflict"}}
+```
+
+## `DELETE /api/v1/users/{id}`
+
+Deletes the user `{id}` names (see [User selectors](#user-selectors)),
+active or blocked, whatever the role. An admin route (see
+[Admin routes](#admin-routes)).
+
+In one transaction the hub deletes the user, every API key and every PAT of
+the user, workspace-bound ones included, and every membership of the user,
+and clears `owner_id` on the orgs the user owned. Those orgs, the user's
+personal org among them, are kept: their `owner_id` is `null` from then on
+and their `updated_at` is the time of the delete, and their other members
+stay. Afterwards the user is `404` `not_found` by id, e-mail and username
+and is gone from `GET /api/v1/users?include_blocked=true`, and a request
+with any of the user's former API keys or PATs is answered `401`
+`unauthenticated` (`invalid credentials`).
+
+The hub never loses its last active admin to a deletion: deleting the only
+user with both the role `admin` and the status `active`, also by that
+user's own API key, is `409` `conflict` and deletes nothing. The check and
+the delete run in one write transaction, like a demotion's (see
+[Role and status of a user](#role-and-status-of-a-user)).
+
+Data that other parts of the hub keep for the user is removed in the same
+transaction, before the user (see [ADR 03](adr/03-register-removers-of-owned-data-on-the-identity-service.md)).
+When that removal fails, the delete is undone as a whole, and the answer is
+`500` `internal`.
+
+| Status | When |
+|---|---|
+| `204 No Content` | the user was deleted; the body is empty |
+| `403` `forbidden` | the caller is not an admin (see [Admin routes](#admin-routes)) |
+| `404` `not_found` | no user has that id, e-mail or username (`user not found`). Nothing changes. |
+| `409` `conflict` | the user is the only active admin (`the user is the only active admin`). Nothing changes. |
+| `500` `internal` | removing data another part of the hub keeps for the user failed (`internal error`). Nothing changes. |
+
+## Org selectors
+
+A route with an org in its path, `/api/v1/orgs/{id}`, takes the org's id or
+its slug there, and its shape alone decides which one it is:
+
+| Value | Looked up as |
+|---|---|
+| a UUID in its hyphenated form, 36 characters (`0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d`) | the org's `id`, and nothing else |
+| every other value (`acme`) | the org's `slug` |
+
+The comparison is exact, letter case included: `ACME` does not name `acme`,
+and an org's `name` never names it. A value that names no org is answered
+`404` `not_found` with the message `org not found`, and nothing changes:
+
+```json
+{"error":{"code":404,"message":"org not found","error_type":"not_found"}}
+```
+
+## `POST /api/v1/orgs`
+
+Creates an org. An admin route (see [Admin routes](#admin-routes)) and a
+create route, so it accepts an `Idempotency-Key`.
+
+The body is a JSON object:
+
+| Member | Value |
+|---|---|
+| `name` | required: a string that is not empty once trimmed of leading and trailing white space; stored trimmed |
+| `slug` | required: 1 to 128 characters of `a`-`z`, `0`-`9`, `_` and `-` that start and end with a letter or digit |
+| `url` | a string; the empty string when absent |
+| `owner_id` | a string, the `id` of an existing user (not a username or an e-mail); no owner when absent |
+
+The org is created with a new UUID as `id`, the status `active` and
+`created_at` and `updated_at` the time of the request. It has no member,
+also when it has an owner: the owner is informational. Names and slugs are
+compared as stored, letter case included, so `acme inc` is free beside
+`Acme Inc`.
+
+| Status | When |
+|---|---|
+| `201 Created` | the org was created; the body is the Org object |
+| `400` `invalid_request` | `name` or `slug` is missing (`name is required`, `slug is required`); a member of the table is not a JSON string, `null` included (`<member> must be a string`); the name is white space only (`name must not be empty`); the slug has another form (`slug must be 1 to 128 characters of a-z, 0-9, _ and -, starting and ending with a letter or digit`); `owner_id` is not the id of a user (`owner_id is not the id of a user`); or the body is not a JSON object. Nothing is created. |
+| `403` `forbidden` | the caller is not an admin (see [Admin routes](#admin-routes)) |
+| `409` `conflict` | another org has the trimmed name (`an org has the name`) or the slug (`an org has the slug`). Nothing is created. |
+
+```json
+{"name":"Acme Inc","slug":"acme","url":"https://acme.example"}
+```
+
+The Org object has exactly `id`, `name`, `slug`, `url`, `owner_id`,
+`status`, `created_at` and `updated_at`; `owner_id` is `null` when the org
+has no owner:
+
+```json
+{"id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","name":"Acme Inc","slug":"acme","url":"https://acme.example","owner_id":null,"status":"active","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}
+```
+
+## `GET /api/v1/orgs`
+
+Lists the orgs, a [list](#lists) in the standard pages. An admin route
+(see [Admin routes](#admin-routes)).
+
+The list holds the orgs with the status `active`, ordered by `name`
+ascending, compared byte by byte, so `Zed` comes before `alpha`. With the
+query parameter `include_blocked=true` it holds the blocked orgs too, in the
+same order; any other value, such as `false` or `1`, is the same as none. A
+`cursor` belongs to its value of `include_blocked`.
+
+| Status | When |
+|---|---|
+| `200 OK` | the body is a page: `items` are Org objects |
+| `400` `invalid_request` | a bad `limit` or `cursor` (see [Lists](#lists)) |
+| `403` `forbidden` | the caller is not an admin (see [Admin routes](#admin-routes)) |
+
+## `GET /api/v1/orgs/{id}`
+
+Answers the Org object of the org `{id}` names (see
+[Org selectors](#org-selectors)). Every authenticated caller may send it;
+it declares the scope `orgs:read` for a PAT. An admin, the admin token or an
+API key whose user has the role `admin`, receives any org, a blocked one
+with the status `blocked`. Every other caller, a PAT of an admin included,
+receives the org only when the caller's user is a member of it and the org
+is `active`; otherwise the answer is the one for an org that does not
+exist, so a caller cannot tell an org it may not read from a missing one.
+
+| Status | When |
+|---|---|
+| `200 OK` | the body is the Org object |
+| `404` `not_found` | no org has that id or slug, or the caller is not an admin and is not a member of the org or the org is blocked (`org not found`) |
+
+## `PATCH /api/v1/orgs/{id}`
+
+Sets the `name`, the `url` or both of the org `{id}` names (see
+[Org selectors](#org-selectors)). An admin route (see
+[Admin routes](#admin-routes)).
+
+The body is a JSON object with `name`, a string that is not empty once
+trimmed, stored trimmed, and `url`, a string, the empty string included; at
+least one of them. A `slug` member is ignored like any other unknown
+member: the slug never changes. The body is checked before the org is
+looked up. The hub stores the members sent, sets `updated_at` to the time
+of the change and answers the updated Org object; every other member is
+unchanged. The org's own current name is accepted.
+
+| Status | When |
+|---|---|
+| `200 OK` | the org was updated; the body is the updated Org object |
+| `400` `invalid_request` | neither `name` nor `url` is sent (`name or url is required`), one is not a JSON string, `null` included (`<member> must be a string`), or the name is white space only (`name must not be empty`); or the body is not a JSON object. The org is unchanged. |
+| `403` `forbidden` | the caller is not an admin (see [Admin routes](#admin-routes)) |
+| `404` `not_found` | no org has that id or slug (`org not found`) |
+| `409` `conflict` | another org has the trimmed name (`an org has the name`). The org is unchanged, its `url` included. |
+
+```json
+{"name":"Acme Corp","url":"https://acme.example"}
+```
+
+## `GET /api/v1/orgs/{id}/members`
+
+Lists the members of the org `{id}` names (see
+[Org selectors](#org-selectors)), a [list](#lists) in the standard pages.
+Who may read it is decided as for
+[`GET /api/v1/orgs/{id}`](#get-apiv1orgsid): an admin, for any org, a
+blocked one included, and every other caller, a PAT of an admin included,
+only when its user is a member of the org and the org is `active`. Every
+other caller gets the answer for an org that does not exist. It declares the
+scope `orgs:read` for a PAT. The `limit` and `cursor` are checked before the
+org is looked up, so a bad one is `400` for every caller, whatever `{id}`
+names, a missing org included, and tells nothing of the org.
+
+The list holds one item per membership, ordered by `username` ascending,
+compared byte by byte. An item has exactly `org_id`, `user_id`, `username`,
+`email` and `created_at`, the time the membership was created (not the
+user's). An org without members gets `items` `[]`.
+
+| Status | When |
+|---|---|
+| `200 OK` | the body is a page of member items |
+| `400` `invalid_request` | a bad `limit` or `cursor` (see [Lists](#lists)), checked first, for an org that does not exist too |
+| `404` `not_found` | the `limit` and `cursor` are good, and no org has that id or slug, or the caller is not an admin and is not a member of the org or the org is blocked (`org not found`) |
+
+```json
+{"items":[{"org_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","user_id":"1b2c3d4e-5f6a-4b7c-8d9e-0f1a2b3c4d5e","username":"alice","email":"alice@example.com","created_at":"2026-01-01T00:02:00Z"}],"next_cursor":null}
+```
+
+## `PUT /api/v1/orgs/{id}/members/{user_id}`
+
+Makes the user `{user_id}` names (see [User selectors](#user-selectors)) a
+member of the org `{id}` names (see [Org selectors](#org-selectors)). An
+admin route (see [Admin routes](#admin-routes)); it reads no body.
+
+The membership is created with `created_at` the time of the request. A
+user who is a member already keeps the membership as it is, its
+`created_at` included. Blocked users and blocked orgs are accepted; the org
+appears in the user's [`GET /api/v1/user/orgs`](#get-apiv1userorgs) while
+it is `active`.
+
+| Status | When |
+|---|---|
+| `204 No Content` | the user is a member; the body is empty |
+| `403` `forbidden` | the caller is not an admin (see [Admin routes](#admin-routes)) |
+| `404` `not_found` | no org has that id or slug (`org not found`), or no user has that id, e-mail or username (`user not found`); the org is looked up first |
+
+## `DELETE /api/v1/orgs/{id}/members/{user_id}`
+
+Ends the membership of the user `{user_id}` names (see
+[User selectors](#user-selectors)) in the org `{id}` names (see
+[Org selectors](#org-selectors)). An admin route (see
+[Admin routes](#admin-routes)).
+
+The user and the org are kept, and the org's `owner_id` is left as it is,
+also when the user removed is the owner: the owner is informational.
+
+| Status | When |
+|---|---|
+| `204 No Content` | the membership was deleted; the body is empty |
+| `403` `forbidden` | the caller is not an admin (see [Admin routes](#admin-routes)) |
+| `404` `not_found` | no org has that id or slug (`org not found`), no user has that id, e-mail or username (`user not found`), or the user is not a member of the org (`membership not found`). Nothing changes. |
+
+```json
+{"error":{"code":404,"message":"membership not found","error_type":"not_found"}}
+```
+
+## Status of an org
+
+`POST /api/v1/orgs/{id}/block` sets the status `blocked` and
+`POST /api/v1/orgs/{id}/unblock` the status `active` on the org `{id}`
+names (see [Org selectors](#org-selectors)). Both are admin routes (see
+[Admin routes](#admin-routes)) and read no body.
+
+The hub sets `updated_at` to the time of the change and answers the
+updated Org object; every other member is unchanged. An org that already
+has the requested status is answered as stored, `updated_at` included, and
+nothing changes.
+
+The memberships of a blocked org are kept. While it is blocked, the org is
+left out of its members' [`GET /api/v1/user/orgs`](#get-apiv1userorgs) and
+of [`GET /api/v1/orgs`](#get-apiv1orgs) without `include_blocked=true`, and
+only an admin reads it and its member list (see
+[`GET /api/v1/orgs/{id}`](#get-apiv1orgsid)). Once it is unblocked, it is
+listed in both again, with the same members.
+
+| Status | When |
+|---|---|
+| `200 OK` | the status is set, or was already; the body is the Org object |
+| `403` `forbidden` | the caller is not an admin (see [Admin routes](#admin-routes)) |
+| `404` `not_found` | no org has that id or slug (`org not found`) |
+
+## `DELETE /api/v1/orgs/{id}`
+
+Deletes the org `{id}` names (see [Org selectors](#org-selectors)), a
+personal org or a blocked one included. An admin route (see
+[Admin routes](#admin-routes)).
+
+The org and all its memberships are deleted in one transaction. The users
+who were its members or its owner are kept. Afterwards the org is `404`
+`not_found` by its id and by its slug, for admins too, it is gone from its
+former members' [`GET /api/v1/user/orgs`](#get-apiv1userorgs), and a new
+org may take its name and its slug.
+
+Data that other parts of the hub keep for the org is removed in the same
+transaction (see [ADR 03](adr/03-register-removers-of-owned-data-on-the-identity-service.md)).
+When that removal fails, the delete is undone as a whole, and the answer is
+`500` `internal`.
+
+| Status | When |
+|---|---|
+| `204 No Content` | the org was deleted; the body is empty |
+| `403` `forbidden` | the caller is not an admin (see [Admin routes](#admin-routes)) |
+| `404` `not_found` | no org has that id or slug (`org not found`). Nothing changes. |
+| `500` `internal` | removing data another part of the hub keeps for the org failed (`internal error`). Nothing changes. |

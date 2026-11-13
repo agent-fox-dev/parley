@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -736,4 +737,76 @@ func snapshot(t *testing.T, dir string) map[string]string {
 		t.Fatal(err)
 	}
 	return state
+}
+
+// runAgainst runs parley with args against hub, presenting the credential K
+// through the global flags, with an empty configuration directory. A test
+// that calls it must not run in parallel.
+func runAgainst(t *testing.T, hub *stubHub, args ...string) (int, string, string) {
+	t.Helper()
+	t.Setenv("PARLEY_CONFIG_DIR", t.TempDir())
+	return runCLI(t, slices.Concat(args, []string{"--endpoint-url", hub.URL, "--api-key", "K"})...)
+}
+
+// sentRequest is the one request a command line must send: its method, its
+// path as sent (percent-encoding included), its query string, and its body,
+// "" for none, else a JSON document compared by value.
+type sentRequest struct {
+	method, rawPath, query, body string
+}
+
+// hubAnswer is the body the stub hub answers a command's request with:
+// indented and with a number whose text decoding would change.
+const hubAnswer = `{"id": "x", "n": 1.50, "items": [], "next_cursor": null}`
+
+// wantSends runs args against a stub hub that answers want with 200 and
+// hubAnswer, and checks that the command sent exactly want, once, with the
+// credential K, printed the answer as parley prints a result and wrote
+// nothing to stderr.
+func wantSends(t *testing.T, args []string, want sentRequest) {
+	t.Helper()
+	path, err := url.PathUnescape(want.rawPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hub := newStubHub(t).answer(want.method, path, http.StatusOK, hubAnswer)
+
+	code, stdout, stderr := runAgainst(t, hub, args...)
+
+	if code != 0 {
+		t.Errorf("exit status = %d, want 0 (stderr %q)", code, stderr)
+	}
+	if want := indented(t, hubAnswer); stdout != want {
+		t.Errorf("stdout = %q, want %q", stdout, want)
+	}
+	if stderr != "" {
+		t.Errorf("stderr = %q, want it empty", stderr)
+	}
+	sent := hub.recorded()
+	if len(sent) != 1 {
+		t.Fatalf("the hub got %d requests, want 1", len(sent))
+	}
+	got := sent[0]
+	if got.method != want.method || got.rawPath != want.rawPath || got.query != want.query {
+		t.Errorf("sent %s %s ?%q, want %s %s ?%q", got.method, got.rawPath, got.query, want.method, want.rawPath, want.query)
+	}
+	if auth := got.header.Get("Authorization"); auth != "Bearer K" {
+		t.Errorf("Authorization = %q, want %q", auth, "Bearer K")
+	}
+	if want.body == "" {
+		if got.body != "" {
+			t.Errorf("body = %q, want none", got.body)
+		}
+		return
+	}
+	var gotBody, wantBody any
+	if err := json.Unmarshal([]byte(got.body), &gotBody); err != nil {
+		t.Fatalf("body %q is not JSON: %v", got.body, err)
+	}
+	if err := json.Unmarshal([]byte(want.body), &wantBody); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(gotBody, wantBody) {
+		t.Errorf("body = %s, want %s", got.body, want.body)
+	}
 }

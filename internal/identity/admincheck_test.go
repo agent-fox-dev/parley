@@ -1,0 +1,118 @@
+package identity_test
+
+import (
+	"fmt"
+	"net/http"
+	"strings"
+	"testing"
+
+	"github.com/agent-fox-dev/parley/internal/identity"
+)
+
+// adminRoute is a route behind the admin check. In its path, ":user"
+// stands for a user selector and ":org" for an org selector; body is a body
+// the route accepts, nil for a route that takes none.
+type adminRoute struct {
+	method, path string
+	body         any
+}
+
+// adminRoutes are every admin route of the identity service.
+var adminRoutes = []adminRoute{
+	{http.MethodPost, "/api/v1/users", newUserBody("zed")},
+	{http.MethodGet, "/api/v1/users", nil},
+	{http.MethodGet, "/api/v1/users/:user", nil},
+	{http.MethodPatch, "/api/v1/users/:user", map[string]any{"full_name": "x"}},
+	{http.MethodPost, "/api/v1/users/:user/promote", nil},
+	{http.MethodPost, "/api/v1/users/:user/demote", nil},
+	{http.MethodPost, "/api/v1/users/:user/block", nil},
+	{http.MethodPost, "/api/v1/users/:user/unblock", nil},
+	{http.MethodDelete, "/api/v1/users/:user", nil},
+	{http.MethodPost, "/api/v1/orgs", newOrgBody("Zed Org", "zed-org")},
+	{http.MethodGet, "/api/v1/orgs", nil},
+	{http.MethodPatch, "/api/v1/orgs/:org", map[string]any{"url": "u"}},
+	{http.MethodPut, "/api/v1/orgs/:org/members/:user", nil},
+	{http.MethodDelete, "/api/v1/orgs/:org/members/:user", nil},
+	{http.MethodPost, "/api/v1/orgs/:org/block", nil},
+	{http.MethodPost, "/api/v1/orgs/:org/unblock", nil},
+	{http.MethodDelete, "/api/v1/orgs/:org", nil},
+}
+
+// newUserBody is a POST /users body for a user no team hub has.
+func newUserBody(username string) map[string]any {
+	return map[string]any{"username": username, "email": username + "@example.com", "provider": "github",
+		"provider_id": username + "-id"}
+}
+
+// adminTargets name what an admin route's selectors point at: alice and
+// her personal org, which exist, or a user and an org that do not.
+var adminTargets = map[string]*strings.Replacer{
+	"existing target": strings.NewReplacer(":user", "alice", ":org", "alice"),
+	"missing target":  strings.NewReplacer(":user", "nobody", ":org", "nope"),
+}
+
+func TestAdminCheck_RefusesEveryCallerButAnAdminBeforeAnythingElse(t *testing.T) {
+	t.Parallel()
+	h := newTeamHub(t)
+	callers := map[string]string{"API key of a user": h.ku, "PAT of a user": h.pu, "PAT of an admin": h.pa}
+	for _, rt := range adminRoutes {
+		bodies := map[string]any{"no body": nil}
+		if rt.method != http.MethodGet && rt.method != http.MethodDelete {
+			bodies = map[string]any{"empty object": map[string]any{}}
+			if rt.body != nil {
+				bodies["valid body"] = rt.body
+			}
+		}
+		for target, names := range adminTargets {
+			path := names.Replace(rt.path)
+			for bodyName, body := range bodies {
+				for callerName, caller := range callers {
+					t.Run(fmt.Sprintf("%s %s/%s/%s/%s", rt.method, rt.path, target, bodyName, callerName), func(t *testing.T) {
+						before := h.snapshot()
+						r := h.call(rt.method, path, caller, body)
+						checkRefusal(t, "answer", r, http.StatusForbidden, "forbidden", "this route needs an admin")
+						if h.snapshot() != before {
+							t.Errorf("the store changed")
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
+func TestAdminCheck_PassesTheAdminTokenAndAnAdminsAPIKeyByTheRoleOfTheMoment(t *testing.T) {
+	t.Parallel()
+	h := newTeamHub(t)
+	n := 0
+	// probes are admin routes with the status each answers an admin.
+	probes := []struct {
+		route string
+		do    func(caller string) response
+		want  int
+	}{
+		{"GET /users", func(caller string) response { return h.get("/api/v1/users", caller) }, http.StatusOK},
+		{"POST /users", func(caller string) response {
+			n++
+			return h.call(http.MethodPost, "/api/v1/users", caller, newUserBody(fmt.Sprintf("probe%d", n)))
+		}, http.StatusCreated},
+	}
+	passes := func(what, caller string) {
+		t.Helper()
+		for _, p := range probes {
+			if r := p.do(caller); r.status != p.want {
+				t.Errorf("%s: %s = %d %s, want %d", what, p.route, r.status, r.body, p.want)
+			}
+		}
+	}
+	passes("admin token", h.admin)
+	passes("API key of an admin", h.ka)
+	h.setRole(h.root.ID, identity.RoleUser)
+	for _, p := range probes {
+		checkRefusal(t, "API key of a demoted admin: "+p.route, p.do(h.ka), http.StatusForbidden, "forbidden",
+			"this route needs an admin")
+	}
+	passes("admin token after the demotion", h.admin)
+	h.setRole(h.alice.ID, identity.RoleAdmin)
+	passes("API key of a promoted user", h.ku)
+}

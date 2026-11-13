@@ -320,8 +320,11 @@ Usage:
   parley [command]
 
 Available Commands:
+  admin       Administer the hub's users and organizations
   help        Print the help of parley or of a command
   login       Sign in to the hub and save the hub URL and the credential
+  orgs        List and read the organizations you belong to
+  user        Read and update your own profile
   version     Print the client's build and, given a hub URL, the hub's build
 
 Flags:
@@ -851,6 +854,87 @@ credential stays valid and is not saved:
 
 Nothing is saved on any failure: the config file is neither created nor
 changed.
+
+### `parley user`, `parley orgs`, `parley admin users` and `parley admin orgs`
+
+These commands each call one route of the hub's user and organization API
+(see [api.md](api.md)): they send one request with the credential as
+`Authorization: Bearer` and print the hub's answer as described under
+[Output](#output). A `2xx` answer without a body, such as the `204` of
+`parley admin users delete`, `parley admin orgs delete`,
+`parley admin orgs members add` and `parley admin orgs members remove`,
+prints `{}` followed by a newline, and nothing on stderr. An error the hub answers is
+written to stderr as received, with exit status `1`; for example, demoting
+the only active admin:
+
+```json
+{
+  "error": {
+    "code": 409,
+    "message": "the user is the only active admin",
+    "error_type": "conflict"
+  }
+}
+```
+
+The commands of `parley user` and `parley orgs` act as the caller's own
+user; the commands of `parley admin` call the
+[admin routes](api.md#admin-routes). A group run without a command, such as
+`parley admin`, `parley admin users`, `parley admin orgs` or
+`parley admin orgs members`, prints its help and exits `0`.
+
+| Command | Request |
+|---|---|
+| `parley user show` | `GET /api/v1/user` |
+| `parley user update --full-name <name>` | `PATCH /api/v1/user` with `{"full_name": <name>}`; `--full-name ""` sends the empty string, which clears the name |
+| `parley orgs list` | `GET /api/v1/user/orgs` |
+| `parley orgs show <org>` | `GET /api/v1/orgs/<org>` |
+| `parley orgs members <org>` | `GET /api/v1/orgs/<org>/members` |
+| `parley admin users list [--include-blocked]` | `GET /api/v1/users`; with `--include-blocked`, the query `include_blocked=true` |
+| `parley admin users show <user>` | `GET /api/v1/users/<user>` |
+| `parley admin users create --username <u> --email <e> --provider <p> --provider-id <id> [--full-name <name>]` | `POST /api/v1/users` with the members `username`, `email`, `provider` and `provider_id`, and `full_name` only when `--full-name` is given |
+| `parley admin users update <user> --full-name <name>` | `PATCH /api/v1/users/<user>` with `{"full_name": <name>}` |
+| `parley admin users delete <user>` | `DELETE /api/v1/users/<user>` |
+| `parley admin users promote <user>` | `POST /api/v1/users/<user>/promote`, without a body |
+| `parley admin users demote <user>` | `POST /api/v1/users/<user>/demote`, without a body |
+| `parley admin users block <user>` | `POST /api/v1/users/<user>/block`, without a body |
+| `parley admin users unblock <user>` | `POST /api/v1/users/<user>/unblock`, without a body |
+| `parley admin orgs list [--include-blocked]` | `GET /api/v1/orgs`; with `--include-blocked`, the query `include_blocked=true` |
+| `parley admin orgs create --name <name> --slug <slug> [--url <url>] [--owner <user id>]` | `POST /api/v1/orgs` with the members `name` and `slug`, `url` only when `--url` is given and `owner_id` only when `--owner` is given; `--owner` takes a user's id, not a selector |
+| `parley admin orgs update <org> [--name <name>] [--url <url>]` | `PATCH /api/v1/orgs/<org>` with only the members whose flags are given; `--url ""` sends the empty string, which clears the URL |
+| `parley admin orgs delete <org>` | `DELETE /api/v1/orgs/<org>` |
+| `parley admin orgs block <org>` | `POST /api/v1/orgs/<org>/block`, without a body |
+| `parley admin orgs unblock <org>` | `POST /api/v1/orgs/<org>/unblock`, without a body |
+| `parley admin orgs members list <org>` | `GET /api/v1/orgs/<org>/members` |
+| `parley admin orgs members add <org> <user>` | `PUT /api/v1/orgs/<org>/members/<user>`, without a body |
+| `parley admin orgs members remove <org> <user>` | `DELETE /api/v1/orgs/<org>/members/<user>` |
+
+`<user>` is a user's id, e-mail or username (see
+[User selectors](api.md#user-selectors)) and `<org>` an organization's id
+or slug (see [Org selectors](api.md#org-selectors)). Each is sent as one
+path segment, percent-encoded: `a/b` is sent as `a%2Fb`, and `?`, `#`, `%`
+and spaces are encoded too, so the hub reads the argument exactly as given.
+
+The list commands print one page of the hub's [list](api.md#lists), with
+the hub's default `limit`; they send no `limit` or `cursor`.
+
+A command run without one of its required flags (`--full-name` on
+`parley user update` and `parley admin users update`; `--username`,
+`--email`, `--provider` and `--provider-id` on `parley admin users create`;
+`--name` and `--slug` on `parley admin orgs create`), `parley admin orgs
+update` given neither `--name` nor `--url`, or a command run with a number
+of arguments other than the ones it takes, is a `usage_error` with exit
+status `2`, and sends no request:
+
+```json
+{
+  "error": {
+    "code": 0,
+    "message": "parley user update needs the flag --full-name",
+    "error_type": "usage_error"
+  }
+}
+```
 
 ### Output
 

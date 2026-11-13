@@ -78,7 +78,8 @@ type Deps struct {
 // to non-public routes. The zero Service is ready to be registered; Bind
 // gives it its dependencies before it serves the first request.
 type Service struct {
-	deps Deps
+	deps     Deps
+	removers removers
 }
 
 // Bind sets the service's dependencies. The hub calls it once, from a start

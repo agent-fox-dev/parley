@@ -6,15 +6,18 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"uuid"
 
 	"github.com/agent-fox-dev/parley/internal/config"
 	"github.com/agent-fox-dev/parley/internal/identity"
@@ -23,7 +26,8 @@ import (
 )
 
 // testHub is the request pipeline of internal/server with the identity
-// service and its routes installed, over a store in t.TempDir(), served
+// service, its admin check and its routes installed, as the hub composes
+// them, over a store in t.TempDir(), served
 // in-process. It also registers two non-public test routes: GET
 // /api/v1/test/whoami answers the caller's Principal, and GET
 // /api/v1/test/me, declared as needing a user, answers 200. Both count
@@ -121,6 +125,7 @@ func newTestHub(t *testing.T, opts ...hubOption) *testHub {
 	h.svc.Bind(identity.Deps{Store: st, Now: h.now, Providers: cfg.providers, ExternalURL: cfg.externalURL, Client: client})
 	h.srv = server.New(server.Options{Logger: slog.New(slog.DiscardHandler), RateLimitDisabled: true, Now: h.now})
 	h.srv.SetAuthenticator(h.svc.Authenticate)
+	h.srv.AddAccessCheck(h.svc.AdminCheck)
 	for _, r := range h.svc.Routes() {
 		h.srv.Register(r)
 	}
@@ -366,12 +371,14 @@ func (h *testHub) count(query string, args ...any) int {
 	return n
 }
 
-// seedOrg stores an active org without an owner.
-func (h *testHub) seedOrg(name, slug string) {
+// seedOrg stores an active org without an owner and returns its id, a
+// UUID like the ids the hub draws.
+func (h *testHub) seedOrg(name, slug string) string {
 	h.t.Helper()
-	now := h.now().UnixNano()
+	id, now := uuid.NewV4().String(), h.now().UnixNano()
 	h.exec(`INSERT INTO orgs (id, name, slug, status, created_at, updated_at) VALUES (?, ?, ?, 'active', ?, ?)`,
-		rand.Text(), name, slug, now, now)
+		id, name, slug, now, now)
+	return id
 }
 
 // loginBody is a callback body the provider stub accepts.
@@ -496,4 +503,136 @@ func checkRefusal(t *testing.T, what string, r response, status int, errorType, 
 	if r.status != status || r.errorField("error_type") != errorType || r.errorField("message") != message {
 		t.Errorf("%s: answer = %d %s, want %d %s %q", what, r.status, r.body, status, errorType, message)
 	}
+}
+
+// everyScope is every scope a route of the identity service declares, so
+// that a PAT holding them passes any scope check a test installs.
+var everyScope = []string{"users:read", "users:write", "orgs:read"}
+
+// teamHub is a bootstrapped test hub with two users, each created with a
+// personal org through identity.CreateUserAndPersonalOrg: root, role admin,
+// e-mail root@example.com, and alice, role user, e-mail alice@example.com,
+// both active and signing in with github. Its callers are the values of an
+// Authorization header: admin is the admin token, ka and ku are live API
+// keys of root and alice, and pa and pu live PATs of root and alice holding
+// everyScope. None of them expires.
+type teamHub struct {
+	*testHub
+	root, alice           identity.User
+	admin, ka, ku, pa, pu string
+}
+
+// newTeamHub builds a team hub; opts are newTestHub's.
+func newTeamHub(t *testing.T, opts ...hubOption) teamHub {
+	t.Helper()
+	h := teamHub{testHub: newTestHub(t, opts...)}
+	h.root = h.createUser("root", identity.RoleAdmin)
+	h.alice = h.createUser("alice", identity.RoleUser)
+	bearer := func(credential string) string { return "Bearer " + credential }
+	h.admin = bearer(h.adminToken)
+	h.ka, _ = h.seedKey(h.root.ID, 0)
+	h.ku, _ = h.seedKey(h.alice.ID, 0)
+	h.pa, _ = h.seedPAT(identity.PATSpec{UserID: h.root.ID, Permissions: everyScope})
+	h.pu, _ = h.seedPAT(identity.PATSpec{UserID: h.alice.ID, Permissions: everyScope})
+	h.ka, h.ku, h.pa, h.pu = bearer(h.ka), bearer(h.ku), bearer(h.pa), bearer(h.pu)
+	return h
+}
+
+// createUser creates the active user username with the role role and the
+// user's personal org, as the hub does: the e-mail is
+// <username>@example.com and the github id is the username.
+func (h *testHub) createUser(username, role string) identity.User {
+	h.t.Helper()
+	var u identity.User
+	h.tx(func(tx *sql.Tx) (err error) {
+		u, _, err = identity.CreateUserAndPersonalOrg(context.Background(), tx, identity.NewUser{
+			Username: username, Email: username + "@example.com", Provider: "github", ProviderID: username,
+			CreatedAt: h.now(),
+		}, role)
+		return err
+	})
+	return u
+}
+
+// call sends a request to the hub with authorization as the Authorization
+// header ("" sends none) and body, when not nil, as JSON (see do).
+func (h *testHub) call(method, path, authorization string, body any) response {
+	h.t.Helper()
+	header := http.Header{}
+	if authorization != "" {
+		header.Set("Authorization", authorization)
+	}
+	return h.do(method, path, body, header)
+}
+
+// snapshot reads every row of the users, orgs, memberships, API keys and
+// PATs from the hub's store. Two snapshots are equal exactly when the
+// store held the same records, so a test compares one taken before a
+// request with one taken after it to show that the request changed nothing.
+func (h *testHub) snapshot() string {
+	h.t.Helper()
+	ctx, db := context.Background(), h.st.Main()
+	var b strings.Builder
+	for _, table := range []string{"users", "orgs", "memberships", "api_keys", "pats"} {
+		rows, err := db.QueryContext(ctx, `SELECT * FROM `+table+` ORDER BY rowid`)
+		if err != nil {
+			h.t.Fatalf("read %s: %v", table, err)
+		}
+		cols, err := rows.Columns()
+		if err != nil {
+			h.t.Fatalf("read the columns of %s: %v", table, err)
+		}
+		vals := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		for rows.Next() {
+			if err := rows.Scan(ptrs...); err != nil {
+				h.t.Fatalf("read a row of %s: %v", table, err)
+			}
+			fmt.Fprintln(&b, append([]any{table}, vals...)...)
+		}
+		if err := rows.Err(); err != nil {
+			h.t.Fatalf("read %s: %v", table, err)
+		}
+		rows.Close()
+	}
+	return b.String()
+}
+
+// orgBySlug reads the org with the slug slug from the hub's store.
+func (h *testHub) orgBySlug(slug string) identity.Org {
+	h.t.Helper()
+	o, err := identity.OrgBySlug(context.Background(), h.st.Main(), slug)
+	if err != nil {
+		h.t.Fatalf("read the org %s: %v", slug, err)
+	}
+	return o
+}
+
+// membershipsOf reads the memberships of the org orgID from the hub's
+// store.
+func (h *testHub) membershipsOf(orgID string) []identity.Membership {
+	h.t.Helper()
+	ms, err := identity.Memberships(context.Background(), h.st.Main(), orgID)
+	if err != nil {
+		h.t.Fatalf("read the memberships of %s: %v", orgID, err)
+	}
+	return ms
+}
+
+// setRole sets the role of the user userID.
+func (h *testHub) setRole(userID, role string) {
+	h.exec(`UPDATE users SET role = ? WHERE id = ?`, role, userID)
+}
+
+// setOrgStatus sets the status of the org orgID.
+func (h *testHub) setOrgStatus(orgID, status string) {
+	h.exec(`UPDATE orgs SET status = ? WHERE id = ?`, status, orgID)
+}
+
+// addMember makes the user userID a member of the org orgID, from now.
+func (h *testHub) addMember(orgID, userID string) {
+	h.exec(`INSERT INTO memberships (org_id, user_id, created_at) VALUES (?, ?, ?)`, orgID, userID, h.now().UnixNano())
 }

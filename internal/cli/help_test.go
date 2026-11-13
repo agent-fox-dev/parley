@@ -96,8 +96,11 @@ func TestHelp_PrintsTheHelpOfTheRootOrAGroupGivenNoCommand(t *testing.T) {
 		subcommands map[string]string
 	}{
 		{nil, map[string]string{
+			"admin":   "Administer the hub's users and organizations",
 			"help":    "Print the help of parley or of a command",
 			"login":   "Sign in to the hub and save the hub URL and the credential",
+			"orgs":    "List and read the organizations you belong to",
+			"user":    "Read and update your own profile",
 			"version": "Print the client's build and, given a hub URL, the hub's build",
 		}},
 		{[]string{"probe"}, map[string]string{"get": "Get a thing", "admin": "Administer the things"}},

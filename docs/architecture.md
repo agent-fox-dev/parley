@@ -436,6 +436,12 @@ appends it there ([ADR 01](adr/01-compose-the-hub-in-one-package.md)).
 | `AddRoute(server.Route)`, `Handle(pattern, handler)` | REST routes and surfaces outside the REST API |
 | `SetAuthenticator`, `SetBindingGuard`, `SetScopeCheck`, `AddAccessCheck` | the checks of the pipeline's positions |
 
+The composition also keeps the identity service in its unexported field
+`identity`, which `composeIdentity` sets. A part listed after it that keeps
+data for a user or an org registers the remover of that data there, with
+`c.identity.RegisterUserRemover` or `c.identity.RegisterOrgRemover`
+([ADR 03](adr/03-register-removers-of-owned-data-on-the-identity-service.md)).
+
 `hub.Runtime` holds the loaded `*config.Config`, the open `*store.Store`, the
 `*slog.Logger`, the `*scrub.Scrubber` and the clock `Now`. Start hooks,
 maintenance tasks and background work receive it; a route handler or a check keeps
@@ -621,8 +627,8 @@ without running a start hook or binding the listener.
 `internal/hub/identity.go` adds the part `composeIdentity`, after
 `composeBootstrap` in `parts`. It adds the schema step
 `identity.SchemaStep` (`identity_records`), installs the `Authenticate`
-method of an `identity.Service` as the pipeline's authenticator, registers
-every route of `(*identity.Service).Routes()` with `AddRoute`, and adds the
+method of an `identity.Service` as the pipeline's authenticator, adds its
+`AdminCheck` method with `AddAccessCheck`, registers every route of `(*identity.Service).Routes()` with `AddRoute`, and adds the
 start hook `identity`, which binds the service with
 `(*identity.Service).Bind(identity.Deps{Store, Now, Providers,
 ExternalURL, Client})` from the `Runtime` before the hub serves its first
@@ -633,9 +639,27 @@ identity.DefaultProviderTimeout)`, and a service without one answers every
 login `502 upstream_error`.
 
 The service's routes are, so far, the public `GET /auth/providers` (see
-[api.md](api.md#get-apiv1authproviders)) and the public `POST
+[api.md](api.md#get-apiv1authproviders)), the public `POST
 /auth/callback` (see [api.md](api.md#post-apiv1authcallback)), which is not
-a create route. The providers in
+a create route, the admin route `POST /users` (see
+[api.md](api.md#post-apiv1users)), a create route, the admin routes `GET /users`, `GET /users/:id`
+and `PATCH /users/:id` (see [api.md](api.md#get-apiv1users)), the admin
+routes `POST /users/:id/promote`, `/demote`, `/block` and `/unblock` (see
+[api.md](api.md#role-and-status-of-a-user)), the admin route
+`DELETE /users/:id` (see [api.md](api.md#delete-apiv1usersid)), and the
+caller's own profile, `GET /user`, `PATCH /user` and `GET /user/orgs` (see
+[api.md](api.md#get-apiv1user)), which need a user, the admin routes
+`POST /orgs`, a create route, `GET /orgs`, `PATCH /orgs/:id`,
+`PUT /orgs/:id/members/:user_id`, `DELETE /orgs/:id/members/:user_id`,
+`POST /orgs/:id/block`, `POST /orgs/:id/unblock` and `DELETE /orgs/:id`,
+and `GET /orgs/:id` and `GET /orgs/:id/members`, which an admin or a member
+reads (see [api.md](api.md#post-apiv1orgs)).
+`(*identity.Service).Routes()` in `internal/identity/routes.go` returns
+them all: it appends the route list of each handlers file, such as
+`userRoutes()` in `internal/identity/handlers_users.go` and
+`ownUserRoutes()` in `internal/identity/handlers_user.go` and `orgRoutes()` in
+`internal/identity/handlers_orgs.go`, so the hub and the
+tests register the same routes. The providers in
 `identity.Deps.Providers` come with their endpoints resolved:
 `internal/config` fills an endpoint the file does not give with the
 provider's public one, through `config.Provider.WithPublicEndpoints`, and
@@ -765,6 +789,173 @@ of SQLite on the insert is reported the same way. The callback answers that
 error `409 conflict` with its text. Its caller chooses the username and the
 role.
 
+The admin routes carry the mark `identity.MarkAdmin` (`identity.admin`) in
+their `server.Route.Marks` and declare no scope. `(*identity.Service).AdminCheck`,
+in `internal/identity/admincheck.go`, is an access check: on a route without
+the mark it lets the request through; on one with it, it passes the
+`identity.Principal` whose `Type` is `admin`, or `api_key` with a `User`
+whose `Role` is `admin`, and answers every other caller, PATs included,
+`server.Forbidden("this route needs an admin")`. It reads the role of the
+`Principal` the authenticator built for this request from the store, so a
+change of role holds from the next request on. Because it runs in the access
+position, after the body's size and media type and before the handler, a
+refused request is not validated, looks nothing up and changes nothing.
+
+`POST /users` (`createUser`) decodes the body into a
+`map[string]json.RawMessage`, so that a missing member, `null` and a value
+of another type are told apart: `username`, `email`, `provider` and
+`provider_id` must be non-empty JSON strings and `full_name`, when present,
+a JSON string, else `400 invalid_request`. It then calls
+`identity.CreateUserAndPersonalOrg` with the role `user` in one
+`(*store.Store).Tx`, with `CreatedAt` from `Deps.Now`, answers its
+`ErrConflict` `409 conflict` with the error's text, and answers `201` with
+the User object. It never promotes: the first-admin rule is the login's.
+
+`identity.UserBySelector(ctx, q, sel)` in `internal/identity/users.go`
+resolves a user selector by its shape alone: a value of 36 characters that
+the standard library's `uuid.Parse` accepts is looked up as the `id`, any
+other value with an `@` as the `email`, and every other value as the
+`username`, each with SQLite's default binary comparison, so exactly. It
+returns `identity.ErrNotFound` without trying another column, and the
+handlers answer that `404 not_found` with the message `user not found`.
+`GET /users/:id` reads through the store's `*sql.DB`; `PATCH /users/:id`
+reads the body first, with the rule of `PATCH /user` (`fullNameOf` in
+`handlers_users.go`), then resolves the selector and calls `updateFullName`
+in the same `(*store.Store).Tx`. `GET /users` reads one page with
+`listUsers(ctx, q, includeBlocked, after, limit)` in `users.go`: `status =
+'active'` unless the query parameter `include_blocked` is exactly `true`,
+`ORDER BY created_at DESC, id DESC`, continuing after the position
+`{created_at in nanoseconds, id}` that the cursor of `server.ReadPage`
+carries, and writes it with `server.WritePage`.
+
+Promote, demote, block and unblock (`setRole` and `setStatus` in
+`handlers_users.go`) go through `changeUser`, which resolves the selector
+and applies the change in one `(*store.Store).Tx`. A user who already has
+the requested role or status is answered as read, without a write, so
+`updated_at` stays; otherwise `updateRole` or `updateStatus` in `users.go`
+sets the column and `updated_at` (from `Deps.Now`). No credential is
+touched: authentication refuses a blocked user's credentials on its own.
+The last-admin guard is `guardLastAdmin(ctx, tx, u)` in `users.go`: it
+returns the conflict `the user is the only active admin` when `u` has the
+role `admin` and the status `active` and no other user has both, and nil
+otherwise. Demote calls it before `updateRole`, in the same transaction
+that read `u`; since the store admits one writer at a time, the count and
+the change cannot interleave with another demotion or deletion. Block has
+no guard.
+
+`DELETE /users/:id` (`deleteUser` in `handlers_users.go`) is an admin route.
+In one `(*store.Store).Tx` it resolves the selector (`errUserNotFound()`
+before anything else), calls `guardLastAdmin` (`409 conflict`, before any
+remover), calls the user removers through `removeUserData` in
+`removers.go`, then `deleteUser(ctx, tx, id, now)` in `users.go`. That
+function deletes the user's `api_keys` and `pats`, bound ones included, and
+`memberships`, runs `UPDATE orgs SET owner_id = NULL, updated_at = ? WHERE
+owner_id = ?` and deletes the user, each an explicit statement rather than
+left to the foreign keys' `ON DELETE` actions, so that an org's
+`updated_at` moves with its `owner_id`. The orgs are kept, so a user delete
+calls no org remover. It answers `204`.
+
+`GET /user` and `PATCH /user`, in `internal/identity/handlers_user.go`,
+carry the mark `identity.MarkNeedsUser` and declare the scopes `users:read`
+and `users:write`. Both take the caller's user from the `identity.Principal`
+of the request. `PATCH /user` reads the body with `fullNameOf(r)`, the rule
+`PATCH /users/:id` shares: a `map[string]json.RawMessage` that needs
+`full_name` as a JSON string, else `400 invalid_request`; it stores it in one `(*store.Store).Tx` through
+`updateFullName(ctx, tx, id, fullName, now)` in
+`internal/identity/users.go`, which sets `full_name` and `updated_at` (from
+`Deps.Now`) and returns the stored user, or `identity.ErrNotFound`.
+
+`internal/identity/orgs.go` holds the org reads: `identity.Org` marshals to
+the REST API's Org object (`id`, `name`, `slug`, `url`, `owner_id`, `null`
+when `OwnerID` is empty, `status`, `created_at`, `updated_at`);
+`identity.OrgByID(ctx, q, id)` and `identity.OrgBySlug(ctx, q, slug)`
+return an org or `identity.ErrNotFound`, comparing the slug exactly; and
+`identity.Memberships(ctx, q, orgID)` returns an org's
+`identity.Membership`s (`OrgID`, `UserID`, `CreatedAt`), oldest first, then
+by user id. It reads through an `identity.RowsQuerier`, an
+`identity.Querier` that also has `QueryContext` (the store's `*sql.DB` or a
+`*sql.Tx`).
+
+`identity.OrgBySelector(ctx, q, sel)` in `orgs.go` resolves an org selector
+by its shape alone, as `UserBySelector` does a user's: a value `isUUID`
+accepts is looked up as the `id`, every other value as the `slug`, exactly,
+and `identity.ErrNotFound` is returned without a second lookup. The org
+routes are `orgRoutes()` in `internal/identity/handlers_orgs.go`, which
+`Routes()` appends. `POST /orgs`, `GET /orgs` and `PATCH /orgs/:id` are admin
+routes. `POST /orgs` (`createOrg`) decodes the body into raw members, trims
+the name (`orgNameMember`), checks the slug against `^[a-z0-9](?:[a-z0-9_-]{0,126}[a-z0-9])?$`
+(`validSlug`), and in one `(*store.Store).Tx` reads the `owner_id` with
+`UserByID` (not found is `400`) and calls `createOrg(ctx, tx, o)`, which
+answers a taken name or slug with a conflict and inserts the org with a
+new UUID, `owner_id` NULL when there is none, and no membership.
+`PATCH /orgs/:id` checks the body first, then resolves the selector and
+calls `updateOrg(ctx, tx, id, name, url, now)`, which refuses a name another
+org has (`id <> ?`) and sets only the members given and `updated_at`.
+`GET /orgs` reads one page with `listOrgs(ctx, q, includeBlocked, "", after,
+limit)`: `ORDER BY name`, continuing after the position `{name}` of the
+cursor. `GET /orgs/:id` carries no admin mark and declares the scope
+`orgs:read`; it goes through `visibleOrg(r)`, the one rule for reading an
+org: an admin (`isAdmin`) reads every org, any other caller an active org
+of which its user is a member (`isMember`), and every other case, a missing
+org included, is the one answer `errOrgNotFound()`, `404 not_found` with the
+message `org not found`.
+
+`GET /orgs/:id/members` (`listMembers`) also carries no admin mark and
+declares `orgs:read`. It reads the page (`server.ReadPage` and `pageAfter`)
+before it looks the org up, so a bad `limit` or `cursor` is `400
+invalid_request` for every caller and tells nothing of the org; then it goes
+through `visibleOrg(r)`, so a blocked org's member list is an admin's alone.
+It reads one page with `listMembers(ctx, q, orgID,
+after, limit)` in `orgs.go`, a join of `memberships` and `users` `ORDER BY
+username`, continuing after the position `{username}`; an item is a
+`memberItem` (`org_id`, `user_id`, `username`, `email`, and the membership's
+`created_at`). `PUT` and `DELETE /orgs/:id/members/:user_id` (`addMember`,
+`removeMember`) resolve, in one `(*store.Store).Tx`, the org selector and
+then the user selector (`orgAndUser`: `errOrgNotFound()` or
+`errUserNotFound()`), then call `addMembership(ctx, tx, orgID, userID, now)`,
+an `INSERT … ON CONFLICT DO NOTHING` that leaves an existing membership as
+it is, or `removeMembership(ctx, tx, orgID, userID)`, which returns
+`identity.ErrNotFound` when no row was deleted (`404 not_found`, `membership
+not found`) and leaves `owner_id` alone; both answer `204`.
+`GET /user/orgs` (`listOwnOrgs` in `handlers_user.go`) carries the
+needs-a-user mark and declares `orgs:read`; it reads the active orgs of
+which the caller is a member through `listOrgs(ctx, q, includeBlocked,
+memberID, after, limit)`, the reader of `GET /orgs`, whose `memberID` limits
+the list to that user's orgs. `pageAfter[T](page)` decodes a page's
+position for these lists and for `GET /users`.
+
+`POST /orgs/:id/block` and `/unblock` (`setOrgStatus` in
+`handlers_orgs.go`) are admin routes: in one `(*store.Store).Tx` they
+resolve the selector and, unless the org has the requested status already,
+call `updateOrgStatus(ctx, tx, id, status, now)` in `orgs.go`, which sets
+`status` and `updated_at` and leaves the memberships alone; an org that has
+the status is answered as read, so `updated_at` stays. A blocked org leaves
+`GET /user/orgs` and the default `GET /orgs` because both lists read
+`status = 'active'`, and `visibleOrg` answers it to admins only.
+`GET /orgs/:id` and `GET /orgs/:id/members` both go through `visibleOrg`, so
+a missing org, an org of which the caller is no member and a blocked org of
+which it is a member get one and the same `errOrgNotFound()`.
+
+`DELETE /orgs/:id` (`deleteOrg` in `handlers_orgs.go`) is an admin route.
+In one `(*store.Store).Tx` it resolves the selector (`errOrgNotFound()`
+before anything else), calls the org removers, then `deleteOrg(ctx, tx,
+id)` in `orgs.go`, which deletes the org's memberships and the org; users
+are never touched, so the owner and the members stay. A remover is an
+`identity.Remover`, `func(ctx context.Context, tx *sql.Tx, id string)
+error`, registered on the service with
+`(*identity.Service).RegisterOrgRemover` or `RegisterUserRemover` in
+`internal/identity/removers.go`, and kept in registration order under a
+mutex ([ADR 03](adr/03-register-removers-of-owned-data-on-the-identity-service.md)).
+`removeOrgData` and `removeUserData` call the org or the user removers,
+a copy of the list taken under the mutex, in order with the delete's
+transaction and the id and stop at the first error, which
+`callRemovers` returns as text only, not wrapped, so that whatever a
+remover returns the delete answers `500 internal` and the transaction rolls
+back, with everything earlier removers wrote through it. A package that
+keeps data for a user or an org registers its remover from its part in
+`internal/hub` through the `identity` field of `hub.Composition`, which
+`composeIdentity` sets.
+
 ### The logger
 
 `hub.NewLogger(w, level, scrubber)` returns a `*slog.Logger` with
@@ -818,8 +1009,9 @@ opens the sign-in page, by default the system's opener in
 `internal/cli/browser.go`; and `Hooks.LoginWait`, how long the browser login
 waits for the redirect, by default 120 s). It builds a fresh cobra
 command tree on each call: the root command `parley` with the persistent
-global flags `--endpoint-url`, `--api-key` and `--json`, and the `help`,
-`version` and `login` subcommands, plus the commands the unexported `options.extra`
+global flags `--endpoint-url`, `--api-key` and `--json`, the `help`,
+`version` and `login` subcommands and the groups `user`, `orgs` and `admin`,
+plus the commands the unexported `options.extra`
 builds, which tests use to add probe commands. It executes the tree with the
 arguments; when a command returns an error, `run` writes it to stderr with
 `printError` and returns `exitCode(err)` (both in `internal/cli/errors.go`).
@@ -845,6 +1037,20 @@ of its children as a `usage_error` (cobra alone would print the help); the
 root is a group too, and its flag error handler turns every flag that is
 unknown or does not parse, on any command, into a `usage_error`.
 `parley version` and `parley login` are declared through `declare`.
+
+The commands of the user and organization routes are declarations without
+client code of their own: `parley user` (`internal/cli/user.go`), `parley
+orgs` (`orgs.go`), `parley admin users` (`admin_users.go`) and `parley
+admin orgs` (`admin_orgs.go`), the last two in the group `parley admin`
+that `newAdminCommand` in `root.go` builds. Those that only call their route
+use the default run step; a command whose request carries a query or a body
+(`--include-blocked`, `--full-name`, the flags of `parley admin users
+create`, and those of `parley admin orgs create` and `update`) has a run
+step that builds them from its flags and sends them with `sendWith`
+(`user.go`), the default run step with a query and a body. The two `list`
+commands with `--include-blocked` share the run step `sendIncludeBlocked`
+(`admin_users.go`), and `parley admin orgs create` and `update` send a
+member only when its flag is given (`addChanged` in `admin_orgs.go`).
 
 Help lives in `internal/cli/help.go`. `installHelp` keeps cobra's own text
 help, sets the root's help function, which `--help` on any command and a

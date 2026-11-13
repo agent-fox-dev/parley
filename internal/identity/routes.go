@@ -11,15 +11,18 @@ import (
 )
 
 // Routes returns the routes of the identity service, for the hub to
-// register.
+// register. Its admin routes need AdminCheck installed as an access check.
 func (s *Service) Routes() []server.Route {
-	return []server.Route{
+	routes := []server.Route{
 		{Method: http.MethodGet, Pattern: "/auth/providers", Public: true, CacheControl: "public, max-age=300",
 			Handler: s.listProviders},
 		// Not a create route: a login always issues a new key, so an
 		// Idempotency-Key is ignored rather than replayed.
 		{Method: http.MethodPost, Pattern: "/auth/callback", Public: true, Handler: s.callback},
 	}
+	routes = append(routes, s.userRoutes()...)
+	routes = append(routes, s.ownUserRoutes()...)
+	return append(routes, s.orgRoutes()...)
 }
 
 // providerItem is one entry of GET /auth/providers.
