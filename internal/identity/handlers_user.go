@@ -2,7 +2,6 @@ package identity
 
 import (
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"net/http"
 
@@ -18,6 +17,7 @@ func (s *Service) ownUserRoutes() []server.Route {
 	return []server.Route{
 		{Method: http.MethodGet, Pattern: "/user", Scope: "users:read", Marks: needsUserMark, Handler: s.getOwnUser},
 		{Method: http.MethodPatch, Pattern: "/user", Scope: "users:write", Marks: needsUserMark, Handler: s.updateOwnUser},
+		{Method: http.MethodGet, Pattern: "/user/orgs", Scope: "orgs:read", Marks: needsUserMark, Handler: s.listOwnOrgs},
 	}
 }
 
@@ -51,16 +51,9 @@ func (s *Service) updateOwnUser(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	var body map[string]json.RawMessage
-	if err := server.DecodeJSON(r, &body); err != nil {
-		return err
-	}
-	fullName, present, err := stringMember(body, "full_name")
+	fullName, err := fullNameOf(r)
 	if err != nil {
 		return err
-	}
-	if !present {
-		return server.InvalidRequest("full_name is required")
 	}
 	var u User
 	err = s.deps.Store.Tx(r.Context(), func(tx *sql.Tx) error {
@@ -77,4 +70,26 @@ func (s *Service) updateOwnUser(w http.ResponseWriter, r *http.Request) error {
 	}
 	server.WriteJSON(w, http.StatusOK, u)
 	return nil
+}
+
+// listOwnOrgs answers GET /user/orgs: a page of the active orgs of which
+// the caller is a member, by name.
+func (s *Service) listOwnOrgs(w http.ResponseWriter, r *http.Request) error {
+	caller, err := callerUser(r)
+	if err != nil {
+		return err
+	}
+	page, err := server.ReadPage(r)
+	if err != nil {
+		return err
+	}
+	after, err := pageAfter[orgPosition](page)
+	if err != nil {
+		return err
+	}
+	orgs, err := listOrgs(r.Context(), s.deps.Store.Main(), false, caller.ID, after, page.Limit+1)
+	if err != nil {
+		return err
+	}
+	return server.WritePage(w, page, orgs, func(o Org) any { return orgPosition{Name: o.Name} })
 }

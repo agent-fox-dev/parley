@@ -18,6 +18,10 @@ func (s *Service) orgRoutes() []server.Route {
 		// Not an admin route: a member reads an org too, see visibleOrg.
 		{Method: http.MethodGet, Pattern: "/orgs/:id", Scope: "orgs:read", Handler: s.getOrg},
 		{Method: http.MethodPatch, Pattern: "/orgs/:id", Marks: adminMark, Handler: s.updateOrg},
+		// Not an admin route either: the members of an org read its list.
+		{Method: http.MethodGet, Pattern: "/orgs/:id/members", Scope: "orgs:read", Handler: s.listMembers},
+		{Method: http.MethodPut, Pattern: "/orgs/:id/members/:user_id", Marks: adminMark, Handler: s.addMember},
+		{Method: http.MethodDelete, Pattern: "/orgs/:id/members/:user_id", Marks: adminMark, Handler: s.removeMember},
 	}
 }
 
@@ -135,17 +139,12 @@ func (s *Service) listOrgs(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	var pos orgPosition
-	hasAfter, err := page.After(&pos)
+	after, err := pageAfter[orgPosition](page)
 	if err != nil {
 		return err
 	}
-	after := &pos
-	if !hasAfter {
-		after = nil
-	}
 	includeBlocked := r.URL.Query().Get("include_blocked") == "true"
-	orgs, err := listOrgs(r.Context(), s.deps.Store.Main(), includeBlocked, after, page.Limit+1)
+	orgs, err := listOrgs(r.Context(), s.deps.Store.Main(), includeBlocked, "", after, page.Limit+1)
 	if err != nil {
 		return err
 	}
@@ -214,4 +213,102 @@ func orgNameMember(body map[string]json.RawMessage) (*string, error) {
 		return nil, server.InvalidRequest("name must not be empty")
 	}
 	return &name, nil
+}
+
+// pageAfter returns the position page continues after, decoded as a T, or
+// nil for a first page.
+func pageAfter[T any](page server.Page) (*T, error) {
+	var pos T
+	hasAfter, err := page.After(&pos)
+	if err != nil || !hasAfter {
+		return nil, err
+	}
+	return &pos, nil
+}
+
+// listMembers answers GET /orgs/:id/members: a page of the memberships of
+// the org the selector names, by username, when the caller may read the
+// org (see visibleOrg), so a blocked org's list is an admin's alone.
+func (s *Service) listMembers(w http.ResponseWriter, r *http.Request) error {
+	o, err := s.visibleOrg(r)
+	if err != nil {
+		return err
+	}
+	page, err := server.ReadPage(r)
+	if err != nil {
+		return err
+	}
+	after, err := pageAfter[memberPosition](page)
+	if err != nil {
+		return err
+	}
+	items, err := listMembers(r.Context(), s.deps.Store.Main(), o.ID, after, page.Limit+1)
+	if err != nil {
+		return err
+	}
+	return server.WritePage(w, page, items, func(m memberItem) any { return memberPosition{Username: m.Username} })
+}
+
+// addMember answers PUT /orgs/:id/members/:user_id: it makes the user the
+// user selector names a member of the org the org selector names, from the
+// time of the request, and answers 204. An existing membership is left as
+// it is, and blocked users and blocked orgs are accepted.
+func (s *Service) addMember(w http.ResponseWriter, r *http.Request) error {
+	ctx := r.Context()
+	err := s.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+		o, u, err := orgAndUser(r, tx)
+		if err != nil {
+			return err
+		}
+		return addMembership(ctx, tx, o.ID, u.ID, s.deps.Now())
+	})
+	if err != nil {
+		return err
+	}
+	w.WriteHeader(http.StatusNoContent)
+	return nil
+}
+
+// removeMember answers DELETE /orgs/:id/members/:user_id: it deletes the
+// membership of the user the user selector names in the org the org
+// selector names, keeping the user, the org and its owner_id, and answers
+// 204. A user who is no member is 404 not_found.
+func (s *Service) removeMember(w http.ResponseWriter, r *http.Request) error {
+	ctx := r.Context()
+	err := s.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+		o, u, err := orgAndUser(r, tx)
+		if err != nil {
+			return err
+		}
+		return removeMembership(ctx, tx, o.ID, u.ID)
+	})
+	if errors.Is(err, ErrNotFound) {
+		return server.NotFound("membership not found")
+	}
+	if err != nil {
+		return err
+	}
+	w.WriteHeader(http.StatusNoContent)
+	return nil
+}
+
+// orgAndUser reads, in tx, the org the selector :id of r names and the user
+// the selector :user_id names, the org first. No org is errOrgNotFound and
+// no user errUserNotFound.
+func orgAndUser(r *http.Request, tx *sql.Tx) (Org, User, error) {
+	o, err := OrgBySelector(r.Context(), tx, server.Param(r, "id"))
+	if errors.Is(err, ErrNotFound) {
+		return Org{}, User{}, errOrgNotFound()
+	}
+	if err != nil {
+		return Org{}, User{}, err
+	}
+	u, err := UserBySelector(r.Context(), tx, server.Param(r, "user_id"))
+	if errors.Is(err, ErrNotFound) {
+		return Org{}, User{}, errUserNotFound()
+	}
+	if err != nil {
+		return Org{}, User{}, err
+	}
+	return o, u, nil
 }

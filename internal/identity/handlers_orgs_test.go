@@ -18,11 +18,81 @@ import (
 // orgMembers are the members of the Org object.
 var orgMembers = []string{"created_at", "id", "name", "owner_id", "slug", "status", "updated_at", "url"}
 
+// memberItemMembers are the members of an item of an org's member list.
+var memberItemMembers = []string{"created_at", "email", "org_id", "user_id", "username"}
+
 // orgSelectorRoutes are the admin routes that name an org by a selector,
-// ":org" in their path, each with a body it accepts (nil for none).
+// ":org" in their path, each with a body it accepts (nil for none). The
+// membership routes name alice.
 var orgSelectorRoutes = []adminRoute{
 	{http.MethodGet, "/api/v1/orgs/:org", nil},
 	{http.MethodPatch, "/api/v1/orgs/:org", map[string]any{"url": "u"}},
+	{http.MethodGet, "/api/v1/orgs/:org/members", nil},
+	{http.MethodDelete, "/api/v1/orgs/:org/members/alice", nil},
+	{http.MethodPut, "/api/v1/orgs/:org/members/alice", nil},
+}
+
+// membershipRoute reports whether rt adds or removes a membership.
+func membershipRoute(rt adminRoute) bool { return strings.Contains(rt.path, "/members/") }
+
+// reachesAliceInAcme sends the membership route rt, at path, as the admin
+// token, with alice a member of the org acme before a DELETE and not one
+// before a PUT. It reports unless the answer is 204 without a body and
+// alice is a member of acme after a PUT and not after a DELETE: the change
+// of that one membership shows that the route's selectors reached alice and
+// acme.
+func (h teamHub) reachesAliceInAcme(t *testing.T, rt adminRoute, acme, path string) {
+	t.Helper()
+	h.setMember(acme, h.alice.ID, rt.method == http.MethodDelete)
+	if r := h.call(rt.method, path, h.admin, rt.body); r.status != http.StatusNoContent || len(r.body) != 0 {
+		t.Errorf("answer = %d %s, want 204 without a body", r.status, r.body)
+	}
+	if got, want := h.isMember(acme, h.alice.ID), rt.method == http.MethodPut; got != want {
+		t.Errorf("alice is a member of acme: %t, want %t", got, want)
+	}
+}
+
+// setMember makes the user userID a member of the org orgID from now when
+// member is true, and no member when it is false.
+func (h *testHub) setMember(orgID, userID string, member bool) {
+	h.t.Helper()
+	h.exec(`DELETE FROM memberships WHERE org_id = ? AND user_id = ?`, orgID, userID)
+	if member {
+		h.addMember(orgID, userID)
+	}
+}
+
+// isMember reports whether the user userID is a member of the org orgID.
+func (h *testHub) isMember(orgID, userID string) bool {
+	h.t.Helper()
+	return h.count(`SELECT count(*) FROM memberships WHERE org_id = ? AND user_id = ?`, orgID, userID) == 1
+}
+
+// answeredOrgIDs returns the ids of the orgs an answer is about: the id of
+// an Org object, or the org_id of each item of a member list.
+func answeredOrgIDs(t *testing.T, r response) []string {
+	t.Helper()
+	if _, ok := r.json["items"]; ok {
+		return itemMember(t, r, "org_id")
+	}
+	id, _ := r.json["id"].(string)
+	return []string{id}
+}
+
+// itemMember returns the member name, a string, of each item of a list
+// answer.
+func itemMember(t *testing.T, r response, name string) []string {
+	t.Helper()
+	items, ok := r.json["items"].([]any)
+	if !ok {
+		t.Fatalf("answer = %d %s, want a list", r.status, r.body)
+	}
+	values := make([]string, 0, len(items))
+	for _, it := range items {
+		v, _ := it.(map[string]any)[name].(string)
+		values = append(values, v)
+	}
+	return values
 }
 
 // newOrgBody is a POST /orgs body for an org no team hub has.
@@ -33,16 +103,7 @@ func newOrgBody(name, slug string) map[string]any {
 // itemNames returns the names of the items of a list answer.
 func itemNames(t *testing.T, r response) []string {
 	t.Helper()
-	items, ok := r.json["items"].([]any)
-	if !ok {
-		t.Fatalf("answer = %d %s, want a list", r.status, r.body)
-	}
-	names := make([]string, 0, len(items))
-	for _, it := range items {
-		name, _ := it.(map[string]any)["name"].(string)
-		names = append(names, name)
-	}
-	return names
+	return itemMember(t, r, "name")
 }
 
 func TestCreateOrg_CreatesAnActiveOrgWithoutMembers(t *testing.T) {
@@ -361,9 +422,9 @@ func TestGetOrg_AnswersAnAdminAnyOrgAndAMemberAnActiveOne(t *testing.T) {
 func TestOrgSelectors_ReachTheSameOrgByIdOrSlug(t *testing.T) {
 	t.Parallel()
 	h := newTeamHub(t)
-	h.seedOrg("Acme Inc", "acme")
+	id := h.seedOrg("Acme Inc", "acme")
+	h.addMember(id, h.root.ID)
 	o := h.get("/api/v1/orgs/acme", h.admin).json
-	id, _ := o["id"].(string)
 	if got := h.get("/api/v1/orgs/"+id, h.admin).json; !reflect.DeepEqual(got, o) {
 		t.Errorf("GET /orgs/%s = %v, want %v", id, got, o)
 	}
@@ -371,8 +432,13 @@ func TestOrgSelectors_ReachTheSameOrgByIdOrSlug(t *testing.T) {
 		for _, sel := range []string{id, "acme"} {
 			path := strings.ReplaceAll(rt.path, ":org", sel)
 			t.Run(rt.method+" "+path, func(t *testing.T) {
-				if r := h.call(rt.method, path, h.admin, rt.body); r.status != http.StatusOK || r.json["id"] != id {
-					t.Errorf("answer = %d %s, want 200 with acme's id %s", r.status, r.body, id)
+				if membershipRoute(rt) {
+					h.reachesAliceInAcme(t, rt, id, path)
+					return
+				}
+				r := h.call(rt.method, path, h.admin, rt.body)
+				if ids := answeredOrgIDs(t, r); r.status != http.StatusOK || len(ids) == 0 || slices.ContainsFunc(ids, func(got string) bool { return got != id }) {
+					t.Errorf("answer = %d %s, want 200 about acme's id %s alone", r.status, r.body, id)
 				}
 			})
 		}
@@ -382,7 +448,7 @@ func TestOrgSelectors_ReachTheSameOrgByIdOrSlug(t *testing.T) {
 func TestOrgSelectors_AnswerNotFoundForNoOrgAndChangeNothing(t *testing.T) {
 	t.Parallel()
 	h := newTeamHub(t)
-	h.seedOrg("Acme Inc", "acme")
+	h.addMember(h.seedOrg("Acme Inc", "acme"), h.alice.ID)
 	selectors := map[string]string{
 		"a random UUID":          uuid.NewV4().String(),
 		"an unknown slug":        "nope",
@@ -401,4 +467,172 @@ func TestOrgSelectors_AnswerNotFoundForNoOrgAndChangeNothing(t *testing.T) {
 			})
 		}
 	}
+}
+
+// newMembersHub is a team hub with the org acme, whose members carol, alice
+// and bob were added in that order a minute apart, after the users were
+// created; the active org empty without members; and the blocked org
+// blocked-co. It returns acme's id and the time alice was added.
+func newMembersHub(t *testing.T) (h teamHub, acme string, aliceAdded time.Time) {
+	t.Helper()
+	h = newTeamHub(t)
+	acme = h.seedOrg("Acme Inc", "acme")
+	h.seedOrg("Empty", "empty")
+	h.setOrgStatus(h.seedOrg("Blocked Co", "blocked-co"), identity.StatusBlocked)
+	bob, carol := h.createUser("bob", identity.RoleUser), h.createUser("carol", identity.RoleUser)
+	for _, u := range []identity.User{carol, h.alice, bob} {
+		h.advance(time.Minute)
+		h.addMember(acme, u.ID)
+		if u.ID == h.alice.ID {
+			aliceAdded = h.now()
+		}
+	}
+	return h, acme, aliceAdded
+}
+
+func TestListMembers_ListsTheMembershipsByUsernameInPages(t *testing.T) {
+	t.Parallel()
+	h, acme, aliceAdded := newMembersHub(t)
+	for name, caller := range map[string]string{"admin token": h.admin, "API key of an admin": h.ka,
+		"API key of a member": h.ku, "PAT of a member": h.pu} {
+		t.Run(name, func(t *testing.T) {
+			r := h.get("/api/v1/orgs/acme/members", caller)
+			if r.status != http.StatusOK {
+				t.Fatalf("GET /orgs/acme/members = %d %s, want 200", r.status, r.body)
+			}
+			if got, want := itemMember(t, r, "username"), []string{"alice", "bob", "carol"}; !slices.Equal(got, want) {
+				t.Fatalf("usernames = %v, want %v", got, want)
+			}
+			first := r.json["items"].([]any)[0].(map[string]any)
+			if got := slices.Sorted(maps.Keys(first)); !slices.Equal(got, memberItemMembers) {
+				t.Errorf("members = %v, want %v", got, memberItemMembers)
+			}
+			want := map[string]any{"org_id": acme, "user_id": h.alice.ID, "username": "alice",
+				"email": "alice@example.com", "created_at": aliceAdded.Format(time.RFC3339)}
+			if !reflect.DeepEqual(first, want) {
+				t.Errorf("alice's item = %v, want %v", first, want)
+			}
+			if first["created_at"] == h.alice.CreatedAt.Format(time.RFC3339) {
+				t.Errorf("created_at = %v, the time alice was created, want the time she was added", first["created_at"])
+			}
+		})
+	}
+	t.Run("pages", func(t *testing.T) {
+		first := h.get("/api/v1/orgs/acme/members?limit=2", h.admin)
+		cursor, ok := first.json["next_cursor"].(string)
+		if got := itemMember(t, first, "username"); !ok || !slices.Equal(got, []string{"alice", "bob"}) {
+			t.Fatalf("first page = %s, want alice and bob and a next_cursor", first.body)
+		}
+		next := h.get("/api/v1/orgs/acme/members?limit=2&cursor="+url.QueryEscape(cursor), h.admin)
+		if got := itemMember(t, next, "username"); !slices.Equal(got, []string{"carol"}) || next.json["next_cursor"] != nil {
+			t.Errorf("second page = %s, want carol and no next_cursor", next.body)
+		}
+	})
+	t.Run("an org without members", func(t *testing.T) {
+		r := h.get("/api/v1/orgs/empty/members", h.admin)
+		if items, ok := r.json["items"].([]any); r.status != http.StatusOK || !ok || len(items) != 0 {
+			t.Errorf("answer = %d %s, want 200 with items []", r.status, r.body)
+		}
+	})
+	t.Run("a blocked org, for an admin", func(t *testing.T) {
+		if r := h.get("/api/v1/orgs/blocked-co/members", h.admin); r.status != http.StatusOK {
+			t.Errorf("answer = %d %s, want 200", r.status, r.body)
+		}
+	})
+}
+
+func TestAddMember_CreatesTheMembershipAtTheTimeOfTheRequest(t *testing.T) {
+	t.Parallel()
+	h := newTeamHub(t)
+	h.seedOrg("Acme Inc", "acme")
+	h.setOrgStatus(h.seedOrg("Blocked Co", "blocked-co"), identity.StatusBlocked)
+	bob := h.createUser("bob", identity.RoleUser)
+	h.createUser("carol", identity.RoleUser)
+	h.setStatus(h.createUser("mallory", identity.RoleUser).ID, identity.StatusBlocked)
+	for _, c := range []struct{ name, org, selector, username string }{
+		{"a user by username", "acme", "alice", "alice"},
+		{"a user by id", "acme", bob.ID, "bob"},
+		{"a user by e-mail", "acme", "carol@example.com", "carol"},
+		{"a blocked user", "acme", "mallory", "mallory"},
+		{"a blocked org", "blocked-co", "alice", "alice"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h.advance(time.Minute)
+			r := h.call(http.MethodPut, "/api/v1/orgs/"+c.org+"/members/"+c.selector, h.admin, nil)
+			if r.status != http.StatusNoContent || len(r.body) != 0 {
+				t.Fatalf("answer = %d %s, want 204 without a body", r.status, r.body)
+			}
+			members := h.get("/api/v1/orgs/"+c.org+"/members", h.admin)
+			i := slices.Index(itemMember(t, members, "username"), c.username)
+			if i < 0 {
+				t.Fatalf("members of %s = %s, want %s among them", c.org, members.body, c.username)
+			}
+			if got, want := members.json["items"].([]any)[i].(map[string]any)["created_at"], h.now().Format(time.RFC3339); got != want {
+				t.Errorf("created_at = %v, want the time of the request %s", got, want)
+			}
+		})
+	}
+	if slugs := itemMember(t, h.get("/api/v1/user/orgs", h.ku), "slug"); !slices.Contains(slugs, "acme") {
+		t.Errorf("alice's orgs = %v, want acme among them", slugs)
+	}
+	if r := h.get("/api/v1/orgs/acme", h.ku); r.status != http.StatusOK {
+		t.Errorf("GET /orgs/acme by alice = %d %s, want 200", r.status, r.body)
+	}
+}
+
+func TestAddMember_LeavesAnExistingMembershipAsItIs(t *testing.T) {
+	t.Parallel()
+	h := newTeamHub(t)
+	h.addMember(h.seedOrg("Acme Inc", "acme"), h.alice.ID)
+	before, stored := h.get("/api/v1/orgs/acme/members", h.admin).json["items"], h.snapshot()
+	h.advance(2 * time.Second)
+	if r := h.call(http.MethodPut, "/api/v1/orgs/acme/members/alice@example.com", h.admin, nil); r.status != http.StatusNoContent {
+		t.Errorf("answer = %d %s, want 204", r.status, r.body)
+	}
+	if after := h.get("/api/v1/orgs/acme/members", h.admin).json["items"]; !reflect.DeepEqual(after, before) {
+		t.Errorf("members = %v, want %v", after, before)
+	}
+	if h.snapshot() != stored {
+		t.Errorf("the store changed")
+	}
+}
+
+func TestRemoveMember_DeletesTheMembershipAndKeepsTheUserTheOrgAndItsOwner(t *testing.T) {
+	t.Parallel()
+	h := newTeamHub(t)
+	if r := h.get("/api/v1/orgs/alice", h.ku); r.status != http.StatusOK {
+		t.Fatalf("GET /orgs/alice by alice before = %d %s, want 200", r.status, r.body)
+	}
+	r := h.call(http.MethodDelete, "/api/v1/orgs/alice/members/alice", h.admin, nil)
+	if r.status != http.StatusNoContent || len(r.body) != 0 {
+		t.Fatalf("answer = %d %s, want 204 without a body", r.status, r.body)
+	}
+	if items := itemMember(t, h.get("/api/v1/orgs/alice/members", h.admin), "username"); len(items) != 0 {
+		t.Errorf("members of alice = %v, want none", items)
+	}
+	checkRefusal(t, "GET /orgs/alice by alice", h.get("/api/v1/orgs/alice", h.ku), http.StatusNotFound, "not_found", "org not found")
+	if o := h.get("/api/v1/orgs/alice", h.admin); o.status != http.StatusOK || o.json["owner_id"] != h.alice.ID {
+		t.Errorf("GET /orgs/alice = %d %s, want 200 with owner_id %s", o.status, o.body, h.alice.ID)
+	}
+	if u := h.get("/api/v1/users/alice", h.admin); u.status != http.StatusOK {
+		t.Errorf("GET /users/alice = %d %s, want 200", u.status, u.body)
+	}
+}
+
+func TestRemoveMember_AnswersNotFoundForNoMembershipAndChangesNothing(t *testing.T) {
+	t.Parallel()
+	h := newTeamHub(t)
+	h.addMember(h.seedOrg("Acme Inc", "acme"), h.alice.ID)
+	h.createUser("bob", identity.RoleUser)
+	before := h.snapshot()
+	r := h.call(http.MethodDelete, "/api/v1/orgs/acme/members/bob", h.admin, nil)
+	checkRefusal(t, "DELETE of a user who is no member", r, http.StatusNotFound, "not_found", "membership not found")
+	if h.snapshot() != before {
+		t.Errorf("the store changed")
+	}
+	if r := h.call(http.MethodDelete, "/api/v1/orgs/acme/members/alice", h.admin, nil); r.status != http.StatusNoContent {
+		t.Fatalf("DELETE of a member = %d %s, want 204", r.status, r.body)
+	}
+	r = h.call(http.MethodDelete, "/api/v1/orgs/acme/members/alice", h.admin, nil)
+	checkRefusal(t, "DELETE of the membership just deleted", r, http.StatusNotFound, "not_found", "membership not found")
 }

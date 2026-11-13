@@ -209,13 +209,19 @@ type orgPosition struct {
 
 // listOrgs returns up to limit orgs in the order of the list of orgs, by
 // name compared byte-wise, after the position after when it is not nil,
-// the blocked ones only when includeBlocked is true.
-func listOrgs(ctx context.Context, q RowsQuerier, includeBlocked bool, after *orgPosition, limit int) ([]Org, error) {
+// the blocked ones only when includeBlocked is true, and only those of
+// which the user memberID is a member when memberID is not "".
+func listOrgs(ctx context.Context, q RowsQuerier, includeBlocked bool, memberID string, after *orgPosition,
+	limit int) ([]Org, error) {
 	query := `SELECT ` + orgColumns + ` FROM orgs WHERE 1 = 1`
 	var args []any
 	if !includeBlocked {
 		query += ` AND status = ?`
 		args = append(args, StatusActive)
+	}
+	if memberID != "" {
+		query += ` AND id IN (SELECT org_id FROM memberships WHERE user_id = ?)`
+		args = append(args, memberID)
 	}
 	if after != nil {
 		query += ` AND name > ?`
@@ -244,4 +250,82 @@ func listOrgs(ctx context.Context, q RowsQuerier, includeBlocked bool, after *or
 // isMember reports whether the user userID is a member of the org orgID.
 func isMember(ctx context.Context, q Querier, orgID, userID string) (bool, error) {
 	return exists(ctx, q, `SELECT count(*) FROM memberships WHERE org_id = ? AND user_id = ?`, orgID, userID)
+}
+
+// memberItem is an item of an org's member list: a membership, with the
+// time it was created, and the member's username and e-mail.
+type memberItem struct {
+	OrgID     string       `json:"org_id"`
+	UserID    string       `json:"user_id"`
+	Username  string       `json:"username"`
+	Email     string       `json:"email"`
+	CreatedAt timefmt.Time `json:"created_at"`
+}
+
+// memberPosition is the position of a membership in an org's member list:
+// by the member's username, ascending.
+type memberPosition struct {
+	Username string `json:"username"`
+}
+
+// listMembers returns up to limit memberships of the org orgID in the order
+// of its member list, by username compared byte-wise, after the position
+// after when it is not nil.
+func listMembers(ctx context.Context, q RowsQuerier, orgID string, after *memberPosition, limit int) ([]memberItem, error) {
+	query := `SELECT m.org_id, m.user_id, u.username, u.email, m.created_at
+FROM memberships m JOIN users u ON u.id = m.user_id WHERE m.org_id = ?`
+	args := []any{orgID}
+	if after != nil {
+		query += ` AND u.username > ?`
+		args = append(args, after.Username)
+	}
+	query += ` ORDER BY u.username LIMIT ?`
+	rows, err := q.QueryContext(ctx, query, append(args, limit)...)
+	if err != nil {
+		return nil, fmt.Errorf("list the members of an org: %w", err)
+	}
+	defer rows.Close()
+	var items []memberItem
+	for rows.Next() {
+		var it memberItem
+		var created int64
+		if err := rows.Scan(&it.OrgID, &it.UserID, &it.Username, &it.Email, &created); err != nil {
+			return nil, fmt.Errorf("list the members of an org: %w", err)
+		}
+		it.CreatedAt = timefmt.Time(fromNanos(created))
+		items = append(items, it)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list the members of an org: %w", err)
+	}
+	return items, nil
+}
+
+// addMembership makes the user userID a member of the org orgID in tx, from
+// now. A membership that exists is left as it is, its created_at included.
+func addMembership(ctx context.Context, tx *sql.Tx, orgID, userID string, now time.Time) error {
+	_, err := tx.ExecContext(ctx, `INSERT INTO memberships (org_id, user_id, created_at) VALUES (?, ?, ?)
+ON CONFLICT (org_id, user_id) DO NOTHING`, orgID, userID, now.UTC().UnixNano())
+	if err != nil {
+		return fmt.Errorf("store the membership: %w", err)
+	}
+	return nil
+}
+
+// removeMembership deletes the membership of the user userID in the org
+// orgID in tx, or returns ErrNotFound when there is none. The org's
+// owner_id is left alone: the owner is informational.
+func removeMembership(ctx context.Context, tx *sql.Tx, orgID, userID string) error {
+	res, err := tx.ExecContext(ctx, `DELETE FROM memberships WHERE org_id = ? AND user_id = ?`, orgID, userID)
+	if err != nil {
+		return fmt.Errorf("delete the membership: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("delete the membership: %w", err)
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }

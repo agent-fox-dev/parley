@@ -227,7 +227,8 @@ func TestCreateUser_RefusesWhatIsTakenAndCreatesNothing(t *testing.T) {
 }
 
 // userSelectorRoutes are the admin routes that name a user by a selector,
-// ":user" in their path, each with a body it accepts (nil for none).
+// ":user" in their path, each with a body it accepts (nil for none). The
+// membership routes name the org acme, which the selector tests seed.
 var userSelectorRoutes = []adminRoute{
 	{http.MethodGet, "/api/v1/users/:user", nil},
 	{http.MethodPatch, "/api/v1/users/:user", map[string]any{"full_name": "x"}},
@@ -235,6 +236,8 @@ var userSelectorRoutes = []adminRoute{
 	{http.MethodPost, "/api/v1/users/:user/demote", nil},
 	{http.MethodPost, "/api/v1/users/:user/block", nil},
 	{http.MethodPost, "/api/v1/users/:user/unblock", nil},
+	{http.MethodPut, "/api/v1/orgs/acme/members/:user", nil},
+	{http.MethodDelete, "/api/v1/orgs/acme/members/:user", nil},
 }
 
 // itemIDs returns the ids of the items of a list answer.
@@ -443,11 +446,15 @@ func TestUpdateUser_RejectsABodyWithoutAFullNameString(t *testing.T) {
 func TestUserSelectors_ReachTheSameUserByIdEmailOrUsername(t *testing.T) {
 	t.Parallel()
 	h := newTeamHub(t)
-	id := h.alice.ID
+	id, acme := h.alice.ID, h.seedOrg("Acme Inc", "acme")
 	for _, rt := range userSelectorRoutes {
 		for _, sel := range []string{id, "alice@example.com", "alice"} {
 			path := strings.ReplaceAll(rt.path, ":user", sel)
 			t.Run(rt.method+" "+path, func(t *testing.T) {
+				if membershipRoute(rt) {
+					h.reachesAliceInAcme(t, rt, acme, path)
+					return
+				}
 				r := h.call(rt.method, path, h.admin, rt.body)
 				if r.status != http.StatusOK || r.json["id"] != id {
 					t.Fatalf("answer = %d %s, want 200 with alice's id %s", r.status, r.body, id)
@@ -466,6 +473,7 @@ func TestUserSelectors_ReachTheSameUserByIdEmailOrUsername(t *testing.T) {
 func TestUserSelectors_AnswerNotFoundForNoUserAndChangeNothing(t *testing.T) {
 	t.Parallel()
 	h := newTeamHub(t)
+	h.addMember(h.seedOrg("Acme Inc", "acme"), h.alice.ID)
 	selectors := map[string]string{
 		"a random UUID":            uuid.NewV4().String(),
 		"an unknown e-mail":        "nobody@example.com",

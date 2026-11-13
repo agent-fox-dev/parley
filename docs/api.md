@@ -610,6 +610,23 @@ updated User object; every other member is unchanged.
 {"full_name":"Alice A."}
 ```
 
+## `GET /api/v1/user/orgs`
+
+Lists the orgs the caller is a member of, a [list](#lists) in the standard
+pages. The route needs a user, as `GET /api/v1/user` does, and declares the
+scope `orgs:read` for a PAT.
+
+The list holds the orgs with the status `active` of which the caller's user
+is a member, ordered by `name` ascending, compared byte by byte. Blocked
+orgs and orgs the user is not a member of are left out. A user with no
+membership in an active org gets `items` `[]`.
+
+| Status | When |
+|---|---|
+| `200 OK` | the body is a page: `items` are Org objects (see [`POST /api/v1/orgs`](#post-apiv1orgs)) |
+| `400` `invalid_request` | a bad `limit` or `cursor` (see [Lists](#lists)) |
+| `403` `forbidden` | the caller is the admin token (`this route needs a user`) |
+
 ## Admin routes
 
 The user and org administration routes are admin routes. Their caller must
@@ -633,14 +650,17 @@ The admin routes so far: `POST /api/v1/users`, `GET /api/v1/users`,
 `GET /api/v1/users/{id}`, `PATCH /api/v1/users/{id}`,
 `POST /api/v1/users/{id}/promote`, `POST /api/v1/users/{id}/demote`,
 `POST /api/v1/users/{id}/block`, `POST /api/v1/users/{id}/unblock`,
-`POST /api/v1/orgs`, `GET /api/v1/orgs` and `PATCH /api/v1/orgs/{id}`.
-`GET /api/v1/orgs/{id}` is not one: a member reads an org too (see
-[`GET /api/v1/orgs/{id}`](#get-apiv1orgsid)).
+`POST /api/v1/orgs`, `GET /api/v1/orgs`, `PATCH /api/v1/orgs/{id}`,
+`PUT /api/v1/orgs/{id}/members/{user_id}` and
+`DELETE /api/v1/orgs/{id}/members/{user_id}`. `GET /api/v1/orgs/{id}` and
+`GET /api/v1/orgs/{id}/members` are not: a member reads an org and its
+member list too (see [`GET /api/v1/orgs/{id}`](#get-apiv1orgsid)).
 
 ## User selectors
 
-A route with a user in its path, `/api/v1/users/{id}`, takes any of the
-user's three names there, and its shape alone decides which one it is:
+A route with a user in its path, `/api/v1/users/{id}` or
+`/api/v1/orgs/{id}/members/{user_id}`, takes any of the user's three names
+there, and its shape alone decides which one it is:
 
 | Value | Looked up as |
 |---|---|
@@ -919,4 +939,68 @@ unchanged. The org's own current name is accepted.
 
 ```json
 {"name":"Acme Corp","url":"https://acme.example"}
+```
+
+## `GET /api/v1/orgs/{id}/members`
+
+Lists the members of the org `{id}` names (see
+[Org selectors](#org-selectors)), a [list](#lists) in the standard pages.
+Who may read it is decided as for
+[`GET /api/v1/orgs/{id}`](#get-apiv1orgsid): an admin, for any org, a
+blocked one included, and every other caller, a PAT of an admin included,
+only when its user is a member of the org and the org is `active`. Every
+other caller gets the answer for an org that does not exist. It declares the
+scope `orgs:read` for a PAT.
+
+The list holds one item per membership, ordered by `username` ascending,
+compared byte by byte. An item has exactly `org_id`, `user_id`, `username`,
+`email` and `created_at`, the time the membership was created (not the
+user's). An org without members gets `items` `[]`.
+
+| Status | When |
+|---|---|
+| `200 OK` | the body is a page of member items |
+| `400` `invalid_request` | a bad `limit` or `cursor` (see [Lists](#lists)) |
+| `404` `not_found` | no org has that id or slug, or the caller is not an admin and is not a member of the org or the org is blocked (`org not found`) |
+
+```json
+{"items":[{"org_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","user_id":"1b2c3d4e-5f6a-4b7c-8d9e-0f1a2b3c4d5e","username":"alice","email":"alice@example.com","created_at":"2026-01-01T00:02:00Z"}],"next_cursor":null}
+```
+
+## `PUT /api/v1/orgs/{id}/members/{user_id}`
+
+Makes the user `{user_id}` names (see [User selectors](#user-selectors)) a
+member of the org `{id}` names (see [Org selectors](#org-selectors)). An
+admin route (see [Admin routes](#admin-routes)); it reads no body.
+
+The membership is created with `created_at` the time of the request. A
+user who is a member already keeps the membership as it is, its
+`created_at` included. Blocked users and blocked orgs are accepted; the org
+appears in the user's [`GET /api/v1/user/orgs`](#get-apiv1userorgs) while
+it is `active`.
+
+| Status | When |
+|---|---|
+| `204 No Content` | the user is a member; the body is empty |
+| `403` `forbidden` | the caller is not an admin (see [Admin routes](#admin-routes)) |
+| `404` `not_found` | no org has that id or slug (`org not found`), or no user has that id, e-mail or username (`user not found`); the org is looked up first |
+
+## `DELETE /api/v1/orgs/{id}/members/{user_id}`
+
+Ends the membership of the user `{user_id}` names (see
+[User selectors](#user-selectors)) in the org `{id}` names (see
+[Org selectors](#org-selectors)). An admin route (see
+[Admin routes](#admin-routes)).
+
+The user and the org are kept, and the org's `owner_id` is left as it is,
+also when the user removed is the owner: the owner is informational.
+
+| Status | When |
+|---|---|
+| `204 No Content` | the membership was deleted; the body is empty |
+| `403` `forbidden` | the caller is not an admin (see [Admin routes](#admin-routes)) |
+| `404` `not_found` | no org has that id or slug (`org not found`), no user has that id, e-mail or username (`user not found`), or the user is not a member of the org (`membership not found`). Nothing changes. |
+
+```json
+{"error":{"code":404,"message":"membership not found","error_type":"not_found"}}
 ```

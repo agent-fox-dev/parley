@@ -9,6 +9,9 @@ import (
 	"slices"
 	"testing"
 	"time"
+
+	"github.com/agent-fox-dev/parley/internal/identity"
+	"github.com/agent-fox-dev/parley/internal/server"
 )
 
 // needsUserRoute is a route that needs a user, with a body it accepts, nil
@@ -23,6 +26,7 @@ type needsUserRoute struct {
 var needsUserRoutes = []needsUserRoute{
 	{http.MethodGet, "/api/v1/user", nil},
 	{http.MethodPatch, "/api/v1/user", map[string]any{"full_name": "x"}},
+	{http.MethodGet, "/api/v1/user/orgs", nil},
 }
 
 // wholeSecondsUTC is an RFC 3339 time in UTC with whole seconds.
@@ -129,6 +133,80 @@ func TestNeedsUserRoutes_RefuseTheAdminToken(t *testing.T) {
 			checkRefusal(t, "admin token", r, http.StatusForbidden, "forbidden", "this route needs a user")
 			if h.snapshot() != before {
 				t.Errorf("the store changed")
+			}
+		})
+	}
+}
+
+func TestOwnOrgs_ListsTheActiveOrgsOfTheCallerByName(t *testing.T) {
+	t.Parallel()
+	h := newTeamHub(t)
+	for _, name := range []string{"zeta", "beta"} {
+		h.addMember(h.seedOrg(name, name), h.alice.ID)
+	}
+	blocked := h.seedOrg("blocked-co", "blocked-co")
+	h.setOrgStatus(blocked, identity.StatusBlocked)
+	h.addMember(blocked, h.alice.ID)
+	h.seedOrg("other", "other")
+	r := h.get("/api/v1/user/orgs", h.ku)
+	if r.status != http.StatusOK {
+		t.Fatalf("GET /user/orgs = %d %s, want 200", r.status, r.body)
+	}
+	if got, want := itemNames(t, r), []string{"alice", "beta", "zeta"}; !slices.Equal(got, want) {
+		t.Fatalf("names = %v, want %v", got, want)
+	}
+	if got := slices.Sorted(maps.Keys(r.json["items"].([]any)[0].(map[string]any))); !slices.Equal(got, orgMembers) {
+		t.Errorf("members = %v, want %v", got, orgMembers)
+	}
+	ids := itemIDs(t, r)
+	if got, requests := h.walk("/api/v1/user/orgs", h.ku, 2); !slices.Equal(got, ids) || requests != 2 {
+		t.Errorf("pages of 2 = %v in %d requests, want %v in 2", got, requests, ids)
+	}
+	h.exec(`DELETE FROM memberships WHERE user_id = ?`, h.alice.ID)
+	r = h.get("/api/v1/user/orgs", h.ku)
+	items, ok := r.json["items"].([]any)
+	if next, present := r.json["next_cursor"]; r.status != http.StatusOK || !ok || len(items) != 0 || !present || next != nil {
+		t.Errorf("GET /user/orgs without memberships = %d %s, want 200 with items [] and next_cursor null", r.status, r.body)
+	}
+}
+
+func TestScopes_RefuseAPATWithoutTheDeclaredScopeBeforeAnythingElse(t *testing.T) {
+	t.Parallel()
+	h := newTeamHub(t)
+	// The scope check package 06 installs compares with the implication
+	// rules; this one compares the declared scope with the PAT's own.
+	h.srv.SetScopeCheck(func(r *http.Request) error {
+		p, _ := identity.PrincipalOf(r.Context())
+		m, _ := server.MatchedRoute(r)
+		if p.Type == identity.TypePAT && m.Route.Scope != "" && !slices.Contains(p.Permissions, m.Route.Scope) {
+			return server.InsufficientScope("the token does not hold the scope " + m.Route.Scope)
+		}
+		return nil
+	})
+	for _, c := range []struct {
+		method, path, scope string
+		body                any
+	}{
+		{http.MethodGet, "/api/v1/user", "users:read", nil},
+		{http.MethodPatch, "/api/v1/user", "users:write", map[string]any{"full_name": "Changed"}},
+		{http.MethodGet, "/api/v1/user/orgs", "orgs:read", nil},
+		{http.MethodGet, "/api/v1/orgs/alice", "orgs:read", nil},
+		{http.MethodGet, "/api/v1/orgs/alice/members", "orgs:read", nil},
+	} {
+		t.Run(c.method+" "+c.path, func(t *testing.T) {
+			others := slices.DeleteFunc(slices.Clone(everyScope), func(s string) bool { return s == c.scope })
+			without, _ := h.seedPAT(identity.PATSpec{UserID: h.alice.ID, Permissions: others})
+			only, _ := h.seedPAT(identity.PATSpec{UserID: h.alice.ID, Permissions: []string{c.scope}})
+			before := h.snapshot()
+			r := h.call(c.method, c.path, "Bearer "+without, c.body)
+			if r.status != http.StatusForbidden || r.errorField("error_type") != "insufficient_scope" {
+				t.Errorf("without %s: answer = %d %s, want 403 insufficient_scope", c.scope, r.status, r.body)
+			}
+			if h.snapshot() != before {
+				t.Errorf("without %s: the store changed", c.scope)
+			}
+			if r := h.call(c.method, c.path, "Bearer "+only, c.body); r.status != http.StatusOK {
+				t.Errorf("with %s alone: answer = %d %s, want 200", c.scope, r.status, r.body)
 			}
 		})
 	}

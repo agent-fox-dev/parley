@@ -640,10 +640,12 @@ a create route, the admin route `POST /users` (see
 and `PATCH /users/:id` (see [api.md](api.md#get-apiv1users)), the admin
 routes `POST /users/:id/promote`, `/demote`, `/block` and `/unblock` (see
 [api.md](api.md#role-and-status-of-a-user)), and the
-caller's own profile, `GET /user` and `PATCH /user` (see
+caller's own profile, `GET /user`, `PATCH /user` and `GET /user/orgs` (see
 [api.md](api.md#get-apiv1user)), which need a user, the admin routes
-`POST /orgs`, `GET /orgs` and `PATCH /orgs/:id`, and `GET /orgs/:id`, which
-an admin or a member reads (see [api.md](api.md#post-apiv1orgs)).
+`POST /orgs`, `GET /orgs`, `PATCH /orgs/:id`, `PUT /orgs/:id/members/:user_id`
+and `DELETE /orgs/:id/members/:user_id`, and `GET /orgs/:id` and
+`GET /orgs/:id/members`, which an admin or a member reads (see
+[api.md](api.md#post-apiv1orgs)).
 `(*identity.Service).Routes()` in `internal/identity/routes.go` returns
 them all: it appends the route list of each handlers file, such as
 `userRoutes()` in `internal/identity/handlers_users.go` and
@@ -836,9 +838,9 @@ no guard.
 `GET /user` and `PATCH /user`, in `internal/identity/handlers_user.go`,
 carry the mark `identity.MarkNeedsUser` and declare the scopes `users:read`
 and `users:write`. Both take the caller's user from the `identity.Principal`
-of the request. `PATCH /user` decodes the body into a
-`map[string]json.RawMessage` and needs `full_name` as a JSON string, else
-`400 invalid_request`; it stores it in one `(*store.Store).Tx` through
+of the request. `PATCH /user` reads the body with `fullNameOf(r)`, the rule
+`PATCH /users/:id` shares: a `map[string]json.RawMessage` that needs
+`full_name` as a JSON string, else `400 invalid_request`; it stores it in one `(*store.Store).Tx` through
 `updateFullName(ctx, tx, id, fullName, now)` in
 `internal/identity/users.go`, which sets `full_name` and `updated_at` (from
 `Deps.Now`) and returns the stored user, or `identity.ErrNotFound`.
@@ -869,7 +871,7 @@ new UUID, `owner_id` NULL when there is none, and no membership.
 `PATCH /orgs/:id` checks the body first, then resolves the selector and
 calls `updateOrg(ctx, tx, id, name, url, now)`, which refuses a name another
 org has (`id <> ?`) and sets only the members given and `updated_at`.
-`GET /orgs` reads one page with `listOrgs(ctx, q, includeBlocked, after,
+`GET /orgs` reads one page with `listOrgs(ctx, q, includeBlocked, "", after,
 limit)`: `ORDER BY name`, continuing after the position `{name}` of the
 cursor. `GET /orgs/:id` carries no admin mark and declares the scope
 `orgs:read`; it goes through `visibleOrg(r)`, the one rule for reading an
@@ -877,6 +879,27 @@ org: an admin (`isAdmin`) reads every org, any other caller an active org
 of which its user is a member (`isMember`), and every other case, a missing
 org included, is the one answer `errOrgNotFound()`, `404 not_found` with the
 message `org not found`.
+
+`GET /orgs/:id/members` (`listMembers`) also carries no admin mark, declares
+`orgs:read` and goes through `visibleOrg(r)`, so a blocked org's member list
+is an admin's alone. It reads one page with `listMembers(ctx, q, orgID,
+after, limit)` in `orgs.go`, a join of `memberships` and `users` `ORDER BY
+username`, continuing after the position `{username}`; an item is a
+`memberItem` (`org_id`, `user_id`, `username`, `email`, and the membership's
+`created_at`). `PUT` and `DELETE /orgs/:id/members/:user_id` (`addMember`,
+`removeMember`) resolve, in one `(*store.Store).Tx`, the org selector and
+then the user selector (`orgAndUser`: `errOrgNotFound()` or
+`errUserNotFound()`), then call `addMembership(ctx, tx, orgID, userID, now)`,
+an `INSERT … ON CONFLICT DO NOTHING` that leaves an existing membership as
+it is, or `removeMembership(ctx, tx, orgID, userID)`, which returns
+`identity.ErrNotFound` when no row was deleted (`404 not_found`, `membership
+not found`) and leaves `owner_id` alone; both answer `204`.
+`GET /user/orgs` (`listOwnOrgs` in `handlers_user.go`) carries the
+needs-a-user mark and declares `orgs:read`; it reads the active orgs of
+which the caller is a member through `listOrgs(ctx, q, includeBlocked,
+memberID, after, limit)`, the reader of `GET /orgs`, whose `memberID` limits
+the list to that user's orgs. `pageAfter[T](page)` decodes a page's
+position for these lists.
 
 ### The logger
 

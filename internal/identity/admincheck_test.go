@@ -30,6 +30,8 @@ var adminRoutes = []adminRoute{
 	{http.MethodPost, "/api/v1/orgs", newOrgBody("Zed Org", "zed-org")},
 	{http.MethodGet, "/api/v1/orgs", nil},
 	{http.MethodPatch, "/api/v1/orgs/:org", map[string]any{"url": "u"}},
+	{http.MethodPut, "/api/v1/orgs/:org/members/:user", nil},
+	{http.MethodDelete, "/api/v1/orgs/:org/members/:user", nil},
 }
 
 // newUserBody is a POST /users body for a user no team hub has.
