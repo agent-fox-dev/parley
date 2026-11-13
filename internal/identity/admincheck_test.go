@@ -9,17 +9,8 @@ import (
 	"github.com/agent-fox-dev/parley/internal/identity"
 )
 
-// adminRoute is a route behind the admin check. In its path, ":user"
-// stands for a user selector, ":org" for an org selector and ":key" and
-// ":token" for the id of an API key and a PAT; body is a body the route
-// accepts, nil for a route that takes none.
-type adminRoute struct {
-	method, path string
-	body         any
-}
-
 // adminRoutes are every admin route of the identity service.
-var adminRoutes = []adminRoute{
+var adminRoutes = []testRoute{
 	{http.MethodPost, "/api/v1/users", newUserBody("zed")},
 	{http.MethodGet, "/api/v1/users", nil},
 	{http.MethodGet, "/api/v1/users/:user", nil},
@@ -41,12 +32,6 @@ var adminRoutes = []adminRoute{
 	{http.MethodPost, "/api/v1/orgs/:org/block", nil},
 	{http.MethodPost, "/api/v1/orgs/:org/unblock", nil},
 	{http.MethodDelete, "/api/v1/orgs/:org", nil},
-}
-
-// newUserBody is a POST /users body for a user no team hub has.
-func newUserBody(username string) map[string]any {
-	return map[string]any{"username": username, "email": username + "@example.com", "provider": "github",
-		"provider_id": username + "-id"}
 }
 
 func TestAdminCheck_RefusesEveryCallerButAnAdminBeforeAnythingElse(t *testing.T) {

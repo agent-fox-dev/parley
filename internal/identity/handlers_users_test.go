@@ -3,9 +3,7 @@ package identity_test
 import (
 	"cmp"
 	"fmt"
-	"maps"
 	"net/http"
-	"net/url"
 	"reflect"
 	"slices"
 	"strings"
@@ -21,18 +19,11 @@ import (
 var userMembers = []string{"created_at", "email", "full_name", "id", "provider", "provider_id", "role", "status",
 	"updated_at", "username"}
 
-// postUser posts body to POST /users as the caller authorization.
-func (h *testHub) postUser(authorization string, body any) response {
-	h.t.Helper()
-	return h.call(http.MethodPost, "/api/v1/users", authorization, body)
-}
-
 func TestCreateUser_CreatesAnActiveUserWithAPersonalOrg(t *testing.T) {
 	t.Parallel()
 	// No user has role admin, so the bootstrap e-mail would make a first
 	// login an admin.
 	h := newTestHub(t, withAdminEmail("boss@example.com"))
-	admin := "Bearer " + h.adminToken
 	for _, c := range []struct {
 		name     string
 		body     map[string]any
@@ -46,13 +37,9 @@ func TestCreateUser_CreatesAnActiveUserWithAPersonalOrg(t *testing.T) {
 			"provider": "google", "provider_id": "3"}, ""},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			r := h.postUser(admin, c.body)
-			if r.status != http.StatusCreated {
-				t.Fatalf("status = %d %s, want 201", r.status, r.body)
-			}
-			if got := slices.Sorted(maps.Keys(r.json)); !slices.Equal(got, userMembers) {
-				t.Errorf("members = %v, want %v", got, userMembers)
-			}
+			r := wantStatus(t, "POST /users", h.call(http.MethodPost, "/api/v1/users", "Bearer "+h.adminToken, c.body),
+				http.StatusCreated)
+			checkMembers(t, r.json, userMembers)
 			id, _ := r.json["id"].(string)
 			if _, err := uuid.Parse(id); err != nil || len(id) != 36 {
 				t.Errorf("id = %q, want a new UUID", id)
@@ -67,8 +54,7 @@ func TestCreateUser_CreatesAnActiveUserWithAPersonalOrg(t *testing.T) {
 					t.Errorf("%s = %v, want %v", member, r.json[member], want)
 				}
 			}
-			stored := h.storedUser(id)
-			if stored.Role != "user" || stored.Status != "active" {
+			if stored := h.storedUser(id); stored.Role != "user" || stored.Status != "active" {
 				t.Errorf("stored user = %+v, want role user and status active", stored)
 			}
 			username := c.body["username"].(string)
@@ -76,49 +62,25 @@ func TestCreateUser_CreatesAnActiveUserWithAPersonalOrg(t *testing.T) {
 			if o.Name != username || o.OwnerID != id || o.Status != "active" {
 				t.Errorf("personal org = %+v, want name %s, owner %s and status active", o, username, id)
 			}
-			m := h.membershipsOf(o.ID)
-			if len(m) != 1 || m[0].UserID != id {
+			if m := h.membershipsOf(o.ID); len(m) != 1 || m[0].UserID != id {
 				t.Errorf("memberships of the personal org = %+v, want the user's alone", m)
 			}
 		})
 	}
 }
 
-func TestCreateUser_GivesThePersonalOrgTheSlugOfTheRule(t *testing.T) {
+func TestCreateUser_GivesThePersonalOrgTheSlugOfTheRuleOrTheFirstFreeNumberedOne(t *testing.T) {
 	t.Parallel()
 	h := newTestHub(t)
-	admin := "Bearer " + h.adminToken
-	for i, c := range []struct{ username, want string }{
-		{"Alice.Smith", "alice-smith"},
-		{"42bob", "u-42bob"},
-		{"-_ab_-", "ab"},
-		{"a", "u-<id8>"},
-	} {
-		t.Run(c.username, func(t *testing.T) {
-			body := map[string]any{"username": c.username, "email": fmt.Sprintf("user%d@example.com", i),
-				"provider": "github", "provider_id": fmt.Sprint(i)}
-			r := h.postUser(admin, body)
-			if r.status != http.StatusCreated {
-				t.Fatalf("status = %d %s, want 201", r.status, r.body)
-			}
-			id := r.json["id"].(string)
-			name, slug, _, _ := h.orgOf(id)
-			if want := strings.ReplaceAll(c.want, "<id8>", id[:8]); slug != want || name != c.username {
-				t.Errorf("personal org = %s %s, want %s %s", name, slug, c.username, want)
-			}
-		})
-	}
-}
-
-func TestCreateUser_GivesThePersonalOrgTheFirstFreeNumberedSlug(t *testing.T) {
-	t.Parallel()
-	h := newTestHub(t)
-	admin := "Bearer " + h.adminToken
 	for _, c := range []struct {
 		username string
 		taken    []string
 		want     string
 	}{
+		{"Alice.Smith", nil, "alice-smith"},
+		{"42bob", nil, "u-42bob"},
+		{"-_ab_-", nil, "ab"},
+		{"a", nil, "u-<id8>"},
 		{"Frank", []string{"frank"}, "frank-1"},
 		{"gina", []string{"gina", "gina-1"}, "gina-2"},
 		{"hal", []string{"hal", "hal-1", "hal-2", "hal-3", "hal-4", "hal-5", "hal-6", "hal-7", "hal-8", "hal-9"}, "hal-10"},
@@ -127,202 +89,128 @@ func TestCreateUser_GivesThePersonalOrgTheFirstFreeNumberedSlug(t *testing.T) {
 			for _, s := range c.taken {
 				h.seedOrg("Org "+s, s)
 			}
-			r := h.postUser(admin, newUserBody(c.username))
-			if r.status != http.StatusCreated {
-				t.Fatalf("status = %d %s, want 201", r.status, r.body)
-			}
-			if name, slug, _, _ := h.orgOf(r.json["id"].(string)); slug != c.want || name != c.username {
-				t.Errorf("personal org = %s %s, want %s %s", name, slug, c.username, c.want)
+			r := h.call(http.MethodPost, "/api/v1/users", "Bearer "+h.adminToken, newUserBody(c.username))
+			id := wantStatus(t, "POST /users", r, http.StatusCreated).json["id"].(string)
+			name, slug, _, _ := h.orgOf(id)
+			if want := strings.ReplaceAll(c.want, "<id8>", id[:8]); slug != want || name != c.username {
+				t.Errorf("personal org = %s %s, want %s %s", name, slug, c.username, want)
 			}
 		})
 	}
 }
 
-func TestCreateUser_RejectsABodyWithoutTheRequiredStrings(t *testing.T) {
+func TestAdminWrites_RejectAnInvalidBodyAndChangeNothing(t *testing.T) {
 	t.Parallel()
 	h := newTeamHub(t)
-	valid := func(change func(map[string]any)) map[string]any {
-		b := newUserBody("carol")
-		b["full_name"] = "Carol C"
-		change(b)
-		return b
-	}
-	bodies := map[string]any{
-		"empty object":       map[string]any{},
-		"username a number":  valid(func(b map[string]any) { b["username"] = 7 }),
-		"full_name a number": valid(func(b map[string]any) { b["full_name"] = 7 }),
-		"full_name null":     valid(func(b map[string]any) { b["full_name"] = nil }),
+	h.seedOrg("Acme Inc", "acme")
+	newUser := with(newUserBody("carol"), "full_name", "Carol C")
+	userBodies := map[string]any{
+		"an empty object":    map[string]any{},
+		"username a number":  with(newUser, "username", 7),
+		"full_name a number": with(newUser, "full_name", 7),
+		"full_name null":     with(newUser, "full_name", nil),
 	}
 	for _, m := range []string{"username", "email", "provider", "provider_id"} {
-		bodies[m+" missing"] = valid(func(b map[string]any) { delete(b, m) })
-		bodies[m+" empty"] = valid(func(b map[string]any) { b[m] = "" })
-		bodies[m+" null"] = valid(func(b map[string]any) { b[m] = nil })
+		for what, v := range map[string]any{"missing": omitted{}, "empty": "", "null": nil} {
+			userBodies[m+" "+what] = with(newUser, m, v)
+		}
 	}
-	for name, body := range bodies {
-		t.Run(name, func(t *testing.T) {
-			before := h.snapshot()
-			r := h.postUser(h.admin, body)
-			if r.status != http.StatusBadRequest || r.errorField("error_type") != "invalid_request" {
-				t.Errorf("answer = %d %s, want 400 invalid_request", r.status, r.body)
-			}
-			if h.snapshot() != before {
-				t.Errorf("the store changed")
-			}
-		})
+	newOrg := map[string]any{"name": "New", "slug": "new", "url": "https://new.example", "owner_id": h.alice.ID}
+	for _, rt := range []struct {
+		method, path string
+		bodies       map[string]any
+	}{
+		{http.MethodPost, "/api/v1/users", userBodies},
+		{http.MethodPatch, "/api/v1/users/alice", map[string]any{
+			"no full_name":       map[string]any{},
+			"full_name a number": map[string]any{"full_name": 5},
+			"full_name null":     map[string]any{"full_name": nil},
+		}},
+		{http.MethodPost, "/api/v1/orgs", map[string]any{
+			"no name":                  with(newOrg, "name", omitted{}),
+			"a blank name":             with(newOrg, "name", "   "),
+			"a number as name":         with(newOrg, "name", 5),
+			"no slug":                  with(newOrg, "slug", omitted{}),
+			"an empty slug":            with(newOrg, "slug", ""),
+			"a slug of 129 characters": with(newOrg, "slug", strings.Repeat("a", 129)),
+			"a slug in upper case":     with(newOrg, "slug", "Acme"),
+			"a slug with a dot":        with(newOrg, "slug", "a.b"),
+			"a slug starting with -":   with(newOrg, "slug", "-ab"),
+			"a slug ending with _":     with(newOrg, "slug", "ab_"),
+			"the slug _":               with(newOrg, "slug", "_"),
+			"a number as url":          with(newOrg, "url", 5),
+			"an owner_id of no user":   with(newOrg, "owner_id", uuid.NewV4().String()),
+			"a username as owner_id":   with(newOrg, "owner_id", "alice"),
+			"a number as owner_id":     with(newOrg, "owner_id", 5),
+		}},
+		{http.MethodPatch, "/api/v1/orgs/acme", map[string]any{
+			"an empty object":            map[string]any{},
+			"a slug alone":               map[string]any{"slug": "x"},
+			"an empty name":              map[string]any{"name": ""},
+			"a blank name":               map[string]any{"name": "  "},
+			"a number as name":           map[string]any{"name": 5},
+			"a number as url":            map[string]any{"url": 5},
+			"a name and a number as url": map[string]any{"name": "ok", "url": 5},
+		}},
+	} {
+		for name, body := range rt.bodies {
+			t.Run(rt.method+" "+rt.path+"/"+name, func(t *testing.T) {
+				r := h.callUnchanged(t, rt.method, rt.path, h.admin, body)
+				if r.status != http.StatusBadRequest || r.errorField("error_type") != "invalid_request" {
+					t.Errorf("answer = %d %s, want 400 invalid_request", r.status, r.body)
+				}
+			})
+		}
 	}
 }
 
-func TestCreateUser_RefusesWhatIsTakenAndCreatesNothing(t *testing.T) {
+func TestAdminWrites_RefuseWhatIsTakenAndChangeNothing(t *testing.T) {
 	t.Parallel()
+	h := newTeamHub(t)
+	for _, o := range [][2]string{{"Acme Inc", "acme"}, {"Beta", "beta"}, {"henry", "henrys-org"}, {"Org ivy", "ivy"}} {
+		h.seedOrg(o[0], o[1])
+	}
+	for i := 1; i <= 10; i++ {
+		h.seedOrg(fmt.Sprintf("Org ivy %d", i), fmt.Sprintf("ivy-%d", i))
+	}
+	user := func(username, email, providerID string) map[string]any {
+		return map[string]any{"username": username, "email": email, "provider": "github", "provider_id": providerID}
+	}
 	for _, c := range []struct {
-		name  string
-		setup func(h teamHub)
-		body  map[string]any
-		// free is true when no user has the body's username.
-		free bool
+		name, method, path string
+		body               map[string]any
 	}{
-		{"the username is taken", nil,
-			map[string]any{"username": "alice", "email": "new@example.com", "provider": "github", "provider_id": "new"}, false},
-		{"the e-mail is taken", nil,
-			map[string]any{"username": "new", "email": "alice@example.com", "provider": "github", "provider_id": "new"}, true},
-		{"the provider identity is taken", nil,
-			map[string]any{"username": "new", "email": "new@example.com", "provider": "github", "provider_id": "alice"}, true},
-		{"an org has the username as its name", func(h teamHub) { h.seedOrg("henry", "henrys-org") },
-			newUserBody("henry"), true},
-		{"no numbered slug is free", func(h teamHub) {
-			h.seedOrg("Org ivy", "ivy")
-			for i := 1; i <= 10; i++ {
-				h.seedOrg(fmt.Sprintf("Org ivy %d", i), fmt.Sprintf("ivy-%d", i))
-			}
-		}, newUserBody("ivy"), true},
+		{"the username", http.MethodPost, "/api/v1/users", user("alice", "new@example.com", "new")},
+		{"the e-mail", http.MethodPost, "/api/v1/users", user("new", "alice@example.com", "new")},
+		{"the provider identity", http.MethodPost, "/api/v1/users", user("new", "new@example.com", "alice")},
+		{"an org has the username as its name", http.MethodPost, "/api/v1/users", newUserBody("henry")},
+		{"no numbered slug is free", http.MethodPost, "/api/v1/users", newUserBody("ivy")},
+		{"the name", http.MethodPost, "/api/v1/orgs", newOrgBody("Acme Inc", "other")},
+		{"the name with white space", http.MethodPost, "/api/v1/orgs", newOrgBody(" Acme Inc ", "other")},
+		{"the slug", http.MethodPost, "/api/v1/orgs", newOrgBody("Other", "acme")},
+		{"the name of a personal org", http.MethodPost, "/api/v1/orgs", newOrgBody("alice", "other")},
+		{"the name of another org", http.MethodPatch, "/api/v1/orgs/acme", map[string]any{"name": "Beta"}},
+		{"that name with white space and a url", http.MethodPatch, "/api/v1/orgs/acme", map[string]any{"name": " Beta ", "url": "new"}},
 	} {
-		t.Run(c.name, func(t *testing.T) {
-			t.Parallel()
-			h := newTeamHub(t)
-			if c.setup != nil {
-				c.setup(h)
-			}
-			before := h.snapshot()
-			r := h.postUser(h.admin, c.body)
+		t.Run(c.method+" "+c.path+"/"+c.name, func(t *testing.T) {
+			h.advance(time.Hour)
+			r := h.callUnchanged(t, c.method, c.path, h.admin, c.body)
 			if r.status != http.StatusConflict || r.errorField("error_type") != "conflict" {
 				t.Errorf("answer = %d %s, want 409 conflict", r.status, r.body)
 			}
-			if h.snapshot() != before {
-				t.Errorf("the store changed")
-			}
-			if username := c.body["username"].(string); c.free {
-				checkRefusal(t, "GET /users/"+username, h.get("/api/v1/users/"+username, h.admin), http.StatusNotFound,
-					"not_found", "user not found")
-			}
 		})
 	}
-	t.Run("a new provider id of a taken provider", func(t *testing.T) {
-		t.Parallel()
-		h := newTeamHub(t)
-		r := h.postUser(h.admin, map[string]any{"username": "new", "email": "new@example.com", "provider": "github",
-			"provider_id": "alice-2"})
-		if r.status != http.StatusCreated {
-			t.Errorf("answer = %d %s, want 201", r.status, r.body)
-		}
-	})
-}
-
-// userSelectorRoutes are the admin routes that name a user by a selector,
-// ":user" in their path, each with a body it accepts (nil for none). The
-// membership routes name the org acme, which the selector tests seed. The
-// user delete comes last, so that the routes before it find the user as the
-// team hub created her.
-var userSelectorRoutes = []adminRoute{
-	{http.MethodGet, "/api/v1/users/:user", nil},
-	{http.MethodPatch, "/api/v1/users/:user", map[string]any{"full_name": "x"}},
-	{http.MethodPost, "/api/v1/users/:user/promote", nil},
-	{http.MethodPost, "/api/v1/users/:user/demote", nil},
-	{http.MethodPost, "/api/v1/users/:user/block", nil},
-	{http.MethodPost, "/api/v1/users/:user/unblock", nil},
-	{http.MethodPut, "/api/v1/orgs/acme/members/:user", nil},
-	{http.MethodDelete, "/api/v1/orgs/acme/members/:user", nil},
-	{http.MethodDelete, "/api/v1/users/:user", nil},
-}
-
-// userDeleteRoute reports whether rt deletes the user.
-func userDeleteRoute(rt adminRoute) bool {
-	return rt.method == http.MethodDelete && rt.path == "/api/v1/users/:user"
-}
-
-// deletesAlice sends the user delete at path as the admin token and reports
-// unless the answer is 204 without a body and alice is gone: her going
-// shows that the selector reached her. It then stores alice again, the
-// record the team hub created, so that the next request finds her.
-func (h teamHub) deletesAlice(t *testing.T, path string) {
-	t.Helper()
-	if r := h.call(http.MethodDelete, path, h.admin, nil); r.status != http.StatusNoContent || len(r.body) != 0 {
-		t.Errorf("answer = %d %s, want 204 without a body", r.status, r.body)
+	for name, c := range map[string]struct {
+		path string
+		body map[string]any
+	}{
+		"a new provider id of a taken provider": {"/api/v1/users", user("new", "new@example.com", "alice-2")},
+		"an org name in other case":             {"/api/v1/orgs", newOrgBody("acme inc", "other")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			wantStatus(t, "POST "+c.path, h.call(http.MethodPost, c.path, h.admin, c.body), http.StatusCreated)
+		})
 	}
-	if n := h.count(`SELECT count(*) FROM users WHERE id = ?`, h.alice.ID); n != 0 {
-		t.Errorf("alice is still there")
-	}
-	a := h.alice
-	h.exec(`INSERT OR IGNORE INTO users (id, username, email, full_name, role, status, provider, provider_id, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, a.ID, a.Username, a.Email, a.FullName, a.Role, a.Status, a.Provider, a.ProviderID,
-		a.CreatedAt.UnixNano(), a.UpdatedAt.UnixNano())
-}
-
-// itemIDs returns the ids of the items of a list answer.
-func itemIDs(t *testing.T, r response) []string {
-	t.Helper()
-	return itemValues(t, r, "id")
-}
-
-// itemValues returns the string member of each item of a list answer.
-func itemValues(t *testing.T, r response, member string) []string {
-	t.Helper()
-	items, ok := r.json["items"].([]any)
-	if !ok {
-		t.Fatalf("answer = %d %s, want a list", r.status, r.body)
-	}
-	ids := make([]string, 0, len(items))
-	for _, it := range items {
-		id, _ := it.(map[string]any)[member].(string)
-		ids = append(ids, id)
-	}
-	return ids
-}
-
-// walk reads the list at path page by page, limit items a page, following
-// next_cursor until it is null, and returns the ids of every item in order
-// and how many requests it took.
-func (h *testHub) walk(path, authorization string, limit int) (ids []string, requests int) {
-	h.t.Helper()
-	return h.walkBy(path, authorization, limit, "id")
-}
-
-// walkBy is walk for a list whose items are named by member.
-func (h *testHub) walkBy(path, authorization string, limit int, member string) (ids []string, requests int) {
-	h.t.Helper()
-	sep := "?"
-	if strings.Contains(path, "?") {
-		sep = "&"
-	}
-	cursor := ""
-	for requests < 10 {
-		page := fmt.Sprintf("%s%slimit=%d", path, sep, limit)
-		if cursor != "" {
-			page += "&cursor=" + url.QueryEscape(cursor)
-		}
-		r := h.get(page, authorization)
-		requests++
-		if r.status != http.StatusOK {
-			h.t.Fatalf("GET %s = %d %s, want 200", page, r.status, r.body)
-		}
-		ids = append(ids, itemValues(h.t, r, member)...)
-		next, ok := r.json["next_cursor"].(string)
-		if !ok {
-			return ids, requests
-		}
-		cursor = next
-	}
-	h.t.Fatalf("GET %s: next_cursor still set after %d pages", path, requests)
-	return nil, 0
 }
 
 // newListHub is a bootstrapped test hub with five active users created an
@@ -365,24 +253,19 @@ func TestListUsers_ListsActiveUsersNewestFirstInPages(t *testing.T) {
 	h, users := newListHub(t)
 	admin := "Bearer " + h.adminToken
 	want := idsOf(users, identity.StatusActive)
-	r := h.get("/api/v1/users", admin)
-	if r.status != http.StatusOK {
-		t.Fatalf("GET /users = %d %s, want 200", r.status, r.body)
+	r := wantStatus(t, "GET /users", h.get("/api/v1/users", admin), http.StatusOK)
+	if got := itemValues(t, r, "status"); !slices.Equal(got, slices.Repeat([]string{"active"}, len(want))) {
+		t.Errorf("statuses = %v, want active alone", got)
 	}
-	for _, it := range r.json["items"].([]any) {
-		if status := it.(map[string]any)["status"]; status != "active" {
-			t.Errorf("an item has the status %v, want active", status)
-		}
-	}
-	if got := itemIDs(t, r); !slices.Equal(got, want) {
+	if got := itemValues(t, r, "id"); !slices.Equal(got, want) {
 		t.Errorf("items = %v, want %v", got, want)
 	}
-	if got, requests := h.walk("/api/v1/users", admin, 2); !slices.Equal(got, want) || requests != 3 {
+	if got, requests := h.walkBy("/api/v1/users", admin, 2, "id"); !slices.Equal(got, want) || requests != 3 {
 		t.Errorf("pages of 2 = %v in %d requests, want %v in 3", got, requests, want)
 	}
 	for _, v := range []string{"false", "1", "yes", "TRUE", ""} {
 		t.Run("include_blocked="+v, func(t *testing.T) {
-			if got := itemIDs(t, h.get("/api/v1/users?include_blocked="+v, admin)); !slices.Equal(got, want) {
+			if got := itemValues(t, h.get("/api/v1/users?include_blocked="+v, admin), "id"); !slices.Equal(got, want) {
 				t.Errorf("items = %v, want %v", got, want)
 			}
 		})
@@ -398,20 +281,18 @@ func TestListUsers_AddsBlockedUsersForIncludeBlockedTrue(t *testing.T) {
 		t.Fatalf("the hub has %d users, the test %d", n, len(want))
 	}
 	r := h.get("/api/v1/users?include_blocked=true", admin)
-	if got := itemIDs(t, r); !slices.Equal(got, want) {
+	if got := itemValues(t, r, "id"); !slices.Equal(got, want) {
 		t.Errorf("items = %v, want %v", got, want)
 	}
-	var blocked []any
-	for _, it := range r.json["items"].([]any) {
-		if item := it.(map[string]any); item["status"] == "blocked" {
-			blocked = append(blocked, item["username"])
-		}
+	var statuses []string
+	for _, u := range users {
+		statuses = append(statuses, u.Status)
 	}
-	if !slices.Equal(blocked, []any{"mallory"}) {
-		t.Errorf("blocked items = %v, want mallory alone", blocked)
+	if got := itemValues(t, r, "status"); !slices.Equal(got, statuses) {
+		t.Errorf("statuses = %v, want %v, mallory's alone blocked", got, statuses)
 	}
 	// Pages of 3 split mallory from the user created at the same instant.
-	if got, _ := h.walk("/api/v1/users?include_blocked=true", admin, 3); !slices.Equal(got, want) {
+	if got, _ := h.walkBy("/api/v1/users?include_blocked=true", admin, 3, "id"); !slices.Equal(got, want) {
 		t.Errorf("pages of 3 = %v, want %v", got, want)
 	}
 }
@@ -419,260 +300,96 @@ func TestListUsers_AddsBlockedUsersForIncludeBlockedTrue(t *testing.T) {
 func TestGetUser_AnswersAnActiveOrABlockedUser(t *testing.T) {
 	t.Parallel()
 	h := newTeamHub(t)
-	mallory := h.createUser("mallory", identity.RoleUser)
-	h.setStatus(mallory.ID, identity.StatusBlocked)
+	h.setStatus(h.createUser("mallory", identity.RoleUser).ID, identity.StatusBlocked)
 	for _, c := range []struct{ username, status string }{{"alice", "active"}, {"mallory", "blocked"}} {
 		t.Run(c.username, func(t *testing.T) {
-			r := h.get("/api/v1/users/"+c.username, h.admin)
-			if r.status != http.StatusOK {
-				t.Fatalf("GET /users/%s = %d %s, want 200", c.username, r.status, r.body)
-			}
-			if got := slices.Sorted(maps.Keys(r.json)); !slices.Equal(got, userMembers) {
-				t.Errorf("members = %v, want %v", got, userMembers)
-			}
+			r := wantStatus(t, "GET /users/"+c.username, h.get("/api/v1/users/"+c.username, h.admin), http.StatusOK)
+			checkMembers(t, r.json, userMembers)
 			if r.json["username"] != c.username || r.json["status"] != c.status {
-				t.Errorf("user = %s, want %s with status %s", r.body, c.username, c.status)
+				t.Errorf("user = %s, want %s with the status %s", r.body, c.username, c.status)
 			}
 		})
 	}
 }
 
-func TestUpdateUser_StoresTheFullNameAndTheTimeOfTheChange(t *testing.T) {
+func TestUserChanges_StoreTheChangeAndTheTimeOfIt(t *testing.T) {
 	t.Parallel()
 	h := newTeamHub(t)
-	// In order: the empty string clears the name the first case set.
-	for _, fullName := range []string{"Alice B.", ""} {
-		t.Run(fmt.Sprintf("%q", fullName), func(t *testing.T) {
-			h.advance(time.Hour)
-			r := h.call(http.MethodPatch, "/api/v1/users/alice", h.ka, map[string]any{"full_name": fullName})
-			if r.status != http.StatusOK {
-				t.Fatalf("PATCH /users/alice = %d %s, want 200", r.status, r.body)
-			}
-			if r.json["id"] != h.alice.ID || r.json["full_name"] != fullName {
-				t.Errorf("user = %s, want alice with the full name %q", r.body, fullName)
-			}
-			if want := h.now().Format(time.RFC3339); r.json["updated_at"] != want {
-				t.Errorf("updated_at = %v, want %s", r.json["updated_at"], want)
-			}
-			if got := h.get("/api/v1/users/alice", h.admin).json; !reflect.DeepEqual(got, r.json) {
-				t.Errorf("GET /users/alice = %v, want %v", got, r.json)
-			}
-		})
-	}
-}
-
-func TestUpdateUser_RejectsABodyWithoutAFullNameString(t *testing.T) {
-	t.Parallel()
-	h := newTeamHub(t)
-	for name, body := range map[string]any{
-		"no full_name":       map[string]any{},
-		"full_name a number": map[string]any{"full_name": 5},
-		"full_name null":     map[string]any{"full_name": nil},
-	} {
-		t.Run(name, func(t *testing.T) {
-			before := h.get("/api/v1/users/alice", h.admin).json
-			r := h.call(http.MethodPatch, "/api/v1/users/alice", h.admin, body)
-			if r.status != http.StatusBadRequest || r.errorField("error_type") != "invalid_request" {
-				t.Errorf("answer = %d %s, want 400 invalid_request", r.status, r.body)
-			}
-			if got := h.get("/api/v1/users/alice", h.admin).json; !reflect.DeepEqual(got, before) {
-				t.Errorf("GET /users/alice = %v, want %v", got, before)
-			}
-		})
-	}
-}
-
-func TestUserSelectors_ReachTheSameUserByIdEmailOrUsername(t *testing.T) {
-	t.Parallel()
-	h := newTeamHub(t)
-	id, acme := h.alice.ID, h.seedOrg("Acme Inc", "acme")
-	for _, rt := range userSelectorRoutes {
-		for _, sel := range []string{id, "alice@example.com", "alice"} {
-			path := strings.ReplaceAll(rt.path, ":user", sel)
-			t.Run(rt.method+" "+path, func(t *testing.T) {
-				if membershipRoute(rt) {
-					h.reachesAliceInAcme(t, rt, acme, path)
-					return
-				}
-				if userDeleteRoute(rt) {
-					h.deletesAlice(t, path)
-					return
-				}
-				r := h.call(rt.method, path, h.admin, rt.body)
-				if r.status != http.StatusOK || r.json["id"] != id {
-					t.Fatalf("answer = %d %s, want 200 with alice's id %s", r.status, r.body, id)
-				}
-				if rt.method != http.MethodGet {
-					return
-				}
-				if want := h.get("/api/v1/users/"+id, h.admin).json; !reflect.DeepEqual(r.json, want) {
-					t.Errorf("user = %v, want %v", r.json, want)
-				}
-			})
-		}
-	}
-}
-
-func TestUserSelectors_AnswerNotFoundForNoUserAndChangeNothing(t *testing.T) {
-	t.Parallel()
-	h := newTeamHub(t)
-	h.addMember(h.seedOrg("Acme Inc", "acme"), h.alice.ID)
-	selectors := map[string]string{
-		"a random UUID":            uuid.NewV4().String(),
-		"an unknown e-mail":        "nobody@example.com",
-		"an unknown username":      "nobody",
-		"a username in other case": "ALICE",
-		"an e-mail in upper case":  "ALICE@EXAMPLE.COM",
-	}
-	for _, rt := range userSelectorRoutes {
-		for name, sel := range selectors {
-			t.Run(rt.method+" "+rt.path+"/"+name, func(t *testing.T) {
-				before := h.snapshot()
-				r := h.call(rt.method, strings.ReplaceAll(rt.path, ":user", sel), h.admin, rt.body)
-				checkRefusal(t, "answer", r, http.StatusNotFound, "not_found", "user not found")
-				if h.snapshot() != before {
-					t.Errorf("the store changed")
-				}
-			})
-		}
-	}
-}
-
-// post sends POST path without a body, with authorization as the
-// Authorization header.
-func (h *testHub) post(path, authorization string) response {
-	h.t.Helper()
-	return h.call(http.MethodPost, path, authorization, nil)
-}
-
-func TestPromoteAndDemote_SetTheRoleAndTheTimeOfTheChange(t *testing.T) {
-	t.Parallel()
-	h := newTeamHub(t)
-	before := withoutMembers(h.get("/api/v1/users/alice", h.admin).json, "role", "updated_at")
-	// In order: root's API key demotes alice while root is an active admin.
-	for _, c := range []struct{ verb, caller, role string }{
-		{"promote", h.admin, "admin"},
-		{"demote", h.ka, "user"},
-	} {
-		t.Run(c.verb, func(t *testing.T) {
-			h.advance(time.Hour)
-			r := h.post("/api/v1/users/alice/"+c.verb, c.caller)
-			if r.status != http.StatusOK || r.json["role"] != c.role {
-				t.Fatalf("POST /users/alice/%s = %d %s, want 200 with the role %s", c.verb, r.status, r.body, c.role)
-			}
-			if want := h.now().Format(time.RFC3339); r.json["updated_at"] != want {
-				t.Errorf("updated_at = %v, want %s", r.json["updated_at"], want)
-			}
-			if got := withoutMembers(r.json, "role", "updated_at"); !reflect.DeepEqual(got, before) {
-				t.Errorf("user = %v, want %v but for role and updated_at", got, before)
-			}
-			if got := h.get("/api/v1/users/alice", h.admin).json; !reflect.DeepEqual(got, r.json) {
-				t.Errorf("GET /users/alice = %v, want %v", got, r.json)
-			}
-		})
-	}
-}
-
-func TestBlockAndUnblock_SetTheStatusAndRevokeNoCredential(t *testing.T) {
-	t.Parallel()
-	h := newTeamHub(t)
-	before := withoutMembers(h.get("/api/v1/users/alice", h.admin).json, "status", "updated_at")
-	revoked := func() int {
-		return h.count(`SELECT count(*) FROM api_keys WHERE revoked_at IS NOT NULL`) +
-			h.count(`SELECT count(*) FROM pats WHERE revoked_at IS NOT NULL`)
-	}
-	// In order: alice's credentials are refused while she is blocked and
-	// pass again once she is unblocked.
-	for _, c := range []struct {
-		verb, status string
-		credentials  int
-	}{
-		{"block", "blocked", http.StatusForbidden},
-		{"unblock", "active", http.StatusOK},
-	} {
-		t.Run(c.verb, func(t *testing.T) {
-			h.advance(time.Hour)
-			r := h.post("/api/v1/users/alice/"+c.verb, h.admin)
-			if r.status != http.StatusOK || r.json["status"] != c.status || r.json["role"] != "user" {
-				t.Fatalf("POST /users/alice/%s = %d %s, want 200 with the status %s and the role user", c.verb,
-					r.status, r.body, c.status)
-			}
-			if want := h.now().Format(time.RFC3339); r.json["updated_at"] != want {
-				t.Errorf("updated_at = %v, want %s", r.json["updated_at"], want)
-			}
-			if got := withoutMembers(r.json, "status", "updated_at"); !reflect.DeepEqual(got, before) {
-				t.Errorf("user = %v, want %v but for status and updated_at", got, before)
-			}
-			if n := revoked(); n != 0 {
+	// credentials checks that no credential is revoked and that GET /user
+	// answers alice's API key and PAT status.
+	credentials := func(status int) func(*testing.T) {
+		return func(t *testing.T) {
+			if n := h.count(`SELECT (SELECT count(*) FROM api_keys WHERE revoked_at IS NOT NULL) +
+(SELECT count(*) FROM pats WHERE revoked_at IS NOT NULL)`); n != 0 {
 				t.Errorf("%d credentials are revoked, want none", n)
 			}
 			for name, cred := range map[string]string{"API key": h.ku, "PAT": h.pu} {
-				if got := h.get("/api/v1/user", cred); got.status != c.credentials {
-					t.Errorf("GET /user with alice's %s = %d %s, want %d", name, got.status, got.body, c.credentials)
+				if got := h.get("/api/v1/user", cred); got.status != status {
+					t.Errorf("GET /user with alice's %s = %d %s, want %d", name, got.status, got.body, status)
 				}
 			}
-		})
+		}
 	}
+	const alice = "/api/v1/users/alice"
+	// In order: the empty full name clears the one set before it, root's
+	// API key demotes alice while root is an active admin, and alice's
+	// credentials are refused while she is blocked and pass again once she
+	// is unblocked.
+	h.checkChanges(t, []recordChange{
+		{name: "a full name", method: http.MethodPatch, path: alice, caller: h.ka, get: alice,
+			body: map[string]any{"full_name": "Alice B."}, changed: map[string]any{"full_name": "Alice B."}},
+		{name: "an empty full name", method: http.MethodPatch, path: alice, caller: h.ka, get: alice,
+			body: map[string]any{"full_name": ""}, changed: map[string]any{"full_name": ""}},
+		{name: "promote", method: http.MethodPost, path: alice + "/promote", caller: h.admin, get: alice,
+			changed: map[string]any{"role": "admin"}},
+		{name: "demote", method: http.MethodPost, path: alice + "/demote", caller: h.ka, get: alice,
+			changed: map[string]any{"role": "user"}},
+		{name: "block", method: http.MethodPost, path: alice + "/block", caller: h.admin, get: alice,
+			changed: map[string]any{"status": "blocked"}, then: credentials(http.StatusForbidden)},
+		{name: "unblock", method: http.MethodPost, path: alice + "/unblock", caller: h.admin, get: alice,
+			changed: map[string]any{"status": "active"}, then: credentials(http.StatusOK)},
+	})
 }
 
-func TestRoleAndStatusChanges_AnswerTheUnchangedUserWhenNothingChanges(t *testing.T) {
+func TestStatusChanges_AnswerTheUnchangedRecordWhenNothingChanges(t *testing.T) {
 	t.Parallel()
 	h := newTeamHub(t)
-	mallory := h.createUser("mallory", identity.RoleUser)
-	h.setStatus(mallory.ID, identity.StatusBlocked)
-	for _, c := range []struct{ verb, username string }{
-		{"promote", "root"}, {"demote", "alice"}, {"block", "mallory"}, {"unblock", "alice"},
-	} {
-		t.Run(c.verb+" "+c.username, func(t *testing.T) {
-			before := h.get("/api/v1/users/"+c.username, h.admin).json
-			stored := h.snapshot()
+	h.setStatus(h.createUser("mallory", identity.RoleUser).ID, identity.StatusBlocked)
+	h.seedOrg("Acme Inc", "acme")
+	h.setOrgStatus(h.seedOrg("Blocked Co", "blocked-co"), identity.StatusBlocked)
+	for _, path := range []string{"/api/v1/users/root/promote", "/api/v1/users/alice/demote", "/api/v1/users/mallory/block",
+		"/api/v1/users/alice/unblock", "/api/v1/orgs/blocked-co/block", "/api/v1/orgs/acme/unblock"} {
+		t.Run(path, func(t *testing.T) {
+			before := h.get(path[:strings.LastIndex(path, "/")], h.admin).json
 			h.advance(2 * time.Second)
-			r := h.post("/api/v1/users/"+c.username+"/"+c.verb, h.admin)
-			if r.status != http.StatusOK {
-				t.Fatalf("POST /users/%s/%s = %d %s, want 200", c.username, c.verb, r.status, r.body)
-			}
-			if !reflect.DeepEqual(r.json, before) {
-				t.Errorf("user = %v, want the unchanged %v", r.json, before)
-			}
-			if h.snapshot() != stored {
-				t.Errorf("the store changed")
+			if r := h.callUnchanged(t, http.MethodPost, path, h.admin, nil); r.status != http.StatusOK || !reflect.DeepEqual(r.json, before) {
+				t.Errorf("answer = %d %s, want 200 with the unchanged %v", r.status, r.body, before)
 			}
 		})
 	}
 }
 
-func TestDemote_RefusesTheOnlyActiveAdmin(t *testing.T) {
+func TestLastAdminGuard_RefusesToDemoteOrDeleteTheOnlyActiveAdmin(t *testing.T) {
 	t.Parallel()
-	for _, c := range []struct {
-		name string
-		// blockedAdmin is true when oscar, a blocked admin, exists.
-		blockedAdmin bool
-	}{
-		{"root is the only admin", false},
-		{"root and a blocked admin exist", true},
-	} {
-		t.Run(c.name, func(t *testing.T) {
+	for _, blockedAdmin := range []bool{false, true} {
+		t.Run(fmt.Sprintf("beside a blocked admin: %t", blockedAdmin), func(t *testing.T) {
 			t.Parallel()
 			h := newTeamHub(t)
-			if c.blockedAdmin {
-				oscar := h.createUser("oscar", identity.RoleAdmin)
-				h.setStatus(oscar.ID, identity.StatusBlocked)
+			if blockedAdmin {
+				h.setStatus(h.createUser("oscar", identity.RoleAdmin).ID, identity.StatusBlocked)
 			}
-			for name, caller := range map[string]string{"admin token": h.admin, "API key of root": h.ka} {
-				before := h.snapshot()
-				r := h.post("/api/v1/users/root/demote", caller)
-				checkRefusal(t, name, r, http.StatusConflict, "conflict", "the user is the only active admin")
-				if got := h.get("/api/v1/users/root", h.admin).json["role"]; got != "admin" {
-					t.Errorf("%s: root's role = %v, want admin", name, got)
-				}
-				if h.snapshot() != before {
-					t.Errorf("%s: the store changed", name)
+			for _, rt := range []testRoute{{http.MethodPost, "/api/v1/users/root/demote", nil}, {http.MethodDelete, "/api/v1/users/root", nil}} {
+				for name, caller := range map[string]string{"admin token": h.admin, "API key of root": h.ka} {
+					r := h.callUnchanged(t, rt.method, rt.path, caller, nil)
+					checkRefusal(t, rt.method+" "+rt.path+" by the "+name, r, http.StatusConflict, "conflict",
+						"the user is the only active admin")
 				}
 			}
-			if c.blockedAdmin {
-				if r := h.post("/api/v1/users/oscar/demote", h.admin); r.status != http.StatusOK || r.json["role"] != "user" {
-					t.Errorf("POST /users/oscar/demote = %d %s, want 200 with the role user", r.status, r.body)
-				}
+			if !blockedAdmin {
+				return
+			}
+			if r := h.call(http.MethodPost, "/api/v1/users/oscar/demote", h.admin, nil); r.status != http.StatusOK || r.json["role"] != "user" {
+				t.Errorf("POST /users/oscar/demote = %d %s, want 200 with the role user", r.status, r.body)
 			}
 		})
 	}
@@ -681,35 +398,23 @@ func TestDemote_RefusesTheOnlyActiveAdmin(t *testing.T) {
 func TestBlock_BlocksTheOnlyActiveAdmin(t *testing.T) {
 	t.Parallel()
 	h := newTeamHub(t)
-	r := h.post("/api/v1/users/root/block", h.admin)
+	r := h.call(http.MethodPost, "/api/v1/users/root/block", h.admin, nil)
 	if r.status != http.StatusOK || r.json["status"] != "blocked" || r.json["role"] != "admin" {
 		t.Fatalf("POST /users/root/block = %d %s, want 200 with the status blocked and the role admin", r.status, r.body)
 	}
-	if got := h.get("/api/v1/users", h.admin); got.status != http.StatusOK {
-		t.Errorf("GET /users with the admin token = %d %s, want 200", got.status, got.body)
-	}
-	r = h.post("/api/v1/users/root/unblock", h.admin)
+	wantStatus(t, "GET /users with the admin token", h.get("/api/v1/users", h.admin), http.StatusOK)
+	r = h.call(http.MethodPost, "/api/v1/users/root/unblock", h.admin, nil)
 	if r.status != http.StatusOK || r.json["status"] != "active" {
 		t.Fatalf("POST /users/root/unblock = %d %s, want 200 with the status active", r.status, r.body)
 	}
-	if got := h.get("/api/v1/users", h.ka); got.status != http.StatusOK {
-		t.Errorf("GET /users with root's API key after the unblock = %d %s, want 200", got.status, got.body)
-	}
-}
-
-// deleteUser sends DELETE /users/<selector> as the admin token.
-func (h *testHub) deleteUser(selector string) response {
-	h.t.Helper()
-	return h.call(http.MethodDelete, "/api/v1/users/"+selector, "Bearer "+h.adminToken, nil)
+	wantStatus(t, "GET /users with root's API key after the unblock", h.get("/api/v1/users", h.ka), http.StatusOK)
 }
 
 func TestDeleteUser_DeletesTheUserWhateverTheRoleAndStatus(t *testing.T) {
 	t.Parallel()
 	h := newTeamHub(t)
-	mallory := h.createUser("mallory", identity.RoleUser)
-	h.setStatus(mallory.ID, identity.StatusBlocked)
-	oscar := h.createUser("oscar", identity.RoleAdmin)
-	h.setStatus(oscar.ID, identity.StatusBlocked)
+	h.setStatus(h.createUser("mallory", identity.RoleUser).ID, identity.StatusBlocked)
+	h.setStatus(h.createUser("oscar", identity.RoleAdmin).ID, identity.StatusBlocked)
 	h.createUser("ruth", identity.RoleAdmin)
 	// root stays an active admin throughout.
 	for _, c := range []struct{ name, username string }{
@@ -720,7 +425,7 @@ func TestDeleteUser_DeletesTheUserWhateverTheRoleAndStatus(t *testing.T) {
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			u := h.get("/api/v1/users/"+c.username, h.admin).json
-			r := h.deleteUser(c.username)
+			r := h.call(http.MethodDelete, "/api/v1/users/"+c.username, h.admin, nil)
 			if r.status != http.StatusNoContent || len(r.body) != 0 {
 				t.Fatalf("DELETE /users/%s = %d %s, want 204 without a body", c.username, r.status, r.body)
 			}
@@ -729,7 +434,7 @@ func TestDeleteUser_DeletesTheUserWhateverTheRoleAndStatus(t *testing.T) {
 				checkRefusal(t, "GET /users/"+sel, h.get("/api/v1/users/"+sel, h.admin), http.StatusNotFound, "not_found",
 					"user not found")
 			}
-			if ids := itemIDs(t, h.get("/api/v1/users?include_blocked=true&limit=200", h.admin)); slices.Contains(ids, id) {
+			if ids := itemValues(t, h.get("/api/v1/users?include_blocked=true&limit=200", h.admin), "id"); slices.Contains(ids, id) {
 				t.Errorf("GET /users?include_blocked=true lists the deleted user %s", id)
 			}
 		})
@@ -745,9 +450,7 @@ func TestDeleteUser_KeepsTheOrgsWithoutTheUserAsOwnerOrMember(t *testing.T) {
 	h.addMember(acme, h.alice.ID)
 	h.addMember(acme, bob.ID)
 	h.advance(time.Hour)
-	if r := h.deleteUser("alice"); r.status != http.StatusNoContent {
-		t.Fatalf("DELETE /users/alice = %d %s, want 204", r.status, r.body)
-	}
+	wantStatus(t, "DELETE /users/alice", h.call(http.MethodDelete, "/api/v1/users/alice", h.admin, nil), http.StatusNoContent)
 	now := h.now().Format(time.RFC3339)
 	for _, slug := range []string{"alice", "acme"} {
 		r := h.get("/api/v1/orgs/"+slug, h.admin)
@@ -756,10 +459,10 @@ func TestDeleteUser_KeepsTheOrgsWithoutTheUserAsOwnerOrMember(t *testing.T) {
 			t.Errorf("GET /orgs/%s = %d %s, want 200 with owner_id null and updated_at %s", slug, r.status, r.body, now)
 		}
 	}
-	if got := itemMember(t, h.get("/api/v1/orgs/acme/members", h.admin), "username"); !slices.Equal(got, []string{"bob"}) {
+	if got := itemValues(t, h.get("/api/v1/orgs/acme/members", h.admin), "username"); !slices.Equal(got, []string{"bob"}) {
 		t.Errorf("members of acme = %v, want [bob]", got)
 	}
-	if got := itemMember(t, h.get("/api/v1/orgs/alice/members", h.admin), "username"); len(got) != 0 {
+	if got := itemValues(t, h.get("/api/v1/orgs/alice/members", h.admin), "username"); len(got) != 0 {
 		t.Errorf("members of alice's personal org = %v, want none", got)
 	}
 	if got := h.get("/api/v1/orgs/bob", h.admin).json["owner_id"]; got != bob.ID {
@@ -774,9 +477,7 @@ func TestDeleteUser_DeletesEveryCredentialOfTheUser(t *testing.T) {
 	if n := h.count(`SELECT count(*) FROM pats WHERE user_id = ? AND workspace IS NOT NULL`, h.alice.ID); n != 1 {
 		t.Fatalf("alice has %d bound PATs, want 1", n)
 	}
-	if r := h.deleteUser("alice"); r.status != http.StatusNoContent {
-		t.Fatalf("DELETE /users/alice = %d %s, want 204", r.status, r.body)
-	}
+	wantStatus(t, "DELETE /users/alice", h.call(http.MethodDelete, "/api/v1/users/alice", h.admin, nil), http.StatusNoContent)
 	for name, cred := range map[string]string{"API key": h.ku, "PAT": h.pu, "bound PAT": "Bearer " + bound} {
 		checkRefusal(t, "GET /user with alice's "+name, h.get("/api/v1/user", cred), http.StatusUnauthorized,
 			"unauthenticated", "invalid credentials")
@@ -789,26 +490,6 @@ func TestDeleteUser_DeletesEveryCredentialOfTheUser(t *testing.T) {
 		if r := h.get("/api/v1/user", cred); r.status != http.StatusOK {
 			t.Errorf("GET /user with root's %s = %d %s, want 200", name, r.status, r.body)
 		}
-	}
-}
-
-func TestDeleteUser_RefusesTheOnlyActiveAdminAndDeletesNothing(t *testing.T) {
-	t.Parallel()
-	h := newTeamHub(t)
-	oscar := h.createUser("oscar", identity.RoleAdmin)
-	h.setStatus(oscar.ID, identity.StatusBlocked)
-	for name, caller := range map[string]string{"admin token": h.admin, "API key of root itself": h.ka} {
-		t.Run(name, func(t *testing.T) {
-			before := h.snapshot()
-			r := h.call(http.MethodDelete, "/api/v1/users/root", caller, nil)
-			checkRefusal(t, "answer", r, http.StatusConflict, "conflict", "the user is the only active admin")
-			if h.snapshot() != before {
-				t.Errorf("the store changed")
-			}
-			if got := h.get("/api/v1/users", h.ka); got.status != http.StatusOK {
-				t.Errorf("GET /users with root's API key = %d %s, want 200", got.status, got.body)
-			}
-		})
 	}
 }
 
@@ -833,7 +514,7 @@ func TestLastAdminGuard_RefusesOneOfTwoConcurrentChangesOfTheLastTwoAdmins(t *te
 				start := make(chan struct{})
 				var wg sync.WaitGroup
 				wg.Go(func() { <-start; root = h.call(c.method, c.path, admin, nil) })
-				wg.Go(func() { <-start; ruth = h.post("/api/v1/users/ruth/demote", admin) })
+				wg.Go(func() { <-start; ruth = h.call(http.MethodPost, "/api/v1/users/ruth/demote", admin, nil) })
 				close(start)
 				wg.Wait()
 				refused := root
