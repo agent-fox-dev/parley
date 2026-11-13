@@ -87,10 +87,12 @@ type MintRequest struct {
 
 // MintPAT mints a PAT for the user of caller in tx, which it does not
 // commit, so that a caller can mint a token with other changes of its own:
-// it validates req, then stores the token with StorePAT, created now, and
-// returns its value, which is shown once, with its record. It is the one
-// way a PAT is created. A request that is not valid is answered 400
-// invalid_request and stores nothing. The token expires the given number of
+// it validates req, holds a PAT caller to the subset rule (CheckSubset),
+// then stores the token with StorePAT, created now, and returns its value,
+// which is shown once, with its record. It is the one way a PAT is created.
+// A request that is not valid is answered 400 invalid_request, one beyond
+// what a PAT caller holds 403 insufficient_scope, and neither stores
+// anything. The token expires the given number of
 // days after the whole second of now, or at req.ExpiresAt.
 func MintPAT(ctx context.Context, tx *sql.Tx, caller Principal, req MintRequest, now time.Time) (string, PAT, error) {
 	if caller.User == nil {
@@ -117,9 +119,11 @@ func MintPAT(ctx context.Context, tx *sql.Tx, caller Principal, req MintRequest,
 	} else if expiresAt, err = tokenExpiry(req.Expires, now); err != nil {
 		return "", PAT{}, err
 	}
-	// The subset rule, which holds a PAT caller to its own scopes and
-	// paths, is checked here: after the request is known to be valid and
-	// before anything is stored.
+	// The subset rule needs a valid request, so it comes after validation,
+	// and before anything is stored.
+	if err := CheckSubset(caller, perms, paths); err != nil {
+		return "", PAT{}, err
+	}
 	return StorePAT(ctx, tx, PATSpec{UserID: caller.User.ID, Name: req.Name, Permissions: perms, Paths: paths,
 		Workspace: req.Workspace, ExpiresAt: expiresAt, CreatedAt: now})
 }

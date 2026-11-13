@@ -702,6 +702,20 @@ from that instant on the token no longer authenticates; it is `null` for
 `0`. `workspace` is `null`: a token minted here is not bound to a
 workspace.
 
+A PAT caller is held to the subset rule: it can mint a token only within
+what it holds itself, so that a token never creates a stronger one. Each
+requested permission must be in the caller's own `permissions`, compared
+exactly, without the implication rules of [Scopes](#scopes): a PAT with
+`git:write` cannot mint one with `git:read`. A caller with `paths` must
+send `paths` (absent or `null` is refused), and each requested glob must be
+covered by one of the caller's globs: the caller's glob matches every path
+the requested one can match, where a `*` of the caller's glob covers no `/`
+and no `**` (`src/**` covers `src/api/*.go` and `src/**`; `docs/*` does not
+cover `docs/**`). A caller without `paths` may ask for any `paths` or none.
+The rule runs after the body is validated, so a body that is invalid and
+also asks for more than the caller holds is answered `400`. An API key is
+not held to it: it may mint any registered scopes and any valid `paths`.
+
 | Status | When |
 |---|---|
 | `201 Created` | the token was minted; the body is the Token object and `token` |
@@ -709,6 +723,7 @@ workspace.
 | `400` `invalid_request` | a member is missing, of another type or out of range; nothing is minted. The messages: `name must be a string`, `name must be 1 to 255 characters`, `permissions must be an array of strings`, `permissions must hold at least one scope`, `permissions: "git:admin" is not a registered scope`, `paths must be an array of strings`, `paths must hold at least one glob; omit it for no path limit`, `paths holds 51 globs, at most 50 are allowed`, `paths[0] is empty`, `paths[0] is longer than 255 characters`, `paths[0] "/src/**" starts with /; globs are relative to the repository root`, `expires must be one of 0, 30, 60 and 90` |
 | `403` `forbidden` | the caller is the admin token (`this route needs a user`) |
 | `403` `insufficient_scope` | a PAT without `tokens:manage` (`this route needs the scope tokens:manage`) |
+| `403` `insufficient_scope` | a valid body beyond what the calling PAT holds; nothing is minted. The message names the first requested permission, in request order, the PAT does not hold (`permissions: this token does not hold "git:read"`); when it holds them all, the first requested glob none of its globs covers (`paths: "lib/**" is not covered by a glob of this token`), or, for a PAT with `paths` and a body without, `paths is required: this token is limited to paths, so the token it creates must be too` |
 
 ```json
 {"name":"ci","permissions":["git:write","changes:write"],"paths":["docs/**","src/*.go"],"expires":90}

@@ -854,7 +854,8 @@ can mint a token together with changes of its own. It validates the values
 (`Name` 1 to 255 characters, `Permissions` at least one registered scope,
 duplicates dropped and the order kept, `Paths` through `ValidatePaths`,
 `Expires` 0, 30, 60 or 90 with `nil` meaning 90), each failure a
-`400 invalid_request` that stores nothing, then stores the token with
+`400 invalid_request` that stores nothing, then applies the subset rule
+(`CheckSubset`, below), then stores the token with
 `StorePAT` for `caller.User`, created at `now`. `expires_at` is `Expires` ×
 24 hours after `now` truncated to whole seconds, or `nil` for 0, so the
 instant the API shows is the instant the token stops authenticating; a
@@ -865,6 +866,19 @@ workspace-token minting component's, which calls `MintPAT` with it.
 `user_id`, `name`, `permissions`, `paths`, `workspace`, `expires_at`,
 `revoked_at`, `created_at`, `null` for what is unset), which never holds
 the token's value; only the creation answer adds `token`.
+
+`internal/identity/subset.go` holds the subset rule, so that every way of
+creating or widening a token applies the same code.
+`identity.CheckSubset(caller, permissions, paths)` returns `nil` unless
+`caller.Type` is `TypePAT`; for a PAT it returns a `403
+insufficient_scope` `*server.Error` naming the first requested permission,
+in request order, that is not in `caller.Permissions` (exact membership, no
+implication), else, when `caller.Paths` is not `nil`, saying `paths` is
+required for a `nil` request or naming the first requested glob
+`FirstUncovered` reports. `identity.CheckPermissionSubset(caller,
+permissions)` is its permission half alone, for a request that changes a
+token's permissions and not its paths (it is passed only the scopes being
+added). Both expect validated values: validation answers first.
 
 `POST /user/tokens`, in `internal/identity/token_routes.go`, is a create
 route with `ShowOnce: []string{"token"}`, so a replay under the same

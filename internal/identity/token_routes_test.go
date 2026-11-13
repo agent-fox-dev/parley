@@ -145,6 +145,10 @@ func TestCreateToken_SetsExpiresAtFromTheLifetimeInDays(t *testing.T) {
 func TestCreateToken_RefusesAnInvalidBodyAndCreatesNothing(t *testing.T) {
 	t.Parallel()
 	h := newAliceHub(t)
+	// The PAT holds neither git:admin nor git:write: a body that is invalid
+	// is refused as invalid, before the rows that ask for more than it holds
+	// meet the subset rule.
+	pat, _ := h.seedPAT(identity.PATSpec{UserID: h.alice.ID, Permissions: []string{"tokens:manage", "git:read"}})
 	before := h.tokenCount(h.alice.ID)
 	for _, c := range []struct {
 		name string
@@ -159,7 +163,7 @@ func TestCreateToken_RefusesAnInvalidBodyAndCreatesNothing(t *testing.T) {
 		{"permissions a string", map[string]any{"permissions": "git:read"}},
 		{"an unregistered scope", map[string]any{"permissions": []string{"git:read", "git:admin"}}},
 		{"a scope in capitals", map[string]any{"permissions": []string{"GIT:READ"}}},
-		{"expires 45", map[string]any{"expires": 45}},
+		{"expires 45", map[string]any{"permissions": []string{"git:write"}, "expires": 45}},
 		{"expires -1", map[string]any{"expires": -1}},
 		{"expires a string", map[string]any{"expires": "30"}},
 		{"expires a fraction", map[string]any{"expires": 30.5}},
@@ -167,9 +171,11 @@ func TestCreateToken_RefusesAnInvalidBodyAndCreatesNothing(t *testing.T) {
 		{"51 globs", map[string]any{"paths": slices.Repeat([]string{"docs/**"}, 51)}},
 		{"an absolute glob", map[string]any{"paths": []string{"/src/**"}}},
 	} {
-		r := h.createToken("Bearer "+h.key, tokenBody(c.set))
-		if r.status != http.StatusBadRequest || r.errorField("error_type") != "invalid_request" {
-			t.Errorf("%s: answer = %d %s, want 400 invalid_request", c.name, r.status, r.body)
+		for caller, credential := range map[string]string{"API key": h.key, "PAT": pat} {
+			r := h.createToken("Bearer "+credential, tokenBody(c.set))
+			if r.status != http.StatusBadRequest || r.errorField("error_type") != "invalid_request" {
+				t.Errorf("%s, %s: answer = %d %s, want 400 invalid_request", caller, c.name, r.status, r.body)
+			}
 		}
 	}
 	if n := h.tokenCount(h.alice.ID); n != before {
@@ -211,5 +217,72 @@ func TestCreateToken_ReplaysTheFirstAnswerWithoutTheTokenValue(t *testing.T) {
 	}
 	if n := h.tokenCount(h.alice.ID); n != before+1 {
 		t.Errorf("alice has %d PATs, want %d", n, before+1)
+	}
+}
+
+func TestCreateToken_CreatesWithinWhatTheCallingPATHoldsAndCovers(t *testing.T) {
+	t.Parallel()
+	h := newAliceHub(t)
+	reader, _ := h.seedPAT(identity.PATSpec{UserID: h.alice.ID, Permissions: []string{"tokens:manage", "git:read"}})
+	writer, _ := h.seedPAT(identity.PATSpec{UserID: h.alice.ID, Permissions: []string{"tokens:manage", "git:write"}, Paths: []string{"src/**"}})
+	for _, c := range []struct {
+		name, caller string
+		set          map[string]any
+	}{
+		{"no paths held, none asked", reader, map[string]any{"permissions": []string{"git:read"}}},
+		{"tokens:manage passed on", reader, map[string]any{"permissions": []string{"git:read", "tokens:manage"}}},
+		{"no paths held, paths asked", reader, map[string]any{"paths": []string{"docs/**"}}},
+		{"a narrower glob", writer, map[string]any{"permissions": []string{"git:write"}, "paths": []string{"src/api/*.go"}}},
+		{"the same glob", writer, map[string]any{"permissions": []string{"git:write"}, "paths": []string{"src/**"}}},
+		{"an API key, every scope and **", h.key, map[string]any{"permissions": identity.RegisteredScopes(), "paths": []string{"**"}}},
+	} {
+		body := tokenBody(c.set)
+		r := h.createToken("Bearer "+c.caller, body)
+		if r.status != http.StatusCreated {
+			t.Errorf("%s: POST /user/tokens = %d %s, want 201", c.name, r.status, r.body)
+			continue
+		}
+		if want := asJSON(t, []any{body["permissions"], body["paths"]}); !reflect.DeepEqual([]any{r.json["permissions"], r.json["paths"]}, want) {
+			t.Errorf("%s: permissions, paths = %v, %v, want %v", c.name, r.json["permissions"], r.json["paths"], want)
+		}
+	}
+}
+
+func TestCreateToken_RefusesAPATBeyondItsOwnScopesAndPaths(t *testing.T) {
+	t.Parallel()
+	h := newAliceHub(t)
+	limited := identity.PATSpec{UserID: h.alice.ID, Permissions: []string{"tokens:manage", "git:write"}, Paths: []string{"src/**", "docs/*"}}
+	for _, c := range []struct {
+		name   string
+		caller identity.PATSpec
+		set    map[string]any
+		named  string
+	}{
+		{"write does not give read", identity.PATSpec{Permissions: []string{"tokens:manage", "git:write"}},
+			map[string]any{"permissions": []string{"git:read"}}, `"git:read"`},
+		{"the first in request order", identity.PATSpec{Permissions: []string{"tokens:manage", "git:read"}},
+			map[string]any{"permissions": []string{"git:read", "changes:write", "vars:read"}}, `"changes:write"`},
+		{"manage does not give write", identity.PATSpec{Permissions: []string{"tokens:manage"}},
+			map[string]any{"permissions": []string{"tokens:write"}}, `"tokens:write"`},
+		{"write does not give approve", identity.PATSpec{Permissions: []string{"tokens:manage", "changes:write"}},
+			map[string]any{"permissions": []string{"changes:approve"}}, `"changes:approve"`},
+		{"paths absent", limited, map[string]any{"permissions": []string{"git:write"}}, "paths is required"},
+		{"paths null", limited, map[string]any{"permissions": []string{"git:write"}, "paths": nil}, "paths is required"},
+		{"the first uncovered glob", limited, map[string]any{"permissions": []string{"git:write"}, "paths": []string{"src/a.go", "lib/**"}}, `"lib/**"`},
+		{"* does not cover **", limited, map[string]any{"permissions": []string{"git:write"}, "paths": []string{"docs/**"}}, `"docs/**"`},
+		{"everything", limited, map[string]any{"permissions": []string{"git:write"}, "paths": []string{"**"}}, `"**"`},
+		{"a permission before a glob", limited, map[string]any{"permissions": []string{"git:read"}, "paths": []string{"lib/**"}}, `"git:read"`},
+	} {
+		c.caller.UserID = h.alice.ID
+		caller, _ := h.seedPAT(c.caller)
+		before := h.tokenCount(h.alice.ID)
+		r := h.createToken("Bearer "+caller, tokenBody(c.set))
+		msg, _ := r.errorField("message").(string)
+		if r.status != http.StatusForbidden || r.errorField("error_type") != "insufficient_scope" || !strings.Contains(msg, c.named) {
+			t.Errorf("%s: answer = %d %s, want 403 insufficient_scope naming %s", c.name, r.status, r.body, c.named)
+		}
+		if n := h.tokenCount(h.alice.ID); n != before {
+			t.Errorf("%s: alice has %d PATs, want %d", c.name, n, before)
+		}
 	}
 }
