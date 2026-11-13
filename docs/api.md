@@ -740,6 +740,68 @@ it, a replay included.
 {"token_id":"k3x9m2pq","user_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","name":"ci","permissions":["git:write","changes:write"],"paths":["docs/**","src/*.go"],"workspace":null,"expires_at":"2026-04-01T00:00:00Z","revoked_at":null,"created_at":"2026-01-01T00:00:00Z","token":"parley_pat_k3x9m2pq_0123456789abcdefghijklmnopqrstuv"}
 ```
 
+## `GET /api/v1/user/tokens`
+
+Lists the caller's personal access tokens, a [list](#lists) in the standard
+pages. The route needs a user, as `GET /api/v1/user` does, and declares the
+scope `tokens:read` for a PAT, which `tokens:write` and `tokens:manage`
+satisfy.
+
+The list holds every PAT of the caller's user in any state: live, revoked
+and expired, and the tokens bound to a workspace too. It is ordered newest
+first: `created_at` descending, then `token_id` descending. Each item is a
+Token object (see [`POST /api/v1/user/tokens`](#post-apiv1usertokens)),
+without the token's value.
+
+| Status | When |
+|---|---|
+| `200 OK` | the body is a page: `items` are Token objects |
+| `400` `invalid_request` | a bad `limit` or `cursor` (see [Lists](#lists)) |
+| `403` `forbidden` | the caller is the admin token (`this route needs a user`) |
+| `403` `insufficient_scope` | a PAT without `tokens:read` or a scope that implies it (`this route needs the scope tokens:read`) |
+
+## `GET /api/v1/user/tokens/{token_id}`
+
+Answers one of the caller's PATs, in any state, as a Token object without
+the token's value. The route needs a user and declares the scope
+`tokens:read` for a PAT, checked before the token is looked up, so a
+refused PAT is answered alike for a token that exists and one that does
+not.
+
+A `token_id` that names no token and one that names another user's token
+get the same answer, `404` `not_found` with the message `token not found`,
+so the answer tells nothing of other users' tokens. Every route under
+`/api/v1/user/tokens/{token_id}` looks the token up this way.
+
+```json
+{"error":{"code":404,"message":"token not found","error_type":"not_found"}}
+```
+
+| Status | When |
+|---|---|
+| `200 OK` | the body is the Token object |
+| `403` `forbidden` | the caller is the admin token (`this route needs a user`) |
+| `403` `insufficient_scope` | a PAT without `tokens:read` or a scope that implies it (`this route needs the scope tokens:read`) |
+| `404` `not_found` | the caller's user has no token with this id (`token not found`) |
+
+## `DELETE /api/v1/user/tokens/{token_id}`
+
+Revokes one of the caller's PATs: its `revoked_at` is set to the time of
+the request and the record is kept, so the token stays in the list and no
+longer authenticates. An expired token is revoked too, and so is the token
+the request came with. The route needs a user and declares the scope
+`tokens:manage` for a PAT, checked before the token is looked up. A token
+that is already revoked is answered as it is, with its earlier
+`revoked_at`; nothing changes. A token not found is answered as for
+`GET /api/v1/user/tokens/{token_id}`.
+
+| Status | When |
+|---|---|
+| `200 OK` | the token is revoked; the body is the Token object with `revoked_at` set |
+| `403` `forbidden` | the caller is the admin token (`this route needs a user`) |
+| `403` `insufficient_scope` | a PAT without `tokens:manage` (`this route needs the scope tokens:manage`) |
+| `404` `not_found` | the caller's user has no token with this id (`token not found`) |
+
 ## Admin routes
 
 The user and org administration routes are admin routes. Their caller must

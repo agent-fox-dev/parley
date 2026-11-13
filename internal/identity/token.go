@@ -163,3 +163,110 @@ func tokenExpiry(days *int, now time.Time) (*time.Time, error) {
 	at := now.Truncate(time.Second).Add(time.Duration(d) * 24 * time.Hour)
 	return &at, nil
 }
+
+// errTokenNotFound is the answer for a token_id the caller's user does not
+// own, whether it exists or not.
+func errTokenNotFound() error { return server.NotFound("token not found") }
+
+// tokenOfUser returns the PAT tokenID when the user userID owns it. A token
+// that does not exist and one of another user are both errTokenNotFound,
+// so that the answer tells nothing of other users' tokens.
+func tokenOfUser(ctx context.Context, q Querier, userID, tokenID string) (PAT, error) {
+	p, err := PATByID(ctx, q, tokenID)
+	if errors.Is(err, ErrNotFound) || err == nil && p.UserID != userID {
+		return PAT{}, errTokenNotFound()
+	}
+	return p, err
+}
+
+// tokenPosition is the position of a token in a list of tokens: newest
+// first, created_at descending, then token_id descending, so that tokens
+// created at the same instant keep one order across pages.
+type tokenPosition struct {
+	CreatedAt int64  `json:"c"`
+	ID        string `json:"id"`
+}
+
+// position returns the position of p in a list of tokens.
+func (p PAT) position() any { return tokenPosition{CreatedAt: p.CreatedAt.UnixNano(), ID: p.TokenID} }
+
+// listTokens returns up to limit PATs of the user userID in any state, bound
+// ones included, in the order of a list of tokens, after the position after
+// when it is not nil.
+func listTokens(ctx context.Context, q RowsQuerier, userID string, after *tokenPosition, limit int) ([]PAT, error) {
+	query := `SELECT ` + patColumns + ` FROM pats WHERE user_id = ?`
+	args := []any{userID}
+	if after != nil {
+		query += ` AND (created_at < ? OR created_at = ? AND token_id < ?)`
+		args = append(args, after.CreatedAt, after.CreatedAt, after.ID)
+	}
+	query += ` ORDER BY created_at DESC, token_id DESC LIMIT ?`
+	rows, err := q.QueryContext(ctx, query, append(args, limit)...)
+	if err != nil {
+		return nil, fmt.Errorf("list the PATs: %w", err)
+	}
+	defer rows.Close()
+	var pats []PAT
+	for rows.Next() {
+		p, err := scanPAT(rows)
+		if err != nil {
+			return nil, fmt.Errorf("list the PATs: %w", err)
+		}
+		pats = append(pats, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list the PATs: %w", err)
+	}
+	return pats, nil
+}
+
+// revokeTokenOfUser revokes the PAT tokenID of the user userID in tx, as
+// RevokeTokenByID does, and returns its record as stored then; a token the
+// user does not own is errTokenNotFound.
+func revokeTokenOfUser(ctx context.Context, tx *sql.Tx, userID, tokenID string, now time.Time) (PAT, error) {
+	if _, err := tokenOfUser(ctx, tx, userID, tokenID); err != nil {
+		return PAT{}, err
+	}
+	if err := RevokeTokenByID(ctx, tx, tokenID, now); err != nil {
+		return PAT{}, err
+	}
+	return PATByID(ctx, tx, tokenID)
+}
+
+// RevokeTokenByID sets the revoked_at of the PAT tokenID to now in tx, which
+// it does not commit, so that a hub-internal caller revokes a token with
+// other changes of its own. A token already revoked keeps its revoked_at,
+// and an expired one is revoked as a live one is. It checks no owner and
+// writes no event; a token that does not exist is ErrNotFound.
+func RevokeTokenByID(ctx context.Context, tx *sql.Tx, tokenID string, now time.Time) error {
+	res, err := tx.ExecContext(ctx, `UPDATE pats SET revoked_at = ? WHERE token_id = ? AND revoked_at IS NULL`,
+		now.UTC().UnixNano(), tokenID)
+	if err != nil {
+		return fmt.Errorf("revoke PAT %s: %w", tokenID, err)
+	}
+	if n, err := res.RowsAffected(); err != nil || n > 0 {
+		return err
+	}
+	found, err := exists(ctx, tx, `SELECT count(*) FROM pats WHERE token_id = ?`, tokenID)
+	if err == nil && !found {
+		err = ErrNotFound
+	}
+	return err
+}
+
+// SetTokenExpiryByID sets the expires_at of the PAT tokenID to at, kept to
+// whole seconds, in tx, which it does not commit, and changes nothing else
+// of the token, revoked_at included. It checks no owner and writes no
+// event; a token that does not exist is ErrNotFound.
+func SetTokenExpiryByID(ctx context.Context, tx *sql.Tx, tokenID string, at time.Time) error {
+	res, err := tx.ExecContext(ctx, `UPDATE pats SET expires_at = ? WHERE token_id = ?`,
+		at.Truncate(time.Second).UTC().UnixNano(), tokenID)
+	if err != nil {
+		return fmt.Errorf("set the expiry of PAT %s: %w", tokenID, err)
+	}
+	n, err := res.RowsAffected()
+	if err == nil && n == 0 {
+		err = ErrNotFound
+	}
+	return err
+}

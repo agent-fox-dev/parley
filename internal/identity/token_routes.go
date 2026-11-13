@@ -16,7 +16,91 @@ func (s *Service) tokenRoutes() []server.Route {
 		// value is shown once even when the request is sent again.
 		{Method: http.MethodPost, Pattern: "/user/tokens", Create: true, ShowOnce: []string{"token"},
 			Scope: "tokens:manage", Marks: needsUserMark, Handler: s.createToken},
+		{Method: http.MethodGet, Pattern: "/user/tokens", Scope: "tokens:read", Marks: needsUserMark, Handler: s.listOwnTokens},
+		{Method: http.MethodGet, Pattern: "/user/tokens/:token_id", Scope: "tokens:read", Marks: needsUserMark,
+			Handler: s.getOwnToken},
+		{Method: http.MethodDelete, Pattern: "/user/tokens/:token_id", Scope: "tokens:manage", Marks: needsUserMark,
+			Handler: s.revokeOwnToken},
 	}
+}
+
+// listOwnTokens answers GET /user/tokens: a page of the caller's tokens.
+func (s *Service) listOwnTokens(w http.ResponseWriter, r *http.Request) error {
+	caller, err := callerUser(r)
+	if err != nil {
+		return err
+	}
+	return s.writeTokens(w, r, caller.ID)
+}
+
+// writeTokens answers a page of the PATs of the user userID in any state,
+// bound ones included, newest first: created_at descending, then token_id
+// descending.
+func (s *Service) writeTokens(w http.ResponseWriter, r *http.Request, userID string) error {
+	page, err := server.ReadPage(r)
+	if err != nil {
+		return err
+	}
+	after, err := pageAfter[tokenPosition](page)
+	if err != nil {
+		return err
+	}
+	pats, err := listTokens(r.Context(), s.deps.Store.Main(), userID, after, page.Limit+1)
+	if err != nil {
+		return err
+	}
+	return server.WritePage(w, page, pats, PAT.position)
+}
+
+// ownToken returns the caller's token the path's token_id names, or
+// errTokenNotFound when the caller's user does not own it.
+// It reads through q, so that a route that changes the token looks it up
+// in its own transaction.
+func ownToken(r *http.Request, q Querier) (PAT, error) {
+	caller, err := callerUser(r)
+	if err != nil {
+		return PAT{}, err
+	}
+	return tokenOfUser(r.Context(), q, caller.ID, server.Param(r, "token_id"))
+}
+
+// getOwnToken answers GET /user/tokens/:token_id with the caller's token,
+// in any state.
+func (s *Service) getOwnToken(w http.ResponseWriter, r *http.Request) error {
+	p, err := ownToken(r, s.deps.Store.Main())
+	if err != nil {
+		return err
+	}
+	server.WriteJSON(w, http.StatusOK, p)
+	return nil
+}
+
+// revokeOwnToken answers DELETE /user/tokens/:token_id: it revokes the
+// caller's token now, also an expired one and the one the request came
+// with, and answers 200 with the token; a revoked token is answered as it
+// is.
+func (s *Service) revokeOwnToken(w http.ResponseWriter, r *http.Request) error {
+	caller, err := callerUser(r)
+	if err != nil {
+		return err
+	}
+	return s.revokeToken(w, r, caller.ID)
+}
+
+// revokeToken revokes the PAT of the user userID the path's token_id names
+// and answers 200 with it.
+func (s *Service) revokeToken(w http.ResponseWriter, r *http.Request, userID string) error {
+	var p PAT
+	err := s.deps.Store.Tx(r.Context(), func(tx *sql.Tx) error {
+		var err error
+		p, err = revokeTokenOfUser(r.Context(), tx, userID, server.Param(r, "token_id"), s.deps.Now())
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	server.WriteJSON(w, http.StatusOK, p)
+	return nil
 }
 
 // createToken answers POST /user/tokens: it mints a PAT for the caller's

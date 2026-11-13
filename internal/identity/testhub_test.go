@@ -508,7 +508,7 @@ func checkRefusal(t *testing.T, what string, r response, status int, errorType, 
 
 // everyScope is every scope a route of the identity service declares, so
 // that a PAT holding them passes the scope check of every identity route.
-var everyScope = []string{"users:read", "users:write", "orgs:read", "tokens:manage"}
+var everyScope = []string{"users:read", "users:write", "orgs:read", "tokens:read", "tokens:manage"}
 
 // omitted marks a member that tokenBody leaves out.
 type omitted struct{}
@@ -540,6 +540,16 @@ func (h *testHub) createToken(authorization string, body any) response {
 func (h *testHub) tokenCount(userID string) int {
 	h.t.Helper()
 	return h.count(`SELECT count(*) FROM pats WHERE user_id = ?`, userID)
+}
+
+// storedPAT reads the record of the PAT tokenID from the hub's store.
+func (h *testHub) storedPAT(tokenID string) identity.PAT {
+	h.t.Helper()
+	rec, err := identity.PATByID(context.Background(), h.st.Main(), tokenID)
+	if err != nil {
+		h.t.Fatalf("read PAT %s: %v", tokenID, err)
+	}
+	return rec
 }
 
 // teamHub is a bootstrapped test hub with two users, each created with a

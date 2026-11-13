@@ -1,7 +1,7 @@
 package identity_test
 
 import (
-	"context"
+	"bytes"
 	"encoding/json"
 	"maps"
 	"net/http"
@@ -95,12 +95,8 @@ func TestCreateToken_KeepsTheNameAndThePathsAsGiven(t *testing.T) {
 				t.Errorf("name, paths = %v, %v, want %v, %v", r.json["name"], r.json["paths"], body["name"], want)
 			}
 			id, _ := r.json["token_id"].(string)
-			stored, err := identity.PATByID(context.Background(), h.st.Main(), id)
-			if err != nil {
-				t.Fatalf("read the new PAT: %v", err)
-			}
-			if got, want := asJSON(t, stored), any(withoutMembers(r.json, "token")); !reflect.DeepEqual(got, want) {
-				t.Errorf("Token object of the stored PAT = %v, want the created one %v", got, want)
+			if got, want := h.get(tokenPath(id), "Bearer "+h.key).json, withoutMembers(r.json, "token"); !reflect.DeepEqual(got, want) {
+				t.Errorf("GET /user/tokens/%s = %v, want the created token %v", id, got, want)
 			}
 		})
 	}
@@ -283,6 +279,180 @@ func TestCreateToken_RefusesAPATBeyondItsOwnScopesAndPaths(t *testing.T) {
 		}
 		if n := h.tokenCount(h.alice.ID); n != before {
 			t.Errorf("%s: alice has %d PATs, want %d", c.name, n, before)
+		}
+	}
+}
+
+// tokenPath is the path of the caller's token tokenID.
+func tokenPath(tokenID string) string { return "/api/v1/user/tokens/" + tokenID }
+
+func TestListTokens_AnswersEveryTokenOfTheCallerNewestFirst(t *testing.T) {
+	t.Parallel()
+	h := newAliceHub(t)
+	now := h.now()
+	_, revoked := h.seedPAT(identity.PATSpec{UserID: h.alice.ID, Permissions: []string{"git:read"}, CreatedAt: now.Add(-3 * time.Hour)})
+	h.revoke(revoked.TokenID)
+	// The bound and the expired token were created at the same instant, so
+	// the id decides their order.
+	past := now.Add(-time.Minute)
+	_, expired := h.seedPAT(identity.PATSpec{UserID: h.alice.ID, Permissions: []string{"git:read"}, ExpiresAt: &past, CreatedAt: now.Add(-time.Hour)})
+	_, bound := h.seedPAT(identity.PATSpec{UserID: h.alice.ID, Permissions: []string{"git:read"}, Workspace: "my-ws", CreatedAt: now.Add(-time.Hour)})
+	h.seedPAT(identity.PATSpec{UserID: h.seedUser("bob").ID, Permissions: []string{"git:read"}})
+	later, earlier := bound.TokenID, expired.TokenID
+	if later < earlier {
+		later, earlier = earlier, later
+	}
+	want := []string{h.patRec.TokenID, later, earlier, revoked.TokenID}
+
+	r := h.get("/api/v1/user/tokens", "Bearer "+h.key)
+	if got := itemValues(t, r, "token_id"); r.status != http.StatusOK || !slices.Equal(got, want) {
+		t.Fatalf("GET /user/tokens = %d, token ids %v, want 200 with %v", r.status, got, want)
+	}
+	for _, item := range r.json["items"].([]any) {
+		id, _ := item.(map[string]any)["token_id"].(string)
+		if stored := asJSON(t, h.storedPAT(id)); !reflect.DeepEqual(item, stored) {
+			t.Errorf("item %v, want the stored token %v", item, stored)
+		}
+		if ws := item.(map[string]any)["workspace"]; (id == bound.TokenID) != (ws == "my-ws") {
+			t.Errorf("token %s has the workspace %v", id, ws)
+		}
+	}
+	if got, requests := h.walkBy("/api/v1/user/tokens", "Bearer "+h.key, 2, "token_id"); !slices.Equal(got, want) || requests != 2 {
+		t.Errorf("pages of 2 = %v in %d requests, want %v in 2", got, requests, want)
+	}
+	for _, scope := range []string{"tokens:read", "tokens:write", "tokens:manage"} {
+		pat, _ := h.seedPAT(identity.PATSpec{UserID: h.alice.ID, Permissions: []string{scope}})
+		if r := h.get("/api/v1/user/tokens", "Bearer "+pat); r.status != http.StatusOK {
+			t.Errorf("a PAT with %s: GET /user/tokens = %d %s, want 200", scope, r.status, r.body)
+		}
+	}
+}
+
+func TestShowToken_AnswersTheCallersTokenInAnyState(t *testing.T) {
+	t.Parallel()
+	h := newAliceHub(t)
+	_, revoked := h.seedPAT(identity.PATSpec{UserID: h.alice.ID, Permissions: []string{"git:write"}})
+	h.revoke(revoked.TokenID)
+	past := h.now().Add(-time.Minute)
+	_, expired := h.seedPAT(identity.PATSpec{UserID: h.alice.ID, Permissions: []string{"git:read"}, ExpiresAt: &past})
+	for state, id := range map[string]string{"live": h.patRec.TokenID, "revoked": revoked.TokenID, "expired": expired.TokenID} {
+		r := h.get(tokenPath(id), "Bearer "+h.key)
+		if want := asJSON(t, h.storedPAT(id)); r.status != http.StatusOK || !reflect.DeepEqual(any(r.json), want) {
+			t.Errorf("%s: GET /user/tokens/%s = %d %s, want 200 with %v", state, id, r.status, r.body, want)
+		}
+	}
+}
+
+func TestRevokeToken_SetsRevokedAtAndTheTokenStopsAuthenticating(t *testing.T) {
+	t.Parallel()
+	h := newAliceHub(t)
+	t1, live := h.seedPAT(identity.PATSpec{UserID: h.alice.ID, Permissions: []string{"git:write"}})
+	past := h.now().Add(-time.Minute)
+	_, expired := h.seedPAT(identity.PATSpec{UserID: h.alice.ID, Permissions: []string{"git:read"}, ExpiresAt: &past})
+	t3, manager := h.seedPAT(identity.PATSpec{UserID: h.alice.ID, Permissions: []string{"tokens:manage"}})
+	h.advance(time.Hour)
+	before := h.tokenCount(h.alice.ID)
+	for _, c := range []struct {
+		name, caller string
+		target       identity.PAT
+		value        string // "" when the token no longer authenticates anyway
+	}{
+		{"an API key, a live token", h.key, live, t1},
+		{"an API key, an expired token", h.key, expired, ""},
+		{"a PAT holding tokens:manage, itself", t3, manager, t3},
+	} {
+		r := h.call(http.MethodDelete, tokenPath(c.target.TokenID), "Bearer "+c.caller, nil)
+		want := asJSON(t, c.target).(map[string]any)
+		want["revoked_at"] = h.now().Format(time.RFC3339)
+		if r.status != http.StatusOK || !reflect.DeepEqual(r.json, want) {
+			t.Errorf("%s: DELETE = %d %s, want 200 with %v", c.name, r.status, r.body, want)
+		}
+		if c.value != "" {
+			if got := h.get("/api/v1/test/whoami", "Bearer "+c.value).status; got != http.StatusUnauthorized {
+				t.Errorf("%s: whoami with the revoked token = %d, want 401", c.name, got)
+			}
+		}
+	}
+	if n := h.tokenCount(h.alice.ID); n != before {
+		t.Errorf("alice has %d PATs after the revocations, want %d kept", n, before)
+	}
+}
+
+func TestRevokeToken_AnswersARevokedTokenUnchanged(t *testing.T) {
+	t.Parallel()
+	h := newAliceHub(t)
+	revokedAt := h.now().Format(time.RFC3339)
+	first := h.call(http.MethodDelete, tokenPath(h.patRec.TokenID), "Bearer "+h.key, nil)
+	h.advance(time.Hour)
+	second := h.call(http.MethodDelete, tokenPath(h.patRec.TokenID), "Bearer "+h.key, nil)
+	if second.status != http.StatusOK || second.json["revoked_at"] != revokedAt || !reflect.DeepEqual(second.json, first.json) {
+		t.Errorf("DELETE twice = %d %s, then %d %s, want 200 and the token revoked at %s", first.status, first.body, second.status, second.body, revokedAt)
+	}
+}
+
+func TestOwnTokenRoutes_AnswerAMissingAndAnotherUsersTokenAlike(t *testing.T) {
+	t.Parallel()
+	h := newAliceHub(t)
+	_, bobs := h.seedPAT(identity.PATSpec{UserID: h.seedUser("bob").ID, Permissions: []string{"git:write"}})
+	for _, method := range []string{http.MethodGet, http.MethodDelete} {
+		before := h.snapshot()
+		missing := h.call(method, tokenPath("zzzzzzzz"), "Bearer "+h.key, nil)
+		foreign := h.call(method, tokenPath(bobs.TokenID), "Bearer "+h.key, nil)
+		checkRefusal(t, method+" a missing token", missing, http.StatusNotFound, "not_found", "token not found")
+		if !bytes.Equal(foreign.body, missing.body) || foreign.status != missing.status {
+			t.Errorf("%s bob's token = %d %s, want the answer for a missing one %d %s", method, foreign.status, foreign.body, missing.status, missing.body)
+		}
+		if h.snapshot() != before {
+			t.Errorf("%s: the store changed", method)
+		}
+	}
+}
+
+func TestOwnTokenRoutes_RefuseAPATWithoutTheScopeBeforeTheLookup(t *testing.T) {
+	t.Parallel()
+	h := newAliceHub(t)
+	for _, c := range []struct {
+		method, path, held, needed string
+	}{
+		{http.MethodGet, "/api/v1/user/tokens", "git:read", "tokens:read"},
+		{http.MethodGet, tokenPath("%s"), "keys:manage", "tokens:read"},
+		{http.MethodDelete, tokenPath("%s"), "tokens:write", "tokens:manage"},
+		{http.MethodDelete, tokenPath("%s"), "tokens:read", "tokens:manage"},
+	} {
+		caller, _ := h.seedPAT(identity.PATSpec{UserID: h.alice.ID, Permissions: []string{c.held}})
+		for _, id := range []string{h.patRec.TokenID, "zzzzzzzz"} {
+			path := strings.Replace(c.path, "%s", id, 1)
+			before := h.snapshot()
+			r := h.call(c.method, path, "Bearer "+caller, nil)
+			checkRefusal(t, c.held+" "+c.method+" "+path, r, http.StatusForbidden, "insufficient_scope", "this route needs the scope "+c.needed)
+			if h.snapshot() != before {
+				t.Errorf("%s %s with %s: the store changed", c.method, path, c.held)
+			}
+		}
+	}
+}
+
+func TestTokenAnswers_CarryTheValueOnlyWhenTheTokenIsCreated(t *testing.T) {
+	t.Parallel()
+	h := newAliceHub(t)
+	created := h.createToken("Bearer "+h.key, tokenBody(nil))
+	token, _ := created.json["token"].(string)
+	id, _ := created.json["token_id"].(string)
+	secret := strings.TrimPrefix(token, "parley_pat_"+id+"_")
+	for _, rq := range []struct{ method, path string }{
+		{http.MethodGet, "/api/v1/user/tokens"},
+		{http.MethodGet, tokenPath(id)},
+		{http.MethodDelete, tokenPath(id)},
+	} {
+		r := h.call(rq.method, rq.path, "Bearer "+h.key, nil)
+		objects := []any{any(r.json)}
+		if items, ok := r.json["items"].([]any); ok {
+			objects = items
+		}
+		for _, o := range objects {
+			if _, has := o.(map[string]any)["token"]; has || r.status != http.StatusOK || strings.Contains(string(r.body), secret) {
+				t.Errorf("%s %s = %d %s, want 200 without the token or its secret", rq.method, rq.path, r.status, r.body)
+			}
 		}
 	}
 }

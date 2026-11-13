@@ -307,23 +307,33 @@ FROM api_keys WHERE key_id = ?`, keyID).Scan(&k.KeyID, &k.UserID, &k.hash, &k.Ex
 // PATByID returns the record of the PAT with the id tokenID, or
 // ErrNotFound.
 func PATByID(ctx context.Context, q Querier, tokenID string) (PAT, error) {
+	p, err := scanPAT(q.QueryRowContext(ctx, `SELECT `+patColumns+` FROM pats WHERE token_id = ?`, tokenID))
+	if err != nil {
+		return PAT{}, lookupErr("PAT", err)
+	}
+	return p, nil
+}
+
+// patColumns are the columns of the pats table that scanPAT reads, in its
+// order.
+const patColumns = `token_id, user_id, secret_hash, name, permissions, paths, workspace, expires_at, revoked_at, created_at`
+
+// scanPAT reads a PAT from a row of patColumns.
+func scanPAT(row interface{ Scan(dest ...any) error }) (PAT, error) {
 	var p PAT
 	var perms string
 	var paths, workspace sql.NullString
 	var expires, revoked sql.NullInt64
 	var created int64
-	err := q.QueryRowContext(ctx, `SELECT token_id, user_id, secret_hash, name, permissions, paths, workspace, expires_at, revoked_at, created_at
-FROM pats WHERE token_id = ?`, tokenID).Scan(&p.TokenID, &p.UserID, &p.hash, &p.Name, &perms, &paths, &workspace,
-		&expires, &revoked, &created)
-	if err != nil {
-		return PAT{}, lookupErr("PAT", err)
+	if err := row.Scan(&p.TokenID, &p.UserID, &p.hash, &p.Name, &perms, &paths, &workspace, &expires, &revoked, &created); err != nil {
+		return PAT{}, err
 	}
 	if err := json.Unmarshal([]byte(perms), &p.Permissions); err != nil {
-		return PAT{}, fmt.Errorf("decode the permissions of PAT %s: %w", tokenID, err)
+		return PAT{}, fmt.Errorf("decode the permissions of PAT %s: %w", p.TokenID, err)
 	}
 	if paths.Valid {
 		if err := json.Unmarshal([]byte(paths.String), &p.Paths); err != nil {
-			return PAT{}, fmt.Errorf("decode the paths of PAT %s: %w", tokenID, err)
+			return PAT{}, fmt.Errorf("decode the paths of PAT %s: %w", p.TokenID, err)
 		}
 	}
 	p.Workspace = workspace.String

@@ -270,13 +270,19 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, a.ID, a.Username, a.Email, a.FullName, a
 // itemIDs returns the ids of the items of a list answer.
 func itemIDs(t *testing.T, r response) []string {
 	t.Helper()
+	return itemValues(t, r, "id")
+}
+
+// itemValues returns the string member of each item of a list answer.
+func itemValues(t *testing.T, r response, member string) []string {
+	t.Helper()
 	items, ok := r.json["items"].([]any)
 	if !ok {
 		t.Fatalf("answer = %d %s, want a list", r.status, r.body)
 	}
 	ids := make([]string, 0, len(items))
 	for _, it := range items {
-		id, _ := it.(map[string]any)["id"].(string)
+		id, _ := it.(map[string]any)[member].(string)
 		ids = append(ids, id)
 	}
 	return ids
@@ -286,6 +292,12 @@ func itemIDs(t *testing.T, r response) []string {
 // next_cursor until it is null, and returns the ids of every item in order
 // and how many requests it took.
 func (h *testHub) walk(path, authorization string, limit int) (ids []string, requests int) {
+	h.t.Helper()
+	return h.walkBy(path, authorization, limit, "id")
+}
+
+// walkBy is walk for a list whose items are named by member.
+func (h *testHub) walkBy(path, authorization string, limit int, member string) (ids []string, requests int) {
 	h.t.Helper()
 	sep := "?"
 	if strings.Contains(path, "?") {
@@ -302,7 +314,7 @@ func (h *testHub) walk(path, authorization string, limit int) (ids []string, req
 		if r.status != http.StatusOK {
 			h.t.Fatalf("GET %s = %d %s, want 200", page, r.status, r.body)
 		}
-		ids = append(ids, itemIDs(h.t, r)...)
+		ids = append(ids, itemValues(h.t, r, member)...)
 		next, ok := r.json["next_cursor"].(string)
 		if !ok {
 			return ids, requests

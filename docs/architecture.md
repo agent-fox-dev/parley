@@ -890,6 +890,26 @@ into a `map[string]json.RawMessage` and checks only each member's JSON type
 `null`, `expires` an integer), leaving the values to `MintPAT`, and runs
 `MintPAT` in one `(*store.Store).Tx` with `Deps.Now()`.
 
+`token.go` also holds the reads and revocations of PATs.
+`identity.RevokeTokenByID(ctx, tx, tokenID, now)` sets `revoked_at` to
+`now` when it is `NULL`, so a revoked token keeps its first `revoked_at`,
+and `identity.SetTokenExpiryByID(ctx, tx, tokenID, at)` sets `expires_at`
+to `at` kept to whole seconds and nothing else. Both write through the
+transaction they are given without committing, check no owner, write no
+event and return `ErrNotFound` for an unknown id: they are for hub-internal
+callers (the hub credential of a sandbox), which change a token together
+with changes of their own. The routes look a token up with `tokenOfUser`,
+which answers a missing token and another user's alike, `404` `token not
+found`, and list a user's tokens with `listTokens`, newest first
+(`created_at`, then `token_id`, both descending) with keyset paging on
+those two; the admin routes call the same functions with the selected
+user's id. `GET /user/tokens` and `GET /user/tokens/:token_id` declare
+`tokens:read`, `DELETE /user/tokens/:token_id` declares `tokens:manage`
+and revokes through `RevokeTokenByID` after the owner lookup, in one
+transaction; every `/user/tokens` route carries `identity.MarkNeedsUser`,
+so the admin token is refused by authentication and no handler refuses it
+again.
+
 `POST /users` (`createUser`) decodes the body into a
 `map[string]json.RawMessage`, so that a missing member, `null` and a value
 of another type are told apart: `username`, `email`, `provider` and
