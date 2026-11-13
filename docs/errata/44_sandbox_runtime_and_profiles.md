@@ -39,3 +39,48 @@ what a relative path is relative to. They are resolved against the config
 dir, the directory `config.toml` was looked for in, and `Settings` and
 `Profile.PolicyPath` hold them as absolute paths. The configuration
 reference says so.
+
+## The metrics recorder is declared in the runtime package
+
+The package declares the recorder the sandbox packages report to in
+`internal/sandbox`. The runtime client reports `parley_sandbox_runtime_up`
+to it, but `internal/sandbox/runtime` cannot import `internal/sandbox`,
+which imports it. The recorder is therefore declared as
+`runtime.Recorder` (`Add`, `Set` and `Observe`, each with a metric name, a
+label map and a value, each returning an error), with `runtime.NopRecorder`
+that records nothing, so that `internal/sandbox` can give out the same
+interface under its own name.
+
+## The runtime client's shape
+
+The package lists the operations and the data they exchange, not their
+signatures. Where it leaves a choice, the interface in
+`internal/sandbox/runtime/runtime.go` makes these:
+
+- A sandbox is named by its name within the workspace, which is how the
+  OpenShell SDK addresses one; there is no separate sandbox id.
+  `ApproveProposal` and `RejectProposal` take the sandbox's name with the
+  proposal's id, because the runtime keeps proposals per sandbox.
+- A rule is a name and a JSON object (`runtime.Rule`); the base document is
+  bytes.
+- The streams end with `io.EOF` when the caller's context ends, which is no
+  failure, and with an error of kind unavailable when they break.
+- An error keeps text only (`runtime.Error`, kind, operation and reason),
+  not the error it was made from, so that what was scrubbed from the text
+  cannot be reached through `errors.Unwrap`. An error of none of the four
+  kinds counts as unavailable (`runtime.KindOf`).
+- The reachability flag starts set, and the recorder hears of it at its
+  first change. The hub serves only after its start-up check succeeded
+  through the client, so a set flag is true at that point.
+
+## The contract's error-kind rows that need a gateway
+
+The package's check of the error kinds includes a sandbox image the backend
+refuses, a gateway that answers unauthenticated and one that answers with a
+server error. The in-memory fake has no images to refuse and no
+authentication, so the contract (`runtimetest.RunContract`) leaves those
+three rows out. Instead, it checks a policy value the backend rejects, in
+`ValidatePolicy` and in `CreateSandbox`, with the rejection's reason kept
+in the text, and that every operation of an unreachable backend fails as
+unavailable. How the OpenShell implementation maps the gateway's answers
+to the kinds is tested with that implementation.

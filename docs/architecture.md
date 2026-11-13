@@ -20,6 +20,8 @@ command-line client. Both are written in Go, in the module
 | `internal/hubtest` | test support, imported by test code only: `Start` bootstraps a hub with an admin token and serves it in-process on a free loopback port, `Serve` runs a hub with given options until the test ends, and `LogBuffer` holds a running hub's log for the test to read |
 | `internal/identity` | who may use the hub: the admin settings in the transactional store (the bootstrap e-mail and the admin token's hash), the generation and hashing of admin tokens, and `VerifyAdminToken`, which compares a presented token's hash with the stored one in constant time; the identity records (users, orgs, memberships, API keys, PATs), the generation of API keys and PATs, and `Service`, the pipeline's authenticator |
 | `internal/sandbox` | the hub's side of the sandbox feature: `Register` makes it the owner of the whole `[sandbox]` section of the configuration, and `FromConfig` checks that section after the load, with the config dir and `[server].external_url` in view, and returns its `Settings` with every default filled in, or one error listing every failure; the `Settings` give the profiles and the configured credentials by name (`Profile`, `DefaultProfile`, `Credential`) and in name order (`Profiles`, `Credentials`), as copies, so that they do not change after the load |
+| `internal/sandbox/runtime` | the hub's one boundary to the sandbox runtime: the `Client` interface with every operation the sandbox packages call, the plain data it exchanges, the four error kinds (`ErrNotFound`, `ErrInvalid`, `ErrUnsupported`, `ErrUnavailable`), the reachability flag (`Reachability`) and the metrics recorder (`Recorder`, `NopRecorder`) it reports to; it imports nothing of the project |
+| `internal/sandbox/runtime/runtimetest` | test support, imported by test code only: `Fake`, the in-memory runtime and the only test double of the runtime, with its test controls, and `RunContract`, the contract tests every implementation of the runtime client passes |
 | `internal/scrub` | the one scrubbing function for text that leaves the hub: `Scrubber.Scrub` replaces registered secret values and the hub's own credential formats by `[redacted]`, removes user information from URLs and cuts the text to 1024 bytes; a leaf package that imports nothing of the project |
 | `internal/store` | the hub's two embedded SQLite stores (`modernc.org/sqlite`, no cgo): `Open` creates the data directory and the workspace root, opens the transactional store and the analytical store (`analytics.db` beside it) and applies the registered schema steps; `Tx` runs a transaction of the transactional store; `Snapshot` writes a consistent copy of one store file without changing it |
 | `internal/server` | the hub's HTTP server: its built-in routes, the REST API's route registration and check pipeline, the error envelope, request ids, response headers and the access log, list paging, idempotency keys, and the readiness probes |
@@ -1375,6 +1377,79 @@ every probe with the request's context, including those after one has failed,
 and answers `503` with `{"status":"not ready"}` if any failed. With no probe
 registered the hub is ready. A probe's error text never goes into the
 response.
+
+## The sandbox runtime client
+
+All of the hub's traffic to the sandbox runtime goes through
+`runtime.Client` (`internal/sandbox/runtime`). A client acts in one OpenShell
+workspace, the one it was built for, and in no other. Its operations, each
+taking a context, are grouped as follows; their names in snake case
+(`runtime.OpRelease` = `release`, `runtime.OpGetSandbox` = `get_sandbox`, …)
+are the operation names errors and the fake's call list carry:
+
+| Group | Operations |
+|---|---|
+| Gateway | `Release`, `EnsureWorkspace`, `Reachable` (the flag; no call) |
+| Provider profiles | `GetProviderProfile`, `InstallProviderProfile` (create or replace) |
+| Providers | `EnsureProvider` (create or replace), `DeleteProvider`, `AttachProvider`, `DetachProvider`, `SandboxProviders`, `ListProviders` (without values) |
+| Policy | `ValidatePolicy`, `GetPolicy`, `AddPolicyRule`, `ListProposals`, `ApproveProposal`, `RejectProposal` |
+| Sandboxes | `CreateSandbox`, `GetSandbox`, `ListSandboxes`, `DeleteSandbox`, `StopSandbox`, `StartSandbox`, `WaitReady`, `WatchSandboxes`, `RunMain` |
+| Exec | `Exec`, `ExecStream`, `ExecInteractive` |
+| Files | `Upload`, `MakeDir`, `Stat`, `Download`, `Walk` |
+| Logs | `Logs` |
+
+A sandbox is named by its name within the workspace. A policy value
+(`runtime.Policy`) has three parts: the base document, the protected rules
+and the added rules; a rule (`runtime.Rule`) is a name and a JSON object in
+OpenShell's schema that the hub does not interpret. The streams
+(`SandboxWatch`, `ExecStream`, `Terminal`, `LogStream`) end with `io.EOF`
+when the caller's context ends, and with an error of kind `ErrUnavailable`
+when they break.
+
+A failure is a `*runtime.Error` of exactly one kind, which callers test with
+`errors.Is`: `ErrNotFound`, `ErrInvalid` (the runtime's reason is kept in
+the text), `ErrUnsupported` (the runtime has no such operation; it is never
+imitated with other calls) or `ErrUnavailable` (everything else). Its text
+reads `sandbox runtime: <op>: <kind>: <reason>`. It keeps text only, not the
+error it was made from, so that nothing an implementation scrubbed can be
+reached through `errors.Unwrap`. `runtime.KindOf` gives an error's kind, and
+takes an error of none of them for `ErrUnavailable`.
+
+Every implementation keeps its reachability flag in a `runtime.Reachability`:
+a result of kind `ErrUnavailable` clears it, every other result sets it, and
+each change is reported once, in order, to the `runtime.Recorder` as
+`parley_sandbox_runtime_up` (`runtime.MetricUp`) `1` or `0`. The flag starts
+set. The recorder has the method set of the hub's metrics registry (`Add`,
+`Set`, `Observe`, each with a name, a label map and a value, each returning
+an error); `runtime.NopRecorder` records nothing.
+
+`runtimetest.New(t, opts...)` returns the in-memory runtime, `Fake`, and
+`(*Fake).Client(workspace, recorder)` a client of it. It keeps per workspace
+the provider profiles, the providers, the sandboxes with their status, the
+policy values, files, log entries and pending proposals. A sandbox's files
+are held in memory, or with `WithHostDirs()` in a directory of the host
+(`HostDir`) in which `Exec` and `RunMain` run real commands; otherwise
+commands are run by a script (`SetExec`), and without one a command exits 0
+with no output and a main process runs until `EndMain`. Its terminal echoes
+its input. A new fake reports a healthy gateway of release `0.1.8`;
+approving a proposal adds its rule to the sandbox's added rules. Its
+controls are `SetUnreachable`, `FailOperation` (an operation by name, with a
+kind and a text, until cleared with a nil kind), `SetRelease`,
+`AddProviderProfile`, `RejectPolicies`, `SetPolicyValidation`, `SetExec`,
+`SetState`, `EndMain`, `DropWorkDir`, `EmitOutput`, `EmitPolicyLog`,
+`AddProposal` and `BreakStream`; `Calls` returns the calls its clients
+received in order, `Streams` the open watches, followed logs, exec streams
+and terminals, and `Spec` and `Provider` what a sandbox was created with and
+a provider with its value. Its processes and streams end with the test.
+
+`runtimetest.RunContract(t, newBackend)` runs the contract tests against the
+`runtimetest.Backend` that `newBackend` returns for every test: a function
+that returns a client of the backend for a workspace and a recorder, a
+switch that makes the backend unreachable, and, where the backend can, a
+way to reject policy values and to add a proposal. The assertions about an
+operation that returns `ErrUnsupported` are skipped, so the contract holds
+for a runtime that lacks the operation. `(*Fake).Backend()` gives the fake
+in that form.
 
 ## parley
 
