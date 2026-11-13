@@ -8,6 +8,16 @@ import (
 	"github.com/spf13/pflag"
 )
 
+// sendIncludeBlocked runs a list command with an --include-blocked flag: it
+// sends include_blocked=true when the flag is given and no query otherwise.
+func sendIncludeBlocked(c *call) error {
+	var query url.Values
+	if include, _ := c.cmd.Flags().GetBool("include-blocked"); include {
+		query = url.Values{"include_blocked": {"true"}}
+	}
+	return sendWith(c, query, nil)
+}
+
 // userArg is the <user> argument: a user's id, e-mail or username.
 var userArg = argSpec{Name: "user", Required: true}
 
@@ -36,13 +46,7 @@ func newAdminUsersCommand() *cobra.Command {
 			Flags: func(fs *pflag.FlagSet) {
 				fs.Bool("include-blocked", false, "list the blocked users too")
 			},
-			Run: func(c *call) error {
-				var query url.Values
-				if include, _ := c.cmd.Flags().GetBool("include-blocked"); include {
-					query = url.Values{"include_blocked": {"true"}}
-				}
-				return sendWith(c, query, nil)
-			},
+			Run: sendIncludeBlocked,
 		}),
 		onUser("show", "Print a user", http.MethodGet, "/users/:user"),
 		declare(command{

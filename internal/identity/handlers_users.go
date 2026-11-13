@@ -32,6 +32,15 @@ func (s *Service) userRoutes() []server.Route {
 // errUserNotFound answers a selector that names no user.
 func errUserNotFound() error { return server.NotFound("user not found") }
 
+// asConflict answers a conflict of the store 409 conflict with the rule it
+// breaks, and returns any other error as it is.
+func asConflict(err error) error {
+	if ce := (conflictError{}); errors.As(err, &ce) {
+		return server.Conflict(ce.msg)
+	}
+	return err
+}
+
 // createUser answers POST /users: it creates an active user with the role
 // user, the user's personal org and the membership, in one transaction, and
 // answers 201 with the User object. The role is user also when the e-mail
@@ -66,11 +75,8 @@ func (s *Service) createUser(w http.ResponseWriter, r *http.Request) error {
 		u, _, err = CreateUserAndPersonalOrg(r.Context(), tx, nu, RoleUser)
 		return err
 	})
-	if ce := (conflictError{}); errors.As(err, &ce) {
-		return server.Conflict(ce.msg)
-	}
 	if err != nil {
-		return err
+		return asConflict(err)
 	}
 	server.WriteJSON(w, http.StatusCreated, u)
 	return nil
@@ -83,14 +89,9 @@ func (s *Service) listUsers(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	var pos userPosition
-	hasAfter, err := page.After(&pos)
+	after, err := pageAfter[userPosition](page)
 	if err != nil {
 		return err
-	}
-	after := &pos
-	if !hasAfter {
-		after = nil
 	}
 	includeBlocked := r.URL.Query().Get("include_blocked") == "true"
 	users, err := listUsers(r.Context(), s.deps.Store.Main(), includeBlocked, after, page.Limit+1)
@@ -229,11 +230,8 @@ func (s *Service) changeUser(w http.ResponseWriter, r *http.Request,
 	if errors.Is(err, ErrNotFound) {
 		return errUserNotFound()
 	}
-	if ce := (conflictError{}); errors.As(err, &ce) {
-		return server.Conflict(ce.msg)
-	}
 	if err != nil {
-		return err
+		return asConflict(err)
 	}
 	server.WriteJSON(w, http.StatusOK, u)
 	return nil
@@ -265,11 +263,8 @@ func (s *Service) deleteUser(w http.ResponseWriter, r *http.Request) error {
 	if errors.Is(err, ErrNotFound) {
 		return errUserNotFound()
 	}
-	if ce := (conflictError{}); errors.As(err, &ce) {
-		return server.Conflict(ce.msg)
-	}
 	if err != nil {
-		return err
+		return asConflict(err)
 	}
 	w.WriteHeader(http.StatusNoContent)
 	return nil

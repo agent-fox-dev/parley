@@ -570,6 +570,11 @@ func TestListMembers_ListsTheMembershipsByUsernameInPages(t *testing.T) {
 			t.Errorf("answer = %d %s, want 200", r.status, r.body)
 		}
 	})
+	t.Run("a bad limit is refused before the org is looked up", func(t *testing.T) {
+		r := h.get("/api/v1/orgs/nope/members?limit=0", h.admin)
+		checkRefusal(t, "GET /orgs/nope/members?limit=0", r, http.StatusBadRequest, "invalid_request",
+			"limit must be an integer from 1 to 200")
+	})
 }
 
 func TestAddMember_CreatesTheMembershipAtTheTimeOfTheRequest(t *testing.T) {

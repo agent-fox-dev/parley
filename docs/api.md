@@ -709,7 +709,9 @@ In one transaction the hub creates:
   that slug, the first free of `<slug>-1` to `<slug>-10` is used.
 - the user's membership of that org.
 
-`created_at` and `updated_at` of all three are the time of the request.
+The `created_at` and `updated_at` of the user and of the org, and the
+`created_at` of the membership, which has no `updated_at`, are the time of
+the request.
 Usernames, e-mails, provider identities and org names are compared as
 stored, letter case included.
 
@@ -988,7 +990,9 @@ Who may read it is decided as for
 blocked one included, and every other caller, a PAT of an admin included,
 only when its user is a member of the org and the org is `active`. Every
 other caller gets the answer for an org that does not exist. It declares the
-scope `orgs:read` for a PAT.
+scope `orgs:read` for a PAT. The `limit` and `cursor` are checked before the
+org is looked up, so a bad one is `400` for every caller, whatever `{id}`
+names, a missing org included, and tells nothing of the org.
 
 The list holds one item per membership, ordered by `username` ascending,
 compared byte by byte. An item has exactly `org_id`, `user_id`, `username`,
@@ -998,8 +1002,8 @@ user's). An org without members gets `items` `[]`.
 | Status | When |
 |---|---|
 | `200 OK` | the body is a page of member items |
-| `400` `invalid_request` | a bad `limit` or `cursor` (see [Lists](#lists)) |
-| `404` `not_found` | no org has that id or slug, or the caller is not an admin and is not a member of the org or the org is blocked (`org not found`) |
+| `400` `invalid_request` | a bad `limit` or `cursor` (see [Lists](#lists)), checked first, for an org that does not exist too |
+| `404` `not_found` | the `limit` and `cursor` are good, and no org has that id or slug, or the caller is not an admin and is not a member of the org or the org is blocked (`org not found`) |
 
 ```json
 {"items":[{"org_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","user_id":"1b2c3d4e-5f6a-4b7c-8d9e-0f1a2b3c4d5e","username":"alice","email":"alice@example.com","created_at":"2026-01-01T00:02:00Z"}],"next_cursor":null}

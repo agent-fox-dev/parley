@@ -63,7 +63,7 @@ func (s *Service) updateOwnUser(w http.ResponseWriter, r *http.Request) error {
 	})
 	if errors.Is(err, ErrNotFound) {
 		// The user was deleted after authentication read it.
-		return server.NotFound("user not found")
+		return errUserNotFound()
 	}
 	if err != nil {
 		return err

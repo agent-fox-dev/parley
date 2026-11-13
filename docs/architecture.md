@@ -649,10 +649,11 @@ routes `POST /users/:id/promote`, `/demote`, `/block` and `/unblock` (see
 `DELETE /users/:id` (see [api.md](api.md#delete-apiv1usersid)), and the
 caller's own profile, `GET /user`, `PATCH /user` and `GET /user/orgs` (see
 [api.md](api.md#get-apiv1user)), which need a user, the admin routes
-`POST /orgs`, `GET /orgs`, `PATCH /orgs/:id`, `PUT /orgs/:id/members/:user_id`
-and `DELETE /orgs/:id/members/:user_id`, and `GET /orgs/:id` and
-`GET /orgs/:id/members`, which an admin or a member reads (see
-[api.md](api.md#post-apiv1orgs)).
+`POST /orgs`, a create route, `GET /orgs`, `PATCH /orgs/:id`,
+`PUT /orgs/:id/members/:user_id`, `DELETE /orgs/:id/members/:user_id`,
+`POST /orgs/:id/block`, `POST /orgs/:id/unblock` and `DELETE /orgs/:id`,
+and `GET /orgs/:id` and `GET /orgs/:id/members`, which an admin or a member
+reads (see [api.md](api.md#post-apiv1orgs)).
 `(*identity.Service).Routes()` in `internal/identity/routes.go` returns
 them all: it appends the route list of each handlers file, such as
 `userRoutes()` in `internal/identity/handlers_users.go` and
@@ -899,9 +900,12 @@ of which its user is a member (`isMember`), and every other case, a missing
 org included, is the one answer `errOrgNotFound()`, `404 not_found` with the
 message `org not found`.
 
-`GET /orgs/:id/members` (`listMembers`) also carries no admin mark, declares
-`orgs:read` and goes through `visibleOrg(r)`, so a blocked org's member list
-is an admin's alone. It reads one page with `listMembers(ctx, q, orgID,
+`GET /orgs/:id/members` (`listMembers`) also carries no admin mark and
+declares `orgs:read`. It reads the page (`server.ReadPage` and `pageAfter`)
+before it looks the org up, so a bad `limit` or `cursor` is `400
+invalid_request` for every caller and tells nothing of the org; then it goes
+through `visibleOrg(r)`, so a blocked org's member list is an admin's alone.
+It reads one page with `listMembers(ctx, q, orgID,
 after, limit)` in `orgs.go`, a join of `memberships` and `users` `ORDER BY
 username`, continuing after the position `{username}`; an item is a
 `memberItem` (`org_id`, `user_id`, `username`, `email`, and the membership's
@@ -918,7 +922,7 @@ needs-a-user mark and declares `orgs:read`; it reads the active orgs of
 which the caller is a member through `listOrgs(ctx, q, includeBlocked,
 memberID, after, limit)`, the reader of `GET /orgs`, whose `memberID` limits
 the list to that user's orgs. `pageAfter[T](page)` decodes a page's
-position for these lists.
+position for these lists and for `GET /users`.
 
 `POST /orgs/:id/block` and `/unblock` (`setOrgStatus` in
 `handlers_orgs.go`) are admin routes: in one `(*store.Store).Tx` they
@@ -1036,13 +1040,17 @@ unknown or does not parse, on any command, into a `usage_error`.
 
 The commands of the user and organization routes are declarations without
 client code of their own: `parley user` (`internal/cli/user.go`), `parley
-orgs` (`orgs.go`) and `parley admin users` (`admin_users.go`), the last in
-the group `parley admin` that `newAdminCommand` in `root.go` builds. Those
-that only call their route use the default run step; a command whose
-request carries a query or a body (`--include-blocked`, `--full-name`, the
-flags of `parley admin users create`) has a run step that builds them from
-its flags and sends them with `sendWith` (`user.go`), the default run step
-with a query and a body.
+orgs` (`orgs.go`), `parley admin users` (`admin_users.go`) and `parley
+admin orgs` (`admin_orgs.go`), the last two in the group `parley admin`
+that `newAdminCommand` in `root.go` builds. Those that only call their route
+use the default run step; a command whose request carries a query or a body
+(`--include-blocked`, `--full-name`, the flags of `parley admin users
+create`, and those of `parley admin orgs create` and `update`) has a run
+step that builds them from its flags and sends them with `sendWith`
+(`user.go`), the default run step with a query and a body. The two `list`
+commands with `--include-blocked` share the run step `sendIncludeBlocked`
+(`admin_users.go`), and `parley admin orgs create` and `update` send a
+member only when its flag is given (`addChanged` in `admin_orgs.go`).
 
 Help lives in `internal/cli/help.go`. `installHelp` keeps cobra's own text
 help, sets the root's help function, which `--help` on any command and a

@@ -2,7 +2,6 @@ package cli
 
 import (
 	"net/http"
-	"net/url"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -33,13 +32,7 @@ func newAdminOrgsCommand() *cobra.Command {
 			Flags: func(fs *pflag.FlagSet) {
 				fs.Bool("include-blocked", false, "list the blocked organizations too")
 			},
-			Run: func(c *call) error {
-				var query url.Values
-				if include, _ := c.cmd.Flags().GetBool("include-blocked"); include {
-					query = url.Values{"include_blocked": {"true"}}
-				}
-				return sendWith(c, query, nil)
-			},
+			Run: sendIncludeBlocked,
 		}),
 		declare(command{
 			Name:        "create",

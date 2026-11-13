@@ -173,8 +173,9 @@ func TestOwnOrgs_ListsTheActiveOrgsOfTheCallerByName(t *testing.T) {
 func TestScopes_RefuseAPATWithoutTheDeclaredScopeBeforeAnythingElse(t *testing.T) {
 	t.Parallel()
 	h := newTeamHub(t)
-	// The scope check package 06 installs compares with the implication
-	// rules; this one compares the declared scope with the PAT's own.
+	// The production scope check, which is not part of this service,
+	// compares with the implication rules; this one compares the declared
+	// scope with the PAT's own.
 	h.srv.SetScopeCheck(func(r *http.Request) error {
 		p, _ := identity.PrincipalOf(r.Context())
 		m, _ := server.MatchedRoute(r)

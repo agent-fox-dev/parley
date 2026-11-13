@@ -185,11 +185,8 @@ func (s *Service) createOrg(w http.ResponseWriter, r *http.Request) error {
 			CreatedAt: s.deps.Now()})
 		return err
 	})
-	if ce := (conflictError{}); errors.As(err, &ce) {
-		return server.Conflict(ce.msg)
-	}
 	if err != nil {
-		return err
+		return asConflict(err)
 	}
 	server.WriteJSON(w, http.StatusCreated, o)
 	return nil
@@ -253,11 +250,8 @@ func (s *Service) updateOrg(w http.ResponseWriter, r *http.Request) error {
 	if errors.Is(err, ErrNotFound) {
 		return errOrgNotFound()
 	}
-	if ce := (conflictError{}); errors.As(err, &ce) {
-		return server.Conflict(ce.msg)
-	}
 	if err != nil {
-		return err
+		return asConflict(err)
 	}
 	server.WriteJSON(w, http.StatusOK, o)
 	return nil
@@ -291,17 +285,19 @@ func pageAfter[T any](page server.Page) (*T, error) {
 
 // listMembers answers GET /orgs/:id/members: a page of the memberships of
 // the org the selector names, by username, when the caller may read the
-// org (see visibleOrg), so a blocked org's list is an admin's alone.
+// org (see visibleOrg), so a blocked org's list is an admin's alone. The
+// page is read before the org is looked up: a bad limit or cursor is 400
+// for every caller and tells nothing of the org.
 func (s *Service) listMembers(w http.ResponseWriter, r *http.Request) error {
-	o, err := s.visibleOrg(r)
-	if err != nil {
-		return err
-	}
 	page, err := server.ReadPage(r)
 	if err != nil {
 		return err
 	}
 	after, err := pageAfter[memberPosition](page)
+	if err != nil {
+		return err
+	}
+	o, err := s.visibleOrg(r)
 	if err != nil {
 		return err
 	}
