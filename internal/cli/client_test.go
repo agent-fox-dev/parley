@@ -169,8 +169,8 @@ func halfBodyThenStall(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// The test sets environment variables, so it must not run in parallel.
 func TestClient_AbandonsARequestWithoutACompleteAnswerInTime(t *testing.T) {
+	t.Parallel()
 	if got := defaultOptions().requestTimeout; got != 30*time.Second {
 		t.Errorf("default request timeout = %v, want 30s", got)
 	}
@@ -190,15 +190,15 @@ func TestClient_AbandonsARequestWithoutACompleteAnswerInTime(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			hub := newStubHub(t).handle(http.MethodGet, "/api/v1/things/x", tt.handler)
-			probeEnv(t, hub.URL)
 			opts := withProbes(defaultOptions(), slowProbe)
 			if tt.shortened != 0 {
 				opts.requestTimeout = tt.shortened
 			}
 
 			start := time.Now()
-			code, stdout, stderr := runCLIWith(t, opts, "probe", tt.command, "x")
+			code, stdout, stderr := runCLIWith(t, opts, onHub(hub.URL, "probe", tt.command, "x")...)
 			took := time.Since(start)
 
 			if tt.timeout == 0 {
@@ -218,6 +218,7 @@ func TestClient_AbandonsARequestWithoutACompleteAnswerInTime(t *testing.T) {
 	}
 
 	t.Run("a single request's own timeout", func(t *testing.T) {
+		t.Parallel()
 		hub := newStubHub(t).handle(http.MethodGet, "/api/v1/things/x", answerAfter(2*time.Second))
 		start := time.Now()
 
@@ -355,8 +356,8 @@ func endlessBody(status int) http.HandlerFunc {
 	}
 }
 
-// The test sets environment variables, so it must not run in parallel.
 func TestClient_SendsEachRequestOnce(t *testing.T) {
+	t.Parallel()
 	envelope := func(status int, errorType string) http.HandlerFunc {
 		return func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Retry-After", "1")
@@ -381,10 +382,10 @@ func TestClient_SendsEachRequestOnce(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			hub := newStubHub(t).handle(http.MethodGet, "/api/v1/things/x", tt.handler)
-			probeEnv(t, hub.URL)
 
-			code, _, stderr := runProbes(t, "probe", "get", "x")
+			code, _, stderr := runProbes(t, onHub(hub.URL, "probe", "get", "x")...)
 			if tt.status == http.StatusTooManyRequests {
 				// Long enough for a client that honoured Retry-After to
 				// have asked again.
