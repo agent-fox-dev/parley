@@ -150,7 +150,14 @@ authenticator reports a `server.Caller` (`CredentialID`, and `UserID` or
 `Admin` for the admin token, and `Detail`, what the authenticator knows
 beyond the ids, which the server does not read), which the pipeline puts in
 the request's context; later checks and the handler read it with
-`server.CallerOf(r.Context())`. An `*server.Error` (also when wrapped) is
+`server.CallerOf(r.Context())`. A check returns only an error and cannot
+hand on a request of its own, so the router's handler of each REST route
+puts an empty holder in the request's context before the pipeline runs
+(ADR 04): a check leaves a value for the later checks and the handler with
+`server.Attach(r, key, value)`, and they read it with
+`server.Attached(r, key)`, which reports `false` when nothing was attached
+under `key`; outside a request to a REST route `Attach` does nothing and
+`Attached` reports `false`. Each request has its own holder. An `*server.Error` (also when wrapped) is
 written as its envelope; any other error as `500 internal` with the message
 `internal error`, and its text is logged through `Options.Logger` as an
 error line `internal error` with the `request_id` and the `error`. When the
@@ -1132,7 +1139,8 @@ keeps data for a user or an org registers its remover from its part in
 
 `internal/hub/access.go` adds the part `composeAccess`, after
 `composeIdentity` in `parts`. It adds the schema step `access.SchemaStep`
-(`workspace_records`), registers a zero `access.Service`, and binds it in
+(`workspace_records`), registers a zero `access.Service`, adds its
+`Check` to the access checks, after identity's admin check, and binds it in
 the start hook `access` to `access.Deps{Records:
 access.StoreRecords(rt.Store.Main()), Memberships: ...}`, the membership
 source being `identity.ActiveOrgIDs` over the same store. It registers no
@@ -1218,6 +1226,45 @@ returns, by id, the ids of the orgs with status `active` the user is a
 member of. A blocked org is left out, so its members are `LevelNone` on its
 workspaces while it is blocked (its owner is not), and a deleted org has no
 memberships left, its rows being deleted with it.
+
+#### Decision and check
+
+`internal/access/decide.go` turns a level into an answer for what a route
+needs, `access.Need`: `NeedRead` (`"read"`), `NeedWrite` (`"write"`) or
+`NeedOwner` (`"owner"`). `(*Service).Decide(ctx, caller, slug, need)`
+returns an `access.Decision{Outcome, Level, Record}`, a comparable value:
+
+- level none, or a slug with no record: `Outcome` `access.NotFound`
+  (`"not_found"`) with `LevelNone` and the zero record, for every need, so
+  the decision for a workspace the caller cannot read equals the one for a
+  slug with no workspace;
+- `LevelMember` with `NeedWrite` or `NeedOwner`: `access.ReadOnly`
+  (`"read_only"`) with the level and the record;
+- everything else: `access.Granted` (`"granted"`) with the level and the
+  record.
+
+A need other than the three, and a failed read, return the zero decision
+and an error, never a grant. The slug's shape is not checked: a string that
+cannot be a slug has no record. A surface other than the REST API, such as
+the git server, calls `Decide` directly.
+
+`internal/access/middleware.go` holds the REST side. A workspace route
+declares its need in its `Marks` under `access.MarkNeed`
+(`"access.need"`), with the value `read`, `write` or `owner`, and names its
+workspace with the path parameter `slug`. `(*Service).Check` is a
+`server.Check` in the access position: on a route without the mark it
+passes; otherwise it takes the caller from `server.CallerOf` through
+`access.CallerFrom` and the slug from the matched route, and decides. A
+grant attaches the decision with `server.Attach`, and the handler reads it
+with `access.DecisionOf(r)`; `ReadOnly` is answered
+`server.Forbidden("org members have read-only access to this workspace")`
+and `NotFound` `server.NotFound("workspace not found")`, built from
+constants only, so its bytes cannot differ between an invisible workspace
+and a missing one. A caller that is neither the admin token nor a user, a
+mark other than the three needs, a marked route without a `slug`
+parameter, and an error from `Decide` are returned as plain errors, which
+the pipeline logs and answers `500 internal` with `internal error`. No
+route declares the mark yet.
 
 ### The logger
 

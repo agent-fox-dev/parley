@@ -2,6 +2,7 @@ package server
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"slices"
 	"strings"
@@ -429,5 +430,56 @@ func TestPipeline_KeepsAnAnswerAlreadyStartedWhenTheHandlerFailsLate(t *testing.
 	}
 	if !logged {
 		t.Errorf("no log line holds the late error and the request id %q: %v", id, logs.lines())
+	}
+}
+
+func TestPipeline_GivesTheHandlerTheValuesItsChecksAttachedToItsOwnRequest(t *testing.T) {
+	t.Parallel()
+	type key struct{}
+	s := New(Options{})
+	s.SetAuthenticator(func(*http.Request) (Caller, error) { return testCaller, nil })
+	// The first check attaches the request's query value v; the second
+	// reads it back, as a later check may.
+	s.AddAccessCheck(func(r *http.Request) error {
+		if v := r.URL.Query().Get("v"); v != "" {
+			Attach(r, key{}, v)
+		}
+		return nil
+	})
+	s.AddAccessCheck(func(r *http.Request) error {
+		v, ok := Attached(r, key{})
+		if ok != (r.URL.Query().Get("v") != "") || ok && v != r.URL.Query().Get("v") {
+			t.Errorf("the later check of %s read %v (%t)", r.URL, v, ok)
+		}
+		return nil
+	})
+	s.Register(Route{Method: http.MethodGet, Pattern: "/things", Handler: func(w http.ResponseWriter, r *http.Request) error {
+		v, ok := Attached(r, key{})
+		WriteJSON(w, http.StatusOK, map[string]any{"value": v, "attached": ok})
+		return nil
+	}})
+	h := s.Handler()
+
+	var wg sync.WaitGroup
+	for i := range 20 {
+		wg.Go(func() {
+			want := `{"attached":false,"value":null}` + "\n"
+			target := "/api/v1/things"
+			if i%2 == 0 {
+				want = fmt.Sprintf(`{"attached":true,"value":"r%d"}`+"\n", i)
+				target += fmt.Sprintf("?v=r%d", i)
+			}
+			if rec := do(h, newRequest(http.MethodGet, target, nil, "")); rec.Code != http.StatusOK || rec.Body.String() != want {
+				t.Errorf("GET %s = %d %q, want 200 %q", target, rec.Code, rec.Body.String(), want)
+			}
+		})
+	}
+	wg.Wait()
+
+	// Outside a routed request there is nowhere to attach to.
+	r := newRequest(http.MethodGet, "/api/v1/things", nil, "")
+	Attach(r, key{}, "x")
+	if v, ok := Attached(r, key{}); ok {
+		t.Errorf("Attached outside a route = %v, true, want false", v)
 	}
 }

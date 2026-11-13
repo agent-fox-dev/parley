@@ -3,12 +3,18 @@ package access_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"slices"
+	"sync/atomic"
 	"testing"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/store"
 )
 
@@ -73,8 +79,9 @@ func (m memberships) ActiveOrgIDs(_ context.Context, userID string) ([]string, e
 	return ids, nil
 }
 
-// errRead is the failure of the failing sources.
-var errRead = errors.New("read failed")
+// errRead is the failure of the failing sources. It names a file of the
+// hub, which no answer may show.
+var errRead = errors.New("disk I/O error at /data/parley.db")
 
 // failingRecords reads through RecordReader, except the record of a slug in
 // fail, whose read fails with errRead.
@@ -101,4 +108,88 @@ func newService(records access.RecordReader, m access.Memberships) *access.Servi
 	svc := &access.Service{}
 	svc.Bind(access.Deps{Records: records, Memberships: m})
 	return svc
+}
+
+// probe is a server with svc's access check in the access position and the
+// probe routes GET /workspaces/:slug/r, /w and /o, which need read, write
+// and owner. A probe route answers 200 with the decision it reads, and
+// counts its calls. The authenticator takes the caller from the header
+// X-Caller: "admin" is the admin token, another value a user id, and no
+// header a caller with neither.
+type probe struct {
+	srv   *server.Server
+	calls atomic.Int64
+}
+
+func newProbe(svc *access.Service) *probe {
+	p := &probe{srv: server.New(server.Options{Logger: slog.New(slog.DiscardHandler), RateLimitDisabled: true})}
+	p.srv.SetAuthenticator(func(r *http.Request) (server.Caller, error) {
+		switch id := r.Header.Get("X-Caller"); id {
+		case "":
+			return server.Caller{CredentialID: "anonymous"}, nil
+		case "admin":
+			return server.Caller{CredentialID: id, Admin: true}, nil
+		default:
+			return server.Caller{CredentialID: id, UserID: id}, nil
+		}
+	})
+	p.srv.AddAccessCheck(svc.Check)
+	p.route("/workspaces/:slug/r", "read")
+	p.route("/workspaces/:slug/w", "write")
+	p.route("/workspaces/:slug/o", "owner")
+	return p
+}
+
+// route registers a probe route GET pattern that declares need.
+func (p *probe) route(pattern, need string) {
+	p.srv.Register(server.Route{
+		Method: http.MethodGet, Pattern: pattern, Marks: map[string]string{access.MarkNeed: need},
+		Handler: func(w http.ResponseWriter, r *http.Request) error {
+			p.calls.Add(1)
+			d, ok := access.DecisionOf(r)
+			if !ok {
+				return errors.New("the handler found no decision")
+			}
+			server.WriteJSON(w, http.StatusOK, map[string]any{"level": d.Level, "record": d.Record})
+			return nil
+		},
+	})
+}
+
+// answer is what the probe answered.
+type answer struct {
+	status      int
+	contentType string
+	body        []byte
+}
+
+// get calls path, under /api/v1, as caller ("" for none).
+func (p *probe) get(caller, path string) answer {
+	r := httptest.NewRequest(http.MethodGet, "/api/v1"+path, nil)
+	if caller != "" {
+		r.Header.Set("X-Caller", caller)
+	}
+	rec := httptest.NewRecorder()
+	p.srv.Handler().ServeHTTP(rec, r)
+	return answer{rec.Code, rec.Header().Get("Content-Type"), rec.Body.Bytes()}
+}
+
+// envelope is the error envelope's error object, or the probe's answer.
+type envelope struct {
+	Error struct {
+		Code      int    `json:"code"`
+		Message   string `json:"message"`
+		ErrorType string `json:"error_type"`
+	} `json:"error"`
+	Level  access.Level  `json:"level"`
+	Record access.Record `json:"record"`
+}
+
+func decode(t *testing.T, a answer) envelope {
+	t.Helper()
+	var e envelope
+	if err := json.Unmarshal(a.body, &e); err != nil {
+		t.Fatalf("body %s is not JSON: %v", a.body, err)
+	}
+	return e
 }
