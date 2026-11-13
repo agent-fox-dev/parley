@@ -289,6 +289,73 @@ func TestClient_FailsNamingTheStatusOfAnAnswerItCannotDecode(t *testing.T) {
 }
 
 // The test sets environment variables, so it must not run in parallel.
+func TestClient_RefusesAnAnswerLargerThanItsBound(t *testing.T) {
+	tests := []struct {
+		name    string
+		status  int
+		handler http.HandlerFunc
+		// fails says the command fails naming the status.
+		fails bool
+	}{
+		{name: "a JSON answer of exactly the bound", status: 200, handler: jsonStringOf(maxAnswerSize)},
+		{name: "a JSON answer one byte over the bound", status: 200, handler: jsonStringOf(maxAnswerSize + 1), fails: true},
+		{name: "a success that never ends", status: 200, handler: endlessBody(200), fails: true},
+		{name: "an error that never ends", status: 502, handler: endlessBody(502), fails: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hub := newStubHub(t).handle(http.MethodGet, "/api/v1/things/x", tt.handler)
+			probeEnv(t, hub.URL)
+			opts := withProbes(defaultOptions())
+			opts.requestTimeout = 5 * time.Second
+
+			start := time.Now()
+			code, stdout, stderr := runCLIWith(t, opts, "probe", "get", "x")
+			took := time.Since(start)
+
+			if !tt.fails {
+				if code != 0 || len(stdout) != maxAnswerSize+1 {
+					t.Errorf("exit status %d, %d bytes on stdout, want 0 and %d; stderr %q", code, len(stdout), maxAnswerSize+1, stderr)
+				}
+				return
+			}
+			if code == 0 {
+				t.Fatalf("exit status 0 with %d bytes on stdout, want a client_error", len(stdout))
+			}
+			message := wantClientFailure(t, code, stdout, stderr, "client_error")
+			if !strings.Contains(message, strconv.Itoa(tt.status)) {
+				t.Errorf("message %q does not name the status %d", message, tt.status)
+			}
+			if took >= opts.requestTimeout {
+				t.Errorf("the command took %v, want it to stop reading before the %v timeout", took, opts.requestTimeout)
+			}
+		})
+	}
+}
+
+// jsonStringOf is a handler that answers 200 with a JSON string of n bytes,
+// quotes included.
+func jsonStringOf(n int) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(`"` + strings.Repeat("a", n-2) + `"`))
+	}
+}
+
+// endlessBody is a handler that answers status and writes a body until the
+// client goes away.
+func endlessBody(status int) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(status)
+		chunk := []byte(strings.Repeat(" ", 64<<10))
+		for r.Context().Err() == nil {
+			if _, err := w.Write(chunk); err != nil {
+				return
+			}
+		}
+	}
+}
+
+// The test sets environment variables, so it must not run in parallel.
 func TestClient_SendsEachRequestOnce(t *testing.T) {
 	envelope := func(status int, errorType string) http.HandlerFunc {
 		return func(w http.ResponseWriter, _ *http.Request) {

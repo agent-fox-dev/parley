@@ -551,7 +551,11 @@ URL): a status of `400` or above whose body is not an error envelope (a JSON
 object with an `error` member holding `error_type`), a `2xx` status whose
 body is neither empty nor JSON (`the hub answered 200 with a body that is
 not JSON`), and a status outside `2xx` below `400`, a redirect included
-(`the hub answered 302, which is neither a success nor an error`).
+(`the hub answered 302, which is neither a success nor an error`). So is
+an answer whose body is larger than 8 MiB (8388608 bytes), whatever its
+status: parley stops reading at the first byte past that size instead of
+waiting for the rest (`the hub answered 200 with a body larger than 8388608
+bytes`).
 
 `parley version` and `parley login` need no credential and read the hub URL
 themselves, as their sections say; help needs neither setting.
