@@ -9,9 +9,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -733,4 +737,155 @@ func (h *testHub) setOrgStatus(orgID, status string) {
 // addMember makes the user userID a member of the org orgID, from now.
 func (h *testHub) addMember(orgID, userID string) {
 	h.exec(`INSERT INTO memberships (org_id, user_id, created_at) VALUES (?, ?, ?)`, orgID, userID, h.now().UnixNano())
+}
+
+// testRoute is a route of the identity service. In its path, ":user"
+// stands for a user selector, ":org" for an org selector and ":key" and
+// ":token" for the id of an API key and a PAT; body is a body the route
+// accepts, nil for a route that takes none.
+type testRoute struct {
+	method, path string
+	body         any
+}
+
+// newUserBody is a POST /users body for a user no team hub has.
+func newUserBody(username string) map[string]any {
+	return map[string]any{"username": username, "email": username + "@example.com", "provider": "github",
+		"provider_id": username + "-id"}
+}
+
+// newOrgBody is a POST /orgs body for an org no team hub has.
+func newOrgBody(name, slug string) map[string]any {
+	return map[string]any{"name": name, "slug": slug}
+}
+
+// with returns a copy of body with member set to v, or left out when v is
+// omitted{}.
+func with(body map[string]any, member string, v any) map[string]any {
+	out := maps.Clone(body)
+	if _, gone := v.(omitted); gone {
+		delete(out, member)
+	} else {
+		out[member] = v
+	}
+	return out
+}
+
+// withoutMembers returns obj without the members names.
+func withoutMembers(obj map[string]any, names ...string) map[string]any {
+	out := maps.Clone(obj)
+	for _, n := range names {
+		delete(out, n)
+	}
+	return out
+}
+
+// wantStatus stops the test unless r has the status status, and returns r.
+func wantStatus(t *testing.T, what string, r response, status int) response {
+	t.Helper()
+	if r.status != status {
+		t.Fatalf("%s = %d %s, want %d", what, r.status, r.body, status)
+	}
+	return r
+}
+
+// checkMembers reports unless obj has exactly the members want.
+func checkMembers(t *testing.T, obj map[string]any, want []string) {
+	t.Helper()
+	if got := slices.Sorted(maps.Keys(obj)); !slices.Equal(got, want) {
+		t.Errorf("members = %v, want %v", got, want)
+	}
+}
+
+// callUnchanged is call, and reports when the request changed the store.
+func (h *testHub) callUnchanged(t *testing.T, method, path, authorization string, body any) response {
+	t.Helper()
+	before := h.snapshot()
+	r := h.call(method, path, authorization, body)
+	if h.snapshot() != before {
+		t.Errorf("%s %s changed the store", method, path)
+	}
+	return r
+}
+
+// itemValues returns the string member of each item of a list answer.
+func itemValues(t *testing.T, r response, member string) []string {
+	t.Helper()
+	items, ok := r.json["items"].([]any)
+	if !ok {
+		t.Fatalf("answer = %d %s, want a list", r.status, r.body)
+	}
+	values := make([]string, 0, len(items))
+	for _, it := range items {
+		v, _ := it.(map[string]any)[member].(string)
+		values = append(values, v)
+	}
+	return values
+}
+
+// walkBy reads the list at path page by page, limit items a page, following
+// next_cursor until it is null, and returns the member of every item in
+// order and how many requests it took.
+func (h *testHub) walkBy(path, authorization string, limit int, member string) (values []string, requests int) {
+	h.t.Helper()
+	sep := "?"
+	if strings.Contains(path, "?") {
+		sep = "&"
+	}
+	cursor := ""
+	for requests < 10 {
+		page := fmt.Sprintf("%s%slimit=%d", path, sep, limit)
+		if cursor != "" {
+			page += "&cursor=" + url.QueryEscape(cursor)
+		}
+		r := h.get(page, authorization)
+		requests++
+		if r.status != http.StatusOK {
+			h.t.Fatalf("GET %s = %d %s, want 200", page, r.status, r.body)
+		}
+		values = append(values, itemValues(h.t, r, member)...)
+		next, ok := r.json["next_cursor"].(string)
+		if !ok {
+			return values, requests
+		}
+		cursor = next
+	}
+	h.t.Fatalf("GET %s: next_cursor still set after %d pages", path, requests)
+	return nil, 0
+}
+
+// recordChange is a request that changes one record, sent as caller, and
+// the members of the record it changes. get is the record's path, read as
+// caller.
+type recordChange struct {
+	name, method, path, caller, get string
+	body                            any
+	changed                         map[string]any
+	then                            func(t *testing.T) // checks more, when not nil
+}
+
+// checkChanges sends each change in order, an hour after the one before,
+// and reports unless it answers 200 with the record as get answered it
+// before but for the members changed and updated_at, the time of the
+// change, and get then answers the same.
+func (h *testHub) checkChanges(t *testing.T, changes []recordChange) {
+	t.Helper()
+	for _, c := range changes {
+		t.Run(c.name, func(t *testing.T) {
+			want := h.get(c.get, c.caller).json
+			h.advance(time.Hour)
+			r := wantStatus(t, c.method+" "+c.path, h.call(c.method, c.path, c.caller, c.body), http.StatusOK)
+			maps.Copy(want, c.changed)
+			want["updated_at"] = h.now().Format(time.RFC3339)
+			if !reflect.DeepEqual(r.json, want) {
+				t.Errorf("answer = %v, want %v", r.json, want)
+			}
+			if got := h.get(c.get, c.caller).json; !reflect.DeepEqual(got, r.json) {
+				t.Errorf("GET %s = %v, want %v", c.get, got, r.json)
+			}
+			if c.then != nil {
+				c.then(t)
+			}
+		})
+	}
 }
