@@ -636,6 +636,33 @@ holds the only table of those endpoints. `internal/identity/provider.go`
 holds what the configuration does not: the providers the hub can log in
 with, the scopes it asks each for and Google's extra `response_type=code`.
 
+`internal/identity/oauth.go` reads a user's identity from a provider, with
+the standard library only. `identity.NewOAuthClient(providers, hc,
+timeout)` returns an `*identity.OAuthClient`, the `identity.ProviderClient`
+whose `Identity(ctx, provider, code, redirectURI)` returns an
+`identity.Identity` (`Provider`, `ProviderID`, `Username`, `FullName`,
+`Email`). It exchanges the code with one form-encoded `POST` to the token
+URL (`client_id`, `client_secret`, `code`, `redirect_uri`,
+`grant_type=authorization_code`, `Accept: application/json`), then reads
+the user URL with `Authorization: Bearer <access token>`. For GitHub the id
+is the decimal `id`, the username `login` and the full name `name`; when
+the profile's `email` is null or empty it reads the user URL with `/emails`
+appended and takes the entry whose `primary` and `verified` are both true.
+For Google the id is `sub`, `name` is both the username and the full name,
+and `email` counts only when `email_verified` is true. The username is
+trimmed, and an empty one becomes `<provider>-<provider id>`; the full name
+is the provider's as given.
+Every error is `identity.ErrRejected` (the token endpoint answered a JSON
+object with an `error` member and a status below 500) or
+`identity.ErrUpstream` (everything else: no connection, a timeout, a status
+of 500 or above, a body that is not the expected JSON, no access token, a
+user or e-mail list answer other than `200`, no user id, no verified
+address), and its text is fixed words only, never the code, the client
+secret, the access token or the provider's body. Each call to the provider
+is bounded by the timeout (0 is `identity.DefaultProviderTimeout`, 15
+seconds); when it passes, the request's context ends and the transport
+closes the connection. `hc` nil is `http.DefaultClient`.
+
 The schema step creates, in the transactional store:
 
 | Table | Columns |
