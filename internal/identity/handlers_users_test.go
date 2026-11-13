@@ -1,14 +1,19 @@
 package identity_test
 
 import (
+	"cmp"
 	"fmt"
 	"maps"
 	"net/http"
+	"net/url"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 	"uuid"
+
+	"github.com/agent-fox-dev/parley/internal/identity"
 )
 
 // userMembers are the members of the User object.
@@ -204,8 +209,9 @@ func TestCreateUser_RefusesWhatIsTakenAndCreatesNothing(t *testing.T) {
 			if h.snapshot() != before {
 				t.Errorf("the store changed")
 			}
-			if n := h.count(`SELECT count(*) FROM users WHERE username = ?`, c.body["username"]); c.free && n != 0 {
-				t.Errorf("%d users have the username %v, want none", n, c.body["username"])
+			if username := c.body["username"].(string); c.free {
+				checkRefusal(t, "GET /users/"+username, h.get("/api/v1/users/"+username, h.admin), http.StatusNotFound,
+					"not_found", "user not found")
 			}
 		})
 	}
@@ -218,4 +224,261 @@ func TestCreateUser_RefusesWhatIsTakenAndCreatesNothing(t *testing.T) {
 			t.Errorf("answer = %d %s, want 201", r.status, r.body)
 		}
 	})
+}
+
+// userSelectorRoutes are the admin routes that name a user by a selector,
+// ":user" in their path, each with a body it accepts (nil for none).
+var userSelectorRoutes = []adminRoute{
+	{http.MethodGet, "/api/v1/users/:user", nil},
+	{http.MethodPatch, "/api/v1/users/:user", map[string]any{"full_name": "x"}},
+}
+
+// itemIDs returns the ids of the items of a list answer.
+func itemIDs(t *testing.T, r response) []string {
+	t.Helper()
+	items, ok := r.json["items"].([]any)
+	if !ok {
+		t.Fatalf("answer = %d %s, want a list", r.status, r.body)
+	}
+	ids := make([]string, 0, len(items))
+	for _, it := range items {
+		id, _ := it.(map[string]any)["id"].(string)
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// walk reads the list at path page by page, limit items a page, following
+// next_cursor until it is null, and returns the ids of every item in order
+// and how many requests it took.
+func (h *testHub) walk(path, authorization string, limit int) (ids []string, requests int) {
+	h.t.Helper()
+	sep := "?"
+	if strings.Contains(path, "?") {
+		sep = "&"
+	}
+	cursor := ""
+	for requests < 10 {
+		page := fmt.Sprintf("%s%slimit=%d", path, sep, limit)
+		if cursor != "" {
+			page += "&cursor=" + url.QueryEscape(cursor)
+		}
+		r := h.get(page, authorization)
+		requests++
+		if r.status != http.StatusOK {
+			h.t.Fatalf("GET %s = %d %s, want 200", page, r.status, r.body)
+		}
+		ids = append(ids, itemIDs(h.t, r)...)
+		next, ok := r.json["next_cursor"].(string)
+		if !ok {
+			return ids, requests
+		}
+		cursor = next
+	}
+	h.t.Fatalf("GET %s: next_cursor still set after %d pages", path, requests)
+	return nil, 0
+}
+
+// newListHub is a bootstrapped test hub with five active users created an
+// hour apart and mallory, blocked, created at the same instant as the third
+// of them. It returns them all newest first: created_at descending, then
+// id descending.
+func newListHub(t *testing.T) (*testHub, []identity.User) {
+	t.Helper()
+	h := newTestHub(t)
+	var users []identity.User
+	for i, name := range []string{"ann", "ben", "cat", "dan", "eve"} {
+		h.advance(time.Hour)
+		users = append(users, h.createUser(name, identity.RoleUser))
+		if i == 2 {
+			mallory := h.createUser("mallory", identity.RoleUser)
+			h.setStatus(mallory.ID, identity.StatusBlocked)
+			mallory.Status = identity.StatusBlocked
+			users = append(users, mallory)
+		}
+	}
+	slices.SortFunc(users, func(a, b identity.User) int {
+		return cmp.Or(b.CreatedAt.Compare(a.CreatedAt), cmp.Compare(b.ID, a.ID))
+	})
+	return h, users
+}
+
+// idsOf returns the ids of the users whose status is one of statuses.
+func idsOf(users []identity.User, statuses ...string) []string {
+	var ids []string
+	for _, u := range users {
+		if slices.Contains(statuses, u.Status) {
+			ids = append(ids, u.ID)
+		}
+	}
+	return ids
+}
+
+func TestListUsers_ListsActiveUsersNewestFirstInPages(t *testing.T) {
+	t.Parallel()
+	h, users := newListHub(t)
+	admin := "Bearer " + h.adminToken
+	want := idsOf(users, identity.StatusActive)
+	r := h.get("/api/v1/users", admin)
+	if r.status != http.StatusOK {
+		t.Fatalf("GET /users = %d %s, want 200", r.status, r.body)
+	}
+	for _, it := range r.json["items"].([]any) {
+		if status := it.(map[string]any)["status"]; status != "active" {
+			t.Errorf("an item has the status %v, want active", status)
+		}
+	}
+	if got := itemIDs(t, r); !slices.Equal(got, want) {
+		t.Errorf("items = %v, want %v", got, want)
+	}
+	if got, requests := h.walk("/api/v1/users", admin, 2); !slices.Equal(got, want) || requests != 3 {
+		t.Errorf("pages of 2 = %v in %d requests, want %v in 3", got, requests, want)
+	}
+	for _, v := range []string{"false", "1", "yes", "TRUE", ""} {
+		t.Run("include_blocked="+v, func(t *testing.T) {
+			if got := itemIDs(t, h.get("/api/v1/users?include_blocked="+v, admin)); !slices.Equal(got, want) {
+				t.Errorf("items = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+func TestListUsers_AddsBlockedUsersForIncludeBlockedTrue(t *testing.T) {
+	t.Parallel()
+	h, users := newListHub(t)
+	admin := "Bearer " + h.adminToken
+	want := idsOf(users, identity.StatusActive, identity.StatusBlocked)
+	if n := h.count(`SELECT count(*) FROM users`); len(want) != n {
+		t.Fatalf("the hub has %d users, the test %d", n, len(want))
+	}
+	r := h.get("/api/v1/users?include_blocked=true", admin)
+	if got := itemIDs(t, r); !slices.Equal(got, want) {
+		t.Errorf("items = %v, want %v", got, want)
+	}
+	var blocked []any
+	for _, it := range r.json["items"].([]any) {
+		if item := it.(map[string]any); item["status"] == "blocked" {
+			blocked = append(blocked, item["username"])
+		}
+	}
+	if !slices.Equal(blocked, []any{"mallory"}) {
+		t.Errorf("blocked items = %v, want mallory alone", blocked)
+	}
+	// Pages of 3 split mallory from the user created at the same instant.
+	if got, _ := h.walk("/api/v1/users?include_blocked=true", admin, 3); !slices.Equal(got, want) {
+		t.Errorf("pages of 3 = %v, want %v", got, want)
+	}
+}
+
+func TestGetUser_AnswersAnActiveOrABlockedUser(t *testing.T) {
+	t.Parallel()
+	h := newTeamHub(t)
+	mallory := h.createUser("mallory", identity.RoleUser)
+	h.setStatus(mallory.ID, identity.StatusBlocked)
+	for _, c := range []struct{ username, status string }{{"alice", "active"}, {"mallory", "blocked"}} {
+		t.Run(c.username, func(t *testing.T) {
+			r := h.get("/api/v1/users/"+c.username, h.admin)
+			if r.status != http.StatusOK {
+				t.Fatalf("GET /users/%s = %d %s, want 200", c.username, r.status, r.body)
+			}
+			if got := slices.Sorted(maps.Keys(r.json)); !slices.Equal(got, userMembers) {
+				t.Errorf("members = %v, want %v", got, userMembers)
+			}
+			if r.json["username"] != c.username || r.json["status"] != c.status {
+				t.Errorf("user = %s, want %s with status %s", r.body, c.username, c.status)
+			}
+		})
+	}
+}
+
+func TestUpdateUser_StoresTheFullNameAndTheTimeOfTheChange(t *testing.T) {
+	t.Parallel()
+	h := newTeamHub(t)
+	// In order: the empty string clears the name the first case set.
+	for _, fullName := range []string{"Alice B.", ""} {
+		t.Run(fmt.Sprintf("%q", fullName), func(t *testing.T) {
+			h.advance(time.Hour)
+			r := h.call(http.MethodPatch, "/api/v1/users/alice", h.ka, map[string]any{"full_name": fullName})
+			if r.status != http.StatusOK {
+				t.Fatalf("PATCH /users/alice = %d %s, want 200", r.status, r.body)
+			}
+			if r.json["id"] != h.alice.ID || r.json["full_name"] != fullName {
+				t.Errorf("user = %s, want alice with the full name %q", r.body, fullName)
+			}
+			if want := h.now().Format(time.RFC3339); r.json["updated_at"] != want {
+				t.Errorf("updated_at = %v, want %s", r.json["updated_at"], want)
+			}
+			if got := h.get("/api/v1/users/alice", h.admin).json; !reflect.DeepEqual(got, r.json) {
+				t.Errorf("GET /users/alice = %v, want %v", got, r.json)
+			}
+		})
+	}
+}
+
+func TestUpdateUser_RejectsABodyWithoutAFullNameString(t *testing.T) {
+	t.Parallel()
+	h := newTeamHub(t)
+	for name, body := range map[string]any{
+		"no full_name":       map[string]any{},
+		"full_name a number": map[string]any{"full_name": 5},
+		"full_name null":     map[string]any{"full_name": nil},
+	} {
+		t.Run(name, func(t *testing.T) {
+			before := h.get("/api/v1/users/alice", h.admin).json
+			r := h.call(http.MethodPatch, "/api/v1/users/alice", h.admin, body)
+			if r.status != http.StatusBadRequest || r.errorField("error_type") != "invalid_request" {
+				t.Errorf("answer = %d %s, want 400 invalid_request", r.status, r.body)
+			}
+			if got := h.get("/api/v1/users/alice", h.admin).json; !reflect.DeepEqual(got, before) {
+				t.Errorf("GET /users/alice = %v, want %v", got, before)
+			}
+		})
+	}
+}
+
+func TestUserSelectors_ReachTheSameUserByIdEmailOrUsername(t *testing.T) {
+	t.Parallel()
+	h := newTeamHub(t)
+	id := h.alice.ID
+	for _, rt := range userSelectorRoutes {
+		for _, sel := range []string{id, "alice@example.com", "alice"} {
+			path := strings.ReplaceAll(rt.path, ":user", sel)
+			t.Run(rt.method+" "+path, func(t *testing.T) {
+				r := h.call(rt.method, path, h.admin, rt.body)
+				if r.status != http.StatusOK || r.json["id"] != id {
+					t.Fatalf("answer = %d %s, want 200 with alice's id %s", r.status, r.body, id)
+				}
+				if rt.method != http.MethodGet {
+					return
+				}
+				if want := h.get("/api/v1/users/"+id, h.admin).json; !reflect.DeepEqual(r.json, want) {
+					t.Errorf("user = %v, want %v", r.json, want)
+				}
+			})
+		}
+	}
+}
+
+func TestUserSelectors_AnswerNotFoundForNoUserAndChangeNothing(t *testing.T) {
+	t.Parallel()
+	h := newTeamHub(t)
+	selectors := map[string]string{
+		"a random UUID":            uuid.NewV4().String(),
+		"an unknown e-mail":        "nobody@example.com",
+		"an unknown username":      "nobody",
+		"a username in other case": "ALICE",
+		"an e-mail in upper case":  "ALICE@EXAMPLE.COM",
+	}
+	for _, rt := range userSelectorRoutes {
+		for name, sel := range selectors {
+			t.Run(rt.method+" "+rt.path+"/"+name, func(t *testing.T) {
+				before := h.snapshot()
+				r := h.call(rt.method, strings.ReplaceAll(rt.path, ":user", sel), h.admin, rt.body)
+				checkRefusal(t, "answer", r, http.StatusNotFound, "not_found", "user not found")
+				if h.snapshot() != before {
+					t.Errorf("the store changed")
+				}
+			})
+		}
+	}
 }

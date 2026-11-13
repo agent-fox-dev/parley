@@ -636,8 +636,9 @@ The service's routes are, so far, the public `GET /auth/providers` (see
 [api.md](api.md#get-apiv1authproviders)), the public `POST
 /auth/callback` (see [api.md](api.md#post-apiv1authcallback)), which is not
 a create route, the admin route `POST /users` (see
-[api.md](api.md#post-apiv1users)), a create route, and the caller's own
-profile, `GET /user` and `PATCH /user` (see
+[api.md](api.md#post-apiv1users)), a create route, the admin routes `GET /users`, `GET /users/:id`
+and `PATCH /users/:id` (see [api.md](api.md#get-apiv1users)), and the
+caller's own profile, `GET /user` and `PATCH /user` (see
 [api.md](api.md#get-apiv1user)), which need a user.
 `(*identity.Service).Routes()` in `internal/identity/routes.go` returns
 them all: it appends the route list of each handlers file, such as
@@ -794,6 +795,23 @@ a JSON string, else `400 invalid_request`. It then calls
 `(*store.Store).Tx`, with `CreatedAt` from `Deps.Now`, answers its
 `ErrConflict` `409 conflict` with the error's text, and answers `201` with
 the User object. It never promotes: the first-admin rule is the login's.
+
+`identity.UserBySelector(ctx, q, sel)` in `internal/identity/users.go`
+resolves a user selector by its shape alone: a value of 36 characters that
+the standard library's `uuid.Parse` accepts is looked up as the `id`, any
+other value with an `@` as the `email`, and every other value as the
+`username`, each with SQLite's default binary comparison, so exactly. It
+returns `identity.ErrNotFound` without trying another column, and the
+handlers answer that `404 not_found` with the message `user not found`.
+`GET /users/:id` reads through the store's `*sql.DB`; `PATCH /users/:id`
+reads the body first, with the rule of `PATCH /user` (`fullNameOf` in
+`handlers_users.go`), then resolves the selector and calls `updateFullName`
+in the same `(*store.Store).Tx`. `GET /users` reads one page with
+`listUsers(ctx, q, includeBlocked, after, limit)` in `users.go`: `status =
+'active'` unless the query parameter `include_blocked` is exactly `true`,
+`ORDER BY created_at DESC, id DESC`, continuing after the position
+`{created_at in nanoseconds, id}` that the cursor of `server.ReadPage`
+carries, and writes it with `server.WritePage`.
 
 `GET /user` and `PATCH /user`, in `internal/identity/handlers_user.go`,
 carry the mark `identity.MarkNeedsUser` and declare the scopes `users:read`

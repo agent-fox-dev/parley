@@ -20,6 +20,9 @@ type adminRoute struct {
 // adminRoutes are every admin route of the identity service.
 var adminRoutes = []adminRoute{
 	{http.MethodPost, "/api/v1/users", newUserBody("zed")},
+	{http.MethodGet, "/api/v1/users", nil},
+	{http.MethodGet, "/api/v1/users/:user", nil},
+	{http.MethodPatch, "/api/v1/users/:user", map[string]any{"full_name": "x"}},
 }
 
 // newUserBody is a POST /users body for a user no team hub has.
@@ -69,22 +72,34 @@ func TestAdminCheck_PassesTheAdminTokenAndAnAdminsAPIKeyByTheRoleOfTheMoment(t *
 	t.Parallel()
 	h := newTeamHub(t)
 	n := 0
-	create := func(caller string) response {
-		n++
-		return h.call(http.MethodPost, "/api/v1/users", caller, newUserBody(fmt.Sprintf("probe%d", n)))
+	// probes are admin routes with the status each answers an admin.
+	probes := []struct {
+		route string
+		do    func(caller string) response
+		want  int
+	}{
+		{"GET /users", func(caller string) response { return h.get("/api/v1/users", caller) }, http.StatusOK},
+		{"POST /users", func(caller string) response {
+			n++
+			return h.call(http.MethodPost, "/api/v1/users", caller, newUserBody(fmt.Sprintf("probe%d", n)))
+		}, http.StatusCreated},
 	}
-	for name, caller := range map[string]string{"admin token": h.admin, "API key of an admin": h.ka} {
-		if r := create(caller); r.status != http.StatusCreated {
-			t.Errorf("%s: POST /users = %d %s, want 201", name, r.status, r.body)
+	passes := func(what, caller string) {
+		t.Helper()
+		for _, p := range probes {
+			if r := p.do(caller); r.status != p.want {
+				t.Errorf("%s: %s = %d %s, want %d", what, p.route, r.status, r.body, p.want)
+			}
 		}
 	}
+	passes("admin token", h.admin)
+	passes("API key of an admin", h.ka)
 	h.setRole(h.root.ID, identity.RoleUser)
-	checkRefusal(t, "API key of a demoted admin", create(h.ka), http.StatusForbidden, "forbidden", "this route needs an admin")
-	if r := create(h.admin); r.status != http.StatusCreated {
-		t.Errorf("admin token after the demotion: POST /users = %d %s, want 201", r.status, r.body)
+	for _, p := range probes {
+		checkRefusal(t, "API key of a demoted admin: "+p.route, p.do(h.ka), http.StatusForbidden, "forbidden",
+			"this route needs an admin")
 	}
+	passes("admin token after the demotion", h.admin)
 	h.setRole(h.alice.ID, identity.RoleAdmin)
-	if r := create(h.ku); r.status != http.StatusCreated {
-		t.Errorf("API key of a promoted user: POST /users = %d %s, want 201", r.status, r.body)
-	}
+	passes("API key of a promoted user", h.ku)
 }

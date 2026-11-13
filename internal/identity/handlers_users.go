@@ -17,8 +17,14 @@ var adminMark = map[string]string{MarkAdmin: "true"}
 func (s *Service) userRoutes() []server.Route {
 	return []server.Route{
 		{Method: http.MethodPost, Pattern: "/users", Create: true, Marks: adminMark, Handler: s.createUser},
+		{Method: http.MethodGet, Pattern: "/users", Marks: adminMark, Handler: s.listUsers},
+		{Method: http.MethodGet, Pattern: "/users/:id", Marks: adminMark, Handler: s.getUser},
+		{Method: http.MethodPatch, Pattern: "/users/:id", Marks: adminMark, Handler: s.updateUser},
 	}
 }
+
+// errUserNotFound answers a selector that names no user.
+func errUserNotFound() error { return server.NotFound("user not found") }
 
 // createUser answers POST /users: it creates an active user with the role
 // user, the user's personal org and the membership, in one transaction, and
@@ -62,6 +68,91 @@ func (s *Service) createUser(w http.ResponseWriter, r *http.Request) error {
 	}
 	server.WriteJSON(w, http.StatusCreated, u)
 	return nil
+}
+
+// listUsers answers GET /users: a page of the users, newest first, the
+// active ones only unless include_blocked is exactly "true".
+func (s *Service) listUsers(w http.ResponseWriter, r *http.Request) error {
+	page, err := server.ReadPage(r)
+	if err != nil {
+		return err
+	}
+	var pos userPosition
+	hasAfter, err := page.After(&pos)
+	if err != nil {
+		return err
+	}
+	after := &pos
+	if !hasAfter {
+		after = nil
+	}
+	includeBlocked := r.URL.Query().Get("include_blocked") == "true"
+	users, err := listUsers(r.Context(), s.deps.Store.Main(), includeBlocked, after, page.Limit+1)
+	if err != nil {
+		return err
+	}
+	return server.WritePage(w, page, users, func(u User) any {
+		return userPosition{CreatedAt: u.CreatedAt.UnixNano(), ID: u.ID}
+	})
+}
+
+// getUser answers GET /users/:id with the User object of the user the
+// selector names, active or blocked.
+func (s *Service) getUser(w http.ResponseWriter, r *http.Request) error {
+	u, err := UserBySelector(r.Context(), s.deps.Store.Main(), server.Param(r, "id"))
+	if errors.Is(err, ErrNotFound) {
+		return errUserNotFound()
+	}
+	if err != nil {
+		return err
+	}
+	server.WriteJSON(w, http.StatusOK, u)
+	return nil
+}
+
+// updateUser answers PATCH /users/:id: it stores the body's full_name, by
+// the rule of PATCH /user, as the full name of the user the selector names,
+// with updated_at the time of the change, and answers 200 with the updated
+// User object. The body is checked before the user is looked up.
+func (s *Service) updateUser(w http.ResponseWriter, r *http.Request) error {
+	fullName, err := fullNameOf(r)
+	if err != nil {
+		return err
+	}
+	var u User
+	err = s.deps.Store.Tx(r.Context(), func(tx *sql.Tx) error {
+		target, err := UserBySelector(r.Context(), tx, server.Param(r, "id"))
+		if err != nil {
+			return err
+		}
+		u, err = updateFullName(r.Context(), tx, target.ID, fullName, s.deps.Now())
+		return err
+	})
+	if errors.Is(err, ErrNotFound) {
+		return errUserNotFound()
+	}
+	if err != nil {
+		return err
+	}
+	server.WriteJSON(w, http.StatusOK, u)
+	return nil
+}
+
+// fullNameOf reads a profile update's body: a JSON object whose member
+// full_name is required and a JSON string, the empty string included.
+func fullNameOf(r *http.Request) (string, error) {
+	var body map[string]json.RawMessage
+	if err := server.DecodeJSON(r, &body); err != nil {
+		return "", err
+	}
+	fullName, present, err := stringMember(body, "full_name")
+	if err != nil {
+		return "", err
+	}
+	if !present {
+		return "", server.InvalidRequest("full_name is required")
+	}
+	return fullName, nil
 }
 
 // stringMember returns the member name of a decoded JSON object and whether

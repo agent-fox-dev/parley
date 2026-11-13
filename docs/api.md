@@ -629,7 +629,29 @@ whatever it names, and changes nothing. The role is read from the store on
 every request: an API key whose user loses the role `admin` is refused from
 its next request on, and one whose user gains it passes.
 
-The admin routes so far: `POST /api/v1/users`.
+The admin routes so far: `POST /api/v1/users`, `GET /api/v1/users`,
+`GET /api/v1/users/{id}` and `PATCH /api/v1/users/{id}`.
+
+## User selectors
+
+A route with a user in its path, `/api/v1/users/{id}`, takes any of the
+user's three names there, and its shape alone decides which one it is:
+
+| Value | Looked up as |
+|---|---|
+| a UUID in its hyphenated form, 36 characters (`0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d`) | the user's `id`, and nothing else |
+| any other value with an `@` (`alice@example.com`) | the user's `email`, and nothing else |
+| every other value (`alice`) | the user's `username` |
+
+The comparison is exact, letter case included: `ALICE` does not name
+`alice`. No second lookup is tried, so a user whose username has the form of
+a UUID or holds an `@` is named by the id or the e-mail. A value that names
+no user is answered `404` `not_found` with the message `user not found`,
+and nothing changes:
+
+```json
+{"error":{"code":404,"message":"user not found","error_type":"not_found"}}
+```
 
 ## `POST /api/v1/users`
 
@@ -676,4 +698,60 @@ The User object has exactly `id`, `username`, `email`, `full_name`, `role`,
 
 ```json
 {"id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","username":"carol","email":"carol@example.com","full_name":"Carol C","role":"user","status":"active","provider":"github","provider_id":"1","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}
+```
+
+## `GET /api/v1/users`
+
+Lists the users, a [list](#lists) in the standard pages. An admin route
+(see [Admin routes](#admin-routes)).
+
+The list holds the users with the status `active`, newest first:
+`created_at` descending, then `id` descending. With the query parameter
+`include_blocked=true` it holds the blocked users too, in the same order;
+any other value, such as `1`, `yes` or `TRUE`, is the same as none. A
+`cursor` belongs to its value of `include_blocked`.
+
+| Status | When |
+|---|---|
+| `200 OK` | the body is a page: `items` are User objects |
+| `400` `invalid_request` | a bad `limit` or `cursor` (see [Lists](#lists)) |
+| `403` `forbidden` | the caller is not an admin (see [Admin routes](#admin-routes)) |
+
+```json
+{"items":[{"id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","username":"alice","email":"alice@example.com","full_name":"","role":"user","status":"active","provider":"github","provider_id":"alice","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}],"next_cursor":null}
+```
+
+## `GET /api/v1/users/{id}`
+
+Answers the User object of the user `{id}` names (see
+[User selectors](#user-selectors)), active or blocked. An admin route (see
+[Admin routes](#admin-routes)).
+
+| Status | When |
+|---|---|
+| `200 OK` | the body is the User object; a blocked user has the `status` `blocked` |
+| `403` `forbidden` | the caller is not an admin (see [Admin routes](#admin-routes)) |
+| `404` `not_found` | no user has that id, e-mail or username (`user not found`) |
+
+## `PATCH /api/v1/users/{id}`
+
+Sets the `full_name` of the user `{id}` names (see
+[User selectors](#user-selectors)). An admin route (see
+[Admin routes](#admin-routes)).
+
+The body follows the rule of [`PATCH /api/v1/user`](#patch-apiv1user): a
+JSON object with the member `full_name`, required, a string; the empty
+string clears the name, and other members are ignored. The body is checked
+before the user is looked up. The hub stores the string, sets `updated_at`
+to the time of the change and answers the updated User object.
+
+| Status | When |
+|---|---|
+| `200 OK` | the name was stored; the body is the updated User object |
+| `400` `invalid_request` | `full_name` is missing (`full_name is required`) or is not a JSON string, `null` included (`full_name must be a string`); or the body is not a JSON object. The user is unchanged. |
+| `403` `forbidden` | the caller is not an admin (see [Admin routes](#admin-routes)) |
+| `404` `not_found` | no user has that id, e-mail or username (`user not found`) |
+
+```json
+{"full_name":"Alice B."}
 ```
