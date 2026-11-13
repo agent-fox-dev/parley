@@ -221,11 +221,13 @@ the route (the method, one space and the concrete `r.URL.Path`, such as
 1. takes the per-record gate for that identity (below);
 2. finds the record; one whose `WrittenAt` is 24 hours or more before
    `Options.Now()` is treated as absent. A valid record with the SHA-256 of
-   the buffered request body is replayed as `200` with its body and
-   `Content-Type: application/json; charset=utf-8`; one with another hash is
-   `409 conflict`, and the record is left as it is;
+   the buffered request body is replayed as `200` with its `Header` and its
+   body; one with another hash is `409 conflict`, and the record is left as
+   it is;
 3. otherwise runs the handler through a writer that passes the response
-   through unchanged and keeps a copy of its status and body (it has
+   through unchanged and keeps a copy of its status, its body and the
+   headers the handler set before it answered: those it added or changed,
+   without `Content-Length`, since the recorded body can be shorter (it has
    `Unwrap()`, so the status-capturing writer of the headers middleware below
    it and `http.ResponseController` keep working);
 4. when the handler returned no error and answered `2xx`, removes the route's
@@ -258,6 +260,7 @@ type IdempotencyRecord struct {
 	Route       string            // "POST /api/v1/..." with the concrete path
 	RequestHash [sha256.Size]byte // SHA-256 of the request body's bytes
 	Body        []byte            // the response body without its show-once members
+	Header      http.Header       // the headers the handler set, without Content-Length
 	WrittenAt   time.Time         // the server's clock when written
 }
 ```
@@ -267,7 +270,9 @@ type IdempotencyRecord struct {
   expired record that is not deleted yet; the server decides from
   `WrittenAt` and never replays it.
 - `Write` stores the record, replacing any record with the same `Key`,
-  `Caller` and `Route` (a key whose record expired is recorded anew).
+  `Caller` and `Route` (a key whose record expired is recorded anew). A
+  store keeps every field, `Header` too: a replay sends only the headers
+  the record holds.
 - `DeleteExpired` removes every record whose `WrittenAt` is at or before
   `cutoff`, that is, every record 24 hours old or older.
 - An error from `Find` ends the request as `500 internal`; an error from

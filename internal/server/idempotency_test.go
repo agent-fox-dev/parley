@@ -211,6 +211,76 @@ func TestIdempotency_OmitsShowOnceMembersFromAReplay(t *testing.T) {
 	}
 }
 
+func TestIdempotency_ReplaysTheHeadersTheHandlerSet(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name        string
+		showOnce    string
+		contentType string
+		body        string
+		wantBody    string
+	}{
+		{"JSON answer with a Location", "", contentTypeJSON, `{"id":"1"}`, `{"id":"1"}`},
+		{"answer that is not JSON", "", "text/plain; charset=utf-8", "created 1", "created 1"},
+		{"answer whose show-once member is removed", "token", contentTypeJSON, `{"id":"1","token":"secret-1"}`, "{\"id\":\"1\"}\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := newCreateFixture()
+			rt := Route{
+				Method: http.MethodPost, Pattern: "/things", Create: true,
+				Handler: func(w http.ResponseWriter, _ *http.Request) error {
+					f.calls.Add(1)
+					w.Header().Set("Content-Type", tc.contentType)
+					w.Header().Set("Location", "/api/v1/things/1")
+					w.Header().Set("Content-Length", strconv.Itoa(len(tc.body)))
+					w.WriteHeader(http.StatusCreated)
+					_, _ = w.Write([]byte(tc.body))
+					w.Header().Set("X-Too-Late", "not sent")
+					return nil
+				},
+			}
+			if tc.showOnce != "" {
+				rt.ShowOnce = []string{tc.showOnce}
+			}
+			f.s.Register(rt)
+
+			first := f.post("/api/v1/things", "Bearer u1", `{}`, "k")
+			replay := f.post("/api/v1/things", "Bearer u1", `{}`, "k")
+
+			if first.Code != http.StatusCreated {
+				t.Fatalf("first status = %d, want 201 (body %s)", first.Code, first.Body.Bytes())
+			}
+			if replay.Code != http.StatusOK {
+				t.Fatalf("replay status = %d, want 200 (body %s)", replay.Code, replay.Body.Bytes())
+			}
+			if got := replay.Body.String(); got != tc.wantBody {
+				t.Errorf("replay body = %q, want %q", got, tc.wantBody)
+			}
+			h := replay.Header()
+			if got := h.Get("Content-Type"); got != tc.contentType {
+				t.Errorf("replay Content-Type = %q, want the handler's %q", got, tc.contentType)
+			}
+			if got := h.Get("Location"); got != "/api/v1/things/1" {
+				t.Errorf("replay Location = %q, want the handler's /api/v1/things/1", got)
+			}
+			if got := h.Get("Content-Length"); got != "" && got != strconv.Itoa(len(tc.wantBody)) {
+				t.Errorf("replay Content-Length = %s, want none or the replayed body's %d", got, len(tc.wantBody))
+			}
+			if got := h.Get("X-Too-Late"); got != "" {
+				t.Errorf("replay X-Too-Late = %q, want none: the handler set it after answering", got)
+			}
+			if got, orig := h.Get("X-Request-ID"), first.Header().Get("X-Request-ID"); got == "" || got == orig {
+				t.Errorf("replay X-Request-ID = %q, want its own id, not the first request's %q", got, orig)
+			}
+			if n := f.calls.Load(); n != 1 {
+				t.Errorf("handler ran %d times, want 1", n)
+			}
+		})
+	}
+}
+
 func TestIdempotency_RefusesTheSameKeyWithAnotherBody(t *testing.T) {
 	t.Parallel()
 	f := newCreateFixture()

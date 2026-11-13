@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"maps"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -42,6 +43,9 @@ type IdempotencyRecord struct {
 	// Body is the response body the handler answered, without the route's
 	// show-once members.
 	Body []byte
+	// Header is the response headers the handler set before it answered,
+	// such as Content-Type and Location, without Content-Length.
+	Header http.Header
 	// WrittenAt is when the record was written, by the server's clock.
 	WrittenAt time.Time
 }
@@ -83,12 +87,14 @@ func (m *MemoryIdempotencyStore) Find(_ context.Context, key, caller, route stri
 	defer m.mu.Unlock()
 	rec, ok := m.records[recordKey{key, caller, route}]
 	rec.Body = bytes.Clone(rec.Body)
+	rec.Header = rec.Header.Clone()
 	return rec, ok, nil
 }
 
 // Write stores rec, replacing any record with the same key, caller and route.
 func (m *MemoryIdempotencyStore) Write(_ context.Context, rec IdempotencyRecord) error {
 	rec.Body = bytes.Clone(rec.Body)
+	rec.Header = rec.Header.Clone()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.records[recordKey{rec.Key, rec.Caller, rec.Route}] = rec
@@ -175,24 +181,29 @@ func (s *Server) serveCreate(w http.ResponseWriter, r *http.Request, rt Route) e
 		if rec.RequestHash != hash {
 			return Conflict("Idempotency-Key was already used with a different request body")
 		}
-		w.Header().Set("Content-Type", contentTypeJSON)
+		h := w.Header()
+		for name, values := range rec.Header {
+			h[name] = slices.Clone(values)
+		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(rec.Body)
 		return nil
 	}
 
-	cw := &captureWriter{ResponseWriter: w}
+	cw := newCaptureWriter(w)
 	if err := rt.Handler(cw, r); err != nil {
 		return err
 	}
-	if cw.status() < 200 || cw.status() > 299 {
+	// A handler that wrote nothing answers 200 with the headers it set.
+	cw.answer(http.StatusOK)
+	if cw.code < 200 || cw.code > 299 {
 		return nil
 	}
 	stored, err := removeMembers(cw.body.Bytes(), rt.ShowOnce)
 	if err == nil {
 		err = s.writeRecord(r.Context(), IdempotencyRecord{
 			Key: id.key, Caller: id.caller, Route: id.route,
-			RequestHash: hash, Body: stored, WrittenAt: now,
+			RequestHash: hash, Body: stored, Header: cw.header, WrittenAt: now,
 		})
 	}
 	if err != nil {
@@ -267,24 +278,48 @@ func removeMember(object []byte, path []string) ([]byte, error) {
 }
 
 // captureWriter passes a handler's response through unchanged and keeps a
-// copy of its status and body, for the record.
+// copy of its status, the headers it set and its body, for the record.
 type captureWriter struct {
 	http.ResponseWriter
-	code int
-	body bytes.Buffer
+	code   int
+	before http.Header // the response headers before the handler ran
+	header http.Header // the headers the handler set, once it answered
+	body   bytes.Buffer
+}
+
+func newCaptureWriter(w http.ResponseWriter) *captureWriter {
+	return &captureWriter{ResponseWriter: w, before: w.Header().Clone()}
+}
+
+// answer records the status and the headers the handler set, the first time
+// it is called: headers set after that are not sent.
+func (w *captureWriter) answer(status int) {
+	if w.code != 0 {
+		return
+	}
+	w.code = status
+	for name, values := range w.ResponseWriter.Header() {
+		// The replayed body can be shorter than the one answered, once its
+		// show-once members are removed.
+		if name == "Content-Length" || slices.Equal(w.before[name], values) {
+			continue
+		}
+		if w.header == nil {
+			w.header = make(http.Header)
+		}
+		w.header[name] = slices.Clone(values)
+	}
 }
 
 func (w *captureWriter) WriteHeader(status int) {
-	if w.code == 0 && status >= 200 {
-		w.code = status
+	if status >= 200 {
+		w.answer(status)
 	}
 	w.ResponseWriter.WriteHeader(status)
 }
 
 func (w *captureWriter) Write(b []byte) (int, error) {
-	if w.code == 0 {
-		w.code = http.StatusOK
-	}
+	w.answer(http.StatusOK)
 	w.body.Write(b)
 	return w.ResponseWriter.Write(b)
 }
@@ -293,15 +328,6 @@ func (w *captureWriter) Write(b []byte) (int, error) {
 // below.
 func (w *captureWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
-}
-
-// status is the handler's status: 200 when it wrote nothing, as net/http then
-// sends.
-func (w *captureWriter) status() int {
-	if w.code == 0 {
-		return http.StatusOK
-	}
-	return w.code
 }
 
 // keyGate lets one request at a time hold a record key. Each key has its own
