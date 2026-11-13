@@ -237,7 +237,9 @@ is sent.
 - "The same body" means the same bytes: a body with the members in another
   order or with other white space is another body.
 - A replay answers `200`, not the original `201` or `202`, with the
-  original body and `Content-Type: application/json; charset=utf-8`.
+  original body and the headers the original answer set, such as its
+  `Content-Type` and `Location`. Its `X-Request-ID` and every other header
+  the hub stamps on each response are the replay's own.
 - Only a `2xx` answer is recorded. After a `400`, `409`, `500` or any other
   failure, from the handler or from a check, the same key runs the handler
   again.
