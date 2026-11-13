@@ -1005,8 +1005,9 @@ opens the sign-in page, by default the system's opener in
 `internal/cli/browser.go`; and `Hooks.LoginWait`, how long the browser login
 waits for the redirect, by default 120 s). It builds a fresh cobra
 command tree on each call: the root command `parley` with the persistent
-global flags `--endpoint-url`, `--api-key` and `--json`, and the `help`,
-`version` and `login` subcommands, plus the commands the unexported `options.extra`
+global flags `--endpoint-url`, `--api-key` and `--json`, the `help`,
+`version` and `login` subcommands and the groups `user`, `orgs` and `admin`,
+plus the commands the unexported `options.extra`
 builds, which tests use to add probe commands. It executes the tree with the
 arguments; when a command returns an error, `run` writes it to stderr with
 `printError` and returns `exitCode(err)` (both in `internal/cli/errors.go`).
@@ -1032,6 +1033,16 @@ of its children as a `usage_error` (cobra alone would print the help); the
 root is a group too, and its flag error handler turns every flag that is
 unknown or does not parse, on any command, into a `usage_error`.
 `parley version` and `parley login` are declared through `declare`.
+
+The commands of the user and organization routes are declarations without
+client code of their own: `parley user` (`internal/cli/user.go`), `parley
+orgs` (`orgs.go`) and `parley admin users` (`admin_users.go`), the last in
+the group `parley admin` that `newAdminCommand` in `root.go` builds. Those
+that only call their route use the default run step; a command whose
+request carries a query or a body (`--include-blocked`, `--full-name`, the
+flags of `parley admin users create`) has a run step that builds them from
+its flags and sends them with `sendWith` (`user.go`), the default run step
+with a query and a body.
 
 Help lives in `internal/cli/help.go`. `installHelp` keeps cobra's own text
 help, sets the root's help function, which `--help` on any command and a

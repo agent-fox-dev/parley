@@ -120,9 +120,15 @@ func newRootCommand(opts options) *cobra.Command {
 	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return usageError("%v", err) })
 
 	installHelp(root)
-	root.AddCommand(newVersionCommand(), newLoginCommand())
+	root.AddCommand(newVersionCommand(), newLoginCommand(), newUserCommand(), newOrgsCommand(), newAdminCommand())
 	for _, build := range opts.extra {
 		root.AddCommand(build())
 	}
 	return root
+}
+
+// newAdminCommand builds parley admin: the commands of the routes only an
+// admin may call.
+func newAdminCommand() *cobra.Command {
+	return group("admin", "Administer the hub's users and organizations", newAdminUsersCommand())
 }
