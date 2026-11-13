@@ -121,7 +121,8 @@ the file and exits `1`. While the file is there, a start without
 5. it binds `[server].bind`:`[server].port`;
 6. it starts the maintenance loop in the background, without waiting for
    its first pass: one pass at once and one every hour, each running the
-   registered maintenance tasks one after the other;
+   registered maintenance tasks one after the other; and it starts the
+   background work the hub's parts registered;
 7. it writes the `listening` line and serves.
 
 A failure in stages 1 to 5 writes exactly one error line to stderr, closes
@@ -189,6 +190,14 @@ again in the next hourly pass:
 {"time":"2026-11-13T10:13:00.000000+01:00","level":"ERROR","msg":"maintenance task failed","task":"claim_cleanup","error":"remove claim: database is locked"}
 ```
 
+When a stop stops waiting for something whose grace or the 30-second limit
+has passed, it writes one line naming it in `work`: `requests`,
+`maintenance loop` or the name of a piece of background work:
+
+```json
+{"time":"2026-11-13T14:02:31.401227+01:00","level":"WARN","msg":"abandoned at the stop","work":"event_streams"}
+```
+
 When the start fails before listening it writes one line and exits `1`.
 The line is `cannot start` with the cause in `error`, which names the
 configuration key, the path, the schema step, the admin token file or the
@@ -206,13 +215,18 @@ When it cannot bind the address the line is `cannot listen`:
 
 ### Signals
 
-On `SIGTERM` or `SIGINT` `parleyd` stops accepting connections, lets the
-requests in flight finish for up to 15 seconds, closes the connections of the
-requests that are still running after that, cancels the running
-maintenance task and starts no further one, waits up to 15 seconds for it
-to end, closes the stores
-and exits `0`. A further signal
-during the stop changes nothing.
+On `SIGTERM` or `SIGINT` `parleyd` stops accepting connections, tells the
+handlers of long-lived responses to end them, cancels the running
+maintenance task (and starts no further one) and every piece of background
+work the hub's parts registered, and then waits for all of them at the same
+time: up to 15 seconds for the requests in flight, after which it closes
+their connections, up to 15 seconds for the maintenance loop, and for each
+piece of background work up to its own grace (at most 30 seconds). It waits
+for nothing longer than 30 seconds after the signal. Then it closes the
+stores and exits `0`, also when a grace passed; what it stopped waiting for
+is logged (see [Log lines](#log-lines)). With nothing in flight it exits at
+once. A further `SIGTERM` or `SIGINT` during the stop changes nothing: no
+grace starts again and the process does not exit early.
 
 ### Exit statuses
 

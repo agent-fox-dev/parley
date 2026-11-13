@@ -217,6 +217,14 @@ func TestRun_StopsTheStartAtTheFirstFailingStage(t *testing.T) {
 				hooks(row)(c)
 			}}
 		}},
+		{"background work registered twice", "data", func(t *testing.T, row string) arrangement {
+			return arrangement{dir: workDir(t, localConfig), want: "event_streams", compose: func(c *hub.Composition) {
+				noop := func(context.Context, *hub.Runtime) {}
+				c.AddBackgroundWork("event_streams", time.Second, noop)
+				c.AddBackgroundWork("event_streams", time.Second, noop)
+				hooks(row)(c)
+			}}
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

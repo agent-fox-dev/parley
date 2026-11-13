@@ -184,12 +184,19 @@ func startHub(t *testing.T, opts hub.Options) *running {
 func (r *running) stop(t *testing.T) int {
 	t.Helper()
 	r.cancel()
+	return r.wait(t, 5*time.Second)
+}
+
+// wait returns Run's exit status, failing the test when Run has not
+// returned within the given time.
+func (r *running) wait(t *testing.T, within time.Duration) int {
+	t.Helper()
 	select {
 	case code := <-r.code:
 		r.code <- code // the cleanup reads it again
 		return code
-	case <-time.After(5 * time.Second):
-		t.Fatal("Run did not return within 5 s of its context's cancellation")
+	case <-time.After(within):
+		t.Fatalf("Run did not return within %v", within)
 		return -1
 	}
 }

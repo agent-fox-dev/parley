@@ -54,6 +54,11 @@ every string value of a log line is at most 1024 bytes, the `stack` of the
   maintenance task has recorded its call, instead of reading the record at
   once: the pass runs in the background and may start a moment after the line
   is written. The order it asserts is the package's.
+- The check of the second signal during a stop runs in
+  `internal/hub/shutdown_test.go` through `hub.Run`, not through
+  `cmd/parleyd`'s `run`: a test in package `hub_test` cannot call package
+  `main`, and `run` only forwards the process's inputs to `hub.Run`, which
+  holds the signal handling, so the path the signals take is the same.
 - The check of the readiness probe obtains the stores from a start hook,
   which receives the hub's runtime, and closes one of them through
   `(*store.Store).Analytics()` or `(*store.Store).Main()`.

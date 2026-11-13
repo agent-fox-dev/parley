@@ -397,8 +397,11 @@ hub.Options)` returns the exit status. `Options` holds the process's inputs,
 `Stdout` and `Stderr`, and the fields tests set and `parleyd` leaves zero:
 `Compose` (parts added after the hub's own), `Port` (replaces
 `[server].port`), `Now` (the hub's clock), `RequestGrace` (replaces
-`hub.DefaultRequestGrace`, 15 seconds) and `MaintenanceInterval` (replaces
-`maintenance.Interval`, one hour, the time between two maintenance passes). `cmd/parleyd`'s `run(ctx, args, env,
+`hub.DefaultRequestGrace`, 15 seconds), `MaintenanceInterval` (replaces
+`maintenance.Interval`, one hour, the time between two maintenance passes),
+`StopLimit` (replaces `hub.DefaultStopLimit`, 30 seconds, the longest a stop
+waits) and `LoopGrace` (replaces `hub.DefaultLoopGrace`, 15 seconds, how long
+a stop waits for the maintenance loop). `cmd/parleyd`'s `run(ctx, args, env,
 wd, stdout, stderr)` builds the options and calls `Run`; `main` passes
 `os.Args[1:]`, `os.LookupEnv` and the working directory.
 
@@ -416,17 +419,21 @@ appends it there ([ADR 01](adr/01-compose-the-hub-in-one-package.md)).
 | `AddSchemaStep(store.Step)` | schema steps, applied in the order they were added |
 | `AddStartHook(name, func(ctx, *hub.Runtime) error)` | start work, run in order, each to completion |
 | `AddMaintenanceTask(name, func(ctx, *hub.Runtime) error)` | maintenance tasks (see [The maintenance loop](#the-maintenance-loop)) |
+| `AddBackgroundWork(name, grace, func(ctx, *hub.Runtime))` | work that runs while the hub serves, until its context is cancelled at the stop (see [The stop](#the-stop)) |
 | `AddRoute(server.Route)`, `Handle(pattern, handler)` | REST routes and surfaces outside the REST API |
 | `SetAuthenticator`, `SetBindingGuard`, `SetScopeCheck`, `AddAccessCheck` | the checks of the pipeline's positions |
 
 `hub.Runtime` holds the loaded `*config.Config`, the open `*store.Store`, the
-`*slog.Logger`, the `*scrub.Scrubber` and the clock `Now`. Start hooks and
-maintenance tasks receive it; a route handler or a check keeps
+`*slog.Logger`, the `*scrub.Scrubber` and the clock `Now`. Start hooks,
+maintenance tasks and background work receive it; a route handler or a check keeps
 `(*Composition).Runtime()`, which the hub fills once the stores are open and
 before the first hook runs or the first request is served. A start hook or a
 maintenance task without a name or a function, or with a name already
 registered, a configuration key or section the registry refuses, and a
-route the server refuses, stop the start before anything is opened.
+route the server refuses, stop the start before anything is opened; so does
+background work without a name or a function, or with a name already
+registered. `(*Composition).ShuttingDown()` returns the shutdown
+notification, a channel the hub closes once when the stop begins.
 
 ### The start
 
@@ -459,7 +466,9 @@ failure:
    listener, the request grace, the clock and the logger, and install the
    composition's routes and checks;
 9. start the maintenance loop in the background, without waiting for its
-   first pass (see [The maintenance loop](#the-maintenance-loop));
+   first pass (see [The maintenance loop](#the-maintenance-loop)), and each
+   piece of background work in a goroutine of its own, with one context
+   shared with the server and the loop;
 10. `Serve`, whose `OnListen` writes the `listening` line with `addr`,
     `config` (`cfg.Path`) and `data_dir` (`cfg.DataDir()`).
 
@@ -468,9 +477,35 @@ failure is the only line of a failed start. A failure before listening is
 one line at error level, `cannot start` with the cause in `error`, or
 `cannot listen` with `addr` and `error`; the stores are closed when they were
 open, and `Run` returns `1`. The first signal, or the cancellation of `ctx`,
-stops the server (see [Serving and stopping](#serving-and-stopping)); the
-maintenance loop's context is cancelled and it gets up to 15 seconds to end;
-the stores are closed last, and `Run` returns `0`.
+begins [the stop](#the-stop).
+
+### The stop
+
+`internal/hub/shutdown.go` stops the hub on the first `SIGTERM` or `SIGINT`,
+or when `Run`'s context is cancelled:
+
+1. it cancels the context the server, the maintenance loop and the
+   background work share, so the server closes its listener and stops
+   accepting connections (see [Serving and stopping](#serving-and-stopping)),
+   the loop starts no further task and cancels the running one, and every
+   piece of background work sees its context done;
+2. it closes the shutdown notification, before it waits for anything, so a
+   handler of a long-lived response that watches `ShuttingDown()` ends it
+   and the server need not wait out the request grace for it;
+3. it waits for everything at the same time: the server, which gives the
+   requests in flight the request grace and then closes their connections;
+   the maintenance loop, up to `LoopGrace`; each piece of background work,
+   up to its own grace, which `AddBackgroundWork` cuts to 30 seconds;
+4. it stops waiting for anything once `StopLimit` has passed since the
+   signal, and writes one `abandoned at the stop` warning, with `work`, for
+   each thing it stopped waiting for; abandoned work keeps running and finds
+   the stores closed;
+5. it closes the stores, last, and `Run` returns `0`, whether or not a grace
+   passed (`1` only when the server had failed while serving).
+
+The signal channel stays registered until `Run` returns and nothing reads it
+after the first signal, so a further signal is dropped: no grace starts
+again and the process does not end early.
 
 ### The maintenance loop
 

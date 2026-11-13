@@ -3,9 +3,10 @@
 // maintenance loop and serves until it is stopped, in that fixed order.
 //
 // It is the one place where the hub's packages plug in: each registers its
-// configuration keys, schema steps, start hooks, maintenance tasks, routes and
-// pipeline checks on a Composition, from a file of its own in this package
-// (see docs/adr/01-compose-the-hub-in-one-package.md).
+// configuration keys, schema steps, start hooks, background work,
+// maintenance tasks, routes and pipeline checks on a Composition, from a file
+// of its own in this package (see
+// docs/adr/01-compose-the-hub-in-one-package.md).
 package hub
 
 import (
@@ -33,9 +34,13 @@ import (
 // DefaultRequestGrace is how long in-flight requests get to finish on a stop.
 const DefaultRequestGrace = 15 * time.Second
 
-// maintenanceGrace is how long a stop waits for the maintenance loop to end
+// DefaultStopLimit is the longest a stop waits for anything, counted from
+// the signal; then the stores are closed and Run returns.
+const DefaultStopLimit = 30 * time.Second
+
+// DefaultLoopGrace is how long a stop waits for the maintenance loop to end
 // once its context is cancelled.
-const maintenanceGrace = 15 * time.Second
+const DefaultLoopGrace = 15 * time.Second
 
 // parts compose the hub's own packages, in this order, before
 // Options.Compose. A package that plugs into the hub writes its function in a
@@ -74,6 +79,12 @@ type Options struct {
 	// MaintenanceInterval replaces maintenance.Interval, the time between two
 	// maintenance passes, when it is not zero.
 	MaintenanceInterval time.Duration
+	// StopLimit replaces DefaultStopLimit, the longest a stop waits, when it
+	// is not zero.
+	StopLimit time.Duration
+	// LoopGrace replaces DefaultLoopGrace, how long a stop waits for the
+	// maintenance loop, when it is not zero.
+	LoopGrace time.Duration
 }
 
 // Runtime is what the hub hands the parts it runs: the loaded configuration,
@@ -112,12 +123,14 @@ type Composition struct {
 	bindingGuard  server.Check
 	scopeCheck    server.Check
 	accessChecks  []server.Check
+	works         []backgroundWork
 	runtime       *Runtime
+	shutdown      chan struct{}
 	errs          []error
 }
 
 func newComposition() *Composition {
-	return &Composition{registry: config.NewRegistry(), tasks: maintenance.NewRegistry(), runtime: &Runtime{}}
+	return &Composition{registry: config.NewRegistry(), tasks: maintenance.NewRegistry(), runtime: &Runtime{}, shutdown: make(chan struct{})}
 }
 
 // Runtime returns the runtime the hub fills once the stores are open, before
@@ -356,10 +369,16 @@ type run struct {
 // The start runs in this order and stops at the first failure: load the
 // configuration, open the stores, the bootstrap (which may end the run
 // after writing the admin token file), the start hooks in the order
-// they were added, bind the listener, start the maintenance loop, then write
-// the listening line and serve. A failure is one error line on Stderr; what
-// was opened is closed. The hub serves until ctx is cancelled or the process
-// receives SIGTERM or SIGINT.
+// they were added, bind the listener, start the maintenance loop and the
+// background work, then write the listening line and serve. A failure is one
+// error line on Stderr; what was opened is closed. The hub serves until ctx
+// is cancelled or the process receives SIGTERM or SIGINT. Then it stops
+// accepting connections, closes the shutdown notification (see
+// Composition.ShuttingDown), cancels the maintenance loop and the
+// background work, and waits for all of them and for the requests in flight
+// at the same time, each up to its grace and nothing beyond the stop limit;
+// it closes the stores last and returns 0. Further signals during the stop
+// change nothing.
 func Run(ctx context.Context, opts Options) int {
 	stdout, stderr := orDiscard(opts.Stdout), orDiscard(opts.Stderr)
 	cmd, status, ok := parseArgs(opts.Args, stdout, stderr)
@@ -446,23 +465,15 @@ func (r *run) start(ctx context.Context, c *Composition, cfg *config.Config, st 
 		}
 	}
 
-	serveCtx, stop := context.WithCancel(ctx)
-	defer stop()
 	// Registered before the bind, so that a signal that arrives once the
 	// listening line is out stops the hub rather than the process, and kept
-	// until Run returns, so that a second signal during the stop does not end
-	// the process either: signal.NotifyContext would restore the default
-	// action on the first one.
+	// until Run returns, so that a further signal during the stop does not
+	// end the process either: signal.NotifyContext would restore the default
+	// action on the first one. Nothing reads the channel after the first
+	// signal, so the later ones are dropped and change nothing.
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGTERM, os.Interrupt)
 	defer signal.Stop(signals)
-	go func() {
-		select {
-		case <-signals:
-			stop()
-		case <-serveCtx.Done():
-		}
-	}()
 
 	port := cfg.Server.Port
 	if r.opts.Port != nil {
@@ -495,16 +506,35 @@ func (r *run) start(ctx context.Context, c *Composition, cfg *config.Config, st 
 		return r.fail(err)
 	}
 
-	loopDone := r.startMaintenance(serveCtx, c.tasks)
-	err = srv.Serve(serveCtx)
-	stop()
+	// The maintenance loop, the background work and the server share one
+	// context, so that the stop cancels them at the same moment.
+	serveCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	waits := []wait{{"maintenance loop", r.startMaintenance(serveCtx, c.tasks), r.loopGrace()}}
+	waits = append(waits, startBackgroundWork(serveCtx, c.works, rt)...)
+	served := make(chan struct{})
+	var serveErr error
+	go func() {
+		defer close(served)
+		serveErr = srv.Serve(serveCtx)
+	}()
+
 	select {
-	case <-loopDone:
-	case <-time.After(maintenanceGrace):
+	case <-signals:
+	case <-serveCtx.Done():
+	case <-served:
 	}
-	if err != nil {
-		r.logger.Error("server failed", "error", err.Error())
-		return 1
+	// The server gives in-flight requests the request grace itself and
+	// closes their connections when it has passed, so the stop waits for it
+	// only up to the stop limit.
+	r.stop(stop, c.shutdown, append([]wait{{"requests", served, r.stopLimit()}}, waits...))
+	select {
+	case <-served:
+		if serveErr != nil {
+			r.logger.Error("server failed", "error", serveErr.Error())
+			return 1
+		}
+	default:
 	}
 	return 0
 }

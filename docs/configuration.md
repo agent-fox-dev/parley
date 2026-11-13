@@ -127,6 +127,8 @@ holds nothing else.
 | Setting | Value |
 |---|---|
 | Shutdown grace | 15 seconds: how long in-flight requests get to finish after `SIGTERM` or `SIGINT` |
+| Maintenance loop grace | 15 seconds: how long a stop waits for the running maintenance task to end |
+| Stop limit | 30 seconds: the longest a stop waits for anything after `SIGTERM` or `SIGINT`; a piece of background work's grace is at most this |
 | Idempotency records | kept in the transactional store for 24 hours, so they survive a restart (see [api.md](api.md#idempotency)) |
 
 See [cli.md](cli.md) for how `parleyd` is started and stopped.

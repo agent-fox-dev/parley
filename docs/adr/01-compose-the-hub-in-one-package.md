@@ -8,7 +8,8 @@ Accepted.
 
 `parleyd` is one process built from many packages. Each of them brings
 configuration keys, schema steps for the stores, work to run at start,
-maintenance tasks, REST routes and the checks of the request pipeline
+work to run in the background while the hub serves, maintenance tasks, REST
+routes and the checks of the request pipeline
 (authentication, the binding guard, the scope check, the access checks).
 The start must run these in one fixed order: configuration, data,
 bootstrap, start work, maintenance, listener.
@@ -30,17 +31,28 @@ start order a property of import order, written down nowhere.
 - A package plugs in through a *part*, a `func(*hub.Composition)`, written in
   a file of its own in `internal/hub` (`identity.go`, `access.go`, ...).
   The part registers on the `Composition`: configuration keys and whole
-  sections, schema steps, start hooks, maintenance tasks, routes, surfaces
-  outside the REST API, and the pipeline's checks.
+  sections, schema steps, start hooks, background work (a name, a grace and
+  a function that runs until its context is cancelled at the stop),
+  maintenance tasks, routes, surfaces outside the REST API, and the
+  pipeline's checks.
 - The parts are listed explicitly, in order, in the `parts` variable of
   `internal/hub/hub.go`; a package appends its part there. The list, not
   `init` functions, decides the order, because the order of schema steps and
   start hooks matters and `init` order would follow file names.
-- Start hooks and maintenance tasks receive a `*hub.Runtime` (the loaded
-  configuration, the open stores, the logger, the scrubber and the clock).
-  Code that runs at request time keeps `(*Composition).Runtime()`, which the
-  hub fills before the first hook runs and before the first request.
-- A registration that is refused (a hook or task without a name or function,
+- Start hooks, background work and maintenance tasks receive a
+  `*hub.Runtime` (the loaded configuration, the open stores, the logger, the
+  scrubber and the clock). Code that runs at request time keeps
+  `(*Composition).Runtime()`, which the hub fills before the first hook runs
+  and before the first request, and watches `(*Composition).ShuttingDown()`,
+  a channel the hub closes once when the stop begins, to end a long-lived
+  response.
+- The hub owns the stop: it cancels the background work and the
+  maintenance loop together with the server, waits for each up to its
+  grace and for nothing beyond 30 seconds, and closes the stores last, so a
+  package plugs in work that must end at the stop without handling signals
+  itself.
+- A registration that is refused (a hook, task or piece of background work
+  without a name or function,
   a name registered twice, a key or section the configuration registry
   refuses, a route the server refuses) is a start error: exit status 1 and
   one error line, before anything is opened. It never panics the process.
