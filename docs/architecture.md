@@ -881,10 +881,16 @@ insufficient_scope` `*server.Error` naming the first requested permission,
 in request order, that is not in `caller.Permissions` (exact membership, no
 implication), else, when `caller.Paths` is not `nil`, saying `paths` is
 required for a `nil` request or naming the first requested glob
-`FirstUncovered` reports. `identity.CheckPermissionSubset(caller,
-permissions)` is its permission half alone, for a request that changes a
-token's permissions and not its paths (it is passed only the scopes being
-added). Both expect validated values: validation answers first.
+`FirstUncovered` reports. `identity.CheckWidenSubset(caller, added,
+targetPaths)` is the rule for a request that adds scopes to an existing
+token, whose paths do not change: it returns `nil` when `added` is empty,
+then refuses, in the same order, the first added scope not in
+`caller.Permissions`, and, when `caller.Paths` is not `nil`, a target
+without paths (`paths: this token is limited to paths, so it cannot add
+scopes to a token that is not`) or the first of the target's globs
+`FirstUncovered` reports. Without the paths half a PAT limited to paths
+could give a scope it holds to a token without that limit. Both expect
+validated values: validation answers first.
 
 `POST /user/tokens`, in `internal/identity/token_routes.go`, is a create
 route with `ShowOnce: []string{"token"}`, so a replay under the same
@@ -924,7 +930,8 @@ for `PUT` and `PATCH`, at least one entry for `PATCH` and `DELETE`),
 computes the new list with `changedPermissions` (`PUT` the list without
 duplicates, `PATCH` the current list with the new scopes appended, `DELETE`
 the current list without the given ones), passes the scopes the new list
-adds to the token's current ones to `CheckPermissionSubset` (403), refuses a
+adds to the token's current ones and the token's paths to
+`CheckWidenSubset` (403), refuses a
 revoked or expired token with `409 conflict`, and writes with
 `setTokenPermissions`, which stores `[]` and sets `revoked_at` in the same
 `UPDATE` when the list is empty. Expiry is decided by `expired(expiresAt,
