@@ -3,39 +3,39 @@
   "spec_id": "09",
   "spec_name": "cli_foundation",
   "schema_version": 3,
-  "updated_at": "",
+  "updated_at": "2026-11-13T16:43:23Z",
   "tasks": [
     {
       "id": 1,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 2,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 3,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 4,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 5,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 6,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 7,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 8,
-      "state": "pending"
+      "state": "done"
     }
   ]
 }

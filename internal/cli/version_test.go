@@ -3,16 +3,21 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"maps"
-	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/agent-fox-dev/parley/internal/server"
 )
 
 // recordingHub is a hub that answers GET /version with body and records the
@@ -50,11 +55,6 @@ func (h *recordingHub) recorded() []recordedRequest {
 	return slices.Clone(h.requests)
 }
 
-// sortedKeys gives the member names of a JSON object.
-func sortedKeys[V any](m map[string]V) []string {
-	return slices.Sorted(maps.Keys(m))
-}
-
 // The test sets environment variables and build values, so it must not run
 // in parallel.
 func TestVersion_PrintsTheClientAndTheHubBuild(t *testing.T) {
@@ -68,7 +68,10 @@ func TestVersion_PrintsTheClientAndTheHubBuild(t *testing.T) {
 		// nil; "A" and "B" stand for the URLs of the two hubs.
 		flag *string
 		// env is PARLEY_ENDPOINT_URL, which is unset when env is nil.
-		env  *string
+		env *string
+		// file is endpoint_url of the configuration file, which also holds
+		// an api_key; there is no file when file is nil.
+		file *string
 		want string
 	}{
 		{name: "flag only", flag: new("A"), want: "A"},
@@ -76,6 +79,10 @@ func TestVersion_PrintsTheClientAndTheHubBuild(t *testing.T) {
 		{name: "flag before environment", flag: new("A"), env: new("B"), want: "A"},
 		{name: "empty flag falls back to environment", flag: new(""), env: new("B"), want: "B"},
 		{name: "trailing slash", flag: new("A/"), want: "A"},
+		{name: "configuration file only", file: new("A/"), want: "A"},
+		{name: "flag before the configuration file", flag: new("B"), file: new("A"), want: "B"},
+		{name: "environment before the configuration file", env: new("B"), file: new("A"), want: "B"},
+		{name: "empty environment falls back to the configuration file", env: new(""), file: new("A"), want: "A"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -91,6 +98,11 @@ func TestVersion_PrintsTheClientAndTheHubBuild(t *testing.T) {
 			unsetEnv(t, "PARLEY_ENDPOINT_URL")
 			if tt.env != nil {
 				t.Setenv("PARLEY_ENDPOINT_URL", resolve(*tt.env))
+			}
+			dir := t.TempDir()
+			t.Setenv("PARLEY_CONFIG_DIR", dir)
+			if tt.file != nil {
+				writeConfigFile(t, dir, "endpoint_url = \""+resolve(*tt.file)+"\"\napi_key = \"k\"\n")
 			}
 
 			code, stdout, stderr := runCLI(t, args...)
@@ -125,28 +137,15 @@ func TestVersion_PrintsTheClientAndTheHubBuild(t *testing.T) {
 			}
 
 			for name, hub := range hubs {
-				got := hub.recorded()
-				if name != tt.want {
-					if len(got) != 0 {
-						t.Errorf("hub %s got %d requests, want none", name, len(got))
-					}
-					continue
-				}
-				if len(got) != 1 {
-					t.Fatalf("hub %s got %d requests, want 1", name, len(got))
-				}
-				if got[0].path != "/version" {
-					t.Errorf("request path = %q, want /version", got[0].path)
-				}
-				if len(got[0].authorization) != 0 {
-					t.Errorf("request has an Authorization header %q, want none", got[0].authorization)
+				switch got := hub.recorded(); {
+				case name != tt.want && len(got) != 0:
+					t.Errorf("hub %s got %d requests, want none", name, len(got))
+				case name == tt.want && (len(got) != 1 || got[0].path != "/version" || len(got[0].authorization) != 0):
+					t.Errorf("hub %s got %+v, want one request to /version without an Authorization header", name, got)
 				}
 			}
 
-			var compact, indented bytes.Buffer
-			json.Compact(&compact, []byte(stdout))
-			json.Indent(&indented, compact.Bytes(), "", "  ")
-			if want := indented.String() + "\n"; stdout != want {
+			if want := indented(t, stdout); stdout != want {
 				t.Errorf("stdout is not one JSON document indented by 2 spaces and a newline:\n got %q\nwant %q", stdout, want)
 			}
 		})
@@ -169,6 +168,7 @@ func TestVersion_PrintsTheClientBuildAloneWithoutAHubURL(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			setBuildValues(t, "1.4.0", "3f2a1bc")
+			t.Setenv("PARLEY_CONFIG_DIR", t.TempDir())
 			unsetEnv(t, "PARLEY_ENDPOINT_URL")
 			if tt.env != nil {
 				t.Setenv("PARLEY_ENDPOINT_URL", *tt.env)
@@ -213,24 +213,21 @@ func TestVersion_WarnsAndPrintsTheClientBuildWhenTheHubCannotBeRead(t *testing.T
 		w.Write([]byte(versionBody))
 	}))
 	t.Cleanup(slow.Close)
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	closedPort := "http://" + ln.Addr().String()
-	ln.Close()
+	moved := httptest.NewServer(redirectTo(http.StatusMovedPermanently, answer(http.StatusOK, versionBody)+"/version"))
+	t.Cleanup(moved.Close)
 
 	tests := []struct {
 		name    string
 		hub     string
 		timeout time.Duration
 	}{
-		{name: "connection refused", hub: closedPort},
+		{name: "connection refused", hub: closedPortURL(t)},
 		{name: "no answer within the timeout", hub: slow.URL, timeout: 100 * time.Millisecond},
 		{name: "500 with a JSON body", hub: answer(http.StatusInternalServerError, versionBody)},
 		{name: "404", hub: answer(http.StatusNotFound, "404 page not found\n")},
 		{name: "200 with a body that is not JSON", hub: answer(http.StatusOK, "not json")},
 		{name: "200 with a JSON array", hub: answer(http.StatusOK, "[]")},
+		{name: "301 to a hub that answers", hub: moved.URL},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -264,5 +261,77 @@ func TestVersion_WarnsAndPrintsTheClientBuildWhenTheHubCannotBeRead(t *testing.T
 				t.Errorf("the command took %v, want at most 6s", elapsed)
 			}
 		})
+	}
+}
+
+// The test sets environment variables and build values, so it must not run
+// in parallel.
+func TestVersion_WarnsAndPrintsTheClientBuildWhenTheConfigFileCannotBeParsed(t *testing.T) {
+	setBuildValues(t, "1.4.0", "3f2a1bc")
+	dir := loginEnv(t)
+	path := writeConfigFile(t, dir, "not = [toml")
+
+	code, stdout, stderr := runCLI(t, "version")
+
+	if code != 0 {
+		t.Errorf("Run returned %d, want 0", code)
+	}
+	if want := "{\n  \"cli\": {\n    \"version\": \"1.4.0\",\n    \"commit\": \"3f2a1bc\"\n  }\n}\n"; stdout != want {
+		t.Errorf("stdout = %q, want %q", stdout, want)
+	}
+	if lines := nonEmptyLines(stderr); len(lines) != 1 || !strings.HasPrefix(lines[0], "warning: ") || !strings.Contains(lines[0], path) {
+		t.Errorf("stderr = %q, want one line that begins with %q and names %s", stderr, "warning: ", path)
+	}
+}
+
+// The test sets environment variables, so it must not run in parallel. It
+// runs where the save is reachable: a developer's file as parley login's save
+// writes it, read by parley version against the hub's own HTTP handler on a
+// real listener.
+func TestVersion_FindsTheHubThroughTheFileTheSaveWrote(t *testing.T) {
+	hub := httptest.NewServer(server.New(server.Options{Logger: slog.New(slog.DiscardHandler)}).Handler())
+	t.Cleanup(hub.Close)
+	dir := loginEnv(t)
+	if err := saveConfig(configSettings{EndpointURL: hub.URL + "/", APIKey: testAPIKey, UserID: "u-1"}); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	path := filepath.Join(dir, "config.toml")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := http.Get(hub.URL + "/version")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(res.Body)
+	res.Body.Close()
+	if err != nil || res.StatusCode != http.StatusOK {
+		t.Fatalf("GET /version: %v, %s", err, res.Status)
+	}
+	var want map[string]any
+	if err := json.Unmarshal(body, &want); err != nil {
+		t.Fatalf("GET /version answered no JSON object: %v", err)
+	}
+
+	code, stdout, stderr := runCLI(t, "version")
+
+	if code != 0 {
+		t.Errorf("exit status = %d, want 0", code)
+	}
+	var doc struct {
+		Server map[string]any `json:"server"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &doc); err != nil || !reflect.DeepEqual(doc.Server, want) {
+		t.Errorf("stdout = %q (%v), want a server member equal to %v", stdout, err, want)
+	}
+	if stderr != "" {
+		t.Errorf("stderr = %q, want it empty", stderr)
+	}
+	if after, err := os.ReadFile(path); err != nil || !bytes.Equal(after, before) {
+		t.Errorf("config file = %q (%v), want its bytes unchanged, %q", after, err, before)
+	}
+	if got := modeOf(t, path); got != 0o600 {
+		t.Errorf("config file mode = %v, want 0600", got)
 	}
 }

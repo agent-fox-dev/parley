@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -12,18 +11,14 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
-
-// loginRequestTimeout bounds the login's requests to the hub other than the
-// callback: GET /api/v1/user and GET /api/v1/auth/providers.
-const loginRequestTimeout = 30 * time.Second
 
 // callbackRequestTimeout bounds POST /api/v1/auth/callback. Before it answers,
 // the hub may make up to three calls to the identity provider (token, user,
@@ -31,143 +26,95 @@ const loginRequestTimeout = 30 * time.Second
 // could give up on a sign-in the hub then completes.
 const callbackRequestTimeout = 60 * time.Second
 
-// maxLoginBody bounds how much of the hub's answer, and of stdin, is read.
-const maxLoginBody = 1 << 20
+// maxStdinCredential bounds how much of stdin is read for the credential.
+const maxStdinCredential = 1 << 20
 
-// hubErrorExitStatus is what parley login returns when the hub refused it.
-const hubErrorExitStatus = 1
-
-// loginError is how parley login fails: run writes envelope to stderr as it
-// is and exits with status. A hub's refusal carries the hub's own envelope
-// bytes; a failure on the client's side carries one built by envelopeError.
-type loginError struct {
-	status   int
-	envelope []byte
-}
-
-func (e *loginError) Error() string { return string(bytes.TrimSpace(e.envelope)) }
-
-// errorEnvelope is the shape of the hub's error answers, which the client
-// reuses for its own failures with code 0.
-type errorEnvelope struct {
-	Error struct {
-		Code      int    `json:"code"`
-		Message   string `json:"message"`
-		ErrorType string `json:"error_type"`
-	} `json:"error"`
-}
-
-// envelopeError is a failure on the client's side, exit status 2, with an
-// envelope of code 0 and errorType.
-func envelopeError(errorType, format string, args ...any) *loginError {
-	var env errorEnvelope
-	env.Error.Message = fmt.Sprintf(format, args...)
-	env.Error.ErrorType = errorType
-	body, _ := json.Marshal(env)
-	return &loginError{status: usageExitStatus, envelope: append(body, '\n')}
-}
-
-// clientError is a failure the client cannot blame on its arguments: no hub
-// URL, an unreadable config file or answer, an unreachable hub.
-func clientError(format string, args ...any) *loginError {
-	return envelopeError("client_error", format, args...)
-}
-
-// usageError is a failure caused by the arguments.
-func usageError(format string, args ...any) *loginError {
-	return envelopeError("usage_error", format, args...)
-}
-
-func newLoginCommand(endpointURL *string, opts options) *cobra.Command {
-	var provider, expires, apiKey string
-	cmd := &cobra.Command{
-		Use:   "login",
-		Short: "Sign in to the hub and save the hub URL and the credential",
-		// A bad flag or argument fails like a bad --expires: a usage_error
-		// envelope, not the one error line of the other commands.
-		Args: func(cmd *cobra.Command, args []string) error {
-			if err := cobra.NoArgs(cmd, args); err != nil {
-				return usageError("%v", err)
-			}
-			return nil
+func newLoginCommand() *cobra.Command {
+	return declare(command{
+		Name:        "login",
+		Description: "Sign in to the hub and save the hub URL and the credential",
+		// login needs a hub URL but takes no credential from the
+		// environment or the file: it obtains the one it saves.
+		Auth: authNone,
+		Flags: func(fs *pflag.FlagSet) {
+			fs.String("provider", "github", "identity provider of the browser login")
+			fs.String("expires", "90", "days the browser login's API key lives: 0, 30, 60 or 90 (0: no expiry)")
 		},
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			// Only the flag selects the key flow; --provider and --expires
-			// belong to the browser flow.
-			browser := !cmd.Flags().Changed("api-key")
-			var days int
-			if browser {
-				var err error
-				if days, err = loginExpires(expires); err != nil {
-					return err
-				}
-			}
-			// The file is read before anything else is sent, so that a file
-			// the save would fail on cannot cost a credential the hub just
-			// accepted or issued.
-			path, err := configPath()
-			if err != nil {
-				return clientError("%v", err)
-			}
-			cfg, err := readConfig(path)
-			if err != nil {
-				return clientError("%v", err)
-			}
-			hubURL := loginHubURL(*endpointURL, cfg)
-			if hubURL == "" {
-				return clientError("no hub URL: pass --endpoint-url, set %s or set %s in %s", endpointURLEnv, configEndpointURL, path)
-			}
-
-			var cred string
-			var user loginUser
-			if browser {
-				cred, user, err = browserLogin(cmd.Context(), hubURL, provider, days, opts, cmd.ErrOrStderr())
-			} else if cred, err = loginCredential(apiKey, opts.stdin); err == nil {
-				user, err = hubUser(cmd.Context(), hubURL, cred)
-			}
-			if err != nil {
-				return err
-			}
-
-			cfg[configEndpointURL] = hubURL
-			cfg[configAPIKey] = cred
-			cfg[configUserID] = user.id
-			if err := saveConfig(path, cfg); err != nil {
-				if browser {
-					return clientError("the hub issued an API key, but it was not saved to %s: %v", path, err)
-				}
-				return clientError("the hub accepted the credential, but it was not saved to %s: %v", path, err)
-			}
-			fmt.Fprintf(cmd.OutOrStdout(), "%s\n", user.indented)
-			fmt.Fprintf(cmd.ErrOrStderr(), "Logged in as %s\n", user.username)
-			return nil
-		},
-	}
-	cmd.Flags().StringVar(&provider, "provider", "github", "identity provider of the browser login")
-	cmd.Flags().StringVar(&expires, "expires", "90", "days the browser login's API key lives: 0, 30, 60 or 90 (0: no expiry)")
-	cmd.Flags().StringVar(&apiKey, "api-key", "", "store this credential instead of signing in through the browser (- reads it from stdin)")
-	cmd.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return usageError("%v", err) })
-	return cmd
+		Run: login,
+	})
 }
 
-// loginHubURL is the first non-empty of the flag --endpoint-url, the variable
-// PARLEY_ENDPOINT_URL and the file's endpoint_url, without trailing slashes.
-func loginHubURL(flag string, cfg map[string]any) string {
-	hubURL := flag
-	if hubURL == "" {
-		hubURL = os.Getenv(endpointURLEnv)
+// login is the run step of parley login: it signs in through the browser,
+// or checks the credential --api-key gives, saves the hub URL, the
+// credential and the user's id, and prints the user.
+func login(c *call) error {
+	// Only the global flag --api-key selects the key flow, not
+	// PARLEY_API_KEY or the file; --provider and --expires belong to the
+	// browser flow.
+	browser := !c.cmd.Flags().Changed("api-key")
+	// What the command line gives is checked first, so that a usage error
+	// is reported before any setting is read.
+	var days int
+	var cred string
+	var err error
+	if browser {
+		expires, _ := c.cmd.Flags().GetString("expires")
+		days, err = loginExpires(expires)
+	} else {
+		cred, err = loginCredential(globalFlag(c.cmd, "api-key"), c.opts.stdin)
 	}
-	if hubURL == "" {
-		hubURL, _ = cfg[configEndpointURL].(string)
+	if err != nil {
+		return err
 	}
-	return strings.TrimRight(hubURL, "/")
+	// The file is read, and its path found, before anything is sent, so
+	// that a file or a missing home directory the save would fail on cannot
+	// cost a credential the hub just accepted or issued.
+	if _, err := configPath(); err != nil {
+		return clientError("%v", err)
+	}
+	file, err := readConfig()
+	if err != nil {
+		return err
+	}
+	hubURL := firstNonEmpty(givenHubURL(c.cmd), file.EndpointURL)
+	if hubURL == "" {
+		return clientError("%s", noHubURL())
+	}
+	if err := checkHubURL(hubURL); err != nil {
+		return err
+	}
+
+	// The requests before the credential is known carry none.
+	hub := c.newClient(hubURL, "")
+	var user loginUser
+	if browser {
+		provider, _ := c.cmd.Flags().GetString("provider")
+		cred, user, err = browserLogin(c.ctx, hub, provider, days, c.opts, c.stderr)
+	} else {
+		user, err = hubUser(c.ctx, c.newClient(hubURL, cred))
+	}
+	if err != nil {
+		return err
+	}
+
+	if err := saveConfig(configSettings{EndpointURL: hub.hubURL, APIKey: cred, UserID: user.id}); err != nil {
+		if browser {
+			return clientError("the hub issued an API key, but it was not saved: %v", err)
+		}
+		return clientError("the hub accepted the credential, but it was not saved: %v", err)
+	}
+	if err := c.printResult(user.raw); err != nil {
+		return err
+	}
+	fmt.Fprintf(c.stderr, "Logged in as %s\n", user.username)
+	return nil
 }
 
 // loginCredential is the value of --api-key, or what stdin holds when the
 // value is -, without its surrounding white space.
 func loginCredential(value string, stdin io.Reader) (string, error) {
 	if value == "-" {
-		data, err := io.ReadAll(io.LimitReader(stdin, maxLoginBody))
+		data, err := io.ReadAll(io.LimitReader(stdin, maxStdinCredential))
 		if err != nil {
 			return "", clientError("cannot read the credential from stdin: %v", err)
 		}
@@ -183,56 +130,18 @@ func loginCredential(value string, stdin io.Reader) (string, error) {
 // loginUser is what the login takes from the hub's User.
 type loginUser struct {
 	id, username string
-	// indented is the User as the hub answered it, indented by 2 spaces.
-	indented []byte
+	// raw is the User as the hub answered it.
+	raw []byte
 }
 
-// hubUser asks the hub at hubURL who cred belongs to, with GET /api/v1/user.
-func hubUser(ctx context.Context, hubURL, cred string) (loginUser, error) {
-	body, err := hubCall(ctx, http.MethodGet, hubURL+"/api/v1/user", cred, nil, loginRequestTimeout)
+// hubUser asks the hub who the credential of hub belongs to, with GET
+// /api/v1/user.
+func hubUser(ctx context.Context, hub *client) (loginUser, error) {
+	resp, err := hub.request(ctx, http.MethodGet, "/user", nil, nil)
 	if err != nil {
 		return loginUser{}, err
 	}
-	return parseUser(body)
-}
-
-// hubCall sends a request to the hub, with cred as the bearer credential
-// unless it is empty and with body as JSON unless it is nil, waits up to
-// timeout, and returns the body of a 200 answer. A hub's error envelope comes
-// back as a loginError with the envelope's bytes; any other failure is a
-// client_error.
-func hubCall(ctx context.Context, method, target, cred string, body []byte, timeout time.Duration) ([]byte, error) {
-	var payload io.Reader
-	if body != nil {
-		payload = bytes.NewReader(body)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, target, payload)
-	if err != nil {
-		return nil, clientError("invalid hub URL %q: %v", target, err)
-	}
-	if cred != "" {
-		req.Header.Set("Authorization", "Bearer "+cred)
-	}
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	req.Header.Set("Accept", "application/json")
-	resp, err := (&http.Client{Timeout: timeout}).Do(req)
-	if err != nil {
-		return nil, clientError("cannot reach the hub: %v", err)
-	}
-	defer resp.Body.Close()
-	answer, err := io.ReadAll(io.LimitReader(resp.Body, maxLoginBody))
-	if err != nil {
-		return nil, clientError("cannot read the hub's answer: %v", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		if isErrorEnvelope(answer) {
-			return nil, &loginError{status: hubErrorExitStatus, envelope: answer}
-		}
-		return nil, clientError("the hub answered %s without an error envelope", resp.Status)
-	}
-	return answer, nil
+	return parseUser(resp.body)
 }
 
 // parseUser reads the hub's User from raw.
@@ -246,20 +155,7 @@ func parseUser(raw []byte) (loginUser, error) {
 		return loginUser{}, clientError("the hub's answer has no user id")
 	}
 	username, _ := fields["username"].(string)
-	var indented bytes.Buffer
-	if err := json.Indent(&indented, bytes.TrimSpace(raw), "", "  "); err != nil {
-		return loginUser{}, clientError("the hub's answer is not a JSON object")
-	}
-	return loginUser{id: id, username: username, indented: indented.Bytes()}, nil
-}
-
-// isErrorEnvelope tells whether body is the hub's error envelope, a JSON
-// object whose error member is an object.
-func isErrorEnvelope(body []byte) bool {
-	var doc struct {
-		Error map[string]json.RawMessage `json:"error"`
-	}
-	return json.Unmarshal(body, &doc) == nil && doc.Error != nil
+	return loginUser{id: id, username: username, raw: raw}, nil
 }
 
 // loginExpires reads --expires: the days the issued API key lives, one of
@@ -278,8 +174,8 @@ func loginExpires(value string) (int, error) {
 // to a listener on the loopback interface with a code, and exchanges the
 // code at the hub for a new API key of days days. It returns the key and
 // the user.
-func browserLogin(ctx context.Context, hubURL, provider string, days int, opts options, stderr io.Writer) (string, loginUser, error) {
-	authorize, err := hubProvider(ctx, hubURL, provider)
+func browserLogin(ctx context.Context, hub *client, provider string, days int, opts options, stderr io.Writer) (string, loginUser, error) {
+	authorize, err := hubProvider(ctx, hub, provider)
 	if err != nil {
 		return "", loginUser{}, err
 	}
@@ -313,16 +209,13 @@ func browserLogin(ctx context.Context, hubURL, provider string, days int, opts o
 		return "", loginUser{}, err
 	}
 
-	payload, err := json.Marshal(struct {
+	signIn := struct {
 		Provider    string `json:"provider"`
 		Code        string `json:"code"`
 		RedirectURI string `json:"redirect_uri"`
 		Expires     int    `json:"expires"`
-	}{provider, code, redirectURI, days})
-	if err != nil {
-		return "", loginUser{}, clientError("cannot encode the sign-in: %v", err)
-	}
-	body, err := hubCall(ctx, http.MethodPost, hubURL+"/api/v1/auth/callback", "", payload, callbackRequestTimeout)
+	}{provider, code, redirectURI, days}
+	resp, err := hub.send(ctx, apiRequest{method: http.MethodPost, path: "/auth/callback", body: signIn, timeout: callbackRequestTimeout})
 	if err != nil {
 		return "", loginUser{}, err
 	}
@@ -332,7 +225,7 @@ func browserLogin(ctx context.Context, hubURL, provider string, days int, opts o
 			Key string `json:"key"`
 		} `json:"api_key"`
 	}
-	if json.Unmarshal(body, &answer) != nil || answer.APIKey.Key == "" {
+	if json.Unmarshal(resp.body, &answer) != nil || answer.APIKey.Key == "" {
 		return "", loginUser{}, clientError("the hub's answer to the sign-in holds no API key")
 	}
 	user, err := parseUser(answer.User)
@@ -344,8 +237,8 @@ func browserLogin(ctx context.Context, hubURL, provider string, days int, opts o
 
 // hubProvider returns the authorize_url of the identity provider name from
 // the hub's GET /api/v1/auth/providers, which takes no credential.
-func hubProvider(ctx context.Context, hubURL, name string) (string, error) {
-	body, err := hubCall(ctx, http.MethodGet, hubURL+"/api/v1/auth/providers", "", nil, loginRequestTimeout)
+func hubProvider(ctx context.Context, hub *client, name string) (string, error) {
+	resp, err := hub.request(ctx, http.MethodGet, "/auth/providers", nil, nil)
 	if err != nil {
 		return "", err
 	}
@@ -355,7 +248,7 @@ func hubProvider(ctx context.Context, hubURL, name string) (string, error) {
 			AuthorizeURL string `json:"authorize_url"`
 		} `json:"items"`
 	}
-	if err := json.Unmarshal(body, &list); err != nil {
+	if err := json.Unmarshal(resp.body, &list); err != nil {
 		return "", clientError("the hub's list of identity providers is not readable")
 	}
 	var names []string

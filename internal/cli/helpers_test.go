@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -16,11 +18,14 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/agent-fox-dev/parley/internal/buildinfo"
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 // setBuildValues sets the build values of internal/buildinfo for the test and
@@ -56,6 +61,243 @@ func runCLIWith(t *testing.T, opts options, args ...string) (int, string, string
 	return code, stdout.String(), stderr.String()
 }
 
+// withProbes is opts with the command group "probe" added to the tree, which
+// exists only in tests: "probe get <name>", "probe count" and the commands
+// more builds.
+func withProbes(opts options, more ...func() *cobra.Command) options {
+	return withProbeGroup(opts, append([]func() *cobra.Command{probeGet, probeCount}, more...)...)
+}
+
+// withProbeGroup is opts with the command group "probe" holding exactly the
+// commands children builds. The tree is built afresh on every run, so each
+// builder is called once per run.
+func withProbeGroup(opts options, children ...func() *cobra.Command) options {
+	opts.extra = append(slices.Clone(opts.extra), func() *cobra.Command {
+		built := make([]*cobra.Command, 0, len(children))
+		for _, build := range children {
+			built = append(built, build())
+		}
+		return group("probe", "Commands that exist only in tests", built...)
+	})
+	return opts
+}
+
+// probeGet builds "probe get <name>": GET /things/:name, auth user, with an
+// int flag --limit whose default is 50.
+func probeGet() *cobra.Command {
+	return declare(command{
+		Name:        "get",
+		Description: "Get a thing",
+		Method:      http.MethodGet,
+		Path:        "/things/:name",
+		Args:        []argSpec{{Name: "name", Required: true}},
+		Auth:        authUser,
+		Flags:       func(fs *pflag.FlagSet) { fs.Int("limit", 50, "the most things to get") },
+	})
+}
+
+// probeCount builds "probe count": GET /things, auth user, with an int flag
+// --limit.
+func probeCount() *cobra.Command {
+	return declare(command{
+		Name:        "count",
+		Description: "Count the things",
+		Method:      http.MethodGet,
+		Path:        "/things",
+		Auth:        authUser,
+		Flags:       func(fs *pflag.FlagSet) { fs.Int("limit", 0, "the most things to count") },
+	})
+}
+
+// probeAdmin builds the group "probe admin" holding "purge [reason]":
+// DELETE /things, auth admin, with a bool flag --confirm it requires.
+func probeAdmin() *cobra.Command {
+	purge := declare(command{
+		Name:        "purge",
+		Description: "Purge the things",
+		Method:      http.MethodDelete,
+		Path:        "/things",
+		Args:        []argSpec{{Name: "reason"}},
+		Auth:        authAdmin,
+		Flags: func(fs *pflag.FlagSet) {
+			fs.Bool("confirm", false, "confirm the purge")
+			cobra.MarkFlagRequired(fs, "confirm")
+		},
+	})
+	return group("admin", "Administer the things", purge)
+}
+
+// probeRun builds "probe run": POST /jobs starts a job, and with --wait
+// the command polls GET /jobs/:id with the id of the record. done is a
+// successful end, dead and cancelled unsuccessful ones; every other state,
+// queued, running and failed (waiting to retry) among them, is not terminal.
+func probeRun() *cobra.Command {
+	return declare(probeRunCommand())
+}
+
+func probeRunCommand() command {
+	return command{
+		Name:        "run",
+		Description: "Run a job",
+		Method:      http.MethodPost,
+		Path:        "/jobs",
+		Auth:        authUser,
+		Wait: &waitFor{
+			Poll: func(_ *call, record []byte) (apiRequest, error) {
+				var job struct {
+					ID string `json:"id"`
+				}
+				if err := json.Unmarshal(record, &job); err != nil || job.ID == "" {
+					return apiRequest{}, clientError("the job has no id")
+				}
+				return apiRequest{method: http.MethodGet, path: "/jobs/" + pathSegment(job.ID)}, nil
+			},
+			Classify: byState("state", []string{"done"}, []string{"dead", "cancelled"}),
+		},
+	}
+}
+
+// jobRecord is the record of the job j1 in state, as the hub serves it
+// the n-th time (0 for the answer to the start), so that two records of
+// one state differ.
+func jobRecord(state string, n int) string {
+	return fmt.Sprintf(`{"id":"j1","state":%q,"poll":%d}`, state, n)
+}
+
+// jobHub is a stub hub that starts the job j1 in state start on POST
+// /api/v1/jobs and answers the n-th GET /api/v1/jobs/j1 with polls[n-1],
+// the last of polls answering every later one too. Without polls a poll is
+// answered 404 with an error envelope.
+func jobHub(t *testing.T, start string, polls ...http.HandlerFunc) *stubHub {
+	t.Helper()
+	h := newStubHub(t).answer(http.MethodPost, "/api/v1/jobs", http.StatusCreated, jobRecord(start, 0))
+	if len(polls) == 0 {
+		return h
+	}
+	var mu sync.Mutex
+	n := 0
+	return h.handle(http.MethodGet, "/api/v1/jobs/j1", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		n++
+		i := min(n, len(polls)) - 1
+		mu.Unlock()
+		polls[i](w, r)
+	})
+}
+
+// jobStates are the answers of a jobHub's polls: the n-th is the record of
+// j1 in states[n-1].
+func jobStates(states ...string) []http.HandlerFunc {
+	polls := make([]http.HandlerFunc, 0, len(states))
+	for i, state := range states {
+		polls = append(polls, answerWith(http.StatusOK, jobRecord(state, i+1)))
+	}
+	return polls
+}
+
+// answerWith is a handler that answers status and body.
+func answerWith(status int, body string) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(status)
+		w.Write([]byte(body))
+	}
+}
+
+// redirectTo is a handler that answers status, a redirect, with location as
+// its Location header and no body.
+func redirectTo(status int, location string) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", location)
+		w.WriteHeader(status)
+	}
+}
+
+// count is how many requests with method the stub hub got.
+func (h *stubHub) count(method string) int {
+	n := 0
+	for _, r := range h.recorded() {
+		if r.method == method {
+			n++
+		}
+	}
+	return n
+}
+
+// runProbes runs parley with the probe commands added and args.
+func runProbes(t *testing.T, args ...string) (int, string, string) {
+	t.Helper()
+	return runCLIWith(t, withProbes(defaultOptions()), args...)
+}
+
+// thingHub is a stub hub that answers GET /api/v1/things/x, what "probe get
+// x" sends, with 200 and body.
+func thingHub(t *testing.T, body string) *stubHub {
+	t.Helper()
+	return newStubHub(t).answer(http.MethodGet, "/api/v1/things/x", http.StatusOK, body)
+}
+
+// probeEnv points PARLEY_CONFIG_DIR at an empty directory and
+// PARLEY_ENDPOINT_URL and PARLEY_API_KEY at hubURL and the credential k. A
+// test that calls it must not run in parallel.
+func probeEnv(t *testing.T, hubURL string) {
+	t.Helper()
+	t.Setenv("PARLEY_CONFIG_DIR", t.TempDir())
+	t.Setenv("PARLEY_ENDPOINT_URL", hubURL)
+	t.Setenv("PARLEY_API_KEY", "k")
+}
+
+// indented is the JSON document body as parley prints it: compacted, then
+// indented by 2 spaces, with one newline after it.
+func indented(t *testing.T, body string) string {
+	t.Helper()
+	var compact, out bytes.Buffer
+	if err := json.Compact(&compact, []byte(body)); err != nil {
+		t.Fatalf("not JSON (%v): %q", err, body)
+	}
+	json.Indent(&out, compact.Bytes(), "", "  ")
+	return out.String() + "\n"
+}
+
+// sortedKeys gives the member names of a JSON object.
+func sortedKeys[V any](m map[string]V) []string {
+	return slices.Sorted(maps.Keys(m))
+}
+
+// writeConfigFile writes content to config.toml in dir, creating dir, and
+// returns the file's path.
+func writeConfigFile(t *testing.T, dir, content string) string {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "config.toml")
+	writeFile(content)(t, path)
+	return path
+}
+
+// probeReturning builds "probe outcome", a command of auth none whose run
+// step returns err.
+func probeReturning(err error) func() *cobra.Command {
+	return func() *cobra.Command {
+		return declare(command{
+			Name:        "outcome",
+			Description: "Return a given outcome",
+			Auth:        authNone,
+			Run:         func(*call) error { return err },
+		})
+	}
+}
+
+// oneJSONDocument decodes s, which must hold exactly one JSON document and
+// nothing else (json.Unmarshal refuses anything after the first value), into v.
+func oneJSONDocument(t *testing.T, s string, v any) {
+	t.Helper()
+	if err := json.Unmarshal([]byte(s), v); err != nil {
+		t.Fatalf("not exactly one JSON document (%v): %q", err, s)
+	}
+}
+
 // nonEmptyLines splits s into its lines, without the empty ones.
 func nonEmptyLines(s string) []string {
 	var lines []string
@@ -75,6 +317,7 @@ type stubHub struct {
 
 	mu       sync.Mutex
 	answers  map[string]stubAnswer
+	handlers map[string]http.HandlerFunc
 	requests []stubRequest
 }
 
@@ -85,20 +328,36 @@ type stubAnswer struct {
 
 type stubRequest struct {
 	method, path, body string
-	header             http.Header
+	// rawPath is the path as it was sent, percent-encoding included, and
+	// query the query string.
+	rawPath, query string
+	contentLength  int64
+	header         http.Header
+	// at is when the request arrived.
+	at time.Time
 }
 
 func newStubHub(t *testing.T) *stubHub {
 	t.Helper()
-	h := &stubHub{answers: map[string]stubAnswer{}}
+	h := &stubHub{answers: map[string]stubAnswer{}, handlers: map[string]http.HandlerFunc{}}
 	h.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		at := time.Now()
 		body, _ := io.ReadAll(r.Body)
 		h.mu.Lock()
-		h.requests = append(h.requests, stubRequest{method: r.Method, path: r.URL.Path, body: string(body), header: r.Header.Clone()})
+		h.requests = append(h.requests, stubRequest{
+			method: r.Method, path: r.URL.Path, body: string(body),
+			rawPath: r.URL.EscapedPath(), query: r.URL.RawQuery, contentLength: r.ContentLength,
+			header: r.Header.Clone(), at: at,
+		})
 		a, ok := h.answers[r.Method+" "+r.URL.Path]
+		handler := h.handlers[r.Method+" "+r.URL.Path]
 		h.mu.Unlock()
 		if !ok {
 			a = stubAnswer{http.StatusNotFound, `{"error":{"code":404,"message":"not found","error_type":"not_found"}}` + "\n"}
+		}
+		if handler != nil {
+			handler(w, r)
+			return
 		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.WriteHeader(a.status)
@@ -114,6 +373,47 @@ func (h *stubHub) answer(method, path string, status int, body string) *stubHub 
 	defer h.mu.Unlock()
 	h.answers[method+" "+path] = stubAnswer{status, body}
 	return h
+}
+
+// handle has handler answer method and path, for an answer status and body
+// cannot describe.
+func (h *stubHub) handle(method, path string, handler http.HandlerFunc) *stubHub {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.handlers[method+" "+path] = handler
+	return h
+}
+
+// answerAfter is a handler that answers 200 with an empty object after d,
+// or returns as soon as the client gives up.
+func answerAfter(d time.Duration) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(d):
+			w.Write([]byte("{}"))
+		case <-r.Context().Done():
+		}
+	}
+}
+
+// closeWithoutAnswer is a handler that closes the connection without
+// writing a byte of an answer.
+func closeWithoutAnswer(w http.ResponseWriter, _ *http.Request) {
+	conn, _, err := http.NewResponseController(w).Hijack()
+	if err == nil {
+		conn.Close()
+	}
+}
+
+// closedPortURL is the URL of a loopback port nothing listens on.
+func closedPortURL(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln.Close()
+	return "http://" + ln.Addr().String()
 }
 
 func (h *stubHub) recorded() []stubRequest {
@@ -372,4 +672,68 @@ func (b *syncBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
+}
+
+// writeFile is a setup step that writes content to path with mode 0600.
+func writeFile(content string) func(t *testing.T, path string) {
+	return func(t *testing.T, path string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// wantClientError fails the test unless err is a client_error whose message
+// contains inMessage, and returns the message.
+func wantClientError(t *testing.T, err error, inMessage string) string {
+	t.Helper()
+	var ce *cliError
+	if !errors.As(err, &ce) || ce.errorType != clientErrorType {
+		t.Fatalf("error = %#v, want a client_error", err)
+	}
+	if !strings.Contains(ce.message, inMessage) {
+		t.Errorf("message = %q, want it to contain %q", ce.message, inMessage)
+	}
+	return ce.message
+}
+
+// inodeOf is the inode number of the file at path.
+func inodeOf(t *testing.T, path string) uint64 {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return uint64(fi.Sys().(*syscall.Stat_t).Ino)
+}
+
+// snapshot describes everything under dir, dir included: each entry's
+// relative path with its mode and, for a file, its bytes.
+func snapshot(t *testing.T, dir string) map[string]string {
+	t.Helper()
+	state := map[string]string{}
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		fi, err := d.Info()
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(dir, path)
+		state[rel] = fi.Mode().String()
+		if fi.Mode().IsRegular() {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			state[rel] += " " + string(data)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return state
 }

@@ -12,7 +12,7 @@ command-line client. Both are written in Go, in the module
 | `cmd/parley` | the `parley` program: it calls `cli.Run` and exits with its status |
 | `cmd/parleyd` | the `parleyd` program: `main` calls `hub.Run` with the process's arguments, environment and working directory and exits with its status |
 | `internal/buildinfo` | the version, commit and build time the binary was built with, shared by both programs |
-| `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra` |
+| `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra`, each declared through one helper ([ADR 02](adr/02-declare-every-cli-command-through-one-helper.md)), the client configuration file, the resolution of the hub URL and the credential, the one HTTP client the commands send their requests with, the printing of a command's result on stdout and of its warnings on stderr, the shared wait for a long operation (`--wait`, `--timeout`, `--poll-interval`), and the error envelopes and exit statuses every command ends with |
 | `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, and a registry of keys and whole sections that decides what the file may hold |
 | `internal/hub` | the composition of the `parleyd` process: argument parsing, the scrubbing logger, the fixed start order, the bootstrap of the admin token, the HTTP server's options, the idempotency records in the transactional store, signals and the stop, and the `backup` command; the one place later packages plug their parts in ([ADR 01](adr/01-compose-the-hub-in-one-package.md)) |
 | `internal/maintenance` | the maintenance loop: a registry of named tasks, and `Loop`, which runs one pass at once and one at each tick of an hourly timer, the tasks of a pass one after the other in a fixed order, and logs a failing task without stopping the others |
@@ -817,22 +817,190 @@ end-to-end test, replace what it takes from the process (`Hooks.Stdin`, where
 opens the sign-in page, by default the system's opener in
 `internal/cli/browser.go`; and `Hooks.LoginWait`, how long the browser login
 waits for the redirect, by default 120 s). It builds a fresh cobra
-command tree on each call: the root command `parley` with the persistent flag
-`--endpoint-url`, and the `version` and `login` subcommands. It executes the
-tree with the arguments, and returns `0`, or `2` after one `error: <message>`
-line on stderr when cobra cannot parse the arguments. Cobra's own error and
-usage output is silenced. `parley login` fails with its own error type
-(`internal/cli/login.go`), an exit status and the error envelope to write;
-`run` writes that envelope to stderr as it is and returns its status.
+command tree on each call: the root command `parley` with the persistent
+global flags `--endpoint-url`, `--api-key` and `--json`, and the `help`,
+`version` and `login` subcommands, plus the commands the unexported `options.extra`
+builds, which tests use to add probe commands. It executes the tree with the
+arguments; when a command returns an error, `run` writes it to stderr with
+`printError` and returns `exitCode(err)` (both in `internal/cli/errors.go`).
+Cobra's own error and usage output is silenced, so stderr holds the one
+envelope.
 
-`parley login --api-key` (`internal/cli/login.go`) reads the client
-configuration file (`internal/cli/config.go`: `$PARLEY_CONFIG_DIR/config.toml`
-or `~/.parley/config.toml`, decoded with `github.com/BurntSushi/toml` into a
-map, so that keys it does not know survive), resolves the hub URL from the
-flag, `PARLEY_ENDPOINT_URL` and the file, and asks the hub who the credential
-belongs to with `GET /api/v1/user` (30 s timeout). On `200` it sets
-`endpoint_url`, `api_key` and `user_id` in the map and saves it: a temporary
-file with mode `0600` in the same directory, renamed over `config.toml`.
+A command is declared through one helper, `declare` in
+`internal/cli/command.go` (see
+[ADR 02](adr/02-declare-every-cli-command-through-one-helper.md)): a
+`command` value with its last word, its description, the route it calls
+(`Method` and `Path` relative to `/api/v1`, empty when it calls no single
+route), its named arguments (`argSpec`), its `auth` level (`none`, `user`,
+`admin`), its own flags and its run step. `declare` keeps the declaration as
+JSON in the cobra command's `Annotations` (`parley.declaration`), refuses a
+wrong number of arguments, and a flag marked required with
+`cobra.MarkFlagRequired` that is not given, as a `usage_error`
+(`checkCommandLine`, which runs before cobra's own check of required flags,
+whose error has no kind), and runs the run step with a
+`call`: the context, the arguments by name, stdout, stderr and the run's
+options, which `run` passes down in the context. `group` builds a command
+group, which prints its help without a word and refuses a word that is none
+of its children as a `usage_error` (cobra alone would print the help); the
+root is a group too, and its flag error handler turns every flag that is
+unknown or does not parse, on any command, into a `usage_error`.
+`parley version` and `parley login` are declared through `declare`.
+
+Help lives in `internal/cli/help.go`. `installHelp` keeps cobra's own text
+help, sets the root's help function, which `--help` on any command and a
+group run without a word reach, and replaces cobra's help command with
+`help [command]...`, declared through `declare` (auth `none`, no route; its
+argument `Repeats`, taking every remaining word). The help command finds its
+words with the root's `Find`; words left over are a `usage_error` naming
+the first, and otherwise it prints what `--help` on that command prints,
+after adding cobra's `--help` flag to it as cobra does when it runs it. With
+the global `--json` the help is one JSON document instead: `describe`
+builds a command's object from its declaration (`declarationOf`, which
+decodes the `parley.declaration` annotation; an undeclared command has an
+empty description and auth), with `method` and `path` `null` when empty and
+`flagsOf` listing its local and inherited flags sorted by name, without the
+flags cobra adds itself; for a group (`isGroup`, the `parley.group`
+annotation), the root included, `describeAll` lists every command under it
+that is not a group, at any depth, sorted by name. Help resolves no setting,
+reads no file and sends no request.
+
+Before the run step of a command whose `auth` is `user` or `admin`,
+`declare` resolves its settings with `resolveSettings`
+(`internal/cli/config.go`): the hub URL from the first non-empty of the
+global flag `--endpoint-url`, `PARLEY_ENDPOINT_URL` (these two through
+`givenHubURL`, which `parley login` and `parley version` share) and the
+file's `endpoint_url`, the credential from `--api-key`, `PARLEY_API_KEY` and
+`api_key`. It calls `readConfig` only when the flags and the environment
+leave one empty. A missing setting (a missing hub URL with the message of
+`noHubURL`, which `parley login` shares), a file that cannot be parsed and
+a hub URL that is not an absolute `http` or `https` URL with a host and
+without a query or fragment (`checkHubURL`) are `client_error`s, returned before the run step starts,
+so no request is sent. The resolved settings build the call's `client`
+(`internal/cli/client.go`) with `call.newClient`, which gives it the
+declaration's `Timeout` or else `options.requestTimeout`
+(`defaultRequestTimeout`, 30 s; tests shorten it). A command whose `auth` is
+`none` gets no client: it needs no credential and builds one itself for the
+hub URL it resolves.
+
+`client` is the one HTTP client of the commands, `parley login` and
+`parley version` included. `newClient(hubURL, credential, timeout)` drops
+the URL's trailing slashes. An `apiRequest` holds the method, the path
+(relative to `/api/v1`, or with `outsideAPI` to the hub URL itself, as
+`GET /version` is), the query, the body and an optional timeout of its own.
+`raw(ctx, r)` sends it to `<hub URL>/api/v1<path>` with
+`Authorization: Bearer <credential>` (none when the credential is empty),
+`Accept: application/json`, and the body encoded as JSON with
+`Content-Type: application/json` only when there is one, and returns the
+status and the whole body whatever they hold, for a command whose output is
+not one JSON document. The timeout is a context around connecting, sending
+and reading the whole body; when it runs out the answer is a `client_error`
+(`the hub at <hub URL> gave no complete answer within <timeout>`), and any
+other failure is a `client_error` naming the hub URL: to connect or send,
+`cannot reach the hub at <hub URL>: <reason>`; to read the answer,
+`cannot read the answer of the hub at <hub URL>: <reason>`. `send(ctx, r)` is `raw`
+that accepts only an answer of the REST API: a status of `400` or above
+whose body is an object with an `error` member holding `error_type`
+(`isHubEnvelope`, in `errors.go`) becomes a `hubError`; any other status
+outside `2xx`, and a `2xx` body that is neither empty nor JSON, a
+`client_error` naming the status. `request(ctx, method, path, query, body)`
+is `send` for the common case. Each client has its own transport, a clone
+of `http.DefaultTransport` with keep-alives disabled: Go's transport can
+send a request again on a new connection when a reused one breaks, and the
+hub may have received it the first time, so every connection serves one
+request and nothing in the client retries one. Its `CheckRedirect`
+(`keepRedirect`) returns a redirect as the answer instead of following it,
+which would send the request again (a `POST` with its body after a `307`
+or `308`); `send` then refuses it as a status outside `2xx`.
+
+`internal/cli/errors.go` holds the two kinds of error a command ends with.
+`hubError` is an error envelope the hub answered, with the HTTP status and
+the body's bytes as received, which `printError` writes indented again by
+two spaces with `json.Indent`, so its member order and extra members stay
+as the hub sent them. `cliError`
+is an error the CLI raises itself, built by `usageError`, `clientError`,
+`waitFailed`, `waitTimeout` and `conditionNotMet`; `printError` writes it as
+`{"error":{"code":0,"message":…,"error_type":…}}` indented by two spaces,
+and any other error as a `client_error` with its text as the message.
+`exitCode` maps no error to `0`, a `hubError`, `wait_failed` and
+`wait_timeout` to `1`, `condition_not_met` to `3` and everything else to
+`2`. `parley login` returns these errors too.
+
+`internal/cli/output.go` prints what a command answers. A command declared
+without a run step gets the default one, `sendAndPrint`: it fills each
+`:param` segment of `Path` with the argument of that name, percent-encoded
+as one segment (`routePath`, `pathSegment`: `url.PathEscape`, and `.` and
+`..` as `%2E` and `%2E%2E`), sends `Method` to it with the call's client's
+`send` and passes the success to `printAnswer`. A `2xx` answer without a
+body is replaced by `{}`, or by the document the declaration's `Confirm`
+builds. `printResult` then writes the result with `writeResult`, which
+compacts the body and indents it by two spaces with `json.Indent`, never
+decoding it, and adds one newline; writes the line `warning: this value is
+shown once and will not be shown again` to stderr for a declaration marked
+`ShowsOnce`; and, for each of the declaration's `FailOn` conditions whose
+flag `--fail-on-<Name>` (registered by `declare`) is given, returns
+`condition_not_met` with the condition's message when `Check` says it holds
+in the result, so the result is on stdout before `run` prints the error.
+`warn` and `progress` write a plain line to stderr, a warning prefixed with
+`warning: `; `parley version` writes its warnings with `warn`. `parley
+login` prints the user with `printResult`.
+
+`internal/cli/wait.go` holds the shared wait for a long operation. A
+command declares `Wait`, a `waitFor`: `Start` (optional; the request that
+starts the operation, by default `Method` to `Path`), `Poll` (the request
+that asks for the operation's state, built from the record last received),
+`Classify` (a record's state and whether it is not terminal, `successful`
+or `unsuccessful`; `byState` builds one from a string member and the lists
+of successful and unsuccessful states) and `Document` (optional; the
+document printed in place of the final record, from the start's answer and
+the final record). `declare` registers `--wait` (bool), `--timeout` and
+`--poll-interval` (`durationValue`, a `pflag.Value` whose `Type` is
+`duration`, defaults `5m` and `5s`) and makes `call.wait` the run step of a
+command that declares no `Run`. `durationValue.Set` parses with
+`parseDuration` (a whole number above 0 and one of `s`, `m`, `h`, `d`), so
+a value it refuses is a flag that does not parse, a `usage_error` from the
+root's flag error handler before any request, with or without `--wait`.
+The client does not import the hub's `internal/server/timefmt`; the parser
+is its own. `call.wait` sends the start request through the call's client;
+without `--wait` it prints the answer with `printAnswer`. With `--wait` it
+classifies the start's record, writes `waiting: <state>` with `progress`,
+and until a record is terminal waits one poll interval (or the
+`options.pollInterval` tests set below one second), sends the poll under a
+context whose deadline is `--timeout` after the start's answer came, and
+writes `waiting: <state>` when the state changes. The final record, or
+`Document`'s document, is printed with `printResult`; an unsuccessful end
+then returns `wait_failed` naming the state. When the deadline passes,
+while sleeping or with a poll in flight (the client's error then names the
+abandoned request, not the reason), `waitEnded` returns `wait_timeout`;
+any other error of a poll (the hub's envelope, a `client_error`, a poll's
+own request timeout before the deadline) ends the wait as it is. Nothing
+is printed on stdout then, and no request cancels the operation.
+
+`internal/cli/config.go` is the one implementation of the client
+configuration file. `configPath` gives `$PARLEY_CONFIG_DIR/config.toml`, or
+`~/.parley/config.toml`, and an error when it needs the home directory and
+`os.UserHomeDir` has none. `readConfig` returns the file's `endpoint_url`,
+`api_key` and `user_id` as a `configSettings`; a missing file or no path
+gives empty settings, and a file that cannot be read or parsed is a
+`client_error` naming the path. `saveConfig` takes a `configSettings`,
+decodes the existing file with `github.com/BurntSushi/toml` into a map, so
+that keys it does not know survive, sets the three keys and encodes the map;
+it writes a temporary file in the same directory (created with mode `0700`
+when missing), syncs it, sets its mode to `0600` and renames it over
+`config.toml`. Every failure, including a file it cannot parse, is a
+`client_error` naming the path, with the temporary file removed and the old
+file left as it was; without a path, because there is no home directory,
+it is `cannot save the config file: <configPath's error>`.
+
+`parley login --api-key`, with the global flag (`internal/cli/login.go`),
+takes the credential with `loginCredential` (an empty one is a
+`usage_error` before anything is read or sent), reads the client
+configuration file with `readConfig`, resolves the hub URL
+from the flag, `PARLEY_ENDPOINT_URL` and the file, and asks the hub who the
+credential belongs to with `GET /api/v1/user` through a `client` that
+presents it (30 s timeout). On a `2xx` answer it saves `endpoint_url`,
+`api_key` and `user_id` with `saveConfig`. A hub URL that is not an absolute
+`http` or `https` URL with a host and without a query or fragment is
+refused with `checkHubURL`, as for every command.
 
 Without `--api-key`, `parley login` signs in through the browser
 (`browserLogin` in `internal/cli/login.go`): it validates `--expires`,
@@ -846,12 +1014,18 @@ and hands the code back; the server is shut down and the listener closed on
 every way out, including the wait's expiry. The code goes to
 `POST /api/v1/auth/callback` without a credential, and the answer's key and
 user are saved as in the key flow. Both flows send their requests through
-one helper (`hubCall`, 30 s timeout) that returns a hub's error envelope as
-it was received.
+the shared `client` with its `request` and `send`; the requests before the
+credential is known carry no `Authorization` header, and the callback states
+its own timeout of 60 s. A hub's error envelope comes back as a `hubError`,
+as it was received.
 
-`parley version` reads its build from `internal/buildinfo` and asks the hub
-for its build with a plain `net/http` client over HTTP (`GET /version`, 5 s
-timeout). `internal/cli` imports `internal/buildinfo` and nothing from
+`parley version` reads its build from `internal/buildinfo`, takes the hub URL
+from `--endpoint-url`, `PARLEY_ENDPOINT_URL` and then `readConfig` (a file it
+cannot parse is a warning, not a failure), and asks the hub for its build
+through the shared `client` (`GET /version` with `outsideAPI`, no
+credential, its own 5 s timeout from `options.versionTimeout`); every
+failure of that request, and an answer other than `200` with a JSON object,
+is a warning. `internal/cli` imports `internal/buildinfo` and nothing from
 `internal/server`, so the client carries no server code. The commands, output
 and exit statuses are described in [cli.md](cli.md).
 

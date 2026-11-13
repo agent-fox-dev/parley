@@ -1,0 +1,306 @@
+package cli
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"strings"
+	"time"
+
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+)
+
+// authLevel says what a command needs before it runs: user and admin need a
+// hub URL and a credential, none needs neither.
+type authLevel string
+
+const (
+	authNone  authLevel = "none"
+	authUser  authLevel = "user"
+	authAdmin authLevel = "admin"
+)
+
+// argSpec is one named positional argument of a command.
+type argSpec struct {
+	Name     string `json:"name"`
+	Required bool   `json:"required"`
+	// Repeats marks the last argument as taking every remaining word,
+	// joined by single spaces.
+	Repeats bool `json:"-"`
+}
+
+// command is the declaration of one parley command: everything that differs
+// from one command to the next. Every command is declared through declare,
+// so that each behaves alike on what this declaration does not say (ADR 02).
+type command struct {
+	// Name is the command's last word ("get" of "parley probe get").
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	// Method and Path are the route the command calls, Path relative to
+	// /api/v1 with :param for its parameters; both are empty for a command
+	// that calls no single route.
+	Method string `json:"method"`
+	Path   string `json:"path"`
+	// Args are the named positional arguments, the required ones first.
+	Args []argSpec `json:"args"`
+	Auth authLevel `json:"auth"`
+	// Flags adds the command's own flags, if it has any.
+	Flags func(fs *pflag.FlagSet) `json:"-"`
+	// Run is the command's run step; it runs only once the command line
+	// has been accepted. Without one, the command sends Method and Path
+	// and prints the hub's answer.
+	Run func(c *call) error `json:"-"`
+	// Confirm builds the document a success without a body prints in
+	// place of {}.
+	Confirm func(c *call) any `json:"-"`
+	// ShowsOnce marks a command whose result carries a secret the hub
+	// shows only this once.
+	ShowsOnce bool `json:"-"`
+	// FailOn are the command's --fail-on-… conditions.
+	FailOn []failOn `json:"-"`
+	// Timeout, when not zero, bounds each of the command's requests in
+	// place of the default of 30 seconds.
+	Timeout time.Duration `json:"-"`
+	// Wait makes the command one that can wait for the operation it
+	// starts: declare gives it --wait, --timeout and --poll-interval, and
+	// its run step, unless it declares Run, is the shared wait.
+	Wait *waitFor `json:"-"`
+}
+
+// failOn is a --fail-on-<Name> flag: a condition over the command's result
+// that, when the flag is given and the condition holds, ends the command
+// with condition_not_met once the result is printed.
+type failOn struct {
+	// Name follows "fail-on-" in the flag's name.
+	Name        string
+	Description string
+	// Check reports whether the condition holds in result, the document
+	// printed on stdout, and the message of condition_not_met when it does.
+	Check func(result []byte) (holds bool, message string)
+}
+
+// call is one run of a declared command.
+type call struct {
+	ctx  context.Context
+	cmd  *cobra.Command
+	decl command
+	// args holds the positional arguments by their declared names; an
+	// optional argument not given is absent.
+	args           map[string]string
+	stdout, stderr io.Writer
+	opts           options
+	// client sends the command's requests to the hub with the settings
+	// resolved for it. It is nil for a command whose auth is none, which
+	// needs no credential and resolves what it does need itself.
+	client *client
+}
+
+// newClient is the client of the hub at hubURL presenting credential, with
+// the command's request timeout: the one it declares, else the default.
+func (c *call) newClient(hubURL, credential string) *client {
+	timeout := c.opts.requestTimeout
+	if c.decl.Timeout > 0 {
+		timeout = c.decl.Timeout
+	}
+	return newClient(hubURL, credential, timeout)
+}
+
+// The annotations a declared command or a group carries.
+const (
+	// declarationAnnotation holds the command's declaration as JSON.
+	declarationAnnotation = "parley.declaration"
+	// groupAnnotation marks a command group.
+	groupAnnotation = "parley.group"
+)
+
+// declare builds the cobra command of decl. It keeps decl in the command's
+// annotations, refuses a wrong number of arguments as a usage error, and
+// runs decl.Run with the arguments by name.
+func declare(decl command) *cobra.Command {
+	// Only strings, booleans and slices of them are encoded, so this
+	// cannot fail.
+	encoded, _ := json.Marshal(decl)
+	cmd := &cobra.Command{
+		Use:         useLine(decl),
+		Short:       decl.Description,
+		Args:        checkCommandLine(decl.Args),
+		Annotations: map[string]string{declarationAnnotation: string(encoded)},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			named := make(map[string]string, len(args))
+			for i, spec := range decl.Args {
+				switch {
+				case i >= len(args):
+				case spec.Repeats:
+					named[spec.Name] = strings.Join(args[i:], " ")
+				default:
+					named[spec.Name] = args[i]
+				}
+			}
+			c := &call{
+				ctx:    cmd.Context(),
+				cmd:    cmd,
+				decl:   decl,
+				args:   named,
+				stdout: cmd.OutOrStdout(),
+				stderr: cmd.ErrOrStderr(),
+				opts:   optionsFrom(cmd.Context()),
+			}
+			// Both settings are resolved before the run step, so a command
+			// that lacks one fails before it sends anything.
+			if decl.Auth != authNone {
+				s, err := resolveSettings(cmd)
+				if err != nil {
+					return err
+				}
+				c.client = c.newClient(s.hubURL, s.credential)
+			}
+			switch {
+			case decl.Run != nil:
+				return decl.Run(c)
+			case decl.Wait != nil:
+				return c.wait()
+			}
+			return sendAndPrint(c)
+		},
+	}
+	if decl.Flags != nil {
+		decl.Flags(cmd.Flags())
+	}
+	if decl.Wait != nil {
+		addWaitFlags(cmd.Flags())
+	}
+	for _, f := range decl.FailOn {
+		cmd.Flags().Bool(f.flag(), false, f.Description)
+	}
+	return cmd
+}
+
+// declarationOf is the declaration declare kept in cmd, or the zero
+// declaration for a command not built by declare.
+func declarationOf(cmd *cobra.Command) command {
+	var decl command
+	if encoded, ok := cmd.Annotations[declarationAnnotation]; ok {
+		// declare wrote it, so it decodes.
+		_ = json.Unmarshal([]byte(encoded), &decl)
+	}
+	return decl
+}
+
+// isGroup tells whether cmd is a command group built by group.
+func isGroup(cmd *cobra.Command) bool {
+	return cmd.Annotations[groupAnnotation] == "true"
+}
+
+// group builds a command group: a command that only holds children. Run
+// alone it prints its help; given a word that is none of its children, it
+// fails with a usage error, where cobra would print the help.
+func group(name, description string, children ...*cobra.Command) *cobra.Command {
+	g := &cobra.Command{
+		Use:         name,
+		Short:       description,
+		Annotations: map[string]string{groupAnnotation: "true"},
+		Args: func(cmd *cobra.Command, args []string) error {
+			if len(args) > 0 {
+				return usageError("unknown command %q for %q", args[0], cmd.CommandPath())
+			}
+			return nil
+		},
+		// cobra checks the arguments only of a command that runs, so a group
+		// runs, to print its help.
+		RunE: func(cmd *cobra.Command, _ []string) error { return cmd.Help() },
+	}
+	g.AddCommand(children...)
+	return g
+}
+
+// useLine is the command's name followed by its arguments, <required> and
+// [optional], with ... after one that repeats.
+func useLine(decl command) string {
+	words := []string{decl.Name}
+	for _, a := range decl.Args {
+		word := "[" + a.Name + "]"
+		if a.Required {
+			word = "<" + a.Name + ">"
+		}
+		if a.Repeats {
+			word += "..."
+		}
+		words = append(words, word)
+	}
+	return strings.Join(words, " ")
+}
+
+// checkCommandLine refuses, as a usage error, fewer arguments than specs
+// requires, more than it names, and a required flag that is not given.
+// cobra checks required flags itself only after this, with an error of no
+// kind, so the check is here, before any run step.
+func checkCommandLine(specs []argSpec) cobra.PositionalArgs {
+	countArgs := checkArgs(specs)
+	return func(cmd *cobra.Command, args []string) error {
+		if err := countArgs(cmd, args); err != nil {
+			return err
+		}
+		var missing []string
+		cmd.Flags().VisitAll(func(f *pflag.Flag) {
+			if isRequired(f) && !f.Changed {
+				missing = append(missing, "--"+f.Name)
+			}
+		})
+		if len(missing) > 0 {
+			return usageError("%s needs the flag %s", cmd.CommandPath(), strings.Join(missing, " and "))
+		}
+		return nil
+	}
+}
+
+// isRequired tells whether f was marked required with cobra.MarkFlagRequired.
+func isRequired(f *pflag.Flag) bool {
+	required := f.Annotations[cobra.BashCompOneRequiredFlag]
+	return len(required) > 0 && required[0] == "true"
+}
+
+// checkArgs refuses fewer arguments than specs requires and more than it
+// names, as a usage error. A last argument that repeats takes any number of
+// words.
+func checkArgs(specs []argSpec) cobra.PositionalArgs {
+	return func(cmd *cobra.Command, args []string) error {
+		for i, spec := range specs {
+			if spec.Required && i >= len(args) {
+				return usageError("%s needs the argument <%s>", cmd.CommandPath(), spec.Name)
+			}
+		}
+		if n := len(specs); n > 0 && specs[n-1].Repeats {
+			return nil
+		}
+		if len(args) > len(specs) {
+			if len(specs) == 0 {
+				return usageError("%s takes no arguments, got %q", cmd.CommandPath(), args[0])
+			}
+			return usageError("%s takes at most %d arguments, got the extra argument %q", cmd.CommandPath(), len(specs), args[len(specs)])
+		}
+		return nil
+	}
+}
+
+// optionsKey is the context key of the options of the current run.
+type optionsKey struct{}
+
+// withOptions is ctx carrying opts, so that a declared command finds them.
+func withOptions(ctx context.Context, opts options) context.Context {
+	return context.WithValue(ctx, optionsKey{}, opts)
+}
+
+// optionsFrom is the options ctx carries, or the defaults.
+func optionsFrom(ctx context.Context) options {
+	if opts, ok := ctx.Value(optionsKey{}).(options); ok {
+		return opts
+	}
+	return defaultOptions()
+}
+
+// globalFlag is the value of the global string flag name as cmd parsed it.
+func globalFlag(cmd *cobra.Command, name string) string {
+	value, _ := cmd.Flags().GetString(name)
+	return value
+}
