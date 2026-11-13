@@ -52,18 +52,19 @@ func newLoginCommand(opts options) *cobra.Command {
 					return err
 				}
 			}
-			// The file is read before anything else is sent, so that a file
-			// the save would fail on cannot cost a credential the hub just
-			// accepted or issued.
+			// The file is read, and its path found, before anything else is
+			// sent, so that a file or a missing home directory the save would
+			// fail on cannot cost a credential the hub just accepted or
+			// issued.
 			path, err := configPath()
 			if err != nil {
 				return clientError("%v", err)
 			}
-			cfg, err := readConfig(path)
+			file, err := readConfig()
 			if err != nil {
-				return clientError("%v", err)
+				return err
 			}
-			hubURL := loginHubURL(globalFlag(cmd, "endpoint-url"), cfg)
+			hubURL := loginHubURL(globalFlag(cmd, "endpoint-url"), file.EndpointURL)
 			if hubURL == "" {
 				return clientError("no hub URL: pass --endpoint-url, set %s or set %s in %s", endpointURLEnv, configEndpointURL, path)
 			}
@@ -79,14 +80,11 @@ func newLoginCommand(opts options) *cobra.Command {
 				return err
 			}
 
-			cfg[configEndpointURL] = hubURL
-			cfg[configAPIKey] = cred
-			cfg[configUserID] = user.id
-			if err := saveConfig(path, cfg); err != nil {
+			if err := saveConfig(configSettings{EndpointURL: hubURL, APIKey: cred, UserID: user.id}); err != nil {
 				if browser {
-					return clientError("the hub issued an API key, but it was not saved to %s: %v", path, err)
+					return clientError("the hub issued an API key, but it was not saved: %v", err)
 				}
-				return clientError("the hub accepted the credential, but it was not saved to %s: %v", path, err)
+				return clientError("the hub accepted the credential, but it was not saved: %v", err)
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "%s\n", user.indented)
 			fmt.Fprintf(cmd.ErrOrStderr(), "Logged in as %s\n", user.username)
@@ -100,13 +98,13 @@ func newLoginCommand(opts options) *cobra.Command {
 
 // loginHubURL is the first non-empty of the flag --endpoint-url, the variable
 // PARLEY_ENDPOINT_URL and the file's endpoint_url, without trailing slashes.
-func loginHubURL(flag string, cfg map[string]any) string {
+func loginHubURL(flag, file string) string {
 	hubURL := flag
 	if hubURL == "" {
 		hubURL = os.Getenv(endpointURLEnv)
 	}
 	if hubURL == "" {
-		hubURL, _ = cfg[configEndpointURL].(string)
+		hubURL = file
 	}
 	return strings.TrimRight(hubURL, "/")
 }

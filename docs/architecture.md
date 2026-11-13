@@ -854,14 +854,26 @@ and any other error as a `client_error` with its text as the message.
 `wait_timeout` to `1`, `condition_not_met` to `3` and everything else to
 `2`. `parley login` returns these errors too.
 
-`parley login --api-key`, with the global flag (`internal/cli/login.go`), reads the client
-configuration file (`internal/cli/config.go`: `$PARLEY_CONFIG_DIR/config.toml`
-or `~/.parley/config.toml`, decoded with `github.com/BurntSushi/toml` into a
-map, so that keys it does not know survive), resolves the hub URL from the
-flag, `PARLEY_ENDPOINT_URL` and the file, and asks the hub who the credential
-belongs to with `GET /api/v1/user` (30 s timeout). On `200` it sets
-`endpoint_url`, `api_key` and `user_id` in the map and saves it: a temporary
-file with mode `0600` in the same directory, renamed over `config.toml`.
+`internal/cli/config.go` is the one implementation of the client
+configuration file. `configPath` gives `$PARLEY_CONFIG_DIR/config.toml`, or
+`~/.parley/config.toml`, and an error when it needs the home directory and
+`os.UserHomeDir` has none. `readConfig` returns the file's `endpoint_url`,
+`api_key` and `user_id` as a `configSettings`; a missing file or no path
+gives empty settings, and a file that cannot be read or parsed is a
+`client_error` naming the path. `saveConfig` takes a `configSettings`,
+decodes the existing file with `github.com/BurntSushi/toml` into a map, so
+that keys it does not know survive, sets the three keys and encodes the map;
+it writes a temporary file in the same directory (created with mode `0700`
+when missing), syncs it, sets its mode to `0600` and renames it over
+`config.toml`. Every failure, including a file it cannot parse, is a
+`client_error` naming the path, with the temporary file removed and the old
+file left as it was.
+
+`parley login --api-key`, with the global flag (`internal/cli/login.go`),
+reads the client configuration file with `readConfig`, resolves the hub URL
+from the flag, `PARLEY_ENDPOINT_URL` and the file, and asks the hub who the
+credential belongs to with `GET /api/v1/user` (30 s timeout). On `200` it
+saves `endpoint_url`, `api_key` and `user_id` with `saveConfig`.
 
 Without `--api-key`, `parley login` signs in through the browser
 (`browserLogin` in `internal/cli/login.go`): it validates `--expires`,

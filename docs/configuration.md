@@ -171,12 +171,25 @@ endpoint_url = "http://127.0.0.1:8080"
 user_id = "0b5c6f2e-8d1a-4c3b-9e7f-2a4d6c8e0f13"
 ```
 
-`parley login` reads the file before it sends anything (a missing file is
-empty; one that is not valid TOML fails the login and is left as it is),
-and after a successful login sets these three keys and writes the file
-again. It keeps every other key and table with its value, but not comments
-or the order of the keys. It writes a temporary file with mode `0600` in the
-same directory and renames it over `config.toml`, so the file is replaced
-as a whole and ends with mode `0600`; a missing config directory is created
-with mode `0700`. `parley login` does not read `api_key`, and
-`PARLEY_API_KEY` does not change it. See [cli.md](cli.md#parley-login).
+Reading the file creates nothing. A missing file, and a missing home
+directory when `PARLEY_CONFIG_DIR` is unset or empty, count as an empty
+file. A file that cannot be read, is not valid TOML, or holds
+`endpoint_url`, `api_key` or `user_id` with a value that is not a string is
+an error (`client_error`) whose message names the file's path; for invalid
+TOML it gives the line and column, never the file's text, which holds a
+credential.
+
+Only `parley login` writes the file. It reads the file before it sends
+anything, so a file it could not read fails the login and is left as it
+is, and after a successful login sets these three keys and saves the file.
+The save keeps every other key and table with its value, but not comments
+or the order of the keys. It writes a temporary file in the same directory,
+sets its mode to `0600` whatever the umask and the old file's mode, and
+renames it over `config.toml`, so the file is replaced as a whole and ends
+with mode `0600`; a missing config directory is created with mode `0700`.
+A save that cannot write the new file or replace the old one, finds a file
+it cannot parse, or has no path because there is no home directory fails
+with a `client_error` naming the path, removes its temporary file and
+leaves the old file byte for byte as it was. `parley login` does not read
+`api_key`, and `PARLEY_API_KEY` does not change it. See
+[cli.md](cli.md#parley-login).

@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -442,4 +443,68 @@ func (b *syncBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
+}
+
+// writeFile is a setup step that writes content to path with mode 0600.
+func writeFile(content string) func(t *testing.T, path string) {
+	return func(t *testing.T, path string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// wantClientError fails the test unless err is a client_error whose message
+// contains inMessage, and returns the message.
+func wantClientError(t *testing.T, err error, inMessage string) string {
+	t.Helper()
+	var ce *cliError
+	if !errors.As(err, &ce) || ce.errorType != clientErrorType {
+		t.Fatalf("error = %#v, want a client_error", err)
+	}
+	if !strings.Contains(ce.message, inMessage) {
+		t.Errorf("message = %q, want it to contain %q", ce.message, inMessage)
+	}
+	return ce.message
+}
+
+// inodeOf is the inode number of the file at path.
+func inodeOf(t *testing.T, path string) uint64 {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return uint64(fi.Sys().(*syscall.Stat_t).Ino)
+}
+
+// snapshot describes everything under dir, dir included: each entry's
+// relative path with its mode and, for a file, its bytes.
+func snapshot(t *testing.T, dir string) map[string]string {
+	t.Helper()
+	state := map[string]string{}
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		fi, err := d.Info()
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(dir, path)
+		state[rel] = fi.Mode().String()
+		if fi.Mode().IsRegular() {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			state[rel] += " " + string(data)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return state
 }

@@ -415,11 +415,12 @@ Global Flags:
 `parley login` saves the hub URL, a credential and the user's id in the
 client configuration file (see
 [configuration.md](configuration.md#the-client-configuration-file)). It
-first reads that file, and a file that is not valid TOML fails the login
-before any request, leaving the file as it is. It then takes the hub URL
-from the first non-empty of `--endpoint-url`, `PARLEY_ENDPOINT_URL` and the
-file's `endpoint_url`, and drops trailing slashes from it. With none it
-fails before any request:
+first reads that file, and a file that cannot be read, is not valid TOML
+or holds `endpoint_url`, `api_key` or `user_id` with a value that is not a
+string fails the login before any request, leaving the file as it is. It
+then takes the hub URL from the first non-empty of `--endpoint-url`,
+`PARLEY_ENDPOINT_URL` and the file's `endpoint_url`, and drops trailing
+slashes from it. With none it fails before any request:
 
 ```json
 {
@@ -549,12 +550,13 @@ writes one error envelope with `code` `0` to stderr (see
 `error_type` is `usage_error` for an unknown flag, a flag without its
 value, a positional argument, an empty credential and a bad `--expires`,
 none of which sends a request, and `client_error` for everything else: a
-config file that cannot be read or is not valid TOML (the message gives the
-line and column, not the text), no hub URL, a hub that cannot be reached or
-does not answer within 30 seconds (60 seconds for the callback), an
-answer that is neither what the request expects (on `200`: a JSON object
-with an `id`, a provider list, a callback answer with a key) nor an error
-envelope, a provider the hub does not list, a browser that
+config file that cannot be read, is not valid TOML (the message gives the
+line and column, not the text) or holds a known key with a value that is
+not a string, no home directory to find the config file in, no hub URL, a
+hub that cannot be reached or does not answer within 30 seconds (60
+seconds for the callback), an answer that is neither what the request
+expects (on `200`: a JSON object with an `id`, a provider list, a callback
+answer with a key) nor an error envelope, a provider the hub does not list, a browser that
 comes back with the wrong state, an error or no code, or does not come
 back within 120 seconds, and a config file that cannot be written after
 the hub accepted the credential or issued the key. In that last case the
@@ -571,14 +573,14 @@ credential stays valid and is not saved:
 {
   "error": {
     "code": 0,
-    "message": "the hub accepted the credential, but it was not saved to /home/alice/.parley/config.toml: open /home/alice/.parley/.config.toml.1234567: permission denied",
+    "message": "the hub accepted the credential, but it was not saved: cannot write the config file /home/alice/.parley/config.toml: permission denied",
     "error_type": "client_error"
   }
 }
 {
   "error": {
     "code": 0,
-    "message": "the hub issued an API key, but it was not saved to /home/alice/.parley/config.toml: open /home/alice/.parley/.config.toml.1234567: permission denied",
+    "message": "the hub issued an API key, but it was not saved: cannot write the config file /home/alice/.parley/config.toml: permission denied",
     "error_type": "client_error"
   }
 }

@@ -17,15 +17,22 @@ const configDirEnv = "PARLEY_CONFIG_DIR"
 // configFileName is the client configuration file in the config directory.
 const configFileName = "config.toml"
 
-// The keys parley login sets in the configuration file.
+// The keys of the configuration file parley knows; parley login sets them.
 const (
 	configEndpointURL = "endpoint_url"
 	configAPIKey      = "api_key"
 	configUserID      = "user_id"
 )
 
+// configSettings are the values of the keys of the configuration file parley
+// knows; a key the file does not hold is empty.
+type configSettings struct {
+	EndpointURL, APIKey, UserID string
+}
+
 // configPath is the client configuration file: config.toml in
-// $PARLEY_CONFIG_DIR when it is set and not empty, else in ~/.parley.
+// $PARLEY_CONFIG_DIR when it is set and not empty, else in ~/.parley. It
+// fails when it needs the home directory and none can be determined.
 func configPath() (string, error) {
 	if dir := os.Getenv(configDirEnv); dir != "" {
 		return filepath.Join(dir, configFileName), nil
@@ -37,43 +44,97 @@ func configPath() (string, error) {
 	return filepath.Join(home, ".parley", configFileName), nil
 }
 
-// readConfig reads the configuration file at path into a map, so that a save
-// keeps the keys this client does not know. A missing file is an empty map.
-func readConfig(path string) (map[string]any, error) {
+// readConfig reads the configuration file. A missing file, or no path for
+// it because there is no home directory, gives empty settings: the file is
+// optional and reading it creates nothing. A file that cannot be read or
+// parsed is a client error that names it.
+func readConfig() (configSettings, error) {
+	path, err := configPath()
+	if err != nil {
+		return configSettings{}, nil
+	}
+	cfg, err := parseConfig(path)
+	if err != nil {
+		return configSettings{}, err
+	}
+	// parseConfig has checked that the known keys hold strings.
+	endpointURL, _ := cfg[configEndpointURL].(string)
+	apiKey, _ := cfg[configAPIKey].(string)
+	userID, _ := cfg[configUserID].(string)
+	return configSettings{EndpointURL: endpointURL, APIKey: apiKey, UserID: userID}, nil
+}
+
+// saveConfig sets endpoint_url, api_key and user_id of the configuration
+// file to s and keeps every other key and table of the file with its value.
+// The new file replaces the old one by a rename, so a reader sees one or the
+// other and never a part of either, and it has mode 0600. A file it cannot
+// parse is not replaced, because its other keys could not be kept. On any
+// failure it returns a client error that names the file and leaves the old
+// file as it was.
+func saveConfig(s configSettings) error {
+	path, err := configPath()
+	if err != nil {
+		return clientError("cannot save the config file: %v", err)
+	}
+	cfg, err := parseConfig(path)
+	if err != nil {
+		return err
+	}
+	cfg[configEndpointURL] = s.EndpointURL
+	cfg[configAPIKey] = s.APIKey
+	cfg[configUserID] = s.UserID
+	data, err := toml.Marshal(cfg)
+	if err != nil {
+		return clientError("cannot write the config file %s: %v", path, err)
+	}
+	if err := replaceFile(path, data); err != nil {
+		return clientError("cannot write the config file %s: %v", path, withoutPath(err))
+	}
+	return nil
+}
+
+// parseConfig decodes the configuration file at path into a map, so that a
+// save keeps the keys this client does not know. A missing file is an empty
+// map. A file that cannot be read, is not valid TOML, or holds a known key
+// whose value is not a string is a client error that names path; the message
+// never quotes the file, which holds a credential.
+func parseConfig(path string) (map[string]any, error) {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return map[string]any{}, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("cannot read the config file: %w", err)
+		return nil, clientError("cannot read the config file %s: %v", path, withoutPath(err))
 	}
 	cfg := map[string]any{}
 	if err := toml.Unmarshal(data, &cfg); err != nil {
 		// Only the position: the parser's message can quote the text at the
-		// mistake, and this file holds a credential.
+		// mistake.
 		var pe toml.ParseError
 		if errors.As(err, &pe) {
-			return nil, fmt.Errorf("the config file %s is not valid TOML: line %d, column %d", path, pe.Position.Line, pe.Position.Col)
+			return nil, clientError("the config file %s is not valid TOML: line %d, column %d", path, pe.Position.Line, pe.Position.Col)
 		}
-		return nil, fmt.Errorf("the config file %s is not valid TOML", path)
+		return nil, clientError("the config file %s is not valid TOML", path)
+	}
+	for _, key := range []string{configEndpointURL, configAPIKey, configUserID} {
+		if value, ok := cfg[key]; ok {
+			if _, ok := value.(string); !ok {
+				return nil, clientError("the config file %s is not valid: %s is not a string", path, key)
+			}
+		}
 	}
 	return cfg, nil
 }
 
-// saveConfig writes cfg to path. It writes a temporary file with mode 0600 in
-// the same directory and renames it over path, so a reader sees the old file
-// or the new one and never a part of either; the directory is created with
-// mode 0700 when it is missing. On failure the temporary file is removed.
-func saveConfig(path string, cfg map[string]any) (err error) {
-	data, err := toml.Marshal(cfg)
-	if err != nil {
-		return err
-	}
+// replaceFile writes data to a temporary file with mode 0600 in the
+// directory of path, creating the directory with mode 0700 when it is
+// missing, and renames it over path. On failure the temporary file is
+// removed and path is left as it was.
+func replaceFile(path string, data []byte) (err error) {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	// CreateTemp creates the file with mode 0600.
 	tmp, err := os.CreateTemp(dir, "."+configFileName+".*")
 	if err != nil {
 		return err
@@ -90,8 +151,26 @@ func saveConfig(path string, cfg map[string]any) (err error) {
 	if err := tmp.Sync(); err != nil {
 		return err
 	}
+	// Explicitly, so that neither the umask nor the old file's mode decides.
+	if err := tmp.Chmod(0o600); err != nil {
+		return err
+	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}
 	return os.Rename(tmp.Name(), path)
+}
+
+// withoutPath is err without the operation and path a file system error adds,
+// for a message that names the file itself.
+func withoutPath(err error) error {
+	var pe *fs.PathError
+	if errors.As(err, &pe) {
+		return pe.Err
+	}
+	var le *os.LinkError
+	if errors.As(err, &le) {
+		return le.Err
+	}
+	return err
 }
