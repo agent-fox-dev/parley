@@ -1,21 +1,128 @@
 # Configuration
 
-Parley has no configuration file yet. `parleyd` reads no environment
-variable; `parley` reads one, `PARLEY_ENDPOINT_URL`.
+`parleyd` reads one configuration file, `config.toml`, and the environment
+variables named below. `parley` reads one environment variable,
+`PARLEY_ENDPOINT_URL`.
 
 ## `parleyd`
 
+### The configuration file
+
+`parleyd` reads `config.toml` once, when it starts:
+
+- from `$XDG_CONFIG_HOME/config.toml` when `XDG_CONFIG_HOME` is set and not
+  empty (a relative `XDG_CONFIG_HOME` is taken relative to the working
+  directory);
+- otherwise from `config.toml` in the working directory.
+
+A missing file means every key has its default. The directory the file is
+looked for in is the *config dir*. The `config` member of the `listening`
+line is the absolute path that was looked for, also when the file does not
+exist (see [cli.md](cli.md#log-lines)).
+
+The file is TOML and is checked strictly: invalid TOML, a section or a key
+no part of the hub registers, and a value of the wrong type or out of range
+each stop the start with exit status `1` and one error line that names the
+line or the key (`section.key`). The values of the file are never quoted in
+an error. For example:
+
+```json
+{"time":"2026-11-13T13:11:38.609972+01:00","level":"ERROR","msg":"cannot start","error":"configuration file /srv/parley/config.toml: server.prot: unknown key"}
+```
+
+### Environment references
+
+In a string value, `${NAME}` is replaced by the value of the environment
+variable `NAME`, and `$$` by one `$`. A `$` followed by neither `{` nor `$`
+stays as it is. References are replaced after the file is parsed, in string
+values only: never in section or key names, integers or booleans, so a
+variable cannot add, remove or rename a key.
+
+| Value | Result |
+|---|---|
+| `"${GH_SECRET}"` | the value of `GH_SECRET` |
+| `"https://${HOST}"` | `https://` and the value of `HOST` |
+| `"pa$$word"` | `pa$word` |
+| `"cost $5"` | `cost $5` |
+
+A reference to a variable that is not set (set to the empty string is set),
+a `${` without a closing `}`, and a name that is not a letter or `_` followed
+by letters, digits or `_`, are errors of the key that holds them; the error
+names the key and the variable, never a value.
+
+### Keys
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `[server].bind` | string | `"0.0.0.0"` | the address the hub listens on; not empty |
+| `[server].port` | integer | `8080` | the TCP port the hub listens on, `0` to `65535`; `0` lets the system choose |
+| `[server].external_url` | string | `""` | the URL clients reach the hub at; empty, or an absolute `http` or `https` URL |
+| `[server].max_body_size` | string | `"1MB"` | the largest REST request body: a positive whole number followed by `KB`, `MB` or `GB`, in any letter case, in powers of 1024; a larger body is answered `413` (see [api.md](api.md#request-bodies)) |
+| `[database].path` | string | see below | the transactional store's file; its directory is the data directory |
+| `[workspace].path` | string | see below | the workspace root, where the repositories live |
+| `[workspace].workers` | integer | `4` | how many workspace jobs run at the same time; at least `1` |
+| `[logging].level` | string | `"info"` | `trace`, `debug`, `info`, `warn` or `error`, in any letter case; lines below it are not written |
+| `[logging].log_health_probes` | boolean | `false` | write an access-log line, at debug level, for requests to `/healthz` and `/readyz` |
+| `[limits].requests_per_minute` | integer | `600` | how many REST requests one credential, or one client address without a valid credential, may send in a window of 60 seconds; `0` turns the rate limit off (see [api.md](api.md#rate-limit)) |
+
+`[database].path` and `[workspace].path`, set or not, are resolved to
+absolute paths:
+
+| `[database].path` / `[workspace].path` | `XDG_DATA_HOME` set and not empty | otherwise |
+|---|---|---|
+| not set | `$XDG_DATA_HOME/parley.db` / `$XDG_DATA_HOME/workspaces` | `data/parley.db` / `data/workspaces` in the working directory |
+| a bare name, such as `hub.db` | under `$XDG_DATA_HOME` | under the working directory |
+| a relative path with a directory, such as `var/hub.db` | under the working directory | under the working directory |
+| an absolute path | kept | kept |
+
+The analytical store is `analytics.db` in the data directory. `parleyd`
+creates the data directory and the workspace root when they are missing,
+with missing parents, with mode `0700`; a directory that exists keeps its
+mode.
+
+### OAuth providers
+
+Each `[[oauth.providers]]` table configures one login provider:
+
+```toml
+[[oauth.providers]]
+name = "github"
+client_id = "Iv1.0123456789abcdef"
+client_secret = "${GH_SECRET}"
+```
+
+| Key | Meaning |
+|---|---|
+| `name` | `github` or `google`; each at most once |
+| `client_id` | not empty |
+| `client_secret` | not empty; `parleyd` replaces its value by `[redacted]` in every log line |
+| `authorize_url`, `token_url`, `userinfo_url` | absolute `http` or `https` URLs; default to the provider's public endpoints |
+
+The default endpoints are, for `github`,
+`https://github.com/login/oauth/authorize`,
+`https://github.com/login/oauth/access_token` and
+`https://api.github.com/user`, and for `google`,
+`https://accounts.google.com/o/oauth2/v2/auth`,
+`https://oauth2.googleapis.com/token` and
+`https://openidconnect.googleapis.com/v1/userinfo`. The `[oauth]` section
+holds nothing else.
+
+### Environment variables
+
+| Variable | Effect |
+|---|---|
+| `XDG_CONFIG_HOME` | the directory `config.toml` is read from |
+| `XDG_DATA_HOME` | where the stores and the workspace root go when `[database].path` and `[workspace].path` do not say (see above) |
+| any variable a `${NAME}` reference names | its value replaces the reference |
+
+### Fixed values
+
 | Setting | Value |
 |---|---|
-| Listen address | `0.0.0.0:8080` (all interfaces, port 8080) |
 | Shutdown grace | 15 seconds: how long in-flight requests get to finish after `SIGTERM` or `SIGINT` |
-| Body limit | 1048576 bytes (1 MiB): the largest REST request body; a larger one is answered `413` (see [api.md](api.md#request-bodies)) |
-| Rate limit | 600 REST requests per credential, or per client address without a valid credential, in a window of 60 seconds; a request over it is answered `429` (see [api.md](api.md#rate-limit)) |
-| Idempotency records | kept in memory for 24 hours, and lost when `parleyd` restarts (see [api.md](api.md#idempotency)) |
-| Health-probe logging | off: requests to `/healthz` and `/readyz` get no access-log line (see [cli.md](cli.md#log-lines)) |
+| Idempotency records | kept in the transactional store for 24 hours, so they survive a restart (see [api.md](api.md#idempotency)) |
 
-These values are fixed; `parleyd` takes no flag for them. See
-[cli.md](cli.md) for how `parleyd` is started and stopped.
+See [cli.md](cli.md) for how `parleyd` is started and stopped.
 
 ## `parley`
 

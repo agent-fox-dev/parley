@@ -10,9 +10,11 @@ command-line client. Both are written in Go, in the module
 | Package | Holds |
 |---|---|
 | `cmd/parley` | the `parley` program: it calls `cli.Run` and exits with its status |
-| `cmd/parleyd` | the `parleyd` program: argument parsing, signals, the start log line and the exit status |
+| `cmd/parleyd` | the `parleyd` program: `main` calls `hub.Run` with the process's arguments, environment and working directory and exits with its status |
 | `internal/buildinfo` | the version, commit and build time the binary was built with, shared by both programs |
 | `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra` |
+| `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, and a registry of keys and whole sections that decides what the file may hold |
+| `internal/hub` | the composition of the `parleyd` process: argument parsing, the scrubbing logger, the fixed start order, the HTTP server's options, the idempotency records in the transactional store, signals and the stop; the one place later packages plug their parts in ([ADR 01](adr/01-compose-the-hub-in-one-package.md)) |
 | `internal/scrub` | the one scrubbing function for text that leaves the hub: `Scrubber.Scrub` replaces registered secret values and the hub's own credential formats by `[redacted]`, removes user information from URLs and cuts the text to 1024 bytes; a leaf package that imports nothing of the project |
 | `internal/store` | the hub's two embedded SQLite stores (`modernc.org/sqlite`, no cgo): `Open` creates the data directory and the workspace root, opens the transactional store and the analytical store (`analytics.db` beside it) and applies the registered schema steps; `Tx` runs a transaction of the transactional store |
 | `internal/server` | the hub's HTTP server: its built-in routes, the REST API's route registration and check pipeline, the error envelope, request ids, response headers and the access log, list paging, idempotency keys, and the readiness probes |
@@ -23,7 +25,7 @@ command-line client. Both are written in Go, in the module
 
 `server.New(server.Options)` builds the server, and `(*Server).Handler()`
 returns the `http.Handler` that serves its routes. `Options` holds the listen
-address (`Addr`), the shutdown grace (`ShutdownGrace`), the readiness
+address (`Addr`) or a listener already bound (`Listener`), the shutdown grace (`ShutdownGrace`), the readiness
 probes (`ReadinessProbes`) and `OnListen`, a function `Serve` calls once with
 the address it bound (with port `0` in `Addr`, the port the system chose),
 the REST body limit (`MaxBodySize`), the rate limit (`RequestsPerMinute`,
@@ -247,8 +249,8 @@ the route (the method, one space and the concrete `r.URL.Path`, such as
    has the handler's answer;
 5. records nothing for any other status or for an error.
 
-The records live behind `server.IdempotencyStore`, which package 03
-implements over its transactional store and installs as
+The records live behind `server.IdempotencyStore`, which `internal/hub`
+implements over the transactional store and installs as
 `Options.IdempotencyStore`:
 
 ```go
@@ -285,7 +287,9 @@ type IdempotencyRecord struct {
   record of its own.
 
 `server.NewMemoryIdempotencyStore()` is the in-memory implementation and the
-server's default; its records are lost when the process ends.
+server's default; its records are lost when the process ends. `parleyd` uses
+the store-backed implementation of `internal/hub` instead (see
+[The hub](#the-hub)).
 
 The gate that orders requests with one identity is in memory in either case,
 since the hub is one process: a map from (key, caller, route) to a slot with
@@ -323,9 +327,10 @@ a sign, and refuses a value whose product with the unit would overflow a
 
 ### Serving and stopping
 
-`(*Server).Serve(ctx)` binds `Addr` with `net.Listen("tcp", …)`, returns the
-error (`listen on <addr>: …`) when it cannot, calls `OnListen`, and serves
-until `ctx` is cancelled. Then it stops in this order:
+`(*Server).Serve(ctx)` serves on `Listener` when it is set, and otherwise
+binds `Addr` with `net.Listen("tcp", …)` and returns the error
+(`listen on <addr>: …`) when it cannot; it calls `OnListen` and serves until
+`ctx` is cancelled. Then it stops in this order:
 
 1. It closes the listener, so new connections are refused.
 2. It waits up to 100 ms for connections that are accepted but whose request
@@ -381,28 +386,125 @@ analytical store directly. `Ping` returns nil when both stores answer
 a second `Close` returns nil, and `Tx` and `Ping` return `store.ErrClosed`
 after it.
 
-## parleyd
+## The hub
 
-`cmd/parleyd` holds `main` and a `run` function that does the work:
-`run(ctx, args, addr, grace, stdout, stderr)` returns the exit status, and
-`main` calls it with the defaults `0.0.0.0:8080` and 15 seconds and passes the
-result to `os.Exit`. Tests call `run` with `127.0.0.1:0` and a grace of
-milliseconds. `run`:
+`internal/hub` composes the `parleyd` process, so that `cmd/parleyd` stays a
+thin `main` and tests start a whole hub in-process. `hub.Run(ctx,
+hub.Options)` returns the exit status. `Options` holds the process's inputs,
+`Args`, `Env` (a `config.Env`, the shape of `os.LookupEnv`), `WorkDir`,
+`Stdout` and `Stderr`, and the fields tests set and `parleyd` leaves zero:
+`Compose` (parts added after the hub's own), `Port` (replaces
+`[server].port`), `Now` (the hub's clock) and `RequestGrace` (replaces
+`hub.DefaultRequestGrace`, 15 seconds). `cmd/parleyd`'s `run(ctx, args, env,
+wd, stdout, stderr)` builds the options and calls `Run`; `main` passes
+`os.Args[1:]`, `os.LookupEnv` and the working directory.
 
-1. parses the arguments with the standard `flag` package (`--help` prints the
-   usage on stdout and returns `0`; an unknown flag or any positional
-   argument prints an error and the usage on stderr and returns `2`);
-2. derives the serving context with `signal.NotifyContext` for `SIGTERM` and
-   `SIGINT`, before the listener is bound;
-3. builds the server and calls `Serve`, with an `OnListen` that writes the
-   start line, a JSON object with `"msg":"listening"` and the bound
-   `"addr"`, to stderr with `log/slog`'s JSON handler, and the same logger as
-   `Options.Logger`, so the access log and internal errors go to stderr too;
-4. returns `1` after one `cannot listen` error line when the address cannot
-   be bound, and `0` when `Serve` returns after a stop.
+### The composition
+
+A part is a `func(*hub.Composition)`. The hub's own parts are listed, in
+order, in the `parts` variable of `internal/hub/hub.go`; a package that plugs
+into the hub writes its part in a file of its own in `internal/hub` and
+appends it there ([ADR 01](adr/01-compose-the-hub-in-one-package.md)).
+`Options.Compose` runs after them. On the composition a part registers:
+
+| Method | What |
+|---|---|
+| `RegisterKey(config.Key)`, `RegisterSection(name, validate)` | configuration keys and whole sections |
+| `AddSchemaStep(store.Step)` | schema steps, applied in the order they were added |
+| `AddStartHook(name, func(ctx, *hub.Runtime) error)` | start work, run in order, each to completion |
+| `AddMaintenanceTask(name, func(ctx, *hub.Runtime) error)` | maintenance tasks |
+| `AddRoute(server.Route)`, `Handle(pattern, handler)` | REST routes and surfaces outside the REST API |
+| `SetAuthenticator`, `SetBindingGuard`, `SetScopeCheck`, `AddAccessCheck` | the checks of the pipeline's positions |
+
+`hub.Runtime` holds the loaded `*config.Config`, the open `*store.Store`, the
+`*slog.Logger`, the `*scrub.Scrubber` and the clock `Now`. Start hooks and
+maintenance tasks receive it; a route handler or a check keeps
+`(*Composition).Runtime()`, which the hub fills once the stores are open and
+before the first hook runs or the first request is served. A start hook or a
+maintenance task without a name or a function, or with a name already
+registered, a configuration key or section the registry refuses, and a
+route the server refuses, stop the start before anything is opened.
+
+### The start
+
+`Run` parses the arguments with the standard `flag` package first: `--help`
+prints the usage on stdout and returns `0`; an unknown flag,
+`--admin-email` without a value, a positional argument other than `backup`,
+and `backup` without exactly one directory print the usage on stderr and
+return `2`. None of these loads, opens or creates anything. `backup
+<directory>` writes one error line and returns `1`.
+
+Then it builds the logger and starts in this order, stopping at the first
+failure:
+
+1. compose: the hub's parts, then `Options.Compose`;
+2. load the configuration with the composition's registry (`config.toml`,
+   see [configuration.md](configuration.md)), set the logger's level from
+   `[logging].level`, and register every OAuth provider's `client_secret`
+   with the scrubber;
+3. open the stores with the composition's schema steps (`store.Open`);
+4. the bootstrap stage, which does nothing in this version;
+5. the start hooks, in the order they were added, each to completion, with
+   `Run`'s context;
+6. catch `SIGTERM` and `SIGINT` with `signal.Notify` on a channel kept
+   registered until `Run` returns, so that a second signal during the stop
+   does not end the process;
+7. bind `[server].bind`:`[server].port` with `net.Listen`;
+8. build the server from `hub.ServerOptions(cfg, st)`, with the bound
+   listener, the request grace, the clock and the logger, and install the
+   composition's routes and checks;
+9. start the maintenance pass in the background: every task once, in the
+   order they were added; a task that fails or panics is logged as
+   `maintenance task failed` with its `task` and `error`, and the next one
+   runs;
+10. `Serve`, whose `OnListen` writes the `listening` line with `addr`,
+    `config` (`cfg.Path`) and `data_dir` (`cfg.DataDir()`).
+
+The listener is bound before the maintenance pass starts, so that a bind
+failure is the only line of a failed start. A failure before listening is
+one line at error level, `cannot start` with the cause in `error`, or
+`cannot listen` with `addr` and `error`; the stores are closed when they were
+open, and `Run` returns `1`. The first signal, or the cancellation of `ctx`,
+stops the server (see [Serving and stopping](#serving-and-stopping)); the
+maintenance pass's context is cancelled and it gets up to 15 seconds to end;
+the stores are closed last, and `Run` returns `0`.
+
+`hub.ServerOptions(cfg, st)` returns the options that come from the
+configuration and the stores: `MaxBodySize` from `[server].max_body_size`,
+`RequestsPerMinute` from `[limits].requests_per_minute` with
+`RateLimitDisabled` set when it is `0` (the server reads a
+`RequestsPerMinute` of 0 as 600), `LogHealthProbes` from
+`[logging].log_health_probes`, one readiness probe, `st.Ping`, which fails
+while either store does not answer a query, and the store-backed
+`IdempotencyStore`.
+
+### The logger
+
+`hub.NewLogger(w, level, scrubber)` returns a `*slog.Logger` with
+`log/slog`'s JSON handler on `w`, one object per line. The levels are
+`hub.LevelTrace` (`slog.Level(-8)`, written as `TRACE`), debug, info, warn
+and error; lines below the configured level are dropped. Its `ReplaceAttr`,
+which the JSON handler calls for the message and every attribute, those of
+`With` and of groups included, passes every string value and the text of
+every `error` value through `scrubber.Scrub`; keys, `time` and `level` are
+written as they are. `Run` builds it on `Stderr` before the configuration is
+loaded, at info, sets its level once the configuration is loaded, installs it
+with `slog.SetDefault`, and hands it to the server as `Options.Logger`.
+
+### Idempotency records
+
+`internal/hub/idempotency.go` adds the schema step `idempotency_records` to
+the transactional store: a table `idempotency_records` with `key`, `caller`,
+`route` (together the primary key), `request_hash` (the 32-byte SHA-256),
+`body`, `header` (the headers as JSON) and `written_at` (nanoseconds since
+the Unix epoch). Its `server.IdempotencyStore` finds a record by key, caller
+and route, writes one with an upsert in a transaction of `Tx`, and deletes
+the records written at or before a cutoff. The server calls `DeleteExpired`
+with its clock, the hub's `Now`, so a record written before a stop is
+replayed after the next start until it is 24 hours old.
 
 The flags, exit statuses and log lines are described in [cli.md](cli.md),
-the fixed address and grace in [configuration.md](configuration.md).
+the configuration in [configuration.md](configuration.md).
 
 ### Readiness probes
 

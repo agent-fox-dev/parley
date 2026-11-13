@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/cli"
+	"github.com/agent-fox-dev/parley/internal/hub"
 )
 
 func TestRun_ListensAndLogsTheBoundAddress(t *testing.T) {
@@ -52,9 +54,10 @@ func TestRun_ExitsWithOneErrorLineWhenItCannotListen(t *testing.T) {
 	}
 	defer held.Close()
 	addr := held.Addr().String()
+	dir := workDir(t, fmt.Sprintf("[server]\nbind = \"127.0.0.1\"\nport = %d\n", held.Addr().(*net.TCPAddr).Port))
 
 	var stdout, stderr bytes.Buffer
-	code := run(context.Background(), nil, addr, time.Second, &stdout, &stderr)
+	code := run(context.Background(), nil, noEnv, dir, &stdout, &stderr)
 
 	if code != 1 {
 		t.Errorf("run returned %d, want 1", code)
@@ -71,23 +74,33 @@ func TestRun_ExitsWithOneErrorLineWhenItCannotListen(t *testing.T) {
 	}
 }
 
+// usageNames are what the usage must name: both flags and the backup
+// command.
+var usageNames = []string{"--admin-email", "--reset-admin-token", "backup <directory>"}
+
 func TestRun_PrintsUsageOnStdoutForHelp(t *testing.T) {
 	t.Parallel()
 	for _, arg := range []string{"--help", "-h"} {
 		t.Run(arg, func(t *testing.T) {
 			t.Parallel()
+			dir := t.TempDir()
 			var stdout, stderr bytes.Buffer
 			// run returns without serving, or the test would hang here.
-			code := run(context.Background(), []string{arg}, "127.0.0.1:0", time.Second, &stdout, &stderr)
+			code := run(context.Background(), []string{arg}, noEnv, dir, &stdout, &stderr)
 
 			if code != 0 {
 				t.Errorf("run returned %d, want 0", code)
 			}
-			if !strings.Contains(stdout.String(), "parleyd") {
-				t.Errorf("stdout %q does not name parleyd", stdout.String())
+			for _, name := range append([]string{"parleyd"}, usageNames...) {
+				if !strings.Contains(stdout.String(), name) {
+					t.Errorf("stdout %q does not name %s", stdout.String(), name)
+				}
 			}
 			if stderr.Len() != 0 {
 				t.Errorf("stderr = %q, want empty", stderr.String())
+			}
+			if names := listDir(t, dir); len(names) != 0 {
+				t.Errorf("the working directory holds %v, want nothing", names)
 			}
 		})
 	}
@@ -95,17 +108,29 @@ func TestRun_PrintsUsageOnStdoutForHelp(t *testing.T) {
 
 func TestRun_RefusesUnknownFlagsAndArgumentsWithUsage(t *testing.T) {
 	t.Parallel()
-	for _, args := range [][]string{{"--nope"}, {"-x"}, {"serve"}, {"serve", "dir"}} {
+	for _, args := range [][]string{
+		{"--nope"}, {"-x"}, {"serve"}, {"serve", "dir"},
+		{"--admin-email"}, {"backup"}, {"backup", "a", "b"}, {"backup", "a", "--nope"},
+	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			t.Parallel()
+			dir := t.TempDir()
 			var stdout, stderr bytes.Buffer
-			code := run(context.Background(), args, "127.0.0.1:0", time.Second, &stdout, &stderr)
+			code := run(context.Background(), args, noEnv, dir, &stdout, &stderr)
 
 			if code != 2 {
 				t.Errorf("run returned %d, want 2", code)
 			}
 			if !strings.Contains(stderr.String(), "Usage: parleyd") {
 				t.Errorf("stderr %q does not hold the usage", stderr.String())
+			}
+			for _, name := range usageNames {
+				if !strings.Contains(stderr.String(), name) {
+					t.Errorf("stderr %q does not name %s", stderr.String(), name)
+				}
+			}
+			if names := listDir(t, dir); len(names) != 0 {
+				t.Errorf("the working directory holds %v, want nothing", names)
 			}
 			if !strings.Contains(stderr.String(), args[0]) {
 				t.Errorf("stderr %q does not name the rejected argument %q", stderr.String(), args[0])
@@ -146,9 +171,9 @@ func TestRun_StopsOnASignal(t *testing.T) {
 // The test signals its own process, so it must not run in parallel; see
 // TestRun_StopsOnASignal.
 func TestRun_ExitsZeroWhenTheGraceExpires(t *testing.T) {
-	// main passes this grace; the test shortens it to keep the wait short.
-	if defaultShutdownGrace != 15*time.Second {
-		t.Errorf("main's shutdown grace = %v, want 15s", defaultShutdownGrace)
+	// main leaves this grace; the test shortens it to keep the wait short.
+	if hub.DefaultRequestGrace != 15*time.Second {
+		t.Errorf("the hub's request grace = %v, want 15s", hub.DefaultRequestGrace)
 	}
 	const grace = 50 * time.Millisecond
 	r := startRun(t, grace)

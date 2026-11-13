@@ -5,11 +5,51 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/agent-fox-dev/parley/internal/hub"
 )
+
+// localConfig makes parleyd listen on a port the system chooses, on the
+// loopback interface only.
+const localConfig = "[server]\nbind = \"127.0.0.1\"\nport = 0\n"
+
+// noEnv is an empty environment.
+func noEnv(string) (string, bool) { return "", false }
+
+// workDir returns a new working directory holding config.toml with text.
+func workDir(t *testing.T, text string) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(text), 0o644); err != nil {
+		t.Fatalf("write config.toml: %v", err)
+	}
+	return dir
+}
+
+// listDir returns the names in dir.
+func listDir(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read %s: %v", dir, err)
+	}
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	return names
+}
+
+// withGrace shortens the time in-flight requests get on a stop.
+func withGrace(grace time.Duration) func(*hub.Options) {
+	return func(o *hub.Options) { o.RequestGrace = grace }
+}
 
 // syncBuffer is a bytes.Buffer that run may write to while the test reads it.
 type syncBuffer struct {
@@ -39,18 +79,23 @@ func (b *syncBuffer) String() string {
 	return b.buf.String()
 }
 
-// firstLine waits up to 5 s for a complete first line and returns it.
-func (b *syncBuffer) firstLine(t *testing.T) string {
+// lineWith waits up to 5 s for a complete line holding text and returns it.
+func (b *syncBuffer) lineWith(t *testing.T, text string) string {
 	t.Helper()
 	timeout := time.After(5 * time.Second)
 	for {
-		if line, _, ok := strings.Cut(b.String(), "\n"); ok {
-			return line
+		s := b.String()
+		if i := strings.LastIndexByte(s, '\n'); i >= 0 {
+			for _, line := range nonEmptyLines(s[:i]) {
+				if strings.Contains(line, text) {
+					return line
+				}
+			}
 		}
 		select {
 		case <-b.written:
 		case <-timeout:
-			t.Fatalf("no complete line on stderr within 5 s; stderr = %q", b.String())
+			t.Fatalf("no line holding %s on stderr within 5 s; stderr = %q", text, b.String())
 		}
 	}
 }
@@ -75,25 +120,24 @@ type running struct {
 	code chan int
 }
 
-// startRun calls run with no arguments on 127.0.0.1:0 in a goroutine, waits
-// for its listening line and returns the address that line names.
+// startRun calls run with no arguments in a working directory whose
+// configuration listens on 127.0.0.1:0, in a goroutine, waits for its
+// listening line and returns the address that line names.
 func startRun(t *testing.T, grace time.Duration) *running {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &running{stderr: newSyncBuffer(), cancel: cancel, code: make(chan int, 1)}
-	go func() { r.code <- run(ctx, nil, "127.0.0.1:0", grace, &bytes.Buffer{}, r.stderr) }()
+	dir := workDir(t, localConfig)
+	go func() { r.code <- run(ctx, nil, noEnv, dir, &bytes.Buffer{}, r.stderr, withGrace(grace)) }()
 	t.Cleanup(cancel)
 
-	line := r.stderr.firstLine(t)
+	line := r.stderr.lineWith(t, `"msg":"listening"`)
 	var rec struct {
 		Msg  string `json:"msg"`
 		Addr string `json:"addr"`
 	}
 	if err := json.Unmarshal([]byte(line), &rec); err != nil {
-		t.Fatalf("first stderr line %q is not a JSON object: %v", line, err)
-	}
-	if rec.Msg != "listening" {
-		t.Fatalf("first stderr line %q has msg %q, want %q", line, rec.Msg, "listening")
+		t.Fatalf("listening line %q is not a JSON object: %v", line, err)
 	}
 	r.addr = rec.Addr
 	return r
