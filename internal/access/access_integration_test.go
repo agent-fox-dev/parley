@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"io"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -261,16 +262,58 @@ func (b *logBuffer) String() string {
 	return b.buf.String()
 }
 
-func TestHub_RunsAMembersReadOfAnOrgWorkspaceThroughTheAccessCheck(t *testing.T) {
+func TestHub_AnswersTheOwnerTheMemberAndAnOutsiderOnAWriteRoute(t *testing.T) {
+	t.Parallel()
+	h := startAccessHub(t)
+	owner, member, outsider := h.createUser(t, "owner"), h.createUser(t, "member"), h.createUser(t, "outsider")
+	org := h.createOrg(t, "team")
+	h.addMember(t, org, member)
+	h.insert(t, repo("acme", owner, org, access.StatusReady))
+
+	if a := h.call(t, http.MethodPost, "/workspaces/acme/probe", h.issueKey(t, owner), map[string]any{}); a.status != http.StatusOK || decode(t, a).Level != access.LevelOwner {
+		t.Errorf("the owner's write = %d %s, want 200 at level owner", a.status, a.body)
+	}
+	m := h.call(t, http.MethodPost, "/workspaces/acme/probe", h.issueKey(t, member), map[string]any{})
+	if m.status != http.StatusForbidden || decode(t, m).Error.ErrorType != "forbidden" {
+		t.Errorf("the member's write = %d %s, want 403 forbidden", m.status, m.body)
+	}
+	key := h.issueKey(t, outsider)
+	a := h.call(t, http.MethodPost, "/workspaces/acme/probe", key, map[string]any{})
+	b := h.call(t, http.MethodPost, "/workspaces/nope/probe", key, map[string]any{})
+	if a.status != http.StatusNotFound || decode(t, a).Error.ErrorType != "not_found" || !bytes.Equal(a.body, b.body) || b.status != a.status {
+		t.Errorf("the outsider's writes = %d %s on acme and %d %s on nope, want the same 404 not_found", a.status, a.body, b.status, b.body)
+	}
+	if n := h.calls.Load(); n != 1 {
+		t.Errorf("the probe ran %d times, want once", n)
+	}
+}
+
+func TestHub_ClosesTheForkOfAMemberWhoLeavesTheOrgAndKeepsItOpenToTheParentsOwner(t *testing.T) {
 	t.Parallel()
 	h := startAccessHub(t)
 	owner, member := h.createUser(t, "owner"), h.createUser(t, "member")
 	org := h.createOrg(t, "team")
 	h.addMember(t, org, member)
-	h.insert(t, repo("acme", owner, org, access.StatusReady))
+	h.insert(t, repo("acme", owner, org, access.StatusReady), fork("acme--m", member, org, "acme"))
+	ownerKey, memberKey := h.issueKey(t, owner), h.issueKey(t, member)
 
-	a := h.call(t, http.MethodGet, "/workspaces/acme/probe-read", h.issueKey(t, member), nil)
-	if a.status != http.StatusOK || decode(t, a).Level != access.LevelMember || h.calls.Load() != 1 {
-		t.Errorf("a member's read of acme = %d %s after %d probe calls, want 200 at level member and one call", a.status, a.body, h.calls.Load())
+	if a := h.call(t, http.MethodGet, "/workspaces/acme--m/probe-owner", memberKey, nil); a.status != http.StatusOK || decode(t, a).Level != access.LevelOwner {
+		t.Fatalf("the member's owner route on the fork before leaving = %d %s, want 200 at level owner", a.status, a.body)
+	}
+	h.removeMember(t, org, member)
+	for _, path := range []string{"/workspaces/acme--m/probe-owner", "/workspaces/acme/probe-read"} {
+		if a := h.call(t, http.MethodGet, path, memberKey, nil); a.status != http.StatusNotFound || decode(t, a).Error.ErrorType != "not_found" {
+			t.Errorf("the former member's GET %s = %d %s, want 404 not_found", path, a.status, a.body)
+		}
+	}
+	if set := h.readable(t, member); set.All || len(set.Entries) != 0 {
+		t.Errorf("the former member's readable set = %+v, want empty", set)
+	}
+	if a := h.call(t, http.MethodGet, "/workspaces/acme--m/probe-owner", ownerKey, nil); a.status != http.StatusOK || decode(t, a).Level != access.LevelOwner {
+		t.Errorf("the parent owner's owner route on the fork = %d %s, want 200 at level owner", a.status, a.body)
+	}
+	want := map[string]access.Level{"acme": access.LevelOwner, "acme--m": access.LevelOwner}
+	if set := h.readable(t, owner); set.All || !maps.Equal(set.Entries, want) {
+		t.Errorf("the owner's readable set = %+v, want %v", set, want)
 	}
 }
