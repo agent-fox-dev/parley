@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"maps"
 	"net/http"
@@ -275,9 +276,15 @@ func (w *world) postSyncAndLeave(t *testing.T, cred, slug string, started <-chan
 // postAndLeave sends POST path, with no body, as postSyncAndLeave does.
 func (w *world) postAndLeave(t *testing.T, cred, path string, started <-chan struct{}) {
 	t.Helper()
+	w.sendAndLeave(t, http.MethodPost, cred, path, started)
+}
+
+// sendAndLeave sends method path, with no body, as postSyncAndLeave does.
+func (w *world) sendAndLeave(t *testing.T, method, cred, path string, started <-chan struct{}) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.URL(path), nil)
+	req, err := http.NewRequestWithContext(ctx, method, w.URL(path), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,7 +300,7 @@ func (w *world) postAndLeave(t *testing.T, cred, path string, started <-chan str
 	select {
 	case <-started:
 	case <-time.After(10 * time.Second):
-		t.Fatal("the sync did not reach the point to disconnect at within 10 s")
+		t.Fatal("the request did not reach the point to disconnect at within 10 s")
 	}
 	cancel()
 	if err := <-sent; !errors.Is(err, context.Canceled) {
@@ -794,7 +801,8 @@ func (w *world) insertRecord(t *testing.T, slug string, status workspace.Status,
 
 // put stores the workspace record rec, with what it leaves zero filled in
 // as a create would: a standard repository of the user u in u's personal
-// org, pending, created and updated at the hub's time, with an instance id.
+// org, with an origin, pending, created and updated at the hub's time, with
+// an instance id.
 func (w *world) put(t *testing.T, rec workspace.Workspace) {
 	t.Helper()
 	if rec.Kind == "" {
@@ -811,6 +819,9 @@ func (w *world) put(t *testing.T, rec workspace.Workspace) {
 	}
 	if rec.Status == "" {
 		rec.Status = workspace.StatusPending
+	}
+	if rec.Kind == access.KindRepository && rec.GitURL == nil {
+		rec.GitURL = new("https://origin.test/r.git")
 	}
 	if rec.CreatedAt.IsZero() {
 		rec.CreatedAt = w.clock()
@@ -1413,4 +1424,238 @@ func (e *beforeEmit) set(fn func()) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.fn = fn
+}
+
+// setMarker stores m as the maintenance marker of the workspace slug, as an
+// operation running on it holds it.
+func (w *world) setMarker(t *testing.T, slug string, m workspace.Marker) {
+	t.Helper()
+	if _, err := w.Store.Main().Exec(`UPDATE workspaces SET maintenance = ? WHERE slug = ?`, string(m), slug); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// withSafetyPusher makes p the hub's safety-copy pusher.
+func withSafetyPusher(p workspace.BranchesPusher) option {
+	return withCompose(func(c *hub.Composition) {
+		c.AdjustWorkspace(func(d *workspace.Deps) { d.SafetyPusher = p })
+	})
+}
+
+// withTeardown has fn register collaborators on the hub's teardown set.
+func withTeardown(fn func(*workspace.Teardown)) option {
+	return withCompose(func(c *hub.Composition) { fn(c.Workspaces().Teardown()) })
+}
+
+// teardownLog records the calls of stub teardown collaborators, one line
+// each, in the order they were made.
+type teardownLog struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *teardownLog) add(format string, args ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lines = append(l.lines, fmt.Sprintf(format, args...))
+}
+
+func (l *teardownLog) recorded() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.lines)
+}
+
+// stubTeardown is every collaborator of the teardown set at once. It
+// records each call in log, when set, under its name and then panics when
+// set to, or fails with fail. As a session closer it first writes the slugs
+// it was given as a row of the table session_marks through the
+// transaction, when mark is set; as an archive observer it records the
+// status w's store holds for the workspace; as a sandbox remover with
+// started set it closes started and waits for release first.
+type stubTeardown struct {
+	name             string
+	log              *teardownLog
+	mark             bool
+	w                *world
+	started, release chan struct{}
+
+	mu     sync.Mutex
+	fail   error
+	panics bool
+}
+
+// set makes every later call fail with fail, or panic when panics is set.
+func (s *stubTeardown) set(fail error, panics bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.fail, s.panics = fail, panics
+}
+
+// end records the call and ends it as set says.
+func (s *stubTeardown) end(format string, args ...any) error {
+	if s.log != nil {
+		s.log.add("%s "+format, append([]any{s.name}, args...)...)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.panics {
+		panic("the " + s.name + " panicked")
+	}
+	return s.fail
+}
+
+func (s *stubTeardown) CloseSessions(ctx context.Context, tx *sql.Tx, slugs []string, reason string) error {
+	slugs = slices.Sorted(slices.Values(slugs))
+	if s.mark {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO session_marks (slugs) VALUES (?)`, strings.Join(slugs, " ")); err != nil {
+			return err
+		}
+	}
+	return s.end("close %v %s", slugs, reason)
+}
+
+func (s *stubTeardown) WorkspaceArchived(ctx context.Context, slug string, forks []string) error {
+	var status workspace.Status
+	if s.w != nil {
+		rec, _, _ := workspace.BySlug(ctx, s.w.Store.Main(), slug)
+		status = rec.Status
+	}
+	return s.end("observe %s %v %s", slug, forks, status)
+}
+
+func (s *stubTeardown) RemoveSandboxes(_ context.Context, slugs []string) error {
+	if s.started != nil {
+		close(s.started)
+		<-s.release
+	}
+	return s.end("sandboxes %v", slugs)
+}
+
+func (s *stubTeardown) remove(_ context.Context, _ *sql.Tx, slug string) error {
+	return s.end("remove %s", slug)
+}
+
+// pushAnswer is what a stubBranchesPusher answers a push.
+type pushAnswer func(context.Context, gitrepo.PushBranchesRequest) ([]gitrepo.BranchPush, error)
+
+// stubBranchesPusher is the hub's safety-copy pusher: it runs before, when
+// set, records the heads of every push and the error of its context once
+// the push returns, and answers what answer, given the push, returns,
+// without running git; with no answer, no branch and no error.
+type stubBranchesPusher struct {
+	mu     sync.Mutex
+	before func(context.Context)
+	answer pushAnswer
+	heads  []map[string]string
+	ctxErr []error
+}
+
+func (p *stubBranchesPusher) PushBranches(ctx context.Context, req gitrepo.PushBranchesRequest) ([]gitrepo.BranchPush, error) {
+	p.mu.Lock()
+	before, answer := p.before, p.answer
+	p.mu.Unlock()
+	if before != nil {
+		before(ctx)
+	}
+	var got []gitrepo.BranchPush
+	var err error
+	if answer != nil {
+		got, err = answer(ctx, req)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.heads, p.ctxErr = append(p.heads, req.Heads), append(p.ctxErr, ctx.Err())
+	return got, err
+}
+
+// reset forgets the pushes so far and makes answer the answer to the next.
+func (p *stubBranchesPusher) reset(answer pushAnswer) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.heads, p.ctxErr, p.answer = nil, nil, answer
+}
+
+// calls are the pushes so far: their heads and the error of their context.
+func (p *stubBranchesPusher) calls() ([]map[string]string, []error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.heads, p.ctxErr
+}
+
+// taking answers for every branch offered, in the order of the names, that
+// origin took the first n and refused the others.
+func taking(n int) pushAnswer {
+	return func(_ context.Context, req gitrepo.PushBranchesRequest) ([]gitrepo.BranchPush, error) {
+		var got []gitrepo.BranchPush
+		for i, b := range slices.Sorted(maps.Keys(req.Heads)) {
+			r := gitrepo.BranchPush{Branch: b, Commit: req.Heads[b], Result: gitrepo.PushUpToDate}
+			if i >= n {
+				r.Result, r.Err = "", gitrepo.ErrNonFastForward
+			}
+			got = append(got, r)
+		}
+		return got, nil
+	}
+}
+
+// operation is a route that retires or repairs a workspace: the method and
+// the part of the path after /api/v1/workspaces/<slug>.
+type operation struct{ name, method, suffix string }
+
+// operations are the four such routes.
+var operations = []operation{
+	{"archive", http.MethodPost, "/archive"},
+	{"reactivate", http.MethodPost, "/reactivate"},
+	{"reclone", http.MethodPost, "/reclone"},
+	{"delete", http.MethodDelete, ""},
+}
+
+// operationNamed is the operation named name.
+func operationNamed(name string) operation {
+	return operations[slices.IndexFunc(operations, func(o operation) bool { return o.name == name })]
+}
+
+// operate sends the operation named op on slug, with no body, with cred as
+// the bearer credential.
+func (w *world) operate(t *testing.T, op, cred, slug string) answer {
+	t.Helper()
+	o := operationNamed(op)
+	status, b := w.Call(t, o.method, "/api/v1/workspaces/"+slug+o.suffix, cred, nil)
+	return answer{status, b}
+}
+
+// outcome is a's status, followed by its error_type when it is a refusal.
+func (a answer) outcome(t *testing.T) string {
+	t.Helper()
+	if a.status < 300 {
+		return fmt.Sprint(a.status)
+	}
+	return fmt.Sprintf("%d %s", a.status, a.errorType(t))
+}
+
+// archiveWithForks starts a world with opts and the ready workspace demo,
+// without a copy, so that the safety copy has nothing to offer, and its
+// forks.
+func archiveWithForks(t *testing.T, forks []string, opts ...option) *world {
+	t.Helper()
+	w := newWorld(t, opts...)
+	w.put(t, workspace.Workspace{Slug: "demo", Status: workspace.StatusReady})
+	for _, f := range forks {
+		w.put(t, workspace.Workspace{Slug: f, Kind: access.KindFork, ParentSlug: new("demo"), Status: workspace.StatusReady})
+	}
+	return w
+}
+
+// withRemoveCopy makes remove the hub's removal of a workspace's copy.
+func withRemoveCopy(remove func(dir string) error) option {
+	return withCompose(func(c *hub.Composition) {
+		c.AdjustWorkspace(func(d *workspace.Deps) { d.RemoveCopy = remove })
+	})
+}
+
+// exists tells whether something is at path.
+func exists(path string) bool {
+	_, err := os.Lstat(path)
+	return err == nil
 }

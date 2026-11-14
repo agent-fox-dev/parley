@@ -134,6 +134,7 @@ func TestWorkspace_PrintsTheHubsRefusalAndFails(t *testing.T) {
 		{"push --force, origin moved", http.MethodPost, pushPath, pushMain("--force"), http.StatusConflict, pushRefusal(409, "origin_moved")},
 		{"push --force of a protected branch", http.MethodPost, pushPath, pushMain("--force"), http.StatusForbidden, pushRefusal(403, "protected_branch")},
 		{"push past origin's deadline", http.MethodPost, pushPath, pushMain(), http.StatusGatewayTimeout, pushRefusal(504, "origin_timeout")},
+		{"delete of a workspace not archived", http.MethodDelete, demoPath, []string{"workspace", "delete", "demo", "--confirm"}, http.StatusConflict, notArchived},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -201,6 +202,11 @@ func TestWorkspace_RefusesABadCommandLineBeforeAnyRequest(t *testing.T) {
 		{"a push without a slug", []string{"workspace", "push"}, "<slug>"},
 		{"a push without a branch", []string{"workspace", "push", "demo"}, "<branch>"},
 		{"a push of two branches", pushMain("extra"), `"extra"`},
+		{"a reclone without --confirm", []string{"workspace", "reclone", "demo"}, "--confirm"},
+		{"a reclone wait without --confirm", []string{"workspace", "reclone", "demo", "--wait"}, "--confirm"},
+		{"a delete without --confirm", []string{"workspace", "delete", "demo"}, "--confirm"},
+		{"a delete with --confirm=false", []string{"workspace", "delete", "demo", "--confirm=false"}, "--confirm"},
+		{"an archive without a slug", []string{"workspace", "archive"}, "<slug>"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -764,5 +770,154 @@ func TestWorkspacePush_PostsTheForceAndPrintsTheAnswer(t *testing.T) {
 				t.Errorf("the request's deadline was %v after the start, want 3 minutes", left)
 			}
 		})
+	}
+}
+
+// notArchived is the hub's refusal of a delete of a workspace that is not
+// archived.
+const notArchived = `{"error":{"code":409,"message":"workspace \"demo\" is not archived","error_type":"workspace_not_archived"}}`
+
+func TestWorkspaceRetire_SendsTheRouteOnceAndPrintsTheAnswer(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name            string
+		args            []string
+		method, rawPath string
+		status          int
+		answer, printed string
+		// timeout is how long each request may take.
+		timeout time.Duration
+	}{
+		{
+			"archive", []string{"workspace", "archive", "demo"}, http.MethodPost, demoPath + "/archive",
+			http.StatusOK, workspaceRecord("archived", ""), workspaceRecord("archived", ""), 3 * time.Minute,
+		},
+		{
+			"reactivate", []string{"workspace", "reactivate", "demo"}, http.MethodPost, demoPath + "/reactivate",
+			http.StatusOK, workspaceRecord("pending", ""), workspaceRecord("pending", ""), 30 * time.Second,
+		},
+		{
+			"reclone", []string{"workspace", "reclone", "demo", "--confirm"}, http.MethodPost, demoPath + "/reclone",
+			http.StatusOK, workspaceRecord("pending", ""), workspaceRecord("pending", ""), 3 * time.Minute,
+		},
+		{
+			"delete", []string{"workspace", "delete", "demo", "--confirm"}, http.MethodDelete, demoPath,
+			http.StatusNoContent, "", `{"status":"deleted","slug":"demo"}`, 30 * time.Second,
+		},
+		{
+			"archive of a slug with a slash", []string{"workspace", "archive", "a/b"}, http.MethodPost, "/api/v1/workspaces/a%2Fb/archive",
+			http.StatusOK, workspaceRecord("archived", ""), workspaceRecord("archived", ""), 3 * time.Minute,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			path, _ := url.PathUnescape(tt.rawPath)
+			hub := newStubHub(t).answer(tt.method, path, tt.status, tt.answer)
+
+			code, stdout, stderr, left := runSync(t, hub, tt.args...)
+
+			if code != 0 || stderr != "" {
+				t.Errorf("exit status = %d, stderr %q; want 0 and nothing", code, stderr)
+			}
+			if want := indented(t, tt.printed); stdout != want {
+				t.Errorf("stdout = %q, want %q", stdout, want)
+			}
+			sent := hub.recorded()
+			if len(sent) != 1 {
+				t.Fatalf("the hub got %v, want one request", sent)
+			}
+			if got := sent[0]; got.method != tt.method || got.rawPath != tt.rawPath || got.body != "" || got.header.Get("Authorization") != "Bearer k" {
+				t.Errorf("sent %s %s body %q with Authorization %q, want %s %s, no body and Bearer k",
+					got.method, got.rawPath, got.body, got.header.Get("Authorization"), tt.method, tt.rawPath)
+			}
+			// The deadline, not a wait of 30 seconds and more, shows how long
+			// the CLI would wait for the hub's answer.
+			if len(left) != 1 || left[0] <= tt.timeout-10*time.Second || left[0] > tt.timeout {
+				t.Errorf("the request had %v before its deadline, want %v", left, tt.timeout)
+			}
+		})
+	}
+}
+
+func TestWorkspaceReactivateReclone_WaitUntilTheWorkspaceIsReadyOrFailed(t *testing.T) {
+	t.Parallel()
+	commands := []struct {
+		name, path string
+		args       []string
+	}{
+		{"reactivate", demoPath + "/reactivate", []string{"workspace", "reactivate", "demo", "--wait"}},
+		{"reclone", demoPath + "/reclone", []string{"workspace", "reclone", "demo", "--confirm", "--wait"}},
+	}
+	tests := []struct {
+		name    string
+		polls   []http.HandlerFunc
+		timeout string
+		// code is the exit status; stdout the record printed, "" for none;
+		// errorType the envelope's on stderr, "" for none.
+		code              int
+		stdout, errorType string
+	}{
+		{
+			name: "ready",
+			polls: []http.HandlerFunc{
+				answerWith(http.StatusOK, workspaceRecord("pending", "")),
+				answerWith(http.StatusOK, workspaceRecord("cloning", "")),
+				answerWith(http.StatusOK, workspaceRecord("ready", "")),
+			},
+			stdout: workspaceRecord("ready", ""),
+		},
+		{
+			name:  "failed",
+			polls: []http.HandlerFunc{answerWith(http.StatusOK, workspaceRecord("failed", "x"))},
+			code:  1, stdout: workspaceRecord("failed", "x"), errorType: "wait_failed",
+		},
+		{
+			name:    "pending until the timeout",
+			polls:   []http.HandlerFunc{answerWith(http.StatusOK, workspaceRecord("pending", ""))},
+			timeout: "1s",
+			code:    1, errorType: "wait_timeout",
+		},
+	}
+	for _, c := range commands {
+		for _, tt := range tests {
+			t.Run(c.name+" "+tt.name, func(t *testing.T) {
+				t.Parallel()
+				hub := newStubHub(t).
+					answer(http.MethodPost, c.path, http.StatusOK, workspaceRecord("pending", "")).
+					handle(http.MethodGet, demoPath, inTurn(tt.polls...))
+				args := c.args
+				if tt.timeout != "" {
+					args = append(slices.Clone(args), "--timeout", tt.timeout)
+				}
+
+				code, stdout, stderr := runWorkspace(t, hub, args...)
+
+				if code != tt.code {
+					t.Errorf("exit status = %d, want %d (stderr %q)", code, tt.code, stderr)
+				}
+				want := ""
+				if tt.stdout != "" {
+					want = indented(t, tt.stdout)
+				}
+				if stdout != want {
+					t.Errorf("stdout = %q, want %q", stdout, want)
+				}
+				if tt.errorType == "" && lastDocument(stderr) != "" {
+					t.Errorf("stderr holds a JSON document: %q", stderr)
+				} else if tt.errorType != "" {
+					wantErrorType(t, stderr, tt.errorType)
+				}
+				sent := hub.recorded()
+				if len(sent) < 2 || sent[0].method != http.MethodPost || sent[0].path != c.path {
+					t.Fatalf("the hub got %v, want POST %s and then polls", sent, c.path)
+				}
+				for _, r := range sent[1:] {
+					if r.method != http.MethodGet || r.rawPath != demoPath {
+						t.Errorf("after the POST the hub got %s %s, want only GET %s", r.method, r.rawPath, demoPath)
+					}
+				}
+			})
+		}
 	}
 }

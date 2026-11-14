@@ -391,7 +391,7 @@ Available Commands:
   tokens      Create, read, change and revoke your personal access tokens
   user        Read and update your own profile
   version     Print the client's build and, given a hub URL, the hub's build
-  workspace   Register, list, read, change, sync and push the workspaces of the hub
+  workspace   Register, list, read, change, sync, push, archive, reactivate, reclone and delete the workspaces of the hub
 
 Flags:
       --api-key string        credential presented to the hub (default: $PARLEY_API_KEY, then api_key in the config file); parley login takes it from this flag alone and stores it (- reads it from stdin)
@@ -1767,6 +1767,86 @@ request.
 | Command | Request |
 |---|---|
 | `parley workspace push <slug> <branch> [--force]` | `POST /api/v1/workspaces/<slug>/branches/<branch>/push` with `{"force":false}`, or `{"force":true}` for `--force` |
+
+#### `parley workspace archive`, `reactivate`, `reclone` and `delete`
+
+```
+parley workspace archive <slug>
+parley workspace reactivate <slug> [--wait] [--timeout <duration>] [--poll-interval <duration>]
+parley workspace reclone <slug> --confirm [--wait] [--timeout <duration>] [--poll-interval <duration>]
+parley workspace delete <slug> --confirm
+```
+
+These four commands retire, revive, repair and remove a repository
+workspace. Each sends one request with the credential as
+`Authorization: Bearer`, no body, and `<slug>` as one percent-encoded path
+segment (`parley workspace archive a/b` sends
+`POST /api/v1/workspaces/a%2Fb/archive`).
+
+- `archive` sends
+  [`POST /api/v1/workspaces/<slug>/archive`](api.md#post-apiv1workspacesslugarchive)
+  and prints the hub's answer, the workspace with `status` `archived`, with
+  exit status `0`.
+- `reactivate` sends
+  [`POST /api/v1/workspaces/<slug>/reactivate`](api.md#post-apiv1workspacesslugreactivate)
+  and prints the workspace with `status` `pending`.
+- `reclone` sends
+  [`POST /api/v1/workspaces/<slug>/reclone`](api.md#post-apiv1workspacesslugreclone)
+  and prints the workspace with `status` `pending`.
+- `delete` sends
+  [`DELETE /api/v1/workspaces/<slug>`](api.md#delete-apiv1workspacesslug).
+  The hub answers `204` with no body, so the command prints a document that
+  names the workspace, with exit status `0`:
+
+  ```json
+  {
+    "status": "deleted",
+    "slug": "demo"
+  }
+  ```
+
+Before an archive and a reclone the hub offers every branch to origin within
+its own deadline of 2 minutes, so the requests of these two commands have a
+timeout of 3 minutes instead of 30 seconds. `reactivate` and `delete` keep
+the default.
+
+**`--confirm`.** `reclone` throws the hub's copy away, and `delete` removes
+the workspace, its forks and everything they own; neither can be undone.
+Without `--confirm`, or with `--confirm=false`, they send nothing and exit
+`2` with a `usage_error`:
+
+```json
+{
+  "error": {
+    "code": 0,
+    "message": "parley workspace delete needs --confirm, because it cannot be undone",
+    "error_type": "usage_error"
+  }
+}
+```
+
+**`--wait`.** `reactivate` and `reclone` put the workspace back to
+`pending`, and the hub's clone work then makes it `ready` or `failed`. With
+`--wait`, once the route has answered `200`, the command polls
+`GET /api/v1/workspaces/<slug>` under the rules of [Waiting](#waiting),
+reading its `status`: `ready` is the successful end, with the final
+workspace on stdout and exit status `0`; `failed` prints the final
+workspace, writes `wait_failed` to stderr and exits `1`; running out of time
+is `wait_timeout` with nothing on stdout and exit status `1`.
+
+A refusal of the hub's (`409` `workspace_busy`, `409` `workspace_archived`,
+`409` `workspace_not_archived`, `409` `has_forks`, `400`
+`not_supported_on_fork`, `400` `fork_has_no_origin`, among others) is
+written to stderr as received, with nothing on stdout and exit status `1`.
+A missing `<slug>` and a second argument are refused with a `usage_error`
+and exit status `2` before any request.
+
+| Command | Request |
+|---|---|
+| `parley workspace archive <slug>` | `POST /api/v1/workspaces/<slug>/archive` |
+| `parley workspace reactivate <slug> [--wait]` | `POST /api/v1/workspaces/<slug>/reactivate`; with `--wait`, then `GET /api/v1/workspaces/<slug>` until `ready` or `failed` |
+| `parley workspace reclone <slug> --confirm [--wait]` | `POST /api/v1/workspaces/<slug>/reclone`; with `--wait`, then `GET /api/v1/workspaces/<slug>` until `ready` or `failed` |
+| `parley workspace delete <slug> --confirm` | `DELETE /api/v1/workspaces/<slug>` |
 
 ### Output
 

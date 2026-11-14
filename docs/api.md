@@ -1676,6 +1676,242 @@ never both:
 | `504` `origin_timeout` | the push had not finished 2 minutes after it began; `git` is killed with every process it started before the answer (`the push of branch "<name>" to origin did not finish within 2m0s`) |
 | `500` `internal` | the workspace's secrets could not be read, in which case origin is not contacted and nothing is pushed without a credential and no event is written; the records of a push handed to origin could not be written, in which case no event is written and, when origin took the push, the origin head is put back unless a sync has moved it since; or the hub failed otherwise |
 
+## `POST /api/v1/workspaces/{slug}/archive`
+
+Takes the repository workspace `{slug}` out of service without losing
+anything the hub holds. It takes the admin token, an API key or a PAT,
+declares the scope `workspaces:write` for a PAT and needs write access to
+the workspace (see [Workspace access](#workspace-access)): its owner or the
+admin token. The route reads no body; one that passes the content-type and
+size rules is ignored.
+
+A workspace in status `ready` or `failed` is archived; the checks run in
+the order of the table below, and a refused archive contacts no origin and
+changes nothing. Once they have passed, the archive runs to its end even
+when the caller disconnects, and while it runs every other request that
+needs the workspace's repository answers `409` `workspace_busy`. It first
+makes the safety copy: every branch of the hub's copy (for a `carry_patch`
+workspace every branch but its `integration_branch`) is offered to the
+branch of the same name on origin as a fast-forward, in one push with the
+workspace's origin credential and a deadline of two minutes, sending no
+tag, forcing nothing and deleting nothing. Whatever origin answers, the
+archive goes on: a branch origin refused stays in the hub's copy. A
+`failed` workspace, or one with no copy, offers nothing. Then, in one
+store transaction, `status` becomes `archived`, `clone_error` is cleared,
+one `parley.workspace.archive` event is written and every active agent
+session of the workspace and of its forks is ended with the reason
+`workspace archived`; when that transaction fails nothing has changed and
+the answer is `500 internal`. A session that cannot be ended does not fail
+the archive: what ending the sessions wrote is undone, the failure is
+logged, and the workspace is archived all the same. Once the archive is
+stored, the features that act on an archived workspace, such as one that
+stops its sandboxes, are told; a failure there is logged and changes
+nothing in the answer. The hub's copy, every ref of it, the workspace's
+forks and the data they own are left as they are.
+
+The event has `workspace` the slug, `resource_type` `workspace`,
+`resource_id` the slug, and as actor the caller as for
+[`PATCH /api/v1/workspaces/{slug}`](#patch-apiv1workspacesslug). Its
+`metadata` holds `head_sha` (the workspace's `head_sha` when it was
+archived, `null` when it has none), `origin_push`, the outcome of the
+safety copy, and `forks`, the number of forks of the workspace.
+`origin_push` is `ok` when origin took every branch offered or there was
+none to offer, `partial` when it took at least one and refused at least
+one, and `failed` when it took none, also when the credential could not be
+read (no anonymous push is tried), origin refused the credential, could
+not be reached or did not answer within the deadline. Neither the answer
+nor the event nor the hub's log holds the credential or what origin said.
+
+```json
+{"seq":16,"id":"…","type":"parley.workspace.archive","time":"2026-11-14T10:40:00Z","workspace":"demo","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"workspace","resource_id":"demo","action":"archive","session_id":null,"metadata":{"head_sha":"a3f2b1c4d5e6f708192a3b4c5d6e7f8091a2b3c4","origin_push":"partial","forks":2}}
+```
+
+The answer is the workspace object, read after the archive, with `status`
+`archived`, `clone_error` `null` and `access` the caller's level, the
+object [`GET /api/v1/workspaces/{slug}`](#get-apiv1workspacesslug) answers.
+
+| Status | When |
+|---|---|
+| `200 OK` | the workspace is archived, whatever `origin_push` says; the body is the workspace object |
+| `400` `not_supported_on_fork` | the workspace is a task fork (`workspace "<slug>" is a task fork, which cannot be archived; delete it instead`) |
+| `403` `insufficient_scope` | a PAT without `workspaces:write` (`this route needs the scope workspaces:write`) |
+| `403` `forbidden` | a member of the workspace's org who does not own it (`org members have read-only access to this workspace`) |
+| `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug (`workspace not found`); also a bound PAT on a workspace outside its binding |
+| `409` `workspace_busy` | a reclone, archive or delete runs on the workspace, in any status (`workspace "<slug>" is busy: a reclone is running; try again later`), or it is `pending` or `cloning` (`workspace "<slug>" is busy: its clone has not finished; try again later`) |
+| `409` `workspace_archived` | the workspace is `archived` already (`workspace "<slug>" is archived`) |
+| `500` `internal` | the status change or its event could not be written; the workspace is as it was |
+
+## `POST /api/v1/workspaces/{slug}/reactivate`
+
+Brings the archived repository workspace `{slug}` back into service. It
+takes the admin token, an API key or a PAT, declares the scope
+`workspaces:write` for a PAT and needs write access to the workspace (see
+[Workspace access](#workspace-access)): its owner or the admin token. The
+route reads no body; one that passes the content-type and size rules is
+ignored.
+
+A workspace in status `archived` is reactivated; the checks run in the
+order of the table below, and a refused reactivate changes nothing. In one
+store transaction `status` becomes `pending`, `clone_error` is cleared and
+one `parley.workspace.reactivate` event is written; when that transaction
+fails nothing has changed and the answer is `500 internal`. Once it has
+committed, the clone work of the workspace is started. When the copy the
+archive kept is still valid, the clone work brings the workspace to
+`ready` from it, with its branches and its `head_sha`, without contacting
+origin; when the copy is missing or does not open as a repository, the
+clone work makes a fresh copy from origin, which holds origin's branches
+and nothing that existed only in the hub.
+
+The event has `workspace` the slug, `resource_type` `workspace`,
+`resource_id` the slug, as actor the caller as for
+[`PATCH /api/v1/workspaces/{slug}`](#patch-apiv1workspacesslug), and an
+empty `metadata`.
+
+```json
+{"seq":17,"id":"…","type":"parley.workspace.reactivate","time":"2026-11-14T10:45:00Z","workspace":"demo","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"workspace","resource_id":"demo","action":"reactivate","session_id":null,"metadata":{}}
+```
+
+The answer is the workspace object, read after the reactivate, with
+`status` `pending`, `clone_error` `null` and `access` the caller's level,
+the object [`GET /api/v1/workspaces/{slug}`](#get-apiv1workspacesslug)
+answers; read it again to see the clone work reach `ready` or `failed`.
+
+| Status | When |
+|---|---|
+| `200 OK` | the workspace is back in `pending` and its clone work is started; the body is the workspace object |
+| `400` `not_supported_on_fork` | the workspace is a task fork (`workspace "<slug>" is a task fork, which cannot be reactivated on its own`) |
+| `403` `insufficient_scope` | a PAT without `workspaces:write` (`this route needs the scope workspaces:write`) |
+| `403` `forbidden` | a member of the workspace's org who does not own it (`org members have read-only access to this workspace`) |
+| `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug (`workspace not found`); also a bound PAT on a workspace outside its binding |
+| `409` `workspace_busy` | a reclone, archive or delete runs on the workspace (`workspace "<slug>" is busy: a delete is running; try again later`) |
+| `409` `workspace_not_archived` | the workspace is in any status other than `archived`, `pending` and `cloning` included (`workspace "<slug>" is ready, not archived`) |
+| `500` `internal` | the status change or its event could not be written; the workspace is still `archived` |
+
+## `POST /api/v1/workspaces/{slug}/reclone`
+
+Throws away the hub's copy of the repository workspace `{slug}` and clones
+its origin again. It takes the admin token, an API key or a PAT, declares
+the scope `workspaces:write` for a PAT and needs write access to the
+workspace (see [Workspace access](#workspace-access)): its owner or the
+admin token. The route reads no body; one that passes the content-type and
+size rules is ignored.
+
+A workspace in status `ready` or `failed` without forks is recloned; the
+checks run in the order of the table below, and a refused reclone neither
+contacts origin nor touches the copy. While the reclone runs, every other
+request that needs the workspace's repository is answered `409
+workspace_busy`. First the hub makes the same safety copy as
+[`POST /api/v1/workspaces/{slug}/archive`](#post-apiv1workspacesslugarchive):
+it offers every branch of its copy to origin as a fast-forward, except a
+carry-patch workspace's integration branch, and goes on whatever origin
+answers. Then, in one store transaction, `status` becomes `pending`,
+`sync_error` and `origin_head_sha` are cleared and one
+`parley.workspace.reclone` event is written; when that transaction fails
+nothing has changed, the copy included, and the answer is `500 internal`.
+Once it has committed, the copy is removed from disk, and with it the
+origin head of every branch, and the clone work of the workspace is
+started. The new copy holds what origin holds and nothing else: a branch
+origin did not take, and every ref under `refs/parley/`, are lost; change
+records and the other data the workspace owns stay. `head_sha`,
+`default_branch`, `last_sync_at` and `clone_error` keep their values until
+the clone work changes them. A copy that a hub stopped in the middle of a
+reclone left on disk is not taken for the workspace's copy: the clone
+work at the next start replaces it with a fresh clone.
+
+The event has `workspace` the slug, `resource_type` `workspace`,
+`resource_id` the slug, as actor the caller as for
+[`PATCH /api/v1/workspaces/{slug}`](#patch-apiv1workspacesslug), and in
+`metadata` `origin_push`, the outcome of the safety copy, with the values
+the archive event gives it (`ok`, `partial` or `failed`).
+
+```json
+{"seq":18,"id":"…","type":"parley.workspace.reclone","time":"2026-11-14T10:50:00Z","workspace":"demo","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"workspace","resource_id":"demo","action":"reclone","session_id":null,"metadata":{"origin_push":"ok"}}
+```
+
+The answer is the workspace object, read after the reclone, with `status`
+`pending`, `sync_error` `null`, `origin_head_sha` `null` and `access` the
+caller's level, the object
+[`GET /api/v1/workspaces/{slug}`](#get-apiv1workspacesslug) answers; read
+it again to see the clone work reach `ready` or `failed`.
+
+| Status | When |
+|---|---|
+| `200 OK` | the workspace is back in `pending`, its copy is gone and its clone work is started, whatever `origin_push` says; the body is the workspace object |
+| `400` `fork_has_no_origin` | the workspace is a task fork (`workspace "<slug>" is a task fork, which has no origin to reclone from`) |
+| `403` `insufficient_scope` | a PAT without `workspaces:write` (`this route needs the scope workspaces:write`) |
+| `403` `forbidden` | a member of the workspace's org who does not own it (`org members have read-only access to this workspace`) |
+| `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug (`workspace not found`); also a bound PAT on a workspace outside its binding |
+| `409` `workspace_busy` | a reclone, archive or delete runs on the workspace, in any status (`workspace "<slug>" is busy: a reclone is running; try again later`), or it is `pending` or `cloning` (`workspace "<slug>" is busy: its clone has not finished; try again later`) |
+| `409` `workspace_archived` | the workspace is `archived` (`workspace "<slug>" is archived`) |
+| `409` `has_forks` | the workspace has at least one fork, which depends on its copy (`workspace "<slug>" has <n> forks, which depend on its copy; delete them first`) |
+| `500` `internal` | the status change or its event could not be written; the workspace and its copy are as they were |
+
+## `DELETE /api/v1/workspaces/{slug}`
+
+Deletes the archived repository workspace `{slug}`, its task forks and
+everything they own, in one step or not at all. It takes the admin token,
+an API key or a PAT, declares the scope `workspaces:write` for a PAT and
+needs write access to the workspace (see
+[Workspace access](#workspace-access)): its owner or the admin token. The
+route reads no body; one that passes the content-type and size rules is
+ignored.
+
+For a task fork, once the scope and access checks have passed, the delete
+is handed to the task-fork feature, which removes forks by its own rules:
+its answer is the route's, `204` with an empty body when it removed the
+fork and its error, unchanged, otherwise. None of what follows applies to a
+fork. While the hub has no task-fork feature, a fork is answered `500`
+`internal` and nothing is removed.
+
+A repository workspace in status `archived` is deleted; the checks run in
+the order of the table below, and a refused delete changes nothing. Once
+they have passed, the delete runs to its end even when the caller
+disconnects, and while it runs every other request that needs the
+workspace's repository answers `409` `workspace_busy`. First the
+sandboxes of the workspace and of its forks are deleted; when that fails
+the answer is `500 internal` and no record, token or other data has
+changed, so the delete can be repeated. Then, in one store transaction,
+the forks are removed in ascending slug order and then the workspace: for
+each, the tokens bound to it are revoked, the data other features keep
+for it (its secrets among them) is removed, its remaining agent sessions
+are ended with the reason `workspace deleted`, its record is removed with
+its settings, and one `parley.workspace.delete` event is written, the
+workspace's last. When anything in that transaction fails, nothing has
+changed, the repository data included, and the answer is `500 internal`.
+Once it has committed, the hub's copies of the removed workspaces are
+removed from disk; a copy that cannot be removed is logged with the slug
+and the path, and the answer stays `204`. Every event written about the
+workspace and its forks before the delete stays in the event log. The slug
+is free again afterwards:
+[`POST /api/v1/workspaces`](#post-apiv1workspaces) takes it as a slug that
+was never used.
+
+Each event has `workspace` the removed slug, `resource_type` `workspace`,
+`resource_id` the slug, and as actor the caller as for
+[`PATCH /api/v1/workspaces/{slug}`](#patch-apiv1workspacesslug). Its
+`metadata` holds `kind` (`fork` or `repository`), `parent_slug` (the
+fork's parent, `null` for the repository workspace) and `revoked_tokens`,
+the ids of the tokens bound to that slug that were revoked, in ascending
+order, `[]` when there were none. The repository workspace's event also
+holds `deleted_forks`, the slugs of the forks removed with it, in
+ascending order, `[]` when it had none. A fork's event is visible to the
+readers of its parent's events, as the fork's other events are.
+
+```json
+{"seq":19,"id":"…","type":"parley.workspace.delete","time":"2026-11-14T11:00:00Z","workspace":"demo--t1","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"workspace","resource_id":"demo--t1","action":"delete","session_id":null,"metadata":{"kind":"fork","parent_slug":"demo","revoked_tokens":["tok1"]}}
+{"seq":20,"id":"…","type":"parley.workspace.delete","time":"2026-11-14T11:00:00Z","workspace":"demo","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"workspace","resource_id":"demo","action":"delete","session_id":null,"metadata":{"kind":"repository","parent_slug":null,"revoked_tokens":[],"deleted_forks":["demo--t1"]}}
+```
+
+| Status | When |
+|---|---|
+| `204 No Content` | the workspace, its forks and what they own are gone; the body is empty |
+| `403` `insufficient_scope` | a PAT without `workspaces:write` (`this route needs the scope workspaces:write`) |
+| `403` `forbidden` | a member of the workspace's org who does not own it (`org members have read-only access to this workspace`) |
+| `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug (`workspace not found`); also a bound PAT on a workspace outside its binding |
+| `409` `workspace_busy` | a reclone, archive or delete runs on the workspace (`workspace "<slug>" is busy: a reclone is running; try again later`) |
+| `409` `workspace_not_archived` | the workspace is in any status other than `archived`, `pending` and `cloning` included (`workspace "<slug>" is ready, not archived`) |
+| `500` `internal` | the workspace is a task fork and no part of the hub deletes task forks (`workspace "<slug>" is a task fork, and no fork remover deletes it`): the fork is unchanged; or the sandboxes could not be deleted, or a step of the removal failed: the workspace is still `archived` and nothing has changed |
+
 ## `POST /api/v1/workspaces/{slug}/tokens`
 
 Mints a personal access token (PAT) owned by the caller's user and bound to

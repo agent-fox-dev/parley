@@ -6,6 +6,7 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/config"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
+	"github.com/agent-fox-dev/parley/internal/secret"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
@@ -65,8 +66,10 @@ func (l originLister) ListOrigin(ctx context.Context, url string, cred workspace
 // hub listens, so that a start that fails after the hook leaves no clone
 // running over stores that are closed; they are stopped when the hub stops.
 // The service exists from the composition on, with the keys of the settings
-// table registered on its settings registry, so a later part keeps it
-// through Composition.Workspaces.
+// table registered on its settings registry and, on its teardown set, the
+// access rule as the token revoker and the secrets' removal as a remover of
+// owned data, so a later part keeps it through Composition.Workspaces and
+// registers its own collaborators on Workspaces().Teardown().
 func composeWorkspaces(c *Composition) {
 	svc := &workspace.Service{}
 	c.workspaces = svc
@@ -78,6 +81,13 @@ func composeWorkspaces(c *Composition) {
 	// One git for the part, so that every call it makes to an origin runs
 	// with the same environment.
 	git := gitFor(c.env)
+	// The collaborators of the packages composed before this part: tokens
+	// have no remover of their own and are revoked through the access rule,
+	// and the secret package cannot register itself, since it cannot import
+	// this one. Every other owner of workspace data registers its own from
+	// its part (ADR 07).
+	svc.Teardown().RegisterTokenRevoker(c.access)
+	svc.Teardown().RegisterRemover(secret.RemoveWorkspace)
 	c.AddSchemaStep(workspace.SchemaStep)
 	for _, r := range svc.Routes() {
 		c.AddRoute(r)
@@ -85,25 +95,31 @@ func composeWorkspaces(c *Composition) {
 	// Built by the start hook, which runs before the background work.
 	var workers *workspace.Workers
 	c.AddStartHook(workspacesHook, func(ctx context.Context, rt *Runtime) error {
+		// A maintenance marker guards an operation of a running hub only;
+		// one left by a hub that stopped during it is released first.
+		if err := workspace.ClearMarkers(ctx, rt.Store.Main()); err != nil {
+			return err
+		}
 		var err error
 		if workers, err = workspace.NewWorkers(rt.Config.Workspace.Workers, svc, nil); err != nil {
 			return err
 		}
 		d := workspace.Deps{
-			Store:       rt.Store,
-			Secrets:     c.Secrets(),
-			Events:      c.Events(),
-			Access:      c.access,
-			Lister:      originLister{git},
-			Git:         git,
-			Fetcher:     git,
-			Pusher:      git,
-			Notify:      workers.Enqueue,
-			Scrubber:    rt.Scrubber,
-			Logger:      rt.Logger,
-			Now:         rt.Now,
-			ExternalURL: rt.Config.Server.ExternalURL,
-			Root:        rt.Config.Workspace.Path,
+			Store:        rt.Store,
+			Secrets:      c.Secrets(),
+			Events:       c.Events(),
+			Access:       c.access,
+			Lister:       originLister{git},
+			Git:          git,
+			Fetcher:      git,
+			Pusher:       git,
+			SafetyPusher: git,
+			Notify:       workers.Enqueue,
+			Scrubber:     rt.Scrubber,
+			Logger:       rt.Logger,
+			Now:          rt.Now,
+			ExternalURL:  rt.Config.Server.ExternalURL,
+			Root:         rt.Config.Workspace.Path,
 		}
 		for _, adjust := range c.workspaceAdjusters {
 			adjust(&d)
