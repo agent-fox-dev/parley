@@ -6,6 +6,7 @@ import (
 	"math"
 	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -70,10 +71,11 @@ type Registry struct {
 }
 
 // NewRegistry returns a registry holding the keys the configuration loader
-// owns: those of [server], [database], [workspace], [logging] and [limits].
+// owns: those of [server], [database], [workspace], [logging], [limits] and
+// [forks].
 func NewRegistry() *Registry {
 	r := &Registry{keys: map[string]map[string]Key{}, sections: map[string]func(map[string]any) error{}}
-	for _, k := range ownKeys {
+	for _, k := range slices.Concat(ownKeys, forkKeys) {
 		// A refusal is remembered and fails the load; the loader's own keys
 		// are fixed and well formed, so there is none.
 		_ = r.Register(k)

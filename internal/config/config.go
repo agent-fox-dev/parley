@@ -48,6 +48,7 @@ type Config struct {
 	Logging   Logging
 	Limits    Limits
 	OAuth     OAuth
+	Forks     Forks
 
 	values map[string]map[string]any
 	// sections holds the content of each section registered as a whole that
@@ -194,7 +195,12 @@ func (r *Registry) Load(env Env, workDir string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("configuration file %s: %w", path, err)
 	}
+	forks, err := forksFrom(values)
+	if err != nil {
+		return nil, fmt.Errorf("configuration file %s: %w", path, err)
+	}
 	c := build(values, providers, path, work, lookup(env, "XDG_DATA_HOME"))
+	c.Forks = forks
 	c.sections = sections
 	return c, nil
 }

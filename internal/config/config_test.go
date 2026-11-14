@@ -282,22 +282,22 @@ func TestRegistry_LoadsTheKeysOtherPackagesRegister(t *testing.T) {
 	cases := []struct {
 		name      string
 		file      *string
-		wantForks int
+		wantQuota int
 		wantThing int
 		wantRPM   int
 		wantErr   string
 	}{
-		{name: "no file", wantForks: 200, wantThing: 5, wantRPM: 600},
-		{name: "own section", file: ptr("[forks]\nmax_per_workspace = 9"), wantForks: 9, wantThing: 5, wantRPM: 600},
-		{name: "shared section", file: ptr("[limits]\nmax_things = 2\nrequests_per_minute = 3"), wantForks: 200, wantThing: 2, wantRPM: 3},
-		{name: "refused by its rule", file: ptr("[forks]\nmax_per_workspace = 0"), wantErr: "forks.max_per_workspace"},
-		{name: "unregistered key in a registered section", file: ptr("[forks]\nother = 1"), wantErr: "forks.other"},
+		{name: "no file", wantQuota: 200, wantThing: 5, wantRPM: 600},
+		{name: "own section", file: ptr("[quotas]\nmax_per_workspace = 9"), wantQuota: 9, wantThing: 5, wantRPM: 600},
+		{name: "shared section", file: ptr("[limits]\nmax_things = 2\nrequests_per_minute = 3"), wantQuota: 200, wantThing: 2, wantRPM: 3},
+		{name: "refused by its rule", file: ptr("[quotas]\nmax_per_workspace = 0"), wantErr: "quotas.max_per_workspace"},
+		{name: "unregistered key in a registered section", file: ptr("[quotas]\nother = 1"), wantErr: "quotas.other"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			reg := config.NewRegistry()
-			if err := reg.Register(config.Key{Section: "forks", Name: "max_per_workspace", Type: config.Int, Default: 200, Validate: atLeast(1)}); err != nil {
+			if err := reg.Register(config.Key{Section: "quotas", Name: "max_per_workspace", Type: config.Int, Default: 200, Validate: atLeast(1)}); err != nil {
 				t.Fatal(err)
 			}
 			if err := reg.Register(config.Key{Section: "limits", Name: "max_things", Type: config.Int, Default: 5}); err != nil {
@@ -317,8 +317,8 @@ func TestRegistry_LoadsTheKeysOtherPackagesRegister(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got := cfg.Int("forks", "max_per_workspace"); got != tc.wantForks {
-				t.Errorf("forks.max_per_workspace = %d, want %d", got, tc.wantForks)
+			if got := cfg.Int("quotas", "max_per_workspace"); got != tc.wantQuota {
+				t.Errorf("quotas.max_per_workspace = %d, want %d", got, tc.wantQuota)
 			}
 			if got := cfg.Int("limits", "max_things"); got != tc.wantThing {
 				t.Errorf("limits.max_things = %d, want %d", got, tc.wantThing)
@@ -337,7 +337,7 @@ func TestRegistry_RefusesAKeyRegisteredTwice(t *testing.T) {
 		key   config.Key
 		twice bool
 	}{
-		{"registered twice by one package", config.Key{Section: "forks", Name: "default_ttl", Type: config.String, Default: "7d"}, true},
+		{"registered twice by one package", config.Key{Section: "quotas", Name: "window", Type: config.String, Default: "7d"}, true},
 		{"owned by the loader", config.Key{Section: "server", Name: "port", Type: config.Int, Default: 1}, false},
 	}
 	for _, tc := range cases {
