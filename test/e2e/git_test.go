@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -55,25 +56,6 @@ func (g *gitClient) git(dir string, args ...string) (string, error) {
 	cmd.Dir, cmd.Env = dir, g.env
 	out, err := cmd.CombinedOutput()
 	return string(out), err
-}
-
-func TestGit_TheCredentialHelperGivesTheHubCredentialToStockGitAndToNoOtherHost(t *testing.T) {
-	h := startForkHub(t)
-	remote := h.URL("/git/acme/demo.git")
-	g := newGitClient(t, h.URL(""), h.key)
-
-	out, err := g.git("", "ls-remote", remote)
-	if err != nil || !strings.Contains(out, "\trefs/heads/main\n") {
-		t.Fatalf("git ls-remote %s: %v, output %q; want the refs of demo", remote, err, out)
-	}
-
-	// The helper is asked for the hub's address while its settings name the
-	// same hub under another host name, so it answers nothing.
-	g.env = append(g.env, "PARLEY_ENDPOINT_URL="+strings.Replace(h.URL(""), "127.0.0.1", "localhost", 1))
-	out, err = g.git("", "ls-remote", remote)
-	if err == nil || !strings.Contains(out, "could not read Username") {
-		t.Errorf("git ls-remote %s with the helper set for another host: %v, output %q; want git to find no credential", remote, err, out)
-	}
 }
 
 // seedGitHistory replaces the main branch of the hub's repository dir by
@@ -137,6 +119,13 @@ func TestGit_ADeveloperClonesAWorkspaceWithStockGitAndTheCredentialHelper(t *tes
 	refs, _ := g.git(dir, "for-each-ref", "--format=%(refname)")
 	if !strings.Contains(refs, "refs/remotes/origin/dev\n") || !strings.Contains(refs, "refs/tags/v1\n") || strings.Contains(refs, "parley") {
 		t.Errorf("the clone's refs are\n%s\nwant origin/dev and v1 and none under refs/parley/", refs)
+	}
+
+	// The helper is asked for the hub's address while its settings name the
+	// same hub under another host name, so it answers nothing.
+	other := &gitClient{env: append(slices.Clone(g.env), "PARLEY_ENDPOINT_URL="+strings.Replace(h.URL(""), "127.0.0.1", "localhost", 1)), helper: g.helper}
+	if out, err := other.git("", "ls-remote", url); err == nil || !strings.Contains(out, "could not read Username") {
+		t.Errorf("git ls-remote %s with the helper set for another host: %v, output %q; want git to find no credential", url, err, out)
 	}
 
 	// Without a credential the helper answers nothing, and git has no other.

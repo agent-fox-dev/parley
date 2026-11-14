@@ -17,31 +17,18 @@ func TestRefs_AdvertisesEveryRefWhileACloneTakesBranchesAndTags(t *testing.T) {
 	w := newGitWorld(t, hubtest.Config{})
 	w.extendHistory(t)
 	want := gitrepotest.Refs(t, w.repo, "")
-	want["HEAD"] = want["refs/heads/main"]
+	want["HEAD"], want["symref HEAD"] = want["refs/heads/main"], "refs/heads/main"
 	remote := w.remote(w.ownerKey, "acme/demo.git")
 	for _, version := range []string{"0", "2"} {
 		t.Run("protocol "+version, func(t *testing.T) {
 			t.Parallel()
 			dir := t.TempDir()
 			v := []string{"-c", "protocol.version=" + version}
-			out, err := clientGit(t, dir, nil, append(v, "ls-remote", "--symref", remote)...)
-			if err != nil {
-				t.Fatalf("git ls-remote: %v\n%s", err, out)
+			if got := lsRemote(t, remote, v...); !maps.Equal(got, want) {
+				t.Errorf("git ls-remote --symref listed %v, want %v", got, want)
 			}
-			got := map[string]string{}
-			for line := range strings.Lines(out) {
-				id, name, ok := strings.Cut(strings.TrimSpace(line), "\t")
-				if ok && !strings.HasPrefix(id, "ref: ") {
-					got[name] = id
-				}
-			}
-			if !maps.Equal(got, want) || !strings.Contains(out, "ref: refs/heads/main\tHEAD") {
-				t.Errorf("git ls-remote --symref listed\n%s\nwant HEAD as ref: refs/heads/main and the refs %v", out, want)
-			}
-			if out, err := clientGit(t, dir, nil, append(v, "clone", "--no-checkout", remote, "d")...); err != nil {
-				t.Fatalf("git clone: %v\n%s", err, out)
-			}
-			out, _ = clientGit(t, filepath.Join(dir, "d"), nil, "for-each-ref", "--format=%(refname)")
+			runGit(t, dir, append(v, "clone", "--no-checkout", remote, "d")...)
+			out := runGit(t, filepath.Join(dir, "d"), "for-each-ref", "--format=%(refname)")
 			for name := range strings.Lines(out) {
 				if !strings.HasPrefix(name, "refs/heads/") && !strings.HasPrefix(name, "refs/remotes/origin/") && !strings.HasPrefix(name, "refs/tags/") {
 					t.Errorf("the clone took %s, want branches and tags only", strings.TrimSpace(name))
@@ -88,9 +75,7 @@ func TestRefs_SendsWhatARefReachesByNameOrIdAndRefusesTheRest(t *testing.T) {
 			t.Run(c.name+"/protocol "+version, func(t *testing.T) {
 				t.Parallel()
 				d := t.TempDir()
-				if out, err := clientGit(t, d, nil, "init", "--quiet"); err != nil {
-					t.Fatalf("git init: %v\n%s", err, out)
-				}
+				runGit(t, d, "init", "--quiet")
 				out, err := clientGit(t, d, nil, "-c", "protocol.version="+version, "fetch", remote, c.what)
 				switch {
 				case c.served && err != nil:

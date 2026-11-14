@@ -95,13 +95,8 @@ func TestState_ServesFetchesFromAForkOfAnArchivedParent(t *testing.T) {
 	w := newGitWorld(t, hubtest.Config{})
 	w.addFork(t)
 	w.setStatus(t, "demo", access.StatusArchived)
-	if a := w.call(t, http.MethodGet, "/git/acme/demo--t1.git/info/refs?service=git-upload-pack", basic("x", w.memberKey)); a.status != http.StatusOK {
-		t.Errorf("ref discovery = %d %q, want 200", a.status, a.body)
-	}
 	dir := t.TempDir()
-	if out, err := clientGit(t, dir, nil, "clone", w.remote(w.memberKey, "acme/demo--t1.git"), "d"); err != nil {
-		t.Fatalf("git clone: %v\n%s", err, out)
-	}
+	runGit(t, dir, "clone", w.remote(w.memberKey, "acme/demo--t1.git"), "d")
 	if got, _ := clientGit(t, filepath.Join(dir, "d"), nil, "rev-parse", "origin/main"); strings.TrimSpace(got) != w.head {
 		t.Errorf("origin/main of the clone = %s, want %s", got, w.head)
 	}

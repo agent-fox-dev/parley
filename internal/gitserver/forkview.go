@@ -59,13 +59,31 @@ var (
 // A fork's slug picks one of them, so that the locks take a fixed amount of
 // memory however many forks the hub has served; two forks that share one
 // only wait for each other's copy, which writes nothing once the refs are
-// up to date.
-type forkLocks [64]sync.Mutex
+// up to date. A lock is a channel that holds one token, so that a request
+// waits for it no longer than its own deadline, however long the copy that
+// holds it runs.
+type forkLocks struct {
+	once  sync.Once
+	slots [64]chan struct{}
+}
 
-func (l *forkLocks) of(slug string) *sync.Mutex {
+// lock takes the lock of the fork slug, waiting no longer than ctx, and
+// returns its release.
+func (l *forkLocks) lock(ctx context.Context, slug string) (release func(), err error) {
+	l.once.Do(func() {
+		for i := range l.slots {
+			l.slots[i] = make(chan struct{}, 1)
+		}
+	})
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(slug))
-	return &l[h.Sum32()%uint32(len(l))]
+	slot := l.slots[h.Sum32()%uint32(len(l.slots))]
+	select {
+	case slot <- struct{}{}:
+		return func() { <-slot }, nil
+	case <-ctx.Done():
+		return nil, fmt.Errorf("wait for another copy into the fork: %w", ctx.Err())
+	}
 }
 
 // forkRefs brings a task fork's repository up to date with its parent's
@@ -91,8 +109,11 @@ func (c *Component) forkRefs(w http.ResponseWriter, r *http.Request, x *Exchange
 	return true
 }
 
+// copyForkRefs runs under the request's deadline, which the run of git
+// shares, so that a copy that hangs leaves git none of its time and a
+// request waits for another's copy no longer than its own timeout.
 func (c *Component) copyForkRefs(r *http.Request, x *Exchange) error {
-	ctx, cancel := context.WithTimeout(r.Context(), c.timeout())
+	ctx, cancel := context.WithDeadline(r.Context(), x.deadline)
 	defer cancel()
 	view, err := c.deps.ForkView.ForkRefs(ctx, x.Workspace.Slug)
 	if err != nil {
@@ -118,9 +139,11 @@ func (c *Component) copyForkRefs(r *http.Request, x *Exchange) error {
 	for _, n := range view.Changes {
 		spec.Prefixes = append(spec.Prefixes, changesNamespace+strconv.FormatInt(n, 10)+"/")
 	}
-	lock := c.locks.of(x.Workspace.Slug)
-	lock.Lock()
-	defer lock.Unlock()
+	release, err := c.locks.lock(ctx, x.Workspace.Slug)
+	if err != nil {
+		return err
+	}
+	defer release()
 	done, err := c.deps.Copier.CopyRefs(ctx, parent, x.Repo, spec)
 	if err != nil {
 		return err

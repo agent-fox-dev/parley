@@ -36,14 +36,18 @@ type Settings interface {
 // audit_fetches at true. A task fork has no settings of its own: it has its
 // parent's, read now, as the workspace object of a fork shows them, so a
 // fork is audited when its parent is. Without Settings, or while no feature
-// has registered the key, it is false; so is it when the parent cannot be
-// read, which is logged, since the fetch it would record has been served.
+// has registered the key, it is false; so is it for a fork whose parent is
+// not found or cannot be read, the latter logged, since the fetch it would
+// record has been served.
 func (c *Component) auditsFetches(ctx context.Context, x Exchange) bool {
 	if c.deps.Settings == nil {
 		return false
 	}
 	w := x.Workspace
-	if w.Kind == access.KindFork && w.ParentSlug != nil && c.deps.Records != nil {
+	if w.Kind == access.KindFork {
+		if w.ParentSlug == nil || c.deps.Records == nil {
+			return false
+		}
 		parent, found, err := c.deps.Records.Workspace(ctx, *w.ParentSlug)
 		switch {
 		case err != nil:
@@ -54,9 +58,10 @@ func (c *Component) auditsFetches(ctx context.Context, x Exchange) bool {
 				slog.String("error", err.Error()),
 			)
 			return false
-		case found:
-			w = parent
+		case !found:
+			return false
 		}
+		w = parent
 	}
 	on, _ := c.deps.Settings.EffectiveSettings(w.Settings, w.DefaultBranch)[settingAuditFetches].(bool)
 	return on

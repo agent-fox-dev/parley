@@ -15,6 +15,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
@@ -25,7 +26,8 @@ import (
 
 // The patterns of the three git routes on the server's router. Every other
 // path or method under /git gets the server's general 404 and 405 answers,
-// before any credential is read.
+// before any credential is read; HEAD, which the router serves with a GET
+// pattern, is answered as the server answers any other method.
 const (
 	PatternInfoRefs    = "GET /git/{org}/{repo}/info/refs"
 	PatternUploadPack  = "POST /git/{org}/{repo}/git-upload-pack"
@@ -106,6 +108,9 @@ type Exchange struct {
 	// Repo is the git directory of the workspace's repository, which opened
 	// as a repository before the Service was called.
 	Repo string
+	// deadline is [git].timeout after the request came in: the end of a
+	// fork's ref copy and of the run of git, which share it.
+	deadline time.Time
 }
 
 // Service serves a git request that passed every check. It writes the
@@ -165,7 +170,8 @@ type Deps struct {
 	// audit_fetches is read; with none, or while the key is not
 	// registered, audit_fetches is false.
 	Settings Settings
-	// Timeout bounds one run of git for a client; zero is DefaultTimeout.
+	// Timeout bounds one git request: a task fork's ref copy and the run of
+	// git for ref discovery or a fetch together; zero is DefaultTimeout.
 	Timeout time.Duration
 	// Logger receives the causes of 500 answers; nil discards them.
 	Logger *slog.Logger
@@ -192,7 +198,8 @@ func (c *Component) Bind(d Deps) {
 // the hub composition's.
 func (c *Component) Mount(handle func(pattern string, h http.Handler)) {
 	for _, rt := range routes {
-		handle(rt.pattern, c.handler(rt.route))
+		method, _, _ := strings.Cut(rt.pattern, " ")
+		handle(rt.pattern, c.handler(method, rt.route))
 	}
 }
 
@@ -225,14 +232,21 @@ var checks = []check{
 	(*Component).forkRefs,
 }
 
-// handler serves route: it runs the checks in order, stops at the first
-// that refuses, and serves a request that passed them all with git, or
-// hands it to the Service when one is set. Every request is counted once,
-// when its answer is complete but for the end of its body, which the
-// server writes once the handler returns, so that a client that has read
-// its answer finds it counted.
-func (c *Component) handler(route Route) http.Handler {
+// handler serves route, registered for method: it runs the checks in
+// order, stops at the first that refuses, and serves a request that passed
+// them all with git, or hands it to the Service when one is set. Every
+// request is counted once, when its answer is complete but for the end of
+// its body, which the server writes once the handler returns, so that a
+// client that has read its answer finds it counted. A request of another
+// method, HEAD on the GET route, gets the server's 405 envelope, as the
+// server answers a method no route of a path has, and is not counted.
+func (c *Component) handler(method string, route Route) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != method {
+			w.Header().Set("Allow", method)
+			server.WriteError(w, server.MethodNotAllowed("method not allowed"))
+			return
+		}
 		sw := &statusWriter{ResponseWriter: w}
 		res := c.serve(sw, r, route)
 		if res == "" {
@@ -247,7 +261,7 @@ func (c *Component) handler(route Route) http.Handler {
 // the answer's status is the result: a refusal of a check, or the answer of
 // the Service.
 func (c *Component) serve(w http.ResponseWriter, r *http.Request, route Route) Result {
-	x := Exchange{Route: route, Service: serviceOf(route, r)}
+	x := Exchange{Route: route, Service: serviceOf(route, r), deadline: time.Now().Add(c.timeout())}
 	x.Need = needOf(route, x.Service)
 	for _, chk := range checks {
 		if !chk(c, w, r, &x) {

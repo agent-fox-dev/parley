@@ -49,17 +49,6 @@ server answers it, and a record whose `org_id` is empty, with the same
 `404` as an unknown slug, and its test stores a workspace whose `org_id`
 names no organization.
 
-## The two `service` values are checked at the exchange, not at its content type
-
-The check of the package asserts that ref discovery with
-`service=git-upload-pack&service=git-receive-pack` answers with the
-`Content-Type` of an upload-pack advertisement. Which service serves a
-request is decided by the checks, and the advertisement is written by the
-service that runs after them; the test of the checks asserts that the
-request reaches that service as an upload-pack request with need read. The
-content type is the one the upload-pack advertisement always carries, written
-by the service of ref discovery, not by the checks.
-
 ## A workspace under maintenance is answered `workspace is busy`
 
 The package refuses a workspace "whose status is not ready" with
@@ -98,7 +87,10 @@ went out and wrote no error packet of its own, the hub writes one `ERR`
 pkt-line with the last line of git's standard error, without its `fatal: `
 or `error: ` prefix and with the repository's directory on disk replaced by
 `repository` (`upload-pack failed` when git wrote nothing), so that the
-client gets git's reason and never a path of the hub. The `ERR` pkt-lines
+client gets git's reason and never a path of the hub. A line that still
+names an absolute path after that replacement, such as the object directory
+of a fork's parent that git reads through the fork's alternates, is replaced
+as a whole by `upload-pack failed`. The `ERR` pkt-lines
 the hub writes carry no trailing newline, as git's own do.
 
 ## A version 2 want of a commit no ref reaches is refused by the hub, not by git
@@ -118,13 +110,38 @@ version 2 git serves any object it holds by its id: a commit written with
 refuses it.
 
 So the hub refuses it itself (`internal/gitrepo/serve.go`, `checkWants`):
-a version 2 `command=fetch` request is kept in a file of git's private
-directory, its `want` ids are given to `git rev-list --stdin --not --all`,
-and when that lists one of them, the request is answered with the `ERR`
-pkt-line `upload-pack: not our ref <id>`, git's own text of version 0,
-before upload-pack runs. A commit no ref reaches (one whose branch was
-deleted, or a commit of the parent that a task fork can read only through
-its alternates) is thereby served under neither version.
+a version 2 request is kept in a file of git's private directory and read
+as git's version 2 server reads it, the command and the capabilities in any
+order up to the delimiter packet (a capability line such as `agent=` may
+come before `command=fetch`); for a `command=fetch`, every `want` id is
+read as git reads it, the leading 40 (SHA-1) or 64 (SHA-256) hexadecimal
+digits, in either case, whatever follows them, so that `want <ID IN
+UPPERCASE>` and `want <id> junk` are checked as the id git serves; both
+lengths are given, lowercased, to
+`git rev-list --ignore-missing --stdin --not --all`, which resolves the one
+of the repository's object format and leaves out a name it cannot resolve.
+When that lists a commit, an annotated tag's commit included, the request is
+answered with the `ERR` pkt-line `upload-pack: not our ref <id>`, git's own
+text of version 0, before upload-pack runs. A `want` without 40 leading
+hexadecimal digits, which git cannot read, is refused the same way with
+git's text `upload-pack: protocol error, expected to get oid`. A commit no
+ref reaches (one whose branch was deleted, or a commit of the parent that a
+task fork can read only through its alternates) is thereby served under
+neither version.
+
+## A version 2 request is kept up to 16 MiB, answered `ERR request too large` beyond
+
+The package takes a fetch body "of any size". The want check above keeps a
+version 2 request whole on disk before git runs, so the hub bounds what it
+keeps: up to `gitrepo.DefaultMaxRequest`, 16 MiB, counted after gzip
+decompression. A fetch request is a pkt-line of about 50 bytes per want and
+per have; stock git sends a few thousand haves at most in one round of
+negotiation, and a fetch of 100,000 refs is about 5 MB of wants, so a real
+request stays far below the bound. A larger version 2 request is answered
+in band, before git runs, with the `ERR` pkt-line `request too large`, a
+text of the hub's beside the package's `empty request`, `invalid gzip body`
+and `request timed out`, and counted with the result `error`. A version 0
+request is not kept but streamed to git, and has no such bound.
 
 A tree or a blob is not checked, under either version: rev-list does not
 list one, and git's version 0 check, which runs the same rev-list, lets it
@@ -242,6 +259,20 @@ points the fork's `HEAD` at `refs/heads/<default_branch>` of the fork's
 record, its base branch, when it names another ref, so that a fork is
 cloned as a workspace is, with its base branch checked out.
 
+## `[git].timeout` bounds one request, the fork's ref copy and git together
+
+The package says `[git].timeout` "bounds one upload-pack request". Before
+git runs on a task fork, the git server copies the refs the fork shows of
+its parent's into the fork's repository, and two requests on one fork wait
+for each other's copy. One deadline, `[git].timeout` after the request came
+in, bounds the copy, the wait for another request's copy (the 64 fork locks
+are channels a request waits on no longer than its deadline) and the run of
+git, so that a copy that hangs holds a request, and every request behind it
+on the same lock, no longer than the timeout. A request whose deadline
+passes during the copy or the wait is answered `500 internal error`, before
+git runs; one whose deadline passes while git runs gets
+`ERR request timed out` as before.
+
 ## A fork is audited by its parent's `audit_fetches`
 
 A task fork has no settings of its own: its workspace object shows its
@@ -249,5 +280,5 @@ parent's, read at the time of the request, and an update of a fork's
 `settings` is refused. The git server therefore reads `audit_fetches` of a
 fork from its parent's record (`internal/gitserver/event.go`
 `auditsFetches`); the event still names the fork. When the parent's record
-cannot be read the failure is logged and no event is written, since the
-fetch has been served.
+is not found no event is written, and when it cannot be read the failure is
+logged and no event is written, since the fetch has been served.

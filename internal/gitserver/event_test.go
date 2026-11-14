@@ -4,12 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/agent-fox-dev/parley/internal/event"
@@ -88,14 +88,9 @@ func (w *world) auditFetches(t *testing.T, on bool) {
 
 // clone clones demo with stock git under protocol version protocol, the
 // options args coming before the URL, with password, into dir/d.
-func (w *world) clone(t *testing.T, dir, protocol, password string, args ...string) error {
+func (w *world) clone(t *testing.T, dir, protocol, password string, args ...string) {
 	t.Helper()
-	args = append(append([]string{"-c", "protocol.version=" + protocol, "clone"}, args...), w.remote(password, "acme/demo.git"), "d")
-	out, err := clientGit(t, dir, nil, args...)
-	if err != nil {
-		t.Logf("git clone: %v\n%s", err, out)
-	}
-	return err
+	runGit(t, dir, append(append([]string{"-c", "protocol.version=" + protocol, "clone"}, args...), w.remote(password, "acme/demo.git"), "d")...)
 }
 
 func TestEvent_RecordsAnAuditedFetchThatSendsAPack(t *testing.T) {
@@ -120,9 +115,7 @@ func TestEvent_RecordsAnAuditedFetchThatSendsAPack(t *testing.T) {
 		for _, row := range rows {
 			t.Run("protocol "+protocol+"/"+row.name, func(t *testing.T) {
 				sink.clear()
-				if err := w.clone(t, t.TempDir(), protocol, row.password, row.args...); err != nil {
-					t.Fatal(err)
-				}
+				w.clone(t, t.TempDir(), protocol, row.password, row.args...)
 				events := sink.fetches()
 				if len(events) != 1 {
 					t.Fatalf("%d parley.git.fetch events, want 1: %+v", len(events), events)
@@ -149,27 +142,43 @@ func TestEvent_RecordsAnAuditedFetchThatSendsAPack(t *testing.T) {
 	}
 }
 
+// orphaning reads the records as Records does, but for the parent demo,
+// which it does not find while orphan is set.
+type orphaning struct {
+	gitserver.Records
+	orphan atomic.Bool
+}
+
+func (o *orphaning) Workspace(ctx context.Context, slug string) (workspace.Workspace, bool, error) {
+	if slug == "demo" && o.orphan.Load() {
+		return workspace.Workspace{}, false, nil
+	}
+	return o.Records.Workspace(ctx, slug)
+}
+
 // A fork has no settings of its own: it audits its fetches when its parent
-// does, as the workspace object of a fork shows the parent's settings.
+// does, as the workspace object of a fork shows the parent's settings, and
+// not when its parent's record is not found.
 func TestEvent_AuditsAForkByItsParentsSetting(t *testing.T) {
 	t.Parallel()
-	sink := &recordingSink{}
-	w := newAuditWorld(t, sink, nil)
+	sink, records := &recordingSink{}, &orphaning{}
+	w := newAuditWorld(t, sink, func(d *gitserver.Deps) { records.Records, d.Records = d.Records, records })
 	w.addFork(t)
 	// The fork's own stored document says the opposite of its parent's in
 	// each row, so that only the parent's can decide.
 	for _, row := range []struct {
-		parent bool
-		want   int
-	}{{true, 1}, {false, 0}} {
-		t.Run(fmt.Sprintf("parent audits %v", row.parent), func(t *testing.T) {
+		name           string
+		parent, orphan bool
+		want           int
+	}{{"parent audits", true, false, 1}, {"parent does not audit", false, false, 0}, {"parent not found", false, true, 0}} {
+		t.Run(row.name, func(t *testing.T) {
 			w.auditFetches(t, row.parent)
 			doc, _ := json.Marshal(map[string]bool{"audit_fetches": !row.parent})
 			w.set(t, "demo--t1", "settings", string(doc))
+			records.orphan.Store(row.orphan)
+			defer records.orphan.Store(false)
 			sink.clear()
-			if out, err := clientGit(t, t.TempDir(), nil, "clone", "--no-checkout", w.remote(w.memberKey, "acme/demo--t1.git"), "d"); err != nil {
-				t.Fatalf("git clone of the fork: %v\n%s", err, out)
-			}
+			runGit(t, t.TempDir(), "clone", "--no-checkout", w.remote(w.memberKey, "acme/demo--t1.git"), "d")
 			events := sink.fetches()
 			if len(events) != row.want {
 				t.Fatalf("%d parley.git.fetch events, want %d: %+v", len(events), row.want, events)
@@ -203,16 +212,8 @@ func TestEvent_RecordsNoFetchThatSendsNoPackOrIsNotAudited(t *testing.T) {
 	}{
 		{"ls-remote", w, sink, nil, func(t *testing.T, _ string) { lsRemote(t, w.remote(w.ownerKey, "acme/demo.git")) }},
 		{"fetch in an up-to-date clone", w, sink,
-			func(t *testing.T, dir string) {
-				if err := w.clone(t, dir, "2", w.ownerKey); err != nil {
-					t.Fatal(err)
-				}
-			},
-			func(t *testing.T, dir string) {
-				if out, err := clientGit(t, filepath.Join(dir, "d"), nil, "fetch", "origin"); err != nil {
-					t.Fatalf("git fetch: %v\n%s", err, out)
-				}
-			}},
+			func(t *testing.T, dir string) { w.clone(t, dir, "2", w.ownerKey) },
+			func(t *testing.T, dir string) { runGit(t, filepath.Join(dir, "d"), "fetch", "origin") }},
 		{"refused fetch", w, sink, nil, send(basic("x", w.strangerKey), fetchRequest(w.head), http.StatusNotFound)},
 		{"fetch answered with an ERR packet", w, sink, nil, send(basic("x", w.ownerKey), "", http.StatusOK)},
 		{"clone with audit_fetches false", w, sink,
@@ -220,17 +221,9 @@ func TestEvent_RecordsNoFetchThatSendsNoPackOrIsNotAudited(t *testing.T) {
 				w.auditFetches(t, false)
 				t.Cleanup(func() { w.auditFetches(t, true) })
 			},
-			func(t *testing.T, dir string) {
-				if err := w.clone(t, dir, "2", w.ownerKey); err != nil {
-					t.Fatal(err)
-				}
-			}},
+			func(t *testing.T, dir string) { w.clone(t, dir, "2", w.ownerKey) }},
 		{"clone with no audit_fetches key registered", unregistered, unregisteredSink, nil,
-			func(t *testing.T, dir string) {
-				if err := unregistered.clone(t, dir, "2", unregistered.ownerKey); err != nil {
-					t.Fatal(err)
-				}
-			}},
+			func(t *testing.T, dir string) { unregistered.clone(t, dir, "2", unregistered.ownerKey) }},
 	}
 	for _, row := range rows {
 		t.Run(row.name, func(t *testing.T) {
@@ -267,9 +260,7 @@ func TestEvent_CompletesAnAuditedFetchWhateverBecomesOfItsEvent(t *testing.T) {
 			served := gitserver.RequestLabels{Service: gitserver.LabelUploadPack, Result: gitserver.ResultOK}
 			before := w.git.Requests()
 			dir := t.TempDir()
-			if err := w.clone(t, dir, "0", w.ownerKey); err != nil {
-				t.Fatal(err)
-			}
+			w.clone(t, dir, "0", w.ownerKey)
 			if head, _ := clientGit(t, filepath.Join(dir, "d"), nil, "rev-parse", "HEAD"); strings.TrimSpace(head) != w.head {
 				t.Errorf("HEAD of the clone = %s, want %s", head, w.head)
 			}

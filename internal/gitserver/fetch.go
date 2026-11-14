@@ -26,10 +26,11 @@ const (
 	DefaultTimeout = 30 * time.Minute
 )
 
-// Register registers [git].timeout with r: how long one run of upload-pack
-// may take, a duration with a unit of s, m, h or d above zero (default
-// 30m). A value that breaks the rule fails the load with an error naming
-// the key, which stops the start.
+// Register registers [git].timeout with r: how long one git request may
+// take, a task fork's ref copy and the run of upload-pack together, a
+// duration with a unit of s, m, h or d above zero (default 30m). A value
+// that breaks the rule fails the load with an error naming the key, which
+// stops the start.
 func Register(r *config.Registry) error {
 	return r.Register(config.Key{Section: SectionName, Name: "timeout", Type: config.String, Default: "30m", Validate: validTimeout})
 }
@@ -72,6 +73,9 @@ const (
 	errEmptyRequest = "empty request"
 	errInvalidGzip  = "invalid gzip body"
 	errTimedOut     = "request timed out"
+	// errTooLarge answers a version 2 request larger than the hub keeps
+	// for its want check (gitrepo.DefaultMaxRequest).
+	errTooLarge = "request too large"
 	// errGitFailed, after the name of git's command, upload-pack or
 	// receive-pack, stands for git's text when git failed without one.
 	errGitFailed = " failed"
@@ -164,14 +168,15 @@ func (c *Component) fetch(w http.ResponseWriter, r *http.Request, x Exchange) Re
 }
 
 // run runs git with serve, the runner's upload-pack or receive-pack, for
-// req, its answer written to out, bounded by the timeout, and returns ok
+// req, its answer written to out, bounded by the request's deadline, which
+// a fork's ref copy has already used of, and returns ok
 // when git succeeded and error when it did not. When git fails or runs out
 // of time before any pack data went out, and git wrote no error packet of
 // its own, the answer ends with an ERR packet that says why: the hub's text
 // for the timeout, git's own for a request git refused. A client that went
 // away is told nothing.
 func (c *Component) run(r *http.Request, x Exchange, out *stream, serve func(context.Context, gitrepo.ServeRequest) error, req gitrepo.ServeRequest) Result {
-	ctx, cancel := context.WithTimeout(r.Context(), c.timeout())
+	ctx, cancel := context.WithDeadline(r.Context(), x.deadline)
 	defer cancel()
 	req.Stdout = out
 	err := serve(ctx, req)
@@ -197,7 +202,7 @@ func (c *Component) run(r *http.Request, x Exchange, out *stream, serve func(con
 	return ResultError
 }
 
-// timeout is how long one run of upload-pack may take.
+// timeout is how long one git request may take.
 func (c *Component) timeout() time.Duration {
 	if c.deps.Timeout <= 0 {
 		return DefaultTimeout
@@ -208,12 +213,18 @@ func (c *Component) timeout() time.Duration {
 // gitText is the text of the ERR packet for err, a failure of git: the
 // last line git wrote to its standard error, without git's fatal: or
 // error: prefix and with the repository's place on disk left out, which is
-// no business of the client's; or, when git wrote nothing, that the
-// command of service failed.
+// no business of the client's; that the command of service failed when git
+// wrote nothing, or when the line names another place on disk, such as the
+// object directory of a fork's parent; and the hub's own text for a request
+// refused before git ran because it is too large.
 func gitText(err error, service, repo string) string {
+	failed := strings.TrimPrefix(service, "git-") + errGitFailed
 	var se *gitrepo.ServeError
-	if !errors.As(err, &se) || se.Stderr == "" {
-		return strings.TrimPrefix(service, "git-") + errGitFailed
+	switch {
+	case errors.Is(err, gitrepo.ErrRequestTooLarge):
+		return errTooLarge
+	case !errors.As(err, &se) || se.Stderr == "":
+		return failed
 	}
 	line := se.Stderr[strings.LastIndexByte(se.Stderr, '\n')+1:]
 	for _, prefix := range []string{"fatal: ", "error: "} {
@@ -222,7 +233,22 @@ func gitText(err error, service, repo string) string {
 	if repo != "" {
 		line = strings.ReplaceAll(line, repo, "repository")
 	}
+	if namesAbsolutePath(line) {
+		return failed
+	}
 	return line
+}
+
+// namesAbsolutePath reports whether line holds an absolute path: a slash
+// that starts the line or follows a space, a quote or a parenthesis. A ref
+// name, such as refs/heads/main, is no such path.
+func namesAbsolutePath(line string) bool {
+	for i := range len(line) {
+		if line[i] == '/' && (i == 0 || strings.IndexByte(" \t'\"`(", line[i-1]) >= 0) {
+			return true
+		}
+	}
+	return false
 }
 
 // protocol2 reports whether the Git-Protocol header asks for protocol

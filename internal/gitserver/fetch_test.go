@@ -136,9 +136,7 @@ func TestFetch_SendsTheHistoryAShallowFetchAsksFor(t *testing.T) {
 					if i == 0 {
 						in = dir
 					}
-					if out, err := clientGit(t, in, nil, append([]string{"-c", "protocol.version=" + version}, s.args...)...); err != nil {
-						t.Fatalf("git %s: %v\n%s", s.args[0], err, out)
-					}
+					runGit(t, in, append([]string{"-c", "protocol.version=" + version}, s.args...)...)
 					if got, _ := clientGit(t, d, nil, "rev-list", "--count", "HEAD"); strings.TrimSpace(got) != strconv.Itoa(s.commits) {
 						t.Fatalf("after git %s %s the clone holds %s commits, want %d", s.args[0], s.args[1], strings.TrimSpace(got), s.commits)
 					}
@@ -158,9 +156,7 @@ func TestFetch_SendsOnlyTheObjectsAClientLacks(t *testing.T) {
 	dir := t.TempDir()
 	versions := []string{"0", "2"}
 	for _, v := range versions {
-		if out, err := clientGit(t, dir, nil, "-c", "protocol.version="+v, "clone", w.remote(w.ownerKey, "acme/demo.git"), "d"+v); err != nil {
-			t.Fatalf("git clone: %v\n%s", err, out)
-		}
+		runGit(t, dir, "-c", "protocol.version="+v, "clone", w.remote(w.ownerKey, "acme/demo.git"), "d"+v)
 	}
 	stream := "commit refs/heads/main\ncommitter P <p@example.invalid> now\ndata 6\nthird\nfrom refs/heads/main^0\nM 100644 inline README\ndata 2\n3\n"
 	if _, err := gitrepotest.Run(w.repo, stream, "fast-import", "--quiet", "--date-format=now"); err != nil {
@@ -169,10 +165,7 @@ func TestFetch_SendsOnlyTheObjectsAClientLacks(t *testing.T) {
 	head := gitrepotest.Refs(t, w.repo, "refs/heads/")["main"]
 	for _, v := range versions {
 		d := filepath.Join(dir, "d"+v)
-		out, err := clientGit(t, d, nil, "-c", "protocol.version="+v, "fetch", "--progress", "origin")
-		if err != nil {
-			t.Fatalf("protocol %s: git fetch: %v\n%s", v, err, out)
-		}
+		out := runGit(t, d, "-c", "protocol.version="+v, "fetch", "--progress", "origin")
 		if got, _ := clientGit(t, d, nil, "rev-parse", "origin/main"); strings.TrimSpace(got) != head {
 			t.Errorf("protocol %s: origin/main = %s, want %s", v, got, head)
 		}

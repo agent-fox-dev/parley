@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -158,16 +159,8 @@ func TestPush_HandsTheCheckedPushToTheProcessorWithTheCallerAndTheWholeBody(t *t
 			got := processor.calls[i]
 			pat := got.caller.PAT
 			got.caller.PAT = nil
-			if got.caller.Binding == nil || c.want.Binding == nil {
-				if got.caller.Binding != c.want.Binding {
-					t.Errorf("binding = %+v, want %+v", got.caller.Binding, c.want.Binding)
-				}
-			} else if *got.caller.Binding != *c.want.Binding {
-				t.Errorf("binding = %+v, want %+v", *got.caller.Binding, *c.want.Binding)
-			}
-			got.caller.Binding, c.want.Binding = nil, nil
-			if got.caller != c.want {
-				t.Errorf("caller = %+v, want %+v", got.caller, c.want)
+			if !reflect.DeepEqual(got.caller, c.want) {
+				t.Errorf("caller = %+v binding %+v, want %+v binding %+v", got.caller, got.caller.Binding, c.want, c.want.Binding)
 			}
 			if wantPAT := c.want.CredentialType == "pat"; (pat != nil) != wantPAT || (pat != nil && (pat.CredentialID != c.want.CredentialID || !slices.Equal(pat.Paths, c.paths))) {
 				t.Errorf("PAT record = %+v, want the PAT %s with paths %q, or none for another credential", pat, c.want.CredentialID, c.paths)
@@ -188,13 +181,9 @@ func TestPush_RefusesAndChangesNothingWithoutAProcessor(t *testing.T) {
 	before := gitrepotest.Git(t, w.repo, "for-each-ref")
 	dir := t.TempDir()
 	remote := w.remote(w.ownerKey, "acme/demo.git")
-	if out, err := clientGit(t, dir, nil, "clone", "--quiet", remote, "c"); err != nil {
-		t.Fatalf("git clone: %v\n%s", err, out)
-	}
+	runGit(t, dir, "clone", "--quiet", remote, "c")
 	clone := dir + "/c"
-	if out, err := clientGit(t, clone, nil, "-c", "user.name=P", "-c", "user.email=p@example.invalid", "commit", "--allow-empty", "-m", "new"); err != nil {
-		t.Fatalf("git commit: %v\n%s", err, out)
-	}
+	runGit(t, clone, "-c", "user.name=P", "-c", "user.email=p@example.invalid", "commit", "--allow-empty", "-m", "new")
 	if out, err := clientGit(t, clone, nil, "push", remote, "HEAD:refs/heads/new"); err == nil {
 		t.Errorf("git push = success, want a failure\n%s", out)
 	}

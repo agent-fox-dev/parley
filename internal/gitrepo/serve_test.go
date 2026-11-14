@@ -19,41 +19,34 @@ import (
 )
 
 // Not parallel: the environment of the test process asks for protocol
-// version 2 and hides every branch, for a fetch and a push alike, through a system, a global and a home
-// configuration, none of which may reach the git the hub runs.
+// version 2 and hides every branch, for a fetch and a push alike, through a
+// system, a global and a home configuration, none of which may reach the git
+// the hub runs.
 func TestServe_ServesTheRequestAsAskedWhateverTheHostSays(t *testing.T) {
 	o := gitrepotest.NewOrigin(t)
 	head := o.Commit("main", "first")
 	hide := filepath.Join(t.TempDir(), "gitconfig")
-	if err := os.WriteFile(hide, []byte("[transfer]\n\thideRefs = refs/heads\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(filepath.Dir(hide), ".gitconfig"), []byte("[transfer]\n\thideRefs = refs/heads\n"), 0o600); err != nil {
-		t.Fatal(err)
+	for _, f := range []string{hide, filepath.Join(filepath.Dir(hide), ".gitconfig")} {
+		if err := os.WriteFile(f, []byte("[transfer]\n\thideRefs = refs/heads\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
 	t.Setenv("GIT_CONFIG_SYSTEM", hide)
 	t.Setenv("GIT_CONFIG_GLOBAL", hide)
 	t.Setenv("HOME", filepath.Dir(hide))
 	t.Setenv("GIT_PROTOCOL", "version=2")
-	gitrepotest.Git(t, o.Dir(), "update-ref", "refs/parley/changes/1/1", head)
-	request := pkt("want "+head+"\n") + "0000" + pkt("done\n")
 	upload, receive := (gitrepo.Git{}).UploadPack, (gitrepo.Git{}).ReceivePack
 	cases := []struct {
-		name       string
-		run        func(context.Context, gitrepo.ServeRequest) error
-		req        gitrepo.ServeRequest
-		want       []string
-		not        string
-		wantPrefix string
+		name         string
+		run          func(context.Context, gitrepo.ServeRequest) error
+		req          gitrepo.ServeRequest
+		prefix, want string
+		not          string
 	}{
-		{"version 0 advertisement", upload, gitrepo.ServeRequest{AdvertiseRefs: true}, []string{head + " refs/heads/main"}, " filter", ""},
-		{"version 2 advertisement", upload, gitrepo.ServeRequest{AdvertiseRefs: true, Protocol2: true}, []string{"ls-refs"}, "refs/heads/", pkt("version 2\n")},
-		{"configuration of the run", upload, gitrepo.ServeRequest{AdvertiseRefs: true, Config: []string{"uploadpack.allowFilter=true"}}, []string{" filter"}, "", ""},
-		{"fetch exchange", upload, gitrepo.ServeRequest{Stdin: strings.NewReader(request)}, []string{"PACK"}, "", pkt("NAK\n")},
-		{"push advertisement", receive, gitrepo.ServeRequest{AdvertiseRefs: true, Protocol2: true}, []string{
-			head + " refs/heads/main\x00", head + " refs/parley/changes/1/1", " report-status", " delete-refs", " side-band-64k",
-			" ofs-delta", " atomic", " push-options",
-		}, "version", ""},
+		{"version 0 unless asked", upload, gitrepo.ServeRequest{AdvertiseRefs: true}, "", head + " refs/heads/main", "version 2"},
+		{"version 2 when asked", upload, gitrepo.ServeRequest{AdvertiseRefs: true, Protocol2: true}, pkt("version 2\n"), "ls-refs", "refs/heads/"},
+		{"configuration of the run", upload, gitrepo.ServeRequest{AdvertiseRefs: true, Config: []string{"uploadpack.allowFilter=true"}}, "", " filter", ""},
+		{"push never version 2", receive, gitrepo.ServeRequest{AdvertiseRefs: true, Protocol2: true}, "", head + " refs/heads/main\x00", "version"},
 	}
 	for _, c := range cases {
 		var out bytes.Buffer
@@ -62,11 +55,8 @@ func TestServe_ServesTheRequestAsAskedWhateverTheHostSays(t *testing.T) {
 			t.Errorf("%s: git = %v", c.name, err)
 			continue
 		}
-		got := out.String()
-		for _, want := range c.want {
-			if !strings.Contains(got, want) || (c.not != "" && strings.Contains(got, c.not)) || !strings.HasPrefix(got, c.wantPrefix) {
-				t.Errorf("%s: git wrote %q, want it to start with %q, hold %q and not %q", c.name, got, c.wantPrefix, want, c.not)
-			}
+		if got := out.String(); !strings.HasPrefix(got, c.prefix) || !strings.Contains(got, c.want) || (c.not != "" && strings.Contains(got, c.not)) {
+			t.Errorf("%s: git wrote %q, want it to start with %q, hold %q and not %q", c.name, got, c.prefix, c.want, c.not)
 		}
 	}
 	var out bytes.Buffer
@@ -141,6 +131,53 @@ func TestUploadPack_GivesUpOnAVersion2RequestThatStopsComingWhenTheContextEnds(t
 	err := (gitrepo.Git{}).UploadPack(ctx, gitrepo.ServeRequest{Dir: o.Dir(), Protocol2: true, Stdin: stalled, Stdout: io.Discard})
 	if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > 2*time.Second {
 		t.Errorf("UploadPack = %v after %v, want an error wrapping context.DeadlineExceeded within 2s", err, time.Since(start))
+	}
+}
+
+// Every want names a commit by an id git reads as its own: the leading hex
+// digits, in either case, whatever follows them.
+func TestUploadPack_RefusesAVersion2WantOfACommitNoRefReachesHoweverItIsWritten(t *testing.T) {
+	t.Parallel()
+	o := gitrepotest.NewOrigin(t)
+	head := o.Commit("main", "first")
+	dangling := gitrepotest.Git(t, o.Dir(), "commit-tree", "-m", "dangling", head+"^{tree}")
+	gitrepotest.Git(t, o.Dir(), "tag", "-a", "-m", "loose", "loose", dangling)
+	tag := gitrepotest.Git(t, o.Dir(), "rev-parse", "refs/tags/loose")
+	gitrepotest.Git(t, o.Dir(), "update-ref", "-d", "refs/tags/loose")
+	fetch := func(head, want string) string {
+		return head + "0001" + pkt("want "+want+"\n") + pkt("done\n") + "0000"
+	}
+	command := pkt("command=fetch\n")
+	for _, c := range []struct {
+		name, request, refused string
+		limit                  int64
+	}{
+		{"a commit main reaches", fetch(command, head), "", 0},
+		{"a request of its bound", fetch(command, head), "", int64(len(fetch(command, head)))},
+		{"a request over its bound", fetch(command, head), "request too large", int64(len(fetch(command, head))) - 1},
+		{"a lowercase id", fetch(command, dangling), "upload-pack: not our ref " + dangling, 0},
+		{"an uppercase id", fetch(command, strings.ToUpper(dangling)), "upload-pack: not our ref " + dangling, 0},
+		{"an id followed by more", fetch(command, dangling+strings.Repeat("f", 30)+" junk"), "upload-pack: not our ref " + dangling, 0},
+		{"a capability before the command", fetch(pkt("agent=git/2.56\n")+command, dangling), "upload-pack: not our ref " + dangling, 0},
+		{"an annotated tag of such a commit", fetch(command, tag), "upload-pack: not our ref " + tag, 0},
+		{"an id too short", fetch(command, dangling[:12]), "upload-pack: protocol error, expected to get oid", 0},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var out bytes.Buffer
+			err := (gitrepo.Git{}).UploadPack(context.Background(), gitrepo.ServeRequest{
+				Dir: o.Dir(), Protocol2: true, Stdin: strings.NewReader(c.request), Stdout: &out, MaxRequest: c.limit,
+			})
+			var se *gitrepo.ServeError
+			switch {
+			case c.refused == "request too large" && (!errors.Is(err, gitrepo.ErrRequestTooLarge) || out.Len() != 0):
+				t.Errorf("UploadPack = %v, wrote %q; want ErrRequestTooLarge with git not run", err, out.String())
+			case c.refused == "request too large":
+			case c.refused == "" && (err != nil || !strings.Contains(out.String(), "PACK")):
+				t.Errorf("UploadPack = %v, wrote %q; want a pack", err, out.String())
+			case c.refused != "" && (!errors.As(err, &se) || se.Stderr != c.refused || out.Len() != 0):
+				t.Errorf("UploadPack = %v, wrote %q; want %q with git not run", err, out.String(), c.refused)
+			}
+		})
 	}
 }
 

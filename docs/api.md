@@ -561,7 +561,8 @@ Outside `/api/v1`, the hub speaks git smart HTTP on three routes:
 
 Any other path or method under `/git` gets the general `404 not_found` or
 `405 method_not_allowed` envelope of [Routes and matching](#routes-and-matching),
-before any credential is read. The git routes pass none of the REST API's
+before any credential is read; that includes `HEAD` on ref discovery, which
+gets `405` with `Allow: GET`, is not counted and never runs git. The git routes pass none of the REST API's
 checks: no JSON body, no body limit, no content-type rule, no error envelope.
 A git request passes these checks in this order, and the first that refuses
 answers it with an HTTP status and a body of one line of text, sent with
@@ -607,7 +608,8 @@ answers it with an HTTP status and a body of one line of text, sent with
    `token lacks scope git:write`, before the repository is looked at, so the
    answer is the same for a repository that exists and one that does not. An
    API key and the admin token carry no scopes and skip this check; the
-   `paths` of a PAT are never read on git.
+   `paths` of a PAT are never read on the fetch side (the push processor
+   receives them).
 5. The repository and the caller's access to it, by the
    [workspace access rule](#workspace-access): a push needs write access,
    every other request read access. The repository segment must end in
@@ -653,8 +655,11 @@ body `internal error`, nothing of the cause in it, and written to the hub's
 log with the request id, the route's pattern and the repository segment.
 
 A fetch that passed every check is served by `git upload-pack` on the
-workspace's repository, as stock git expects it; a request body of any size
-and any `Content-Type` is taken. The `paths` of a PAT are not read.
+workspace's repository, as stock git expects it; a request body of any
+`Content-Type` is taken, with no limit of the REST API: a version 0 body of
+any size is streamed to git, and a version 2 body, which the hub reads
+whole before git runs, up to 16 MiB, far above any request stock git sends.
+The `paths` of a PAT are not read.
 
 - `GET …/info/refs?service=git-upload-pack` answers `200` with
   `Content-Type: application/x-git-upload-pack-advertisement` and
@@ -691,9 +696,11 @@ protocol versions:
   `tree:<depth>`, and the fetch by id of an object the filter left out
   (git does that on its own, at checkout). Every other filter kind
   (`object:type`, `sparse:oid`, `combine`, …) is refused.
-- A commit by its object id, when a ref reaches it. A commit no ref reaches
-  is refused under both versions; a tree or a blob is sent by its id, as git
-  does under version 0 (see
+- A commit by its object id, when a ref reaches it. A commit no ref reaches,
+  or an annotated tag of one, is refused under both versions, however the
+  want writes its id (git reads the leading 40 or 64 hexadecimal digits, in
+  either case, and ignores what follows); a tree or a blob is sent by its
+  id, as git does under version 0 (see
   [errata/17_git_smart_http.md](errata/17_git_smart_http.md)).
 
 Once the answer has begun, an error is reported in band, as one pkt-line
@@ -703,10 +710,12 @@ starting with `ERR `, and no pack follows it:
 |---|---|
 | the request body is empty | `ERR empty request` |
 | `Content-Encoding` is `gzip` but the body is not valid gzip | `ERR invalid gzip body` |
-| git refuses the request | `ERR ` and git's own text, the last line of its error output without `fatal: ` |
+| git refuses the request | `ERR ` and git's own text, the last line of its error output without `fatal: `; `ERR upload-pack failed` when git wrote none or that line names a place on the hub's disk |
 | a filter other than `blob:none`, `blob:limit` and `tree` | git's `ERR filter '<kind>' not supported` |
 | a want of a commit no ref reaches | `ERR upload-pack: not our ref <id>` |
-| the run of git takes longer than `[git].timeout` (see [configuration.md](configuration.md)) | `ERR request timed out` |
+| a version 2 want whose id git cannot read (fewer than 40 hexadecimal digits) | `ERR upload-pack: protocol error, expected to get oid` |
+| a version 2 request body larger than 16 MiB (after gzip decompression) | `ERR request too large` |
+| the request, a task fork's ref copy and the run of git together, takes longer than `[git].timeout` (see [configuration.md](configuration.md)) | `ERR request timed out` |
 
 On a timeout git is killed and the answer ends; the `ERR` pkt-line is
 written only when no pack data had been sent yet, and the client's git

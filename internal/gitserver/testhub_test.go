@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
@@ -219,18 +220,19 @@ func (w *world) set(t *testing.T, slug, column, value string) {
 
 // gitRequest is one of the four requests git sends: ref discovery for a
 // fetch, the fetch exchange, ref discovery for a push and the push
-// exchange.
+// exchange; label is the service the request counter counts it under.
 type gitRequest struct {
 	name, method, suffix string
 	push                 bool
+	label                string
 }
 
 // gitRequests are the four requests, the three routes among them.
 var gitRequests = []gitRequest{
-	{"fetch refs", http.MethodGet, "/info/refs?service=git-upload-pack", false},
-	{"fetch", http.MethodPost, "/git-upload-pack", false},
-	{"push refs", http.MethodGet, "/info/refs?service=git-receive-pack", true},
-	{"push", http.MethodPost, "/git-receive-pack", true},
+	{"fetch refs", http.MethodGet, "/info/refs?service=git-upload-pack", false, gitserver.LabelInfoRefs},
+	{"fetch", http.MethodPost, "/git-upload-pack", false, gitserver.LabelUploadPack},
+	{"push refs", http.MethodGet, "/info/refs?service=git-receive-pack", true, gitserver.LabelInfoRefs},
+	{"push", http.MethodPost, "/git-receive-pack", true, gitserver.LabelReceivePack},
 }
 
 // to is the path of the request for the repository segment pair repo, such
@@ -249,14 +251,10 @@ type answer struct {
 func (a answer) dump() string {
 	var b strings.Builder
 	b.WriteString(http.StatusText(a.status) + "\n")
-	for _, k := range slices.Sorted(func(yield func(string) bool) {
-		for k := range a.header {
-			if k != "Date" && !yield(k) {
-				return
-			}
+	for _, k := range slices.Sorted(maps.Keys(a.header)) {
+		if k != "Date" {
+			b.WriteString(k + ": " + strings.Join(a.header[k], ",") + "\n")
 		}
-	}) {
-		b.WriteString(k + ": " + strings.Join(a.header[k], ",") + "\n")
 	}
 	return b.String() + a.body
 }
@@ -549,18 +547,32 @@ func (f *fakeForkView) questions() int {
 	return f.asked
 }
 
-// lsRemote maps every ref stock git lists for remote to its id.
-func lsRemote(t *testing.T, remote string) map[string]string {
+// lsRemote maps every ref stock git lists for remote, run with gitArgs
+// before ls-remote, to its id, and each symbolic ref, such as HEAD, as
+// "symref HEAD", to the ref it names.
+func lsRemote(t *testing.T, remote string, gitArgs ...string) map[string]string {
 	t.Helper()
-	out, err := clientGit(t, t.TempDir(), nil, "ls-remote", remote)
-	if err != nil {
-		t.Fatalf("git ls-remote: %v\n%s", err, out)
-	}
+	out := runGit(t, t.TempDir(), append(slices.Clone(gitArgs), "ls-remote", "--symref", remote)...)
 	refs := map[string]string{}
 	for line := range strings.Lines(out) {
 		if id, name, ok := strings.Cut(strings.TrimSpace(line), "\t"); ok {
-			refs[name] = id
+			if target, symref := strings.CutPrefix(id, "ref: "); symref {
+				refs["symref "+name] = target
+			} else {
+				refs[name] = id
+			}
 		}
 	}
 	return refs
+}
+
+// runGit is clientGit without an environment of its own, failing the test
+// when git fails, and returns git's output.
+func runGit(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	out, err := clientGit(t, dir, nil, args...)
+	if err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	return out
 }

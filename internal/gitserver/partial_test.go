@@ -42,13 +42,8 @@ func TestPartial_LeavesOutWhatTheFilterExcludesAndSendsItOnDemand(t *testing.T) 
 				dir := t.TempDir()
 				d := filepath.Join(dir, "d")
 				v := []string{"-c", "protocol.version=" + version}
-				if out, err := clientGit(t, dir, nil, append(v, "clone", "--no-checkout", "--filter="+c.filter, w.remote(w.ownerKey, "acme/demo.git"), "d")...); err != nil {
-					t.Fatalf("git clone: %v\n%s", err, out)
-				}
-				out, err := clientGit(t, d, nil, "rev-list", "--objects", "--missing=print", "HEAD")
-				if err != nil {
-					t.Fatalf("git rev-list: %v\n%s", err, out)
-				}
+				runGit(t, dir, append(v, "clone", "--no-checkout", "--filter="+c.filter, w.remote(w.ownerKey, "acme/demo.git"), "d")...)
+				out := runGit(t, d, "rev-list", "--objects", "--missing=print", "HEAD")
 				var lacks int
 				for line := range strings.Lines(out) {
 					id, _, _ := strings.Cut(strings.TrimSpace(line), " ")
@@ -63,9 +58,7 @@ func TestPartial_LeavesOutWhatTheFilterExcludesAndSendsItOnDemand(t *testing.T) 
 				if lacks == 0 {
 					t.Errorf("the clone lacks no object:\n%s", out)
 				}
-				if out, err := clientGit(t, d, nil, append(v, "checkout", "--quiet", "main")...); err != nil {
-					t.Fatalf("git checkout main: %v\n%s", err, out)
-				}
+				runGit(t, d, append(v, "checkout", "--quiet", "main")...)
 				if got, err := os.ReadFile(filepath.Join(d, "big.bin")); err != nil || sha256.Sum256(got) != h.bigSum {
 					t.Errorf("big.bin of the checkout (%v) is not the content committed", err)
 				}

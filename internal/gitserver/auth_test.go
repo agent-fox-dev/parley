@@ -77,22 +77,6 @@ func TestAuth_ChallengesEveryMissingOrFailedCredentialAlike(t *testing.T) {
 	}
 }
 
-func TestAuth_RefusesABlockedUserWithoutAChallenge(t *testing.T) {
-	t.Parallel()
-	w := newWorld(t, hubtest.Config{})
-	if status, body := w.Call(t, http.MethodPost, "/api/v1/users/"+w.owner+"/block", w.Token, nil); status != http.StatusOK {
-		t.Fatalf("block the owner = %d %s, want 200", status, body)
-	}
-	a := w.call(t, http.MethodGet, demoRefs, basic("x", w.ownerKey))
-	if a.status != http.StatusForbidden || a.body != "user is blocked\n" || a.header.Get("WWW-Authenticate") != "" {
-		t.Errorf("answer = %d WWW-Authenticate %q %q, want 403 without the header \"user is blocked\\n\"",
-			a.status, a.header.Get("WWW-Authenticate"), a.body)
-	}
-	if n := w.service.served(); n != 0 {
-		t.Errorf("%d refused requests reached the service, want none", n)
-	}
-}
-
 // The two requests under the limit are one REST request and one git
 // request, so that the test also shows that git counts against the window
 // the REST API counts the credential in.

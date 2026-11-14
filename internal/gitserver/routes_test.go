@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"net/http"
 	"slices"
 	"strings"
@@ -39,6 +40,24 @@ func TestRoutes_RefusesRefDiscoveryWithoutAValidService(t *testing.T) {
 	}
 }
 
+// DELETE gets the server's own answer to a method no route of the path has,
+// which HEAD, a method the router serves with a GET route, is to match.
+func TestRoutes_AnswersHEADAsAnyOtherMethodBeforeAnyCheck(t *testing.T) {
+	t.Parallel()
+	w := newGitWorld(t, hubtest.Config{})
+	before := w.git.Requests()
+	for _, auth := range []string{"", basic("x", w.ownerKey)} {
+		other := w.call(t, http.MethodDelete, demoRefs, auth)
+		a := w.call(t, http.MethodHead, demoRefs, auth)
+		if a.status != http.StatusMethodNotAllowed || a.header.Get("Allow") != "GET" || a.dump() != strings.TrimSuffix(other.dump(), other.body) {
+			t.Errorf("HEAD =\n%s\nwant DELETE's answer without its body:\n%s", a.dump(), other.dump())
+		}
+	}
+	if got := grown(before, w.git.Requests()); len(got) != 0 || w.runs.n.Load() != 0 {
+		t.Errorf("HEAD was counted %v and ran git %d times, want neither", got, w.runs.n.Load())
+	}
+}
+
 // The REST body limit is 1KB on this hub.
 func TestRoutes_TakesAGitBodyBeyondTheRESTLimits(t *testing.T) {
 	t.Parallel()
@@ -60,7 +79,8 @@ func TestRoutes_TakesAGitBodyBeyondTheRESTLimits(t *testing.T) {
 // The hub admits one request a minute per key, and each row starts a new
 // window, so that the row over the limit, which sends its request twice,
 // is the only one refused for it. The workspace empty is ready and has no
-// repository on disk.
+// repository on disk. Each row's request is counted once, by its route and
+// its result.
 func TestRoutes_AnswersEveryEarlyRefusalWithOneLineOfText(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t, hubtest.Config{TOML: "[limits]\nrequests_per_minute = 1"})
@@ -72,6 +92,7 @@ func TestRoutes_AnswersEveryEarlyRefusalWithOneLineOfText(t *testing.T) {
 		t.Fatalf("block the user = %d %s, want 200", status, body)
 	}
 	noGit, _ := w.pat(t, w.owner, "", "changes:read")
+	const refused, failed = gitserver.ResultRefused, gitserver.ResultError
 	rows := []struct {
 		name, auth string
 		request    gitRequest
@@ -80,23 +101,24 @@ func TestRoutes_AnswersEveryEarlyRefusalWithOneLineOfText(t *testing.T) {
 		twice      bool
 		status     int
 		message    string
+		result     gitserver.Result
 	}{
-		{"no credential", "", gitRequests[0], "acme/demo.git", "", false, http.StatusUnauthorized, "authentication required"},
-		{"blocked user", basic("x", blockedKey), gitRequests[0], "acme/demo.git", "", false, http.StatusForbidden, "user is blocked"},
-		{"over the limit", basic("x", w.ownerKey), gitRequests[0], "acme/demo.git", "", true, http.StatusTooManyRequests, "rate limit exceeded"},
-		{"unknown repository", basic("x", w.ownerKey), gitRequests[0], "acme/nosuch.git", "", false, http.StatusNotFound, "repository not found"},
-		{"pat without git:read", basic("x", noGit), gitRequests[1], "acme/demo.git", "", false, http.StatusForbidden, "token lacks scope git:read"},
-		{"pat without git:write", basic("x", w.ownerPAT), gitRequests[3], "acme/demo.git", "", false, http.StatusForbidden, "token lacks scope git:write"},
-		{"member pushes", basic("x", w.memberKey), gitRequests[3], "acme/demo.git", "", false, http.StatusForbidden, msgReadOnly[:len(msgReadOnly)-1]},
-		{"invalid service", basic("x", w.ownerKey), gitRequest{"refs", http.MethodGet, "/info/refs?service=git-archive", false}, "acme/demo.git", "", false,
-			http.StatusBadRequest, "invalid or missing service parameter"},
-		{"workspace not ready", basic("x", w.ownerKey), gitRequests[0], "acme/demo.git", access.StatusFailed, false, http.StatusConflict,
-			"repository not available: workspace is failed"},
+		{"no credential", "", gitRequests[0], "acme/demo.git", "", false, http.StatusUnauthorized, "authentication required", refused},
+		{"blocked user", basic("x", blockedKey), gitRequests[0], "acme/demo.git", "", false, http.StatusForbidden, "user is blocked", refused},
+		{"over the limit", basic("x", w.ownerKey), gitRequests[0], "acme/demo.git", "", true, http.StatusTooManyRequests, "rate limit exceeded", failed},
+		{"unknown repository", basic("x", w.ownerKey), gitRequests[1], "acme/nosuch.git", "", false, http.StatusNotFound, "repository not found", refused},
+		{"pat without git:read", basic("x", noGit), gitRequests[1], "acme/demo.git", "", false, http.StatusForbidden, "token lacks scope git:read", refused},
+		{"pat without git:write", basic("x", w.ownerPAT), gitRequests[3], "acme/demo.git", "", false, http.StatusForbidden, "token lacks scope git:write", refused},
+		{"member pushes", basic("x", w.memberKey), gitRequests[3], "acme/demo.git", "", false, http.StatusForbidden, msgReadOnly[:len(msgReadOnly)-1], refused},
+		{"invalid service", basic("x", w.ownerKey), gitRequest{"refs", http.MethodGet, "/info/refs?service=git-archive", false, gitserver.LabelInfoRefs}, "acme/demo.git", "", false,
+			http.StatusBadRequest, "invalid or missing service parameter", failed},
+		{"workspace not ready", basic("x", w.ownerKey), gitRequests[1], "acme/demo.git", access.StatusFailed, false, http.StatusConflict,
+			"repository not available: workspace is failed", failed},
 		{"parent busy", basic("x", w.memberKey), gitRequests[1], "acme/demo--t1.git", access.StatusCloning, false, http.StatusConflict,
-			"repository not available: parent workspace is busy"},
+			"repository not available: parent workspace is busy", failed},
 		{"parent archived", basic("x", w.memberKey), gitRequests[3], "acme/demo--t1.git", access.StatusArchived, false, http.StatusConflict,
-			"repository is read-only: parent workspace is archived"},
-		{"no repository on disk", basic("x", w.ownerKey), gitRequests[0], "acme/empty.git", "", false, http.StatusInternalServerError, "internal error"},
+			"repository is read-only: parent workspace is archived", failed},
+		{"no repository on disk", basic("x", w.ownerKey), gitRequests[0], "acme/empty.git", "", false, http.StatusInternalServerError, "internal error", failed},
 	}
 	for _, row := range rows {
 		t.Run(row.name, func(t *testing.T) {
@@ -105,13 +127,24 @@ func TestRoutes_AnswersEveryEarlyRefusalWithOneLineOfText(t *testing.T) {
 			if row.twice {
 				w.call(t, row.request.method, row.request.to(row.repo), row.auth)
 			}
+			before, served := w.git.Requests(), w.service.served()
 			a := w.call(t, row.request.method, row.request.to(row.repo), row.auth)
+			if w.service.served() != served {
+				t.Error("the refused request reached the service")
+			}
 			if a.status != row.status || a.body != row.message+"\n" || a.header.Get("Content-Type") != "text/plain; charset=utf-8" {
 				t.Errorf("answer = %d %q Content-Type %q, want %d %q text/plain; charset=utf-8",
 					a.status, a.body, a.header.Get("Content-Type"), row.status, row.message+"\n")
 			}
+			if challenged := a.header.Get("WWW-Authenticate") != ""; challenged != (row.status == http.StatusUnauthorized) {
+				t.Errorf("WWW-Authenticate %q on a %d, want the challenge on a 401 alone", a.header.Get("WWW-Authenticate"), a.status)
+			}
 			if json.Valid([]byte(a.body)) {
 				t.Errorf("body %q is JSON, want one line of text", a.body)
+			}
+			want := map[gitserver.RequestLabels]uint64{{Service: row.request.label, Result: row.result}: 1}
+			if got := grown(before, w.git.Requests()); !maps.Equal(got, want) {
+				t.Errorf("the counter grew by %v, want %v", got, want)
 			}
 		})
 	}

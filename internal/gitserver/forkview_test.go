@@ -1,6 +1,7 @@
 package gitserver_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"maps"
@@ -9,7 +10,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/gitserver"
 	"github.com/agent-fox-dev/parley/internal/hub"
@@ -48,9 +51,7 @@ func TestForkView_AdvertisesEachTrackingRefAtTheParentsValueOfTheRequest(t *test
 		t.Errorf("the fork's own work moved to %q, want %s", refs["refs/heads/work"], w.work)
 	}
 	dir := t.TempDir()
-	if out, err := clientGit(t, dir, nil, "clone", "--quiet", forkRemote(w), "d"); err != nil {
-		t.Fatalf("git clone: %v\n%s", err, out)
-	}
+	runGit(t, dir, "clone", "--quiet", forkRemote(w), "d")
 	if got, _ := clientGit(t, filepath.Join(dir, "d"), nil, "rev-parse", "origin/main"); strings.TrimSpace(got) != next {
 		t.Errorf("origin/main of the clone = %s, want %s", got, next)
 	}
@@ -71,12 +72,8 @@ func TestForkView_AdvertisesTheVersionRefsOfTheForksOwnChangesAlone(t *testing.T
 		t.Error("the fork lists refs/parley/changes/8/1, a version of another change")
 	}
 	d := t.TempDir()
-	if out, err := clientGit(t, d, nil, "init", "--quiet"); err != nil {
-		t.Fatalf("git init: %v\n%s", err, out)
-	}
-	if out, err := clientGit(t, d, nil, "fetch", forkRemote(w), "refs/parley/changes/7/1"); err != nil {
-		t.Fatalf("git fetch refs/parley/changes/7/1: %v\n%s", err, out)
-	}
+	runGit(t, d, "init", "--quiet")
+	runGit(t, d, "fetch", forkRemote(w), "refs/parley/changes/7/1")
 	view.set(gitserver.ForkRefs{Tracking: []string{"refs/heads/main"}}, nil)
 	for name := range lsRemote(t, forkRemote(w)) {
 		if strings.HasPrefix(name, "refs/parley/changes/") {
@@ -86,29 +83,20 @@ func TestForkView_AdvertisesTheVersionRefsOfTheForksOwnChangesAlone(t *testing.T
 }
 
 // The hub's own view names the tracking refs the fork's record holds and no
-// change, since the hub has no record of a change's source yet.
+// change, since the hub has no record of a change's source yet. A fork's
+// HEAD names its base branch, as a workspace's names its default branch, so
+// that a clone of the fork checks it out and a single-branch (shallow) clone
+// takes it.
 func TestForkView_TheHubNamesTheTrackingRefsOfTheForksRecord(t *testing.T) {
 	t.Parallel()
 	w := newForkWorld(t, nil)
 	parent := gitrepotest.Refs(t, w.repo, "")
-	want := map[string]string{"refs/heads/work": w.work, "HEAD": parent["refs/heads/main"]}
+	want := map[string]string{"refs/heads/work": w.work, "HEAD": parent["refs/heads/main"], "symref HEAD": "refs/heads/main"}
 	for _, name := range []string{"refs/heads/main", "refs/heads/dev", "refs/tags/v1"} {
 		want[name] = parent[name]
 	}
 	if got := lsRemote(t, forkRemote(w)); !maps.Equal(got, want) {
 		t.Errorf("the fork lists %v, want %v", got, want)
-	}
-}
-
-// A fork's HEAD names its base branch, as a workspace's names its default
-// branch, so that a clone of the fork checks it out and a single-branch
-// (shallow) clone takes it.
-func TestForkView_AdvertisesHEADAtTheForksBaseBranch(t *testing.T) {
-	t.Parallel()
-	w := newForkWorld(t, nil)
-	out, err := clientGit(t, t.TempDir(), nil, "ls-remote", "--symref", forkRemote(w), "HEAD")
-	if err != nil || !strings.Contains(out, "ref: refs/heads/main\tHEAD") {
-		t.Errorf("git ls-remote --symref of the fork: %v\n%s\nwant HEAD as a symref to refs/heads/main", err, out)
 	}
 }
 
@@ -161,6 +149,51 @@ func TestForkView_RefusesTheForkWhenItsRefsCannotBeBroughtUpToDate(t *testing.T)
 				t.Errorf("git upload-pack ran %d times, want never", n)
 			}
 		})
+	}
+}
+
+// stuckCopier holds every copy until release is closed, whatever its
+// context says, and tells entered of the first.
+type stuckCopier struct{ entered, release chan struct{} }
+
+func (s stuckCopier) CopyRefs(context.Context, string, string, gitrepo.RefCopy) (gitrepo.Copied, error) {
+	select {
+	case s.entered <- struct{}{}:
+	default:
+	}
+	<-s.release
+	return gitrepo.Copied{}, errors.New("stuck")
+}
+
+// A request waits for the copy of another into the same fork no longer than
+// its own timeout, which bounds the copy and git together.
+func TestForkView_GivesUpWaitingForAStuckCopyAtTheTimeout(t *testing.T) {
+	t.Parallel()
+	stuck := stuckCopier{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	w := newGitWorld(t, hubtest.Config{Compose: func(c *hub.Composition) {
+		c.AdjustGitServer(func(d *gitserver.Deps) { d.Copier, d.Timeout = stuck, 300*time.Millisecond })
+	}})
+	t.Cleanup(func() { close(stuck.release) })
+	w.addFork(t)
+	status := make(chan int, 2)
+	get := func() {
+		req, _ := http.NewRequest(http.MethodGet, w.URL("/git/acme/demo--t1.git/info/refs?service=git-upload-pack"), nil)
+		req.Header.Set("Authorization", basic("x", w.memberKey))
+		if res, err := http.DefaultClient.Do(req); err == nil {
+			_ = res.Body.Close()
+			status <- res.StatusCode
+		}
+	}
+	go get()
+	<-stuck.entered
+	go get()
+	select {
+	case s := <-status:
+		if s != http.StatusInternalServerError {
+			t.Errorf("the request behind the stuck copy = %d, want 500", s)
+		}
+	case <-time.After(3 * time.Second):
+		t.Error("the request behind the stuck copy got no answer within 3s")
 	}
 }
 
