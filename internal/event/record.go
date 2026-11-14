@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/scrub"
 	"github.com/agent-fox-dev/parley/internal/server/timefmt"
 )
 
@@ -47,7 +48,8 @@ type Input struct {
 	// 8-4-4-4-12 form; nil for none. It is stored in lower case.
 	SessionID *string
 	// Metadata is anything encoding/json encodes as a JSON object, such as a
-	// map[string]any or a json.RawMessage; nil for none, stored as {}.
+	// map[string]any or a json.RawMessage; nil for none, stored as {}. A
+	// list of paths is built with PathList.
 	Metadata any
 	// Parent is the slug of the fork's parent when Workspace is a task fork.
 	// The component reads it from the workspace record when it is empty; a
@@ -231,4 +233,92 @@ func isUUID(s string) bool {
 		}
 	}
 	return true
+}
+
+// maxPaths is the most paths a metadata list built with PathList holds.
+const maxPaths = 100
+
+// PathList stores the first 100 of paths, in their order, in meta under key,
+// and sets meta["truncated"] to true when it had to cut the list; with 100
+// paths or fewer it stores them all and adds no truncated member. meta must
+// not be nil. The component cannot tell which metadata member is a list of
+// paths, so an emitting package builds its path lists with PathList; other
+// lists are stored whole.
+func PathList(meta map[string]any, key string, paths []string) {
+	kept := make([]string, min(len(paths), maxPaths))
+	copy(kept, paths)
+	meta[key] = kept
+	if len(paths) > maxPaths {
+		meta["truncated"] = true
+	}
+}
+
+// scrubMetadata returns the metadata object raw, valid compact JSON, with
+// every string value at any depth, in objects and in arrays, passed through
+// s. Member names, numbers, booleans and null are written back as they were,
+// in their order; a nil s returns raw unchanged.
+func scrubMetadata(raw json.RawMessage, s *scrub.Scrubber) (json.RawMessage, error) {
+	if s == nil {
+		return raw, nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var out bytes.Buffer
+	if err := scrubValue(dec, &out, s); err != nil {
+		return nil, fmt.Errorf("scrub the metadata: %w", err)
+	}
+	return json.RawMessage(out.Bytes()), nil
+}
+
+// scrubValue copies the next JSON value of dec to out, scrubbing its strings.
+func scrubValue(dec *json.Decoder, out *bytes.Buffer, s *scrub.Scrubber) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	switch v := tok.(type) {
+	case json.Delim:
+		out.WriteRune(rune(v))
+		for i := 0; dec.More(); i++ {
+			if i > 0 {
+				out.WriteByte(',')
+			}
+			if v == '{' {
+				name, err := dec.Token()
+				if err != nil {
+					return err
+				}
+				if err := writeJSON(out, name); err != nil {
+					return err
+				}
+				out.WriteByte(':')
+			}
+			if err := scrubValue(dec, out, s); err != nil {
+				return err
+			}
+		}
+		end, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		out.WriteRune(rune(end.(json.Delim)))
+		return nil
+	case string:
+		return writeJSON(out, s.Scrub(v))
+	case json.Number:
+		out.WriteString(v.String())
+		return nil
+	default: // a bool or nil
+		return writeJSON(out, v)
+	}
+}
+
+// writeJSON appends v to out as encode writes it.
+func writeJSON(out *bytes.Buffer, v any) error {
+	b, err := encode(v)
+	if err != nil {
+		return err
+	}
+	out.Write(b)
+	return nil
 }

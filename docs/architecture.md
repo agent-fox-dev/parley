@@ -1415,6 +1415,19 @@ A `Record` marshals to one line with exactly the members `seq`, `id`, `type`,
 for an absent `workspace`, `actor_id` or `session_id`, an object for
 `metadata` and `time` as `timefmt.Format` writes it.
 
+Metadata leaves the hub with every event, so `Emit` passes every string value
+of it, at any depth (object values and array elements, not member names),
+through `Deps.Scrubber`, the hub's scrubber, before the row is written: URL
+user information and registered secret values are removed and the string is
+cut to 1024 bytes. Member names, numbers (kept as written), booleans and
+`null` are written back unchanged, in their order. The record `Emit` returns
+holds the scrubbed metadata, the same the log serves.
+
+The component cannot tell which metadata member is a list of paths, so an
+emitting package builds one with `event.PathList(meta, key, paths)`: it stores
+the first 100 paths, in their order, under `key`, and sets `truncated` to
+`true` only when it cut the list. Other lists in metadata are stored whole.
+
 The event log is read by position
 ([ADR 05](adr/05-deliver-events-by-reading-the-log-by-position.md)).
 `(*Component).Bounds(ctx)` returns `event.Bounds{OldestSeq, LastSeq}`, both 0

@@ -90,7 +90,9 @@ type Deps struct {
 	Store *store.Store
 	// Clock stamps the events and runs the component's timers.
 	Clock Clock
-	// Scrubber is the hub's credential scrubber.
+	// Scrubber is the hub's credential scrubber, which every string of an
+	// event's metadata passes through before it is stored; nil stores the
+	// metadata as given.
 	Scrubber *scrub.Scrubber
 	// Parents looks up the parent of a task fork at emit time; nil stores no
 	// parent unless the caller passes one.
@@ -133,7 +135,8 @@ var errNotBound = errors.New("the event component is not bound to a store")
 
 // Emit stores one event for in inside tx, the caller's transaction of the
 // transactional store, and returns the stored record with seq, id, time and
-// action filled in. The event commits or rolls back with tx.
+// action filled in. The event commits or rolls back with tx. Every string of
+// the metadata, at any depth, is stored as the hub's scrubber returns it.
 //
 // An input that breaks the record contract returns an error wrapping
 // ErrInvalidEvent and writes nothing. Any failure to write returns another
@@ -146,6 +149,11 @@ func (c *Component) Emit(ctx context.Context, tx *sql.Tx, in Input) (Record, err
 	rec, err := in.check()
 	if err != nil {
 		return Record{}, err
+	}
+	// Metadata leaves the hub through the stream, the log and webhooks, so
+	// no credential may be stored in it.
+	if rec.Metadata, err = scrubMetadata(rec.Metadata, c.deps.Scrubber); err != nil {
+		return Record{}, fmt.Errorf("emit event %s: %w", rec.Type, err)
 	}
 	if rec.parent == "" && rec.Workspace != nil && c.deps.Parents != nil {
 		rec.parent, err = c.deps.Parents.ForkParent(ctx, tx, *rec.Workspace)

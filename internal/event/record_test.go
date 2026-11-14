@@ -6,8 +6,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -156,5 +159,181 @@ func TestEmit_RejectsInvalidInput(t *testing.T) {
 				t.Errorf("last_seq = %d, want 0", got)
 			}
 		})
+	}
+}
+
+// jsonValue decodes data with its numbers kept as written, so that two
+// documents compare equal exactly when they hold the same values.
+func jsonValue(t *testing.T, data []byte) any {
+	t.Helper()
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		t.Fatalf("%s: %v", data, err)
+	}
+	return v
+}
+
+func TestRecord_EveryResourceFamilyPassesThrough(t *testing.T) {
+	t.Parallel()
+	const session = "0f8fad5b-d9cb-469f-a165-70867728950e"
+	pat := func(typ, rtype, rid string, meta string) Input {
+		return Input{Type: typ, Workspace: ptr("api"), ActorType: ActorPAT, ActorID: ptr("u_1"),
+			ResourceType: rtype, ResourceID: rid, Metadata: json.RawMessage(meta)}
+	}
+	system := func(typ, rtype, rid string, meta string) Input {
+		in := pat(typ, rtype, rid, meta)
+		in.ActorType, in.ActorID = ActorSystem, nil
+		return in
+	}
+	forge := func(typ, rtype, rid string, meta string) Input {
+		in := pat(typ, rtype, rid, meta)
+		in.ActorType, in.ActorID = ActorForge, nil
+		return in
+	}
+	withSession := func(in Input) Input { in.SessionID = ptr(session); return in }
+	noWorkspace := func(in Input) Input { in.Workspace = nil; return in }
+	for _, in := range []Input{
+		pat("parley.workspace.create", "workspace", "api", `{"default_branch":"main","kind":"repository"}`),
+		pat("parley.workspace.push", "branch", "main", `{"old":"`+strings.Repeat("a", 40)+`","new":"`+strings.Repeat("b", 40)+`","forced":false}`),
+		system("parley.session.force_closed", "session", session, `{"reason":"expired","tokens":{"input":12345678901234567890,"cost":0.0125}}`),
+		pat("parley.token.bind", "token", "tok_1", `{"workspace":"api","scopes":["code:read","audit:read"]}`),
+		withSession(pat("parley.git.push", "ref", "refs/heads/main", `{"commits":3,"rejected":null}`)),
+		pat("parley.scm.commit", "commit", strings.Repeat("c", 40), `{"message":"fix: <escape> & \"quote\"","files":["a.go","b/c.go"]}`),
+		pat("parley.change.land", "change", "42", `{"target":"main","version":2}`),
+		pat("parley.policy.update", "policy", "api", `{"rules":[{"path":"internal/**","reviewers":2}]}`),
+		pat("parley.claim.create", "claim", "c1", `{"paths":["docs/"],"ttl":"4h"}`),
+		pat("parley.patch.create", "patch", "p1", `{"change":42,"empty":{}}`),
+		system("parley.rebuild.complete", "rebuild", "j1", `{"status":"ok","duration_ms":1500}`),
+		noWorkspace(pat("parley.secret.create", "secret", "KEY", `{"scope":"user","scope_id":"u_1"}`)),
+		pat("parley.variable.update", "variable", "KEY", `{"scope":"workspace"}`),
+		forge("parley.forge.issue.opened", "issue", "7", `{"title":"Crash on start","labels":["bug"]}`),
+		forge("parley.forge.comment.create", "comment", "7", `{"issue":7,"body":"ünïcode ✓"}`),
+		pat("parley.forge.label.create", "label", "bug", `{"color":"d73a4a"}`),
+		pat("parley.forge.pull_request.create", "pull_request", "9", `{"head":"feature/x","draft":true}`),
+		pat("parley.forge.webhook.set", "webhook", "api", `{"events":["push"]}`),
+		withSession(pat("parley.sandbox.create", "sandbox", "s1", `{"profile":"agent"}`)),
+		pat("parley.sandbox.rule_add", "sandbox_rule", "r1", `{"host":"proxy.golang.org","port":443}`),
+		pat("parley.webhook.create", "event_webhook", "w1", `{"url":"https://hooks.example.com/parley","types":["parley.change.*"]}`),
+	} {
+		t.Run(in.ResourceType, func(t *testing.T) {
+			t.Parallel()
+			f := newFixture(t)
+			f.emit(in)
+			read := f.readAll(0)
+			if len(read) != 1 {
+				t.Fatalf("ReadAfter = %d records, want 1", len(read))
+			}
+			got := read[0]
+			want := in
+			got.parent, want.Parent = "", ""
+			if got.Type != want.Type || !reflect.DeepEqual(got.Workspace, want.Workspace) ||
+				got.ActorType != want.ActorType || !reflect.DeepEqual(got.ActorID, want.ActorID) ||
+				got.ResourceType != want.ResourceType || got.ResourceID != want.ResourceID ||
+				!reflect.DeepEqual(got.SessionID, want.SessionID) {
+				t.Errorf("read back %+v, want the fields of %+v", got, want)
+			}
+			if g, w := jsonValue(t, got.Metadata), jsonValue(t, want.Metadata.(json.RawMessage)); !reflect.DeepEqual(g, w) {
+				t.Errorf("metadata = %s, want %s", got.Metadata, want.Metadata)
+			}
+			segments := strings.Split(in.Type, ".")
+			if last := segments[len(segments)-1]; got.Action != last {
+				t.Errorf("action = %q, want %q", got.Action, last)
+			}
+		})
+	}
+}
+
+func TestPathList_CutsAtOneHundred(t *testing.T) {
+	t.Parallel()
+	for _, n := range []int{0, 100, 101, 250} {
+		t.Run(strconv.Itoa(n)+" paths", func(t *testing.T) {
+			t.Parallel()
+			paths := make([]string, n)
+			for i := range paths {
+				paths[i] = fmt.Sprintf("dir/file%03d.go", i)
+			}
+			meta := map[string]any{"commit": "abc"}
+			PathList(meta, "files", paths)
+			in := valid("parley.workspace.push")
+			in.Metadata = meta
+			f := newFixture(t)
+			f.emit(in)
+
+			var stored struct {
+				Files     *[]string `json:"files"`
+				Truncated *bool     `json:"truncated"`
+				Commit    string    `json:"commit"`
+			}
+			if err := json.Unmarshal(f.readAll(0)[0].Metadata, &stored); err != nil {
+				t.Fatal(err)
+			}
+			if stored.Files == nil {
+				t.Fatalf("metadata has no files member")
+			}
+			if want := paths[:min(n, 100)]; !slices.Equal(*stored.Files, want) {
+				t.Errorf("files = %d entries %v, want the first %d", len(*stored.Files), *stored.Files, len(want))
+			}
+			switch {
+			case n > 100 && (stored.Truncated == nil || !*stored.Truncated):
+				t.Errorf("truncated = %v, want true", stored.Truncated)
+			case n <= 100 && stored.Truncated != nil:
+				t.Errorf("truncated = %v, want no truncated member", *stored.Truncated)
+			}
+			if stored.Commit != "abc" {
+				t.Errorf("commit = %q, want the other members kept", stored.Commit)
+			}
+		})
+	}
+}
+
+func TestEmit_ScrubsMetadataStrings(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	f.scrubber.Add("s3cr3t-value")
+	in := valid("parley.workspace.create")
+	in.Metadata = json.RawMessage(`{"git_url":"https://bob:pw@example.com/r.git",` +
+		`"nested":{"note":"token s3cr3t-value here","s3cr3t-value":"member names stay"},` +
+		`"list":["https://x:y@h/p",{"deep":["s3cr3t-value"]}],` +
+		`"count":12345678901234567890,"ratio":0.5,"ok":true,"none":null,"long":"` + strings.Repeat("x", 1100) + `"}`)
+	emitted := f.emit(in)
+	stored := f.readAll(0)[0]
+	if !bytes.Equal(emitted.Metadata, stored.Metadata) {
+		t.Errorf("Emit returned metadata %s, the log holds %s", emitted.Metadata, stored.Metadata)
+	}
+
+	var got struct {
+		GitURL string `json:"git_url"`
+		Nested map[string]string
+		List   []json.RawMessage
+		Count  json.Number
+		Ratio  json.Number
+		OK     *bool
+		None   json.RawMessage
+		Long   string
+	}
+	dec := json.NewDecoder(bytes.NewReader(stored.Metadata))
+	dec.UseNumber()
+	if err := dec.Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got.GitURL != "https://example.com/r.git" {
+		t.Errorf("git_url = %q, want https://example.com/r.git", got.GitURL)
+	}
+	if note := got.Nested["note"]; !strings.Contains(note, "[redacted]") || strings.Contains(note, "s3cr3t-value") {
+		t.Errorf("nested.note = %q, want the secret replaced by [redacted]", note)
+	}
+	if got.Nested["s3cr3t-value"] != "member names stay" {
+		t.Errorf("nested = %v, want the member name kept", got.Nested)
+	}
+	if len(got.List) != 2 || string(got.List[0]) != `"https://h/p"` || string(got.List[1]) != `{"deep":["[redacted]"]}` {
+		t.Errorf("list = %s, want [\"https://h/p\",{\"deep\":[\"[redacted]\"]}]", got.List)
+	}
+	if got.Count != "12345678901234567890" || got.Ratio != "0.5" || got.OK == nil || !*got.OK || string(got.None) != "null" {
+		t.Errorf("count, ratio, ok, none = %s, %s, %v, %s, want them unchanged", got.Count, got.Ratio, got.OK, got.None)
+	}
+	if len(got.Long) != 1024 {
+		t.Errorf("long = %d bytes, want it cut to 1024", len(got.Long))
 	}
 }
