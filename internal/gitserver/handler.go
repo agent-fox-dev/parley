@@ -103,6 +103,9 @@ type Exchange struct {
 	// resolution of the repository read it; it is the zero Workspace on a
 	// request no check has resolved.
 	Workspace workspace.Workspace
+	// Repo is the git directory of the workspace's repository, which opened
+	// as a repository before the Service was called.
+	Repo string
 }
 
 // Service serves a git request that passed every check. It writes the
@@ -129,6 +132,12 @@ type Deps struct {
 	// Records reads the organization and the workspace record a request
 	// names; with none, as with no Access.
 	Records Records
+	// Parents judges the parent of a task fork; with none, a request for a
+	// ready fork is answered 500 internal error.
+	Parents Parents
+	// Repositories opens the repository of a workspace; with none, a
+	// request that passed every other check is answered 500 internal error.
+	Repositories Repositories
 	// Service serves a request that passed the checks; with none, such a
 	// request is answered 500 internal error.
 	Service Service
@@ -169,9 +178,11 @@ type check func(c *Component, w http.ResponseWriter, r *http.Request, x *Exchang
 // the rate limit, which counts the request against the credential
 // authentication found, so that a caller over its limit learns nothing
 // about the repository it asked for; the binding guard; the scope of a PAT;
-// the resolution of the repository with the access rule; and the
-// validation of the request, which a caller who cannot see the repository
-// never reaches.
+// the resolution of the repository with the access rule; the validation of
+// the request, which a caller who cannot see the repository never reaches;
+// the state of the workspace and of a fork's parent; and last the opening
+// of the repository, so that nothing has run git before every refusal had
+// its chance.
 var checks = []check{
 	(*Component).authenticate,
 	(*Component).rateLimit,
@@ -179,6 +190,8 @@ var checks = []check{
 	(*Component).scope,
 	(*Component).resolve,
 	(*Component).validate,
+	(*Component).state,
+	(*Component).open,
 }
 
 // handler serves route: it runs the checks in order, stops at the first

@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/fork"
+	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/gitserver"
 	"github.com/agent-fox-dev/parley/internal/hub"
@@ -125,12 +127,48 @@ func (w *world) pat(t *testing.T, user, bound string, perms ...string) (token, i
 	return w.IssuePATID(t, identity.PATSpec{UserID: user, Permissions: perms, Workspace: bound, CreatedAt: w.clock()})
 }
 
+// addFork adds the task fork demo--t1 of demo, which the member owns: ready,
+// in acme, tracking main, with its own repository made from demo's.
+func (w *world) addFork(t *testing.T) {
+	t.Helper()
+	ctx, now, head := context.Background(), w.clock(), gitrepotest.Refs(t, w.repo, "refs/heads/")["main"]
+	f := fork.Fork{
+		Workspace: workspace.Workspace{
+			Slug: "demo--t1", Kind: access.KindFork, Mode: workspace.ModeStandard, DefaultBranch: new("main"),
+			OwnerID: w.member, OrgID: w.acme, Status: workspace.StatusReady, DisplayName: "demo--t1",
+			ParentSlug: new("demo"), ForkPoint: &workspace.ForkPoint{Ref: "main", SHA: head},
+			ExpiresAt: new(now.Add(7 * 24 * time.Hour)), AutoChange: new(false),
+			CreatedAt: now, UpdatedAt: now, InstanceID: workspace.NewInstanceID(),
+		},
+		TrackingBranches: []string{"main"},
+	}
+	if err := (gitrepo.Git{}).CreateFork(ctx, w.repo, w.workspaces.RepoPath(f.Slug)); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Store.Tx(ctx, func(tx *sql.Tx) error { return fork.Insert(ctx, tx, f) }); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // setStatus sets the status of the workspace slug in the store.
 func (w *world) setStatus(t *testing.T, slug, status string) {
 	t.Helper()
+	w.set(t, slug, "status", status)
+}
+
+// setMarker sets the maintenance marker of the workspace slug in the store,
+// as a running reclone, archive or delete holds it; "" releases it.
+func (w *world) setMarker(t *testing.T, slug string, m workspace.Marker) {
+	t.Helper()
+	w.set(t, slug, "maintenance", string(m))
+}
+
+// set sets column of the workspace slug to value in the store.
+func (w *world) set(t *testing.T, slug, column, value string) {
+	t.Helper()
 	ctx := context.Background()
 	if err := w.Store.Tx(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `UPDATE workspaces SET status = ? WHERE slug = ?`, status, slug)
+		_, err := tx.ExecContext(ctx, `UPDATE workspaces SET `+column+` = ? WHERE slug = ?`, value, slug)
 		return err
 	}); err != nil {
 		t.Fatal(err)

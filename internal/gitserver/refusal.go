@@ -16,6 +16,10 @@ const (
 	msgLacksScope     = "token lacks scope "
 	msgReadOnly       = "org members have read-only access to this workspace; create a task fork to contribute"
 	msgInvalidService = "invalid or missing service parameter"
+	// msgNotAvailable is followed by the workspace's status, or busy.
+	msgNotAvailable   = "repository not available: workspace is "
+	msgParentBusy     = "repository not available: parent workspace is busy"
+	msgParentArchived = "repository is read-only: parent workspace is archived"
 )
 
 // basicChallenge asks git for a credential: git prompts for one, or asks

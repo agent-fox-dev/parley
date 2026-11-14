@@ -59,3 +59,31 @@ service that runs after them; the test of the checks asserts that the
 request reaches that service as an upload-pack request with need read. The
 content type is the one the upload-pack advertisement always carries, written
 by the service of ref discovery, not by the checks.
+
+## A workspace under maintenance is answered `workspace is busy`
+
+The package refuses a workspace "whose status is not ready" with
+`409 repository not available: workspace is <status>`, and names no answer
+for a workspace whose own maintenance marker is set: a reclone keeps the
+status `ready` while it replaces the repository, and an archive or a delete
+runs on a workspace of any status. The git server judges the workspace's own
+record with `workspace.RequireReady`, the state guard of every route that
+needs a repository, which reads the marker first; a set marker is answered
+`409 repository not available: workspace is busy`, the message of the
+package with `busy` where the status goes, the word the package uses for
+the same state of a parent. A status other than ready without a marker is
+named as the package says.
+
+## A failed parent is answered as a busy one
+
+The package refuses a fork whose parent is "in exclusive maintenance"
+(a marker, pending or cloning) with
+`409 repository not available: parent workspace is busy`, and an archived
+parent on a push with `409 repository is read-only: parent workspace is
+archived`; it names no answer for a parent whose clone failed. The parent is
+judged by `(*fork.Component).CheckParentState`, the check every route that
+works on a fork uses, which refuses a failed parent for both uses. The git
+server answers that refusal, as every `409` of the check other than
+`parent_archived`, with the busy message, so that the refusals of the git
+routes stay the fixed list of the package and a fork is never served while
+its parent cannot serve.

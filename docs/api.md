@@ -633,10 +633,25 @@ answers it with an HTTP status and a body of one line of text, sent with
    `service` must be `git-upload-pack` or `git-receive-pack`; later values
    are ignored. Otherwise the answer is `400` with the body
    `invalid or missing service parameter`.
+7. The workspace's state. A workspace that a reclone, archive or delete is
+   working on gets `409` with the body
+   `repository not available: workspace is busy`, whatever its status;
+   otherwise a workspace whose status is not `ready` gets `409` with the
+   body `repository not available: workspace is <status>` (`pending`,
+   `cloning`, `failed` or `archived`). A ready task fork is then
+   judged by its parent: while the parent is pending, cloning, failed or
+   being recloned, archived or deleted, every request gets `409` with the body
+   `repository not available: parent workspace is busy`; while the parent is
+   archived, a push (`POST …/git-receive-pack` and ref discovery for
+   `git-receive-pack`) gets `409` with the body
+   `repository is read-only: parent workspace is archived`, and a fetch is
+   served.
 
-An error the hub did not expect is answered `500` with the body
-`internal error` and written to the hub's log with the request id. The hub
-has no git service yet: a request that passes every check is answered
+An error the hub did not expect, such as a failed read of the store or a
+workspace whose repository is missing from disk, is answered `500` with the
+body `internal error`, nothing of the cause in it, and written to the hub's
+log with the request id, the route's pattern and the repository segment.
+The hub has no git service yet: a request that passes every check is answered
 `500 internal error`.
 
 ## `GET /healthz`
