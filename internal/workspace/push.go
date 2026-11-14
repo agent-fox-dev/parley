@@ -2,6 +2,7 @@ package workspace
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,7 +12,9 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
+	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/server"
 )
 
@@ -71,7 +74,9 @@ type pushAnswer struct {
 // workspace's origin. It reads the branch's head once and pushes that
 // commit, so that a branch that moves meanwhile changes neither what is
 // pushed nor what is answered; it takes no lock. The origin credential is
-// resolved from the workspace's secrets for this push.
+// resolved from the workspace's secrets for this push. Every push handed to
+// origin is recorded as one push event, and one origin took also as the
+// branch's origin head; a refusal before the push records nothing.
 func (s *Service) servePush(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 	force, err := pushForce(r)
@@ -111,39 +116,145 @@ func (s *Service) servePush(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	var lease string
-	var recorded bool
-	if force {
-		// The lease is the origin head the hub last saw, so that a forced
-		// push replaces only commits the hub has seen; with none recorded
-		// origin must not have the branch.
-		if lease, recorded, err = repo.OriginHead(ctx, name); err != nil {
-			return err
-		}
+	// The caller is the push event's actor; the access check has let only
+	// the admin token or a user's credential through.
+	p, _ := identity.PrincipalOf(ctx)
+	actorType, actorID, ok := eventActor(p)
+	if !ok {
+		return fmt.Errorf("push branch %q of workspace %q: the push names no caller", name, slug)
+	}
+	// From here on a caller who disconnects changes neither the push, which
+	// only its deadline ends, nor its records.
+	ctx = context.WithoutCancel(ctx)
+	// The origin head the hub last saw is the lease of a forced push, so
+	// that a forced push replaces only commits the hub has seen (with none
+	// recorded origin must not have the branch), and the value the record
+	// is put back to when the records of a push origin took fail.
+	seen, recorded, err := repo.OriginHead(ctx, name)
+	if err != nil {
+		return err
 	}
 	originURL := deref(rec.GitURL)
+	op := pushOp{slug: slug, branch: name, sha: head, force: force, remoteURL: withoutUserinfo(originURL),
+		actorType: actorType, actorID: actorID}
 	pushCtx, cancel := context.WithTimeout(ctx, s.deps.PushDeadline)
 	defer cancel()
 	result, err := s.deps.Pusher.Push(pushCtx, gitrepo.PushRequest{
-		Dir: repo.Dir(), URL: originURL, Credential: cred, Commit: head, Branch: name, Force: force, Lease: lease,
+		Dir: repo.Dir(), URL: originURL, Credential: cred, Commit: head, Branch: name, Force: force, Lease: seen,
 	})
-	switch {
-	case err == nil:
-	case ctx.Err() == nil && errors.Is(pushCtx.Err(), context.DeadlineExceeded):
-		// The push operation killed git with every process it started when
-		// the deadline passed, and waited for them.
-		return server.NewError("origin_timeout", http.StatusGatewayTimeout, fmt.Sprintf(
-			"the push of branch %q to origin did not finish within %v", name, s.deps.PushDeadline))
-	case errors.Is(err, gitrepo.ErrNonFastForward):
-		return nonFastForward(ctx, repo, name, head)
-	case errors.Is(err, gitrepo.ErrOriginMoved):
-		return originMoved(name, lease, recorded)
-	default:
-		return pushFailure(err, slug, name, withoutUserinfo(originURL), cred)
+	if err != nil {
+		var answer *server.Error
+		switch {
+		case errors.Is(pushCtx.Err(), context.DeadlineExceeded):
+			// The push operation killed git with every process it started
+			// when the deadline passed, and waited for them.
+			answer = server.NewError("origin_timeout", http.StatusGatewayTimeout, fmt.Sprintf(
+				"the push of branch %q to origin did not finish within %v", name, s.deps.PushDeadline))
+		case errors.Is(err, gitrepo.ErrNonFastForward):
+			answer = nonFastForward(name, head, seen, recorded)
+		case errors.Is(err, gitrepo.ErrOriginMoved):
+			answer = originMoved(name, seen, recorded)
+		default:
+			answer = pushFailure(err, slug, name, op.remoteURL, cred)
+		}
+		if err := s.writePushRecords(ctx, op.event("", answer.Type()), nil); err != nil {
+			return err
+		}
+		return answer
+	}
+	if err := s.recordPushed(ctx, repo, rec, op, result, seen, recorded); err != nil {
+		return err
 	}
 	server.WriteJSON(w, http.StatusOK, pushAnswer{
-		Branch: name, SHA: head, Remote: remoteOrigin, RemoteURL: withoutUserinfo(originURL), Result: result,
+		Branch: name, SHA: head, Remote: remoteOrigin, RemoteURL: op.remoteURL, Result: result,
 	})
+	return nil
+}
+
+// eventPush is the event every push handed to origin writes.
+const eventPush = "parley.workspace.push"
+
+// pushOp is a push handed to origin as its event names it: the workspace,
+// the branch, the hub's head offered, whether it was forced, origin's URL
+// without user information and the caller.
+type pushOp struct {
+	slug, branch, sha string
+	force             bool
+	remoteURL         string
+	actorType         string
+	actorID           *string
+}
+
+// pushEventMeta is the metadata of a push event: result for a push origin
+// took, error_type, the answer's, for one that failed, never both.
+type pushEventMeta struct {
+	Branch    string             `json:"branch"`
+	SHA       string             `json:"sha"`
+	Force     bool               `json:"force"`
+	OK        bool               `json:"ok"`
+	RemoteURL string             `json:"remote_url"`
+	Result    gitrepo.PushResult `json:"result,omitempty"`
+	ErrorType string             `json:"error_type,omitempty"`
+}
+
+// event is the push event of op, which ended with result when origin took
+// it and with the answer of type errorType otherwise. Every text a push
+// event holds is put in it here.
+func (op pushOp) event(result gitrepo.PushResult, errorType string) event.Input {
+	slug := op.slug
+	return event.Input{Type: eventPush, Workspace: &slug, ActorType: op.actorType, ActorID: op.actorID,
+		ResourceType: "branch", ResourceID: op.branch, Metadata: pushEventMeta{
+			Branch: op.branch, SHA: op.sha, Force: op.force, OK: errorType == "", RemoteURL: op.remoteURL,
+			Result: result, ErrorType: errorType,
+		}}
+}
+
+// recordPushed records that origin took op with result: the branch's
+// origin head, the ref refs/remotes/origin/<branch> of the hub's copy, set
+// to the pushed commit, then in one store transaction the push event and,
+// for w's default branch, w's origin_head_sha. A ref cannot be part of a
+// store transaction, so when the transaction fails the ref is put back to
+// seen, the value it had (removed when recorded is false), and the push is
+// answered as a failure inside the hub; origin keeps the commit, and the
+// next sync or push records it.
+func (s *Service) recordPushed(ctx context.Context, repo *gitrepo.Repo, w Workspace, op pushOp, result gitrepo.PushResult, seen string, recorded bool) error {
+	if err := repo.SetOriginHead(ctx, op.branch, op.sha); err != nil {
+		return fmt.Errorf("record the origin head of branch %q of workspace %q: %w", op.branch, op.slug, err)
+	}
+	var originHead *string
+	if op.branch == deref(w.DefaultBranch) {
+		originHead = &op.sha
+	}
+	err := s.writePushRecords(ctx, op.event(result, ""), originHead)
+	if err == nil {
+		return nil
+	}
+	restore := repo.DeleteOriginHead(ctx, op.branch)
+	if recorded {
+		restore = repo.SetOriginHead(ctx, op.branch, seen)
+	}
+	if restore != nil {
+		s.deps.Logger.Error("workspace origin head not put back after a push", "slug", op.slug, "branch", op.branch,
+			"error", restore)
+	}
+	return err
+}
+
+// writePushRecords writes the push event in and, when originHead is not
+// nil, the origin_head_sha of in's workspace, in one store transaction.
+func (s *Service) writePushRecords(ctx context.Context, in event.Input, originHead *string) error {
+	err := s.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+		if originHead != nil {
+			if err := recordOriginHead(ctx, tx, *in.Workspace, *originHead); err != nil {
+				return err
+			}
+		}
+		_, err := s.deps.Events.Emit(ctx, tx, in)
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("record the push of branch %q of workspace %q: %w", in.ResourceID, *in.Workspace, err)
+	}
 	return nil
 }
 
@@ -237,16 +348,12 @@ func pushForce(r *http.Request) (bool, error) {
 }
 
 // nonFastForward is the refusal of a push of head to branch that origin did
-// not take because its branch is not an ancestor of head. It names the
-// origin head the hub last saw for branch, when it keeps one; the hub asks
-// origin nothing more to learn the current one.
-func nonFastForward(ctx context.Context, repo *gitrepo.Repo, branch, head string) error {
-	seen, found, err := repo.OriginHead(ctx, branch)
-	if err != nil {
-		return err
-	}
+// not take because its branch is not an ancestor of head. It names seen,
+// the origin head the hub last saw for branch, when recorded says it keeps
+// one; the hub asks origin nothing more to learn the current one.
+func nonFastForward(branch, head, seen string, recorded bool) *server.Error {
 	last := "the hub has no record of origin's head of it"
-	if found {
+	if recorded {
 		last = "the origin head the hub last saw is " + seen
 	}
 	return server.NewError("non_fast_forward", http.StatusConflict, fmt.Sprintf(
@@ -260,7 +367,7 @@ func nonFastForward(ctx context.Context, repo *gitrepo.Repo, branch, head string
 // or the statement that origin lacks the branch. Origin's branch and the
 // recorded origin head are left as they are: a sync brings in what origin
 // has, after which the push may be tried again.
-func originMoved(branch, lease string, recorded bool) error {
+func originMoved(branch, lease string, recorded bool) *server.Error {
 	last := "the hub has no record of origin's head of it, so origin must not have it"
 	if recorded {
 		last = "the origin head the hub last saw is " + lease
@@ -275,7 +382,7 @@ func originMoved(branch, lease string, recorded bool) error {
 // push presented: 422 origin_rejected with origin's reason when origin
 // refused the update itself, otherwise 502 with the type of the failure's
 // class, and 502 upstream_error for a failure of no known class.
-func pushFailure(err error, slug, branch, remoteURL string, cred Credential) error {
+func pushFailure(err error, slug, branch, remoteURL string, cred Credential) *server.Error {
 	var pe *gitrepo.PushError
 	if !errors.As(err, &pe) {
 		return server.UpstreamError(fmt.Sprintf("the push of branch %q to origin at %s failed", branch, remoteURL))

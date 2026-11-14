@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -32,6 +33,7 @@ const (
 	createEvent = "parley.workspace.create"
 	updateEvent = "parley.workspace.update"
 	syncEvent   = "parley.workspace.sync"
+	pushEvent   = "parley.workspace.push"
 )
 
 // world is a hub the workspace route tests ask: the users u and v, each with
@@ -267,9 +269,15 @@ func (w *world) postSync(t *testing.T, cred, slug, query string) answer {
 // caller who disconnects; it returns when the request has ended so.
 func (w *world) postSyncAndLeave(t *testing.T, cred, slug string, started <-chan struct{}) {
 	t.Helper()
+	w.postAndLeave(t, cred, "/api/v1/workspaces/"+slug+"/sync", started)
+}
+
+// postAndLeave sends POST path, with no body, as postSyncAndLeave does.
+func (w *world) postAndLeave(t *testing.T, cred, path string, started <-chan struct{}) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.URL("/api/v1/workspaces/"+slug+"/sync"), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.URL(path), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1229,6 +1237,68 @@ func (p *pushWorld) setOriginHead(t *testing.T, branch, id string) {
 	if err != nil {
 		t.Fatalf("setting the origin head of %s to %q: %v", branch, id, err)
 	}
+}
+
+// asked is closed once origin has been sent a request more than now.
+func (p *pushWorld) asked() <-chan struct{} {
+	n, ch := p.origin.Requests(), make(chan struct{})
+	go func() {
+		for deadline := time.Now().Add(10 * time.Second); p.origin.Requests() == n && time.Now().Before(deadline); {
+			time.Sleep(5 * time.Millisecond)
+		}
+		close(ch)
+	}()
+	return ch
+}
+
+// checkRecords checks what a push of the hub's head sha of branch of the
+// workspace syncSlug by u, forced when force is set, recorded after the log
+// held n push events: exactly one push event more, for that branch, whose
+// metadata has ok true and result outcome when outcome is a push result,
+// and otherwise ok false and error_type outcome; for a result also the
+// branch's origin head in the hub's copy, and for the default branch main
+// the workspace's origin_head_sha, at sha.
+func (p *pushWorld) checkRecords(t *testing.T, what string, n int, branch, sha string, force bool, outcome string) {
+	t.Helper()
+	evs := p.eventsOf(t, pushEvent)
+	if len(evs) != n+1 {
+		t.Errorf("%s: %d push events written, want 1", what, len(evs)-n)
+		return
+	}
+	rec, _ := p.workspace(t, syncSlug)
+	want := map[string]any{"branch": branch, "sha": sha, "force": force, "remote_url": deref(rec.GitURL), "ok": false, "error_type": outcome}
+	if slices.Contains([]gitrepo.PushResult{gitrepo.PushPushed, gitrepo.PushForced, gitrepo.PushUpToDate}, gitrepo.PushResult(outcome)) {
+		delete(want, "error_type")
+		want["ok"], want["result"] = true, outcome
+		if got := ref(t, p.copy, "refs/remotes/origin/"+branch); got != sha {
+			t.Errorf("%s: the recorded origin head of %s is %q, want %s", what, branch, got, sha)
+		}
+		if got := deref(rec.OriginHeadSHA); branch == "main" && got != sha {
+			t.Errorf("%s: origin_head_sha is %q, want %s", what, got, sha)
+		}
+	}
+	ev := evs[n]
+	var meta map[string]any
+	if err := json.Unmarshal(ev.Metadata, &meta); err != nil {
+		t.Fatal(err)
+	}
+	if deref(ev.Workspace) != syncSlug || ev.ActorType != event.ActorAPIKey || deref(ev.ActorID) != p.u ||
+		ev.ResourceType != "branch" || ev.ResourceID != branch || !reflect.DeepEqual(meta, want) {
+		t.Errorf("%s: push event of workspace %q by %s %q on %s %q with %v, want workspace %q by %s %q on branch %q with %v", what,
+			deref(ev.Workspace), ev.ActorType, deref(ev.ActorID), ev.ResourceType, ev.ResourceID, meta,
+			syncSlug, event.ActorAPIKey, p.u, branch, want)
+	}
+}
+
+// outcome is the result of a push's answer a when it is 200, its error type
+// otherwise.
+func (a answer) outcome(t *testing.T) string {
+	t.Helper()
+	if a.status == http.StatusOK {
+		r, _ := a.decode(t, http.StatusOK)["result"].(string)
+		return r
+	}
+	return a.errorType(t)
 }
 
 // push sends POST /workspaces/<slug>/branches/<segment>/push, segment being

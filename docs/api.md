@@ -1606,6 +1606,33 @@ it was at the commit already.
 {"branch":"feature","sha":"a3f2b1c4d5e6f708192a3b4c5d6e7f8091a2b3c4","remote":"origin","remote_url":"https://example.com/a.git","result":"pushed"}
 ```
 
+Every push handed to origin, one that passed the checks above and whose
+credential was read, writes exactly one `parley.workspace.push` event, also
+when it fails and also when the caller disconnected: once the push begins
+it runs to its end or to its deadline, and its records are written, whether
+or not the caller is still there to read the answer. A push origin took
+first records the pushed commit as the branch's origin head in the hub's
+repository and then, in one store transaction, writes the event and, for
+the default branch, the workspace's `origin_head_sha` (`updated_at` and
+`status` are not changed). When that transaction fails the origin head is
+put back to what it was before the call (removed when there was none),
+no event is written and the answer is `500 internal`; origin keeps the
+commit, and the next sync or push records it. A push that failed writes
+the event alone and leaves the origin head as it was. The event has
+`workspace` the slug, `resource_type` `branch`, `resource_id` the branch
+name, and as actor the caller as for
+[`PATCH /api/v1/workspaces/{slug}`](#patch-apiv1workspacesslug):
+`admin_token` with `actor_id` `null`, or `api_key` or `pat` with the
+caller's user. Its `metadata` holds `branch`, `sha` (the hub's head that was
+offered), `force` (what the request asked), `ok`, `remote_url` (as in the
+answer) and, for a push origin took (`ok` `true`), `result`, as in the
+answer, or, for one that failed (`ok` `false`), `error_type`, the answer's,
+never both:
+
+```json
+{"seq":15,"id":"…","type":"parley.workspace.push","time":"2026-11-14T10:35:00Z","workspace":"demo","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"branch","resource_id":"feature","action":"push","session_id":null,"metadata":{"branch":"feature","sha":"a3f2b1c4d5e6f708192a3b4c5d6e7f8091a2b3c4","force":false,"ok":false,"remote_url":"https://example.com/a.git","error_type":"non_fast_forward"}}
+```
+
 | Status | When |
 |---|---|
 | `200 OK` | origin took the push; `result` is `pushed`, `forced` or `up_to_date` |
@@ -1631,7 +1658,7 @@ it was at the commit already.
 | `502` `upstream_error` | the push failed in any other way, such as HTTP `500` from origin (`the push of branch "<name>" to origin at <remote_url> failed: <what git said>`) |
 | `503` `unavailable` | the patch list of a `carry_patch` workspace could not be read (`the patch list of workspace "<slug>" cannot be read; try again later`); nothing is pushed |
 | `504` `origin_timeout` | the push had not finished 2 minutes after it began; `git` is killed with every process it started before the answer (`the push of branch "<name>" to origin did not finish within 2m0s`) |
-| `500` `internal` | the workspace's secrets could not be read, in which case origin is not contacted and nothing is pushed without a credential, or the hub failed otherwise |
+| `500` `internal` | the workspace's secrets could not be read, in which case origin is not contacted and nothing is pushed without a credential and no event is written; origin took the push but its records could not be written, in which case the origin head is put back and no event is written; or the hub failed otherwise |
 
 ## `POST /api/v1/workspaces/{slug}/tokens`
 

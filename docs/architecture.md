@@ -2209,7 +2209,21 @@ operation is called. It answers `200` with `branch`, `sha`,
 URL without user information, any other form as stored) and `result`; an
 error matching `gitrepo.ErrNonFastForward` is `409 non_fast_forward`,
 whose message names the origin head the copy keeps for the branch
-(`OriginHead`), read without asking origin.
+(`OriginHead`), read without asking origin. The handler reads that origin
+head once, after the credential and the caller (`eventActor`), and from
+there on works on `context.WithoutCancel` of the request's context, so a
+caller who disconnects ends neither the push, which only
+`Deps.PushDeadline` bounds, nor its records. Every push handed to origin
+writes one `parley.workspace.push` event (`pushOp.event`, the one place
+its texts are put together: `branch`, `sha`, `force`, `ok`, `remote_url`
+and `result` or `error_type`) with `writePushRecords`, one `Store.Tx`. A
+failure writes the event alone. A push origin took goes through
+`recordPushed`: `SetOriginHead` of the branch to the pushed commit first,
+since a ref cannot be part of a store transaction, then the transaction
+with the event and, for the default branch, `recordOriginHead`
+(`origin_head_sha` alone, never `updated_at` or `status`); when the
+transaction fails the ref is put back (`SetOriginHead` of the value read
+before the push, or `DeleteOriginHead`) and the answer is `500 internal`.
 
 ### Hub events
 

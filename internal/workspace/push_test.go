@@ -153,12 +153,13 @@ func TestPush_FastForwardsOriginsBranch(t *testing.T) {
 		}},
 		{"the protected default branch one commit ahead", "main", func() string { return grow(t, p.copy, "main", main, "hub") }},
 	} {
-		head := c.grow()
+		head, n := c.grow(), len(p.eventsOf(t, pushEvent))
 		obj := p.push(t, p.uKey, syncSlug, c.branch, nil).decode(t, http.StatusOK)
 		want := map[string]any{"branch": c.branch, "sha": head, "remote": "origin", "remote_url": p.origin.URL(), "result": "pushed"}
 		if !reflect.DeepEqual(obj, want) {
 			t.Errorf("%s: answer %v, want %v", c.name, obj, want)
 		}
+		p.checkRecords(t, c.name, n, c.branch, head, false, "pushed")
 		if got := p.origin.Head(c.branch); got != head {
 			t.Errorf("%s: origin's %s is at %s, want %s", c.name, c.branch, got, head)
 		}
@@ -170,21 +171,22 @@ func TestPush_AnswersUpToDateWhenOriginHasTheHead(t *testing.T) {
 	p := newPushWorld(t, nil)
 	dev := p.origin.Head("dev")
 	for _, c := range []struct {
-		name   string
-		body   string
-		forget bool
+		name          string
+		force, forget bool
 	}{
-		{"without force", `{"force":false}`, false},
-		{"with force", `{"force":true}`, false},
-		{"with force and no recorded origin head", `{"force":true}`, true},
+		{"without force", false, false},
+		{"with force", true, false},
+		{"with force and no recorded origin head", true, true},
 	} {
 		if c.forget {
-			gitrepotest.Git(t, p.copy, "update-ref", "-d", "refs/remotes/origin/dev")
+			p.setOriginHead(t, "dev", "")
 		}
-		obj := p.push(t, p.uKey, syncSlug, "dev", c.body).decode(t, http.StatusOK)
+		n := len(p.eventsOf(t, pushEvent))
+		obj := p.push(t, p.uKey, syncSlug, "dev", map[string]bool{"force": c.force}).decode(t, http.StatusOK)
 		if obj["result"] != "up_to_date" || obj["sha"] != dev {
 			t.Errorf("%s: answer %v, want up_to_date at %s", c.name, obj, dev)
 		}
+		p.checkRecords(t, c.name, n, "dev", dev, c.force, "up_to_date")
 		if got := p.origin.Head("dev"); got != dev {
 			t.Errorf("%s: origin's dev moved from %s to %s", c.name, dev, got)
 		}
@@ -203,12 +205,13 @@ func TestPush_RefusesNonFastForward(t *testing.T) {
 		{"the hub one commit behind", "main", func(base string) { grow(t, origin, "main", base, "origin") }},
 	} {
 		c.move(p.origin.Head(c.branch))
-		theirs, recorded := p.origin.Head(c.branch), ref(t, p.copy, "refs/remotes/origin/"+c.branch)
+		theirs, recorded, n := p.origin.Head(c.branch), ref(t, p.copy, "refs/remotes/origin/"+c.branch), len(p.eventsOf(t, pushEvent))
 		a := p.push(t, p.uKey, syncSlug, c.branch, nil)
 		errorType, msg := a.refusal(t)
 		if a.status != http.StatusConflict || errorType != "non_fast_forward" {
 			t.Errorf("%s: answer %d %s, want 409 non_fast_forward", c.name, a.status, a.body)
 		}
+		p.checkRecords(t, c.name, n, c.branch, ref(t, p.copy, "refs/heads/"+c.branch), false, "non_fast_forward")
 		for _, word := range []string{recorded, "sync", "force"} {
 			if !strings.Contains(msg, word) {
 				t.Errorf("%s: message %q does not name %q", c.name, msg, word)
@@ -311,6 +314,7 @@ func TestPush_RefusesBeforeContactingOrigin(t *testing.T) {
 		{"a registered patch branch", "cp", url.PathEscape("patch/a"), `{"force":false}`, http.StatusForbidden, "patch_branch"},
 		{"a registered patch branch with force", "cp", url.PathEscape("patch/a"), `{"force":true}`, http.StatusForbidden, "patch_branch"},
 		{"a patch list that cannot be read", "cp-broken", "feature", nil, http.StatusServiceUnavailable, "unavailable"},
+		{"a forced push of the protected default branch", syncSlug, "main", `{"force":true}`, http.StatusForbidden, "protected_branch"},
 		{"a branch the hub's copy lacks", syncSlug, "nope", `{"force":false}`, http.StatusNotFound, "branch_not_found"},
 	} {
 		if a := p.push(t, p.uKey, c.slug, c.branch, c.body); a.status != c.status || a.errorType(t) != c.errorType {
@@ -486,7 +490,9 @@ func TestPush_ForcesOnlyUnderTheRecordedOriginHead(t *testing.T) {
 	} {
 		c.arrange(c.branch)
 		hub, theirs, recorded := ref(t, p.copy, "refs/heads/"+c.branch), p.origin.Head(c.branch), ref(t, p.copy, "refs/remotes/origin/"+c.branch)
+		n := len(p.eventsOf(t, pushEvent))
 		a := p.push(t, p.uKey, syncSlug, c.branch, `{"force":true}`)
+		p.checkRecords(t, c.name, n, c.branch, hub, true, a.outcome(t))
 		if c.result == "" {
 			if a.status != http.StatusConflict || a.errorType(t) != "origin_moved" {
 				t.Errorf("%s: answer %d %s, want 409 origin_moved", c.name, a.status, a.body)
@@ -553,8 +559,9 @@ func TestPush_AnswersEachFailureOfThePush(t *testing.T) {
 		}, http.StatusBadGateway, "origin_unreachable", ""},
 		{"origin answers 500", refuse(http.StatusInternalServerError), http.StatusBadGateway, "upstream_error", ""},
 	} {
-		undo := c.arrange()
+		n, undo := len(p.eventsOf(t, pushEvent)), c.arrange()
 		a := p.push(t, p.uKey, syncSlug, "feature", nil)
+		p.checkRecords(t, c.name, n, "feature", head, false, a.outcome(t))
 		undo()
 		errorType, msg := a.refusal(t)
 		if a.status != c.status || errorType != c.errorType || !strings.Contains(msg, c.message) {
@@ -577,8 +584,8 @@ func TestPush_EndsAPushThatOutlivesItsDeadline(t *testing.T) {
 	t.Parallel()
 	const deadline = 300 * time.Millisecond
 	p := newPushWorldWith(t, nil, []option{withPushDeadline(deadline)})
-	grow(t, p.copy, "dev", ref(t, p.copy, "refs/heads/dev"), "hub")
-	recorded := ref(t, p.copy, "refs/remotes/origin/dev")
+	head := grow(t, p.copy, "dev", ref(t, p.copy, "refs/heads/dev"), "hub")
+	recorded, n := ref(t, p.copy, "refs/remotes/origin/dev"), len(p.eventsOf(t, pushEvent))
 	p.origin.Block()
 	start := time.Now()
 	a := p.push(t, p.uKey, syncSlug, "dev", nil)
@@ -594,5 +601,50 @@ func TestPush_EndsAPushThatOutlivesItsDeadline(t *testing.T) {
 	}
 	if got := ref(t, p.copy, "refs/remotes/origin/dev"); got != recorded {
 		t.Errorf("the recorded origin head moved from %s to %s", recorded, got)
+	}
+	p.checkRecords(t, "a connected caller", n, "dev", head, false, "origin_timeout")
+	// A caller who leaves while origin stalls changes nothing either.
+	p.postAndLeave(t, p.uKey, "/api/v1/workspaces/"+syncSlug+"/branches/dev/push", p.asked())
+	eventually(t, "the push past its deadline is recorded", func() bool { return len(p.eventsOf(t, pushEvent)) == n+2 })
+	p.checkRecords(t, "a caller who left", n+1, "dev", head, false, "origin_timeout")
+}
+
+func TestPush_CompletesAfterTheCallerLeaves(t *testing.T) {
+	t.Parallel()
+	p := newPushWorld(t, nil)
+	head, n := grow(t, p.copy, "feature", ref(t, p.copy, "refs/heads/main"), "hub"), len(p.eventsOf(t, pushEvent))
+	p.origin.Block()
+	p.postAndLeave(t, p.uKey, "/api/v1/workspaces/"+syncSlug+"/branches/feature/push", p.asked())
+	p.origin.Release()
+	eventually(t, "the push is recorded", func() bool { return len(p.eventsOf(t, pushEvent)) == n+1 })
+	if got := p.origin.Head("feature"); got != head {
+		t.Errorf("origin's feature is at %q, want %s", got, head)
+	}
+	p.checkRecords(t, "a caller who left", n, "feature", head, false, "pushed")
+}
+
+func TestPush_PutsTheOriginHeadBackWhenTheRecordsFail(t *testing.T) {
+	t.Parallel()
+	p := newPushWorld(t, nil)
+	p.pushes.stubWith(gitrepo.PushPushed)
+	main := ref(t, p.copy, "refs/heads/main")
+	grow(t, p.copy, "main", main, "hub")
+	gitrepotest.Git(t, p.copy, "branch", "feature", main)
+	p.fail(faultEvent)
+	for _, branch := range []string{"main", "feature"} {
+		recorded, events := ref(t, p.copy, "refs/remotes/origin/"+branch), p.eventCount(t)
+		rec, _ := p.workspace(t, syncSlug)
+		if a := p.push(t, p.uKey, syncSlug, branch, nil); a.status != http.StatusInternalServerError || a.errorType(t) != "internal" {
+			t.Errorf("%s: answer %d %s, want 500 internal", branch, a.status, a.body)
+		}
+		if got := ref(t, p.copy, "refs/remotes/origin/"+branch); got != recorded {
+			t.Errorf("%s: the recorded origin head is %q, want %q as before", branch, got, recorded)
+		}
+		if after, _ := p.workspace(t, syncSlug); deref(after.OriginHeadSHA) != deref(rec.OriginHeadSHA) {
+			t.Errorf("%s: origin_head_sha moved from %q to %q", branch, deref(rec.OriginHeadSHA), deref(after.OriginHeadSHA))
+		}
+		if n := p.eventCount(t); n != events {
+			t.Errorf("%s: %d events written", branch, n-events)
+		}
 	}
 }
