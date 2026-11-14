@@ -54,3 +54,22 @@ origin would be trusted by a hub that trusts the first; the untrusted
 certificate is therefore a switch of the one origin. The stall is
 `Block()`, and "listener closed" is a second origin that was closed, which
 the workspace's `git_url` is pointed at for that case.
+
+## The records after a push and the deadline
+
+The push deadline bounds the push alone, not the writes after it. A push
+cut off at its deadline still writes its `origin_timeout` event, which a
+context past its deadline could not, and the writes run on a context the
+caller's disconnect does not cancel.
+
+## The developer's push from the shell
+
+The first execution path ends with "the workspace record's
+`origin_head_sha` equals its `head_sha`". The push writes
+`origin_head_sha` for the default branch, and nothing else of the record:
+`head_sha` is written by the clone and by a sync, and the writers that move
+a branch of the hub (landing, git push into the hub) are later packages. The
+end-to-end test adds its commit to the hub's copy on disk, past the hub's
+record keeping, so its `head_sha` still names the clone's head after the
+push. The test therefore compares `origin_head_sha` with the hub's head of
+`main` read from the copy, which is the commit the push answered as `sha`.
