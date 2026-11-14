@@ -1113,7 +1113,51 @@ The message names the first scope the token lacks, or the first of the
 hub credential's globs no glob of the token covers, or says that the token
 is limited to paths and the hub credential is not; do not branch on it.
 
-No sandbox route is served yet; the sandbox routes will be.
+## `GET /api/v1/sandbox-profiles`
+
+Lists the sandbox profiles of the hub's configuration (see
+[configuration.md](configuration.md#sandboxes)), so that an agent knows
+which profile to ask for. Any authenticated caller may call it: an API key,
+the admin token, or a PAT with the scope `sandboxes:read`. It needs access
+to no workspace, so a user who owns none gets the same list.
+
+The answer is `200` with every profile, in name order, on one page:
+`next_cursor` is always `null`, and the route ignores every query
+parameter, `limit` and `cursor` included. It is read from the configuration
+alone and asks the sandbox runtime nothing, so it answers the same while the
+runtime is unreachable.
+
+```json
+{"items":[{"name":"agent","default":true,"description":"an agent","image":"agent:1","cpu":"2","memory":"4Gi","gpu":1,"ttl":"4h","ttl_seconds":14400,"idle_timeout":"30m","policy_summary":["a.test","b.test"],"credentials":["model"],"optional_credentials":["search"],"exposed_secrets":[{"name":"A_TOKEN","optional":true},{"name":"Z_TOKEN","optional":false}],"hub_access":"none","env_keys":["A","B"],"checkpoint":false,"allow_proposals":false}],"next_cursor":null}
+```
+
+Each item has exactly these members:
+
+| Member | Value |
+|---|---|
+| `name` | the profile's name |
+| `default` | `true` for the profile a sandbox gets when its creator names none |
+| `description` | the profile's description, `""` when it has none |
+| `image`, `cpu`, `memory` | as configured, `""` when the profile leaves them to the runtime |
+| `gpu` | the number of GPUs, `0` when none |
+| `ttl` | the profile's time to live, as a [duration](#timestamps-and-durations) in the largest unit that divides it: `4h`, `30m`, `1d` (a `ttl` of `24h` is written `1d`) |
+| `ttl_seconds` | the same time to live in seconds, an integer |
+| `idle_timeout` | the profile's idle timeout, the section's when the profile sets none, written like `ttl`; `0s` when the idle stop is off |
+| `policy_summary` | the hosts the profile's base policy allows, as the runtime reported them at start, sorted; `[]` for the built-in policy |
+| `credentials`, `optional_credentials` | the names of the configured credentials the profile attaches, required and optional; `[]` when none |
+| `exposed_secrets` | the names of the secrets the profile exposes, each `{"name": …, "optional": …}`, sorted by name; `[]` when none |
+| `hub_access` | `fork` or `none` |
+| `env_keys` | the names of the profile's `env` variables, sorted; `[]` when none |
+| `checkpoint`, `allow_proposals` | as configured |
+
+The path of a policy file, the values of `env`, and the lists
+`expose_secrets` and `optional_expose_secrets` are never shown, and no
+member holds a secret's value.
+
+A PAT without `sandboxes:read` gets `403 insufficient_scope`, a request
+without a credential `401 unauthenticated`, and on a hub without sandboxes
+every authenticated caller gets `404 sandboxes_disabled` (see
+[Sandbox routes](#sandbox-routes)).
 
 ## User selectors
 

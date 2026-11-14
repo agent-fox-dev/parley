@@ -343,6 +343,7 @@ Available Commands:
   keys        List, refresh and revoke your API keys
   login       Sign in to the hub and save the hub URL and the credential
   orgs        List and read the organizations you belong to
+  sandbox     Work with the hub's sandboxes and their profiles
   tokens      Create, read, change and revoke your personal access tokens
   user        Read and update your own profile
   version     Print the client's build and, given a hub URL, the hub's build
@@ -1123,6 +1124,32 @@ with exit status `2`, and sends no request:
   }
 }
 ```
+
+### `parley sandbox`
+
+`parley sandbox profiles` calls `GET /api/v1/sandbox-profiles` once (see
+[api.md](api.md#get-apiv1sandbox-profiles)) with the credential as
+`Authorization: Bearer`, prints the hub's answer on stdout as described
+under [Output](#output), and exits `0`. The list is one page, in name order,
+and the command has no paging flags. An error the hub answers is written to
+stderr as received, with exit status `1`; on a hub without sandboxes:
+
+```json
+{
+  "error": {
+    "code": 404,
+    "message": "sandboxes are not enabled on this hub",
+    "error_type": "sandboxes_disabled"
+  }
+}
+```
+
+| Command | Request |
+|---|---|
+| `parley sandbox profiles` | `GET /api/v1/sandbox-profiles` |
+
+`parley sandbox` run without a command prints its help and exits `0`; it
+reads no credential and sends no request.
 
 ### Output
 

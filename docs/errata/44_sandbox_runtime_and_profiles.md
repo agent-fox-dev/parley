@@ -271,3 +271,25 @@ leaves the rest open. The code follows these rules:
   not`, or the first glob of `hub_access.paths` no PAT glob covers
   (`paths: "<glob>" of the sandbox's hub credential is not covered by a glob
   of this token`).
+
+## The profile list's details
+
+The package fixes the members of an item of `GET /sandbox-profiles` and
+writes `ttl` and `idle_timeout` "in the largest unit that divides them",
+with the examples `4h`, `30m` and `0s`. The code follows these rules:
+
+- The units are those of the duration grammar the configuration is read
+  with (`s`, `m`, `h`, `d`), so a whole number of days is written in days: a
+  `ttl` of `24h` is listed as `1d`. Every value listed reads back to the same
+  duration. Zero is `0s`.
+- The route is added in `composeSandbox` (`internal/hub/sandbox.go`, where
+  the sandbox part of the composition lives since task 5), not in
+  `internal/hub/hub.go`; it is declared by `(*sandbox.Service).ProfilesRoute`
+  in `internal/sandbox/routes.go`.
+- Query parameters are ignored entirely, a malformed `cursor` or an
+  out-of-range `limit` included, rather than read and refused as other
+  lists do, because the list is one page by design.
+- `policy_summary` is the start-up check's hosts, sorted again on output;
+  a profile on the built-in policy, and a validated policy that allows no
+  host, both list `[]`. Every other list member is `[]` when empty, never
+  `null`.

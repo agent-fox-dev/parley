@@ -229,8 +229,8 @@ type probeHub struct {
 // startProbeHub starts a probe hub, with sandboxes on over a fake runtime
 // when on is true. Its probe routes are:
 //
-//   - GET /sandbox-profiles (scope sandboxes:read) and GET /sandboxes,
-//     declared for the whole hub;
+//   - GET /sandboxes, declared for the whole hub (GET /sandbox-profiles is
+//     the hub's own);
 //   - GET /workspaces/:slug/sandboxes/probe-read, of kind read;
 //   - POST /workspaces/:slug/sandboxes/probe-write, of kind write, with the
 //     body limit probeBodyLimit;
@@ -257,9 +257,8 @@ func startProbeHub(t *testing.T, on bool) *probeHub {
 				return h.rt.Client(s.OpenShellWorkspace, deps.Recorder), nil
 			})
 		}
-		// The routes of the whole hub stand in for the feature's own until
-		// the hub serves them.
-		c.AddRoute(svc.Route(server.Route{Method: http.MethodGet, Pattern: "/sandbox-profiles", Scope: "sandboxes:read", Handler: h.probe}))
+		// The hub-wide list stands in for the feature's own until the hub
+		// serves it.
 		c.AddRoute(svc.Route(server.Route{Method: http.MethodGet, Pattern: "/sandboxes", Handler: h.probe}))
 		c.AddRoute(svc.WorkspaceRoute(sandbox.KindRead, server.Route{Method: http.MethodGet, Pattern: "/workspaces/:slug/sandboxes/probe-read", Handler: h.probe}))
 		c.AddRoute(svc.WorkspaceRoute(sandbox.KindWrite, server.Route{Method: http.MethodPost, Pattern: "/workspaces/:slug/sandboxes/probe-write", MaxBodySize: probeBodyLimit, Handler: h.probe}))
@@ -375,4 +374,44 @@ func (h *probeHub) call(t *testing.T, method, path, cred string, body any) answe
 		_ = json.Unmarshal(*env.Error, &a.err)
 	}
 	return a
+}
+
+// profilesFile is the configuration of the profile list's tests: the
+// profile plain, on the built-in policy with nothing set but a ttl of 24h
+// and the idle stop turned off, and
+// the profile agent, with every key the list shows or hides set and the
+// idle_timeout left to the section's default (30m), written in that order.
+var profilesFile = hubtest.Config{
+	Server: "external_url = \"https://hub.test\"\n",
+	TOML: "[sandbox]\ngateway_url = \"https://gw.test:8443\"\ntoken_file = \"gateway-token\"\n" +
+		"[[sandbox.profiles]]\nname = \"plain\"\nttl = \"24h\"\nidle_timeout = \"0s\"\n" +
+		"[[sandbox.profiles]]\nname = \"agent\"\ndefault = true\ndescription = \"an agent\"\nimage = \"agent:1\"\ncpu = \"2\"\nmemory = \"4Gi\"\ngpu = 1\n" +
+		"ttl = \"4h\"\npolicy = \"policy.yaml\"\ncredentials = [\"model\"]\noptional_credentials = [\"search\"]\n" +
+		"expose_secrets = [\"Z_TOKEN\"]\noptional_expose_secrets = [\"A_TOKEN\"]\nhub_access = \"none\"\ncheckpoint = false\nallow_proposals = false\n" +
+		"env = { B = \"vb\", A = \"va\" }\n" +
+		credentialTable("model") + credentialTable("search"),
+	Files: map[string]string{"gateway-token": gatewayToken + "\n", "policy.yaml": policyContent},
+}
+
+// startProfilesHub starts a hub with sandboxes on over a fake runtime with
+// profilesFile, the runtime reporting the hosts b.test and a.test for the
+// policy file, and returns it with the absolute path of agent's policy file.
+func startProfilesHub(t *testing.T) (*probeHub, string) {
+	t.Helper()
+	h := &probeHub{rt: newRuntime(t)}
+	h.rt.SetPolicyValidation([]byte(policyContent), runtime.PolicyValidation{Hosts: []string{"b.test", "a.test"}})
+	var svc *sandbox.Service
+	cfg := profilesFile
+	cfg.Compose = func(c *hub.Composition) {
+		svc = c.Sandbox()
+		c.SetSandboxRuntime(func(s *sandbox.Settings, deps sandbox.RuntimeDeps) (runtime.Client, error) {
+			return h.rt.Client(s.OpenShellWorkspace, deps.Recorder), nil
+		})
+	}
+	h.Hub = hubtest.StartWith(t, cfg)
+	agent, ok := svc.Settings().Profile("agent")
+	if !ok || agent.PolicyPath == "" {
+		t.Fatalf("the hub has no profile agent with a policy file: %+v", agent)
+	}
+	return h, agent.PolicyPath
 }
