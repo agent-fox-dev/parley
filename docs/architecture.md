@@ -30,7 +30,7 @@ command-line client. Both are written in Go, in the module
 | `internal/store` | the hub's two embedded SQLite stores (`modernc.org/sqlite`, no cgo): `Open` creates the data directory and the workspace root, opens the transactional store and the analytical store (`analytics.db` beside it) and applies the registered schema steps; `Tx` runs a transaction of the transactional store; `Snapshot` writes a consistent copy of one store file without changing it |
 | `internal/server` | the hub's HTTP server: its built-in routes, the REST API's route registration and check pipeline, the error envelope, request ids, response headers and the access log, list paging, idempotency keys, and the readiness probes |
 | `internal/server/timefmt` | the one timestamp format (`Format`, and the response member type `Time`) and the one duration grammar (`ParseDuration`); a leaf package that imports nothing of the project, so that the configuration loader can use it as well as the REST API |
-| `internal/workspace` | the place for workspace records, their validation rules, the state guard, and the create and clone work; so far the rules every workspace route judges its values by, each deciding on the text alone and returning an error that says which rule broke: `ValidateSlug` (3 to 64 characters of a to z, digits and hyphens, starting with a letter), `ValidateGitURL` (`https://<host>/<path>` without user information, or `git@<host>:<path>`, with no lookup or connection), `ValidateBranchName` (git's branch-name rule), `ValidateForkName` (1 to 32 characters of a to z, digits and hyphens) and `ParseDuration` (a whole number above zero followed by `m`, `h` or `d`, unlike `timefmt.ParseDuration`, which also takes seconds) |
+| `internal/workspace` | the place for workspace records, their validation rules, the state guard, and the create and clone work; so far the whole workspace record with its store functions and the state guard `RequireReady` (see Workspace records), and the rules every workspace route judges its values by, each deciding on the text alone and returning an error that says which rule broke: `ValidateSlug` (3 to 64 characters of a to z, digits and hyphens, starting with a letter), `ValidateGitURL` (`https://<host>/<path>` without user information, or `git@<host>:<path>`, with no lookup or connection), `ValidateBranchName` (git's branch-name rule), `ValidateForkName` (1 to 32 characters of a to z, digits and hyphens) and `ParseDuration` (a whole number above zero followed by `m`, `h` or `d`, unlike `timefmt.ParseDuration`, which also takes seconds) |
 | `test/e2e` | tests that build the binaries and run them |
 
 ## The HTTP server
@@ -1631,6 +1631,59 @@ a workspace-bound token was not recorded`, with `token_id`,
 `bound_workspace` and `error`, never a token value) and not retried, and
 the token's minute counts as started. A limiter without an emitter logs
 the same warning.
+
+### Workspace records
+
+`internal/workspace/store.go` holds `workspace.SchemaStep`
+(`workspace_fields`), which extends the table `workspaces` of
+`access.SchemaStep` instead of keeping a second table, so that the access
+rule and the workspace routes read one row; it applies after
+`access.CreatingTokenStep`. It adds one column per `ALTER TABLE workspaces
+ADD COLUMN` statement: `workspace_mode` (`standard` or `carry_patch`, a
+`CHECK` constraint, default `standard`), `git_url`, `default_branch`,
+`display_name` and `description` (default `''`), `head_sha`,
+`origin_head_sha`, `clone_error`, `last_sync_at`, `sync_error`,
+`upstream_url`, `integration_branch`, `upstream_head_sha`, `fork_point_ref`
+and `fork_point_sha` (both NULL unless the workspace is a fork),
+`expires_at`, `auto_change`, `purpose`, `session_id`, `settings` (the stored
+settings document as one JSON object, default `'{}'`), `created_at` and
+`updated_at` (default `0`), `instance_id` (default `''`) and `maintenance`
+(`''`, `reclone`, `archive` or `delete`, a `CHECK` constraint). Times are
+UnixNano integers. The slug stays the primary key, unique across
+repositories and forks. Origin heads have no column: they are refs of the
+workspace's copy. No part of the hub registers the step yet.
+
+`internal/workspace/record.go` holds `workspace.Workspace`, every field of
+a workspace (a nil pointer for a null field) plus `InstanceID`, `Marker` and
+`CreatingTokenID`, which no response shows; the type `Status` with
+`StatusPending` to `StatusArchived` (the access rule's strings); the type
+`Marker` with `MarkerNone` (`""`), `MarkerReclone`, `MarkerArchive` and
+`MarkerDelete`; `ModeStandard` and `ModeCarryPatch`; `ForkPoint` (`Ref`,
+`SHA`); and `NewInstanceID`, 128 random bits as 32 hex digits. The store
+functions take the caller's transaction:
+
+- `Insert(ctx, tx, w)` refuses an empty `InstanceID` with
+  `access.ErrInvalidRecord` before writing, stores the access rule's columns
+  with `access.InsertRecord` (so a taken slug is `access.ErrDuplicateSlug`)
+  and then the other fields with an `UPDATE` in the same transaction; a nil
+  `Settings` is stored as `{}`.
+- `BySlug(ctx, q, slug)` reads the record through an `access.Querier`; an
+  unknown slug is found = false with a nil error, and `Settings` is never
+  nil.
+- `UpdateClone(ctx, ex, slug, c)` writes `CloneFields` (`Status`,
+  `DefaultBranch`, `HeadSHA`, `OriginHeadSHA`, `CloneError`, `UpdatedAt`),
+  every one of them, a nil one as NULL, through an `Execer` (a `*sql.Tx` or
+  the `*sql.DB`); an unknown slug is `workspace.ErrNotFound`.
+
+`internal/workspace/guard.go` holds `RequireReady(w)`, the state check of
+every route that needs a workspace's repository. It reads the marker first:
+any marker is `409 workspace_busy`, because a reclone or a delete of a
+failed or archived workspace is work the caller should wait out. Then the
+status: `pending` or `cloning` is `409 workspace_busy`, `archived` is
+`409 workspace_archived` (`server.WorkspaceArchived`), `failed` is
+`409 workspace_not_ready`, and `ready` passes. It reads only the record it
+is given and takes no lock, so a ready workspace serves any number of
+requests at once.
 
 ### Hub events
 
