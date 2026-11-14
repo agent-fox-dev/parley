@@ -17,16 +17,20 @@ var tokenIDArg = argSpec{Name: "token_id", Required: true}
 // tokens.
 func newTokensCommand() *cobra.Command {
 	return group("tokens", "Create, read, change and revoke your personal access tokens",
-		declare(command{
+		withWorkspace(declare(command{
 			Name:        "list",
-			Description: "List your personal access tokens, newest first",
+			Description: "List your personal access tokens, newest first, or with --workspace the tokens bound to a workspace",
 			Method:      http.MethodGet,
 			Path:        "/user/tokens",
 			Auth:        authUser,
-		}),
-		declare(command{
+			Flags: func(fs *pflag.FlagSet) {
+				fs.String("workspace", "", "list the tokens bound to the workspace with this slug, in place of your own")
+			},
+			Run: func(c *call) error { return sendToTokens(c, nil) },
+		})),
+		withWorkspace(declare(command{
 			Name:        "create",
-			Description: "Create a personal access token",
+			Description: "Create a personal access token, with --workspace one bound to a workspace",
 			Method:      http.MethodPost,
 			Path:        "/user/tokens",
 			Auth:        authUser,
@@ -39,9 +43,10 @@ func newTokensCommand() *cobra.Command {
 				_ = cobra.MarkFlagRequired(fs, "permissions")
 				fs.StringArray("paths", nil, "globs of the repository paths the token may write, separated by commas; repeatable, and sent only when given")
 				fs.Int("expires", 90, "the token's lifetime in days, or 0 for a token that does not expire")
+				fs.String("workspace", "", "bind the token to the workspace with this slug")
 			},
 			Run: createToken,
-		}),
+		})),
 		declare(command{
 			Name:        "show",
 			Description: "Show one of your personal access tokens",
@@ -91,7 +96,43 @@ func createToken(c *call) error {
 		}
 		body["paths"] = paths
 	}
-	return sendWith(c, nil, body)
+	return sendToTokens(c, body)
+}
+
+// withWorkspace refuses an empty --workspace on cmd as a usage error, with
+// the other usage errors and before any setting is resolved or any request
+// sent: sent on, it would reach the caller's own tokens, and create would
+// mint a token bound to no workspace in place of a bound one.
+func withWorkspace(cmd *cobra.Command) *cobra.Command {
+	checkLine := cmd.Args
+	cmd.Args = func(cmd *cobra.Command, args []string) error {
+		if err := checkLine(cmd, args); err != nil {
+			return err
+		}
+		if fs := cmd.Flags(); fs.Changed("workspace") {
+			if slug, _ := fs.GetString("workspace"); slug == "" {
+				return usageError("%s needs a workspace slug as the value of --workspace", cmd.CommandPath())
+			}
+		}
+		return nil
+	}
+	return cmd
+}
+
+// sendToTokens sends the command's method with body to the tokens bound to
+// the workspace named by --workspace, the slug encoded as one segment, or,
+// without the flag, to the command's own path, and prints the answer.
+func sendToTokens(c *call, body any) error {
+	path := c.decl.Path
+	if fs := c.cmd.Flags(); fs.Changed("workspace") {
+		slug, _ := fs.GetString("workspace")
+		path = routePath("/workspaces/:slug/tokens", map[string]string{"slug": slug})
+	}
+	resp, err := c.client.request(c.ctx, c.decl.Method, path, nil, body)
+	if err != nil {
+		return err
+	}
+	return c.printAnswer(resp)
 }
 
 // changePermissions builds parley tokens replace, add or remove: method to

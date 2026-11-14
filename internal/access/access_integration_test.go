@@ -105,7 +105,7 @@ func (h *accessHub) call(t *testing.T, method, path, key string, body any) answe
 	if err != nil {
 		t.Fatalf("%s %s: read the body: %v", method, path, err)
 	}
-	return answer{res.StatusCode, res.Header.Get("Content-Type"), b}
+	return answer{res.StatusCode, res.Header.Get("Content-Type"), b, res.Header.Get("Allow")}
 }
 
 // readable builds the readable set of the user userID with a service bound

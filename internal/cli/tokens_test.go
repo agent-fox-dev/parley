@@ -2,6 +2,7 @@ package cli
 
 import (
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -10,6 +11,12 @@ import (
 const mintedToken = `{"token":"parley_pat_k3x9q2mz_0123456789abcdefghijklmnopqrstuv","token_id":"k3x9q2mz","name":"ci",` +
 	`"permissions":["git:read","changes:write"],"paths":null,"workspace":null,` +
 	`"expires_at":"2027-02-11T10:00:00Z","revoked_at":null,"created_at":"2026-11-13T10:00:00Z"}`
+
+// boundToken is a Token bound to the workspace w1 as the hub answers its
+// creation, with its value.
+const boundToken = `{"token_id":"b7r2w9qd","name":"a","permissions":["git:read","git:write"],"paths":null,"workspace":"w1",` +
+	`"expires_at":"2027-02-11T10:00:00Z","revoked_at":null,"created_at":"2026-11-13T10:00:00Z",` +
+	`"token":"parley_pat_b7r2w9qd_0123456789abcdefghijklmnopqrstuv"}`
 
 // tokenRevokedAt is a Token after a change of its permissions, revoked at
 // revokedAt, a JSON value.
@@ -23,25 +30,46 @@ func TestTokensCreate_SendsTheTokenAndWarnsItsValueIsShownOnce(t *testing.T) {
 	tests := []struct {
 		name  string
 		flags []string
-		body  string
+		// rawPath is the path the request goes to, as sent; answer is the
+		// hub's 201 body.
+		rawPath, answer string
+		body            string
 	}{
 		{"with every flag",
 			[]string{"--name", "ci", "--permissions", "git:read,changes:write", "--paths", "docs/**,src/*.go", "--paths", "README.md", "--expires", "30"},
+			"/api/v1/user/tokens", mintedToken,
 			`{"name":"ci","permissions":["git:read","changes:write"],"paths":["docs/**","src/*.go","README.md"],"expires":30}`},
 		{"without --paths and --expires",
 			[]string{"--name", "ci", "--permissions", "git:read"},
+			"/api/v1/user/tokens", mintedToken,
 			`{"name":"ci","permissions":["git:read"],"expires":90}`},
+		{"bound to a workspace",
+			[]string{"--name", "a", "--permissions", "git:read,git:write", "--workspace", "w1"},
+			"/api/v1/workspaces/w1/tokens", boundToken,
+			`{"name":"a","permissions":["git:read","git:write"],"expires":90}`},
+		{"bound to a workspace with every flag",
+			[]string{"--name", "a", "--permissions", "git:read,git:write", "--paths", "docs/**", "--paths", "src/*.go,README.md", "--expires", "30", "--workspace", "w1"},
+			"/api/v1/workspaces/w1/tokens", boundToken,
+			`{"name":"a","permissions":["git:read","git:write"],"paths":["docs/**","src/*.go","README.md"],"expires":30}`},
+		{"bound to a workspace whose slug holds a slash",
+			[]string{"--name", "a", "--permissions", "git:read,git:write", "--workspace", "a/b"},
+			"/api/v1/workspaces/a%2Fb/tokens", boundToken,
+			`{"name":"a","permissions":["git:read","git:write"],"expires":90}`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			hub := newStubHub(t).answer(http.MethodPost, "/api/v1/user/tokens", http.StatusCreated, mintedToken)
+			path, err := url.PathUnescape(tt.rawPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			hub := newStubHub(t).answer(http.MethodPost, path, http.StatusCreated, tt.answer)
 
 			code, stdout, stderr := runAgainst(t, hub, append([]string{"tokens", "create"}, tt.flags...)...)
 
 			if code != 0 {
 				t.Errorf("exit status = %d, want 0 (stderr %q)", code, stderr)
 			}
-			if want := indented(t, mintedToken); stdout != want {
+			if want := indented(t, tt.answer); stdout != want {
 				t.Errorf("stdout = %q, want %q", stdout, want)
 			}
 			if !strings.Contains(stderr, showOnceWarning) {
@@ -51,8 +79,11 @@ func TestTokensCreate_SendsTheTokenAndWarnsItsValueIsShownOnce(t *testing.T) {
 			if len(sent) != 1 {
 				t.Fatalf("the hub got %d requests, want 1", len(sent))
 			}
-			if sent[0].method != http.MethodPost || sent[0].rawPath != "/api/v1/user/tokens" {
-				t.Errorf("sent %s %s, want POST /api/v1/user/tokens", sent[0].method, sent[0].rawPath)
+			if sent[0].method != http.MethodPost || sent[0].rawPath != tt.rawPath {
+				t.Errorf("sent %s %s, want POST %s", sent[0].method, sent[0].rawPath, tt.rawPath)
+			}
+			if auth := sent[0].header.Get("Authorization"); auth != "Bearer K" {
+				t.Errorf("Authorization = %q, want %q", auth, "Bearer K")
 			}
 			if ct := sent[0].header.Get("Content-Type"); ct != "application/json" {
 				t.Errorf("Content-Type = %q, want application/json", ct)
@@ -70,6 +101,8 @@ func TestKeyAndTokenCommands_SendOneRequestAndPrintTheAnswer(t *testing.T) {
 	}{
 		{[]string{"keys", "list"}, sentRequest{method: http.MethodGet, rawPath: "/api/v1/user/keys"}},
 		{[]string{"tokens", "list"}, sentRequest{method: http.MethodGet, rawPath: "/api/v1/user/tokens"}},
+		{[]string{"tokens", "list", "--workspace", "w1"}, sentRequest{method: http.MethodGet, rawPath: "/api/v1/workspaces/w1/tokens"}},
+		{[]string{"tokens", "list", "--workspace", "a/b"}, sentRequest{method: http.MethodGet, rawPath: "/api/v1/workspaces/a%2Fb/tokens"}},
 		{[]string{"tokens", "show", "k3x9q2mz"}, sentRequest{method: http.MethodGet, rawPath: "/api/v1/user/tokens/k3x9q2mz"}},
 		{[]string{"tokens", "revoke", "k3x9q2mz"}, sentRequest{method: http.MethodDelete, rawPath: "/api/v1/user/tokens/k3x9q2mz"}},
 		{[]string{"tokens", "replace", "k3x9q2mz", "--permissions", ""},
@@ -130,5 +163,67 @@ func TestTokensPermissions_SendTheListAndNoteARevocation(t *testing.T) {
 				wantJSONBody(t, sent[0].body, `{"permissions":["git:read","vars:read"]}`)
 			})
 		}
+	}
+}
+
+// The test sets environment variables, so it must not run in parallel.
+func TestTokensWithWorkspace_PrintTheHubsErrorAndNoResult(t *testing.T) {
+	commands := []struct {
+		args         []string
+		method, path string
+	}{
+		{[]string{"tokens", "create", "--name", "a", "--permissions", "git:read", "--workspace", "w1"}, http.MethodPost, "/api/v1/workspaces/w1/tokens"},
+		{[]string{"tokens", "list", "--workspace", "w1"}, http.MethodGet, "/api/v1/workspaces/w1/tokens"},
+	}
+	envelopes := []string{
+		`{"error":{"code":403,"message":"a token bound to a workspace cannot use this route","error_type":"token_bound"}}`,
+		`{"error":{"code":403,"message":"the token lacks the scope tokens:manage","error_type":"insufficient_scope"}}`,
+		`{"error":{"code":404,"message":"workspace not found","error_type":"not_found"}}`,
+		`{"error":{"code":409,"message":"the workspace is archived","error_type":"workspace_archived"}}`,
+	}
+	for _, cmd := range commands {
+		for _, envelope := range envelopes {
+			status, _, errorType := clientEnvelope(t, envelope)
+			t.Run(cmd.args[1]+" "+errorType, func(t *testing.T) {
+				hub := newStubHub(t).answer(cmd.method, cmd.path, int(status), envelope)
+
+				code, stdout, stderr := runAgainst(t, hub, cmd.args...)
+
+				if code != 1 {
+					t.Errorf("exit status = %d, want 1", code)
+				}
+				if want := indented(t, envelope); stderr != want {
+					t.Errorf("stderr = %q, want the hub's envelope %q and nothing else", stderr, want)
+				}
+				if stdout != "" {
+					t.Errorf("stdout = %q, want it empty", stdout)
+				}
+				if n := len(hub.recorded()); n != 1 {
+					t.Errorf("the hub got %d requests, want 1", n)
+				}
+			})
+		}
+	}
+}
+
+// The test sets environment variables, so it must not run in parallel.
+func TestTokensWithWorkspace_RefuseAnEmptyWorkspaceBeforeAnyRequest(t *testing.T) {
+	tests := [][]string{
+		{"tokens", "create", "--name", "a", "--permissions", "git:read", "--workspace", ""},
+		{"tokens", "list", "--workspace", ""},
+	}
+	for _, args := range tests {
+		t.Run(args[1], func(t *testing.T) {
+			hub := newStubHub(t)
+
+			code, stdout, stderr := runAgainst(t, hub, args...)
+
+			if message := wantClientFailure(t, code, stdout, stderr, "usage_error"); !strings.Contains(message, "--workspace") {
+				t.Errorf("message = %q, want it to name --workspace", message)
+			}
+			if n := len(hub.recorded()); n != 0 {
+				t.Errorf("the hub got %d requests, want none", n)
+			}
+		})
 	}
 }

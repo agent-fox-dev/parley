@@ -37,14 +37,18 @@ const (
 
 // Record is the minimal workspace record. ParentSlug is "" for a repository
 // and the slug of the repository a fork was created from for a fork; the
-// store keeps "" as NULL.
+// store keeps "" as NULL. CreatingTokenID is the id of the PAT whose request
+// created a fork, "" for a repository and for a fork created by another
+// credential; a token bound to the parent covers the forks it created. It is
+// never part of an answer, so it has no JSON name.
 type Record struct {
-	Slug       string `json:"slug"`
-	OwnerID    string `json:"owner_id"`
-	OrgID      string `json:"org_id"`
-	Kind       string `json:"kind"`
-	ParentSlug string `json:"parent_slug"`
-	Status     string `json:"status"`
+	Slug            string `json:"slug"`
+	OwnerID         string `json:"owner_id"`
+	OrgID           string `json:"org_id"`
+	Kind            string `json:"kind"`
+	ParentSlug      string `json:"parent_slug"`
+	Status          string `json:"status"`
+	CreatingTokenID string `json:"-"`
 }
 
 // ErrDuplicateSlug is returned by InsertRecord when a record with the slug
@@ -80,6 +84,19 @@ CREATE INDEX workspaces_parent ON workspaces (parent_slug);`)
 	},
 }
 
+// CreatingTokenStep gives the workspace records the creating token of a
+// fork. It is a step of its own, after SchemaStep, so that a store whose
+// records exist already gains the column. The token id carries no foreign
+// key: a revoked or deleted token keeps naming the forks it created.
+var CreatingTokenStep = store.Step{
+	Name:   "workspace_creating_token",
+	Target: store.Main,
+	Apply: func(ctx context.Context, tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `ALTER TABLE workspaces ADD COLUMN creating_token_id TEXT`)
+		return err
+	},
+}
+
 // Querier is what a read of records goes through: the store's *sql.DB or an
 // open *sql.Tx.
 type Querier interface {
@@ -89,10 +106,11 @@ type Querier interface {
 
 // InsertRecord stores rec in tx. It returns an error wrapping
 // ErrInvalidRecord, and writes nothing, when rec has an empty slug, owner or
-// org, an unknown kind or status, a parent although it is a repository, or no
-// parent although it is a fork, or when a fork's parent has no record, is a
+// org, an unknown kind or status, a parent or a creating token although it
+// is a repository, or no parent although it is a fork, or when a fork's parent has no record, is a
 // fork itself or belongs to another org; it returns ErrDuplicateSlug when the
-// slug has a record. The parent is read in tx, so that it cannot change
+// slug has a record. Fork creation records the creating token through it.
+// The parent is read in tx, so that it cannot change
 // between the check and the write.
 func InsertRecord(ctx context.Context, tx *sql.Tx, rec Record) error {
 	if err := validate(rec); err != nil {
@@ -112,10 +130,10 @@ func InsertRecord(ctx context.Context, tx *sql.Tx, rec Record) error {
 		}
 	}
 	res, err := tx.ExecContext(ctx, `
-INSERT INTO workspaces (slug, owner_id, org_id, kind, parent_slug, status)
-VALUES (?, ?, ?, ?, ?, ?)
+INSERT INTO workspaces (slug, owner_id, org_id, kind, parent_slug, status, creating_token_id)
+VALUES (?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT (slug) DO NOTHING`,
-		rec.Slug, rec.OwnerID, rec.OrgID, rec.Kind, sql.NullString{String: rec.ParentSlug, Valid: rec.ParentSlug != ""}, rec.Status)
+		rec.Slug, rec.OwnerID, rec.OrgID, rec.Kind, nullable(rec.ParentSlug), rec.Status, nullable(rec.CreatingTokenID))
 	if err != nil {
 		return fmt.Errorf("insert workspace record %q: %w", rec.Slug, err)
 	}
@@ -149,6 +167,9 @@ func validate(rec Record) error {
 		if rec.ParentSlug != "" {
 			return fmt.Errorf("%w: a repository has no parent", ErrInvalidRecord)
 		}
+		if rec.CreatingTokenID != "" {
+			return fmt.Errorf("%w: a repository has no creating token", ErrInvalidRecord)
+		}
 	case KindFork:
 		if rec.ParentSlug == "" {
 			return fmt.Errorf("%w: a fork has a parent", ErrInvalidRecord)
@@ -160,17 +181,23 @@ func validate(rec Record) error {
 }
 
 // recordColumns are the columns scanRecord reads, in its order.
-const recordColumns = `slug, owner_id, org_id, kind, parent_slug, status`
+const recordColumns = `slug, owner_id, org_id, kind, parent_slug, status, creating_token_id`
 
 // scanRecord reads one row of recordColumns.
 func scanRecord(scan func(dest ...any) error) (Record, error) {
 	var rec Record
-	var parent sql.NullString
-	if err := scan(&rec.Slug, &rec.OwnerID, &rec.OrgID, &rec.Kind, &parent, &rec.Status); err != nil {
+	var parent, creator sql.NullString
+	if err := scan(&rec.Slug, &rec.OwnerID, &rec.OrgID, &rec.Kind, &parent, &rec.Status, &creator); err != nil {
 		return Record{}, err
 	}
 	rec.ParentSlug = parent.String
+	rec.CreatingTokenID = creator.String
 	return rec, nil
+}
+
+// nullable is s as a query argument, NULL when s is "".
+func nullable(s string) sql.NullString {
+	return sql.NullString{String: s, Valid: s != ""}
 }
 
 // RecordBySlug reads the record whose slug is exactly slug. A slug no record

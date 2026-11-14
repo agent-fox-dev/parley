@@ -250,6 +250,14 @@ again in the next hourly pass:
 {"time":"2026-11-13T10:13:00.000000+01:00","level":"ERROR","msg":"maintenance task failed","task":"claim_cleanup","error":"remove claim: database is locked"}
 ```
 
+The maintenance task `token_binding_sweep` writes one info line with the
+number of tokens it revoked, in a pass that revoked any: tokens bound to a
+workspace that no longer exists:
+
+```json
+{"time":"2026-11-14T10:13:00.000000+01:00","level":"INFO","msg":"revoked the tokens bound to workspaces that no longer exist","count":2}
+```
+
 When a stop stops waiting for something whose grace or the 30-second limit
 has passed, it writes one line naming it in `work`: `requests`,
 `maintenance loop` or the name of a piece of background work:
@@ -1062,7 +1070,9 @@ error the hub answers is written to stderr as received, with exit status
 | Command | Request |
 |---|---|
 | `parley tokens list` | `GET /api/v1/user/tokens` |
+| `parley tokens list --workspace <slug>` | `GET /api/v1/workspaces/<slug>/tokens` |
 | `parley tokens create --name <name> --permissions <scopes> [--paths <globs>]... [--expires <days>]` | `POST /api/v1/user/tokens` with the members `name`, `permissions` and `expires`, and `paths` only when `--paths` is given |
+| `parley tokens create --name <name> --permissions <scopes> [--paths <globs>]... [--expires <days>] --workspace <slug>` | `POST /api/v1/workspaces/<slug>/tokens` with the same body |
 | `parley tokens show <token_id>` | `GET /api/v1/user/tokens/<token_id>` |
 | `parley tokens revoke <token_id>` | `DELETE /api/v1/user/tokens/<token_id>` |
 | `parley tokens replace <token_id> --permissions <scopes>` | `PUT /api/v1/user/tokens/<token_id>/permissions` with `{"permissions": [...]}` |
@@ -1109,6 +1119,30 @@ warning: the token was revoked: it has no permissions left
 
 and exit `0`. `parley tokens add` writes no such note.
 
+`--workspace <slug>` on `parley tokens create` and `parley tokens list`
+turns them to the tokens bound to the workspace `<slug>` (see
+[Workspace-bound tokens](api.md#workspace-bound-tokens)): `create` sends its
+body, built from the same flags, to
+[`POST /api/v1/workspaces/<slug>/tokens`](api.md#post-apiv1workspacesslugtokens)
+in place of `POST /api/v1/user/tokens`, and prints the bound Token with its
+`token` and the show-once warning on stderr, as above; `list` sends
+[`GET /api/v1/workspaces/<slug>/tokens`](api.md#get-apiv1workspacesslugtokens)
+in place of `GET /api/v1/user/tokens` and prints the hub's list, whose
+Tokens never carry a `token`. The slug is sent as one percent-encoded path
+segment: `--workspace a/b` is sent as `/api/v1/workspaces/a%2Fb/tokens`. For
+example,
+
+```
+parley tokens create --name agent --permissions git:read --workspace w1
+```
+
+sends `{"expires":90,"name":"agent","permissions":["git:read"]}` to
+`POST /api/v1/workspaces/w1/tokens`. An error the hub answers, such as
+`403 token_bound` for a bound token or `409 workspace_archived`, is written
+to stderr as received with exit status `1`, and nothing is printed on
+stdout. Without `--workspace` both commands call the `/api/v1/user/tokens`
+routes.
+
 `parley admin tokens` takes `<user>` as the other admin commands do (see
 [User selectors](api.md#user-selectors)). Every command sends `<user>` and
 `<token_id>` each as one percent-encoded path segment: `a/b` is sent as
@@ -1117,8 +1151,13 @@ and exit `0`. `parley tokens add` writes no such note.
 A command run without one of its required flags (`--name` and
 `--permissions` on `parley tokens create`; `--permissions` on `replace`,
 `add` and `remove`), with a number of arguments other than the ones it
-takes, or with an `--expires` that is not an integer is a `usage_error`
-with exit status `2`, and sends no request:
+takes, with an `--expires` that is not an integer, or with `--workspace`
+given an empty value on `parley tokens create` or `parley tokens list` is
+a `usage_error` with exit status `2`, and sends no request, so an empty
+slug never falls back to an unbound token. The empty `--workspace` reads
+`parley tokens list needs a workspace slug as the value of --workspace`
+(`create` in place of `list` for the other command); an `--expires` that is
+not an integer reads:
 
 ```json
 {

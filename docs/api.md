@@ -53,7 +53,9 @@ that fails answers the request, and no later check or the handler runs.
 5. The route's own feature check, where it declares one, then the binding
    guard. Every sandbox route has the sandbox feature check: `404`
    `sandboxes_disabled` on a hub without sandboxes (see
-   [Sandbox routes](#sandbox-routes)).
+   [Sandbox routes](#sandbox-routes)). The binding guard confines a PAT
+   bound to a workspace: `404 not_found` or `403 token_bound` (see
+   [Workspace-bound tokens](#workspace-bound-tokens)).
 6. The scope check: `403 insufficient_scope` for a PAT whose permissions
    do not satisfy the scope the route declares (see [Scopes](#scopes)).
 7. The access checks: first the admin check of the admin routes, `403
@@ -167,6 +169,109 @@ the resource it addresses exists, and nothing changes:
 ```json
 {"error":{"code":403,"message":"this route needs the scope users:read","error_type":"insufficient_scope"}}
 ```
+
+## Workspace-bound tokens
+
+A PAT bound to a workspace (its `workspace` is a slug) is confined by the
+binding guard, which runs on every route that is not public, after
+authentication and the route's feature check and before the scope check
+(step 5 of the [order of checks](#order-of-checks)). It runs only for a bound
+PAT: the admin token, an API key and a PAT whose `workspace` is `null` get
+the same answers as on a hub without it. An unknown path (`404`), a method
+the path does not allow (`405`) and a credential that does not authenticate
+(`401`: a wrong secret, a revoked or an expired token) are answered before
+it, as for any caller. What the guard lets through goes on to the scope
+check and the access checks as for an unbound PAT of the same user, so a
+binding takes access away and never grants it.
+
+A binding covers the bound workspace and the task forks created with the
+token. A token bound to a task fork covers the fork alone, and on the
+fork's parent also reaches the contributor routes below.
+
+**Routes that name a workspace** (`/api/v1/workspaces/{slug}` and every
+route under it) pass for a covered workspace. Every other slug, whether or
+not a workspace has it, is answered with the same bytes as a workspace the
+caller cannot read, before the scope check, so a token without the route's
+scope gets the same answer:
+
+```json
+{"error":{"code":404,"message":"workspace not found","error_type":"not_found"}}
+```
+
+On the parent of the fork a token is bound to, the 25 contributor routes
+pass; every other route of the parent is answered `403 token_bound` with the
+message `a token bound to a task fork reaches only the contributor routes of
+its parent`. The contributor routes, under `/api/v1/workspaces/{slug}`: `POST`
+and `GET /changes`, `GET` and `PATCH /changes/:number`, `GET
+/changes/by-commit/:sha`, `POST /changes/:number/abandon`, `/restore`,
+`/restack` and `/land`, `GET /changes/:number/versions`,
+`/versions/:version`, `/diff`, `/stack`, `/lands`, `/conflict`,
+`/conflict/file`, `/approvals`, `/checks` and `/overlaps`, `GET /lands/:id`,
+`GET /policy`, `POST /policy/evaluate`, `GET /activity`, `GET /claims` and
+`GET /claims/:id`. The guard only lets them through, with the fork; confining
+them to the changes whose source is the fork is each route's own.
+
+**Routes that name no workspace** pass on the allowlist, with the binding,
+from which the route confines its result to the covered workspaces (the
+event routes do: see [`GET /api/v1/events/log`](#get-apiv1eventslog)):
+`GET /api/v1/workspaces`, `GET
+/api/v1/events`, `GET /api/v1/events/log`, `GET /api/v1/audit`, `GET
+/api/v1/sandbox-profiles`, `POST` and `GET /api/v1/sessions`, `GET
+/api/v1/sessions/:id`, `POST /api/v1/sessions/:id/complete`, and `POST` and
+`GET /api/v1/sessions/:id/usage`. Every other route that names no workspace,
+every identity route (`/user`, `/user/orgs`, `/user/keys…`, `/user/tokens…`),
+every admin route, `POST /api/v1/workspaces` and `GET /api/v1/sandboxes`
+among them, is answered before the scope check, whatever scopes the token
+holds, so a bound token can neither read nor revoke itself nor mint another
+token through `/api/v1/user/tokens`:
+
+```json
+{"error":{"code":403,"message":"a token bound to a workspace cannot use this route","error_type":"token_bound"}}
+```
+
+**Routes closed to bound tokens.** `POST` and `GET
+/api/v1/workspaces/{slug}/tokens` refuse every bound PAT, so a bound token
+can neither mint another nor list the tokens of its workspace. On a
+workspace the binding reaches (the bound workspace, a fork the token
+created, and the parent of the fork a token is bound to) they are answered
+before the scope check, with or without the route's scope on the token:
+
+```json
+{"error":{"code":403,"message":"a token bound to a workspace cannot use this route","error_type":"token_bound"}}
+```
+
+On every other workspace the `404` above still comes first, so the answer
+tells nothing of which workspaces exist. A route added later is closed the
+same way when it is registered with the mark `access.refuses_bound`.
+
+The guard recognises a contributor route and an allowlisted route by its
+method and its pattern as registered, with the parameter names given here
+(`:slug`, `:number`, `:sha`, `:version`, `:id`). A route added later
+reaches a bound token only when it is registered under exactly these names.
+
+**Refusal events.** Each `403` and `404` the guard answers, on the REST API
+and on git, is reported as a hub event of type `parley.token.bound_refused`,
+at most one per token per minute. The minute starts when the token's event
+is emitted; the token's refusals inside it emit nothing and are counted, and
+the token's next event carries the count as `suppressed` (`0` when there
+was none). Every token is limited on its own, and the count is kept in
+memory only, so a restart of the hub starts every token afresh. The answer
+to the refused request is the same whether it is reported or counted, and
+whether or not the event could be written. A request the guard lets
+through, or that another check answers (`401`, `insufficient_scope`, the
+access rule's `404`), is neither reported nor counted. The event, as
+[`GET /api/v1/events/log`](#get-apiv1eventslog) shows it to the admin token
+and to a user with level `owner` or `admin` on the bound workspace:
+
+```json
+{"seq":12,"id":"…","type":"parley.token.bound_refused","time":"2026-11-14T12:01:00Z","workspace":"w1","actor_type":"pat","actor_id":"u_1","resource_type":"token","resource_id":"t_1","action":"bound_refused","session_id":null,"metadata":{"bound_workspace":"w1","method":"GET","requested_workspace":"w5","route":"/api/v1/workspaces/:slug/probe","status":404,"suppressed":3,"surface":"api","token_id":"t_1"}}
+```
+
+`workspace` is the bound slug; `metadata.route` is the matched route's
+pattern without the method (on git, the git route's pattern), `status` the
+answered status, `surface` `api` or `git`, and `requested_workspace`, the
+slug exactly as the request typed it, is present only when the request
+named a workspace.
 
 ## Request ids and response headers
 
@@ -951,6 +1056,108 @@ authenticates, cannot be changed. A refused request changes nothing.
 | `403` `insufficient_scope` | a `PUT` or `PATCH` that adds a scope, by a PAT limited to paths, to a token without `paths` (`paths: this token is limited to paths, so it cannot add scopes to a token that is not`) or with a glob none of the caller's globs covers; the message names the first one (`paths: "src/**" is not covered by a glob of this token`) |
 | `404` `not_found` | the caller's user has no token with this id (`token not found`) |
 | `409` `conflict` | the token is revoked (`token is revoked`) or expired (`token is expired`) |
+
+## `POST /api/v1/workspaces/{slug}/tokens`
+
+Mints a personal access token (PAT) owned by the caller's user and bound to
+the workspace `{slug}`: its `workspace` is the slug from the moment it
+exists, and no route changes it. It takes an API key or a PAT and declares
+the scope `tokens:manage` for a PAT and the level `owner` on the workspace
+(see [Workspace access](#workspace-access)). It is a create route (see
+[Idempotency](#idempotency)); a replay leaves out `token`.
+
+The body is that of [`POST /api/v1/user/tokens`](#post-apiv1usertokens),
+validated the same way with the same messages: `name`, `permissions`,
+`paths` and `expires`. A PAT caller is held to the same subset rule. The
+route is closed to every PAT bound to a workspace, so a bound token cannot
+mint another: see [Workspace-bound tokens](#workspace-bound-tokens).
+
+The checks run in this order, the first that fails answering, and a refused
+request mints nothing: a bound PAT (`403` `token_bound` on a workspace its
+binding reaches, `404` on any other); a PAT without `tokens:manage` (`403`); the subset
+rule for a PAT caller, before the workspace is looked up, so the answer is
+the same for an unknown slug; the access rule for need `owner` (`404` for a
+workspace the caller cannot read and for an unknown slug, with the same
+bytes; `403` for an org member, who reads it); the admin token (`403`),
+before the body is read; the body (`400`); and then, for a valid body, an
+archived workspace (`409`).
+
+The token and a `parley.token.bind` event are written in one store
+transaction: a failure of either, or of the commit, leaves neither and is
+answered `500` `internal` without its cause.
+
+| Status | When |
+|---|---|
+| `201 Created` | the token was minted; the body is the Token object, with `workspace` the slug, and `token` |
+| `200 OK` | a replay of a recorded `Idempotency-Key` with the same body: the first answer without `token`; nothing is minted |
+| `400` `invalid_request` | the body is not valid, with the messages of `POST /api/v1/user/tokens` (`request body must be a JSON object` for a body that is not an object) |
+| `403` `token_bound` | a PAT bound to a workspace, on a workspace its binding reaches, whatever scopes it holds (`a token bound to a workspace cannot use this route`) |
+| `403` `insufficient_scope` | a PAT without `tokens:manage` (`this route needs the scope tokens:manage`), or a valid body beyond what the calling PAT holds, with the subset rule's messages (`permissions: this token does not hold "git:read"`) |
+| `403` `forbidden` | an org member who can read the workspace (`org members have read-only access to this workspace`), or the admin token (`this route needs a user`) |
+| `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug (`workspace not found`); also a bound PAT on a workspace outside its binding |
+| `409` `workspace_archived` | a valid body for an archived workspace (`workspace is archived`) |
+| `500` `internal` | writing the token or its event failed; nothing is minted |
+
+```json
+{"name":"agent","permissions":["git:read"],"expires":30}
+```
+
+```json
+{"token_id":"k3x9m2pq","user_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","name":"agent","permissions":["git:read"],"paths":null,"workspace":"w1","expires_at":"2026-01-31T00:00:00Z","revoked_at":null,"created_at":"2026-01-01T00:00:00Z","token":"parley_pat_k3x9m2pq_0123456789abcdefghijklmnopqrstuv"}
+```
+
+The event, as [`GET /api/v1/events/log`](#get-apiv1eventslog) shows it to
+the admin token and to a user with level `owner` or `admin` on the
+workspace, has `actor_type` `api_key` or `pat` after the calling
+credential, `actor_id` the token's owner, and in `metadata` the token's
+`token_id`, `workspace`, `permissions`, `paths` and `expires_at` (`null`
+when it has none or never expires), never its value:
+
+```json
+{"seq":7,"id":"…","type":"parley.token.bind","time":"2026-01-01T00:00:00Z","workspace":"w1","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"token","resource_id":"k3x9m2pq","action":"bind","session_id":null,"metadata":{"expires_at":"2026-01-31T00:00:00Z","paths":null,"permissions":["git:read"],"token_id":"k3x9m2pq","workspace":"w1"}}
+```
+
+## `GET /api/v1/workspaces/{slug}/tokens`
+
+Lists every personal access token bound to the workspace `{slug}`, live,
+revoked or expired, so its owner can see everything that can reach it or
+once could. It takes an API key, an unbound PAT or the admin token, and
+declares the scope `tokens:read` for a PAT, which `tokens:write` and
+`tokens:manage` imply, and the level `owner` on the workspace (see
+[Workspace access](#workspace-access)); the admin token has it on every
+workspace. An archived workspace is listed like any other. Like the mint
+route, it is closed to every PAT bound to a workspace (see
+[Workspace-bound tokens](#workspace-bound-tokens)).
+
+The answer is a [list](#lists) in the standard envelope, `{"items":[…],"next_cursor":…}`,
+with the standard `limit` and `cursor`. Each item is a Token object (see
+[`POST /api/v1/user/tokens`](#post-apiv1usertokens)), never with its value,
+with `workspace` the slug; tokens bound to another workspace and unbound
+tokens are not in it. It is ordered oldest first, by `created_at` in whole
+seconds, as it is shown, and then by `token_id`: tokens created in the same
+second are in `token_id` order, whatever their order within that second. A
+workspace with no
+bound token answers `{"items":[],"next_cursor":null}`.
+
+The checks run in this order, the first that fails answering: a bound PAT
+(`403` `token_bound` on a workspace its binding reaches, `404` on any
+other); a PAT without `tokens:read` (`403`), the same for an unknown slug;
+the access rule for need `owner` (`404` for a workspace the caller cannot
+read and for an unknown slug, with the same bytes; `403` for an org member,
+who reads it); the `limit` and `cursor` (`400`).
+
+| Status | When |
+|---|---|
+| `200 OK` | a page of the tokens bound to the workspace |
+| `400` `invalid_request` | a `limit` or `cursor` that is not valid |
+| `403` `token_bound` | a PAT bound to a workspace, on a workspace its binding reaches, whatever scopes it holds (`a token bound to a workspace cannot use this route`) |
+| `403` `insufficient_scope` | a PAT without `tokens:read` or a scope that implies it (`this route needs the scope tokens:read`) |
+| `403` `forbidden` | an org member who can read the workspace (`org members have read-only access to this workspace`) |
+| `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug (`workspace not found`); also a bound PAT on a workspace outside its binding |
+
+```json
+{"items":[{"token_id":"k3x9m2pq","user_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","name":"agent","permissions":["git:read"],"paths":null,"workspace":"w1","expires_at":"2026-01-31T00:00:00Z","revoked_at":"2026-01-02T00:00:00Z","created_at":"2026-01-01T00:00:00Z"}],"next_cursor":null}
+```
 
 ## Admin routes
 
@@ -1773,7 +1980,7 @@ keys are not held to it. It has no workspace in its path.
 | `cursor` | another name for `after`; both may be given only with the same value |
 | `limit` | the most items the page holds: an integer from 1 to 200, 50 when absent |
 | `wait` | how long to hold the request when there is nothing to return: a whole number of seconds from 0 to 60, 0 when absent |
-| `workspace` | only events whose `workspace` is this slug. The caller must be able to read the workspace: the admin token may name any slug, also one whose workspace was deleted, and reads the events stored under it; a workspace-bound PAT only a workspace its binding covers (none yet: no covered set is installed, so every `workspace` a bound PAT sends is `404`); every other caller only a workspace on which it has a level |
+| `workspace` | only events whose `workspace` is this slug. The caller must be able to read the workspace: the admin token may name any slug, also one whose workspace was deleted, and reads the events stored under it; a workspace-bound PAT only a workspace its binding covers, every other `workspace` it sends is `404`; every other caller only a workspace on which it has a level |
 | `types` | only events whose `type` matches one of these comma-separated entries: an exact type, or a prefix ending in `*` that matches every type beginning with the text before it (`*` alone matches every type). At most 20 entries, none empty, with `*` only as an entry's last character |
 | `session_id` | only events whose `session_id` is this UUID, in any letter case |
 
@@ -1809,7 +2016,8 @@ events of a workspace on which, or on whose fork parent, it has a level
 (`owner` or `admin` for the types beginning with `parley.secret.`,
 `parley.token.` and `parley.webhook.`), and an event of no workspace when its `metadata.scope`
 is `user` with the user's id, or `org` with an active org the user is a
-member of. A workspace-bound PAT sees no event yet.
+member of. A workspace-bound PAT sees, under its user's level, only the
+events of the workspaces its binding covers, and no event of no workspace.
 
 **Long-poll.** With `wait` above 0 and nothing to return, the hub holds the
 request until a visible, matching event is committed, and then answers with

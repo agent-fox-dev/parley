@@ -11,7 +11,7 @@ command-line client. Both are written in Go, in the module
 |---|---|
 | `cmd/parley` | the `parley` program: it calls `cli.Run` and exits with its status |
 | `cmd/parleyd` | the `parleyd` program: `main` calls `hub.Run` with the process's arguments, environment and working directory and exits with its status |
-| `internal/access` | the workspace access rule, the one place that decides what a caller may do on a workspace; the minimal workspace record (slug, owner, org, kind, parent, status) in the transactional store, the caller's level on a workspace, the decision for a declared need and the REST access check, and the readable set for reads across workspaces |
+| `internal/access` | the workspace access rule, the one place that decides what a caller may do on a workspace; the minimal workspace record (slug, owner, org, kind, parent, status, the creating token of a fork) in the transactional store, the caller's level on a workspace, the decision for a declared need and the REST access check, the readable set for reads across workspaces, what the binding of a workspace-bound PAT covers, and the binding guard that confines such a PAT on every REST route and, for the git server, on git, and the minting, listing and revoking of bound tokens (`MintBound`, `POST` and `GET /workspaces/:slug/tokens`, `RevokeBoundTo`, and the maintenance task `token_binding_sweep`, `SweepBindings`) |
 | `internal/buildinfo` | the version, commit and build time the binary was built with, shared by both programs |
 | `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra`, each declared through one helper ([ADR 02](adr/02-declare-every-cli-command-through-one-helper.md)), the client configuration file, the resolution of the hub URL and the credential, the one HTTP client the commands send their requests with, the printing of a command's result on stdout and of its warnings on stderr, the shared wait for a long operation (`--wait`, `--timeout`, `--poll-interval`), and the error envelopes and exit statuses every command ends with |
 | `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, and a registry of keys and whole sections that decides what the file may hold |
@@ -1165,12 +1165,31 @@ keeps data for a user or an org registers its remover from its part in
 ### Workspace access
 
 `internal/hub/access.go` adds the part `composeAccess`, after
-`composeIdentity` in `parts`. It adds the schema step `access.SchemaStep`
-(`workspace_records`), registers a zero `access.Service`, adds its
-`Check` to the access checks, after identity's admin check, and binds it in
+`composeIdentity` in `parts`. It adds the schema steps `access.SchemaStep`
+(`workspace_records`) and, after it, `access.CreatingTokenStep`
+(`workspace_creating_token`), registers a zero `access.Service`, installs
+its `Guard` as the pipeline's binding guard (`SetBindingGuard`), adds its
+`SubsetCheck` and then its `Check` to the access checks, after identity's
+admin check, registers its `TokenRoutes()`, registers its
+`SweepBindings` as the maintenance task `token_binding_sweep`, and binds it in
 the start hook `access` to `access.Deps{Records:
-access.StoreRecords(rt.Store.Main()), Memberships: ...}`, the membership
-source being `identity.ActiveOrgIDs` over the same store. It adds the route
+access.StoreRecords(rt.Store.Main()), Memberships: ..., Refusals:
+access.NewRefusalLimiter(events, rt.Now, rt.Logger), Events: events, Store:
+rt.Store, Now: rt.Now, Logger: rt.Logger}`, the
+membership source being `identity.ActiveOrgIDs` over the same store and
+`events` the adapter `accessEvents`, which implements
+`access.EventEmitter` over the event component: it converts an
+`access.Event` to an `event.Input` (an empty `Workspace` or `ActorID`
+becomes nil, `Metadata` is passed as is) and calls `c.Events().Emit` or
+`EmitNow`, reading the component from the composition at each emit, since
+`composeEvents` comes after `composeAccess`. The limiter is built in the
+hook, so every start of the hub begins with no refusal counted. The same hook
+installs the covered set of workspace-bound tokens in the event component,
+`c.Events().SetCoverage(...)`: an `event.CoverageFunc` that answers whether
+`(*access.Service).CoveredSet` of the caller contains the slug, with the
+`event.Caller`'s `CredentialID` (the PAT's token id) as `TokenID` and its
+`Workspace` as the binding. The hook runs before the `events` hook, whose
+bind keeps what `SetCoverage` installed. It adds the route
 rule `refusePublicNeed`: a route that is `Public` and declares
 `access.MarkNeed` stops the start with `compose the routes: <method>
 <pattern>: a public route cannot declare the workspace need access.need:
@@ -1190,6 +1209,7 @@ The step creates the table `workspaces` in the transactional store:
 | `kind` | `repository` or `fork` (a `CHECK` constraint) |
 | `parent_slug` | the slug of the repository a fork was created from; NULL for a repository, and no foreign key |
 | `status` | `pending`, `cloning`, `ready`, `failed` or `archived` (a `CHECK` constraint) |
+| `creating_token_id` | the `token_id` of the PAT whose request created a fork; NULL for a repository and for a fork no token created, and no foreign key. Added by the second step, `ALTER TABLE workspaces ADD COLUMN creating_token_id TEXT`, so that a store whose table exists gains it |
 
 with an index on each of `owner_id`, `org_id` and `parent_slug`, for the
 list reads. A dangling `owner_id` matches no caller and a dangling `org_id`
@@ -1197,8 +1217,9 @@ grants no membership, because the memberships of a deleted org are deleted
 with it.
 
 `internal/access/record.go` holds the record type `access.Record` (`Slug`,
-`OwnerID`, `OrgID`, `Kind`, `ParentSlug`, `Status`; `ParentSlug` is `""`
-for a repository and stored as NULL), the constants `KindRepository`,
+`OwnerID`, `OrgID`, `Kind`, `ParentSlug`, `Status`, `CreatingTokenID`;
+`ParentSlug` and `CreatingTokenID` are `""` for a repository and stored as
+NULL, and `CreatingTokenID` has no JSON name, so no answer shows it), the constants `KindRepository`,
 `KindFork` and `StatusPending` to `StatusArchived`, and the store functions.
 The insert takes the caller's `*sql.Tx`; the reads take a `Querier` (the
 store's `*sql.DB` or an open `*sql.Tx`):
@@ -1206,11 +1227,13 @@ store's `*sql.DB` or an open `*sql.Tx`):
 - `InsertRecord(ctx, tx, rec)` stores a record in the caller's transaction.
   It refuses, with an error wrapping `access.ErrInvalidRecord` and without
   writing, a record with an empty slug, owner or org, an unknown kind or
-  status, a repository with a parent, a fork without one, and a fork whose
+  status, a repository with a parent or a creating token, a fork without a
+  parent, and a fork whose
   parent has no record, is a fork itself or is in another org; the parent is
   read in the same transaction. A slug that has a record already is
   refused with `access.ErrDuplicateSlug` (the insert is `ON CONFLICT (slug)
-  DO NOTHING`), and the stored record stays as it was.
+  DO NOTHING`), and the stored record stays as it was. Fork creation records
+  the creating token through it, in `Record.CreatingTokenID`.
 - `RecordBySlug(ctx, q, slug)` returns the record and `true`, or `false`
   and a nil error for any string no record has as its slug.
 - `ForkParent(ctx, q, slug)` returns the parent's slug when `slug` names a
@@ -1229,8 +1252,11 @@ The rule reads records through the interface `access.RecordReader`
 `internal/access/level.go` resolves what a caller is on one workspace,
 `access.Level`: `LevelAdmin` (`"admin"`), `LevelOwner` (`"owner"`),
 `LevelMember` (`"member"`) or `LevelNone` (`""`). The caller is
-`access.Caller{Admin, UserID}`, built from the pipeline's `server.Caller`
-by `access.CallerFrom`; the kind of credential and the user's role are not
+`access.Caller{Admin, UserID, TokenID, Workspace}`, built from the
+pipeline's `server.Caller` by `access.CallerFrom`. `TokenID` and `Workspace`
+are set only for a PAT bound to a workspace, from the `identity.Principal`
+in the caller's `Detail` (`Type` `pat` with a `Workspace`): the token's id
+and the bound slug. `Level` and `Decide` do not read them. The kind of credential and the user's role are not
 part of it, so a user has the same level by API key as by PAT, and a user
 with the role admin has no level from the role.
 
@@ -1346,6 +1372,9 @@ through. `(*Service).Readable(ctx, caller)` returns an
   in one of the user's orgs is `LevelOwner`;
 - a caller that is neither, and a user with nothing, get the empty set and
   no error;
+- a PAT bound to a workspace gets its user's set cut down to the covered
+  set of its binding (below), each entry at the user's level: a covered
+  workspace the user cannot read stays out;
 - a failed read returns the error and the empty set, never part of one.
 
 `Level` and `Readable` share one resolver (`userLevels` in `level.go`); they
@@ -1358,6 +1387,215 @@ therefore in a user's set exactly when `Level` resolves a level other than
 `LevelNone` for it, with that level. The visibility decision of the hub
 events calls `Readable` (see [Hub events](#hub-events)); the workspace list
 and the audit query will.
+
+#### Workspace-bound tokens
+
+`internal/access/coverage.go` says what the binding of a PAT bound to a
+workspace reaches. `(*Service).CoveredSet(ctx, caller)` returns, sorted, the
+covered workspaces: for a token bound to a repository W, W and every fork of
+W whose `creating_token_id` is the token's id; for a token bound to a fork,
+the fork alone; for a bound slug with no record, that slug alone. A caller
+without a binding covers nothing (`nil`). `(*Service).RelationOf(ctx,
+caller, slug)` answers how a workspace a request names stands to the
+binding, as an `access.Relation` (`internal/access/binding.go`):
+`RelationBound` (`"bound"`) for the bound slug, record or not;
+`RelationCreatedFork` (`"created_fork"`) for a fork of it the token created;
+`RelationParentOfBoundFork` (`"parent_of_bound_fork"`) for the parent of the
+fork the token is bound to; and `""` (none) for every other slug and every
+caller without a binding. Both read the records on every call, so a fork the
+token has just created is covered at once. `access.Binding{TokenID,
+Workspace, Relation}` is the value a binding guard attaches to a request
+for its handler (ADR 04), read with `access.BindingOf(r)`; it reports false
+for every caller but a bound PAT.
+
+`internal/access/guard.go` holds the binding guard, `(*Service).Guard`, a
+`server.Check` for the binding-guard position of the pipeline, after the
+route's feature check and before the scope check; `composeAccess` installs
+it. It runs only on a route that matched, for a caller that authenticated,
+since routing and authentication answer first, and never on a public route.
+It does nothing for the admin token, an API key and a PAT that is not
+bound. A route names a workspace when its pattern is `/workspaces/:slug` or
+lies under it; the slug is the path value as typed. On a route that names
+no workspace a bound PAT passes when the method and the pattern, relative to
+`/api/v1`, are in the allowlist of `internal/access/allowlist.go`, with the
+`Binding` of the bound slug and no relation attached, from which the
+route's handler reads the covered set it confines its result to
+(`CoveredSet(ctx, access.Caller{TokenID: b.TokenID, Workspace:
+b.Workspace})`); every other such route, every identity and admin route
+among them, is answered `403 token_bound` with the message `a token bound
+to a workspace cannot use this route`, before the scope check, whatever
+scopes the token holds. The allowlist is `GET /workspaces`, `GET /events`,
+`GET /events/log`, `GET /audit`, `GET /sandbox-profiles`, `POST` and `GET
+/sessions`, `GET /sessions/:id`, `POST /sessions/:id/complete`, and `POST`
+and `GET /sessions/:id/usage`; like the contributor table it matches the
+pattern as registered, so a route reaches a bound token only when it is
+registered with these parameter names. On a route that names a workspace,
+for a bound PAT the guard asks `RelationOf` and:
+
+- for `bound` and `created_fork`, attaches the `Binding` and passes;
+- for `parent_of_bound_fork`, attaches the `Binding` and passes when the
+  method and the pattern relative to `/workspaces/:slug` are in the
+  contributor table, and answers `403 token_bound` otherwise;
+- for none, answers `404 not_found` with the message `workspace not found`,
+  the bytes the access check answers for a workspace the caller cannot read,
+  for an existing and an unknown slug alike, and before the scope check, so
+  a token without the route's scope gets the same `404`.
+
+It makes no access or scope decision: a request it passes reaches the scope
+check and the access checks as an unbound PAT of the same user would. Each
+`403` and `404` it answers is reported to `Deps.Refusals`, an
+`access.RefusalReporter` (`Refused(ctx, access.Refusal)`; nil discards),
+as `access.Refusal{TokenID, UserID, BoundWorkspace, RequestedWorkspace,
+Method, Route, Status, Surface}`, where `Route` is `/api/v1` followed by the
+matched pattern, `RequestedWorkspace` is nil on a route that names no
+workspace, and `Surface` is `access.SurfaceAPI` (`"api"`). A failed read of
+the records is an error, answered `500 internal`.
+
+`(*Service).GuardGit(ctx, caller, slug, method, pattern)` is the same guard
+for the git server, which calls it after authentication with the
+`server.Caller`, the slug of the repository, the method and the matched git
+route's pattern, and returns an `access.GitDecision{Pass, Status, Binding}`.
+A bound PAT passes with its `*Binding` on the bound workspace and on a fork
+the token created; on every other slug, the parent of the bound fork
+included, `Pass` is false and `Status` `404`, and the refusal is reported
+with `Surface` `access.SurfaceGit` (`"git"`), `Route` the git pattern as
+given and `RequestedWorkspace` the slug. The admin token, an API key and an
+unbound PAT pass with a nil `Binding`. A failed read is a zero decision and
+the error. No git server calls it yet.
+
+`internal/access/contributor_routes.go` holds the contributor table, the 25
+routes a token bound to a fork reaches on the fork's parent, as method and
+pattern relative to `/workspaces/:slug`, unexported and read by the guard
+alone: `POST` and `GET /changes`, `GET` and `PATCH
+/changes/:number`, `GET /changes/by-commit/:sha`, `POST
+/changes/:number/abandon`, `/restore`, `/restack` and `/land`, `GET
+/changes/:number/versions`, `/versions/:version`, `/diff`, `/stack`,
+`/lands`, `/conflict`, `/conflict/file`, `/approvals`, `/checks` and
+`/overlaps`, `GET /lands/:id`, `GET /policy`, `POST /policy/evaluate`, `GET
+/activity`, `GET /claims` and `GET /claims/:id`. The guard matches the
+pattern as registered, so a route reaches a fork-bound token on the parent
+only when it is registered with these parameter names.
+
+`internal/access/events.go` declares `access.EventEmitter` (`Emit(ctx, tx,
+access.Event)` in the caller's transaction, `EmitNow(ctx, access.Event)` in
+one of its own) over the value `access.Event{Type, Workspace, ActorType,
+ActorID, ResourceType, ResourceID, Metadata}`. The event component imports
+`internal/access`, so this package cannot name `event.Input`, and the hub
+passes the event component behind the interface (`accessEvents` in
+`internal/hub/access.go`). There is no discarding default.
+
+`internal/access/mint.go` holds the one minting component of bound tokens,
+`(*Service).MintBound(ctx, tx, access.MintInput{Creator, Workspace, Name,
+Permissions, Paths, Expires, ExpiresAt})`, which returns the
+`identity.PAT` and its value. In the caller's transaction, which it does not
+commit, it mints through `identity.MintPAT` with `Workspace` set to the
+slug, so the token is owned by `Creator.User`, validated as for `POST
+/user/tokens` and, for a PAT creator, held to the subset rule, and then
+emits `access.BindEventType` (`parley.token.bind`) through `Deps.Events` in
+the same transaction: workspace the bound slug, actor type the creator's
+`identity.Principal.Type` (`api_key` or `pat`) and actor the owner,
+resource `token` and the token id, and metadata `token_id`, `workspace`,
+`permissions`, `paths` (or null) and `expires_at` (or null, in the Token
+object's time format), never the value. `identity.MintPAT`'s errors are
+returned unchanged (`400 invalid_request`, `403 insufficient_scope`), with
+nothing written; a failure of the emitter is returned wrapped, and the
+caller rolls back the token with its transaction. A service without an
+emitter refuses to mint. `ExpiresAt` is the instant a hub-internal caller
+(fork creation, the hub credential of a sandbox) sets in place of
+`Expires`. No production caller besides the route below uses it yet.
+
+`internal/access/bound_tokens.go` holds `(*Service).TokenRoutes()`, which
+`composeAccess` registers: `POST /workspaces/:slug/tokens` with `Scope`
+`tokens:manage`, `Create`, `ShowOnce` `token` and the marks
+`access.MarkNeed` `owner`, `access.MarkSubsetRule` and
+`access.MarkRefusesBound`, and `GET /workspaces/:slug/tokens` with `Scope`
+`tokens:read` and the marks `access.MarkNeed` `owner` and
+`access.MarkRefusesBound`. On a route marked `access.MarkRefusesBound`
+(`"access.refuses_bound"`) the binding guard answers a bound PAT `403
+token_bound` on every workspace whose relation to the binding is not none
+(bound, created fork, parent of the bound fork), and on a route that names
+no workspace even when it is allowlisted; outside the binding the `404`
+comes first. The list handler reads the page (`server.ReadPage`), then, in
+one read-only transaction, the ids of the PATs whose `workspace` is the
+slug in any state, ordered by the whole second of `created_at` (stored in
+nanoseconds) and then `token_id` after the cursor's position, which holds
+that second and the id, and each PAT with `identity.PATByID`, and answers them
+with `server.WritePage`; the admin token passes, since the access rule
+gives it owner, and an archived workspace is listed. On a route marked
+`access.MarkSubsetRule` (`"access.subset_rule"`) the access check
+`(*Service).SubsetCheck`, installed before `Check`,
+decodes the body with `identity.DecodeMintRequest` and applies
+`identity.CheckSubset` to a PAT caller, so the `403 insufficient_scope` of
+the subset rule comes before the workspace is looked up; a body that does
+not decode, or whose paths are not valid, passes to the handler. The
+handler answers the admin token `403 forbidden` (`this route needs a user`)
+before it reads the body, decodes the body (`400`), and then, in one store
+transaction, mints with `MintBound`, refusing an archived workspace with
+`409 workspace_archived` after the token is validated and before its event
+is emitted, so the refusal rolls back the token and emits nothing. Any other
+failure of the insert, the event or the commit rolls back and is answered
+`500 internal`. The answer is `201` with the Token object followed by
+`token`, the value.
+
+`internal/access/revoke.go` holds the revoking component of bound tokens,
+`(*Service).RevokeBoundTo(ctx, tx, slugs)`, for the components that remove
+workspaces (workspace delete, fork expiry), which call it in the
+transaction that removes them, so the removal and the revocation commit or
+roll back together. In that transaction, which it does not commit, one
+`UPDATE pats ... RETURNING token_id` sets `revoked_at` to the instant of
+`Deps.Now` on every PAT whose `workspace` is one of `slugs`, whose
+`revoked_at` is NULL and whose `expires_at` is NULL or after that instant,
+and it returns their token ids sorted ascending, a non-nil list that is
+empty for no slug or no live token. A token already revoked keeps its
+`revoked_at` and an expired one is left as it is (unlike
+`identity.RevokeTokenByID`, which revokes an expired token too), and
+neither is returned. On a failed write it returns the error and a nil
+list, and the caller rolls back. It emits no event: the removal's own event
+carries the ids. A revoked token is answered `401 credential revoked` by
+authentication from the next request on, before the binding guard, so it
+is never reported as a refusal. No production caller uses it yet.
+
+`internal/access/sweep.go` holds the token binding sweep,
+`(*Service).SweepBindings(ctx)`, which the hub runs as the maintenance task
+`token_binding_sweep`, so that a bound token a removal left behind stops
+working within one maintenance interval. In one transaction of `Deps.Store`
+it reads the distinct `workspace` of the PATs that are bound and not revoked
+and have no row in `workspaces`, and revokes their live tokens with
+`RevokeBoundTo`, so a token that is unbound, bound to a workspace with a
+record in any status (archived included), revoked or expired is left as it
+is. It returns how many it revoked and, when that is more than 0, logs one
+info line `revoked the tokens bound to workspaces that no longer exist` with
+`count` to `Deps.Logger` (nil discards); it emits no event. On a store
+failure the transaction is rolled back and it returns 0 and the error, which
+the maintenance loop logs as `maintenance task failed`. A context cancelled
+before it begins returns the context's error and writes nothing; once
+begun, the transaction runs to its end with a context that a stop does not
+cancel, because `database/sql` rolls a cancelled transaction back in a
+goroutine of its own, which could close the store's last connection after
+the hub has closed the store and returned from `Run`.
+
+`internal/access/refusal.go` holds the hub's `RefusalReporter`,
+`access.RefusalLimiter`, built with `access.NewRefusalLimiter(events, now,
+logger)` (nil `now` is `time.Now`, nil `logger` discards). It keeps, in
+memory and under a mutex, for each token id the time of the token's last
+event and the count of refusals suppressed since. A refusal of a token
+with no event in the preceding 60 seconds is emitted with `EmitNow` as
+`access.RefusedEventType` (`parley.token.bound_refused`): workspace the
+bound slug, actor type `pat` and actor the token's user, resource `token`
+and the token id, and metadata `token_id`, `bound_workspace`, `method`,
+`route`, `status`, `surface`, `suppressed` (the count, then reset to 0) and,
+only when the request named a workspace, `requested_workspace`, the slug as
+typed; the token's minute starts then. A refusal inside the minute emits
+nothing and adds 1 to the count. Each refusal first drops every entry
+whose minute has passed with a count of 0, so the map holds only the
+tokens refused in the last minute or with refusals still to report. The
+emit runs after the guard has decided the answer, with the request's
+context detached from its cancellation, and cannot change it: an error, or
+a panic, which it recovers, is logged once at warn level (`the refusal of
+a workspace-bound token was not recorded`, with `token_id`,
+`bound_workspace` and `error`, never a token value) and not retried, and
+the token's minute counts as started. A limiter without an emitter logs
+the same warning.
 
 ### Hub events
 
@@ -1523,8 +1761,10 @@ route). The rules:
   `resource_id`, has the fork as its source, asked through the
   `event.ChangeSources` installed with `(*Component).SetChangeSources`.
   Without a covered set a bound token sees nothing; without a change lookup
-  it sees none of the parent's events. Nothing installs either yet, so a
-  bound token sees no event.
+  it sees none of the parent's events. The hub installs the covered set of
+  `access.Service` (see [Workspace access](#workspace-access)); nothing
+  installs a change lookup yet, so a fork-bound token sees none of the
+  parent's events.
 
 A read that fails returns `false` with the error, never a grant. The
 covered set and the change lookup are kept apart from `Deps`, so the bind in
