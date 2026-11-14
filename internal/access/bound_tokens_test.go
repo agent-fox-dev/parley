@@ -352,6 +352,16 @@ func TestListBoundTokens_ListsEveryTokenOfTheWorkspaceInAnyStateOldestFirst(t *t
 	_, a := h.storePAT(spec("w1", at, nil))
 	_, b := h.storePAT(spec("w1", at, nil))
 	t1, t2 := min(a, b), max(a, b)
+	// In the same whole second, the one created_at is shown in, but the
+	// greater token_id is the earlier instant: token_id decides.
+	for _, u := range []struct {
+		id      string
+		created time.Time
+	}{{t1, at.Add(900 * time.Millisecond)}, {t2, at.Add(100 * time.Millisecond)}} {
+		if _, err := h.st.Main().Exec("UPDATE pats SET created_at = ? WHERE token_id = ?", u.created.UnixNano(), u.id); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if _, err := h.st.Main().Exec("UPDATE pats SET revoked_at = ? WHERE token_id = ?", at.Add(time.Minute).UnixNano(), t2); err != nil {
 		t.Fatal(err)
 	}

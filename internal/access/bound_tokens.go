@@ -113,17 +113,22 @@ func (s *Service) listBoundTokens(w http.ResponseWriter, r *http.Request) error 
 }
 
 // boundPosition is the position of a token in the list of the tokens bound
-// to a workspace: oldest first, created_at ascending, then token_id
-// ascending, since created_at has whole seconds and tokens minted in the
-// same second must keep one order across pages.
+// to a workspace: oldest first, by the whole second of created_at, the
+// precision the list shows it in, then token_id ascending. The stored
+// created_at has nanoseconds, so tokens minted in the same second are
+// ordered by token_id and not by the instant of their minting.
 type boundPosition struct {
-	CreatedAt int64  `json:"c"`
+	CreatedAt int64  `json:"c"` // the whole second of created_at, Unix time
 	TokenID   string `json:"id"`
 }
 
 func positionOf(p identity.PAT) any {
-	return boundPosition{CreatedAt: p.CreatedAt.UnixNano(), TokenID: p.TokenID}
+	return boundPosition{CreatedAt: p.CreatedAt.Unix(), TokenID: p.TokenID}
 }
+
+// createdSecond is the whole second of a stored created_at (Unix
+// nanoseconds), the first key of boundPosition.
+const createdSecond = `created_at / 1000000000`
 
 // boundTokens returns up to limit PATs bound to the workspace slug, in any
 // state, in the order of boundPosition and after the position after when it
@@ -134,10 +139,10 @@ func boundTokens(ctx context.Context, db *sql.DB, slug string, after *boundPosit
 	query := `SELECT token_id FROM pats WHERE workspace = ?`
 	args := []any{slug}
 	if after != nil {
-		query += ` AND (created_at > ? OR created_at = ? AND token_id > ?)`
+		query += ` AND (` + createdSecond + ` > ? OR ` + createdSecond + ` = ? AND token_id > ?)`
 		args = append(args, after.CreatedAt, after.CreatedAt, after.TokenID)
 	}
-	query += ` ORDER BY created_at, token_id LIMIT ?`
+	query += ` ORDER BY ` + createdSecond + `, token_id LIMIT ?`
 	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return nil, fmt.Errorf("list the tokens bound to %s: %w", slug, err)

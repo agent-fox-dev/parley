@@ -70,7 +70,7 @@ type RefusalReporter interface {
 //   - the bound workspace and a fork the token created pass, with the
 //     Binding attached for the handler (BindingOf);
 //   - the parent of the fork the token is bound to passes on a contributor
-//     route (ContributorRoutes), with the Binding attached, and is answered
+//     route (contributorRoutes), with the Binding attached, and is answered
 //     403 token_bound on every other route;
 //   - every other slug, whether or not it has a workspace and whatever the
 //     user may do on it, is answered 404 not_found with the same bytes as

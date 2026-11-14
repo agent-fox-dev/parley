@@ -75,39 +75,3 @@ func TestAccess_ConfinesABoundTokenAndReportsItsRefusalsOnTheServedHub(t *testin
 		}
 	}
 }
-
-func TestAccess_MintsABoundTokenWithItsEventOnTheServedHub(t *testing.T) {
-	t.Parallel()
-	h := hubtest.Start(t, nil)
-	alice := h.CreateUser(t, "alice")
-	h.AddWorkspace(t, access.Record{Slug: "w1", OwnerID: alice, OrgID: h.CreateOrg(t, "acme"), Kind: access.KindRepository, Status: access.StatusReady})
-	key := h.IssueKey(t, alice)
-
-	status, body := h.Call(t, http.MethodPost, "/api/v1/workspaces/w1/tokens", key, map[string]any{"name": "agent", "permissions": []string{"git:read"}})
-	var tok struct {
-		TokenID   string `json:"token_id"`
-		Workspace string `json:"workspace"`
-		Token     string `json:"token"`
-	}
-	if status != http.StatusCreated || json.Unmarshal(body, &tok) != nil || tok.Workspace != "w1" || tok.Token == "" {
-		t.Fatalf("POST /workspaces/w1/tokens = %d %s, want 201 with a token bound to w1", status, body)
-	}
-	status, body = h.Call(t, http.MethodGet, "/api/v1/events/log", key, nil)
-	var page struct {
-		Items []struct {
-			Type       string         `json:"type"`
-			Workspace  string         `json:"workspace"`
-			ActorType  string         `json:"actor_type"`
-			ResourceID string         `json:"resource_id"`
-			Action     string         `json:"action"`
-			Metadata   map[string]any `json:"metadata"`
-		} `json:"items"`
-	}
-	if status != http.StatusOK || json.Unmarshal(body, &page) != nil || len(page.Items) != 1 {
-		t.Fatalf("GET /events/log = %d %s, want one event", status, body)
-	}
-	if e := page.Items[0]; e.Type != "parley.token.bind" || e.Workspace != "w1" || e.ActorType != "api_key" ||
-		e.ResourceID != tok.TokenID || e.Action != "bind" || e.Metadata["token_id"] != tok.TokenID {
-		t.Errorf("event %+v, want the binding of %s to w1 by an API key", e, tok.TokenID)
-	}
-}

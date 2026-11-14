@@ -1465,8 +1465,8 @@ the error. No git server calls it yet.
 
 `internal/access/contributor_routes.go` holds the contributor table, the 25
 routes a token bound to a fork reaches on the fork's parent, as method and
-pattern relative to `/workspaces/:slug`, read with
-`access.ContributorRoutes()`: `POST` and `GET /changes`, `GET` and `PATCH
+pattern relative to `/workspaces/:slug`, unexported and read by the guard
+alone: `POST` and `GET /changes`, `GET` and `PATCH
 /changes/:number`, `GET /changes/by-commit/:sha`, `POST
 /changes/:number/abandon`, `/restore`, `/restack` and `/land`, `GET
 /changes/:number/versions`, `/versions/:version`, `/diff`, `/stack`,
@@ -1517,11 +1517,13 @@ token_bound` on every workspace whose relation to the binding is not none
 no workspace even when it is allowlisted; outside the binding the `404`
 comes first. The list handler reads the page (`server.ReadPage`), then, in
 one read-only transaction, the ids of the PATs whose `workspace` is the
-slug in any state, ordered by `created_at` and `token_id` after the
-cursor's position, and each PAT with `identity.PATByID`, and answers them
+slug in any state, ordered by the whole second of `created_at` (stored in
+nanoseconds) and then `token_id` after the cursor's position, which holds
+that second and the id, and each PAT with `identity.PATByID`, and answers them
 with `server.WritePage`; the admin token passes, since the access rule
-gives it owner, and an archived workspace is listed. On a route with that
-mark the access check `(*Service).SubsetCheck`, installed before `Check`,
+gives it owner, and an archived workspace is listed. On a route marked
+`access.MarkSubsetRule` (`"access.subset_rule"`) the access check
+`(*Service).SubsetCheck`, installed before `Check`,
 decodes the body with `identity.DecodeMintRequest` and applies
 `identity.CheckSubset` to a PAT caller, so the `403 insufficient_scope` of
 the subset rule comes before the workspace is looked up; a body that does

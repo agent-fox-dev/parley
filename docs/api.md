@@ -1133,8 +1133,10 @@ The answer is a [list](#lists) in the standard envelope, `{"items":[…],"next_c
 with the standard `limit` and `cursor`. Each item is a Token object (see
 [`POST /api/v1/user/tokens`](#post-apiv1usertokens)), never with its value,
 with `workspace` the slug; tokens bound to another workspace and unbound
-tokens are not in it. It is ordered oldest first, by `created_at` and then
-by `token_id`, since `created_at` has whole seconds. A workspace with no
+tokens are not in it. It is ordered oldest first, by `created_at` in whole
+seconds, as it is shown, and then by `token_id`: tokens created in the same
+second are in `token_id` order, whatever their order within that second. A
+workspace with no
 bound token answers `{"items":[],"next_cursor":null}`.
 
 The checks run in this order, the first that fails answering: a bound PAT

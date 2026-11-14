@@ -22,8 +22,9 @@ type EventEmitter interface {
 `access.Event` has the members the two events of this package need (`Type`,
 `Workspace`, `ActorType`, `ActorID`, `ResourceType`, `ResourceID`,
 `Metadata`), with `""` for a missing workspace or actor where `event.Input`
-has a nil pointer. The event component is to be passed behind it through
-an adapter in `internal/hub` that converts `access.Event` to `event.Input`.
+has a nil pointer. The event component is passed behind it through the
+adapter `accessEvents` in `internal/hub/access.go`, which converts
+`access.Event` to `event.Input`.
 What the package says of the two calls
 otherwise holds: one emits in the caller's transaction, the other in a
 transaction of its own, and there is no discarding default.

@@ -57,6 +57,16 @@ func TestGuard_PassesWhatTheBindingCoversWithTheBindingForTheHandler(t *testing.
 	if got := h.refusals.all(); len(got) != 0 {
 		t.Errorf("refusals = %+v, want none", got)
 	}
+
+	// A fork the token creates after an earlier answer is covered at once.
+	if a := h.do(http.MethodGet, "/workspaces/f3/probe", tokW1); a.status != http.StatusNotFound {
+		t.Fatalf("f3 before it exists = %d %s, want 404", a.status, a.body)
+	}
+	seed(t, h.st, createdBy(fork("f3", alice, org, "w1"), idW1))
+	a := h.do(http.MethodGet, "/workspaces/f3/probe", tokW1)
+	if got := decode(t, a).Binding; a.status != http.StatusOK || got == nil || *got != (binding{"w1", access.RelationCreatedFork}) {
+		t.Errorf("f3 after the token created it = %d %s, want 200 with the binding of a created fork", a.status, a.body)
+	}
 }
 
 func TestGuard_AnswersEveryWorkspaceOutsideTheBindingNotFoundBeforeScopeAndAccess(t *testing.T) {
@@ -75,7 +85,8 @@ func TestGuard_AnswersEveryWorkspaceOutsideTheBindingNotFoundBeforeScopeAndAcces
 		createdBy(fork("f2", alice, org, "w1"), idB),
 		fork("f3", alice, org, "w1"),
 		createdBy(fork("f4", bob, org, "w1"), idBob),
-		fork("f9", alice, org, "w1"))
+		fork("f9", alice, org, "w1"),
+		createdBy(fork("g1", alice, org, "w5"), idA))
 	tokF, idF := h.pat(alice, "f1", "git:read")
 
 	type row struct{ token, tokenID, bound, slug string }
@@ -84,6 +95,7 @@ func TestGuard_AnswersEveryWorkspaceOutsideTheBindingNotFoundBeforeScopeAndAcces
 		{tokA, idA, "w1", "f3"}, // created with no token
 		{tokA, idA, "w1", "f4"}, // created by another user's token
 		{tokF, idF, "f1", "f9"}, // a sibling of the bound fork
+		{tokA, idA, "w1", "g1"}, // created by the token, but a fork of another workspace
 	}
 	for _, slug := range []string{"w5", "w6", "nosuch", "f9"} {
 		rows = append(rows, row{tokA, idA, "w1", slug}, row{tokNoScope, "", "w1", slug})
@@ -137,6 +149,7 @@ func TestGuard_LeavesScopeAndAccessToDecideAsForAnUnboundToken(t *testing.T) {
 		{"a user no longer in the workspace's org", carol, "w7", "probe", []string{"git:read"}, false, http.StatusNotFound},
 		{"a token without the route's scope", alice, "w1", "probe", []string{"changes:read"}, false, http.StatusForbidden},
 		{"a member on a route that needs write", carol, "w7", "probe-write", []string{"git:read"}, true, http.StatusForbidden},
+		{"a bound slug with no workspace", alice, "gone", "probe", []string{"git:read"}, false, http.StatusNotFound},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h.orgs[carol] = nil
@@ -196,15 +209,11 @@ func TestGuard_LetsAForkTokenOntoTheContributorRoutesOfTheParent(t *testing.T) {
 		{http.MethodGet, "/claims", "/claims"},
 		{http.MethodGet, "/claims/:id", "/claims/c1"},
 	}
-	table := access.ContributorRoutes()
-	if len(rows) != 25 || len(table) != 25 {
-		t.Fatalf("%d rows and %d contributor routes, want 25 of each", len(rows), len(table))
+	if len(rows) != 25 {
+		t.Fatalf("%d rows, want the 25 contributor routes", len(rows))
 	}
 	want := binding{"f1", access.RelationParentOfBoundFork}
 	for _, r := range rows {
-		if !slices.Contains(table, access.ContributorRoute{Method: r.method, Pattern: r.pattern}) {
-			t.Errorf("%s %s is not in the contributor table", r.method, r.pattern)
-		}
 		// One server per route: the router cannot hold /changes/by-commit/:sha
 		// together with the routes under /changes/:number.
 		s := h.fresh()

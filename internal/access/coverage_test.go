@@ -91,56 +91,13 @@ func TestReadable_IsUnchangedForACallerWithoutABinding(t *testing.T) {
 			t.Errorf("%s: Readable = %+v, %v, want %+v, %v", c.name, got, err, want, wantErr)
 		}
 	}
-	keySet, _ := svc.Readable(ctx, access.CallerFrom(byKey("alice")))
+	keySet, err := svc.Readable(ctx, access.CallerFrom(byKey("alice")))
+	if err != nil {
+		t.Fatalf("Readable(alice's API key): %v", err)
+	}
 	for _, slug := range []string{"w1", "w5", "w7", "f1", "f2"} {
 		if !keySet.Contains(slug) {
 			t.Errorf("alice's API key cannot read %s", slug)
 		}
-	}
-}
-
-func TestRelationOf_TellsHowANamedWorkspaceStandsToTheBinding(t *testing.T) {
-	t.Parallel()
-	st := openStore(t, t.TempDir())
-	seed(t, st,
-		repo("w1", "alice", "o-alice", access.StatusReady),
-		repo("w5", "alice", "o-alice", access.StatusReady),
-		createdBy(fork("f1", "alice", "o-alice", "w1"), "tokA"),
-		createdBy(fork("f2", "alice", "o-alice", "w1"), "tokA2"),
-		createdBy(fork("g1", "alice", "o-alice", "w5"), "tokA"),
-	)
-	svc := newService(access.StoreRecords(st.Main()), memberships{})
-	ctx := context.Background()
-	for _, c := range []struct {
-		caller server.Caller
-		slug   string
-		want   access.Relation
-	}{
-		{boundPAT("alice", "tokA", "w1"), "w1", access.RelationBound},
-		{boundPAT("alice", "tokA", "w1"), "f1", access.RelationCreatedFork},
-		{boundPAT("alice", "tokA", "w1"), "f2", ""},
-		{boundPAT("alice", "tokA", "w1"), "g1", ""},
-		{boundPAT("alice", "tokA", "w1"), "w5", ""},
-		{boundPAT("alice", "tokA", "w1"), "nope", ""},
-		{boundPAT("alice", "tokF", "f1"), "f1", access.RelationBound},
-		{boundPAT("alice", "tokF", "f1"), "w1", access.RelationParentOfBoundFork},
-		{boundPAT("alice", "tokF", "f1"), "f2", ""},
-		{boundPAT("alice", "tokF", "f1"), "w5", ""},
-		{boundPAT("alice", "tokG", "gone"), "gone", access.RelationBound},
-		{byKey("alice"), "w1", ""},
-	} {
-		if got, err := svc.RelationOf(ctx, access.CallerFrom(c.caller), c.slug); err != nil || got != c.want {
-			t.Errorf("RelationOf(%s, %s) = %q, %v, want %q", c.caller.CredentialID, c.slug, got, err, c.want)
-		}
-	}
-
-	// A fork the token creates after an earlier answer is covered at once.
-	tokB := access.CallerFrom(boundPAT("alice", "tokB", "w1"))
-	if got, err := svc.RelationOf(ctx, tokB, "f3"); err != nil || got != "" {
-		t.Fatalf("RelationOf(tokB, f3) before f3 exists = %q, %v, want none", got, err)
-	}
-	seed(t, st, createdBy(fork("f3", "alice", "o-alice", "w1"), "tokB"))
-	if got, err := svc.RelationOf(ctx, tokB, "f3"); err != nil || got != access.RelationCreatedFork {
-		t.Errorf("RelationOf(tokB, f3) after it was created = %q, %v, want created_fork", got, err)
 	}
 }

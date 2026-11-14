@@ -5,11 +5,11 @@ import (
 	"slices"
 )
 
-// ContributorRoute is a route a PAT bound to a task fork reaches on the
+// contributorRoute is a route a PAT bound to a task fork reaches on the
 // fork's parent: its method and its pattern relative to /workspaces/:slug,
 // with the parameter names a route must be registered with for the binding
 // guard to recognise it.
-type ContributorRoute struct {
+type contributorRoute struct {
 	Method, Pattern string
 }
 
@@ -18,7 +18,7 @@ type ContributorRoute struct {
 // others do there. Each route confines what it does to the fork's changes
 // itself; the guard only lets the request through, with the fork in the
 // Binding.
-var contributorRoutes = []ContributorRoute{
+var contributorRoutes = []contributorRoute{
 	{http.MethodPost, "/changes"},
 	{http.MethodGet, "/changes"},
 	{http.MethodGet, "/changes/:number"},
@@ -46,14 +46,8 @@ var contributorRoutes = []ContributorRoute{
 	{http.MethodGet, "/claims/:id"},
 }
 
-// ContributorRoutes returns a copy of the fixed table of contributor
-// routes.
-func ContributorRoutes() []ContributorRoute {
-	return slices.Clone(contributorRoutes)
-}
-
 // isContributorRoute reports whether method and pattern, relative to
 // /workspaces/:slug, are in the contributor table.
 func isContributorRoute(method, pattern string) bool {
-	return slices.Contains(contributorRoutes, ContributorRoute{method, pattern})
+	return slices.Contains(contributorRoutes, contributorRoute{method, pattern})
 }
