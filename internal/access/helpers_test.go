@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/identity"
@@ -225,8 +226,15 @@ type envelope struct {
 		Message   string `json:"message"`
 		ErrorType string `json:"error_type"`
 	} `json:"error"`
-	Level  access.Level  `json:"level"`
-	Record access.Record `json:"record"`
+	Level   access.Level  `json:"level"`
+	Record  access.Record `json:"record"`
+	Binding *binding      `json:"binding"`
+}
+
+// binding is the binding a guard probe found, as it answers it.
+type binding struct {
+	BoundWorkspace string          `json:"bound_workspace"`
+	Relation       access.Relation `json:"relation"`
 }
 
 func decode(t *testing.T, a answer) envelope {
@@ -297,4 +305,146 @@ func (e *recordingEmitter) all() []emitted {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return slices.Clone(e.emitted)
+}
+
+// guardHub is the hub's REST pipeline built from internal/server: identity's
+// authenticator, the service's binding guard, identity's scope check, then
+// identity's admin check and the workspace access check, over a store in a
+// temporary directory with the identity and workspace record steps. Users
+// and credentials are stored with identity's own functions; the active orgs
+// of a user come from orgs. The guard's refusals go to refusals. Probe
+// routes answer 200 with the binding they find and count their calls.
+type guardHub struct {
+	t        *testing.T
+	st       *store.Store
+	ids      *identity.Service
+	svc      *access.Service
+	srv      *server.Server
+	orgs     map[string][]string
+	refusals *refusalLog
+	calls    *atomic.Int64
+}
+
+func newGuardHub(t *testing.T) *guardHub {
+	t.Helper()
+	dir := t.TempDir()
+	st, err := store.Open(context.Background(), store.Options{
+		DatabasePath:  filepath.Join(dir, "parley.db"),
+		WorkspaceRoot: filepath.Join(dir, "workspaces"),
+	}, []store.Step{identity.SchemaStep, access.SchemaStep, access.CreatingTokenStep})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	h := &guardHub{t: t, st: st, ids: &identity.Service{}, svc: &access.Service{},
+		orgs: map[string][]string{}, refusals: &refusalLog{}, calls: &atomic.Int64{}}
+	h.ids.Bind(identity.Deps{Store: st})
+	h.svc.Bind(access.Deps{
+		Records: access.StoreRecords(st.Main()),
+		Memberships: access.MembershipsFunc(func(_ context.Context, userID string) ([]string, error) {
+			return h.orgs[userID], nil
+		}),
+		Refusals: h.refusals,
+	})
+	h.srv = h.pipeline()
+	return h
+}
+
+// pipeline is a server with the hub's checks installed and no route.
+func (h *guardHub) pipeline() *server.Server {
+	srv := server.New(server.Options{Logger: slog.New(slog.DiscardHandler), RateLimitDisabled: true})
+	srv.SetAuthenticator(h.ids.Authenticate)
+	srv.SetBindingGuard(h.svc.Guard)
+	srv.SetScopeCheck(identity.ScopeCheck)
+	srv.AddAccessCheck(h.ids.AdminCheck)
+	srv.AddAccessCheck(h.svc.Check)
+	return srv
+}
+
+// fresh is the same hub, store, service and counters, served by a server of
+// its own, for routes whose patterns one router cannot hold together.
+func (h *guardHub) fresh() *guardHub {
+	c := *h
+	c.srv = h.pipeline()
+	return &c
+}
+
+// user creates the user name with the role user and returns its id and
+// the id of its personal org.
+func (h *guardHub) user(name string) (id, org string) {
+	h.t.Helper()
+	err := h.st.Tx(context.Background(), func(tx *sql.Tx) error {
+		u, o, err := identity.CreateUserAndPersonalOrg(context.Background(), tx, identity.NewUser{
+			Username: name, Email: name + "@example.com", Provider: "github", ProviderID: name, CreatedAt: time.Now(),
+		}, identity.RoleUser)
+		id, org = u.ID, o.ID
+		return err
+	})
+	if err != nil {
+		h.t.Fatalf("create user %s: %v", name, err)
+	}
+	return id, org
+}
+
+// pat stores a PAT of userID with perms, bound to workspace ("" for none),
+// and returns its value and its token_id.
+func (h *guardHub) pat(userID, workspace string, perms ...string) (value, tokenID string) {
+	h.t.Helper()
+	err := h.st.Tx(context.Background(), func(tx *sql.Tx) error {
+		v, rec, err := identity.StorePAT(context.Background(), tx, identity.PATSpec{
+			UserID: userID, Name: "agent", Permissions: perms, Workspace: workspace, CreatedAt: time.Now(),
+		})
+		value, tokenID = v, rec.TokenID
+		return err
+	})
+	if err != nil {
+		h.t.Fatalf("store a PAT of %s: %v", userID, err)
+	}
+	return value, tokenID
+}
+
+// probe registers a probe route method pattern that declares need and
+// scope.
+func (h *guardHub) probe(method, pattern string, need access.Need, scope string) {
+	h.srv.Register(server.Route{
+		Method: method, Pattern: pattern, Scope: scope, Marks: map[string]string{access.MarkNeed: string(need)},
+		Handler: func(w http.ResponseWriter, r *http.Request) error {
+			h.calls.Add(1)
+			var found *binding
+			if b, ok := access.BindingOf(r); ok {
+				found = &binding{BoundWorkspace: b.Workspace, Relation: b.Relation}
+			}
+			server.WriteJSON(w, http.StatusOK, map[string]any{"binding": found})
+			return nil
+		},
+	})
+}
+
+// do sends method path, under /api/v1, with credential as the bearer
+// credential and no body.
+func (h *guardHub) do(method, path, credential string) answer {
+	r := httptest.NewRequest(method, "/api/v1"+path, nil)
+	r.Header.Set("Authorization", "Bearer "+credential)
+	rec := httptest.NewRecorder()
+	h.srv.Handler().ServeHTTP(rec, r)
+	return answer{rec.Code, rec.Header().Get("Content-Type"), rec.Body.Bytes()}
+}
+
+// refusalLog is a refusal reporter that remembers, in order, each refusal.
+type refusalLog struct {
+	mu  sync.Mutex
+	got []access.Refusal
+}
+
+func (l *refusalLog) Refused(_ context.Context, f access.Refusal) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.got = append(l.got, f)
+}
+
+// all returns the refusals so far.
+func (l *refusalLog) all() []access.Refusal {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.got)
 }

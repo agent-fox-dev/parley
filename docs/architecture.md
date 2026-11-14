@@ -11,7 +11,7 @@ command-line client. Both are written in Go, in the module
 |---|---|
 | `cmd/parley` | the `parley` program: it calls `cli.Run` and exits with its status |
 | `cmd/parleyd` | the `parleyd` program: `main` calls `hub.Run` with the process's arguments, environment and working directory and exits with its status |
-| `internal/access` | the workspace access rule, the one place that decides what a caller may do on a workspace; the minimal workspace record (slug, owner, org, kind, parent, status, the creating token of a fork) in the transactional store, the caller's level on a workspace, the decision for a declared need and the REST access check, the readable set for reads across workspaces, and what the binding of a workspace-bound PAT covers |
+| `internal/access` | the workspace access rule, the one place that decides what a caller may do on a workspace; the minimal workspace record (slug, owner, org, kind, parent, status, the creating token of a fork) in the transactional store, the caller's level on a workspace, the decision for a declared need and the REST access check, the readable set for reads across workspaces, what the binding of a workspace-bound PAT covers, and the binding guard that confines such a PAT on the routes that name a workspace |
 | `internal/buildinfo` | the version, commit and build time the binary was built with, shared by both programs |
 | `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra`, each declared through one helper ([ADR 02](adr/02-declare-every-cli-command-through-one-helper.md)), the client configuration file, the resolution of the hub URL and the credential, the one HTTP client the commands send their requests with, the printing of a command's result on stdout and of its warnings on stderr, the shared wait for a long operation (`--wait`, `--timeout`, `--poll-interval`), and the error envelopes and exit statuses every command ends with |
 | `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, and a registry of keys and whole sections that decides what the file may hold |
@@ -1387,8 +1387,48 @@ fork the token is bound to; and `""` (none) for every other slug and every
 caller without a binding. Both read the records on every call, so a fork the
 token has just created is covered at once. `access.Binding{TokenID,
 Workspace, Relation}` is the value a binding guard attaches to a request
-for its handler (ADR 04), read with `access.BindingOf(r)`; no guard is
-installed yet, so it reports false on every request.
+for its handler (ADR 04), read with `access.BindingOf(r)`; it reports false
+for every caller but a bound PAT.
+
+`internal/access/guard.go` holds the binding guard, `(*Service).Guard`, a
+`server.Check` for the binding-guard position of the pipeline, after the
+route's feature check and before the scope check. The hub does not install
+it yet. It does nothing for the admin token, an API key and a PAT that is
+not bound, and decides nothing on a route that names no workspace. A route
+names a workspace when its pattern is `/workspaces/:slug` or lies under it;
+the slug is the path value as typed. For a bound PAT the guard asks
+`RelationOf` and:
+
+- for `bound` and `created_fork`, attaches the `Binding` and passes;
+- for `parent_of_bound_fork`, attaches the `Binding` and passes when the
+  method and the pattern relative to `/workspaces/:slug` are in the
+  contributor table, and answers `403 token_bound` otherwise;
+- for none, answers `404 not_found` with the message `workspace not found`,
+  the bytes the access check answers for a workspace the caller cannot read,
+  for an existing and an unknown slug alike, and before the scope check, so
+  a token without the route's scope gets the same `404`.
+
+It makes no access or scope decision: a request it passes reaches the scope
+check and the access checks as an unbound PAT of the same user would. Each
+`403` and `404` it answers is reported to `Deps.Refusals`, an
+`access.RefusalReporter` (`Refused(ctx, access.Refusal)`; nil discards),
+as `access.Refusal{TokenID, UserID, BoundWorkspace, RequestedWorkspace,
+Method, Route, Status, Surface}`, where `Route` is `/api/v1` followed by the
+matched pattern and `Surface` is `access.SurfaceAPI` (`"api"`). A failed read
+of the records is an error, answered `500 internal`.
+
+`internal/access/contributor_routes.go` holds the contributor table, the 25
+routes a token bound to a fork reaches on the fork's parent, as method and
+pattern relative to `/workspaces/:slug`, read with
+`access.ContributorRoutes()`: `POST` and `GET /changes`, `GET` and `PATCH
+/changes/:number`, `GET /changes/by-commit/:sha`, `POST
+/changes/:number/abandon`, `/restore`, `/restack` and `/land`, `GET
+/changes/:number/versions`, `/versions/:version`, `/diff`, `/stack`,
+`/lands`, `/conflict`, `/conflict/file`, `/approvals`, `/checks` and
+`/overlaps`, `GET /lands/:id`, `GET /policy`, `POST /policy/evaluate`, `GET
+/activity`, `GET /claims` and `GET /claims/:id`. The guard matches the
+pattern as registered, so a route reaches a fork-bound token on the parent
+only when it is registered with these parameter names.
 
 `internal/access/events.go` declares `access.EventEmitter` (`Emit(ctx, tx,
 access.Event)` in the caller's transaction, `EmitNow(ctx, access.Event)` in

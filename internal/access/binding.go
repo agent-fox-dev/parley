@@ -48,3 +48,9 @@ func BindingOf(r *http.Request) (Binding, bool) {
 	b, ok := v.(Binding)
 	return b, ok
 }
+
+// attachBinding attaches b to the request r for its handler, where
+// BindingOf reads it.
+func attachBinding(r *http.Request, b Binding) {
+	server.Attach(r, bindingKey{}, b)
+}
