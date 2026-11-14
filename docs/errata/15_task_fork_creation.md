@@ -117,3 +117,28 @@ Where the package is silent: a sandbox component that answers something
 other than a JSON object, without an error, fails the create with `500
 internal` inside the transaction, so that a fork once committed is always
 answered `201` with a valid body.
+
+## The update event of a fork carries its session, through package 11's file
+
+The package carries the fork's `session_id` on `parley.workspace.update`
+"through the event field the update handler fills from the record" and
+edits no file of package 11. Package 11's update handler fills no such
+field: `updateEventInput` in `internal/workspace/update.go` set no session.
+The code makes the edit unavoidable, so that function now sets the event's
+`session_id` from the record it updates (`SessionID: cur.SessionID`): the
+fork's session for a fork created in one, `null` otherwise, a repository
+workspace included. It is the one change this package makes to a file of
+package 11.
+
+## The parent-state check is a method of the fork component
+
+The package names `CheckParentState(workspace slug, use)`. It is
+`(*fork.Component).CheckParentState(ctx, slug, use)`, with `use` one of
+`fork.UseRead` and `fork.UseWrite`, reached through `Composition.Forks()`.
+The update guard registered with `RegisterForkUpdateGuard` is
+`fork.GuardUpdate`, the same check for a write with the parent read through
+the update's transaction. Where the package is silent: a slug no workspace
+has is `404 not_found` (`workspace not found`), and an archived parent on
+which a maintenance operation runs (its delete) is `409 workspace_busy` for
+both uses, since the marker is read first, as `workspace.RequireReady`
+does.

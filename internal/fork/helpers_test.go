@@ -288,17 +288,42 @@ func (w *world) postKey(t *testing.T, cred, path, key string, body any) answer {
 // forkEvents are the parley.workspace.fork events of the log, in its order.
 func (w *world) forkEvents(t *testing.T) []event.Record {
 	t.Helper()
+	return w.eventsOf(t, "parley.workspace.fork")
+}
+
+// eventsOf are the events of type typ in the log, in its order.
+func (w *world) eventsOf(t *testing.T, typ string) []event.Record {
+	t.Helper()
 	recs, _, err := w.events.ReadAfter(context.Background(), 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var out []event.Record
 	for _, r := range recs {
-		if r.Type == "parley.workspace.fork" {
+		if r.Type == typ {
 			out = append(out, r)
 		}
 	}
 	return out
+}
+
+// setParent stores status and marker on demo's record until the test ends,
+// when demo is ready again with no maintenance running.
+func (w *world) setParent(t *testing.T, status workspace.Status, marker workspace.Marker) {
+	t.Helper()
+	const set = `UPDATE workspaces SET status = ?, maintenance = ? WHERE slug = ?`
+	w.exec(t, set, status, marker, parentSlug)
+	t.Cleanup(func() { w.exec(t, set, workspace.StatusReady, workspace.MarkerNone, parentSlug) })
+}
+
+// record is the stored fork slug.
+func (w *world) record(t *testing.T, slug string) fork.Fork {
+	t.Helper()
+	f, found, err := fork.BySlug(context.Background(), w.Store.Main(), slug)
+	if err != nil || !found {
+		t.Fatalf("fork %s: found %v, %v", slug, found, err)
+	}
+	return f
 }
 
 // footprint is what a refused or failed create must leave as it found it:

@@ -395,10 +395,11 @@ func eventActor(p identity.Principal) (actorType string, actorID *string, ok boo
 // admin token, with no actor id, or the credential's type with its user's
 // id. Its metadata names the mutable fields body carries, in the order of
 // updateFields, and for a fork the parent, never a value, so that the log
-// shows who changed what without holding a setting.
+// shows who changed what without holding a setting; a fork created in a
+// session carries that session.
 func updateEventInput(ctx context.Context, cur Workspace, body map[string]json.RawMessage) (event.Input, error) {
 	slug := cur.Slug
-	in := event.Input{Type: eventUpdate, Workspace: &slug, ResourceType: "workspace", ResourceID: slug}
+	in := event.Input{Type: eventUpdate, Workspace: &slug, ResourceType: "workspace", ResourceID: slug, SessionID: cur.SessionID}
 	p, _ := identity.PrincipalOf(ctx)
 	var ok bool
 	if in.ActorType, in.ActorID, ok = eventActor(p); !ok {

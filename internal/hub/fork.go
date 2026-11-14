@@ -10,9 +10,12 @@ import (
 const forksHook = "forks"
 
 // composeForks adds the task forks: the fork fields of the workspace
-// records, after the workspace part's, and the fork view of the workspace
+// records, after the workspace part's; the fork view of the workspace
 // service, through which every workspace object of a fork shows the head
-// the fork component computes from the parent's repository. Its start hook
+// the fork component computes from the parent's repository; and, in an
+// update of a fork, the handlers of purpose and auto_change and the guard
+// that refuses every update of a fork whose parent is not ready (ttl is the
+// fork lifetime's to register). Its start hook
 // binds the component to the stores, the workspace service, which knows
 // where the parents' and the forks' repositories are, and the hub's git.
 // The component exists from the composition on, so a later part keeps it
@@ -28,6 +31,9 @@ func composeForks(c *Composition) {
 	c.forks = comp
 	c.AddSchemaStep(fork.SchemaStep)
 	c.workspaces.RegisterForkView(comp.WorkspaceView)
+	c.workspaces.RegisterForkField("purpose", fork.PurposeField)
+	c.workspaces.RegisterForkField("auto_change", fork.AutoChangeField)
+	c.workspaces.RegisterForkUpdateGuard(fork.GuardUpdate)
 	for _, r := range comp.Routes() {
 		c.AddRoute(r)
 	}

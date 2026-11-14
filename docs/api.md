@@ -1288,10 +1288,13 @@ when the fork was created.
 ## `PATCH /api/v1/workspaces/{slug}`
 
 Changes the display name, the description, the organization and the
-settings of the workspace `{slug}`. It takes the admin token, an API key or a PAT, declares
+settings of the workspace `{slug}`, and the purpose and `auto_change` of a
+task fork. It takes the admin token, an API key or a PAT, declares
 the scope `workspaces:write` for a PAT and needs write access to the
 workspace (see [Workspace access](#workspace-access)): its owner or the
-admin token. It works in every status but `archived`.
+admin token, and for a task fork also the owner of its parent. It works in
+every status but `archived`, and on a task fork only while its parent is
+`ready` with no maintenance running.
 
 The body is a JSON object that changes exactly the fields it carries;
 members the route does not know are ignored, and a field not given keeps
@@ -1303,7 +1306,9 @@ its value.
 | `description` | `null` or a string of at most 1024 characters; `null` sets it to `""` | the same |
 | `org_id` | an org id or slug, or `null` for the personal org of the workspace's owner; the workspace and every fork of it move to that org | `400` `not_supported_on_fork` |
 | `settings` | an object or `null`, applied to the stored settings key by key (below) | `400` `not_supported_on_fork` |
-| `ttl`, `purpose`, `auto_change` | `400` `invalid_request` | `400` `invalid_request` until the fork features accept them |
+| `ttl` | `400` `invalid_request` | `400` `invalid_request` until the fork lifetime accepts it |
+| `purpose` | `400` `invalid_request` | `null` or a string of at most 1024 characters (Unicode code points); `null` clears it |
+| `auto_change` | `400` `invalid_request` | `true` or `false`; `null` is refused |
 | `slug`, `kind`, `git_url`, `default_branch`, `owner_id`, `workspace_mode`, `upstream_url`, `integration_branch`, `parent_slug`, `fork_point` | `400` `invalid_request`, whatever the value, the current one included | the same |
 
 In `settings`, a key given with a value its rule accepts is stored with that
@@ -1334,9 +1339,16 @@ for a slug no workspace has, `403` for a member of its org, also on an
 archived workspace); then the body: not a JSON object; an immutable field;
 a field that does not apply to the workspace's kind; no field to change;
 the values in the order `display_name`, `description`, `org_id`,
-`settings`; an `org_id` naming an org of which the workspace's owner is
-not an active member (`403`); and last the state: an archived workspace is
-`409`.
+`settings`, `purpose`, `auto_change`; an `org_id` naming an org of which
+the workspace's owner is not an active member (`403`); and last the state:
+an archived workspace is `409`, and for a task fork, whatever the fields,
+its parent's state, read in the update's transaction: a parent that is
+`pending` or `cloning` or on which a maintenance operation (archive,
+reclone, delete) runs is `409` `workspace_busy`, a `failed` parent `409`
+`workspace_not_ready`, an `archived` parent `409` `parent_archived`. An
+invalid body is therefore `400` also while the parent is archived. A fork
+whose parent is archived stays readable:
+[`GET /api/v1/workspaces/{slug}`](#get-apiv1workspacesslug) answers it.
 Of several refused setting keys the message names one: an unknown key
 before any refused value, the first unknown key in byte order of the keys,
 otherwise the refused key that comes first in the table of
@@ -1356,8 +1368,10 @@ update is not made and is answered `500` `internal`. The event has
 caller's user, and in `metadata` `fields`, the names of the mutable fields
 the body carried in the order `display_name`, `description`, `org_id`,
 `settings`, `ttl`, `purpose`, `auto_change`, and for a task fork
-`parent_slug`, its parent's slug. The metadata holds no value of any
-field, so no setting appears in the log:
+`parent_slug`, its parent's slug; its `session_id` is the workspace's
+`session_id`, that of a fork created in a session and otherwise `null`.
+The metadata holds no value of any field, so no setting appears in the
+log:
 
 ```json
 {"seq":13,"id":"…","type":"parley.workspace.update","time":"2026-11-14T10:31:02Z","workspace":"demo","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"workspace","resource_id":"demo","action":"update","session_id":null,"metadata":{"fields":["display_name","settings"]}}
@@ -1370,12 +1384,15 @@ The answer is the workspace object after the update, the object
 | Status | When |
 |---|---|
 | `200 OK` | the fields are changed; the body is the workspace object |
-| `400` `invalid_request` | the body is not a JSON object; it carries an immutable field (`<field>: cannot be changed`), a fork-only field on a repository workspace (`<field>: applies only to a task fork`) or on a fork that does not accept it (`<field>: cannot be changed`); it carries no field to change (`the body carries no field to change`); or a value is refused: `display_name: must be a string or null`, `display_name: must be at most 128 characters`, the same for `description` with 1024, `org_id: must be a string or null`, `org_id: no organization has the id or slug "<value>"` (also for `""` and an id no org has), `org_id: the workspace's owner has no personal organization`, `settings: must be an object or null`, `unknown setting "<key>"`, or `settings.<key>: <reason>` for a value its rule refuses (`settings.land.strategy: must be one of ["rebase" "squash"]`); the reason never repeats a URL |
+| `400` `invalid_request` | the body is not a JSON object; it carries an immutable field (`<field>: cannot be changed`), a fork-only field on a repository workspace (`<field>: applies only to a task fork`) or on a fork that does not accept it (`<field>: cannot be changed`); it carries no field to change (`the body carries no field to change`); or a value is refused: `display_name: must be a string or null`, `display_name: must be at most 128 characters`, the same for `description` with 1024, `org_id: must be a string or null`, `org_id: no organization has the id or slug "<value>"` (also for `""` and an id no org has), `org_id: the workspace's owner has no personal organization`, `settings: must be an object or null`, `unknown setting "<key>"`, or `settings.<key>: <reason>` for a value its rule refuses (`settings.land.strategy: must be one of ["rebase" "squash"]`), `purpose: must be a string`, `purpose: must be at most 1024 characters long`, `auto_change: must be true or false`; the reason never repeats a URL |
 | `400` `not_supported_on_fork` | `org_id` or `settings` in an update of a task fork, whatever the value (`<field>: a task fork takes its org and its settings from its parent`) |
 | `403` `insufficient_scope` | a PAT without `workspaces:write` (`this route needs the scope workspaces:write`) |
 | `403` `forbidden` | a member of the workspace's org who does not own it (`org members have read-only access to this workspace`), in every status; or an `org_id` naming an org of which the workspace's owner is not an active member, whoever the caller is (`the workspace's owner is not an active member of the organization`) |
 | `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug (`workspace not found`); also a bound PAT on a workspace outside its binding |
 | `409` `workspace_archived` | a valid update of a workspace in status `archived` (`workspace <slug> is archived`) |
+| `409` `parent_archived` | a valid update of a task fork whose parent is `archived` (`workspace "<fork slug>" is read-only: its parent workspace "<parent slug>" is archived`) |
+| `409` `workspace_busy` | a valid update of a task fork whose parent is `pending` or `cloning` (`workspace "<parent slug>" is busy: its clone has not finished; try again later`) or runs a maintenance operation (`workspace "<parent slug>" is busy: a <archive, reclone or delete> is running; try again later`) |
+| `409` `workspace_not_ready` | a valid update of a task fork whose parent is `failed` (`workspace "<parent slug>" is not ready: its clone failed; reclone it`) |
 | `500` `internal` | a write failed, that of a fork moved with the workspace or of the update's event included; nothing is changed |
 
 ## `POST /api/v1/workspaces/{slug}/sync`
