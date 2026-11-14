@@ -167,7 +167,8 @@ the file and exits `1`. While the file is there, a start without
 
 `parleyd` starts in this order and stops at the first stage that fails:
 
-1. it loads and checks the configuration;
+1. it loads and checks the configuration, and loads the secret keys (see
+   [configuration.md](configuration.md#secret-keys));
 2. it creates the data directory and the workspace root when they are
    missing, opens both stores and brings them to the current schema;
 3. the bootstrap: it writes the admin token file and exits, refuses to
@@ -207,7 +208,22 @@ cleanly is replaced by `[redacted]` as a whole. Attribute names, `time` and
 body is logged; a set of HTTP headers given to the logger shows its
 `Authorization` and `Proxy-Authorization` values as `[redacted]`.
 
-Once it listens it writes:
+Once it has bound the address, it writes what its parts report about the
+start, then the `listening` line. The secret store reports whether a
+current key is configured, whether a previous key is, and how many stored
+secrets were sealed under a key that is neither (counted by the key id
+stored with each, without decrypting any): those cannot be read until their
+key is configured again.
+
+```json
+{"time":"2026-11-14T06:20:11.402117+01:00","level":"INFO","msg":"secret encryption","key_configured":true,"previous_key_present":false,"undecryptable_secrets":0}
+```
+
+Without a current key it also writes a warning and goes on starting:
+
+```json
+{"time":"2026-11-14T06:20:11.402121+01:00","level":"WARN","msg":"secrets cannot be stored: no encryption key configured"}
+```
 
 ```json
 {"time":"2026-11-13T13:11:38.622658+01:00","level":"INFO","msg":"listening","addr":"127.0.0.1:52887","config":"/srv/parley/config.toml","data_dir":"/srv/parley/data"}
@@ -268,11 +284,17 @@ has passed, it writes one line naming it in `work`: `requests`,
 
 When the start fails before listening it writes one line and exits `1`.
 The line is `cannot start` with the cause in `error`, which names the
-configuration key, the path, the schema step, the admin token file or the
-start work that failed:
+configuration key, the secret key's variable or file, the path, the schema
+step, the admin token file or the start work that failed:
 
 ```json
 {"time":"2026-11-13T13:11:38.609972+01:00","level":"ERROR","msg":"cannot start","error":"configuration file /srv/parley/config.toml: server.prot: unknown key"}
+```
+
+A secret key that cannot be loaded is named and never quoted:
+
+```json
+{"time":"2026-11-14T06:20:11.391337+01:00","level":"ERROR","msg":"cannot start","error":"PARLEY_SECRETS_KEY: must be standard padded base64 of exactly 32 bytes"}
 ```
 
 With sandboxes on (a `[sandbox]` section, see
@@ -323,7 +345,7 @@ grace starts again and the process does not exit early.
 | Status | When |
 |---|---|
 | `0` | `--help`, a run that wrote the admin token file, a written backup, or a stop by `SIGTERM` or `SIGINT`, whether or not the grace passed |
-| `1` | the start failed before listening (the configuration, the data, a schema step, the admin token file that could not be written or is still there, the start work or the listen address), or `backup` failed (see [`parleyd backup <directory>`](#parleyd-backup-directory)) |
+| `1` | the start failed before listening (the configuration, a secret key, the data, a schema step, the admin token file that could not be written or is still there, the start work or the listen address), or `backup` failed (see [`parleyd backup <directory>`](#parleyd-backup-directory)) |
 | `2` | a usage error: an unknown flag, `--admin-email` without a value, a positional argument other than `backup`, `backup` without exactly one directory, or `backup` with `--admin-email` or `--reset-admin-token` |
 
 ## `parley`

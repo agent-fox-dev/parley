@@ -80,6 +80,7 @@ It never quotes a variable's value.
 | `[limits].requests_per_minute` | integer | `600` | how many REST requests one credential, or one client address without a valid credential, may send in a window of 60 seconds; `0` turns the rate limit off (see [api.md](api.md#rate-limit)) |
 | `[events].retention` | string | `"30d"` | how long an event stays in the event log, which `GET /api/v1/events` and `GET /api/v1/events/log` read from: a whole number followed by `s`, `m`, `h` or `d`, at least `1h` (see [api.md](api.md#get-apiv1events)). The hub's retention run applies it; that run is not built yet, and until it runs no event leaves the log |
 | `[events].max_sse_connections` | integer | `500` | how many event streams (`GET /api/v1/events`) may be open at once; at least `1`. A stream beyond it is answered `503` with `Retry-After: 5`; held long-polls of `GET /api/v1/events/log` do not count (see [api.md](api.md#get-apiv1events)) |
+| `[secrets].key_file` | string | `""` | a file holding the current secret key, read only when `PARLEY_SECRETS_KEY` is unset or empty; a relative path is taken from the directory of `config.toml` (see [Secret keys](#secret-keys)) |
 
 `[database].path` and `[workspace].path`, set or not, are resolved to
 absolute paths:
@@ -269,12 +270,43 @@ example:
 configuration file /srv/parley/config.toml: sandbox.runtime: must be openshell; sandbox.max_ttl: must be more than 0; sandbox.reconcile_interval: must be from 10s to 10m; sandbox.gatway_url: unknown key; server.external_url: must be set when the [sandbox] section is present
 ```
 
+### Secret keys
+
+The hub seals every stored secret with AES-256-GCM under the operator's
+current key, and opens values sealed under the previous key during a
+rotation. Each key is standard base64 with padding (`=`) of exactly 32
+bytes, such as the output of `openssl rand -base64 32`; white space around
+it is ignored, the URL-safe alphabet is not accepted.
+
+| Source | Holds |
+|---|---|
+| `PARLEY_SECRETS_KEY` | the current key |
+| `[secrets].key_file` | the current key, when `PARLEY_SECRETS_KEY` is unset or empty; the file is not read otherwise |
+| `PARLEY_SECRETS_KEY_PREVIOUS` | the previous key, optional |
+
+`parleyd` loads the keys with the configuration, before it opens the stores,
+also for `--admin-email`, `--reset-admin-token` and `backup`. A key that is
+not 32 bytes of standard padded base64, or a key file that cannot be read,
+stops it with one `cannot start` line and exit status `1`; the line names the
+variable or the file, never the value:
+
+```
+PARLEY_SECRETS_KEY: must be standard padded base64 of exactly 32 bytes
+[secrets].key_file "/srv/parley/secrets.key": cannot be read: no such file or directory
+```
+
+Without a current key the hub starts, lists and deletes secrets, and refuses
+to store one. What the start logs about the keys is in
+[cli.md](cli.md#log-lines).
+
 ### Environment variables
 
 | Variable | Effect |
 |---|---|
 | `XDG_CONFIG_HOME` | the directory `config.toml` is read from |
 | `XDG_DATA_HOME` | where the stores and the workspace root go when `[database].path` and `[workspace].path` do not say (see above) |
+| `PARLEY_SECRETS_KEY` | the current secret key (see [Secret keys](#secret-keys)) |
+| `PARLEY_SECRETS_KEY_PREVIOUS` | the previous secret key, during a rotation (see [Secret keys](#secret-keys)) |
 | any variable a `${NAME}` reference names | its value replaces the reference |
 
 ### Fixed values

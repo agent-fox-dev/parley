@@ -104,10 +104,12 @@ grepping for declarations.
   only: `hubtest.Start` bootstraps a hub with an admin token and serves it
   in-process on a free loopback port (its `Hub` has `Token`, `Store`,
   `URL(path)`, `Call`, `CreateUser`, `IssueKey`, `IssuePAT`, `CreateOrg`,
-  `AddMember`, `AddWorkspace` and `Restart`, which stops the hub and serves
-  it again on the same data directory and port), `hubtest.StartWith` does
-  the same with a `hubtest.Config` (`Server` inside `[server]`, `TOML` after
-  it, `Files` in the config dir, `Compose` on the composition, `Now` the
+  `AddMember`, `AddWorkspace`, `Restart`, which stops the hub and serves
+  it again on the same data directory and port, and `RestartEnv`, which
+  does so with other variables added to the hub's environment),
+  `hubtest.StartWith` does the same with a `hubtest.Config` (`Server`
+  inside `[server]`, `TOML` after it, `Files` in the config dir, `Env`
+  added to the hub's environment, `Compose` on the composition, `Now` the
   hub's clock), `hubtest.Serve` runs a hub
   with the options a test gives until the test ends (its `Served` has
   `URL(path)` and `Call(t, method, path, credential, body)`, which sends a
