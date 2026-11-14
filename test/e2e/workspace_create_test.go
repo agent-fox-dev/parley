@@ -33,6 +33,7 @@ import (
 type workspaceHub struct {
 	*hubtest.Hub
 	root   string
+	user   string
 	key    string
 	origin *gitrepotest.Origin
 	// starts records, at every start of the hub, what the workspace part
@@ -76,7 +77,8 @@ func startWorkspaceHub(t *testing.T, origin *gitrepotest.Origin, slug string) *w
 			})
 		},
 	})
-	h.key = h.IssueKey(t, h.CreateUser(t, "dev"))
+	h.user = h.CreateUser(t, "dev")
+	h.key = h.IssueKey(t, h.user)
 	clientEnv(t, t.TempDir())
 	return h
 }
