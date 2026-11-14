@@ -96,7 +96,7 @@ func TestWorkspaceSync_ADeveloperSyncsFromTheShellAndIsToldWhichBranchDiverged(t
 	if got := syncResults(t, first.json(t)); !reflect.DeepEqual(got, want) {
 		t.Errorf("the first sync reported %v, want %v", got, want)
 	}
-	copied := refs(t, hub)
+	copied := gitrepotest.Refs(t, hub, "")
 	for ref, id := range map[string]string{
 		"refs/heads/release/1.x": origin.Head("release/1.x"),
 		"refs/heads/exp":         origin.Head("exp"),
@@ -138,7 +138,7 @@ func TestWorkspaceSync_ADeveloperSyncsFromTheShellAndIsToldWhichBranchDiverged(t
 	if got := syncResults(t, second.json(t))["exp"]; got != "diverged" {
 		t.Errorf("sync --fail-on-diverged reported exp %q, want diverged", got)
 	}
-	if got := refs(t, hub)["refs/heads/exp"]; got != hubExp {
+	if got := gitrepotest.Refs(t, hub, "")["refs/heads/exp"]; got != hubExp {
 		t.Errorf("after the diverged sync the hub's exp = %s, want it unchanged at %s", got, hubExp)
 	}
 
@@ -146,7 +146,7 @@ func TestWorkspaceSync_ADeveloperSyncsFromTheShellAndIsToldWhichBranchDiverged(t
 	if got := syncResults(t, third.json(t))["exp"]; got != "reset" {
 		t.Errorf("sync --reset-to-origin reported exp %q, want reset", got)
 	}
-	if got := refs(t, hub)["refs/heads/exp"]; got != origin.Head("exp") {
+	if got := gitrepotest.Refs(t, hub, "")["refs/heads/exp"]; got != origin.Head("exp") {
 		t.Errorf("after the reset the hub's exp = %s, want origin's %s", got, origin.Head("exp"))
 	}
 }

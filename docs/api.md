@@ -1411,10 +1411,11 @@ runs inside the sync of a `carry_patch` workspace, never of a `standard`
 one, at two points: right after the fetch of origin, before any tag or
 branch is created or moved, and after the comparison of every branch,
 before the completion is recorded. Both run to their end when the caller
-disconnects. If the first fails, the sync ends as a failed fetch: nothing
-moves, `sync_error` is set and the answer is `502` `upstream_error`, whose
-message is the extension's error, scrubbed as below and without the prefix
-`origin fetch failed: `. If the second fails, the answer is `500`
+disconnects. If the first fails, the sync ends as a failed fetch: no
+branch or tag moves, `sync_error` is set and the answer is `502`
+`upstream_error`, whose message is the extension's error, scrubbed as below
+and without the prefix `origin fetch failed: `; the origin heads stay as
+the fetch, which had succeeded, set them. If the second fails, the answer is `500`
 `internal` with its error, scrubbed, as message; the completion is not
 recorded (no field is written and no event emitted) and the branches moved
 before stay moved. When the second succeeds it may set `upstream_head_sha`,
@@ -1457,8 +1458,8 @@ end when the caller disconnects, with the same branch moves, fields and
 event as when the caller waits.
 
 A sync that cannot fetch origin changes nothing in the hub's repository: no
-branch, tag or origin head moves, since the fetch writes all of them or
-none and tags are created only after it. This covers secrets that cannot be
+branch, tag or origin head moves, since the origin heads are set only once
+the fetch has succeeded and tags are created only after it. This covers secrets that cannot be
 read (nothing is then fetched, never anonymously), origin refusing the
 credential or the request, a failing network, and a fetch that has not
 ended after two minutes, whose git processes are stopped. The sync writes
@@ -1477,8 +1478,10 @@ bytes. The next sync that completes clears `sync_error`.
 A completed sync, also one with branches `ahead` or `diverged`, sets in one
 store transaction `last_sync_at` to the hub's time cut to the second,
 `sync_error` to `null`, `head_sha` to the hub's head of the default branch
-and `origin_head_sha` to origin's head of the default branch, `null` when
-origin has no such branch; `updated_at` is not changed. In the same
+and `origin_head_sha` to its origin head, both read from the hub's
+repository when the completion is recorded, so that of two overlapping
+syncs the one that completes last never records an older origin than the
+other already fetched, `null` when there is no such branch; `updated_at` is not changed. In the same
 transaction it writes one `parley.workspace.sync` event with `workspace`
 and `resource_id` the slug, `resource_type` `workspace`, and as actor the
 caller as for [`PATCH /api/v1/workspaces/{slug}`](#patch-apiv1workspacesslug):
@@ -1521,7 +1524,7 @@ whose name the workspace object or `branches` has already is left out.
 | `409` `workspace_busy` | the workspace is `pending` or `cloning` (`workspace "<slug>" is busy: its clone has not finished; try again later`), or a reclone, archive or delete runs on it, in any status (`workspace "<slug>" is busy: a reclone is running; try again later`) |
 | `409` `workspace_not_ready` | the workspace is `failed` (`workspace "<slug>" is not ready: its clone failed; reclone it`) |
 | `409` `workspace_archived` | the workspace is `archived` (`workspace "<slug>" is archived`) |
-| `502` `upstream_error` | origin could not be fetched, or the workspace's secrets could not be read to fetch it (`origin fetch failed: <git's error, scrubbed>`), or the first stage of a sync extension failed (`<its error, scrubbed>`); nothing in the hub's repository changed and `sync_error` holds the same text |
+| `502` `upstream_error` | origin could not be fetched, or the workspace's secrets could not be read to fetch it (`origin fetch failed: <git's error, scrubbed>`), or the first stage of a sync extension failed (`<its error, scrubbed>`); no branch or tag of the hub's repository changed, nor, for a failed fetch, any origin head (after a failed first stage they are those the fetch set), and `sync_error` holds the same text |
 | `500` `internal` | the sync could not complete: a branch moved in the hub under each of five comparisons (`the sync of workspace "<slug>" stopped: branch "<name>" moved in the hub during each of its 5 evaluations; sync again`), the excluded-branch provider of a `carry_patch` workspace failed (`the sync of workspace "<slug>" stopped before any branch was compared: the excluded-branch provider failed: <its error, scrubbed>`), the second stage of a sync extension failed (`<its error, scrubbed>`) or added a member that is not JSON, a ref of the hub could not be read or written, or `sync_error`, the completion or its event could not be written; branches moved before stay moved |
 
 ## `POST /api/v1/workspaces/{slug}/tokens`

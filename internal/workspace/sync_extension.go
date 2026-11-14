@@ -44,8 +44,9 @@ type SyncAddition struct {
 type SyncExtension interface {
 	// AfterFetch runs once the fetch of origin has succeeded, before any tag
 	// or branch of the copy is created or moved. An error ends the sync as
-	// a fetch that failed: nothing moves, sync_error holds the error's
-	// scrubbed text and the answer is 502 upstream_error with it.
+	// a fetch that failed: no tag or branch moves, sync_error holds the
+	// error's scrubbed text and the answer is 502 upstream_error with it;
+	// the origin heads stay those the fetch set.
 	AfterFetch(ctx context.Context, run SyncRun) error
 	// BeforeCompletion runs once the per-branch pass has handled every
 	// branch, with its results in the answer's order, before the completion

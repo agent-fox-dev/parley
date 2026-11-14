@@ -5,7 +5,6 @@ import (
 	"errors"
 	"maps"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -29,7 +28,7 @@ func TestFetchOrigin_RecordsOriginHeads(t *testing.T) {
 	release := o.Branch("release/1.x", "dev")
 	feat := o.Branch("feat/a", mainHead)
 	o.Tag("v2", "dev")
-	local := allRefs(t, dir)
+	local := gitrepotest.Refs(t, dir, "")
 
 	got, err := g.FetchOrigin(ctx, dir, o.URL(), gitrepo.Credential{}, time.Minute)
 	if err != nil {
@@ -40,7 +39,7 @@ func TestFetchOrigin_RecordsOriginHeads(t *testing.T) {
 	assertRefs(t, "Fetched.Tags", got.Tags, map[string]string{"v1": v1, "v2": devHead})
 	// The branches and tags of the copy are as they were, and no ref but
 	// the origin heads was added.
-	assertRefs(t, "the copy's refs after the fetch", allRefs(t, dir), withOriginHeads(local, heads))
+	assertRefs(t, "the copy's refs after the fetch", gitrepotest.Refs(t, dir, ""), withOriginHeads(local, heads))
 
 	gitrepotest.Git(t, o.Dir(), "update-ref", "-d", "refs/heads/feat/a")
 	newer := o.Commit("main", "fifth")
@@ -48,7 +47,17 @@ func TestFetchOrigin_RecordsOriginHeads(t *testing.T) {
 		t.Fatal(err)
 	}
 	heads = map[string]string{"main": newer, "dev": devHead, "release/1.x": release}
-	assertRefs(t, "the copy's refs after origin deleted feat/a", allRefs(t, dir), withOriginHeads(local, heads))
+	assertRefs(t, "the copy's refs after origin deleted feat/a", gitrepotest.Refs(t, dir, ""), withOriginHeads(local, heads))
+
+	// Origin renames dev to dev/next: the origin head of dev is in the way
+	// of dev/next's until it is removed.
+	gitrepotest.Git(t, o.Dir(), "update-ref", "-d", "refs/heads/dev")
+	next := o.Branch("dev/next", devHead)
+	if _, err := g.FetchOrigin(ctx, dir, o.URL(), gitrepo.Credential{}, time.Minute); err != nil {
+		t.Fatalf("fetch after origin renamed dev to dev/next: %v", err)
+	}
+	heads = map[string]string{"main": newer, "dev/next": next, "release/1.x": release}
+	assertRefs(t, "the copy's refs after origin renamed dev", gitrepotest.Refs(t, dir, ""), withOriginHeads(local, heads))
 }
 
 func TestFetchOrigin_StopsAtDeadline(t *testing.T) {
@@ -60,7 +69,7 @@ func TestFetchOrigin_StopsAtDeadline(t *testing.T) {
 	if err := g.Clone(context.Background(), o.URL(), gitrepo.Credential{}, dir); err != nil {
 		t.Fatal(err)
 	}
-	before := allRefs(t, dir)
+	before := gitrepotest.Refs(t, dir, "")
 	ln := newSilentListener(t)
 	start := time.Now()
 	_, err := g.FetchOrigin(context.Background(), dir, ln.url, gitrepo.Credential{}, 200*time.Millisecond)
@@ -75,19 +84,7 @@ func TestFetchOrigin_StopsAtDeadline(t *testing.T) {
 	if !ln.quiet(500*time.Millisecond, 2*time.Second) {
 		t.Errorf("a connection to origin is still open 2s after the return: a git process is left")
 	}
-	assertRefs(t, "the copy's refs after the deadline", allRefs(t, dir), before)
-}
-
-// allRefs maps every ref of the repository at dir to the object id it
-// points at.
-func allRefs(t *testing.T, dir string) map[string]string {
-	t.Helper()
-	refs := map[string]string{}
-	for line := range strings.Lines(gitrepotest.Git(t, dir, "for-each-ref", "--format=%(refname) %(objectname)")) {
-		name, id, _ := strings.Cut(strings.TrimSpace(line), " ")
-		refs[name] = id
-	}
-	return refs
+	assertRefs(t, "the copy's refs after the deadline", gitrepotest.Refs(t, dir, ""), before)
 }
 
 // withOriginHeads is refs with the origin head of every branch of heads

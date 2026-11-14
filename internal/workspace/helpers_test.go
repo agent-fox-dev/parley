@@ -906,16 +906,22 @@ func (s *syncWorld) sync(t *testing.T, opts workspace.SyncOptions) workspace.Syn
 	return r
 }
 
-// refsUnder maps every ref below prefix of the repository at dir, by its
-// name without the prefix, to the object id it points at.
-func refsUnder(t *testing.T, dir, prefix string) map[string]string {
+// syncBranches decodes the branches of a, which must be 200, and checks that
+// the rest of a is the workspace object.
+func syncBranches(t *testing.T, a answer) (map[string]any, []workspace.BranchResult) {
 	t.Helper()
-	refs := map[string]string{}
-	for line := range strings.Lines(gitrepotest.Git(t, dir, "for-each-ref", "--format=%(refname) %(objectname)", prefix)) {
-		name, id, _ := strings.Cut(strings.TrimSpace(line), " ")
-		refs[strings.TrimPrefix(name, prefix)] = id
+	obj := a.decode(t, http.StatusOK)
+	var body struct {
+		Branches []workspace.BranchResult `json:"branches"`
 	}
-	return refs
+	if err := json.Unmarshal(a.body, &body); err != nil || body.Branches == nil {
+		t.Fatalf("the sync answer %s has no branches list (%v)", a.body, err)
+	}
+	delete(obj, "branches")
+	if len(obj) != len(objectMembers) {
+		t.Errorf("the sync answer has %d members beside branches, want the %d of a workspace object", len(obj), len(objectMembers))
+	}
+	return obj, body.Branches
 }
 
 // deref is the value p points at, "" for nil.
@@ -1082,7 +1088,7 @@ func (s *syncWorld) branchSet(t *testing.T) branchSet {
 	gitrepotest.Git(t, s.copy, "branch", "ff", b.base)
 	b.hubAhead = grow(t, s.copy, "ahead-b", b.base, "hub")
 	b.hubDiv = grow(t, s.copy, "div", b.base, "hub")
-	b.theirs = refsUnder(t, origin, "refs/heads/")
+	b.theirs = gitrepotest.Refs(t, origin, "refs/heads/")
 	return b
 }
 

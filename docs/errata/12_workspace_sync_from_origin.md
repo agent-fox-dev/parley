@@ -28,13 +28,24 @@ says, or decides what it leaves open.
 
 Git hands over the object of a tag only for a ref it writes, over every
 transport (the file-based HTTP transport cannot fetch an object by its id).
-So the one fetch also writes origin's tags into a namespace of its own,
-`refs/parley/fetch/<16 random hex digits>/`, in the same atomic transaction
-as the origin heads, reads them from there and deletes the namespace before
-it returns, after a failure too. The copy's `refs/tags/` is never written by
+So the one atomic fetch writes origin's branches and tags into a namespace
+of its own, `refs/parley/fetch/<16 random hex digits>/` (`heads/` and
+`tags/`), reads them from there and deletes the namespace right after
+the fetch, after a failure too, before any origin head is set. The copy's `refs/tags/` is never written by
 the fetch; the sync then creates the tags the copy lacks from the values the
 fetch returned. The tag objects stay in the copy's object store until a ref
 names them or git prunes them as unreachable.
+
+The origin heads are set from that namespace after the fetch has succeeded,
+in one `update-ref --stdin` transaction that removes those of branches
+origin no longer has and creates or moves the rest. Git refuses that
+transaction, and refuses a fetch straight into `refs/remotes/origin/*`,
+when origin replaced a branch by one whose name it is a directory of, such
+as `dev` by `dev/next`: the old origin head is in the way of the new one.
+In that case the removals are made first and the rest after them. A fetch
+that fails, or whose namespace cannot be deleted, changes no origin head;
+the two-step case can leave the removals made if writing the rest then
+fails, which only removes origin heads origin no longer has.
 
 `(*gitrepo.Repo).CompareAndSwapRef` takes `""` as the expected value of a
 ref that must not exist, and also answers `gitrepo.ErrRefMoved`, changing
@@ -102,19 +113,30 @@ moving it at that moment.
 
 ## Sync beside other writers
 
-- Two syncs of one copy at the same time cannot both run `git fetch
-  --atomic --prune`: each locks the origin heads (`refs/remotes/origin/*`)
-  and `packed-refs`, and the loser fails (`cannot lock ref
-  'refs/remotes/origin/<name>': is at … but expected …`), which would
-  answer `502`. The fetch is therefore serialised per copy by an
-  in-process mutex keyed by the slug on the `Service`: a sync waits for the
-  other's fetch and never answers `409 workspace_busy`. The package's "take
+- When the fetch still ran as one `git fetch --atomic --prune` straight
+  into `refs/remotes/origin/*`, two syncs of one copy at the same time were
+  seen to collide: each locked the origin heads and `packed-refs`, and the
+  loser failed (`cannot lock ref 'refs/remotes/origin/b0': is at … but
+  expected …`), which answered `502`. The fetch now writes into a private
+  namespace of its own and sets the origin heads in a separate
+  `update-ref --stdin` transaction, and the whole of it is serialised per
+  copy by an in-process mutex keyed by the slug on the `Service`, so that
+  two such fetch-and-set steps never interleave: a sync waits for the
+  other's fetch and never answers `409 workspace_busy`. The mutex is
+  defensive: no test forces two fetches to overlap now, and
+  `TestSync_TwoConcurrentSyncs` checks the outcome of concurrent syncs (both
+  `200`, the branches at origin's heads), not the lock itself. The package's "take
   no lock on the workspace" holds for everything else: tag creation and the
   per-branch pass take no lock, and the workspace's status is never written.
   Tag creation stays outside the mutex because it is create-only: a tag
   another sync created first is skipped without an error and is not
   reported as created by the second sync. The mutex is per hub process,
   which is the only writer of its copies.
+- `head_sha` and `origin_head_sha` of a completion are read from the
+  copy's refs when the completion is recorded (the hub's head of the
+  default branch and its origin head), not taken from the sync's own
+  fetch: of two overlapping syncs the one that completes last would
+  otherwise record an older origin head than the copy holds.
 - The hook between a branch's evaluation and its swap is the optional
   field `Deps.BeforeRefSwap func(ctx, slug, branch string)`, called after a
   branch was classified as `created`, `fast_forward` or `reset` and before

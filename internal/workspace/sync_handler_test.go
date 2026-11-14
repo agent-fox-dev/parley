@@ -14,28 +14,10 @@ import (
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
-// syncBranches decodes the branches of a, which must be 200, and checks that
-// the rest of a is the workspace object.
-func syncBranches(t *testing.T, a answer) (map[string]any, []workspace.BranchResult) {
-	t.Helper()
-	obj := a.decode(t, http.StatusOK)
-	var body struct {
-		Branches []workspace.BranchResult `json:"branches"`
-	}
-	if err := json.Unmarshal(a.body, &body); err != nil || body.Branches == nil {
-		t.Fatalf("the sync answer %s has no branches list (%v)", a.body, err)
-	}
-	delete(obj, "branches")
-	if len(obj) != len(objectMembers) {
-		t.Errorf("the sync answer has %d members beside branches, want the %d of a workspace object", len(obj), len(objectMembers))
-	}
-	return obj, body.Branches
-}
-
 func TestSyncRoute_AnswersWorkspaceWithBranches(t *testing.T) {
 	t.Parallel()
 	s := newSyncWorld(t)
-	heads := refsUnder(t, s.origin.Dir(), "refs/heads/")
+	heads := gitrepotest.Refs(t, s.origin.Dir(), "refs/heads/")
 	var want []workspace.BranchResult
 	for _, name := range slices.Sorted(maps.Keys(heads)) {
 		want = append(want, workspace.BranchResult{Name: name, Result: workspace.BranchUpToDate, LocalSHA: heads[name], OriginSHA: heads[name]})
@@ -137,7 +119,7 @@ func TestSyncRoute_RefusesBeforeFetching(t *testing.T) {
 		for _, slug := range slugs {
 			recs[slug], _ = s.workspace(t, slug)
 		}
-		return recs, s.eventCount(t), refsUnder(t, s.copy, "refs/")
+		return recs, s.eventCount(t), gitrepotest.Refs(t, s.copy, "refs/")
 	}
 	recsBefore, eventsBefore, refsBefore := snapshot()
 	readPAT := s.pat(t, s.u, "workspaces:read")

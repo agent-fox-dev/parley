@@ -1,7 +1,6 @@
 package e2e
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -9,7 +8,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/agent-fox-dev/parley/internal/cli"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
@@ -21,12 +19,11 @@ import (
 // test unless it exits 0.
 func (h *workspaceHub) must(t *testing.T, args ...string) ran {
 	t.Helper()
-	var stdout, stderr bytes.Buffer
-	code := cli.Run(context.Background(), append([]string{"--endpoint-url", h.URL(""), "--api-key", h.key}, args...), &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("parley %v exited %d; stderr = %q", args, code, stderr.String())
+	r := h.run(t, args...)
+	if r.code != 0 {
+		t.Fatalf("parley %v exited %d; stderr = %q", args, r.code, r.stderr)
 	}
-	return ran{code, stdout.String(), stderr.String()}
+	return r
 }
 
 // updateFields are the metadata.fields of each parley.workspace.update event

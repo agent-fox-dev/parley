@@ -206,9 +206,10 @@ type SyncResult struct {
 // Branches and tells the branch-move observers of each move right after it.
 // A branch only the hub has, never on origin or deleted there, is neither
 // looked at nor reported, and neither is a branch of a carry-patch workspace
-// that excludedBranches leaves out, although its origin head is fetched. Last it records the completion (see
-// completeSync). The caller has checked that the workspace may be synced;
-// opts.Actor must be the admin token or a user's credential.
+// that excludedBranches leaves out, although its origin head is fetched.
+// Last it records the completion (see completeSync). The caller has checked
+// that the workspace may be synced; opts.Actor must be the admin token or a
+// user's credential.
 //
 // For a carry-patch workspace the registered SyncExtension runs at two
 // points: AfterFetch right after the fetch, before any tag or branch moves,
@@ -285,7 +286,7 @@ func (s *Service) Sync(ctx context.Context, slug string, opts SyncOptions) (Sync
 	}
 	in := syncEventInput(slug, branches, updated)
 	in.ActorType, in.ActorID = actorType, actorID
-	rec, err := s.completeSync(ctx, repo, w, fetched.Branches, add.UpstreamHeadSHA, in)
+	rec, err := s.completeSync(ctx, repo, w, add.UpstreamHeadSHA, in)
 	if err != nil {
 		return SyncResult{}, err
 	}
@@ -313,11 +314,13 @@ func (s *Service) beforeCompletion(ctx context.Context, ext SyncExtension, run S
 // completeSync records that the sync of w completed, in one store
 // transaction with its event in: last_sync_at the hub's time cut to the
 // second, sync_error cleared, head_sha the copy's head of w's default branch
-// and origin_head_sha origin's head of it in originHeads, each null when
-// there is none, and upstream_head_sha upstream when it is not nil.
-// updated_at is not written. It returns the record read again after the
-// transaction.
-func (s *Service) completeSync(ctx context.Context, repo *gitrepo.Repo, w Workspace, originHeads map[string]string, upstream *string, in event.Input) (Workspace, error) {
+// and origin_head_sha the copy's origin head of it, each null when there is
+// none, and upstream_head_sha upstream when it is not nil. Both heads are
+// read from the copy now, not taken from this sync's fetch, so that a sync
+// that overlapped a later one and completes after it does not record an
+// older origin than the copy holds. updated_at is not written. It returns
+// the record read again after the transaction.
+func (s *Service) completeSync(ctx context.Context, repo *gitrepo.Repo, w Workspace, upstream *string, in event.Input) (Workspace, error) {
 	f := syncFields{LastSyncAt: s.deps.Now().UTC().Truncate(time.Second), UpstreamHeadSHA: upstream}
 	if w.DefaultBranch != nil {
 		branch := *w.DefaultBranch
@@ -328,8 +331,12 @@ func (s *Service) completeSync(ctx context.Context, repo *gitrepo.Repo, w Worksp
 		if found {
 			f.HeadSHA = &head
 		}
-		if id, ok := originHeads[branch]; ok {
-			f.OriginHeadSHA = &id
+		origin, found, err := repo.OriginHead(ctx, branch)
+		if err != nil {
+			return Workspace{}, err
+		}
+		if found {
+			f.OriginHeadSHA = &origin
 		}
 	}
 	err := s.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
@@ -477,10 +484,10 @@ func classifyBranch(ctx context.Context, repo *gitrepo.Repo, local string, found
 // failure, which failFetch records behind fetchFailurePrefix and turns into
 // the answer; without a credential nothing is fetched, since an
 // anonymous fetch would not be the one the owner configured. Two fetches
-// into one copy collide on git's locks of the origin heads they both write,
-// so the syncs of one workspace fetch one after the other: a sync waits for
-// the other's fetch, never answers busy, and runs the rest of its work
-// beside it.
+// into one copy both set its origin heads and must not interleave there or
+// meet on git's ref locks, so the syncs of one workspace fetch one after the
+// other: a sync waits for the other's fetch, never answers busy, and runs
+// the rest of its work beside it.
 func (s *Service) fetchOrigin(ctx context.Context, w Workspace) (gitrepo.Fetched, Credential, error) {
 	cred, err := ResolveOriginCredential(ctx, s.deps.Secrets, w.Slug)
 	if err != nil {
@@ -506,8 +513,10 @@ const fetchFailurePrefix = "origin fetch failed: "
 // is cause scrubbed of the secret values the hub knows and of cred's
 // secret, with URL userinfo removed and cut to the scrubber's length; it is
 // both sync_error and the answer's message. Only sync_error is written and
-// no event: the fetch is atomic and tags are created only after it and
-// after the first stage, so the copy is as it was.
+// no event. The copy's branches and tags are as they were: tags are created
+// and branches moved only after the fetch and the first stage. A failed
+// fetch changes no origin head either; after a failed first stage the
+// origin heads are those the successful fetch set.
 func (s *Service) failFetch(ctx context.Context, slug string, cred Credential, cause string) error {
 	text := s.deps.Scrubber.Scrub(cause, cred.Password)
 	s.deps.Logger.Warn("workspace sync could not fetch", "slug", slug, "error", text)

@@ -9,7 +9,6 @@ import (
 	"io/fs"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -165,23 +164,6 @@ func (h *workspaceHub) events(t *testing.T, typ, slug string) []string {
 	return metas
 }
 
-// refs are the refs of the copy at dir with the commit each points at, as
-// git itself lists them.
-func refs(t *testing.T, dir string) map[string]string {
-	t.Helper()
-	out, err := exec.Command("git", "--git-dir", dir, "for-each-ref", "--format=%(refname) %(objectname)").Output()
-	if err != nil {
-		t.Fatalf("list the refs of the copy %s: %v", dir, err)
-	}
-	got := map[string]string{}
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if ref, id, ok := strings.Cut(line, " "); ok {
-			got[ref] = id
-		}
-	}
-	return got
-}
-
 func TestWorkspaceCreate_ADeveloperRegistersAPublicRepositoryAndTheHubClonesIt(t *testing.T) {
 	origin := newOrigin(t)
 	h := startWorkspaceHub(t, origin, "demo")
@@ -197,7 +179,7 @@ func TestWorkspaceCreate_ADeveloperRegistersAPublicRepositoryAndTheHubClonesIt(t
 		t.Errorf("ready with default_branch %s, head_sha %s; want main, %s", deref(w.DefaultBranch), deref(w.HeadSHA), origin.Head("main"))
 	}
 	copyDir := filepath.Join(h.root, "demo.git")
-	got := refs(t, copyDir)
+	got := gitrepotest.Refs(t, copyDir, "")
 	want := map[string]string{"refs/heads/main": origin.Head("main"), "refs/heads/dev": origin.Head("dev"), "refs/tags/v1": gitrepotest.Git(t, origin.Dir(), "rev-parse", "v1")}
 	for ref, id := range want {
 		if got[ref] != id {
@@ -220,7 +202,7 @@ func TestWorkspaceCreate_ADeveloperRegistersAPrivateRepositoryWithAToken(t *test
 		t.Fatalf("create priv = %d %s, want 201 without the token", status, body)
 	}
 	h.waitStatus(t, "priv", workspace.StatusReady)
-	if got := refs(t, filepath.Join(h.root, "priv.git")); got["refs/heads/main"] != origin.Head("main") || got["refs/heads/dev"] != origin.Head("dev") {
+	if got := gitrepotest.Refs(t, filepath.Join(h.root, "priv.git"), ""); got["refs/heads/main"] != origin.Head("main") || got["refs/heads/dev"] != origin.Head("dev") {
 		t.Errorf("the copy's branches = %v, want main and dev at origin's heads", got)
 	}
 

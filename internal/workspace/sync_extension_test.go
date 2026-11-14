@@ -53,7 +53,7 @@ func (e *recordingExtension) BeforeCompletion(ctx context.Context, run workspace
 }
 
 func (e *recordingExtension) record(ctx context.Context, stage string, run workspace.SyncRun, results []workspace.BranchResult) (firstErr error, add workspace.SyncAddition, secondErr error) {
-	refs := refsUnder(e.t, e.dir, "refs/")
+	refs := gitrepotest.Refs(e.t, e.dir, "refs/")
 	e.mu.Lock()
 	during := e.during
 	e.mu.Unlock()
@@ -168,7 +168,7 @@ func TestSyncExtension_FirstStageFailure(t *testing.T) {
 	ext := &recordingExtension{firstErr: errors.New("upstream fetch failed: https://user:pw@up.example/x")}
 	s, _, _ := newExtensionWorld(t, ext)
 	before, _ := s.workspace(t, syncSlug)
-	heads, tags, events := refsUnder(t, s.copy, "refs/heads/"), refsUnder(t, s.copy, "refs/tags/"), s.eventCount(t)
+	heads, tags, events := gitrepotest.Refs(t, s.copy, "refs/heads/"), gitrepotest.Refs(t, s.copy, "refs/tags/"), s.eventCount(t)
 
 	a := s.postSync(t, s.uKey, syncSlug, "")
 	typ, msg := a.refusal(t)
@@ -182,7 +182,7 @@ func TestSyncExtension_FirstStageFailure(t *testing.T) {
 		t.Errorf("the record has sync_error %q, last_sync_at %v, heads %v %v; want the message and the rest unchanged",
 			deref(rec.SyncError), rec.LastSyncAt, deref(rec.HeadSHA), deref(rec.OriginHeadSHA))
 	}
-	if !maps.Equal(refsUnder(t, s.copy, "refs/heads/"), heads) || !maps.Equal(refsUnder(t, s.copy, "refs/tags/"), tags) {
+	if !maps.Equal(gitrepotest.Refs(t, s.copy, "refs/heads/"), heads) || !maps.Equal(gitrepotest.Refs(t, s.copy, "refs/tags/"), tags) {
 		t.Errorf("the hub's branches or tags changed")
 	}
 	if _, stages := ext.recorded(); !slices.Equal(stages, []string{"first"}) {

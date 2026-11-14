@@ -90,9 +90,9 @@ func TestSync_CreatesNewTagsAndKeepsExisting(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			c.change(t)
-			before := refsUnder(t, s.copy, "refs/tags/")
+			before := gitrepotest.Refs(t, s.copy, "refs/tags/")
 			created := map[string]string{}
-			for name, id := range refsUnder(t, origin, "refs/tags/") {
+			for name, id := range gitrepotest.Refs(t, origin, "refs/tags/") {
 				if _, had := before[name]; !had {
 					created[name] = id
 				}
@@ -100,7 +100,7 @@ func TestSync_CreatesNewTagsAndKeepsExisting(t *testing.T) {
 			r := s.sync(t, workspace.SyncOptions{})
 			want := maps.Clone(before)
 			maps.Copy(want, created)
-			if got := refsUnder(t, s.copy, "refs/tags/"); !maps.Equal(got, want) {
+			if got := gitrepotest.Refs(t, s.copy, "refs/tags/"); !maps.Equal(got, want) {
 				t.Errorf("the hub's tags = %v, want %v", got, want)
 			}
 			if !maps.Equal(r.CreatedTags, created) {
@@ -153,7 +153,7 @@ func TestSync_LeavesHubOnlyBranchesAlone(t *testing.T) {
 	s.sync(t, workspace.SyncOptions{})
 	gitrepotest.Git(t, s.origin.Dir(), "update-ref", "-d", "refs/heads/gone")
 	grow(t, s.copy, "local-only", s.origin.Head("main"), "hub")
-	before := refsUnder(t, s.copy, "refs/heads/")
+	before := gitrepotest.Refs(t, s.copy, "refs/heads/")
 	for _, reset := range []bool{false, true} {
 		r := s.sync(t, workspace.SyncOptions{ResetToOrigin: reset})
 		for _, name := range []string{"local-only", "gone"} {
@@ -175,7 +175,7 @@ func TestSync_BranchesListShape(t *testing.T) {
 	grow(t, origin, "exp", s.origin.Head("main"), "origin")
 	gitrepotest.Git(t, origin, "branch", "a/b", "dev")
 	gitrepotest.Git(t, origin, "update-ref", "-d", "refs/heads/dev")
-	theirs := refsUnder(t, origin, "refs/heads/")
+	theirs := gitrepotest.Refs(t, origin, "refs/heads/")
 	r := s.sync(t, workspace.SyncOptions{})
 	// The entries as the route marshals them.
 	var entries []map[string]string
@@ -206,60 +206,54 @@ func TestSync_BranchesListShape(t *testing.T) {
 	}
 }
 
-func TestSync_MovesProtectedBranches(t *testing.T) {
-	t.Parallel()
-	for _, ownerPush := range []bool{true, false} {
-		t.Run(fmt.Sprintf("protect.owner_push %t", ownerPush), func(t *testing.T) {
-			t.Parallel()
-			s := newSyncWorld(t)
-			s.patch(t, s.uKey, syncSlug, map[string]any{"settings": map[string]any{
-				"protect.owner_push": ownerPush, "protected_branches": []string{"main", "release/*"}}}).decode(t, http.StatusOK)
-			origin := s.origin.Dir()
-			// The cases run in order on the one workspace.
-			cases := []struct {
-				name, branch string
-				reset        bool
-				want         workspace.BranchOutcome
-				change       func()
-			}{
-				{"origin adds a commit to main", "main", false, workspace.BranchFastForward, func() {
-					grow(t, origin, "main", s.origin.Head("main"), "origin")
-				}},
-				{"main diverged", "main", true, workspace.BranchReset, func() {
-					base := s.origin.Head("main")
-					grow(t, origin, "main", base, "origin")
-					grow(t, s.copy, "main", base, "hub")
-				}},
-				{"origin adds release/2", "release/2", false, workspace.BranchCreated, func() {
-					grow(t, origin, "release/2", s.origin.Head("main"), "origin")
-				}},
-			}
-			for _, c := range cases {
-				c.change()
-				r := s.sync(t, workspace.SyncOptions{ResetToOrigin: c.reset})
-				if got := outcomes(r)[c.branch]; got != c.want {
-					t.Errorf("%s: %s is %q, want %q", c.name, c.branch, got, c.want)
-				}
-				if got, want := ref(t, s.copy, "refs/heads/"+c.branch), s.origin.Head(c.branch); got != want {
-					t.Errorf("%s: the hub's %s = %s, want origin's %s", c.name, c.branch, got, want)
-				}
-			}
-		})
-	}
-}
-
-func TestSync_ProtectedBranchAheadIsNormal(t *testing.T) {
+func TestSync_TreatsProtectedBranchesLikeAnyOther(t *testing.T) {
 	t.Parallel()
 	s := newSyncWorld(t)
-	mine := grow(t, s.copy, "main", s.origin.Head("main"), "hub")
-	for _, reset := range []bool{false, true} {
-		r := s.sync(t, workspace.SyncOptions{ResetToOrigin: reset})
-		i := slices.IndexFunc(r.Branches, func(b workspace.BranchResult) bool { return b.Name == "main" })
-		if i < 0 || r.Branches[i].Result != workspace.BranchAhead || r.Branches[i].LocalSHA != mine {
-			t.Errorf("reset %t: branches = %+v, want main ahead at %s", reset, r.Branches, mine)
+	origin := s.origin.Dir()
+	for _, ownerPush := range []bool{true, false} {
+		s.patch(t, s.uKey, syncSlug, map[string]any{"settings": map[string]any{
+			"protect.owner_push": ownerPush, "protected_branches": []string{"main", "release/*"}}}).decode(t, http.StatusOK)
+		created := fmt.Sprintf("release/%t", ownerPush)
+		// The rows run in order on the one workspace; change returns the head
+		// the hub's branch must have after the sync, "" for origin's.
+		rows := []struct {
+			branch string
+			reset  bool
+			want   workspace.BranchOutcome
+			change func() string
+		}{
+			{"main", false, workspace.BranchFastForward, func() string {
+				gitrepotest.Git(t, s.copy, "update-ref", "refs/heads/main", s.origin.Head("main"))
+				grow(t, origin, "main", s.origin.Head("main"), "origin")
+				return ""
+			}},
+			{"main", true, workspace.BranchReset, func() string {
+				base := s.origin.Head("main")
+				grow(t, origin, "main", base, "origin")
+				grow(t, s.copy, "main", base, "hub")
+				return ""
+			}},
+			{created, false, workspace.BranchCreated, func() string {
+				grow(t, origin, created, s.origin.Head("main"), "origin")
+				return ""
+			}},
+			{"main", true, workspace.BranchAhead, func() string {
+				return grow(t, s.copy, "main", s.origin.Head("main"), "hub")
+			}},
 		}
-		if got := ref(t, s.copy, "refs/heads/main"); got != mine {
-			t.Errorf("reset %t: the hub's main = %s, want %s unchanged", reset, got, mine)
+		for _, row := range rows {
+			want := row.change()
+			r := s.sync(t, workspace.SyncOptions{ResetToOrigin: row.reset})
+			if want == "" {
+				want = s.origin.Head(row.branch)
+			}
+			if got := outcomes(r)[row.branch]; got != row.want || r.Workspace.LastSyncAt == nil || r.Workspace.SyncError != nil {
+				t.Errorf("owner_push %t: %s is %q (last_sync_at %v, sync_error %v), want %q in a completed sync",
+					ownerPush, row.branch, got, r.Workspace.LastSyncAt, deref(r.Workspace.SyncError), row.want)
+			}
+			if got := ref(t, s.copy, "refs/heads/"+row.branch); got != want {
+				t.Errorf("owner_push %t, %s: the hub's %s = %s, want %s", ownerPush, row.want, row.branch, got, want)
+			}
 		}
 	}
 }
@@ -487,13 +481,13 @@ func TestSync_FetchFailureChangesNothing(t *testing.T) {
 			t.Fatal(err)
 		}
 		before, _ := s.workspace(t, syncSlug)
-		refs := refsUnder(t, s.copy, "")
+		refs := gitrepotest.Refs(t, s.copy, "")
 		events := s.eventCount(t)
 		a := s.postSync(t, s.uKey, syncSlug, "")
 		if a.status != http.StatusBadGateway || a.errorType(t) != "upstream_error" {
 			t.Errorf("%s: answer = %d %s, want 502 upstream_error", c.name, a.status, a.body)
 		}
-		if got := refsUnder(t, s.copy, ""); !maps.Equal(got, refs) {
+		if got := gitrepotest.Refs(t, s.copy, ""); !maps.Equal(got, refs) {
 			t.Errorf("%s: the hub's refs = %v, want %v unchanged", c.name, got, refs)
 		}
 		rec, _ := s.workspace(t, syncSlug)
@@ -687,7 +681,7 @@ func TestSync_TwoConcurrentSyncs(t *testing.T) {
 		gitrepotest.Git(t, origin, "branch", name, base)
 	}
 	s.sync(t, workspace.SyncOptions{})
-	heads := refsUnder(t, origin, "refs/heads/")
+	heads := gitrepotest.Refs(t, origin, "refs/heads/")
 	for round := range 20 {
 		if rec, _ := s.workspace(t, syncSlug); rec.Status != workspace.StatusReady {
 			t.Fatalf("round %d: status %s before the syncs, want ready", round, rec.Status)
@@ -700,7 +694,7 @@ func TestSync_TwoConcurrentSyncs(t *testing.T) {
 				name, len(msg), msg, heads[name])
 		}
 		gitFrom(t, origin, stream.String(), "fast-import", "--quiet", "--date-format=now")
-		heads = refsUnder(t, origin, "refs/heads/")
+		heads = gitrepotest.Refs(t, origin, "refs/heads/")
 
 		var answers [2]answer
 		var wg sync.WaitGroup
@@ -733,12 +727,37 @@ func TestSync_TwoConcurrentSyncs(t *testing.T) {
 				t.Errorf("round %d: %s was reported %v, want %v", round, name, got, want)
 			}
 		}
-		if got := refsUnder(t, s.copy, "refs/heads/"); !maps.Equal(got, heads) {
+		if got := gitrepotest.Refs(t, s.copy, "refs/heads/"); !maps.Equal(got, heads) {
 			t.Fatalf("round %d: the hub's branches = %v, want origin's %v", round, got, heads)
 		}
 	}
 	if rec, _ := s.workspace(t, syncSlug); rec.Status != workspace.StatusReady {
 		t.Errorf("status %s after the syncs, want ready", rec.Status)
+	}
+}
+
+func TestSync_CompletionRecordsTheCopysHeads(t *testing.T) {
+	t.Parallel()
+	s := newSyncWorld(t)
+	older := s.origin.Commit("main", "older")
+	// A second sync runs while the first is about to move main, fetches a
+	// newer main and completes first; the first sync's completion must not
+	// record the older origin head it fetched.
+	s.swaps.set("main", func(call int) {
+		if call == 1 {
+			s.origin.Commit("main", "newer")
+			s.sync(t, workspace.SyncOptions{})
+		}
+	})
+	r := s.sync(t, workspace.SyncOptions{})
+	newer := s.origin.Head("main")
+	if got := outcomes(r)["main"]; got != workspace.BranchAhead || newer == older {
+		t.Fatalf("the first sync found main %q, want ahead of the %s it fetched", got, older)
+	}
+	rec, _ := s.workspace(t, syncSlug)
+	if deref(rec.HeadSHA) != newer || deref(rec.OriginHeadSHA) != newer || deref(r.Workspace.OriginHeadSHA) != newer {
+		t.Errorf("head_sha %s, origin_head_sha %s (answer %s); want both %s, as the copy holds them",
+			deref(rec.HeadSHA), deref(rec.OriginHeadSHA), deref(r.Workspace.OriginHeadSHA), newer)
 	}
 }
 
@@ -754,7 +773,7 @@ func TestSync_SkipsCarryPatchBranches(t *testing.T) {
 		grow(t, origin, name, base, "origin")
 	}
 	hubIntegration := grow(t, s.copy, "integration", base, "hub")
-	theirs := refsUnder(t, origin, "refs/heads/")
+	theirs := gitrepotest.Refs(t, origin, "refs/heads/")
 	provider := &excluding{names: []string{"patch/a", "patch/b"}}
 	s.svc.RegisterExcludedBranchProvider(provider)
 	observer := s.observe(t, nil)
@@ -818,14 +837,14 @@ func TestSync_ExcludedBranchProviderFailure(t *testing.T) {
 	s.origin.Commit("main", "after the clone")
 	s.svc.RegisterExcludedBranchProvider(&excluding{err: errors.New("cannot read https://x:s3cr3t@example.test/patches.git")})
 	before, _ := s.workspace(t, syncSlug)
-	heads := refsUnder(t, s.copy, "refs/heads/")
+	heads := gitrepotest.Refs(t, s.copy, "refs/heads/")
 	events := s.eventCount(t)
 	a := s.postSync(t, s.uKey, syncSlug, "")
 	if errorType, message := a.refusal(t); a.status != http.StatusInternalServerError || errorType != "internal" ||
 		!strings.Contains(message, "excluded-branch provider") || strings.Contains(message, "s3cr3t") {
 		t.Errorf("answer = %d %s, want 500 internal naming the scrubbed provider failure", a.status, a.body)
 	}
-	if got := refsUnder(t, s.copy, "refs/heads/"); !maps.Equal(got, heads) {
+	if got := gitrepotest.Refs(t, s.copy, "refs/heads/"); !maps.Equal(got, heads) {
 		t.Errorf("the hub's branches = %v, want %v unchanged", got, heads)
 	}
 	if rec, _ := s.workspace(t, syncSlug); !reflect.DeepEqual(rec, before) {
