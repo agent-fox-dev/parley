@@ -1061,6 +1061,52 @@ authenticates, cannot be changed. A refused request changes nothing.
 | `404` `not_found` | the caller's user has no token with this id (`token not found`) |
 | `409` `conflict` | the token is revoked (`token is revoked`) or expired (`token is expired`) |
 
+## Workspace settings
+
+Every workspace object holds `settings`, a flat object with exactly these
+21 keys, each with its effective value: the value stored for the key when
+it was set, otherwise its default. Only the keys set are stored.
+
+| Key | Type | Values | Default |
+|---|---|---|---|
+| `sync_enabled` | bool | | `true` |
+| `protected_branches` | list of strings | 0 to 50 distinct branch globs | `[<default_branch>]`, `[]` while `default_branch` is `null` |
+| `protect.owner_push` | bool | | `true` |
+| `land.strategy` | enum | `rebase`, `squash` | `rebase` |
+| `land.by_author` | bool | | `true` |
+| `land.delete_source` | bool | | `true` |
+| `land.allow_override` | bool | | `true` |
+| `changes.require_intent` | bool | | `true` |
+| `changes.auto_restack` | bool | | `true` |
+| `audit_fetches` | bool | | `false` |
+| `forge_api_url` | URL string | `""` or an absolute `https://` URL with a host and without user information, query or fragment | `""` |
+| `upstream_forge_api_url` | URL string | the same | `""` |
+| `patch_branch_source` | enum | `hub`, `origin` | `hub` |
+| `patch_divergence_policy` | enum | `replace`, `report` | `replace` |
+| `push_patches_to_origin` | bool | | `false` |
+| `auto_rebuild_after_push` | bool | | `true` |
+| `auto_rebuild_after_sync` | bool | | `true` |
+| `rebuild_strategy` | enum | `rebase`, `merge` | `rebase` |
+| `rebuild_fail_mode` | enum | `fail_fast`, `continue` | `fail_fast` |
+| `rebuild_push_integration_branch` | bool | | `false` |
+| `squash_merge_detection` | enum | `ancestry_only`, `content_based`, `both` | `both` |
+
+A bool key is a JSON boolean, an enum or URL key a JSON string and
+`protected_branches` a JSON array of strings. The default of
+`protected_branches` follows the workspace's `default_branch`; once the key
+is set, the empty list included, the stored list is shown as it is.
+
+A task fork has no settings of its own: its `settings` are its parent's
+effective settings, read when the fork is answered, so a change of the
+parent's settings shows in the fork at once.
+
+A branch glob is 1 to 255 characters that make a valid branch name once
+`*` is allowed too. It matches a whole branch name, case-sensitive: `*`
+matches any run of characters except `/`, `**` any run including `/`, and
+every other character, `?` included, only itself. So `release/*` matches
+`release/1.x` but not `release/1/x` or `release`, and `release/**` matches
+`release/1/x`.
+
 ## `POST /api/v1/workspaces`
 
 Registers a git repository as a workspace owned by the caller's user. It
@@ -1083,7 +1129,7 @@ a member that the table allows to be `null` counts as absent when it is:
 | `workspace_mode` | no | a string or `null`: `standard` or `carry_patch`; absent, `null` or empty, `standard` |
 | `upstream_url` | with `carry_patch` | a string or `null`; required with `carry_patch` and checked by the `git_url` rule; with `standard` only `null` is accepted |
 | `integration_branch` | no | a string or `null`; with `carry_patch` a valid branch name, stored as given (`null` when absent); with `standard` only `null` is accepted |
-| `settings` | no | an object or `null`: each key a registered setting whose value its rule accepts, a key with the value `null` keeping its default; only the keys set are stored. Absent or `null`, every key keeps its default |
+| `settings` | no | an object or `null`: each key one of the [workspace settings](#workspace-settings) with a value its rule accepts, a key with the value `null` keeping its default; only the keys set are stored. Absent or `null`, every key keeps its default |
 | `git_pat` | no | a string, not empty; not with `git_username` or `git_password` |
 | `git_username`, `git_password` | no | strings, not empty, given together or not at all |
 
@@ -1132,11 +1178,11 @@ slug of its org; `hub_url`, the workspace's git remote on the hub,
 `<[server].external_url>/git/<org_slug>/<slug>.git` with one trailing `/`
 of the external URL removed, or `null` when no external URL is configured;
 `access`, the caller's level (`owner` for the creator); and `settings`,
-every registered setting key with its effective value (`{}` while no key is
-registered).
+all 21 setting keys with their effective values (see
+[Workspace settings](#workspace-settings)).
 
 ```json
-{"slug":"demo","kind":"repository","workspace_mode":"standard","git_url":"https://example.com/a.git","default_branch":null,"owner_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","org_id":"5e6f7a8b-9c0d-4e1f-8a2b-3c4d5e6f7a8b","org_slug":"octocat","status":"pending","display_name":"demo","description":"","head_sha":null,"origin_head_sha":null,"clone_error":null,"last_sync_at":null,"sync_error":null,"upstream_url":null,"integration_branch":null,"upstream_head_sha":null,"parent_slug":null,"fork_point":null,"expires_at":null,"auto_change":null,"purpose":null,"session_id":null,"settings":{},"hub_url":"https://hub.example/git/octocat/demo.git","access":"owner","created_at":"2026-11-14T10:30:15Z","updated_at":"2026-11-14T10:30:15Z"}
+{"slug":"demo","kind":"repository","workspace_mode":"standard","git_url":"https://example.com/a.git","default_branch":null,"owner_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","org_id":"5e6f7a8b-9c0d-4e1f-8a2b-3c4d5e6f7a8b","org_slug":"octocat","status":"pending","display_name":"demo","description":"","head_sha":null,"origin_head_sha":null,"clone_error":null,"last_sync_at":null,"sync_error":null,"upstream_url":null,"integration_branch":null,"upstream_head_sha":null,"parent_slug":null,"fork_point":null,"expires_at":null,"auto_change":null,"purpose":null,"session_id":null,"settings":{"sync_enabled":true,"protected_branches":[],"protect.owner_push":true,"land.strategy":"rebase","land.by_author":true,"land.delete_source":true,"land.allow_override":true,"changes.require_intent":true,"changes.auto_restack":true,"audit_fetches":false,"forge_api_url":"","upstream_forge_api_url":"","patch_branch_source":"hub","patch_divergence_policy":"replace","push_patches_to_origin":false,"auto_rebuild_after_push":true,"auto_rebuild_after_sync":true,"rebuild_strategy":"rebase","rebuild_fail_mode":"fail_fast","rebuild_push_integration_branch":false,"squash_merge_detection":"both"},"hub_url":"https://hub.example/git/octocat/demo.git","access":"owner","created_at":"2026-11-14T10:30:15Z","updated_at":"2026-11-14T10:30:15Z"}
 ```
 
 | Status | When |

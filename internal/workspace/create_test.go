@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
-	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/server/timefmt"
 	"github.com/agent-fox-dev/parley/internal/workspace"
@@ -95,32 +94,16 @@ func TestCreate_RecordsAPendingRepositoryAndAnswersTheWholeObject(t *testing.T) 
 
 func TestCreate_AnswersHubURLOrgSlugAndEffectiveSettings(t *testing.T) {
 	t.Parallel()
-	registered := withCompose(func(c *hub.Composition) {
-		for _, k := range []workspace.SettingKey{
-			{Name: "flag", Default: func(*string) any { return true }},
-			{Name: "branches", Default: func(b *string) any {
-				if b == nil {
-					return []string{}
-				}
-				return []string{*b}
-			}},
-		} {
-			k.Validate = func(json.RawMessage) error { return nil }
-			if err := c.Workspaces().Settings().RegisterSetting(k); err != nil {
-				panic(err)
-			}
-		}
-	})
 	for _, c := range []struct {
-		name     string
-		opts     []option
-		body     map[string]any
-		hubURL   string // "" for null
-		settings string
+		name      string
+		opts      []option
+		body      map[string]any
+		hubURL    string // "" for null
+		protected string // the effective protected_branches as JSON
 	}{
-		{"an external URL", []option{withExternalURL("https://hub.example/")}, valid("demo"), "https://hub.example/git/%s/demo.git", `{}`},
-		{"registered settings", []option{registered}, map[string]any{"slug": "demo", "git_url": "https://example.com/a.git", "default_branch": "trunk"},
-			"", `{"branches":["trunk"],"flag":true}`},
+		{"an external URL", []option{withExternalURL("https://hub.example/")}, valid("demo"), "https://hub.example/git/%s/demo.git", `[]`},
+		{"a default branch", nil, map[string]any{"slug": "demo", "git_url": "https://example.com/a.git", "default_branch": "trunk"},
+			"", `["trunk"]`},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
@@ -136,8 +119,9 @@ func TestCreate_AnswersHubURLOrgSlugAndEffectiveSettings(t *testing.T) {
 			if obj["org_slug"] != w.uOrg.Slug {
 				t.Errorf("org_slug = %#v, want %q", obj["org_slug"], w.uOrg.Slug)
 			}
-			if got, _ := json.Marshal(obj["settings"]); string(got) != c.settings {
-				t.Errorf("settings = %s, want %s", got, c.settings)
+			settings, _ := obj["settings"].(map[string]any)
+			if got, _ := json.Marshal(settings["protected_branches"]); len(settings) != len(settingDefaults) || string(got) != c.protected {
+				t.Errorf("settings = %v, want the %d keys with protected_branches %s", settings, len(settingDefaults), c.protected)
 			}
 		})
 	}
@@ -276,25 +260,9 @@ func TestCreate_CreatesExactlyOneOfConcurrentRequestsForOneSlug(t *testing.T) {
 	}
 }
 
-// withBoolSetting registers the setting k: true by default, and only a JSON
-// boolean is a value of it.
-var withBoolSetting = withCompose(func(c *hub.Composition) {
-	err := c.Workspaces().Settings().RegisterSetting(workspace.SettingKey{
-		Name:    "k",
-		Default: func(*string) any { return true },
-		Validate: func(v json.RawMessage) error {
-			var b bool
-			return json.Unmarshal(v, &b)
-		},
-	})
-	if err != nil {
-		panic(err)
-	}
-})
-
 func TestCreate_RefusesAnInvalidBodyNamingTheFirstMemberRefused(t *testing.T) {
 	t.Parallel()
-	w := newWorld(t, withBoolSetting)
+	w := newWorld(t)
 	// Every body names a slug in use, so a refusal shows that the member
 	// checks come before the slug-in-use check.
 	w.create(t, w.uKey, valid("taken")).object(t)
@@ -352,7 +320,7 @@ func TestCreate_RefusesAnInvalidBodyNamingTheFirstMemberRefused(t *testing.T) {
 		{"settings x", map[string]any{"settings": "x"}, "", "settings:"},
 		{"settings 1", map[string]any{"settings": 1}, "", "settings:"},
 		{"an unknown setting", map[string]any{"settings": map[string]any{"nope": true}}, "", `unknown setting "nope"`},
-		{"a setting value its rule refuses", map[string]any{"settings": map[string]any{"k": "x"}}, "", "settings.k:"},
+		{"a setting value its rule refuses", map[string]any{"settings": map[string]any{"audit_fetches": "x"}}, "", "settings.audit_fetches:"},
 		{"bad settings before a bad credential", map[string]any{"settings": 1, "git_pat": 5}, "", "settings:"},
 	} {
 		body := valid("taken")
@@ -371,7 +339,7 @@ func TestCreate_RefusesAnInvalidBodyNamingTheFirstMemberRefused(t *testing.T) {
 
 func TestCreate_StoresAndAnswersTheOptionalMembers(t *testing.T) {
 	t.Parallel()
-	w := newWorld(t, withBoolSetting)
+	w := newWorld(t)
 	twoByte := strings.Repeat("é", 128)
 	long := strings.Repeat("d", 1024)
 	upstream := "https://example.com/up.git"
@@ -379,7 +347,7 @@ func TestCreate_StoresAndAnswersTheOptionalMembers(t *testing.T) {
 	for i, c := range []struct {
 		name  string
 		extra map[string]any
-		want  map[string]any // members of the answer; a display_name of "" stands for the slug
+		want  map[string]any // members of the answer, settings.<key> one setting; a display_name of "" stands for the slug
 	}{
 		{"display_name empty", map[string]any{"display_name": ""}, map[string]any{"display_name": ""}},
 		{"display_name of 128 two-byte characters", map[string]any{"display_name": twoByte}, map[string]any{"display_name": twoByte}},
@@ -397,10 +365,10 @@ func TestCreate_StoresAndAnswersTheOptionalMembers(t *testing.T) {
 		{"carry_patch with integration_branch", map[string]any{"workspace_mode": "carry_patch", "upstream_url": upstream, "integration_branch": "deploy"},
 			map[string]any{"workspace_mode": "carry_patch", "upstream_url": upstream, "integration_branch": "deploy"}},
 
-		{"settings null", map[string]any{"settings": nil}, map[string]any{"settings": map[string]any{"k": true}}},
-		{"settings {}", map[string]any{"settings": map[string]any{}}, map[string]any{"settings": map[string]any{"k": true}}},
-		{"settings k false", map[string]any{"settings": map[string]any{"k": false}}, map[string]any{"settings": map[string]any{"k": false}}},
-		{"settings k null", map[string]any{"settings": map[string]any{"k": nil}}, map[string]any{"settings": map[string]any{"k": true}}},
+		{"settings null", map[string]any{"settings": nil}, map[string]any{"settings.audit_fetches": false}},
+		{"settings {}", map[string]any{"settings": map[string]any{}}, map[string]any{"settings.audit_fetches": false}},
+		{"settings audit_fetches true", map[string]any{"settings": map[string]any{"audit_fetches": true}}, map[string]any{"settings.audit_fetches": true}},
+		{"settings audit_fetches null", map[string]any{"settings": map[string]any{"audit_fetches": nil}}, map[string]any{"settings.audit_fetches": false}},
 
 		{"members the route does not define", map[string]any{"status": "ready", "owner_id": "someone", "kind": "fork", "zzz": []any{1}},
 			map[string]any{"status": "pending", "owner_id": w.u, "kind": "repository"}},
@@ -413,8 +381,13 @@ func TestCreate_StoresAndAnswersTheOptionalMembers(t *testing.T) {
 			if member == "display_name" && want == "" {
 				want = slug
 			}
-			if !reflect.DeepEqual(obj[member], want) {
-				t.Errorf("%s: %s = %#v, want %#v", c.name, member, obj[member], want)
+			got := obj[member]
+			if key, ok := strings.CutPrefix(member, "settings."); ok {
+				settings, _ := obj["settings"].(map[string]any)
+				got = settings[key]
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("%s: %s = %#v, want %#v", c.name, member, got, want)
 			}
 		}
 		// What is stored answers the same object as the create did.

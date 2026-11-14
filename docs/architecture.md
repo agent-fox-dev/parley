@@ -32,7 +32,7 @@ command-line client. Both are written in Go, in the module
 | `internal/store` | the hub's two embedded SQLite stores (`modernc.org/sqlite`, no cgo): `Open` creates the data directory and the workspace root, opens the transactional store and the analytical store (`analytics.db` beside it) and applies the registered schema steps; `Tx` runs a transaction of the transactional store; `Snapshot` writes a consistent copy of one store file without changing it |
 | `internal/server` | the hub's HTTP server: its built-in routes, the REST API's route registration and check pipeline, the error envelope, request ids, response headers and the access log, list paging, idempotency keys, and the readiness probes |
 | `internal/server/timefmt` | the one timestamp format (`Format`, and the response member type `Time`) and the one duration grammar (`ParseDuration`); a leaf package that imports nothing of the project, so that the configuration loader can use it as well as the REST API |
-| `internal/workspace` | the place for workspace records, their validation rules, the state guard, and the create and clone work; so far the whole workspace record with its store functions, the state guard `RequireReady`, the resolution of a workspace's origin credential from its secrets `ResolveOriginCredential`, the workspace service with `POST /api/v1/workspaces` and `GET /api/v1/workspaces/:slug` and the clone work `Clone` with the copy's place `RepoPath` and the post-clone steps, the clone workers `Workers` and `(*Service).Enqueue`, which hands a workspace put back to `pending` to them (see Clone work), the one encoder of the workspace object `RenderWorkspace` and the settings registry (see Workspace records), and the rules every workspace route judges its values by, each deciding on the text alone and returning an error that says which rule broke: `ValidateSlug` (3 to 64 characters of a to z, digits and hyphens, starting with a letter), `ValidateGitURL` (`https://<host>/<path>` without user information, or `git@<host>:<path>`, with no lookup or connection), `ValidateBranchName` (git's branch-name rule), `ValidateForkName` (1 to 32 characters of a to z, digits and hyphens) and `ParseDuration` (a whole number above zero followed by `m`, `h` or `d`, unlike `timefmt.ParseDuration`, which also takes seconds) |
+| `internal/workspace` | the place for workspace records, their validation rules, the state guard, and the create and clone work; so far the whole workspace record with its store functions, the state guard `RequireReady`, the resolution of a workspace's origin credential from its secrets `ResolveOriginCredential`, the workspace service with `POST /api/v1/workspaces` and `GET /api/v1/workspaces/:slug` and the clone work `Clone` with the copy's place `RepoPath` and the post-clone steps, the clone workers `Workers` and `(*Service).Enqueue`, which hands a workspace put back to `pending` to them (see Clone work), the one encoder of the workspace object `RenderWorkspace` and the settings registry with the settings table of the 21 setting keys and `RegisterSettingKeys` (see Workspace records), the one branch-glob matcher `MatchBranchGlob`, `MatchAnyBranchGlob` and `ValidateBranchGlob`, and the rules every workspace route judges its values by, each deciding on the text alone and returning an error that says which rule broke: `ValidateSlug` (3 to 64 characters of a to z, digits and hyphens, starting with a letter), `ValidateGitURL` (`https://<host>/<path>` without user information, or `git@<host>:<path>`, with no lookup or connection), `ValidateBranchName` (git's branch-name rule), `ValidateForkName` (1 to 32 characters of a to z, digits and hyphens) and `ParseDuration` (a whole number above zero followed by `m`, `h` or `d`, unlike `timefmt.ParseDuration`, which also takes seconds) |
 | `test/e2e` | tests that build the binaries and run them |
 
 ## The HTTP server
@@ -503,9 +503,11 @@ emits through it from its start hook on, if it is listed after
 `composeEvents`, or from `Options.Compose` (see [Hub events](#hub-events)).
 
 `(*Composition).Workspaces()` returns the `*workspace.Service` that
-`composeWorkspaces` (`internal/hub/workspace.go`) creates: a part keeps it
-when it is composed and registers its setting keys on
-`Workspaces().Settings()` then (see [Workspace records](#workspace-records)).
+`composeWorkspaces` (`internal/hub/workspace.go`) creates, with the keys of
+the settings table registered on `Workspaces().Settings()` by
+`workspace.RegisterSettingKeys` (a failure panics the composition, as an
+invalid route does): a part keeps it when it is composed (see
+[Workspace records](#workspace-records)).
 
 The composition also keeps the identity service in its unexported field
 `identity`, which `composeIdentity` sets. A part listed after it that keeps
@@ -1772,7 +1774,10 @@ level)`, the one place a workspace object (`workspace.Object`) is built:
 every field of the record, a nil one encoded as `null`, plus `org_slug`
 (read from the workspace's org), `hub_url` (`ExternalURL` without one
 trailing slash, then `/git/<org_slug>/<slug>.git`, or `null` without an
-external URL), `access` (the caller's level) and `settings`. A record of
+external URL), `access` (the caller's level) and `settings`, the effective
+settings of the record, or for a fork those of its parent, read with
+`BySlug` at render time so that a change of the parent shows at once (a
+fork whose parent has no record shows its own). A record of
 kind `fork` goes last through the `ForkView` registered with
 `(*Service).RegisterForkView`, so the fork feature completes its object
 without this package importing it.
@@ -1795,8 +1800,28 @@ its `Validate` rule, refusing a duplicate or incomplete key;
 resets every key; otherwise an object whose unknown keys are refused with
 `unknown setting "<key>"`, a `null` value resets that key, every other
 value passes its key's rule); `EffectiveSettings(stored, defaultBranch)`
-returns every registered key with its stored value or its default. No key
-is registered yet, so every workspace object shows `settings` as `{}`.
+returns every registered key with its stored value, decoded into the Go
+type of the key's default (`bool`, `string`, `[]string`), or its default.
+The same file holds the settings table, the one definition of the 21 keys
+(name, kind: bool, enum with its strings, URL string or list of branch
+globs, and default) in the order they are judged in, and
+`RegisterSettingKeys(registry)`, which registers each with its default and
+a rule built from its kind: a bool key takes a JSON boolean, an enum key one
+of its strings, a URL key a string that is empty or an absolute `https` URL
+with a host and no user information, query or fragment once trimmed, and
+`protected_branches` an array of at most 50 distinct strings that pass
+`ValidateBranchGlob`. Its default is a list holding the default branch, the
+empty list (never `null`) while the default branch is `null`.
+
+`internal/workspace/branchglob.go` holds the one branch-glob matcher of the
+hub, which every feature reading a list of branch globs calls:
+`MatchBranchGlob(glob, branch)` matches the whole name, case-sensitive, `*`
+standing for any run of characters except `/`, `**` for any run, every other
+character for itself; it runs over the bytes in time proportional to the
+product of the two lengths, whatever the stars. `MatchAnyBranchGlob(globs,
+branch)` reports whether one glob of a list matches (an empty list matches
+nothing), and `ValidateBranchGlob(glob)` accepts 1 to 255 characters that
+pass `ValidateBranchName` with each `*` taken as an ordinary character.
 
 `internal/workspace/guard.go` holds `RequireReady(w)`, the state check of
 every route that needs a workspace's repository. It reads the marker first:

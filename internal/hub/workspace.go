@@ -63,13 +63,17 @@ func (l originLister) ListOrigin(ctx context.Context, url string, cred workspace
 // start. The workers run in the background work, which begins only once the
 // hub listens, so that a start that fails after the hook leaves no clone
 // running over stores that are closed; they are stopped when the hub stops.
-// The service
-// exists from the composition on, so a later part keeps it through
-// Composition.Workspaces and registers its setting keys on
-// Workspaces().Settings() when it is composed.
+// The service exists from the composition on, with the keys of the settings
+// table registered on its settings registry, so a later part keeps it
+// through Composition.Workspaces.
 func composeWorkspaces(c *Composition) {
 	svc := &workspace.Service{}
 	c.workspaces = svc
+	// The registry is fresh, so a failure is a programming error, which
+	// panics like an invalid route does.
+	if err := workspace.RegisterSettingKeys(svc.Settings()); err != nil {
+		panic(err)
+	}
 	// One git for the part, so that every call it makes to an origin runs
 	// with the same environment.
 	git := gitFor(c.env)

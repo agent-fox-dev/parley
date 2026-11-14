@@ -2,7 +2,9 @@ package workspace_test
 
 import (
 	"bytes"
+	"encoding/json"
 	"net/http"
+	"reflect"
 	"testing"
 
 	"github.com/agent-fox-dev/parley/internal/access"
@@ -69,5 +71,31 @@ func TestRead_RefusesAPATWithoutAWorkspacesScopeBeforeTheLookup(t *testing.T) {
 	}
 	if a := w.get(t, writer, "demo"); a.status != http.StatusOK {
 		t.Errorf("a PAT with workspaces:write = %d %s, want 200", a.status, a.body)
+	}
+}
+
+func TestRead_ShowsAForkTheEffectiveSettingsOfItsParent(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.put(t, workspace.Workspace{Slug: "demo", Status: workspace.StatusReady, DefaultBranch: new("main")})
+	w.put(t, workspace.Workspace{Slug: "demo--t1", Kind: access.KindFork, ParentSlug: new("demo"),
+		Status: workspace.StatusReady, Settings: map[string]json.RawMessage{"audit_fetches": json.RawMessage(`true`)}})
+	settings := func(slug string) map[string]any {
+		t.Helper()
+		s, _ := w.get(t, w.uKey, slug).decode(t, http.StatusOK)["settings"].(map[string]any)
+		return s
+	}
+	if fork, parent := settings("demo--t1"), settings("demo"); len(parent) == 0 || !reflect.DeepEqual(fork, parent) {
+		t.Errorf("the fork's settings = %v, want its parent's %v", fork, parent)
+	}
+	// The parent's settings change after the fork was made.
+	if _, err := w.Store.Main().Exec(`UPDATE workspaces SET settings = ? WHERE slug = 'demo'`,
+		`{"land.strategy":"squash"}`); err != nil {
+		t.Fatal(err)
+	}
+	fork := settings("demo--t1")
+	if fork["land.strategy"] != "squash" || !reflect.DeepEqual(fork["protected_branches"], []any{"main"}) {
+		t.Errorf("after the parent changed, the fork's land.strategy = %v and protected_branches = %v, want squash and [main]",
+			fork["land.strategy"], fork["protected_branches"])
 	}
 }
