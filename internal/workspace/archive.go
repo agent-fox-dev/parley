@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/event"
@@ -112,7 +113,8 @@ const archiveReason = "workspace archived"
 // one store transaction sets the status to archived, clears clone_error,
 // writes the archive event and has the session closer end the sessions of
 // the workspace and its forks; when the transaction fails nothing has
-// changed. Once it has committed, every archive observer is told. The hub's
+// changed. Once it has committed, every archive observer is told, and an
+// observer that fails or panics is logged: the archive stands. The hub's
 // copy, the forks and what they own are left as they are: an archived
 // workspace can be reactivated from them.
 func (s *Service) archive(ctx context.Context, slug, actorType string, actorID *string) (Workspace, error) {
@@ -131,9 +133,10 @@ func (s *Service) archive(ctx context.Context, slug, actorType string, actorID *
 	set := s.teardown.snapshot()
 	outcome := s.safetyCopy(ctx, rec)
 	var forks []string
+	at := s.deps.Now().UnixNano()
 	err = s.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `UPDATE workspaces SET status = ?, clone_error = NULL, updated_at = ? WHERE slug = ?`,
-			string(StatusArchived), s.deps.Now().UnixNano(), slug)
+			string(StatusArchived), at, slug)
 		if err != nil {
 			return err
 		}
@@ -158,18 +161,15 @@ func (s *Service) archive(ctx context.Context, slug, actorType string, actorID *
 		return Workspace{}, fmt.Errorf("archive workspace %q: %w", slug, err)
 	}
 	for _, o := range set.observers {
-		if err := o.WorkspaceArchived(ctx, slug, slices.Clone(forks)); err != nil {
+		if err := guarded("the archive observer", func() error {
+			return o.WorkspaceArchived(ctx, slug, slices.Clone(forks))
+		}); err != nil {
 			s.deps.Logger.Error("workspace archive observer failed", "slug", slug, "error", err)
 		}
 	}
-	rec, found, err = BySlug(ctx, s.deps.Store.Main(), slug)
-	if err != nil {
-		return Workspace{}, err
-	}
-	if !found {
-		return Workspace{}, fmt.Errorf("archive workspace %q: the record is gone after the archive", slug)
-	}
-	return rec, nil
+	return s.reread(ctx, "archive", rec, func(w *Workspace) {
+		w.Status, w.CloneError, w.UpdatedAt = StatusArchived, nil, time.Unix(0, at).UTC()
+	}), nil
 }
 
 // forksOf returns the slugs of the forks of the workspace parent, read

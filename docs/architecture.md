@@ -2324,9 +2324,14 @@ sessions not closed on archive` with the slug, `ROLLBACK TO
 archive_sessions` undoes the closer's writes, and the archive commits; only
 a failure of the savepoint statements fails it. After the commit every
 archive observer is called in registration order with the slug and the
-forks; an observer's error is logged as `workspace archive observer
-failed` with the slug and the next observer is called. A refused archive
-calls neither.
+forks; an observer's error, or its panic, recovered as an error carrying
+the panic value (`guarded`), is logged as `workspace archive observer
+failed` with the slug and the next observer is called: the archive
+stands, and the answer is `200`. The answer is the record read again
+(`reread`); a read that fails is logged as `workspace record not read
+again after the archive` with the slug, and the answer is the record read
+under the marker with the committed `status`, `clone_error` and
+`updated_at`. A refused archive calls neither.
 
 `internal/workspace/teardown.go` holds the teardown set
 ([ADR 07](adr/07-register-the-teardown-collaborators-on-the-workspace-service.md)),
@@ -2426,10 +2431,14 @@ new `instance_id` (`NewInstanceID`), sets `updated_at` and emits
 `default_branch`, `last_sync_at` and `clone_error` stay until the clone
 work changes them. A failed transaction answers `500 internal` and changes
 neither the record nor the copy. After the commit it reads the record for
-the answer, removes the copy through `Deps.RemoveCopy(RepoPath(slug))`
+the answer (`reread`: a read that fails is logged as `workspace record not
+read again after the reclone` with the slug, and the answer carries the
+committed values instead), removes the copy through `Deps.RemoveCopy(RepoPath(slug))`
 under the copy's entry of `Service.fetchLocks`, which removes the origin heads (`refs/remotes/origin/*`) with it (a
-failure is logged with the slug and the path), and calls
-`(*Service).Enqueue(slug)`; the answer is rendered by `RenderWorkspace`.
+failure or a panic, recovered by `guarded`, is logged as `workspace copy
+not removed after a reclone` with the slug and the path), and calls
+`(*Service).Enqueue(slug)` whatever the removal did; the answer is
+rendered by `RenderWorkspace`.
 The new instance id is what makes a reclone safe against a stop between
 the commit and the removal: a copy that survives is not valid for the
 record (`keepCopy`), so the clone work at the next start replaces it with

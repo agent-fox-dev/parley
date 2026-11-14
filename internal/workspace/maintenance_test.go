@@ -169,9 +169,9 @@ func TestMaintenance_TheMarkerIsReleasedWhenTheCallEnds(t *testing.T) {
 	}{
 		{name: "archive succeeds", op: "archive", status: workspace.StatusReady, want: "200"},
 		{name: "archive whose observer panics", op: "archive", status: workspace.StatusReady,
-			where: "archive observer", panics: true, want: "500 internal"},
+			where: "archive observer", panics: true, want: "200"},
 		{name: "reclone whose copy removal panics", op: "reclone", status: workspace.StatusReady,
-			where: "copy removal", panics: true, want: "500 internal"},
+			where: "copy removal", panics: true, want: "200"},
 		{name: "delete whose sandbox remover fails", op: "delete", status: workspace.StatusArchived,
 			where: "sandbox remover", want: "500 internal"},
 		{name: "delete whose sandbox remover panics", op: "delete", status: workspace.StatusArchived,

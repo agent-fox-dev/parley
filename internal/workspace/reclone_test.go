@@ -3,12 +3,14 @@ package workspace_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -376,6 +378,46 @@ func TestReclone_WaitsOutASyncOrPushAlreadyRunning(t *testing.T) {
 			if rec, _ := s.workspace(t, syncSlug); rec.Status != workspace.StatusPending || rec.OriginHeadSHA != nil {
 				t.Errorf("after both the workspace is %s with origin_head_sha %v, want pending and none",
 					rec.Status, deref(rec.OriginHeadSHA))
+			}
+		})
+	}
+}
+
+func TestReclone_WakesTheCloneWorkersWhateverTheCopyRemovalDoes(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		name   string
+		panics bool
+		// logged is what the log says of the removal's failure.
+		logged string
+	}{
+		{name: "the copy removal fails", logged: "the copy is locked"},
+		{name: "the copy removal panics", panics: true, logged: "the copy removal panicked"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			var log hubtest.LogBuffer
+			removal := &stubTeardown{name: "copy removal"}
+			removal.set(errors.New("the copy is locked"), c.panics)
+			w := newWorld(t, withLog(&log), withRemoveCopy(func(dir string) error {
+				return removal.remove(context.Background(), nil, dir)
+			}))
+			w.put(t, workspace.Workspace{Slug: "demo", Status: workspace.StatusReady})
+			woken := len(w.notifications())
+
+			a := w.operate(t, "reclone", w.uKey, "demo")
+
+			if obj := a.decode(t, http.StatusOK); obj["status"] != "pending" {
+				t.Errorf("answer status %v, want pending", obj["status"])
+			}
+			if got := w.notifications()[woken:]; !slices.Equal(got, []string{"demo"}) {
+				t.Errorf("the clone workers were told of %v, want [demo]", got)
+			}
+			if rec, _ := w.workspace(t, "demo"); rec.Status != workspace.StatusPending || rec.Marker != workspace.MarkerNone {
+				t.Errorf("stored status %s marker %q, want pending and none", rec.Status, rec.Marker)
+			}
+			if !strings.Contains(log.String(), "slug=demo") || !strings.Contains(log.String(), c.logged) {
+				t.Errorf("the log does not report the failed removal with the slug:\n%s", log.String())
 			}
 		})
 	}
