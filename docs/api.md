@@ -1674,3 +1674,59 @@ When that removal fails, the delete is undone as a whole, and the answer is
 | `403` `forbidden` | the caller is not an admin (see [Admin routes](#admin-routes)) |
 | `404` `not_found` | no org has that id or slug (`org not found`). Nothing changes. |
 | `500` `internal` | removing data another part of the hub keeps for the org failed (`internal error`). Nothing changes. |
+
+## `GET /api/v1/events/log`
+
+Answers one page of the event log: the hub events the caller may see, in
+ascending `seq`, after a resume position. The route declares the scope
+`audit:read` for a PAT, which `audit:write` satisfies; the admin token and API
+keys are not held to it. It has no workspace in its path.
+
+| Parameter | Meaning |
+|---|---|
+| `after` | the resume position: the page holds events with a higher `seq`. A non-negative integer. Without it (and without `cursor`) the page starts at `oldest_seq`, the oldest event in the log |
+| `cursor` | another name for `after`; both may be given only with the same value |
+| `limit` | the most items the page holds: an integer from 1 to 200, 50 when absent |
+| `wait` | how long to hold the request when there is nothing to return: a whole number of seconds from 0 to 60, 0 when absent |
+| `workspace` | only events whose `workspace` is this slug |
+| `types` | only events whose `type` matches one of these comma-separated entries: an exact type, or a prefix ending in `*` that matches every type beginning with the text before it (`*` alone matches every type) |
+| `session_id` | only events whose `session_id` is this UUID, in any letter case |
+
+The filters apply together. Other query parameters are ignored.
+
+```json
+{"items":[{"seq":11,"id":"…","type":"parley.change.open","time":"2026-11-14T10:30:15Z","workspace":"api","actor_type":"pat","actor_id":"u_1","resource_type":"change","resource_id":"42","action":"open","session_id":null,"metadata":{}}],"next_cursor":null,"next_after":120,"oldest_seq":11,"last_seq":120}
+```
+
+| Member | Value |
+|---|---|
+| `items` | the visible, matching events after the position, at most `limit`, each the hub event record as stored; `[]` when there is none, never `null` |
+| `next_after` | the position to send as `after` for the next page: the `seq` of the last item when the page holds `limit` items, else the position up to which the log was examined, which is then `last_seq` |
+| `next_cursor` | `next_after` as a string when the page holds `limit` items, else `null` |
+| `oldest_seq`, `last_seq` | the bounds of the event log when the page was read: the lowest `seq` the log holds and the last `seq` written, both 0 while no event was ever written |
+
+Following `next_after` from page to page returns every visible, matching
+event exactly once, also when the events in between are ones the caller may
+not see or the filters exclude. Items are decided with the caller's access at
+the time the page is read: the admin token sees every event; a user sees the
+events of a workspace on which, or on whose fork parent, it has a level
+(`owner` for the types beginning with `parley.secret.`, `parley.token.` and
+`parley.webhook.`), and an event of no workspace when its `metadata.scope`
+is `user` with the user's id, or `org` with an active org the user is a
+member of. A workspace-bound PAT sees no event yet.
+
+**Long-poll.** With `wait` above 0 and nothing to return, the hub holds the
+request until a visible, matching event is committed, and then answers with
+it, within a second of the commit. An event the caller may not see or the
+filters exclude does not end the wait. When `wait` seconds have passed, the
+answer is `200` with `items` `[]` and `next_after` moved to the position
+examined, `last_seq` at that time. When the hub begins to stop, every held
+request is answered at once, `200` with `items` `[]`. A held request whose
+client goes away stops waiting.
+
+| Status | When |
+|---|---|
+| `200 OK` | the body is a page of the log |
+| `400` `invalid_request` | a `limit` that is not an integer from 1 to 200 (`limit must be an integer from 1 to 200`), a `wait` that is not a whole number of seconds from 0 to 60 (`wait must be a whole number of seconds from 0 to 60`), an `after` or `cursor` that is not a non-negative integer (`after must be a non-negative integer`), `after` and `cursor` with different values (`after and cursor name different positions`), or a query string that does not parse (`the query string is malformed`). Answered at once; nothing is held |
+| `403` `insufficient_scope` | a PAT without `audit:read` or `audit:write` (`this route needs the scope audit:read`) |
+| `500` `internal` | the log or the caller's access could not be read (`internal error`) |

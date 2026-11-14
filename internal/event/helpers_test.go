@@ -156,6 +156,10 @@ type fixture struct {
 	// failMemberships makes every read of the memberships fail, for the
 	// access rule and the component alike.
 	failMemberships atomic.Bool
+	// shutdown is the component's shutdown notification, and shutDown
+	// closes it, as the hub does when it begins to stop.
+	shutdown chan struct{}
+	shutDown func()
 	// stop ends the component's Run and waits for it, before the store
 	// closes under it.
 	stop func()
@@ -187,8 +191,10 @@ func (f *fixture) open() {
 	f.store = st
 	f.access = &access.Service{}
 	f.access.Bind(access.Deps{Records: access.StoreRecords(st.Main()), Memberships: f.memberships()})
+	shutdown := make(chan struct{})
+	f.shutdown, f.shutDown = shutdown, sync.OnceFunc(func() { close(shutdown) })
 	f.events, err = New(Deps{Store: st, Clock: f.clock, Scrubber: f.scrubber, Parents: storeParents{},
-		Access: f.access, Memberships: f.memberships()})
+		Access: f.access, Memberships: f.memberships(), Shutdown: shutdown})
 	if err != nil {
 		f.t.Fatalf("bind the component: %v", err)
 	}
@@ -338,6 +344,7 @@ type world struct {
 	srv   *server.Server
 	admin string
 	users map[string]string
+	keys  map[string]string
 	acme  string
 }
 
@@ -345,7 +352,7 @@ type world struct {
 func newWorld(t testing.TB) *world {
 	t.Helper()
 	ctx := context.Background()
-	w := &world{fixture: newFixture(t), users: map[string]string{}}
+	w := &world{fixture: newFixture(t), users: map[string]string{}, keys: map[string]string{}}
 	if err := identity.IssueAdminToken(ctx, w.store, "", func(tok string) error { w.admin = tok; return nil }); err != nil {
 		t.Fatalf("issue the admin token: %v", err)
 	}
@@ -356,7 +363,7 @@ func newWorld(t testing.TB) *world {
 	w.srv.SetScopeCheck(identity.ScopeCheck)
 	w.srv.AddAccessCheck(ids.AdminCheck)
 	w.srv.AddAccessCheck(w.access.Check)
-	for _, r := range ids.Routes() {
+	for _, r := range append(ids.Routes(), w.events.Routes()...) {
 		w.srv.Register(r)
 	}
 	personal := map[string]string{}
@@ -384,6 +391,25 @@ func newWorld(t testing.TB) *world {
 // user is the caller the user name is to the visibility decision.
 func (w *world) user(name string) Caller {
 	return Caller{UserID: w.users[name], CredentialID: "key-" + name}
+}
+
+// key is an API key of the user name, issued on first use, as a login
+// issues one.
+func (w *world) key(name string) string {
+	w.t.Helper()
+	if k, ok := w.keys[name]; ok {
+		return k
+	}
+	ctx := context.Background()
+	err := w.store.Tx(ctx, func(tx *sql.Tx) error {
+		k, _, err := identity.IssueAPIKey(ctx, tx, w.users[name], 0, w.clock.Now())
+		w.keys[name] = k
+		return err
+	})
+	if err != nil {
+		w.t.Fatalf("issue an API key of %s: %v", name, err)
+	}
+	return w.keys[name]
 }
 
 // call sends method path to the router in-process with credential as the

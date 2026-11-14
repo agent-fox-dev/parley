@@ -105,6 +105,10 @@ type Deps struct {
 	// Memberships is the membership question the access rule asks, which
 	// decides who sees an org-scoped event; nil lets no user see one.
 	Memberships access.Memberships
+	// Shutdown is the hub's shutdown notification, closed once when the hub
+	// begins to stop; every held request returns when it closes. nil never
+	// closes.
+	Shutdown <-chan struct{}
 }
 
 // Component is the hub's event component, one per hub. The hub creates it

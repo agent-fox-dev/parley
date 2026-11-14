@@ -2,6 +2,10 @@ package hub_test
 
 import (
 	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptrace"
 	"testing"
 	"time"
 
@@ -96,5 +100,66 @@ func TestEvents_DecidesVisibilityWithTheHubsAccessRule(t *testing.T) {
 		if err != nil || got != tc.want {
 			t.Errorf("%s: Visible = %v, %v, want %v, nil", tc.name, got, err, tc.want)
 		}
+	}
+}
+
+func TestEvents_StopReleasesHeldLogRequests(t *testing.T) {
+	t.Parallel()
+	h := hubtest.Start(t, nil)
+
+	wrote := make(chan struct{})
+	ctx := httptrace.WithClientTrace(context.Background(), &httptrace.ClientTrace{
+		WroteRequest: func(httptrace.WroteRequestInfo) { close(wrote) },
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.URL("/api/v1/events/log?wait=60"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+h.Token)
+	type reply struct {
+		status int
+		body   []byte
+		err    error
+	}
+	answered := make(chan reply, 1)
+	go func() {
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			answered <- reply{err: err}
+			return
+		}
+		defer res.Body.Close()
+		body, err := io.ReadAll(res.Body)
+		answered <- reply{res.StatusCode, body, err}
+	}()
+	select {
+	case <-wrote:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the request was not sent within 5 s")
+	}
+	// The hub has nothing to answer on an empty log, so the request is held
+	// once it reaches the handler.
+	time.Sleep(200 * time.Millisecond)
+	select {
+	case r := <-answered:
+		t.Fatalf("answered %d %s, %v before the stop, want the request held", r.status, r.body, r.err)
+	default:
+	}
+
+	t0 := time.Now()
+	h.Stop()
+	select {
+	case r := <-answered:
+		var page struct {
+			Items []json.RawMessage `json:"items"`
+		}
+		if r.err != nil || r.status != http.StatusOK || json.Unmarshal(r.body, &page) != nil || page.Items == nil || len(page.Items) != 0 {
+			t.Errorf("answer = %d %s, %v; want 200 with items == []", r.status, r.body, r.err)
+		}
+		if elapsed := time.Since(t0); elapsed >= time.Second {
+			t.Errorf("answered %v after the stop began, want under 1 s", elapsed)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the held request was not answered within 5 s of the stop")
 	}
 }

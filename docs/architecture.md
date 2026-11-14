@@ -15,7 +15,7 @@ command-line client. Both are written in Go, in the module
 | `internal/buildinfo` | the version, commit and build time the binary was built with, shared by both programs |
 | `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra`, each declared through one helper ([ADR 02](adr/02-declare-every-cli-command-through-one-helper.md)), the client configuration file, the resolution of the hub URL and the credential, the one HTTP client the commands send their requests with, the printing of a command's result on stdout and of its warnings on stderr, the shared wait for a long operation (`--wait`, `--timeout`, `--poll-interval`), and the error envelopes and exit statuses every command ends with |
 | `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, and a registry of keys and whole sections that decides what the file may hold |
-| `internal/event` | the hub events: every significant state change as one event, written in the caller's store transaction with a hub-wide `seq` that is never reused; the event record and its JSON form, the emit calls `Emit` and `EmitNow`, the log's bounds, the read by position and the expiry of old positions, the following of commits for waiters and `OnCommit` callbacks, and the counters ([ADR 05](adr/05-deliver-events-by-reading-the-log-by-position.md)) |
+| `internal/event` | the hub events: every significant state change as one event, written in the caller's store transaction with a hub-wide `seq` that is never reused; the event record and its JSON form, the emit calls `Emit` and `EmitNow`, the log's bounds, the read by position and the expiry of old positions, the following of commits for waiters and `OnCommit` callbacks, the counters, and the route `GET /api/v1/events/log` with its long-poll ([ADR 05](adr/05-deliver-events-by-reading-the-log-by-position.md)) |
 | `internal/hub` | the composition of the `parleyd` process: argument parsing, the scrubbing logger, the fixed start order, the bootstrap of the admin token, the HTTP server's options, the idempotency records in the transactional store, signals and the stop, and the `backup` command; the one place later packages plug their parts in ([ADR 01](adr/01-compose-the-hub-in-one-package.md)) |
 | `internal/maintenance` | the maintenance loop: a registry of named tasks, and `Loop`, which runs one pass at once and one at each tick of an hourly timer, the tasks of a pass one after the other in a fixed order, and logs a failing task without stopping the others |
 | `internal/hubtest` | test support, imported by test code only: `Start` bootstraps a hub with an admin token and serves it in-process on a free loopback port, `StartWith` does the same with more in `config.toml` (`Config.Server` inside `[server]`, `Config.TOML` after it), files in the config dir (`Config.Files`) and a function run on the composition (`Config.Compose`), `(*Hub).IssuePAT` stores a PAT, `CreateOrg` and `AddMember` make an org and a membership through the admin routes and `AddWorkspace` stores a workspace record, `Serve` runs a hub with given options until the test ends, `(*Served).Call` sends a request with a bearer credential and a body and returns the answer's status and body, and `LogBuffer` holds a running hub's log for the test to read |
@@ -1363,11 +1363,14 @@ and the audit query will.
 in `parts`. It creates a zero `event.Component`, adds the schema step
 `event.SchemaStep` (`hub_events`) and binds the component in the start hook
 `events` to `event.Deps{Store: rt.Store, Clock: event.SystemClock(rt.Now),
-Scrubber: rt.Scrubber, Parents: ..., Access: c.access, Memberships: ...}`, the
-fork-parent lookup being `access.RecordBySlug` read in the emitting
-transaction, `c.access` the `*access.Service` that `composeAccess` creates and
-keeps on the composition, and the memberships the same
-`identity.ActiveOrgIDs` source that service is bound to. `Bind` reads
+Scrubber: rt.Scrubber, Parents: ..., Access: c.access, Memberships: ...,
+Shutdown: c.ShuttingDown()}`, the fork-parent lookup being
+`access.RecordBySlug` read in the emitting transaction, `c.access` the
+`*access.Service` that `composeAccess` creates and keeps on the composition,
+the memberships the same `identity.ActiveOrgIDs` source that service is bound
+to, and `Shutdown` the hub's shutdown notification, which releases the
+requests the component holds. The part registers the routes of
+`(*Component).Routes()` with `AddRoute` when it is composed. `Bind` reads
 `last_seq`, and its error fails the start. The start hooks that run after it,
 those of the parts listed after `composeEvents` and of `Options.Compose`, may
 emit before the hub listens; a call made before the component is bound
@@ -1518,6 +1521,24 @@ stored fork parent, is `workspace`, of every type, and reads nothing.
 The component's `event.Clock` has `Now()` and `NewTimer(d)`, so that tests
 control the time events are stamped with and the timers of the waits;
 `event.SystemClock(now)` is the hub's.
+
+`internal/event/poll.go` serves `GET /api/v1/events/log` (see
+[the API reference](api.md#get-apiv1eventslog)), declared with the scope
+`audit:read` and no access mark. It parses `limit` itself rather than through
+`server.ReadPage`, which would read `cursor` as the generic list's opaque
+cursor, where here it is another name for `after`. The request parsing the
+two event routes share is in `internal/event/filter.go`: the query string,
+the filters `workspace`, `types` and `session_id` with their matcher (all
+filters together, any one `types` entry), and a resume position. A page is
+collected by reading the log after the position in batches of 200, each in
+one snapshot with the bounds, so `next_after` and `last_seq` agree, keeping
+the events that match and that one viewer decides visible, until `limit`
+items or the end of the log. An empty page with `wait` above 0 waits on
+`waitAfter`, a timer of the component's clock, the request's context and
+`Deps.Shutdown`, and reads the log again after every wake-up; when the timer
+fires it reads once more, so `next_after` is the position the log holds then.
+The page is written without HTML escaping, so its items are the bytes of
+`Record`'s JSON form.
 
 ### The logger
 

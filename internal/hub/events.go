@@ -21,7 +21,8 @@ const eventsGrace = time.Second
 // the event component in a start hook to the stores, the hub's clock and
 // scrubber, the fork-parent lookup over the workspace records, and the
 // access rule and memberships composeAccess binds, from which it decides who
-// sees an event. It runs the component as background work: Run follows the
+// sees an event, and the hub's shutdown notification, which releases the
+// requests the component holds. It registers the event routes. It runs the component as background work: Run follows the
 // commits for the waiters and the OnCommit callbacks until the stop, and the
 // stop waits for it before the stores close (ADR 05). The component exists
 // from the composition on, so a later part keeps it through
@@ -38,8 +39,12 @@ func composeEvents(c *Composition) {
 			Parents:     event.ForkParentsFunc(forkParent),
 			Access:      c.access,
 			Memberships: activeOrgs(rt.Store.Main()),
+			Shutdown:    c.ShuttingDown(),
 		})
 	})
+	for _, r := range c.events.Routes() {
+		c.AddRoute(r)
+	}
 	c.AddBackgroundWork(eventsHook, eventsGrace, func(ctx context.Context, _ *Runtime) { c.events.Run(ctx) })
 }
 
