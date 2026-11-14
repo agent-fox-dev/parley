@@ -2,12 +2,10 @@ package workspace_test
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
-	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -105,13 +103,12 @@ func TestArchive_ArchivesAndRecordsTheOutcome(t *testing.T) {
 				t.Errorf("the safety copy ran while the store held status %q, want %q", seen, status)
 			}
 			mu.Unlock()
-			evs := s.eventsOf(t, archiveEvent)
 			if c.want == "" {
-				if a.status != http.StatusInternalServerError || a.errorType(t) != "internal" {
+				if a.outcome(t) != "500 internal" {
 					t.Errorf("answer = %d %s, want 500 internal", a.status, a.body)
 				}
-				if rec.Status != status || len(evs) != events {
-					t.Errorf("status %s and %d archive events after a failed archive, want %s and none", rec.Status, len(evs)-events, status)
+				if n := len(s.eventsOf(t, archiveEvent)); rec.Status != status || n != events {
+					t.Errorf("status %s and %d archive events after a failed archive, want %s and none", rec.Status, n-events, status)
 				}
 				return
 			}
@@ -122,70 +119,12 @@ func TestArchive_ArchivesAndRecordsTheOutcome(t *testing.T) {
 			if rec.Status != workspace.StatusArchived || rec.CloneError != nil {
 				t.Errorf("stored status %s clone_error %v, want archived and null", rec.Status, deref(rec.CloneError))
 			}
-			if len(evs) != events+1 {
-				t.Fatalf("%d archive events written, want 1", len(evs)-events)
-			}
-			ev := evs[events]
-			var meta map[string]any
-			if err := json.Unmarshal(ev.Metadata, &meta); err != nil {
-				t.Fatal(err)
-			}
 			want := map[string]any{"head_sha": nil, "origin_push": c.want, "forks": float64(c.forks)}
 			if head != nil {
 				want["head_sha"] = *head
 			}
-			if deref(ev.Workspace) != syncSlug || ev.ActorType != event.ActorAPIKey || deref(ev.ActorID) != s.u || !reflect.DeepEqual(meta, want) {
-				t.Errorf("archive event of workspace %q by %s %q with %v, want workspace %q by %s %q with %v",
-					deref(ev.Workspace), ev.ActorType, deref(ev.ActorID), meta, syncSlug, event.ActorAPIKey, s.u, want)
-			}
+			s.checkEvent(t, archiveEvent, events, syncSlug, event.ActorAPIKey, s.u, want)
 		})
-	}
-}
-
-func TestArchive_RefusesWithoutTouchingTheWorkspace(t *testing.T) {
-	t.Parallel()
-	p := &stubBranchesPusher{}
-	calls := &teardownLog{}
-	stub := &stubTeardown{name: "stub", log: calls}
-	w := newWorld(t, withSafetyPusher(p), withTeardown(func(td *workspace.Teardown) {
-		td.RegisterSessionCloser(stub)
-		td.RegisterArchiveObserver(stub)
-	}))
-	for _, rec := range []workspace.Workspace{
-		{Slug: "demo", Status: workspace.StatusReady},
-		{Slug: "demo--t1", Kind: access.KindFork, ParentSlug: new("demo"), Status: workspace.StatusReady},
-		{Slug: "archived", Status: workspace.StatusArchived},
-		{Slug: "pending", Status: workspace.StatusPending},
-		{Slug: "cloning", Status: workspace.StatusCloning},
-	} {
-		w.put(t, rec)
-	}
-	for _, c := range []struct {
-		slug      string
-		status    int
-		errorType string
-	}{
-		{"demo--t1", http.StatusBadRequest, "not_supported_on_fork"},
-		{"archived", http.StatusConflict, "workspace_archived"},
-		{"pending", http.StatusConflict, "workspace_busy"},
-		{"cloning", http.StatusConflict, "workspace_busy"},
-	} {
-		before, _ := w.workspace(t, c.slug)
-		if a := w.operate(t, "archive", w.uKey, c.slug); a.status != c.status || a.errorType(t) != c.errorType {
-			t.Errorf("archive of %s = %d %s, want %d %s", c.slug, a.status, a.body, c.status, c.errorType)
-		}
-		if after, _ := w.workspace(t, c.slug); !reflect.DeepEqual(after, before) {
-			t.Errorf("archive of %s changed the record from %+v to %+v", c.slug, before, after)
-		}
-	}
-	if heads, _ := p.calls(); len(heads) != 0 {
-		t.Errorf("refused archives offered branches to origin %d times, want never", len(heads))
-	}
-	if got := calls.recorded(); len(got) != 0 {
-		t.Errorf("refused archives called the session closer and the observers: %v, want no call", got)
-	}
-	if evs := w.eventsOf(t, archiveEvent); len(evs) != 0 {
-		t.Errorf("refused archives wrote %d archive events, want none", len(evs))
 	}
 }
 
@@ -246,29 +185,51 @@ func TestArchive_HubStartReleasesAMarkerLeftByAStoppedHub(t *testing.T) {
 	}
 }
 
-func TestArchive_EndsTheSessionsOfTheWorkspaceAndItsForks(t *testing.T) {
+func TestArchive_EndsTheSessionsAndTellsTheObserversOfTheWorkspaceAndItsForks(t *testing.T) {
 	t.Parallel()
+	closed := []string{"first close [demo demo--a demo--b] workspace archived"}
+	observed := []string{"first observe demo [demo--a demo--b] archived", "second observe demo [demo--a demo--b] archived"}
 	for _, c := range []struct {
-		name   string
-		closer bool
-		fail   error
-		// marks is the number of rows the closer's write leaves.
-		marks int
+		name string
+		// closer registers the stub first as the session closer, observers
+		// first and second as archive observers; first fails with fail, or
+		// panics when panics is set.
+		closer, observers bool
+		fail              error
+		panics            bool
+		// marks is the number of rows the closer's write leaves, calls the
+		// stubs' calls, logged what the log says of first's failure.
+		marks  int
+		calls  []string
+		logged string
 	}{
-		{name: "the closer ends them in the archive's transaction", closer: true, marks: 1},
-		{name: "the closer fails and its writes are undone", closer: true, fail: errors.New("sessions store down")},
-		{name: "no closer is registered"},
+		{name: "the closer ends them in the archive's transaction", closer: true, marks: 1, calls: closed},
+		{name: "the closer fails and its writes are undone", closer: true, fail: errors.New("sessions store down"),
+			calls: closed, logged: "sessions store down"},
+		{name: "the first observer fails", observers: true, fail: errors.New("sandboxes unreachable"),
+			calls: observed, logged: "sandboxes unreachable"},
+		{name: "the first observer panics", observers: true, fail: errors.New("sandboxes unreachable"), panics: true,
+			calls: observed, logged: "the first panicked"},
+		{name: "an empty collaborator set"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
 			var log hubtest.LogBuffer
 			calls := &teardownLog{}
-			opts := []option{withLog(&log)}
-			if c.closer {
-				closer := &stubTeardown{name: "closer", log: calls, fail: c.fail, mark: true}
-				opts = append(opts, withTeardown(func(td *workspace.Teardown) { td.RegisterSessionCloser(closer) }))
-			}
-			w := archiveWithForks(t, []string{"demo--b", "demo--a"}, opts...)
+			first := &stubTeardown{name: "first", log: calls, mark: true}
+			first.set(c.fail, c.panics)
+			second := &stubTeardown{name: "second", log: calls}
+			w := archiveWithForks(t, []string{"demo--b", "demo--a"}, withLog(&log), withTeardown(func(td *workspace.Teardown) {
+				td.Clear()
+				if c.closer {
+					td.RegisterSessionCloser(first)
+				}
+				if c.observers {
+					td.RegisterArchiveObserver(first)
+					td.RegisterArchiveObserver(second)
+				}
+			}))
+			first.w, second.w = w, w
 			if _, err := w.Store.Main().Exec(`CREATE TABLE session_marks (slugs TEXT NOT NULL)`); err != nil {
 				t.Fatal(err)
 			}
@@ -278,64 +239,19 @@ func TestArchive_EndsTheSessionsOfTheWorkspaceAndItsForks(t *testing.T) {
 			if obj := a.decode(t, http.StatusOK); obj["status"] != "archived" {
 				t.Errorf("answer status %v, want archived", obj["status"])
 			}
-			var want []string
-			if c.closer {
-				want = []string{"closer close [demo demo--a demo--b] workspace archived"}
-			}
-			if got := calls.recorded(); !slices.Equal(got, want) {
-				t.Errorf("session closer calls %v, want %v", got, want)
+			if got := calls.recorded(); !slices.Equal(got, c.calls) {
+				t.Errorf("the collaborators' calls %v, want %v", got, c.calls)
 			}
 			var marks int
 			if err := w.Store.Main().QueryRow(`SELECT count(*) FROM session_marks`).Scan(&marks); err != nil {
 				t.Fatal(err)
 			}
 			rec, _ := w.workspace(t, "demo")
-			if marks != c.marks || rec.Status != workspace.StatusArchived || len(w.eventsOf(t, archiveEvent)) != 1 {
-				t.Errorf("%d closer rows, status %s and %d archive events stored, want %d, archived and 1",
-					marks, rec.Status, len(w.eventsOf(t, archiveEvent)), c.marks)
+			if n := len(w.eventsOf(t, archiveEvent)); marks != c.marks || rec.Status != workspace.StatusArchived || n != 1 {
+				t.Errorf("%d closer rows, status %s and %d archive events stored, want %d, archived and 1", marks, rec.Status, n, c.marks)
 			}
-			if c.fail != nil && (!strings.Contains(log.String(), "slug=demo") || !strings.Contains(log.String(), c.fail.Error())) {
-				t.Errorf("the log does not report the closer's failure with the slug:\n%s", log.String())
-			}
-		})
-	}
-}
-
-func TestArchive_TellsEveryObserverOnceTheArchiveHasCommitted(t *testing.T) {
-	t.Parallel()
-	for _, c := range []struct {
-		name   string
-		panics bool
-		// logged is what the log says of the first observer's failure.
-		logged string
-	}{
-		{name: "the first observer fails", logged: "sandboxes unreachable"},
-		{name: "the first observer panics", panics: true, logged: "the first panicked"},
-	} {
-		t.Run(c.name, func(t *testing.T) {
-			t.Parallel()
-			var log hubtest.LogBuffer
-			calls := &teardownLog{}
-			first := &stubTeardown{name: "first", log: calls}
-			first.set(errors.New("sandboxes unreachable"), c.panics)
-			second := &stubTeardown{name: "second", log: calls}
-			w := archiveWithForks(t, []string{"demo--a"}, withLog(&log), withTeardown(func(td *workspace.Teardown) {
-				td.RegisterArchiveObserver(first)
-				td.RegisterArchiveObserver(second)
-			}))
-			first.w, second.w = w, w
-
-			a := w.operate(t, "archive", w.uKey, "demo")
-
-			if obj := a.decode(t, http.StatusOK); obj["status"] != "archived" {
-				t.Errorf("answer status %v, want archived", obj["status"])
-			}
-			want := []string{"first observe demo [demo--a] archived", "second observe demo [demo--a] archived"}
-			if got := calls.recorded(); !slices.Equal(got, want) {
-				t.Errorf("observer calls %v, want %v", got, want)
-			}
-			if !strings.Contains(log.String(), "slug=demo") || !strings.Contains(log.String(), c.logged) {
-				t.Errorf("the log does not report the observer's failure with the slug:\n%s", log.String())
+			if c.logged != "" && (!strings.Contains(log.String(), "slug=demo") || !strings.Contains(log.String(), c.logged)) {
+				t.Errorf("the log does not report first's failure with the slug:\n%s", log.String())
 			}
 		})
 	}

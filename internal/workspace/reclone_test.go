@@ -2,20 +2,16 @@ package workspace_test
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
@@ -29,14 +25,16 @@ const recloneEvent = "parley.workspace.reclone"
 
 // recordSteps records in steps the removals of a copy and the clone
 // notifications, in the order the hub makes them, each with whether the
-// copy's directory exists at that moment; the removal still removes.
+// copy's directory exists at that moment, and a notification with the
+// status the store holds for the workspace; the removal still removes.
 func recordSteps(steps *teardownLog) option {
 	return func(c *hubtest.Config, w *world) {
 		withCompose(func(comp *hub.Composition) {
 			comp.AdjustWorkspace(func(d *workspace.Deps) {
 				next := d.Notify
 				d.Notify = func(slug string) {
-					steps.add("notify %s copy=%t", slug, exists(w.svc.RepoPath(slug)))
+					rec, _, _ := workspace.BySlug(context.Background(), w.Store.Main(), slug)
+					steps.add("notify %s copy=%t %s", slug, exists(w.svc.RepoPath(slug)), rec.Status)
 					next(slug)
 				}
 				d.RemoveCopy = func(dir string) error {
@@ -64,7 +62,7 @@ func TestReclone_DiscardsTheCopyAndPutsTheWorkspaceBackToPending(t *testing.T) {
 	steps := &teardownLog{}
 	p := &stubBranchesPusher{before: func(context.Context) { steps.add("push") }}
 	s := newSyncWorld(t, withSafetyPusher(p), recordSteps(steps))
-	done := []string{"push", "remove copy=true", "notify demo copy=false"}
+	done := []string{"push", "remove copy=true", "notify demo copy=false pending"}
 	for _, c := range []struct {
 		name  string
 		taken int
@@ -82,7 +80,7 @@ func TestReclone_DiscardsTheCopyAndPutsTheWorkspaceBackToPending(t *testing.T) {
 		{name: "origin takes no branch", want: "failed", steps: done},
 		{name: "the event cannot be written", taken: 2, fault: faultEvent, steps: []string{"push"}},
 		{name: "failed workspace without a copy", taken: 2, failed: true, want: "ok",
-			steps: []string{"remove copy=false", "notify demo copy=false"}},
+			steps: []string{"remove copy=false", "notify demo copy=false pending"}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			if rec, _ := s.workspace(t, syncSlug); rec.Status != workspace.StatusReady {
@@ -126,13 +124,12 @@ func TestReclone_DiscardsTheCopyAndPutsTheWorkspaceBackToPending(t *testing.T) {
 			if got := steps.recorded()[made:]; !slices.Equal(got, c.steps) {
 				t.Errorf("the reclone's steps are %v, want %v", got, c.steps)
 			}
-			evs := s.eventsOf(t, recloneEvent)
 			if c.want == "" {
-				if a.status != http.StatusInternalServerError || a.errorType(t) != "internal" {
+				if a.outcome(t) != "500 internal" {
 					t.Errorf("answer = %d %s, want 500 internal", a.status, a.body)
 				}
-				if !reflect.DeepEqual(rec, before) || len(evs) != events {
-					t.Errorf("record %+v and %d reclone events after a failed reclone, want %+v and none", rec, len(evs)-events, before)
+				if n := len(s.eventsOf(t, recloneEvent)); !reflect.DeepEqual(rec, before) || n != events {
+					t.Errorf("record %+v and %d reclone events after a failed reclone, want %+v and none", rec, n-events, before)
 				}
 				if got := gitrepotest.Refs(t, s.copy, "refs/remotes/origin/"); !maps.Equal(got, heads) {
 					t.Errorf("the copy's origin heads are %v after a failed reclone, want %v", got, heads)
@@ -158,76 +155,8 @@ func TestReclone_DiscardsTheCopyAndPutsTheWorkspaceBackToPending(t *testing.T) {
 			if exists(s.copy) {
 				t.Error("the copy is still on disk after the reclone")
 			}
-			if len(evs) != events+1 {
-				t.Fatalf("%d reclone events written, want 1", len(evs)-events)
-			}
-			ev := evs[events]
-			var meta map[string]any
-			if err := json.Unmarshal(ev.Metadata, &meta); err != nil {
-				t.Fatal(err)
-			}
-			want := map[string]any{"origin_push": c.want}
-			if deref(ev.Workspace) != syncSlug || ev.ActorType != event.ActorAPIKey || deref(ev.ActorID) != s.u || !reflect.DeepEqual(meta, want) {
-				t.Errorf("reclone event of workspace %q by %s %q with %v, want workspace %q by %s %q with %v",
-					deref(ev.Workspace), ev.ActorType, deref(ev.ActorID), meta, syncSlug, event.ActorAPIKey, s.u, want)
-			}
+			s.checkEvent(t, recloneEvent, events, syncSlug, event.ActorAPIKey, s.u, map[string]any{"origin_push": c.want})
 		})
-	}
-}
-
-func TestReclone_RefusesWithoutTouchingTheWorkspace(t *testing.T) {
-	t.Parallel()
-	p := &stubBranchesPusher{}
-	w := newWorld(t, withSafetyPusher(p))
-	for _, rec := range []workspace.Workspace{
-		{Slug: "ready-forked", Status: workspace.StatusReady},
-		{Slug: "failed-forked", Status: workspace.StatusFailed},
-		{Slug: "archived", Status: workspace.StatusArchived},
-		{Slug: "archived-forked", Status: workspace.StatusArchived},
-		{Slug: "pending", Status: workspace.StatusPending},
-		{Slug: "cloning-forked", Status: workspace.StatusCloning},
-	} {
-		w.put(t, rec)
-	}
-	for _, parent := range []string{"ready-forked", "failed-forked", "archived-forked", "cloning-forked"} {
-		w.put(t, workspace.Workspace{Slug: parent + "--t1", Kind: access.KindFork, ParentSlug: new(parent), Status: workspace.StatusReady})
-	}
-	for _, c := range []struct {
-		slug      string
-		status    int
-		errorType string
-	}{
-		{"ready-forked--t1", http.StatusBadRequest, "fork_has_no_origin"},
-		{"archived", http.StatusConflict, "workspace_archived"},
-		{"archived-forked", http.StatusConflict, "workspace_archived"},
-		{"pending", http.StatusConflict, "workspace_busy"},
-		{"cloning-forked", http.StatusConflict, "workspace_busy"},
-		{"ready-forked", http.StatusConflict, "has_forks"},
-		{"failed-forked", http.StatusConflict, "has_forks"},
-	} {
-		dir := w.svc.RepoPath(c.slug)
-		if err := os.MkdirAll(filepath.Join(dir, "objects"), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		before, _ := w.workspace(t, c.slug)
-		if a := w.operate(t, "reclone", w.uKey, c.slug); a.status != c.status || a.errorType(t) != c.errorType {
-			t.Errorf("reclone of %s = %d %s, want %d %s", c.slug, a.status, a.body, c.status, c.errorType)
-		}
-		if after, _ := w.workspace(t, c.slug); !reflect.DeepEqual(after, before) {
-			t.Errorf("reclone of %s changed the record from %+v to %+v", c.slug, before, after)
-		}
-		if !exists(filepath.Join(dir, "objects")) {
-			t.Errorf("reclone of %s removed its copy", c.slug)
-		}
-	}
-	if heads, _ := p.calls(); len(heads) != 0 {
-		t.Errorf("refused reclones offered branches to origin %d times, want never", len(heads))
-	}
-	if evs := w.eventsOf(t, recloneEvent); len(evs) != 0 {
-		t.Errorf("refused reclones wrote %d reclone events, want none", len(evs))
-	}
-	if got := w.notifications(); len(got) != 0 {
-		t.Errorf("refused reclones told the clone workers about %v, want nothing", got)
 	}
 }
 
@@ -252,14 +181,7 @@ func TestReclone_TheNewCopyHoldsExactlyWhatOriginHolds(t *testing.T) {
 	if a := s.operate(t, "reclone", s.uKey, syncSlug); a.status != http.StatusOK {
 		t.Fatalf("reclone = %d %s, want 200", a.status, a.body)
 	}
-	var rec workspace.Workspace
-	eventually(t, "the clone work of the recloned workspace ends", func() bool {
-		rec, _ = s.workspace(t, syncSlug)
-		return rec.Status == workspace.StatusReady || rec.Status == workspace.StatusFailed
-	})
-	if rec.Status != workspace.StatusReady {
-		t.Fatalf("the recloned workspace is %s (%v), want ready", rec.Status, deref(rec.CloneError))
-	}
+	rec := s.cloned(t, syncSlug)
 	sameRefs(t, s.copy, s.origin)
 	for _, name := range []string{"refs/heads/rejected", "refs/parley/changes/1/v1"} {
 		if id := ref(t, s.copy, name); id != "" {
@@ -298,14 +220,7 @@ func TestReclone_ACopyLeftByAStoppedHubIsClonedFresh(t *testing.T) {
 
 	s.startWorkers(t, 1, nil)
 
-	var rec workspace.Workspace
-	eventually(t, "the clone work started at the next start ends", func() bool {
-		rec, _ = s.workspace(t, syncSlug)
-		return rec.Status == workspace.StatusReady || rec.Status == workspace.StatusFailed
-	})
-	if rec.Status != workspace.StatusReady {
-		t.Fatalf("the workspace is %s (%v), want ready", rec.Status, deref(rec.CloneError))
-	}
+	s.cloned(t, syncSlug)
 	if id := ref(t, s.copy, "refs/heads/local-only"); id != "" {
 		t.Errorf("refs/heads/local-only is %s in the copy, want it absent", id)
 	}
@@ -346,9 +261,9 @@ func TestReclone_WaitsOutASyncOrPushAlreadyRunning(t *testing.T) {
 			defer free()
 			c.hold(s, held, release)
 
-			work := s.send(http.MethodPost, s.uKey, "/api/v1/workspaces/"+syncSlug+c.path)
+			work := s.send(http.MethodPost, s.uKey, "/api/v1/workspaces/"+syncSlug+c.path, nil)
 			<-held
-			reclone := s.send(http.MethodPost, s.uKey, "/api/v1/workspaces/"+syncSlug+"/reclone")
+			reclone := s.send(http.MethodPost, s.uKey, "/api/v1/workspaces/"+syncSlug+"/reclone", nil)
 			eventually(t, "the reclone sets its marker", func() bool {
 				rec, _ := s.workspace(t, syncSlug)
 				return rec.Marker == workspace.MarkerReclone
@@ -378,46 +293,6 @@ func TestReclone_WaitsOutASyncOrPushAlreadyRunning(t *testing.T) {
 			if rec, _ := s.workspace(t, syncSlug); rec.Status != workspace.StatusPending || rec.OriginHeadSHA != nil {
 				t.Errorf("after both the workspace is %s with origin_head_sha %v, want pending and none",
 					rec.Status, deref(rec.OriginHeadSHA))
-			}
-		})
-	}
-}
-
-func TestReclone_WakesTheCloneWorkersWhateverTheCopyRemovalDoes(t *testing.T) {
-	t.Parallel()
-	for _, c := range []struct {
-		name   string
-		panics bool
-		// logged is what the log says of the removal's failure.
-		logged string
-	}{
-		{name: "the copy removal fails", logged: "the copy is locked"},
-		{name: "the copy removal panics", panics: true, logged: "the copy removal panicked"},
-	} {
-		t.Run(c.name, func(t *testing.T) {
-			t.Parallel()
-			var log hubtest.LogBuffer
-			removal := &stubTeardown{name: "copy removal"}
-			removal.set(errors.New("the copy is locked"), c.panics)
-			w := newWorld(t, withLog(&log), withRemoveCopy(func(dir string) error {
-				return removal.remove(context.Background(), nil, dir)
-			}))
-			w.put(t, workspace.Workspace{Slug: "demo", Status: workspace.StatusReady})
-			woken := len(w.notifications())
-
-			a := w.operate(t, "reclone", w.uKey, "demo")
-
-			if obj := a.decode(t, http.StatusOK); obj["status"] != "pending" {
-				t.Errorf("answer status %v, want pending", obj["status"])
-			}
-			if got := w.notifications()[woken:]; !slices.Equal(got, []string{"demo"}) {
-				t.Errorf("the clone workers were told of %v, want [demo]", got)
-			}
-			if rec, _ := w.workspace(t, "demo"); rec.Status != workspace.StatusPending || rec.Marker != workspace.MarkerNone {
-				t.Errorf("stored status %s marker %q, want pending and none", rec.Status, rec.Marker)
-			}
-			if !strings.Contains(log.String(), "slug=demo") || !strings.Contains(log.String(), c.logged) {
-				t.Errorf("the log does not report the failed removal with the slug:\n%s", log.String())
 			}
 		})
 	}

@@ -1,7 +1,6 @@
 package workspace_test
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -42,30 +41,33 @@ var owners = []string{"changes", "secrets", "sessions", "tokens"}
 // delete through the transaction their owner's row of the table owned for
 // the slug; the call whose line is fail fails after that. As a token
 // revoker it returns tokens[slug]. As a fork remover it deletes the forks'
-// records through the transaction when dropForks is set and returns forks,
-// with a discard function that records its call; asked to delete one fork,
-// it removes nothing and answers forkErr. As the sandbox remover it runs
-// onSandboxes, when set, after it has recorded the call.
+// records through the transaction and returns their slugs, with a discard
+// function that records its call; asked to delete one fork, it removes
+// nothing and answers forkErr. As the sandbox remover it runs during, when
+// set, after it has recorded the call.
 type deleteStub struct {
-	w           *world
-	log         teardownLog
-	tokens      map[string][]string
-	forks       []string
-	dropForks   bool
-	forkErr     error
-	onSandboxes func()
+	w      *world
+	log    teardownLog
+	tokens map[string][]string
 
 	mu      sync.Mutex
 	fail    string
+	forkErr error
+	during  func()
 	txs     map[*sql.Tx]bool
 	visible map[int]bool
 }
 
-func (s *deleteStub) failing(line string) {
+// set makes the call whose line is fail fail, the deletes of a fork
+// answer forkErr and the sandbox remover run during.
+func (s *deleteStub) set(fail string, forkErr error, during func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.fail = line
+	s.fail, s.forkErr, s.during = fail, forkErr, during
 }
+
+// since are the lines of the log after the first n.
+func (s *deleteStub) since(n int) []string { return s.log.recorded()[n:] }
 
 func (s *deleteStub) call(ctx context.Context, tx *sql.Tx, owner, slug, line string) error {
 	var n int
@@ -131,8 +133,11 @@ func (s *deleteStub) CloseSessions(ctx context.Context, tx *sql.Tx, slugs []stri
 
 func (s *deleteStub) RemoveSandboxes(ctx context.Context, slugs []string) error {
 	err := s.call(ctx, nil, "", "", fmt.Sprintf("sandboxes %v", slugs))
-	if s.onSandboxes != nil {
-		s.onSandboxes()
+	s.mu.Lock()
+	during := s.during
+	s.mu.Unlock()
+	if during != nil {
+		during()
 	}
 	return err
 }
@@ -141,17 +146,33 @@ func (s *deleteStub) DeleteFork(ctx context.Context, slug string, caller identit
 	if err := s.call(ctx, nil, "", "", "delete fork "+slug+" by "+principalName(caller)); err != nil {
 		return err
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.forkErr
 }
 
 func (s *deleteStub) RemoveForksOf(ctx context.Context, tx *sql.Tx, parent string, actor identity.Principal) ([]string, func(), error) {
-	if s.dropForks {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM workspaces WHERE parent_slug = ?`, parent); err != nil {
+	// The forks in descending order, which the delete sorts.
+	rows, err := tx.QueryContext(ctx, `SELECT slug FROM workspaces WHERE parent_slug = ? ORDER BY slug DESC`, parent)
+	if err != nil {
+		return nil, nil, err
+	}
+	var forks []string
+	for rows.Next() {
+		var slug string
+		if err := rows.Scan(&slug); err != nil {
 			return nil, nil, err
 		}
+		forks = append(forks, slug)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return nil, nil, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM workspaces WHERE parent_slug = ?`, parent); err != nil {
+		return nil, nil, err
 	}
 	discard := func() { s.log.add("discard committed=%t", s.committed()) }
-	return slices.Clone(s.forks), discard, s.call(ctx, tx, "", "", "forks of "+parent+" by "+principalName(actor))
+	return forks, discard, s.call(ctx, tx, "", "", "forks of "+parent+" by "+principalName(actor))
 }
 
 // withCaller is lines with caller, the name principalName gives, for "%s".
@@ -171,34 +192,28 @@ func principalName(p identity.Principal) string {
 	return p.Type + " " + p.User.ID
 }
 
-// registerAll registers stub as every collaborator of a delete, with the
-// removers secrets and changes, and as the fork remover when forks is set.
-func registerAll(stub *deleteStub, forks bool) func(*workspace.Teardown) {
-	return func(td *workspace.Teardown) {
-		td.RegisterTokenRevoker(stub)
-		td.RegisterRemover(stub.remover("secrets"))
-		td.RegisterRemover(stub.remover("changes"))
-		td.RegisterSessionCloser(stub)
-		td.RegisterSandboxRemover(stub)
-		if forks {
-			td.RegisterForkRemover(stub)
-		}
+// use makes stub every collaborator of a delete, with the removers secrets
+// and changes, and the fork remover when forkRemover is set, in place of
+// the collaborators registered so far.
+func (w *world) use(stub *deleteStub, forkRemover bool) {
+	td := w.svc.Teardown()
+	td.Clear()
+	td.RegisterTokenRevoker(stub)
+	td.RegisterRemover(stub.remover("secrets"))
+	td.RegisterRemover(stub.remover("changes"))
+	td.RegisterSessionCloser(stub)
+	td.RegisterSandboxRemover(stub)
+	if forkRemover {
+		td.RegisterForkRemover(stub)
 	}
 }
 
-// deleteWorld starts a world with opts whose teardown set holds what
-// register registers and nothing else, with the archived repository
-// workspace demo with a setting and a copy, its forks, and in the table
-// owned a row for each owner and workspace. When stub is set, each removal
-// of a copy is recorded in its log with whether the delete had committed.
-func deleteWorld(t *testing.T, stub *deleteStub, forks []string, register func(*workspace.Teardown), opts ...option) *world {
+// deleteWorld starts a world with opts, with an empty teardown set and the
+// table owned. When stub is set, each removal of a copy is recorded in its
+// log with whether the delete had committed.
+func deleteWorld(t *testing.T, stub *deleteStub, opts ...option) *world {
 	t.Helper()
-	opts = append(opts, withTeardown(func(td *workspace.Teardown) {
-		td.Clear()
-		if register != nil {
-			register(td)
-		}
-	}))
+	opts = append(opts, withTeardown(func(td *workspace.Teardown) { td.Clear() }))
 	if stub != nil {
 		opts = append(opts, withCompose(func(c *hub.Composition) {
 			c.AdjustWorkspace(func(d *workspace.Deps) {
@@ -217,12 +232,23 @@ func deleteWorld(t *testing.T, stub *deleteStub, forks []string, register func(*
 	if stub != nil {
 		stub.w = w
 	}
+	if _, err := w.Store.Main().Exec(`CREATE TABLE owned (owner TEXT NOT NULL, slug TEXT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	return w
+}
+
+// seedDemo stores the archived repository workspace demo with a setting
+// and a copy, and its forks, and makes the table owned hold a row for each
+// owner and each of them alone.
+func (w *world) seedDemo(t *testing.T, forks ...string) {
+	t.Helper()
 	w.put(t, workspace.Workspace{Slug: "demo", Status: workspace.StatusArchived,
 		Settings: map[string]json.RawMessage{"note": json.RawMessage(`"kept"`)}})
 	for _, f := range forks {
 		w.put(t, workspace.Workspace{Slug: f, Kind: access.KindFork, ParentSlug: new("demo"), Status: workspace.StatusReady})
 	}
-	if _, err := w.Store.Main().Exec(`CREATE TABLE owned (owner TEXT NOT NULL, slug TEXT NOT NULL)`); err != nil {
+	if _, err := w.Store.Main().Exec(`DELETE FROM owned`); err != nil {
 		t.Fatal(err)
 	}
 	for _, slug := range append([]string{"demo"}, forks...) {
@@ -233,7 +259,6 @@ func deleteWorld(t *testing.T, stub *deleteStub, forks []string, register func(*
 		}
 	}
 	makeCopy(t, w.svc.RepoPath("demo"))
-	return w
 }
 
 // makeCopy puts repository data at dir.
@@ -287,34 +312,78 @@ func rowsOf(slugs ...string) []string {
 
 func TestDelete_RemovesTheWorkspaceItsForksAndWhatTheyOwn(t *testing.T) {
 	t.Parallel()
+	forks := []string{"demo--b", "demo--a"}
 	sandboxes := "sandboxes [demo demo--a demo--b]"
-	oneByOne := slices.Concat([]string{sandboxes}, removal("demo--a"), removal("demo--b"), removal("demo"),
-		[]string{"remove copy demo--a committed=true", "remove copy demo--b committed=true", "remove copy demo committed=true"})
+	copies := []string{"remove copy demo--a committed=true", "remove copy demo--b committed=true", "remove copy demo committed=true"}
+	oneByOne := slices.Concat([]string{sandboxes}, removal("demo--a"), removal("demo--b"), removal("demo"), copies)
+	oneByOneEvents := []map[string]any{
+		{"kind": "fork", "parent_slug": "demo", "revoked_tokens": []any{"t2", "t9"}},
+		{"kind": "fork", "parent_slug": "demo", "revoked_tokens": []any{}},
+		{"kind": "repository", "parent_slug": nil, "revoked_tokens": []any{"t5"}, "deleted_forks": []any{"demo--a", "demo--b"}},
+	}
 	for _, c := range []struct {
 		name  string
 		admin bool
-		forks bool
-		// want is the log of the calls, with the caller's name for
-		// "%s"; left are the rows of owned the delete leaves; recreate
-		// creates the slug again afterwards.
-		want     []string
-		left     []string
-		recreate bool
+		forks []string
+		// collaborators registers the stub as every collaborator, and
+		// forkRemover as the fork remover too, which removes the forks
+		// and writes no event.
+		collaborators, forkRemover bool
+		// want is the log of the calls, with the caller's name for "%s";
+		// left are the rows of owned the delete leaves; events are the
+		// workspaces of the delete events, in order, and meta their
+		// metadata.
+		want, left, events []string
+		meta               []map[string]any
 	}{
-		{name: "the owner, with the forks removed one by one", want: oneByOne, recreate: true},
-		{name: "the admin token", admin: true, want: oneByOne},
-		{name: "the owner, with a fork remover", forks: true,
+		{name: "the owner, with the forks removed one by one", forks: forks, collaborators: true, want: oneByOne,
+			events: []string{"demo--a", "demo--b", "demo"}, meta: oneByOneEvents},
+		{name: "the admin token", admin: true, forks: forks, collaborators: true, want: oneByOne,
+			events: []string{"demo--a", "demo--b", "demo"}, meta: oneByOneEvents},
+		{name: "the owner, with a fork remover", forks: forks, collaborators: true, forkRemover: true,
 			want: slices.Concat([]string{sandboxes, "forks of demo by %s"}, removal("demo"),
 				[]string{"remove copy demo committed=true", "discard committed=true"}),
-			left: rowsOf("demo--a", "demo--b")},
+			left: rowsOf("demo--a", "demo--b"), events: []string{"demo"}, meta: []map[string]any{
+				{"kind": "repository", "parent_slug": nil, "revoked_tokens": []any{"t5"}, "deleted_forks": []any{"demo--a", "demo--b"}}}},
+		{name: "no forks", collaborators: true,
+			want:   slices.Concat([]string{"sandboxes [demo]"}, removal("demo"), []string{"remove copy demo committed=true"}),
+			events: []string{"demo"}, meta: []map[string]any{
+				{"kind": "repository", "parent_slug": nil, "revoked_tokens": []any{"t5"}, "deleted_forks": []any{}}}},
+		{name: "no collaborators", forks: forks, want: copies, left: rowsOf("demo", "demo--a", "demo--b"),
+			events: []string{"demo--a", "demo--b", "demo"}, meta: []map[string]any{
+				{"kind": "fork", "parent_slug": "demo", "revoked_tokens": []any{}},
+				{"kind": "fork", "parent_slug": "demo", "revoked_tokens": []any{}},
+				{"kind": "repository", "parent_slug": nil, "revoked_tokens": []any{}, "deleted_forks": []any{"demo--a", "demo--b"}}}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
-			stub := &deleteStub{forks: []string{"demo--a", "demo--b"}, dropForks: true}
-			w := deleteWorld(t, stub, []string{"demo--b", "demo--a"}, registerAll(stub, c.forks))
-			cred, caller := w.uKey, identity.TypeAPIKey+" "+w.u
+			stub := &deleteStub{tokens: map[string][]string{"demo--a": {"t9", "t2"}, "demo--b": {}, "demo": {"t5"}}}
+			w := deleteWorld(t, stub)
+			w.seedDemo(t, c.forks...)
+			if c.collaborators {
+				w.use(stub, c.forkRemover)
+			}
+			cred, actorType, actorID := w.uKey, event.ActorAPIKey, w.u
 			if c.admin {
-				cred = w.Token
+				cred, actorType, actorID = w.Token, event.ActorAdminToken, ""
+			}
+			// Events of the workspaces written before, which the delete keeps.
+			ctx := context.Background()
+			err := w.Store.Tx(ctx, func(tx *sql.Tx) error {
+				for _, slug := range []string{"demo", "demo", "demo", "demo--a"} {
+					if _, err := w.events.Emit(ctx, tx, event.Input{Type: "parley.workspace.note", Workspace: &slug,
+						ActorType: event.ActorSystem, ResourceType: "workspace", ResourceID: slug}); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			before, _, err := w.events.ReadAfter(ctx, 0, 0)
+			if err != nil {
+				t.Fatal(err)
 			}
 
 			a := w.operate(t, "delete", cred, "demo")
@@ -328,18 +397,51 @@ func TestDelete_RemovesTheWorkspaceItsForksAndWhatTheyOwn(t *testing.T) {
 			if exists(w.svc.RepoPath("demo")) {
 				t.Error("the copy of demo is still on disk after the delete")
 			}
-			want := withCaller(c.want, caller)
+			want := withCaller(c.want, identity.TypeAPIKey+" "+w.u)
+			if c.admin {
+				want = withCaller(c.want, identity.TypeAdmin)
+			}
 			if got := stub.log.recorded(); !slices.Equal(got, want) {
 				t.Errorf("the delete's calls:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
 			}
-			if txs, visible := stub.seen(); txs != 1 || !slices.Equal(visible, []int{3}) {
-				t.Errorf("the calls got %d transactions and another connection saw %v workspace records, want 1 and [3]", txs, visible)
+			txs, visible := stub.seen()
+			if wantTxs, wantVisible := 0, []int(nil); c.collaborators {
+				wantTxs, wantVisible = 1, []int{1 + len(c.forks)}
+				if txs != wantTxs || !slices.Equal(visible, wantVisible) {
+					t.Errorf("the calls got %d transactions and another connection saw %v workspace records, want 1 and %v", txs, visible, wantVisible)
+				}
+			} else if txs != 0 {
+				t.Errorf("with no collaborators %d transactions were handed out, want none", txs)
 			}
 			if got := w.ownedRows(t); !slices.Equal(got, c.left) {
 				t.Errorf("owned rows after the delete %v, want %v", got, c.left)
 			}
-			if !c.recreate {
-				return
+			after, _, err := w.events.ReadAfter(ctx, 0, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(after) != len(before)+len(c.events) || !reflect.DeepEqual(after[:len(before)], before) {
+				t.Fatalf("the log after the delete holds %d events, want the %d before it unchanged and %d delete events",
+					len(after), len(before), len(c.events))
+			}
+			for i, ev := range after[len(before):] {
+				var meta map[string]any
+				if err := json.Unmarshal(ev.Metadata, &meta); err != nil {
+					t.Fatal(err)
+				}
+				if ev.Type != deleteEvent || deref(ev.Workspace) != c.events[i] || ev.ActorType != actorType ||
+					deref(ev.ActorID) != actorID || !reflect.DeepEqual(meta, c.meta[i]) {
+					t.Errorf("event %d: %s of %q by %s %q with %v, want %s of %q by %s %q with %v", i, ev.Type,
+						deref(ev.Workspace), ev.ActorType, deref(ev.ActorID), meta, deleteEvent, c.events[i], actorType, actorID, c.meta[i])
+				}
+				// A fork's event stays visible to its parent's readers.
+				var parent sql.NullString
+				if err := w.Store.Main().QueryRow(`SELECT parent_slug FROM hub_events WHERE seq = ?`, ev.Seq).Scan(&parent); err != nil {
+					t.Fatal(err)
+				}
+				if want := c.meta[i]["parent_slug"] != nil; parent.Valid != want {
+					t.Errorf("event %d stores parent %q, want one = %v", i, parent.String, want)
+				}
 			}
 			if obj := w.create(t, w.uKey, valid("demo")).decode(t, http.StatusCreated); obj["status"] != "pending" {
 				t.Errorf("a create with the deleted slug answers status %v, want pending", obj["status"])
@@ -348,42 +450,19 @@ func TestDelete_RemovesTheWorkspaceItsForksAndWhatTheyOwn(t *testing.T) {
 	}
 }
 
-func TestDelete_RefusesWithoutTouchingTheWorkspace(t *testing.T) {
-	t.Parallel()
-	stub := &deleteStub{}
-	w := deleteWorld(t, stub, nil, registerAll(stub, true))
-	for _, status := range []workspace.Status{workspace.StatusReady, workspace.StatusFailed, workspace.StatusPending, workspace.StatusCloning} {
-		slug := string(status)
-		w.put(t, workspace.Workspace{Slug: slug, Status: status})
-		makeCopy(t, w.svc.RepoPath(slug))
-		before, _ := w.workspace(t, slug)
-		if a := w.operate(t, "delete", w.uKey, slug); a.outcome(t) != "409 workspace_not_archived" {
-			t.Errorf("delete of %s = %d %s, want 409 workspace_not_archived", slug, a.status, a.body)
-		}
-		if after, _ := w.workspace(t, slug); !reflect.DeepEqual(after, before) {
-			t.Errorf("delete of %s changed the record from %+v to %+v", slug, before, after)
-		}
-		if !exists(w.svc.RepoPath(slug)) {
-			t.Errorf("delete of %s removed its copy", slug)
-		}
-	}
-	if got := stub.log.recorded(); len(got) != 0 {
-		t.Errorf("refused deletes called collaborators: %v, want no call", got)
-	}
-	if evs := w.eventsOf(t, deleteEvent); len(evs) != 0 {
-		t.Errorf("refused deletes wrote %d delete events, want none", len(evs))
-	}
-}
-
 func TestDelete_HandsAForkToTheForkRemover(t *testing.T) {
 	t.Parallel()
+	stub := &deleteStub{}
+	w := deleteWorld(t, stub)
+	w.seedDemo(t, "demo--a")
+	parent, _ := w.workspace(t, "demo")
 	busy := server.NewError("workspace_busy", http.StatusConflict, `workspace "demo--a" is busy; try again later`)
 	for _, c := range []struct {
 		name    string
 		remover bool
 		forkErr error
 		// want is the answer, message its error's message; calls are the
-		// collaborators' calls, with the caller's name for "%s".
+		// collaborators' calls.
 		want, message string
 		calls         []string
 	}{
@@ -393,10 +472,9 @@ func TestDelete_HandsAForkToTheForkRemover(t *testing.T) {
 		{name: "no fork remover is registered", want: "500 internal"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			t.Parallel()
-			stub := &deleteStub{forkErr: c.forkErr}
-			w := deleteWorld(t, stub, []string{"demo--a"}, registerAll(stub, c.remover))
-			parent, _ := w.workspace(t, "demo")
+			w.use(stub, c.remover)
+			stub.set("", c.forkErr, nil)
+			made := len(stub.log.recorded())
 
 			a := w.operate(t, "delete", w.uKey, "demo--a")
 
@@ -408,7 +486,7 @@ func TestDelete_HandsAForkToTheForkRemover(t *testing.T) {
 					t.Errorf("delete of the fork answers the message %q, want the fork remover's %q", message, c.message)
 				}
 			}
-			if got, want := stub.log.recorded(), withCaller(c.calls, identity.TypeAPIKey+" "+w.u); !slices.Equal(got, want) {
+			if got, want := stub.since(made), withCaller(c.calls, identity.TypeAPIKey+" "+w.u); !slices.Equal(got, want) {
 				t.Errorf("the delete's calls %v, want %v", got, want)
 			}
 			if after, _ := w.workspace(t, "demo"); !reflect.DeepEqual(after, parent) {
@@ -429,55 +507,77 @@ func TestDelete_HandsAForkToTheForkRemover(t *testing.T) {
 
 func TestDelete_AFailingStepChangesNothing(t *testing.T) {
 	t.Parallel()
+	stub := &deleteStub{}
+	w := deleteWorld(t, stub)
 	for _, c := range []struct {
 		name string
 		// fail is the call that fails, with the caller's name for "%s";
-		// trigger is SQL that makes a write of the store fail.
-		fail    string
-		trigger string
-		forks   bool
+		// trigger is SQL that makes a write of the store fail; fork makes
+		// the fork demo--c while the sandboxes are removed; want is the
+		// answer, 500 internal when "".
+		fail, trigger, want string
+		forkRemover, fork   bool
 	}{
 		{name: "the sandbox remover", fail: "sandboxes [demo demo--a demo--b]"},
 		{name: "the first remover on the first fork", fail: "secrets remove demo--a"},
 		{name: "the last remover on the parent", fail: "changes remove demo"},
 		{name: "the token revoker", fail: "revoke demo--b"},
-		{name: "the fork remover", fail: "forks of demo by %s", forks: true},
+		{name: "the fork remover", fail: "forks of demo by %s", forkRemover: true},
 		{name: "the session closer", fail: "close [demo] workspace deleted"},
 		{name: "the removal of the parent's record", trigger: `CREATE TRIGGER fault BEFORE DELETE ON workspaces
 			WHEN old.slug = 'demo' BEGIN SELECT RAISE(ABORT, 'the record is kept'); END`},
 		{name: "the write of the parent's event", trigger: `CREATE TRIGGER fault BEFORE INSERT ON hub_events
 			WHEN new.workspace = 'demo' AND new.type = '` + deleteEvent + `' BEGIN SELECT RAISE(ABORT, 'no event'); END`},
+		{name: "a fork made while the sandboxes are removed", fork: true, want: "409 workspace_busy"},
+		{name: "a fork made while the sandboxes are removed, with a fork remover", fork: true, forkRemover: true,
+			want: "409 workspace_busy"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			t.Parallel()
-			stub := &deleteStub{forks: []string{"demo--a", "demo--b"}, dropForks: true}
-			w := deleteWorld(t, stub, []string{"demo--a", "demo--b"}, registerAll(stub, c.forks))
-			stub.failing(withCaller([]string{c.fail}, identity.TypeAPIKey+" "+w.u)[0])
+			w.seedDemo(t, "demo--a", "demo--b")
+			w.use(stub, c.forkRemover)
+			var during func()
+			if c.fork {
+				var once sync.Once
+				during = func() {
+					once.Do(func() {
+						w.put(t, workspace.Workspace{Slug: "demo--c", Kind: access.KindFork, ParentSlug: new("demo"),
+							Status: workspace.StatusReady})
+					})
+				}
+			}
+			stub.set(withCaller([]string{c.fail}, identity.TypeAPIKey+" "+w.u)[0], nil, during)
 			if c.trigger != "" {
 				if _, err := w.Store.Main().Exec(c.trigger); err != nil {
 					t.Fatal(err)
 				}
 			}
-
-			a := w.operate(t, "delete", w.uKey, "demo")
-
-			if a.status != http.StatusInternalServerError || a.errorType(t) != "internal" {
-				t.Errorf("delete = %d %s, want 500 internal", a.status, a.body)
+			if c.want == "" {
+				c.want = "500 internal"
 			}
+			made, events := len(stub.log.recorded()), len(w.eventsOf(t, deleteEvent))
+
+			if a := w.operate(t, "delete", w.uKey, "demo"); a.outcome(t) != c.want {
+				t.Errorf("delete = %d %s, want %s", a.status, a.body, c.want)
+			}
+
 			rec, _ := w.workspace(t, "demo")
-			if n := w.workspaces(t); n != 3 || rec.Status != workspace.StatusArchived || rec.Marker != workspace.MarkerNone {
-				t.Errorf("%d records, demo %s with marker %q, want 3, archived and none", n, rec.Status, rec.Marker)
+			records := 3
+			if c.fork {
+				records = 4
+			}
+			if n := w.workspaces(t); n != records || rec.Status != workspace.StatusArchived || rec.Marker != workspace.MarkerNone {
+				t.Errorf("%d records, demo %s with marker %q, want %d, archived and none", n, rec.Status, rec.Marker, records)
 			}
 			if got, want := w.ownedRows(t), rowsOf("demo", "demo--a", "demo--b"); !slices.Equal(got, want) {
 				t.Errorf("owned rows %v, want all of them back: %v", got, want)
 			}
-			if evs := w.eventsOf(t, deleteEvent); len(evs) != 0 {
-				t.Errorf("%d delete events stored, want none", len(evs))
+			if n := len(w.eventsOf(t, deleteEvent)); n != events {
+				t.Errorf("%d delete events stored, want none", n-events)
 			}
 			if !exists(w.svc.RepoPath("demo")) {
 				t.Error("the copy of demo is gone after a failed delete")
 			}
-			got := stub.log.recorded()
+			got := stub.since(made)
 			for _, line := range got {
 				if strings.HasPrefix(line, "remove copy") || strings.HasPrefix(line, "discard") {
 					t.Errorf("a failed delete discarded repository data: %v", got)
@@ -487,122 +587,27 @@ func TestDelete_AFailingStepChangesNothing(t *testing.T) {
 				t.Errorf("calls after the sandbox remover failed: %v, want none", got)
 			}
 
-			stub.failing("")
+			stub.set("", nil, nil)
 			if _, err := w.Store.Main().Exec(`DROP TRIGGER IF EXISTS fault`); err != nil {
 				t.Fatal(err)
 			}
+			made = len(stub.log.recorded())
 			if a := w.operate(t, "delete", w.uKey, "demo"); a.status != http.StatusNoContent {
-				t.Errorf("the repeated delete = %d %s, want 204", a.status, a.body)
+				t.Fatalf("the repeated delete = %d %s, want 204", a.status, a.body)
+			}
+			if got := stub.since(made); c.fork && !slices.Contains(got, "sandboxes [demo demo--a demo--b demo--c]") {
+				t.Errorf("the repeated delete's calls %v, want the sandboxes of demo and of its three forks removed", got)
 			}
 		})
-	}
-}
-
-func TestDelete_WritesOneEventPerRemovedWorkspace(t *testing.T) {
-	t.Parallel()
-	for _, c := range []struct {
-		name  string
-		forks []string
-		// remover registers a fork remover that returns forks and writes
-		// no event.
-		remover bool
-		tokens  map[string][]string
-		// want are the events' workspaces and metadata, in the log's order.
-		want []string
-		meta []map[string]any
-	}{
-		{name: "the forks removed one by one", forks: []string{"demo--b", "demo--a"},
-			tokens: map[string][]string{"demo--a": {"t9", "t2"}, "demo--b": {}, "demo": {"t5"}},
-			want:   []string{"demo--a", "demo--b", "demo"},
-			meta: []map[string]any{
-				{"kind": "fork", "parent_slug": "demo", "revoked_tokens": []any{"t2", "t9"}},
-				{"kind": "fork", "parent_slug": "demo", "revoked_tokens": []any{}},
-				{"kind": "repository", "parent_slug": nil, "revoked_tokens": []any{"t5"}, "deleted_forks": []any{"demo--a", "demo--b"}},
-			}},
-		{name: "no forks", want: []string{"demo"},
-			meta: []map[string]any{{"kind": "repository", "parent_slug": nil, "revoked_tokens": []any{}, "deleted_forks": []any{}}}},
-		{name: "a fork remover", forks: []string{"demo--b", "demo--a"}, remover: true, want: []string{"demo"},
-			meta: []map[string]any{{"kind": "repository", "parent_slug": nil, "revoked_tokens": []any{}, "deleted_forks": []any{"demo--a", "demo--b"}}}},
-	} {
-		t.Run(c.name, func(t *testing.T) {
-			t.Parallel()
-			stub := &deleteStub{tokens: c.tokens, forks: []string{"demo--b", "demo--a"}, dropForks: true}
-			w := deleteWorld(t, stub, c.forks, registerAll(stub, c.remover))
-
-			if a := w.operate(t, "delete", w.uKey, "demo"); a.status != http.StatusNoContent {
-				t.Fatalf("delete = %d %s, want 204", a.status, a.body)
-			}
-			evs := w.eventsOf(t, deleteEvent)
-			if len(evs) != len(c.want) {
-				t.Fatalf("%d delete events, want %d", len(evs), len(c.want))
-			}
-			for i, ev := range evs {
-				var meta map[string]any
-				if err := json.Unmarshal(ev.Metadata, &meta); err != nil {
-					t.Fatal(err)
-				}
-				if deref(ev.Workspace) != c.want[i] || ev.ActorType != event.ActorAPIKey || deref(ev.ActorID) != w.u ||
-					!reflect.DeepEqual(meta, c.meta[i]) {
-					t.Errorf("event %d: workspace %q by %s %q with %v, want %q by %s %q with %v", i, deref(ev.Workspace),
-						ev.ActorType, deref(ev.ActorID), meta, c.want[i], event.ActorAPIKey, w.u, c.meta[i])
-				}
-				// A fork's event stays visible to its parent's readers.
-				var parent sql.NullString
-				if err := w.Store.Main().QueryRow(`SELECT parent_slug FROM hub_events WHERE seq = ?`, ev.Seq).Scan(&parent); err != nil {
-					t.Fatal(err)
-				}
-				if want := c.meta[i]["parent_slug"] != nil; parent.Valid != want {
-					t.Errorf("event %d stores parent %q, want one = %v", i, parent.String, want)
-				}
-			}
-		})
-	}
-}
-
-func TestDelete_KeepsTheEarlierEventsOfTheDeletedWorkspaces(t *testing.T) {
-	t.Parallel()
-	w := deleteWorld(t, nil, []string{"demo--a"}, nil)
-	ctx := context.Background()
-	err := w.Store.Tx(ctx, func(tx *sql.Tx) error {
-		for _, slug := range []string{"demo", "demo", "demo", "demo--a"} {
-			if _, err := w.events.Emit(ctx, tx, event.Input{Type: "parley.workspace.note", Workspace: &slug,
-				ActorType: event.ActorSystem, ResourceType: "workspace", ResourceID: slug}); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	before, _, err := w.events.ReadAfter(ctx, 0, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if a := w.operate(t, "delete", w.uKey, "demo"); a.status != http.StatusNoContent {
-		t.Fatalf("delete = %d %s, want 204", a.status, a.body)
-	}
-
-	after, _, err := w.events.ReadAfter(ctx, 0, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(after) != len(before)+2 || !reflect.DeepEqual(after[:len(before)], before) {
-		t.Fatalf("the log after the delete holds %d events, want the %d before it unchanged and 2 more", len(after), len(before))
-	}
-	for i, slug := range []string{"demo--a", "demo"} {
-		if ev := after[len(before)+i]; ev.Type != deleteEvent || deref(ev.Workspace) != slug {
-			t.Errorf("event %d after the delete is %s of %q, want %s of %q", i, ev.Type, deref(ev.Workspace), deleteEvent, slug)
-		}
 	}
 }
 
 func TestDelete_AnswersDoneWhenTheCopyCannotBeRemoved(t *testing.T) {
 	t.Parallel()
 	var log hubtest.LogBuffer
-	w := deleteWorld(t, nil, nil, nil, withLog(&log),
+	w := deleteWorld(t, nil, withLog(&log),
 		withRemoveCopy(func(string) error { return errors.New("device busy") }))
+	w.seedDemo(t)
 
 	if a := w.operate(t, "delete", w.uKey, "demo"); a.status != http.StatusNoContent || len(a.body) != 0 {
 		t.Fatalf("delete = %d %q, want 204 with no body", a.status, a.body)
@@ -624,80 +629,6 @@ func TestDelete_AnswersDoneWhenTheCopyCannotBeRemoved(t *testing.T) {
 	}
 }
 
-func TestDelete_WithNoCollaboratorsChangesOnlyTheWorkspaceRecords(t *testing.T) {
-	t.Parallel()
-	w := archiveWithForks(t, []string{"demo--a"}, withTeardown(func(td *workspace.Teardown) { td.Clear() }))
-
-	if a := w.operate(t, "archive", w.uKey, "demo"); a.status != http.StatusOK {
-		t.Fatalf("archive = %d %s, want 200", a.status, a.body)
-	}
-	if a := w.operate(t, "delete", w.uKey, "demo"); a.status != http.StatusNoContent {
-		t.Fatalf("delete = %d %s, want 204", a.status, a.body)
-	}
-	if n := w.workspaces(t); n != 0 {
-		t.Errorf("%d workspace records after the delete, want none", n)
-	}
-	evs := w.eventsOf(t, deleteEvent)
-	if len(evs) != 2 {
-		t.Fatalf("%d delete events, want 2", len(evs))
-	}
-	for _, ev := range evs {
-		if !strings.Contains(string(ev.Metadata), `"revoked_tokens":[]`) {
-			t.Errorf("delete event of %q has metadata %s, want revoked_tokens []", deref(ev.Workspace), ev.Metadata)
-		}
-	}
-}
-
-func TestDelete_RefusesWhenAForkIsMadeWhileTheSandboxesAreRemoved(t *testing.T) {
-	t.Parallel()
-	for _, c := range []struct {
-		name  string
-		forks bool
-	}{
-		{name: "the forks removed one by one"},
-		{name: "a fork remover", forks: true},
-	} {
-		t.Run(c.name, func(t *testing.T) {
-			t.Parallel()
-			stub := &deleteStub{forks: []string{"demo--a", "demo--c"}, dropForks: true}
-			w := deleteWorld(t, stub, []string{"demo--a"}, registerAll(stub, c.forks))
-			var once sync.Once
-			stub.onSandboxes = func() {
-				once.Do(func() {
-					w.put(t, workspace.Workspace{Slug: "demo--c", Kind: access.KindFork, ParentSlug: new("demo"),
-						Status: workspace.StatusReady})
-				})
-			}
-
-			a := w.operate(t, "delete", w.uKey, "demo")
-
-			if a.outcome(t) != "409 workspace_busy" {
-				t.Errorf("delete while a fork was made = %d %s, want 409 workspace_busy", a.status, a.body)
-			}
-			rec, _ := w.workspace(t, "demo")
-			if n := w.workspaces(t); n != 3 || rec.Status != workspace.StatusArchived || rec.Marker != workspace.MarkerNone {
-				t.Errorf("%d records, demo %s with marker %q, want 3, archived and none", n, rec.Status, rec.Marker)
-			}
-			if got, want := w.ownedRows(t), rowsOf("demo", "demo--a"); !slices.Equal(got, want) {
-				t.Errorf("owned rows %v, want all of them: %v", got, want)
-			}
-			if evs := w.eventsOf(t, deleteEvent); len(evs) != 0 {
-				t.Errorf("%d delete events stored, want none", len(evs))
-			}
-			if !exists(w.svc.RepoPath("demo")) {
-				t.Error("the copy of demo is gone after the refused delete")
-			}
-
-			if a := w.operate(t, "delete", w.uKey, "demo"); a.status != http.StatusNoContent {
-				t.Fatalf("the repeated delete = %d %s, want 204", a.status, a.body)
-			}
-			if got := stub.log.recorded(); !slices.Contains(got, "sandboxes [demo demo--a demo--c]") {
-				t.Errorf("the repeated delete's calls %v, want the sandboxes of demo, demo--a and demo--c removed", got)
-			}
-		})
-	}
-}
-
 func TestDelete_LeavesTheCopyOfAWorkspaceCreatedAgainMeanwhile(t *testing.T) {
 	t.Parallel()
 	o := gitrepotest.NewOrigin(t)
@@ -709,17 +640,7 @@ func TestDelete_LeavesTheCopyOfAWorkspaceCreatedAgainMeanwhile(t *testing.T) {
 		once.Do(func() {
 			// The delete has committed, so the slug is free: a create with it
 			// lands here and its clone work makes a copy at the same place.
-			body, _ := json.Marshal(map[string]any{"slug": "demo", "git_url": o.URL()})
-			req, _ := http.NewRequest(http.MethodPost, w.URL("/api/v1/workspaces"), bytes.NewReader(body))
-			req.Header.Set("Authorization", "Bearer "+w.uKey)
-			req.Header.Set("Content-Type", "application/json")
-			res, err := http.DefaultClient.Do(req)
-			if err != nil {
-				created <- 0
-				return
-			}
-			_ = res.Body.Close()
-			created <- res.StatusCode
+			created <- <-w.send(http.MethodPost, w.uKey, "/api/v1/workspaces", map[string]any{"slug": "demo", "git_url": o.URL()})
 			done := make(chan error, 1)
 			go func() { done <- w.svc.Clone(context.Background(), "demo") }()
 			select {
@@ -731,7 +652,8 @@ func TestDelete_LeavesTheCopyOfAWorkspaceCreatedAgainMeanwhile(t *testing.T) {
 		})
 		return gitrepo.Remove(dir)
 	}
-	w = deleteWorld(t, nil, nil, nil, withGitOrigin(o), withRemoveCopy(remove))
+	w = deleteWorld(t, nil, withGitOrigin(o), withRemoveCopy(remove))
+	w.seedDemo(t)
 
 	if a := w.operate(t, "delete", w.uKey, "demo"); a.status != http.StatusNoContent {
 		t.Fatalf("delete = %d %s, want 204", a.status, a.body)
