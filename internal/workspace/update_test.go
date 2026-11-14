@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/workspace"
@@ -102,17 +103,20 @@ func TestUpdate_RefusesAnInvalidSettingsValueChangingNothing(t *testing.T) {
 
 // refused sends body to PATCH /workspaces/<slug> as cred, an hour of the
 // hub's time after the workspace was last read, and checks that the answer
-// is status with errorType and that the workspace, updated_at included, is
-// as it was.
+// is status with errorType, that the workspace, updated_at included, is as
+// it was and that the event log holds no new event.
 func (w *world) refused(t *testing.T, cred, slug string, body any, status int, errorType string) {
 	t.Helper()
-	before := w.get(t, w.Token, slug)
+	before, events := w.get(t, w.Token, slug), w.eventCount(t)
 	w.advance(time.Hour)
 	if r := w.patch(t, cred, slug, body); r.status != status || r.errorType(t) != errorType {
 		t.Errorf("PATCH %s %v = %d %s, want %d %s", slug, body, r.status, r.body, status, errorType)
 	}
 	if after := w.get(t, w.Token, slug); !bytes.Equal(after.body, before.body) {
 		t.Errorf("PATCH %s %v: the workspace = %s, want it unchanged %s", slug, body, after.body, before.body)
+	}
+	if n := w.eventCount(t); n != events {
+		t.Errorf("PATCH %s %v: %d events, want the %d before it", slug, body, n, events)
 	}
 }
 
@@ -452,5 +456,105 @@ func TestUpdate_RefusesAnOrgThatIsNoneOrNotOneOfTheOwnersChangingNothing(t *test
 	}
 	if rec, _ := w.workspace(t, "demo--t1"); rec.OrgID != w.uOrg.ID {
 		t.Errorf("the fork after the refusals: org_id = %s, want u's personal org %s", rec.OrgID, w.uOrg.ID)
+	}
+}
+
+// lastUpdateEvent checks that the event log holds exactly one update event
+// more than before and returns it with its metadata decoded.
+func (w *world) lastUpdateEvent(t *testing.T, before int) (event.Record, map[string]any) {
+	t.Helper()
+	evs := w.eventsOf(t, updateEvent)
+	if len(evs) != before+1 {
+		t.Fatalf("%d update events, want %d", len(evs), before+1)
+	}
+	ev := evs[len(evs)-1]
+	var meta map[string]any
+	if err := json.Unmarshal(ev.Metadata, &meta); err != nil {
+		t.Fatal(err)
+	}
+	return ev, meta
+}
+
+func TestUpdate_RecordsOneEventNamingTheCallerAndTheFieldsTheBodyCarried(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.put(t, workspace.Workspace{Slug: "demo", Status: workspace.StatusReady, DefaultBranch: new("main")})
+	for _, caller := range []struct {
+		cred, actorType string
+		actorID         *string
+	}{
+		{w.uKey, event.ActorAPIKey, &w.u},
+		{w.pat(t, w.u, "workspaces:write"), event.ActorPAT, &w.u},
+		{w.Token, event.ActorAdminToken, nil},
+	} {
+		for _, c := range []struct {
+			body   map[string]any
+			fields []any
+		}{
+			{map[string]any{"description": "x"}, []any{"description"}},
+			{map[string]any{"settings": map[string]any{"sync_enabled": false}, "display_name": "D", "foo": 1}, []any{"display_name", "settings"}},
+			{map[string]any{"org_id": nil, "description": nil}, []any{"description", "org_id"}},
+			// Changes no value, and is recorded all the same.
+			{map[string]any{"description": "x"}, []any{"description"}},
+		} {
+			before, events := len(w.eventsOf(t, updateEvent)), w.eventCount(t)
+			w.patch(t, caller.cred, "demo", c.body).decode(t, http.StatusOK)
+			ev, meta := w.lastUpdateEvent(t, before)
+			if n := w.eventCount(t); n != events+1 {
+				t.Errorf("%s %v: the log grew by %d events, want 1", caller.actorType, c.body, n-events)
+			}
+			b, _ := json.Marshal(ev)
+			if !reflect.DeepEqual(ev.Workspace, new("demo")) || ev.ResourceType != "workspace" || ev.ResourceID != "demo" ||
+				ev.ActorType != caller.actorType || !reflect.DeepEqual(ev.ActorID, caller.actorID) {
+				t.Errorf("%s %v: event = %s, want workspace demo, resource workspace demo, the caller as actor", caller.actorType, c.body, b)
+			}
+			// The fields given, never a value of one.
+			if want := map[string]any{"fields": c.fields}; !reflect.DeepEqual(meta, want) {
+				t.Errorf("%s %v: metadata = %v, want %v", caller.actorType, c.body, meta, want)
+			}
+			if bytes.Contains(b, []byte("sync_enabled")) {
+				t.Errorf("%s %v: the event %s names a setting", caller.actorType, c.body, b)
+			}
+		}
+	}
+}
+
+func TestUpdate_RecordsTheParentOfAForkInItsEvent(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.put(t, workspace.Workspace{Slug: "demo", Status: workspace.StatusReady})
+	w.put(t, workspace.Workspace{Slug: "demo--t1", Kind: access.KindFork, ParentSlug: new("demo"), Status: workspace.StatusReady})
+	w.patch(t, w.uKey, "demo--t1", map[string]any{"description": "fix"}).decode(t, http.StatusOK)
+	ev, meta := w.lastUpdateEvent(t, 0)
+	if want := map[string]any{"fields": []any{"description"}, "parent_slug": "demo"}; !reflect.DeepEqual(ev.Workspace, new("demo--t1")) || !reflect.DeepEqual(meta, want) {
+		b, _ := json.Marshal(ev)
+		t.Errorf("the fork's event = %s, want workspace demo--t1 and metadata %v", b, want)
+	}
+}
+
+func TestUpdate_WritesNoEventWhenRefusedOrWhenTheEventCannotBeWritten(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	acme, beta := w.acme(t), w.CreateOrg(t, "beta")
+	w.AddMember(t, beta, w.v)
+	w.put(t, workspace.Workspace{Slug: "demo", OrgID: acme, Status: workspace.StatusReady})
+	w.put(t, workspace.Workspace{Slug: "old", Status: workspace.StatusArchived})
+	for _, c := range []struct {
+		cred, slug string
+		body       map[string]any
+		fault      string
+		status     int
+		errorType  string
+	}{
+		{w.uKey, "demo", map[string]any{"slug": "x"}, "", http.StatusBadRequest, "invalid_request"},
+		{w.uKey, "demo", map[string]any{"settings": map[string]any{"nope": 1}}, "", http.StatusBadRequest, "invalid_request"},
+		{w.vKey, "demo", map[string]any{"description": "x"}, "", http.StatusForbidden, "forbidden"},
+		{w.uKey, "demo", map[string]any{"org_id": "beta"}, "", http.StatusForbidden, "forbidden"},
+		{w.uKey, "old", map[string]any{"description": "x"}, "", http.StatusConflict, "workspace_archived"},
+		{w.uKey, "no-such-slug", map[string]any{"description": "x"}, "", http.StatusNotFound, "not_found"},
+		{w.uKey, "demo", map[string]any{"description": "x", "org_id": nil}, faultEvent, http.StatusInternalServerError, "internal"},
+	} {
+		w.fail(c.fault)
+		w.refused(t, c.cred, c.slug, c.body, c.status, c.errorType)
 	}
 }

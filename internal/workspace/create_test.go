@@ -44,7 +44,7 @@ func TestCreate_AnswersScopeAndAdminTokenRefusalsBeforeTheBody(t *testing.T) {
 			if a.status != http.StatusForbidden || a.errorType(t) != c.errorType {
 				t.Errorf("%s with %s = %d %s, want 403 %s", c.name, body.name, a.status, a.body, c.errorType)
 			}
-			if n, ev := w.workspaces(t), len(w.createEvents(t)); n != 0 || ev != 0 {
+			if n, ev := w.workspaces(t), len(w.eventsOf(t, createEvent)); n != 0 || ev != 0 {
 				t.Errorf("after %s with %s: %d workspaces and %d create events, want none", c.name, body.name, n, ev)
 			}
 		}
@@ -138,11 +138,11 @@ func TestCreate_WritesOneCreateEventInTheTransaction(t *testing.T) {
 		{"demo", nil, nil},
 		{"demo-trunk", map[string]any{"default_branch": "trunk"}, "trunk"},
 	} {
-		before := len(w.createEvents(t))
+		before := len(w.eventsOf(t, createEvent))
 		body := valid(c.slug)
 		maps.Copy(body, c.extra)
 		w.create(t, w.uKey, body).object(t)
-		evs := w.createEvents(t)
+		evs := w.eventsOf(t, createEvent)
 		if len(evs) != before+1 {
 			t.Fatalf("%s: %d create events, want %d", c.slug, len(evs), before+1)
 		}
@@ -167,7 +167,7 @@ func TestCreate_RefusesASlugInUseWithoutTouchingTheWorkspace(t *testing.T) {
 	w := newWorld(t)
 	w.create(t, w.uKey, valid("demo")).object(t)
 	stored, _ := w.workspace(t, "demo")
-	events := len(w.createEvents(t))
+	events := len(w.eventsOf(t, createEvent))
 	w.advance(time.Minute)
 
 	again := func(when string) {
@@ -185,7 +185,7 @@ func TestCreate_RefusesASlugInUseWithoutTouchingTheWorkspace(t *testing.T) {
 		if n := w.workspaceSecrets(t, "demo"); n != 0 {
 			t.Errorf("%s: the workspace holds %d secrets, want none", when, n)
 		}
-		if n := len(w.createEvents(t)); n != events {
+		if n := len(w.eventsOf(t, createEvent)); n != events {
 			t.Errorf("%s: %d create events, want %d", when, n, events)
 		}
 	}
@@ -255,7 +255,7 @@ func TestCreate_CreatesExactlyOneOfConcurrentRequestsForOneSlug(t *testing.T) {
 	if rec, found := w.workspace(t, "demo"); !found || rec.OwnerID != winner || w.workspaces(t) != 1 {
 		t.Errorf("stored = %+v (found %v), %d workspaces; want one, owned by %s", rec, found, w.workspaces(t), winner)
 	}
-	if n := len(w.createEvents(t)); n != 1 {
+	if n := len(w.eventsOf(t, createEvent)); n != 1 {
 		t.Errorf("%d create events, want 1", n)
 	}
 }

@@ -1840,8 +1840,14 @@ forbidden`; an archived workspace
 fork the registered guard. Then it writes `display_name`, `description`,
 `org_id`, `settings` and `updated_at` (the hub's time cut to the second),
 when the org changed sets `org_id` on every record whose `parent_slug` is
-the workspace, and runs the fork-only fields' writes, all in the same
-transaction, so a refusal writes nothing and a failed write keeps nothing. A `null` or empty `display_name` stores the slug, a `null`
+the workspace, runs the fork-only fields' writes and writes the
+`parley.workspace.update` event through `Deps.Events` (`updateEventInput`:
+the actor from `identity.PrincipalOf`, the admin principal mapped to
+`event.ActorAdminToken` with no actor id; `metadata.fields`, the mutable
+fields the body carried in `updateFields` order, and for a fork
+`metadata.parent_slug`, never a value), all in the same transaction, so a
+refusal writes nothing, neither record nor event, and a failed write, the
+event's included, keeps nothing. A `null` or empty `display_name` stores the slug, a `null`
 `description` the empty string. `org_id` (`moveTarget`) is `null`, the
 owner's personal org (`identity.PersonalOrg`), or a string looked up with
 `identity.OrgBySelector` (an id in UUID form, else a slug); anything else,

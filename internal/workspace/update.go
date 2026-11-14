@@ -12,9 +12,13 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/server"
 )
+
+// eventUpdate is the event an update writes.
+const eventUpdate = "parley.workspace.update"
 
 // updateRoute is PATCH /workspaces/:slug. The scope check and then the
 // access check run before the handler, so that a PAT without
@@ -248,6 +252,14 @@ func (s *Service) update(w http.ResponseWriter, r *http.Request) error {
 				return fmt.Errorf("update workspace %q: %w", slug, err)
 			}
 		}
+		// In the transaction: an update the log cannot record is not made.
+		in, err := updateEventInput(ctx, cur, body)
+		if err != nil {
+			return err
+		}
+		if _, err := s.deps.Events.Emit(ctx, tx, in); err != nil {
+			return fmt.Errorf("write the update event of workspace %q: %w", slug, err)
+		}
 		return nil
 	})
 	if err != nil {
@@ -354,6 +366,39 @@ func (s *Service) applyUpdate(ctx context.Context, tx *sql.Tx, cur Workspace, bo
 		}
 	}
 	return next, writes, nil
+}
+
+// updateEventInput is the parley.workspace.update event of an update of
+// cur, whose body has passed every check, by the request's caller: the
+// admin token, with no actor id, or the credential's type with its user's
+// id. Its metadata names the mutable fields body carries, in the order of
+// updateFields, and for a fork the parent, never a value, so that the log
+// shows who changed what without holding a setting.
+func updateEventInput(ctx context.Context, cur Workspace, body map[string]json.RawMessage) (event.Input, error) {
+	slug := cur.Slug
+	in := event.Input{Type: eventUpdate, Workspace: &slug, ResourceType: "workspace", ResourceID: slug}
+	p, ok := identity.PrincipalOf(ctx)
+	switch {
+	case ok && p.Type == identity.TypeAdmin:
+		in.ActorType = event.ActorAdminToken
+	case ok && p.User != nil:
+		id := p.User.ID
+		in.ActorType, in.ActorID = p.Type, &id
+	default:
+		return event.Input{}, errors.New("the workspace update found no caller")
+	}
+	fields := []string{}
+	for _, f := range updateFields {
+		if _, given := body[f.name]; given && f.class != fieldImmutable {
+			fields = append(fields, f.name)
+		}
+	}
+	meta := map[string]any{"fields": fields}
+	if cur.ParentSlug != nil {
+		meta["parent_slug"], in.Parent = *cur.ParentSlug, *cur.ParentSlug
+	}
+	in.Metadata = meta
+	return in, nil
 }
 
 // writeUpdate writes the fields an update changes of w, and its updated_at,

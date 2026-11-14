@@ -1340,6 +1340,23 @@ members in the body. The workspace is read, changed and written with
 an update that changes no value still sets `updated_at`, and a refused
 request changes nothing, `updated_at` included.
 
+Every update that is answered `200` writes one `parley.workspace.update`
+event in the same store transaction, also one that changes no value; a
+refused request writes none, and when the event cannot be written the
+update is not made and is answered `500` `internal`. The event has
+`workspace` and `resource_id` the slug, `resource_type` `workspace`,
+`actor_type` `admin_token` with `actor_id` `null` for the admin token, or
+`api_key` or `pat` after the calling credential with `actor_id` the
+caller's user, and in `metadata` `fields`, the names of the mutable fields
+the body carried in the order `display_name`, `description`, `org_id`,
+`settings`, `ttl`, `purpose`, `auto_change`, and for a task fork
+`parent_slug`, its parent's slug. The metadata holds no value of any
+field, so no setting appears in the log:
+
+```json
+{"seq":13,"id":"…","type":"parley.workspace.update","time":"2026-11-14T10:31:02Z","workspace":"demo","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"workspace","resource_id":"demo","action":"update","session_id":null,"metadata":{"fields":["display_name","settings"]}}
+```
+
 The answer is the workspace object after the update, the object
 [`GET /api/v1/workspaces/{slug}`](#get-apiv1workspacesslug) answers, with
 `access` the caller's level.
@@ -1353,7 +1370,7 @@ The answer is the workspace object after the update, the object
 | `403` `forbidden` | a member of the workspace's org who does not own it (`org members have read-only access to this workspace`), in every status; or an `org_id` naming an org of which the workspace's owner is not an active member, whoever the caller is (`the workspace's owner is not an active member of the organization`) |
 | `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug (`workspace not found`); also a bound PAT on a workspace outside its binding |
 | `409` `workspace_archived` | a valid update of a workspace in status `archived` (`workspace <slug> is archived`) |
-| `500` `internal` | a write failed, that of a fork moved with the workspace included; nothing is changed |
+| `500` `internal` | a write failed, that of a fork moved with the workspace or of the update's event included; nothing is changed |
 
 ## `POST /api/v1/workspaces/{slug}/tokens`
 

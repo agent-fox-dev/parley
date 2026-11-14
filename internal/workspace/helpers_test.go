@@ -23,8 +23,11 @@ import (
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
-// createEvent is the event type a create writes.
-const createEvent = "parley.workspace.create"
+// The event types a create and an update write.
+const (
+	createEvent = "parley.workspace.create"
+	updateEvent = "parley.workspace.update"
+)
 
 // world is a hub the workspace route tests ask: the users u and v, each with
 // an API key and a personal org, the hub's secret and event components, a
@@ -373,8 +376,8 @@ func (w *world) secretCount() (int, error) {
 	return total, nil
 }
 
-// fail makes the write named fault of every create fail until it is called
-// with "".
+// fail makes the write named fault of every create, and of every update for
+// the event write, fail until it is called with "".
 func (w *world) fail(fault string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -453,7 +456,7 @@ func (w *world) footprint(t *testing.T) footprint {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return footprint{w.workspaces(t), secrets, len(w.createEvents(t)), w.origin.called()}
+	return footprint{w.workspaces(t), secrets, len(w.eventsOf(t, createEvent)), w.origin.called()}
 }
 
 // workspace reads the record slug from the store; found is false when there
@@ -496,8 +499,8 @@ func (w *world) eventCount(t *testing.T) int {
 	return len(recs)
 }
 
-// createEvents are the parley.workspace.create events of the log.
-func (w *world) createEvents(t *testing.T) []event.Record {
+// eventsOf are the events of the log of type typ, in the log's order.
+func (w *world) eventsOf(t *testing.T, typ string) []event.Record {
 	t.Helper()
 	recs, _, err := w.events.ReadAfter(context.Background(), 0, 0)
 	if err != nil {
@@ -505,7 +508,7 @@ func (w *world) createEvents(t *testing.T) []event.Record {
 	}
 	var out []event.Record
 	for _, r := range recs {
-		if r.Type == createEvent {
+		if r.Type == typ {
 			out = append(out, r)
 		}
 	}
