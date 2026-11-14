@@ -2357,6 +2357,21 @@ given and declares `ShowsOnce`. `changePermissions` builds the three
 permission commands; after the answer is printed, `replace` and `remove`
 note on stderr a Token whose `revoked_at` is not null.
 
+`parley secrets` (`secrets.go`) is `create`, `list`, `update` and `delete`,
+each with a run step of its own. `withSecretArgs` wraps a command's argument
+check so that the scope flags and the entries are refused as usage errors
+before any setting is resolved: an empty `--org` or `--workspace`, more
+than one scope flag on all but `create`, and arguments that `parseEntries`
+or the `--from-stdin` check refuses. `secretScopes` turns the flags into the
+scopes' routes in the order user, org, workspace, the user's alone without
+a flag. `create` sends one request per scope, keeps going after a failure,
+prints the items of the scopes that succeeded, writes every failure but the
+last with `printError` and returns the last, which `run` prints, so each is
+written once and the exit status is the last failure's. `list` reads the
+whole list with `printWholeList`, which asks for pages of 200, follows
+`next_cursor` and prints `{"items":[…]}`; `delete` prints its `Confirm`
+document `{"deleted":"<KEY>"}`.
+
 Help lives in `internal/cli/help.go`. `installHelp` keeps cobra's own text
 help, sets the root's help function, which `--help` on any command and a
 group run without a word reach, and replaces cobra's help command with

@@ -387,6 +387,7 @@ Available Commands:
   login       Sign in to the hub and save the hub URL and the credential
   orgs        List and read the organizations you belong to
   sandbox     Work with the hub's sandboxes and their profiles
+  secrets     Create, list, update and delete secrets, whose values the hub never shows
   tokens      Create, read, change and revoke your personal access tokens
   user        Read and update your own profile
   version     Print the client's build and, given a hub URL, the hub's build
@@ -1367,6 +1368,127 @@ exit status is `1` (see [Errors and exit statuses](#errors-and-exit-statuses)).
 | `parley events tail [--workspace <slug>] [--types <types>] [--session <id>] [--after <seq>]` | `GET /api/v1/events` with the query parameters of the flags given |
 | `parley events list [--workspace <slug>] [--types <types>] [--session <id>] [--after <seq>] [--limit <n>] [--wait <seconds>]` | `GET /api/v1/events/log` with the query parameters of the flags given |
 
+### `parley secrets`
+
+These commands call the [secret routes](api.md#secrets) of the hub with the
+credential as `Authorization: Bearer`. No route answers a secret's value,
+so no command prints one. `parley secrets` run without a command prints its
+help and exits `0`; it reads no credential and sends no request.
+
+| Command | Request | Prints |
+|---|---|---|
+| `parley secrets create <KEY=VALUE[,KEY=VALUE…]>…` | `POST /api/v1/<scope>/secrets` with `{"entries":[{"key","value"},…]}`, once per scope flag | `{"results":[{"scope","items"},…]}` |
+| `parley secrets create <KEY> --from-stdin` | the same, with the one entry `KEY` and the value read from stdin | the same |
+| `parley secrets list` | `GET /api/v1/<scope>/secrets?limit=200`, then every following page | `{"items":[…]}` |
+| `parley secrets update <KEY=VALUE>` | `PATCH /api/v1/<scope>/secrets/<KEY>` with `{"value"}` | the hub's answer, the entry |
+| `parley secrets update <KEY> --from-stdin` | the same, with the value read from stdin | the same |
+| `parley secrets delete <KEY>` | `DELETE /api/v1/<scope>/secrets/<KEY>` | `{"deleted":"<KEY>"}` |
+
+The scope flags choose `<scope>`:
+
+| Flag | Scope |
+|---|---|
+| `--user` | `user`: your own secrets, `/api/v1/user/secrets`; the scope when no flag is given |
+| `--org <slug>` | `org`: the secrets of the organization with this slug or id, `/api/v1/orgs/<slug>/secrets` |
+| `--workspace <slug>` | `workspace`: the secrets of the workspace with this slug, `/api/v1/workspaces/<slug>/secrets` |
+
+`list`, `update` and `delete` take at most one scope flag. `create` takes
+any of them together and sends one request per scope, in the order `user`,
+`org`, `workspace`, each with every entry. The slug and `<KEY>` are each
+sent as one percent-encoded path segment: `delete a/b` is sent as
+`DELETE /api/v1/user/secrets/a%2Fb`.
+
+**Entries.** The arguments of `create` are joined as if separated by
+commas, split at every comma, and each entry is split at its first `=`, so
+a value may hold `=` but not a comma: `create A=1,B=x=y C=` sends
+
+```json
+{"entries":[{"key":"A","value":"1"},{"key":"B","value":"x=y"},{"key":"C","value":""}]}
+```
+
+`update` takes exactly one entry, split the same way. Key names are left to
+the hub to judge. A value with a comma, or one that should not appear in the
+argument list, is given with `--from-stdin`: the command takes one bare
+`KEY` as its argument, reads stdin to its end and drops one trailing line
+ending, a line feed or a carriage return and line feed, so `abc\n` and
+`abc\r\n` are sent as `abc`, `abc\n\n` as `abc\n`, and commas, `=` and inner
+line breaks are kept:
+
+```
+printf '%s' "$TOKEN" | parley secrets create GIT_PAT --from-stdin --workspace acme
+```
+
+**create.** A scope that fails does not stop the others. stdout holds one
+document with the hub's `items` of each scope that succeeded, in the order
+`user`, `org`, `workspace`, and `{"results":[]}` when none did:
+
+```json
+{
+  "results": [
+    {
+      "scope": "user",
+      "items": [
+        {
+          "key": "GIT_PAT",
+          "created_at": "2026-11-14T10:30:15Z",
+          "updated_at": "2026-11-14T10:30:15Z"
+        }
+      ]
+    }
+  ]
+}
+```
+
+The error of each scope that failed is written to stderr once, in the same
+order, the hub's envelope as received. The exit status is `0` when every
+scope succeeded and otherwise that of the last failure: `1` for an error
+the hub answered (a `409` `conflict`, a `503` `secrets_unavailable`), `2`
+for a failure on the client's side such as a hub that cannot be reached.
+
+**list** reads the whole list: it asks for pages of 200 and follows
+`next_cursor` until it is `null`, then prints the items of every page in the
+hub's order as one document, without `next_cursor`:
+
+```json
+{
+  "items": [
+    {
+      "key": "GIT_PAT",
+      "created_at": "2026-11-14T10:30:15Z",
+      "updated_at": "2026-11-14T10:30:15Z"
+    }
+  ]
+}
+```
+
+**update** prints the hub's answer, the entry without a value; **delete**
+prints `{"deleted":"<KEY>"}` with the key as it was typed:
+
+```json
+{
+  "deleted": "GIT_PAT"
+}
+```
+
+An error the hub answers to `list`, `update` or `delete` (`404` `not_found`
+for a key the scope does not hold, an org or a workspace the caller may not
+reach) is written to stderr as received, nothing is written to stdout, and
+the exit status is `1`.
+
+A malformed command line is a `usage_error` with exit status `2`, and
+nothing is sent: no argument, or for `delete` more than one; an entry
+without `=` (`parley secrets create: entry 2 has no =: give KEY=VALUE, or
+one KEY with --from-stdin`) or with nothing before it (`entry 1 has no key
+before =`); more than one entry for `update`
+(`parley secrets update takes one KEY=VALUE, got 2 entries`); with
+`--from-stdin`, anything but one non-empty `KEY` without `=` or a comma
+(`parley secrets create --from-stdin takes one KEY without = or a comma`);
+an empty `<KEY>` for `delete`; more than one scope flag on `list`, `update`
+or `delete` (`parley secrets list takes at most one of --user, --org and
+--workspace`); and `--org` or `--workspace` with an empty value
+(`parley secrets list needs a slug as the value of --org`). A message names
+an entry by its position, never by its text, which may hold a value.
+
 ### Output
 
 stdout carries exactly one JSON document, indented by two spaces and
@@ -1517,11 +1639,12 @@ operation, which goes on on the hub.
 stdout carries the result, and nothing on a failure, except the result a
 `--fail-on-…` condition held in and the final record of a wait that ended
 in a state that is not a success (`wait_failed`, see [Waiting](#waiting)),
-and the events `parley events tail` printed before an error ended it (see
-[`parley events`](#parley-events)).
-Every error goes to stderr as one error
-envelope, a JSON document indented by two spaces and followed by a newline,
-and nothing else: no usage text follows it. The only other lines on stderr
+the events `parley events tail` printed before an error ended it (see
+[`parley events`](#parley-events)), and the results of the scopes in which
+`parley secrets create` succeeded (see [`parley secrets`](#parley-secrets)).
+Every error goes to stderr as one error envelope (`parley secrets create`
+writes one per scope that failed), a JSON document indented by two spaces
+and followed by a newline, and nothing else: no usage text follows it. The only other lines on stderr
 are the progress lines of a wait (see [Waiting](#waiting)) and the
 `reconnecting in …` lines of [`parley events tail`](#parley-events-tail),
 which come before any error envelope. An error envelope the hub
