@@ -1,6 +1,7 @@
 package event
 
 import (
+	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
@@ -76,4 +77,23 @@ func parsePosition(name, value string) (int64, error) {
 		return 0, server.InvalidRequest(name + " must be a non-negative integer")
 	}
 	return pos, nil
+}
+
+// lastEventID is the header in which a reconnecting client of a stream sends
+// the id of the last frame it received.
+const lastEventID = "Last-Event-ID"
+
+// streamPosition reads the resume position of a stream: the Last-Event-ID
+// header when the request has one, which wins over after, else the query
+// parameter after. It reports false when the request gives neither.
+func streamPosition(r *http.Request, q url.Values) (int64, bool, error) {
+	if ids := r.Header.Values(lastEventID); len(ids) > 0 {
+		pos, err := parsePosition(lastEventID, ids[0])
+		return pos, err == nil, err
+	}
+	if q.Has("after") {
+		pos, err := parsePosition("after", q.Get("after"))
+		return pos, err == nil, err
+	}
+	return 0, false, nil
 }

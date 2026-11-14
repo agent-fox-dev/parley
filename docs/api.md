@@ -1675,6 +1675,59 @@ When that removal fails, the delete is undone as a whole, and the answer is
 | `404` `not_found` | no org has that id or slug (`org not found`). Nothing changes. |
 | `500` `internal` | removing data another part of the hub keeps for the org failed (`internal error`). Nothing changes. |
 
+## `GET /api/v1/events`
+
+Streams the hub events the caller may see as Server-Sent Events: first the
+events after a resume position, then, on the same connection, every event
+committed afterwards, in ascending `seq`, with no gap and no repeat between
+the two. The route declares the scope `audit:read` for a PAT, which
+`audit:write` satisfies; the admin token and API keys are not held to it. It
+has no workspace in its path.
+
+| Parameter | Meaning |
+|---|---|
+| `Last-Event-ID` (header) | the resume position: the stream sends the events with a higher `seq`. A non-negative integer; it wins over `after` |
+| `after` | the resume position when there is no `Last-Event-ID` header. Without either, the stream starts at `last_seq` when it opens and sends only events committed after that |
+| `workspace`, `types`, `session_id` | the filters, as on [`GET /api/v1/events/log`](#get-apiv1eventslog) |
+
+Other query parameters are ignored. The answer is `200` with
+`Content-Type: text/event-stream` and `Cache-Control: no-cache`, and its first
+frame, sent at once, is a heartbeat. Each frame is three lines and an empty
+line:
+
+```text
+id: 3
+event: heartbeat
+data: {"time":"2026-11-14T09:30:15Z","seq":3}
+
+id: 4
+event: hub_event
+data: {"seq":4,"id":"…","type":"parley.change.open","time":"2026-11-14T09:30:20Z","workspace":"api","actor_type":"pat","actor_id":"u_1","resource_type":"change","resource_id":"42","action":"open","session_id":null,"metadata":{}}
+
+```
+
+| Frame | `id` | `data` |
+|---|---|---|
+| `hub_event` | the event's `seq` | the hub event record as stored, on one line, the same bytes as an item of the log |
+| `heartbeat` | the position up to which the log has been examined for this client | `time`, the hub's time at whole seconds in UTC, and `seq`, the same position |
+
+A heartbeat is sent when the stream opens and then every 30 seconds. Every
+visible, matching event at or below a heartbeat's `seq` was sent before it,
+and its `seq` rises with `last_seq` also when no event matched the filters or
+was visible, so a client that reconnects with the `id` of the last frame it
+received, as `Last-Event-ID`, resumes exactly where it stopped. An event
+committed while the stream is open is sent within a second of its commit.
+Events are decided with the caller's access at the time they are delivered,
+by the rules of the log. The stream ends when the client closes the
+connection or the hub begins to stop.
+
+| Status | When |
+|---|---|
+| `200 OK` | the stream; an error after it began ends the connection |
+| `400` `invalid_request` | an `after` or `Last-Event-ID` that is not a non-negative integer (`after must be a non-negative integer`, `Last-Event-ID must be a non-negative integer`), or a query string that does not parse (`the query string is malformed`). No stream is started |
+| `403` `insufficient_scope` | a PAT without `audit:read` or `audit:write` (`this route needs the scope audit:read`) |
+| `500` `internal` | the log's bounds could not be read before the stream began (`internal error`) |
+
 ## `GET /api/v1/events/log`
 
 Answers one page of the event log: the hub events the caller may see, in

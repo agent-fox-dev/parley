@@ -341,7 +341,9 @@ func valid(typ string) Input {
 //   - dev, mem and mem2 are members of acme; out has no relation.
 type world struct {
 	*fixture
-	srv   *server.Server
+	srv *server.Server
+	// http serves srv on a real connection once a test asks for it.
+	http  *httptest.Server
 	admin string
 	users map[string]string
 	keys  map[string]string

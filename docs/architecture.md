@@ -15,7 +15,7 @@ command-line client. Both are written in Go, in the module
 | `internal/buildinfo` | the version, commit and build time the binary was built with, shared by both programs |
 | `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra`, each declared through one helper ([ADR 02](adr/02-declare-every-cli-command-through-one-helper.md)), the client configuration file, the resolution of the hub URL and the credential, the one HTTP client the commands send their requests with, the printing of a command's result on stdout and of its warnings on stderr, the shared wait for a long operation (`--wait`, `--timeout`, `--poll-interval`), and the error envelopes and exit statuses every command ends with |
 | `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, and a registry of keys and whole sections that decides what the file may hold |
-| `internal/event` | the hub events: every significant state change as one event, written in the caller's store transaction with a hub-wide `seq` that is never reused; the event record and its JSON form, the emit calls `Emit` and `EmitNow`, the log's bounds, the read by position and the expiry of old positions, the following of commits for waiters and `OnCommit` callbacks, the counters, and the route `GET /api/v1/events/log` with its long-poll ([ADR 05](adr/05-deliver-events-by-reading-the-log-by-position.md)) |
+| `internal/event` | the hub events: every significant state change as one event, written in the caller's store transaction with a hub-wide `seq` that is never reused; the event record and its JSON form, the emit calls `Emit` and `EmitNow`, the log's bounds, the read by position and the expiry of old positions, the following of commits for waiters and `OnCommit` callbacks, the counters, the route `GET /api/v1/events/log` with its long-poll and the Server-Sent Events stream `GET /api/v1/events` ([ADR 05](adr/05-deliver-events-by-reading-the-log-by-position.md)) |
 | `internal/hub` | the composition of the `parleyd` process: argument parsing, the scrubbing logger, the fixed start order, the bootstrap of the admin token, the HTTP server's options, the idempotency records in the transactional store, signals and the stop, and the `backup` command; the one place later packages plug their parts in ([ADR 01](adr/01-compose-the-hub-in-one-package.md)) |
 | `internal/maintenance` | the maintenance loop: a registry of named tasks, and `Loop`, which runs one pass at once and one at each tick of an hourly timer, the tasks of a pass one after the other in a fixed order, and logs a failing task without stopping the others |
 | `internal/hubtest` | test support, imported by test code only: `Start` bootstraps a hub with an admin token and serves it in-process on a free loopback port, `StartWith` does the same with more in `config.toml` (`Config.Server` inside `[server]`, `Config.TOML` after it), files in the config dir (`Config.Files`) and a function run on the composition (`Config.Compose`), `(*Hub).IssuePAT` stores a PAT, `CreateOrg` and `AddMember` make an org and a membership through the admin routes and `AddWorkspace` stores a workspace record, `Serve` runs a hub with given options until the test ends, `(*Served).Call` sends a request with a bearer credential and a body and returns the answer's status and body, and `LogBuffer` holds a running hub's log for the test to read |
@@ -1539,6 +1539,28 @@ items or the end of the log. An empty page with `wait` above 0 waits on
 fires it reads once more, so `next_after` is the position the log holds then.
 The page is written without HTML escaping, so its items are the bytes of
 `Record`'s JSON form.
+
+`internal/event/stream.go` serves `GET /api/v1/events` (see
+[the API reference](api.md#get-apiv1events)), declared with the scope
+`audit:read`, no access mark and the route's own `Cache-Control: no-cache`.
+It reads the filters with the same parsing as the log, and the resume
+position from the `Last-Event-ID` header, which wins, or from `after`;
+without either it starts at `last_seq` at open. It takes a stream place
+(`takePlace`, which `Counters().OpenStreams` counts, with no limit
+configured yet) before it answers and gives it back when the stream ends.
+It answers `200` with `Content-Type: text/event-stream`, sends a heartbeat at
+once and then runs one loop: it reads the log after the stream's position in
+batches of 200 through the same snapshot read as the log, sends each event
+that matches the filters and that one viewer per batch decides visible as a
+`hub_event` frame, flushes, and moves the position to the position examined,
+also past the events it did not send. Replay and live delivery are this same
+loop, so there is no gap and no repeat between them. When the log has nothing
+further it waits on `waitAfter`, a heartbeat timer of 30 seconds on the
+component's clock, the request's context and `Deps.Shutdown`. When the timer
+fires it reads the log once more and then sends the heartbeat, whose `seq` is
+the position examined. The stream ends when the client goes away or the hub
+begins to stop; a read that fails after the answer began ends it too, and the
+server logs the error.
 
 ### The logger
 

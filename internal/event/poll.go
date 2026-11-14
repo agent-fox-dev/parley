@@ -26,7 +26,10 @@ const (
 
 // Routes returns the event routes, for the hub to register.
 func (c *Component) Routes() []server.Route {
-	return []server.Route{{Method: http.MethodGet, Pattern: "/events/log", Handler: c.serveLog, Scope: "audit:read"}}
+	return []server.Route{
+		{Method: http.MethodGet, Pattern: "/events", Handler: c.serveStream, Scope: "audit:read", CacheControl: "no-cache"},
+		{Method: http.MethodGet, Pattern: "/events/log", Handler: c.serveLog, Scope: "audit:read"},
+	}
 }
 
 // logQuery is a request to the log.
