@@ -357,9 +357,9 @@ func (o *Origin) git(stdin string, args ...string) string {
 	return out
 }
 
-// run runs git on the origin's repository (see gitIn).
+// run runs git on the origin's repository (see Run).
 func (o *Origin) run(stdin string, args ...string) (string, error) {
-	return gitIn(o.dir, stdin, args...)
+	return Run(o.dir, stdin, args...)
 }
 
 // History builds on the empty origin main (the default branch) with three
@@ -434,7 +434,7 @@ func shellQuote(s string) string {
 // the test on an error.
 func Git(t testing.TB, dir string, args ...string) string {
 	t.Helper()
-	out, err := gitIn(dir, "", args...)
+	out, err := Run(dir, "", args...)
 	if err != nil {
 		t.Fatalf("in %s: %v", dir, err)
 	}
@@ -458,10 +458,12 @@ func Refs(t testing.TB, dir, prefix string) map[string]string {
 	return refs
 }
 
-// gitIn runs git on the repository whose git directory is dir with stdin as
+// Run runs git on the repository whose git directory is dir with stdin as
 // its input, away from the user's and the system's git configuration, with
-// a fixed author, and returns its trimmed standard output.
-func gitIn(dir, stdin string, args ...string) (string, error) {
+// a fixed author, and returns its trimmed standard output, or an error that
+// holds git's standard error: for a test that feeds git an input, or
+// expects it to fail, where Git would fail the test.
+func Run(dir, stdin string, args ...string) (string, error) {
 	cmd := exec.Command("git", args...)
 	cmd.Env = append(os.Environ(),
 		"GIT_DIR="+dir,
