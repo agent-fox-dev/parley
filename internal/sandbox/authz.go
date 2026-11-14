@@ -2,10 +2,12 @@ package sandbox
 
 import (
 	"errors"
+	"fmt"
 	"maps"
 	"net/http"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
 	"github.com/agent-fox-dev/parley/internal/scrub"
 	"github.com/agent-fox-dev/parley/internal/server"
@@ -167,4 +169,71 @@ func (s *Service) scrub(text string) string {
 		return scrub.New().Scrub(text)
 	}
 	return s.scrubber.Scrub(text)
+}
+
+// HubAccess is what a sandbox's hub credential, the PAT the hub minted for
+// it, may do: its scopes and its paths limit, nil for none. A sandbox
+// without a hub credential has no HubAccess (nil).
+type HubAccess struct {
+	Scopes []string `json:"scopes"`
+	Paths  []string `json:"paths"`
+}
+
+// Covers reports whether the caller p may act through a sandbox whose hub
+// credential is ha: run a command in it, attach to it or write a file into
+// it. Otherwise a weak token could act through a sandbox a stronger
+// credential created, with the stronger credential's rights.
+//
+// Every caller covers a sandbox without a hub credential. The admin token
+// and an API key cover every hub credential: an API key holds every scope
+// and has no paths limit, and the admin token is not scope-checked. A PAT
+// covers ha when it satisfies every scope of ha by the scope check, and,
+// when it is limited to paths, ha is limited too and each glob of ha is
+// covered by a glob of the PAT. A caller of any other type covers nothing.
+func Covers(p identity.Principal, ha *HubAccess) bool {
+	return uncovered(p, ha) == ""
+}
+
+// RequireCovers is the no-widening decision for a handler that runs a
+// command in a sandbox, attaches to it or writes a file into it: the
+// handler calls it once it has found the sandbox, whose hub credential is
+// ha, and before it validates the body. A caller that does not cover ha
+// (see Covers) gets 403 insufficient_scope, which the handler returns
+// without acting; nil lets it go on. A request without an authenticated
+// caller is refused unless the sandbox has no hub credential.
+func RequireCovers(r *http.Request, ha *HubAccess) error {
+	p, _ := identity.PrincipalOf(r.Context())
+	if reason := uncovered(p, ha); reason != "" {
+		return server.InsufficientScope(reason)
+	}
+	return nil
+}
+
+// uncovered returns why p does not cover ha, or "" when it does.
+func uncovered(p identity.Principal, ha *HubAccess) string {
+	if ha == nil {
+		return ""
+	}
+	switch p.Type {
+	case identity.TypeAdmin, identity.TypeAPIKey:
+		return ""
+	case identity.TypePAT:
+	default:
+		return "this credential does not cover the sandbox's hub credential"
+	}
+	for _, scope := range ha.Scopes {
+		if !identity.Satisfies(p.Permissions, scope) {
+			return fmt.Sprintf("this token does not hold %q, which the sandbox's hub credential holds", scope)
+		}
+	}
+	if p.Paths == nil {
+		return ""
+	}
+	if ha.Paths == nil {
+		return "this token is limited to paths and the sandbox's hub credential is not"
+	}
+	if g, ok := identity.FirstUncovered(p.Paths, ha.Paths); ok {
+		return fmt.Sprintf("paths: %q of the sandbox's hub credential is not covered by a glob of this token", g)
+	}
+	return ""
 }

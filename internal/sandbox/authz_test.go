@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/agent-fox-dev/parley/internal/identity"
+	"github.com/agent-fox-dev/parley/internal/sandbox"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
 )
 
@@ -191,5 +193,107 @@ func TestSandboxRoute_AnswersARuntimeErrorTheHandlerReturnsWithTheRuntimeErrorAn
 				t.Errorf("GET /healthz after the runtime error = %d, want 200", res.StatusCode)
 			}
 		})
+	}
+}
+
+// patWith is a PAT caller holding permissions, limited to paths (nil for no
+// limit).
+func patWith(paths []string, permissions ...string) identity.Principal {
+	return identity.Principal{Type: identity.TypePAT, Permissions: permissions, Paths: paths}
+}
+
+func TestCovers_HoldsAPATToEveryHubScopeAndToPathsNoWiderThanItsOwn(t *testing.T) {
+	t.Parallel()
+	hubScopes := []string{"git:read", "git:write", "changes:write"}
+	for _, c := range []struct {
+		name     string
+		pat      identity.Principal
+		hubPaths []string
+		want     bool
+	}{
+		{"every hub scope, neither limited to paths", patWith(nil, hubScopes...), nil, true},
+		{"git:write missing", patWith(nil, "git:read", "changes:write"), nil, false},
+		{"every hub scope and others", patWith(nil, "git:read", "git:write", "changes:write", "sandboxes:write", "secrets:read"), nil, true},
+		{"git:read implied by git:write", patWith(nil, "git:write", "changes:write"), nil, true},
+		{"a PAT glob covering the hub glob", patWith([]string{"src/**"}, hubScopes...), []string{"src/api/*.go"}, true},
+		{"a PAT glob equal to the hub glob", patWith([]string{"src/**"}, hubScopes...), []string{"src/**"}, true},
+		{"a PAT glob narrower than the hub glob", patWith([]string{"src/*"}, hubScopes...), []string{"src/**"}, false},
+		{"one hub glob no PAT glob covers", patWith([]string{"src/**"}, hubScopes...), []string{"src/a", "docs/b"}, false},
+		{"a PAT limited to paths and a hub credential without a limit", patWith([]string{"src/**"}, hubScopes...), nil, false},
+		{"a PAT without a limit and a hub credential limited to paths", patWith(nil, hubScopes...), []string{"docs/**"}, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			ha := &sandbox.HubAccess{Scopes: hubScopes, Paths: c.hubPaths}
+			if got := sandbox.Covers(c.pat, ha); got != c.want {
+				t.Errorf("Covers(%+v, %+v) = %v, want %v", c.pat, ha, got, c.want)
+			}
+		})
+	}
+	t.Run("no hub scopes and no paths, a PAT without scopes", func(t *testing.T) {
+		if !sandbox.Covers(patWith(nil), &sandbox.HubAccess{Scopes: []string{}}) {
+			t.Error("Covers = false, want true")
+		}
+	})
+}
+
+func TestCovers_LetsTheAdminTokenAndAPIKeysAndEveryCallerOfASandboxWithoutAHubCredentialThrough(t *testing.T) {
+	t.Parallel()
+	admin := identity.Principal{Type: identity.TypeAdmin}
+	key := identity.Principal{Type: identity.TypeAPIKey, User: &identity.User{}}
+	every := &sandbox.HubAccess{
+		Scopes: []string{"git:read", "git:write", "changes:read", "changes:write", "sessions:write", "audit:write"},
+		Paths:  []string{"src/**"},
+	}
+	none := &sandbox.HubAccess{Scopes: []string{}}
+	for _, c := range []struct {
+		name   string
+		caller identity.Principal
+		ha     *sandbox.HubAccess
+	}{
+		{"the admin token, every hub scope limited to paths", admin, every},
+		{"the admin token, no hub scopes or paths", admin, none},
+		{"an API key, every hub scope limited to paths", key, every},
+		{"an API key, no hub scopes or paths", key, none},
+		{"the admin token, no hub credential", admin, nil},
+		{"an API key, no hub credential", key, nil},
+		{"a PAT without scopes limited to paths, no hub credential", patWith([]string{"a/*"}), nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if !sandbox.Covers(c.caller, c.ha) {
+				t.Errorf("Covers(%+v, %+v) = false, want true", c.caller, c.ha)
+			}
+		})
+	}
+}
+
+func TestRouteActingThroughASandbox_RefusesACallerThatDoesNotCoverItsHubCredentialBeforeTheBody(t *testing.T) {
+	t.Parallel()
+	h := startProbeHub(t, true)
+	const path = "/workspaces/ws/sandboxes/probe-exec"
+	before := len(h.rt.Calls())
+
+	// The body is one the handler would refuse, so a 403 shows the decision
+	// came before it.
+	a := h.call(t, http.MethodPost, path, h.pat(t, h.owner, "sandboxes:write"), map[string]any{})
+	const msg = `this token does not hold "git:write", which the sandbox's hub credential holds`
+	if a.status != http.StatusForbidden || a.err.ErrorType != "insufficient_scope" || a.err.Message != msg {
+		t.Errorf("POST with a PAT without git:write = %d %s, want 403 insufficient_scope %q", a.status, a.body, msg)
+	}
+	if n := h.calls.Load(); n != 0 {
+		t.Errorf("the rest of the handler ran %d times, want never", n)
+	}
+	if calls := h.rt.Calls()[before:]; len(calls) != 0 {
+		t.Errorf("the runtime received %v, want no call", ops(calls))
+	}
+
+	a = h.call(t, http.MethodPost, path, h.pat(t, h.owner, "sandboxes:write", "git:write"), map[string]any{"command": []string{"true"}})
+	if a.status != http.StatusOK {
+		t.Errorf("POST with a PAT holding git:write = %d %s, want 200", a.status, a.body)
+	}
+	if n := h.calls.Load(); n != 1 {
+		t.Errorf("the rest of the handler ran %d times, want once", n)
+	}
+	if calls := h.rt.Calls()[before:]; len(calls) != 1 {
+		t.Errorf("the runtime received %v, want the handler's one call", ops(calls))
 	}
 }

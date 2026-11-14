@@ -237,7 +237,11 @@ type probeHub struct {
 //   - POST /workspaces/:slug/sandboxes/probe-create, of kind write and
 //     needing a user, which answers 400 to a body without a name;
 //   - GET /workspaces/:slug/sandboxes/probe-runtime, of kind read, which
-//     returns the error of GetSandbox.
+//     returns the error of GetSandbox;
+//   - POST /workspaces/:slug/sandboxes/probe-exec, of kind write, which
+//     stands for a sandbox whose hub credential has the scope git:write and
+//     no paths limit: it asks whether the caller covers it, then counts,
+//     answers 400 to a body without a command and lists the sandboxes.
 func startProbeHub(t *testing.T, on bool) *probeHub {
 	t.Helper()
 	h := &probeHub{}
@@ -273,6 +277,23 @@ func startProbeHub(t *testing.T, on bool) *probeHub {
 		c.AddRoute(svc.WorkspaceRoute(sandbox.KindRead, server.Route{Method: http.MethodGet, Pattern: "/workspaces/:slug/sandboxes/probe-runtime", Handler: func(w http.ResponseWriter, r *http.Request) error {
 			h.calls.Add(1)
 			if _, err := svc.Client().GetSandbox(r.Context(), "probe"); err != nil {
+				return err
+			}
+			server.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+			return nil
+		}}))
+		c.AddRoute(svc.WorkspaceRoute(sandbox.KindWrite, server.Route{Method: http.MethodPost, Pattern: "/workspaces/:slug/sandboxes/probe-exec", Handler: func(w http.ResponseWriter, r *http.Request) error {
+			if err := sandbox.RequireCovers(r, &sandbox.HubAccess{Scopes: []string{"git:write"}}); err != nil {
+				return err
+			}
+			h.calls.Add(1)
+			var body struct {
+				Command []string `json:"command"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.Command) == 0 {
+				return server.InvalidRequest("command is required")
+			}
+			if _, err := svc.Client().ListSandboxes(r.Context()); err != nil {
 				return err
 			}
 			server.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})

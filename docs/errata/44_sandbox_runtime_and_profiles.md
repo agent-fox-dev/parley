@@ -252,3 +252,22 @@ loaded, the feature check reads whether sandboxes are on per request.
   with `SetScrubber` whether or not sandboxes are on.
 - There is no binding guard yet; the declarations need none of their own,
   since it is a pipeline position.
+
+## The no-widening decision's details
+
+The package gives the decision for the admin token, API keys and PATs and
+leaves the rest open. The code follows these rules:
+
+- A caller of any other credential type, and a request without an
+  authenticated caller, covers no hub credential (it still covers a sandbox
+  without one), so the decision fails closed.
+- A PAT's scopes are compared by `identity.Satisfies`, the scope check's
+  rule, so `git:write` counts for a hub credential's `git:read`; the
+  subset rule of token minting, which compares exactly, is not used.
+- The refusal's message names the first scope of `hub_access.scopes`, in
+  its order, that the PAT does not satisfy (`this token does not hold
+  "<scope>", which the sandbox's hub credential holds`); when every scope is
+  held, `this token is limited to paths and the sandbox's hub credential is
+  not`, or the first glob of `hub_access.paths` no PAT glob covers
+  (`paths: "<glob>" of the sandbox's hub credential is not covered by a glob
+  of this token`).

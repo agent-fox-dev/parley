@@ -1093,6 +1093,26 @@ state keep answering.
 {"error":{"code":502,"message":"sandbox runtime: get_sandbox: unavailable: connection refused","error_type":"sandbox_runtime_error"}}
 ```
 
+A route that runs a command in a sandbox, attaches to it or writes a file
+into it also needs a credential that covers the sandbox's hub credential
+(its `hub_access`), so that a weak token cannot act through a sandbox a
+stronger credential created. It is decided once the sandbox is found and
+before the body is validated: every caller covers a sandbox whose
+`hub_access` is null, the admin token and an API key cover every one, and a
+PAT covers it when it holds every scope of `hub_access.scopes` (a `:write`
+scope also counting for its `:read`, as in the scope check) and, if the PAT
+has `paths`, `hub_access.paths` is not null and each of its globs is covered
+by one of the PAT's globs. Any other caller gets `403
+insufficient_scope`, and nothing is run, attached or written:
+
+```json
+{"error":{"code":403,"message":"this token does not hold \"git:write\", which the sandbox's hub credential holds","error_type":"insufficient_scope"}}
+```
+
+The message names the first scope the token lacks, or the first of the
+hub credential's globs no glob of the token covers, or says that the token
+is limited to paths and the hub credential is not; do not branch on it.
+
 No sandbox route is served yet; the sandbox routes will be.
 
 ## User selectors
