@@ -54,8 +54,8 @@ type ForkPointValue struct {
 	SHA string `json:"sha"`
 }
 
-// ForkView completes the object o of the task fork w, such as with the
-// settings of its parent. The fork feature registers it, so that this
+// ForkView completes the object o of the task fork w, such as with its
+// computed head_sha. The fork feature registers it, so that this
 // package shows a fork without importing that feature.
 type ForkView func(ctx context.Context, w Workspace, o *Object) error
 
@@ -72,8 +72,8 @@ func (s *Service) RegisterForkView(v ForkView) {
 // route answers a workspace the same way: org_slug is read from the
 // workspace's org, hub_url is the workspace's git remote on the hub, null
 // when no external URL is configured, and settings holds every registered
-// key with its effective value. A record of kind fork goes through the
-// registered fork view last.
+// key with its effective value, a fork's being its parent's. A record of
+// kind fork goes through the registered fork view last.
 func (s *Service) RenderWorkspace(ctx context.Context, w Workspace, level access.Level) (Object, error) {
 	org, err := identity.OrgByID(ctx, s.deps.Store.Main(), w.OrgID)
 	if err != nil {
@@ -95,13 +95,17 @@ func (s *Service) render(ctx context.Context, w Workspace, level access.Level, o
 		UpstreamURL: w.UpstreamURL, IntegrationBranch: w.IntegrationBranch, UpstreamHeadSHA: w.UpstreamHeadSHA,
 		ParentSlug: w.ParentSlug, ExpiresAt: timeValue(w.ExpiresAt), AutoChange: w.AutoChange,
 		Purpose: w.Purpose, SessionID: w.SessionID,
-		Settings: s.settings.EffectiveSettings(w.Settings, w.DefaultBranch),
-		HubURL:   s.hubURL(org.Slug, w.Slug), Access: string(level),
+		HubURL: s.hubURL(org.Slug, w.Slug), Access: string(level),
 		CreatedAt: timefmt.Time(w.CreatedAt), UpdatedAt: timefmt.Time(w.UpdatedAt),
 	}
 	if w.ForkPoint != nil {
 		o.ForkPoint = &ForkPointValue{Ref: w.ForkPoint.Ref, SHA: w.ForkPoint.SHA}
 	}
+	settings, err := s.settingsOf(ctx, w)
+	if err != nil {
+		return Object{}, fmt.Errorf("render workspace %q: %w", w.Slug, err)
+	}
+	o.Settings = settings
 	s.viewMu.RLock()
 	view := s.forkView
 	s.viewMu.RUnlock()
@@ -111,6 +115,22 @@ func (s *Service) render(ctx context.Context, w Workspace, level access.Level, o
 		}
 	}
 	return o, nil
+}
+
+// settingsOf is the effective settings of w. A fork has no settings of its
+// own: it shows its parent's, read now, so that a change of the parent shows
+// in the fork at once. A fork whose parent has no record shows its own.
+func (s *Service) settingsOf(ctx context.Context, w Workspace) (map[string]any, error) {
+	if w.Kind == access.KindFork && w.ParentSlug != nil {
+		parent, found, err := BySlug(ctx, s.deps.Store.Main(), *w.ParentSlug)
+		if err != nil {
+			return nil, fmt.Errorf("the parent's settings: %w", err)
+		}
+		if found {
+			w = parent
+		}
+	}
+	return s.settings.EffectiveSettings(w.Settings, w.DefaultBranch), nil
 }
 
 // hubURL is the git remote of the workspace slug of the org orgSlug on the

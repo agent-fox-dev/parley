@@ -1061,6 +1061,55 @@ authenticates, cannot be changed. A refused request changes nothing.
 | `404` `not_found` | the caller's user has no token with this id (`token not found`) |
 | `409` `conflict` | the token is revoked (`token is revoked`) or expired (`token is expired`) |
 
+## Workspace settings
+
+Every workspace object holds `settings`, a flat object with exactly these
+21 keys, each with its effective value: the value stored for the key when
+it was set, otherwise its default. Only the keys set are stored.
+
+| Key | Type | Values | Default |
+|---|---|---|---|
+| `sync_enabled` | bool | | `true` |
+| `protected_branches` | list of strings | 0 to 50 distinct branch globs | `[<default_branch>]`, `[]` while `default_branch` is `null` |
+| `protect.owner_push` | bool | | `true` |
+| `land.strategy` | enum | `rebase`, `squash` | `rebase` |
+| `land.by_author` | bool | | `true` |
+| `land.delete_source` | bool | | `true` |
+| `land.allow_override` | bool | | `true` |
+| `changes.require_intent` | bool | | `true` |
+| `changes.auto_restack` | bool | | `true` |
+| `audit_fetches` | bool | | `false` |
+| `forge_api_url` | URL string | `""` or an absolute URL starting with exactly `https://` (lower case), with a host, a port only if from 1 to 65535, and without user information, query, fragment, white space or control characters | `""` |
+| `upstream_forge_api_url` | URL string | the same | `""` |
+| `patch_branch_source` | enum | `hub`, `origin` | `hub` |
+| `patch_divergence_policy` | enum | `replace`, `report` | `replace` |
+| `push_patches_to_origin` | bool | | `false` |
+| `auto_rebuild_after_push` | bool | | `true` |
+| `auto_rebuild_after_sync` | bool | | `true` |
+| `rebuild_strategy` | enum | `rebase`, `merge` | `rebase` |
+| `rebuild_fail_mode` | enum | `fail_fast`, `continue` | `fail_fast` |
+| `rebuild_push_integration_branch` | bool | | `false` |
+| `squash_merge_detection` | enum | `ancestry_only`, `content_based`, `both` | `both` |
+
+A bool key is a JSON boolean, an enum or URL key a JSON string and
+`protected_branches` a JSON array of strings, in the order given. A URL key
+is judged and stored without the white space around it, so
+`"  https://ghe.example/api/v3  "` is stored as
+`"https://ghe.example/api/v3"` and `"   "` as `""`. The default of
+`protected_branches` follows the workspace's `default_branch`; once the key
+is set, the empty list included, the stored list is shown as it is.
+
+A task fork has no settings of its own: its `settings` are its parent's
+effective settings, read when the fork is answered, so a change of the
+parent's settings shows in the fork at once.
+
+A branch glob is 1 to 255 characters that make a valid branch name once
+`*` is allowed too. It matches a whole branch name, case-sensitive: `*`
+matches any run of characters except `/`, `**` any run including `/`, and
+every other character, `?` included, only itself. So `release/*` matches
+`release/1.x` but not `release/1/x` or `release`, and `release/**` matches
+`release/1/x`.
+
 ## `POST /api/v1/workspaces`
 
 Registers a git repository as a workspace owned by the caller's user. It
@@ -1083,7 +1132,7 @@ a member that the table allows to be `null` counts as absent when it is:
 | `workspace_mode` | no | a string or `null`: `standard` or `carry_patch`; absent, `null` or empty, `standard` |
 | `upstream_url` | with `carry_patch` | a string or `null`; required with `carry_patch` and checked by the `git_url` rule; with `standard` only `null` is accepted |
 | `integration_branch` | no | a string or `null`; with `carry_patch` a valid branch name, stored as given (`null` when absent); with `standard` only `null` is accepted |
-| `settings` | no | an object or `null`: each key a registered setting whose value its rule accepts, a key with the value `null` keeping its default; only the keys set are stored. Absent or `null`, every key keeps its default |
+| `settings` | no | an object or `null`: each key one of the [workspace settings](#workspace-settings) with a value its rule accepts, a key with the value `null` keeping its default; only the keys set are stored. Absent or `null`, every key keeps its default |
 | `git_pat` | no | a string, not empty; not with `git_username` or `git_password` |
 | `git_username`, `git_password` | no | strings, not empty, given together or not at all |
 
@@ -1132,11 +1181,11 @@ slug of its org; `hub_url`, the workspace's git remote on the hub,
 `<[server].external_url>/git/<org_slug>/<slug>.git` with one trailing `/`
 of the external URL removed, or `null` when no external URL is configured;
 `access`, the caller's level (`owner` for the creator); and `settings`,
-every registered setting key with its effective value (`{}` while no key is
-registered).
+all 21 setting keys with their effective values (see
+[Workspace settings](#workspace-settings)).
 
 ```json
-{"slug":"demo","kind":"repository","workspace_mode":"standard","git_url":"https://example.com/a.git","default_branch":null,"owner_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","org_id":"5e6f7a8b-9c0d-4e1f-8a2b-3c4d5e6f7a8b","org_slug":"octocat","status":"pending","display_name":"demo","description":"","head_sha":null,"origin_head_sha":null,"clone_error":null,"last_sync_at":null,"sync_error":null,"upstream_url":null,"integration_branch":null,"upstream_head_sha":null,"parent_slug":null,"fork_point":null,"expires_at":null,"auto_change":null,"purpose":null,"session_id":null,"settings":{},"hub_url":"https://hub.example/git/octocat/demo.git","access":"owner","created_at":"2026-11-14T10:30:15Z","updated_at":"2026-11-14T10:30:15Z"}
+{"slug":"demo","kind":"repository","workspace_mode":"standard","git_url":"https://example.com/a.git","default_branch":null,"owner_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","org_id":"5e6f7a8b-9c0d-4e1f-8a2b-3c4d5e6f7a8b","org_slug":"octocat","status":"pending","display_name":"demo","description":"","head_sha":null,"origin_head_sha":null,"clone_error":null,"last_sync_at":null,"sync_error":null,"upstream_url":null,"integration_branch":null,"upstream_head_sha":null,"parent_slug":null,"fork_point":null,"expires_at":null,"auto_change":null,"purpose":null,"session_id":null,"settings":{"sync_enabled":true,"protected_branches":[],"protect.owner_push":true,"land.strategy":"rebase","land.by_author":true,"land.delete_source":true,"land.allow_override":true,"changes.require_intent":true,"changes.auto_restack":true,"audit_fetches":false,"forge_api_url":"","upstream_forge_api_url":"","patch_branch_source":"hub","patch_divergence_policy":"replace","push_patches_to_origin":false,"auto_rebuild_after_push":true,"auto_rebuild_after_sync":true,"rebuild_strategy":"rebase","rebuild_fail_mode":"fail_fast","rebuild_push_integration_branch":false,"squash_merge_detection":"both"},"hub_url":"https://hub.example/git/octocat/demo.git","access":"owner","created_at":"2026-11-14T10:30:15Z","updated_at":"2026-11-14T10:30:15Z"}
 ```
 
 | Status | When |
@@ -1162,6 +1211,166 @@ given):
 ```json
 {"seq":12,"id":"…","type":"parley.workspace.create","time":"2026-11-14T10:30:15Z","workspace":"demo","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"workspace","resource_id":"demo","action":"create","session_id":null,"metadata":{"default_branch":null,"git_url":"https://example.com/a.git","kind":"repository","workspace_mode":"standard"}}
 ```
+
+## `GET /api/v1/workspaces`
+
+Lists the workspaces the caller can read, in every status but `archived`,
+each as the workspace object `GET /api/v1/workspaces/{slug}` answers, with
+`access` the caller's level on that workspace. It takes the admin token, an
+API key or a PAT, and declares the scope `workspaces:read` for a PAT, which
+a PAT holding `workspaces:write` also satisfies. It names no workspace, so
+no access check runs before it; the list itself holds only the workspaces
+the caller can read (see [Workspace access](#workspace-access)):
+
+| Caller | Listed, with `access` |
+|---|---|
+| the admin token | every workspace, `admin` |
+| a user | the workspaces they own and the task forks of those, `owner`; the workspaces of their active orgs that they do not own, `member` |
+| a PAT bound to a workspace | what its user's list holds of the workspaces its binding covers (see [Workspace-bound tokens](#workspace-bound-tokens)) |
+
+It is a list (see [Lists](#lists)), with `limit` and `cursor` and these
+query parameters:
+
+| Parameter | Meaning |
+|---|---|
+| `include_archived` | `true` lists archived workspaces too; `false` or absent leaves them out |
+| `include_forks` | `true` lists task forks too; `false` or absent leaves them out |
+| `parent` | lists only the task forks whose `parent_slug` is this slug, whatever `include_forks` says; the list is empty when no workspace has the slug, when the caller cannot read it, or when it is a task fork |
+
+The order is `created_at` descending, then `slug` ascending among the
+workspaces created in the same instant; the cursor carries both, so a walk
+over the pages returns each listed workspace once.
+
+| Status | When |
+|---|---|
+| `200 OK` | the body is a page, `items` an array of workspace objects (`[]` when nothing matches) |
+| `400` `invalid_request` | `include_archived` or `include_forks` with a value other than exactly `true` or `false`, an empty one included, or given more than once (`include_forks must be given once, as true or false`); a bad `limit` or `cursor` (see [Lists](#lists)) |
+| `403` `insufficient_scope` | a PAT with neither `workspaces:read` nor `workspaces:write` (`this route needs the scope workspaces:read`) |
+
+## `GET /api/v1/workspaces/{slug}`
+
+Answers the workspace `{slug}` to a caller who can read it, in every status
+(`pending`, `cloning`, `ready`, `failed`, `archived`) and for a repository
+workspace and a task fork alike. It takes the admin token, an API key or a
+PAT, and declares the scope `workspaces:read` for a PAT, which a PAT holding
+`workspaces:write` also satisfies. It needs read access to the workspace
+(see [Workspace access](#workspace-access)).
+
+The checks run in this order: a bound PAT on a workspace outside its
+binding (`404`, see [Workspace-bound tokens](#workspace-bound-tokens)); a
+PAT with neither `workspaces:read` nor `workspaces:write` (`403`), before
+the workspace is looked up, so the answer is the same for a slug a
+workspace has and for one no workspace has; then the access check, which
+answers a caller who cannot read the workspace with the same status and
+the same bytes as a slug no workspace has, archived or not.
+
+The answer is the workspace object, the same object `POST
+/api/v1/workspaces` answers (see there), with `access` the caller's level on
+the workspace: `admin` for the admin token, `owner` for its owner, `member`
+for an active member of its org, whatever scopes the caller's PAT holds.
+
+| Status | When |
+|---|---|
+| `200 OK` | the body is the workspace object |
+| `403` `insufficient_scope` | a PAT with neither `workspaces:read` nor `workspaces:write` (`this route needs the scope workspaces:read`) |
+| `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug (`workspace not found`); also a bound PAT on a workspace outside its binding |
+
+```json
+{"error":{"code":404,"message":"workspace not found","error_type":"not_found"}}
+```
+
+## `PATCH /api/v1/workspaces/{slug}`
+
+Changes the display name, the description, the organization and the
+settings of the workspace `{slug}`. It takes the admin token, an API key or a PAT, declares
+the scope `workspaces:write` for a PAT and needs write access to the
+workspace (see [Workspace access](#workspace-access)): its owner or the
+admin token. It works in every status but `archived`.
+
+The body is a JSON object that changes exactly the fields it carries;
+members the route does not know are ignored, and a field not given keeps
+its value.
+
+| Field | Repository workspace | Task fork |
+|---|---|---|
+| `display_name` | `null` or a string of at most 128 characters (Unicode code points); `null` or `""` sets it to the slug | the same |
+| `description` | `null` or a string of at most 1024 characters; `null` sets it to `""` | the same |
+| `org_id` | an org id or slug, or `null` for the personal org of the workspace's owner; the workspace and every fork of it move to that org | `400` `not_supported_on_fork` |
+| `settings` | an object or `null`, applied to the stored settings key by key (below) | `400` `not_supported_on_fork` |
+| `ttl`, `purpose`, `auto_change` | `400` `invalid_request` | `400` `invalid_request` until the fork features accept them |
+| `slug`, `kind`, `git_url`, `default_branch`, `owner_id`, `workspace_mode`, `upstream_url`, `integration_branch`, `parent_slug`, `fork_point` | `400` `invalid_request`, whatever the value, the current one included | the same |
+
+In `settings`, a key given with a value its rule accepts is stored with that
+value (see [Workspace settings](#workspace-settings)), a key given with
+`null` returns to its default, and every key not given keeps its value;
+`"settings": null` returns every key to its default. The settings are
+applied all or nothing: when one key is refused, nothing is stored.
+
+`org_id` names the org by its id (a value in UUID form) or else by its
+slug, exactly; the answer's `org_id` is the org's id either way, with its
+`org_slug` and a `hub_url` under the new org. The workspace's owner, not
+the caller, must be an active member of that org, also when the admin
+token moves it. The workspace moves with every task fork whose
+`parent_slug` it is, in the same store transaction: all of them move or
+none does. Who can read the workspace and its forks follows: the members
+of the new org gain read access and those of the previous org lose it.
+
+```json
+{"display_name":"Payments","settings":{"land.strategy":"squash","protected_branches":["main","release/**"]}}
+```
+
+The checks run in this order, the first that fails answering: a bound PAT
+on a workspace outside its binding (`404`, see
+[Workspace-bound tokens](#workspace-bound-tokens)); a PAT without
+`workspaces:write` (`403`), before the workspace is looked up; the access
+check (`404` for a caller who cannot read the workspace, the same bytes as
+for a slug no workspace has, `403` for a member of its org, also on an
+archived workspace); then the body: not a JSON object; an immutable field;
+a field that does not apply to the workspace's kind; no field to change;
+the values in the order `display_name`, `description`, `org_id`,
+`settings`; an `org_id` naming an org of which the workspace's owner is
+not an active member (`403`); and last the state: an archived workspace is
+`409`.
+Of several refused setting keys the message names one: an unknown key
+before any refused value, the first unknown key in byte order of the keys,
+otherwise the refused key that comes first in the table of
+[Workspace settings](#workspace-settings), whatever the order of the
+members in the body. The workspace is read, changed and written with
+`updated_at`, the current time cut to the second, in one store transaction;
+an update that changes no value still sets `updated_at`, and a refused
+request changes nothing, `updated_at` included.
+
+Every update that is answered `200` writes one `parley.workspace.update`
+event in the same store transaction, also one that changes no value; a
+refused request writes none, and when the event cannot be written the
+update is not made and is answered `500` `internal`. The event has
+`workspace` and `resource_id` the slug, `resource_type` `workspace`,
+`actor_type` `admin_token` with `actor_id` `null` for the admin token, or
+`api_key` or `pat` after the calling credential with `actor_id` the
+caller's user, and in `metadata` `fields`, the names of the mutable fields
+the body carried in the order `display_name`, `description`, `org_id`,
+`settings`, `ttl`, `purpose`, `auto_change`, and for a task fork
+`parent_slug`, its parent's slug. The metadata holds no value of any
+field, so no setting appears in the log:
+
+```json
+{"seq":13,"id":"…","type":"parley.workspace.update","time":"2026-11-14T10:31:02Z","workspace":"demo","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"workspace","resource_id":"demo","action":"update","session_id":null,"metadata":{"fields":["display_name","settings"]}}
+```
+
+The answer is the workspace object after the update, the object
+[`GET /api/v1/workspaces/{slug}`](#get-apiv1workspacesslug) answers, with
+`access` the caller's level.
+
+| Status | When |
+|---|---|
+| `200 OK` | the fields are changed; the body is the workspace object |
+| `400` `invalid_request` | the body is not a JSON object; it carries an immutable field (`<field>: cannot be changed`), a fork-only field on a repository workspace (`<field>: applies only to a task fork`) or on a fork that does not accept it (`<field>: cannot be changed`); it carries no field to change (`the body carries no field to change`); or a value is refused: `display_name: must be a string or null`, `display_name: must be at most 128 characters`, the same for `description` with 1024, `org_id: must be a string or null`, `org_id: no organization has the id or slug "<value>"` (also for `""` and an id no org has), `org_id: the workspace's owner has no personal organization`, `settings: must be an object or null`, `unknown setting "<key>"`, or `settings.<key>: <reason>` for a value its rule refuses (`settings.land.strategy: must be one of ["rebase" "squash"]`); the reason never repeats a URL |
+| `400` `not_supported_on_fork` | `org_id` or `settings` in an update of a task fork, whatever the value (`<field>: a task fork takes its org and its settings from its parent`) |
+| `403` `insufficient_scope` | a PAT without `workspaces:write` (`this route needs the scope workspaces:write`) |
+| `403` `forbidden` | a member of the workspace's org who does not own it (`org members have read-only access to this workspace`), in every status; or an `org_id` naming an org of which the workspace's owner is not an active member, whoever the caller is (`the workspace's owner is not an active member of the organization`) |
+| `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug (`workspace not found`); also a bound PAT on a workspace outside its binding |
+| `409` `workspace_archived` | a valid update of a workspace in status `archived` (`workspace <slug> is archived`) |
+| `500` `internal` | a write failed, that of a fork moved with the workspace or of the update's event included; nothing is changed |
 
 ## `POST /api/v1/workspaces/{slug}/tokens`
 

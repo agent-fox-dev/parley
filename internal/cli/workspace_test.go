@@ -46,6 +46,11 @@ func createDemo(more ...string) []string {
 	return append([]string{"workspace", "create", "--slug", "demo", "--git-url", "https://example.com/a.git"}, more...)
 }
 
+// updateDemo is the command line that updates demo, followed by more.
+func updateDemo(more ...string) []string {
+	return append([]string{"workspace", "update", "demo"}, more...)
+}
+
 // runWorkspace runs args against hub, polling every 10 ms in place of
 // --poll-interval, and returns the exit status, stdout and stderr.
 func runWorkspace(t *testing.T, hub *stubHub, args ...string) (int, string, string) {
@@ -105,19 +110,27 @@ func TestWorkspaceCreate_PostsAMemberForEachFlagGivenAndPrintsTheWorkspace(t *te
 	}
 }
 
-func TestWorkspaceCreate_PrintsTheHubsRefusalAndFails(t *testing.T) {
+func TestWorkspace_PrintsTheHubsRefusalAndFails(t *testing.T) {
 	t.Parallel()
-	refusal := `{"error":{"code":409,"message":"slug: a workspace with the slug \"demo\" exists","error_type":"conflict"}}`
-	for _, wait := range []bool{false, true} {
-		t.Run(map[bool]string{false: "without --wait", true: "with --wait"}[wait], func(t *testing.T) {
+	conflict := `{"error":{"code":409,"message":"slug: a workspace with the slug \"demo\" exists","error_type":"conflict"}}`
+	notFound := `{"error":{"code":404,"message":"workspace not found","error_type":"not_found"}}`
+	tests := []struct {
+		name, method, path string
+		args               []string
+		status             int
+		refusal            string
+	}{
+		{"create", http.MethodPost, workspacesPath, createDemo(), http.StatusConflict, conflict},
+		{"create --wait", http.MethodPost, workspacesPath, createDemo("--wait"), http.StatusConflict, conflict},
+		{"get", http.MethodGet, demoPath, []string{"workspace", "get", "demo"}, http.StatusNotFound, notFound},
+		{"update", http.MethodPatch, demoPath, updateDemo("--description", "x"), http.StatusNotFound, notFound},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			hub := newStubHub(t).answer(http.MethodPost, workspacesPath, http.StatusConflict, refusal)
-			args := createDemo()
-			if wait {
-				args = append(args, "--wait")
-			}
+			hub := newStubHub(t).answer(tt.method, tt.path, tt.status, tt.refusal)
 
-			code, stdout, stderr := runWorkspace(t, hub, args...)
+			code, stdout, stderr := runWorkspace(t, hub, tt.args...)
 
 			if code != 1 {
 				t.Errorf("exit status = %d, want 1", code)
@@ -125,17 +138,17 @@ func TestWorkspaceCreate_PrintsTheHubsRefusalAndFails(t *testing.T) {
 			if stdout != "" {
 				t.Errorf("stdout = %q, want it empty", stdout)
 			}
-			if want := indented(t, refusal); stderr != want {
+			if want := indented(t, tt.refusal); stderr != want {
 				t.Errorf("stderr = %q, want the hub's envelope %q", stderr, want)
 			}
-			if n := len(hub.recorded()); n != 1 {
-				t.Errorf("the hub got %d requests, want 1", n)
+			if sent := hub.recorded(); len(sent) != 1 || sent[0].method != tt.method || sent[0].rawPath != tt.path {
+				t.Errorf("the hub got %v, want one %s %s", sent, tt.method, tt.path)
 			}
 		})
 	}
 }
 
-func TestWorkspaceCreate_RefusesABadCommandLineBeforeAnyRequest(t *testing.T) {
+func TestWorkspace_RefusesABadCommandLineBeforeAnyRequest(t *testing.T) {
 	t.Parallel()
 	url := []string{"--git-url", "https://example.com/a.git"}
 	slug := []string{"--slug", "demo"}
@@ -158,6 +171,12 @@ func TestWorkspaceCreate_RefusesABadCommandLineBeforeAnyRequest(t *testing.T) {
 		{"a setting without a key", createDemo("--setting", "=v"), "--setting"},
 		{"an empty setting", createDemo("--setting", ""), "--setting"},
 		{"a wait without time", createDemo("--wait", "--timeout", "0s"), "--timeout"},
+		{"an update without a flag", updateDemo(), "--description"},
+		{"an update of a setting without =", updateDemo("--setting", "sync_enabled"), "--setting"},
+		{"an update of a setting without a key", updateDemo("--setting", "=true"), "--setting"},
+		{"an update with a bad setting among good flags", updateDemo("--description", "x", "--setting", "novalue"), "--setting"},
+		{"a get without a slug", []string{"workspace", "get"}, "<slug>"},
+		{"an update without a slug", []string{"workspace", "update", "--description", "x"}, "<slug>"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -176,48 +195,58 @@ func TestWorkspaceCreate_RefusesABadCommandLineBeforeAnyRequest(t *testing.T) {
 	}
 }
 
-func TestWorkspaceCreate_SendsEachSettingByTheTypeItsValueReads(t *testing.T) {
+func TestWorkspace_SendsEachSettingByTheTypeItsValueReads(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		settings []string
 		want     string
 	}{
-		{[]string{"a=true"}, `{"a":true}`},
-		{[]string{"a=false"}, `{"a":false}`},
-		{[]string{"a="}, `{"a":null}`},
+		{[]string{"sync_enabled=false"}, `{"sync_enabled":false}`},
+		{[]string{"audit_fetches=true"}, `{"audit_fetches":true}`},
+		{[]string{"land.strategy="}, `{"land.strategy":null}`},
 		{[]string{"protected_branches=main,release/*"}, `{"protected_branches":["main","release/*"]}`},
 		{[]string{"protected_branches=main"}, `{"protected_branches":["main"]}`},
 		{[]string{"protected_branches=true"}, `{"protected_branches":["true"]}`},
 		{[]string{"protected_branches="}, `{"protected_branches":null}`},
-		{[]string{"u=https://x/y?a=b"}, `{"u":"https://x/y?a=b"}`},
+		{[]string{"forge_api_url=https://x.example/api?a=b"}, `{"forge_api_url":"https://x.example/api?a=b"}`},
+		{[]string{"land.strategy=True"}, `{"land.strategy":"True"}`},
 		{[]string{"a=1"}, `{"a":"1"}`},
-		{[]string{"a=x", "a=y"}, `{"a":"y"}`},
+		{[]string{"land.strategy=rebase", "land.strategy=squash"}, `{"land.strategy":"squash"}`},
 		{[]string{"a=x", "b=true"}, `{"a":"x","b":true}`},
 	}
-	for _, tt := range tests {
-		t.Run(strings.Join(tt.settings, " "), func(t *testing.T) {
-			t.Parallel()
-			hub := newStubHub(t).answer(http.MethodPost, workspacesPath, http.StatusCreated, workspaceRecord("pending", ""))
-			args := createDemo()
-			for _, s := range tt.settings {
-				args = append(args, "--setting", s)
-			}
+	commands := []struct {
+		name, method, path string
+		args               []string
+	}{
+		{"create", http.MethodPost, workspacesPath, createDemo()},
+		{"update", http.MethodPatch, demoPath, updateDemo()},
+	}
+	for _, c := range commands {
+		for _, tt := range tests {
+			t.Run(c.name+" "+strings.Join(tt.settings, " "), func(t *testing.T) {
+				t.Parallel()
+				hub := newStubHub(t).answer(c.method, c.path, http.StatusOK, workspaceRecord("pending", ""))
+				args := slices.Clone(c.args)
+				for _, s := range tt.settings {
+					args = append(args, "--setting", s)
+				}
 
-			code, _, stderr := runWorkspace(t, hub, args...)
+				code, _, stderr := runWorkspace(t, hub, args...)
 
-			if code != 0 {
-				t.Fatalf("exit status = %d, want 0 (stderr %q)", code, stderr)
-			}
-			sent := hub.recorded()
-			if len(sent) != 1 {
-				t.Fatalf("the hub got %d requests, want 1", len(sent))
-			}
-			var body map[string]json.RawMessage
-			if err := json.Unmarshal([]byte(sent[0].body), &body); err != nil {
-				t.Fatalf("body %q is not a JSON object: %v", sent[0].body, err)
-			}
-			wantJSONBody(t, string(body["settings"]), tt.want)
-		})
+				if code != 0 {
+					t.Fatalf("exit status = %d, want 0 (stderr %q)", code, stderr)
+				}
+				sent := hub.recorded()
+				if len(sent) != 1 || sent[0].method != c.method {
+					t.Fatalf("the hub got %v, want one %s", sent, c.method)
+				}
+				var body map[string]json.RawMessage
+				if err := json.Unmarshal([]byte(sent[0].body), &body); err != nil {
+					t.Fatalf("body %q is not a JSON object: %v", sent[0].body, err)
+				}
+				wantJSONBody(t, string(body["settings"]), tt.want)
+			})
+		}
 	}
 }
 
@@ -314,6 +343,39 @@ func TestWorkspaceCreate_WaitsUntilTheWorkspaceIsReadyOrFailed(t *testing.T) {
 			if gets := len(sent) - 1; tt.gets >= 0 && gets != tt.gets {
 				t.Errorf("the hub got %d polls, want %d", gets, tt.gets)
 			}
+		})
+	}
+}
+
+func TestWorkspaceListGetUpdate_SendExactlyWhatTheArgumentsAndFlagsName(t *testing.T) {
+	list := []string{"workspace", "list"}
+	tests := []struct {
+		args []string
+		want sentRequest
+	}{
+		{list, sentRequest{http.MethodGet, workspacesPath, "", ""}},
+		{append(list, "--include-archived"), sentRequest{http.MethodGet, workspacesPath, "include_archived=true", ""}},
+		{
+			append(list, "--include-forks", "--parent", "demo", "--limit", "10", "--cursor", "abc"),
+			sentRequest{http.MethodGet, workspacesPath, "cursor=abc&include_forks=true&limit=10&parent=demo", ""},
+		},
+		{[]string{"workspace", "get", "demo--t1"}, sentRequest{http.MethodGet, "/api/v1/workspaces/demo--t1", "", ""}},
+		{[]string{"workspace", "get", "a/b"}, sentRequest{http.MethodGet, "/api/v1/workspaces/a%2Fb", "", ""}},
+		{updateDemo("--description", "x"), sentRequest{http.MethodPatch, demoPath, "", `{"description":"x"}`}},
+		{updateDemo("--display-name", "D", "--org", "acme"), sentRequest{http.MethodPatch, demoPath, "", `{"display_name":"D","org_id":"acme"}`}},
+		{updateDemo("--clear-description"), sentRequest{http.MethodPatch, demoPath, "", `{"description":null}`}},
+		{updateDemo("--display-name", "D", "--clear-display-name"), sentRequest{http.MethodPatch, demoPath, "", `{"display_name":null}`}},
+		{updateDemo("--clear-org"), sentRequest{http.MethodPatch, demoPath, "", `{"org_id":null}`}},
+		{updateDemo("--display-name", ""), sentRequest{http.MethodPatch, demoPath, "", `{"display_name":""}`}},
+		{updateDemo("--setting", "land.strategy=squash"), sentRequest{http.MethodPatch, demoPath, "", `{"settings":{"land.strategy":"squash"}}`}},
+		{
+			[]string{"workspace", "update", "a/b", "--description", "x"},
+			sentRequest{http.MethodPatch, "/api/v1/workspaces/a%2Fb", "", `{"description":"x"}`},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
+			wantSends(t, tt.args, tt.want)
 		})
 	}
 }

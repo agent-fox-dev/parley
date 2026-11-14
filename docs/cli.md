@@ -391,7 +391,7 @@ Available Commands:
   tokens      Create, read, change and revoke your personal access tokens
   user        Read and update your own profile
   version     Print the client's build and, given a hub URL, the hub's build
-  workspace   Register repositories as workspaces of the hub
+  workspace   Register, list, read and change the workspaces of the hub
 
 Flags:
       --api-key string        credential presented to the hub (default: $PARLEY_API_KEY, then api_key in the config file); parley login takes it from this flag alone and stores it (- reads it from stdin)
@@ -1539,13 +1539,16 @@ sends
 {"slug":"demo","git_url":"https://example.com/a.git"}
 ```
 
-**Settings.** Each `--setting` is split at its first `=` into a key and a
+**Settings.** Each `--setting`, here and on
+[`parley workspace update`](#parley-workspace-list-get-and-update), is
+split at its first `=` into a key and a
 value, and sets `settings[key]` to: `null` when the value is empty, which
 keeps the setting's default; for the key `protected_branches`, the list of
 the value's comma-separated parts; otherwise `true` or `false` as a boolean
 when the value is one of them; otherwise the value as a string. When a key
 is given more than once, the last one wins. Which keys exist, and which
-values each takes, is the hub's to judge. `--setting a=true --setting
+values each takes, is the hub's to judge (see
+[Workspace settings](api.md#workspace-settings)). `--setting a=true --setting
 protected_branches=main,release/* --setting u=https://x/y?a=b --setting
 b=1 --setting c=` sends
 
@@ -1598,6 +1601,75 @@ received with exit status `1`.
 | Command | Request |
 |---|---|
 | `parley workspace create --slug <slug> --git-url <url> [flags]` | `POST /api/v1/workspaces` with a member for each flag given; with `--wait`, then `GET /api/v1/workspaces/<slug>` until `ready` or `failed` |
+
+#### `parley workspace list`, `get` and `update`
+
+```
+parley workspace list [--include-archived] [--include-forks] [--parent <slug>] [--limit <n>] [--cursor <cursor>]
+parley workspace get <slug>
+parley workspace update <slug> [flags]
+```
+
+Each sends one request with the credential as `Authorization: Bearer` and
+prints the hub's answer on stdout with exit status `0`; a refusal of the
+hub's is written to stderr as received, with nothing on stdout and exit
+status `1`. `<slug>` is sent as one percent-encoded path segment:
+`parley workspace get a/b` sends `GET /api/v1/workspaces/a%2Fb`.
+
+`parley workspace list` sends
+[`GET /api/v1/workspaces`](api.md#get-apiv1workspaces) with one query
+parameter for each flag given and none for a flag not given, and prints the
+page the hub answers, `{"items": [...], "next_cursor": ...}`, one page per
+run. `--include-archived` sends `include_archived=true` and
+`--include-forks` `include_forks=true`; `--parent`, `--limit` and
+`--cursor` send `parent`, `limit` and `cursor` with their values as given,
+which the hub judges. `parley workspace list --include-forks --parent demo
+--limit 10 --cursor abc` sends
+`GET /api/v1/workspaces?cursor=abc&include_forks=true&limit=10&parent=demo`.
+
+`parley workspace get <slug>` sends
+[`GET /api/v1/workspaces/<slug>`](api.md#get-apiv1workspacesslug) and
+prints the workspace. A workspace the caller cannot read is the hub's
+`404` `not_found`, exit status `1`.
+
+`parley workspace update <slug>` sends
+[`PATCH /api/v1/workspaces/<slug>`](api.md#patch-apiv1workspacesslug) with
+a JSON body that holds exactly the members its flags name, and prints the
+updated workspace:
+
+| Flag | Body member | Value |
+|---|---|---|
+| `--display-name <text>` | `display_name` | the string as given; `""` is sent as `""` |
+| `--description <text>` | `description` | the string as given |
+| `--org <id or slug>` | `org_id` | the organization to move the workspace and its forks to |
+| `--clear-display-name` | `display_name` | `null`, which the hub makes the slug |
+| `--clear-description` | `description` | `null`, which the hub makes `""` |
+| `--clear-org` | `org_id` | `null`, which the hub makes the owner's personal organization |
+| `--setting <key=value>` | `settings` | repeatable: one workspace setting each, read as for `create` (see above) |
+
+A clear flag wins over its value flag: `--display-name D
+--clear-display-name` sends `{"display_name":null}`. `parley workspace
+update demo --description "payments service" --setting land.strategy=squash`
+sends
+
+```json
+{"description":"payments service","settings":{"land.strategy":"squash"}}
+```
+
+**Client checks.** An update with none of the flags above
+(`parley workspace update needs at least one of --display-name,
+--description, --org, --clear-display-name, --clear-description,
+--clear-org and --setting`), a `--setting` without `=` or with nothing
+before it, a missing `<slug>` and a second argument are refused with a
+`usage_error` and exit status `2` before any setting is read or any request
+sent. Everything else, an immutable member, an unknown setting key or an
+invalid value among them, is the hub's to refuse.
+
+| Command | Request |
+|---|---|
+| `parley workspace list [flags]` | `GET /api/v1/workspaces` with a query parameter for each flag given |
+| `parley workspace get <slug>` | `GET /api/v1/workspaces/<slug>` |
+| `parley workspace update <slug> [flags]` | `PATCH /api/v1/workspaces/<slug>` with a member for each flag given |
 
 ### Output
 

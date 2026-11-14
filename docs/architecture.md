@@ -32,7 +32,7 @@ command-line client. Both are written in Go, in the module
 | `internal/store` | the hub's two embedded SQLite stores (`modernc.org/sqlite`, no cgo): `Open` creates the data directory and the workspace root, opens the transactional store and the analytical store (`analytics.db` beside it) and applies the registered schema steps; `Tx` runs a transaction of the transactional store; `Snapshot` writes a consistent copy of one store file without changing it |
 | `internal/server` | the hub's HTTP server: its built-in routes, the REST API's route registration and check pipeline, the error envelope, request ids, response headers and the access log, list paging, idempotency keys, and the readiness probes |
 | `internal/server/timefmt` | the one timestamp format (`Format`, and the response member type `Time`) and the one duration grammar (`ParseDuration`); a leaf package that imports nothing of the project, so that the configuration loader can use it as well as the REST API |
-| `internal/workspace` | the place for workspace records, their validation rules, the state guard, and the create and clone work; so far the whole workspace record with its store functions, the state guard `RequireReady`, the resolution of a workspace's origin credential from its secrets `ResolveOriginCredential`, the workspace service with `POST /api/v1/workspaces` and the clone work `Clone` with the copy's place `RepoPath` and the post-clone steps, the clone workers `Workers` and `(*Service).Enqueue`, which hands a workspace put back to `pending` to them (see Clone work), the one encoder of the workspace object `RenderWorkspace` and the settings registry (see Workspace records), and the rules every workspace route judges its values by, each deciding on the text alone and returning an error that says which rule broke: `ValidateSlug` (3 to 64 characters of a to z, digits and hyphens, starting with a letter), `ValidateGitURL` (`https://<host>/<path>` without user information, or `git@<host>:<path>`, with no lookup or connection), `ValidateBranchName` (git's branch-name rule), `ValidateForkName` (1 to 32 characters of a to z, digits and hyphens) and `ParseDuration` (a whole number above zero followed by `m`, `h` or `d`, unlike `timefmt.ParseDuration`, which also takes seconds) |
+| `internal/workspace` | the place for workspace records, their validation rules, the state guard, and the create and clone work; so far the whole workspace record with its store functions, the state guard `RequireReady`, the resolution of a workspace's origin credential from its secrets `ResolveOriginCredential`, the workspace service with `POST /api/v1/workspaces`, `GET /api/v1/workspaces`, `GET /api/v1/workspaces/:slug` and `PATCH /api/v1/workspaces/:slug` and the clone work `Clone` with the copy's place `RepoPath` and the post-clone steps, the clone workers `Workers` and `(*Service).Enqueue`, which hands a workspace put back to `pending` to them (see Clone work), the one encoder of the workspace object `RenderWorkspace` and the settings registry with the settings table of the 21 setting keys and `RegisterSettingKeys` (see Workspace records), the one branch-glob matcher `MatchBranchGlob`, `MatchAnyBranchGlob` and `ValidateBranchGlob`, and the rules every workspace route judges its values by, each deciding on the text alone and returning an error that says which rule broke: `ValidateSlug` (3 to 64 characters of a to z, digits and hyphens, starting with a letter), `ValidateGitURL` (`https://<host>/<path>` without user information, or `git@<host>:<path>`, with no lookup or connection), `ValidateBranchName` (git's branch-name rule), `ValidateForkName` (1 to 32 characters of a to z, digits and hyphens) and `ParseDuration` (a whole number above zero followed by `m`, `h` or `d`, unlike `timefmt.ParseDuration`, which also takes seconds) |
 | `test/e2e` | tests that build the binaries and run them |
 
 ## The HTTP server
@@ -503,9 +503,11 @@ emits through it from its start hook on, if it is listed after
 `composeEvents`, or from `Options.Compose` (see [Hub events](#hub-events)).
 
 `(*Composition).Workspaces()` returns the `*workspace.Service` that
-`composeWorkspaces` (`internal/hub/workspace.go`) creates: a part keeps it
-when it is composed and registers its setting keys on
-`Workspaces().Settings()` then (see [Workspace records](#workspace-records)).
+`composeWorkspaces` (`internal/hub/workspace.go`) creates, with the keys of
+the settings table registered on `Workspaces().Settings()` by
+`workspace.RegisterSettingKeys` (a failure panics the composition, as an
+invalid route does): a part keeps it when it is composed (see
+[Workspace records](#workspace-records)).
 
 The composition also keeps the identity service in its unexported field
 `identity`, which `composeIdentity` sets. A part listed after it that keeps
@@ -1436,8 +1438,9 @@ collected, which hold every repository the user has a level on, so a parent
 that is not among them is one the user has no level on. A workspace is
 therefore in a user's set exactly when `Level` resolves a level other than
 `LevelNone` for it, with that level. The visibility decision of the hub
-events calls `Readable` (see [Hub events](#hub-events)); the workspace list
-and the audit query will.
+events calls `Readable` (see [Hub events](#hub-events)), and so does the
+workspace list (`GET /workspaces`, see Workspace records); the audit query
+will.
 
 #### Workspace-bound tokens
 
@@ -1699,7 +1702,8 @@ functions take the caller's transaction:
 `workspace.SchemaStep` and the workspace routes, and adds the start hook
 `workspaces`, which builds the service's `workspace.Deps` (the stores, the
 secret and event components through the `Secrets` and `Events` interfaces,
-the hub's scrubber, logger and clock, `[server].external_url` as
+the access part's `*access.Service` as `Access`, an `AccessRule` that gives
+the workspace list the caller's readable set, the hub's scrubber, logger and clock, `[server].external_url` as
 `ExternalURL` and `[workspace].path` as `Root`, and `Lister`, an
 `OriginLister` that lists an origin's refs with a `Credential`, the type
 `gitrepo.Credential`, so that a resolved credential goes to git unchanged),
@@ -1772,22 +1776,133 @@ level)`, the one place a workspace object (`workspace.Object`) is built:
 every field of the record, a nil one encoded as `null`, plus `org_slug`
 (read from the workspace's org), `hub_url` (`ExternalURL` without one
 trailing slash, then `/git/<org_slug>/<slug>.git`, or `null` without an
-external URL), `access` (the caller's level) and `settings`. A record of
+external URL), `access` (the caller's level) and `settings`, the effective
+settings of the record, or for a fork those of its parent, read with
+`BySlug` at render time so that a change of the parent shows at once (a
+fork whose parent has no record shows its own). A record of
 kind `fork` goes last through the `ForkView` registered with
 `(*Service).RegisterForkView`, so the fork feature completes its object
 without this package importing it.
 
+`internal/workspace/read.go` holds `GET /workspaces/:slug`, declared with
+`Scope` `workspaces:read` and `Marks` `access.need: read`, so the scope
+check and then the access check answer before the handler: the access
+check's `404` is the one answer for a workspace the caller cannot read and
+for a slug no workspace has. The handler takes the caller's level from
+`access.DecisionOf`, reads the whole record with `BySlug` (a record deleted
+since the check is the same `404`) and answers it through
+`RenderWorkspace`, in every status and for both kinds.
+
+The same file holds `GET /workspaces`, declared with `Scope`
+`workspaces:read` and no access need, since it names no workspace; it is on
+the binding guard's allowlist. The handler reads the page (`server.ReadPage`),
+refuses `include_archived` or `include_forks` with a value other than `true`
+or `false` (`400`), and takes the caller's readable set from
+`Deps.Access.Readable(ctx, access.CallerFrom(caller))`, which for a
+workspace-bound PAT is already cut to its covered set, so the list narrows
+with the set and needs no rule of its own. One query (`readList`) then reads
+the page's rows: the set's slugs as one JSON parameter (`slug IN (SELECT value
+FROM json_each(?))`, every row for the admin token), `status <> 'archived'`
+unless asked, `kind = 'repository'` unless forks are asked, or with `parent`
+the forks whose `parent_slug` it is when it names a repository workspace
+(a parent outside the readable set reads nothing), the cursor's position
+`(created_at, slug)` and `ORDER BY created_at DESC, slug ASC LIMIT` the page
+plus one. Each row is answered through `RenderWorkspace` with the set's
+level for it, and `server.WritePage` writes the page with a cursor of the
+last item's stored `created_at` (UnixNano) and slug.
+
+`internal/workspace/update.go` holds `PATCH /workspaces/:slug`, declared
+with `Scope` `workspaces:write` and `Marks` `access.need: write`, so the
+scope check and then the access check answer before the handler (a member
+of the org is `403` in every status, archived included). The handler
+decodes the body as an object of raw members, so that a member given as
+`null` is told from one not given, then in one store transaction reads the
+record with `BySlug` (gone: the same `404`) and judges the body against it
+in `applyUpdate`. One table, `updateFields`, says what an update may do with
+each field by the workspace's kind: `display_name` and `description` are
+mutable on both kinds, `org_id` and `settings` on a repository workspace
+only (on a fork `400 not_supported_on_fork`), `ttl`, `purpose` and
+`auto_change` on a fork only, through a handler registered for them, and
+`slug`, `kind`, `git_url`, `default_branch`, `owner_id`, `workspace_mode`,
+`upstream_url`, `integration_branch`, `parent_slug` and `fork_point` on
+neither. The checks run in this order, the first failing one answering: an
+immutable field, whatever its value; a field that does not apply to the
+kind (a fork-only field on a repository workspace, or on a fork with no
+handler registered, is `400 invalid_request`); no mutable field; the values
+in table order (`display_name`, `description`, `org_id`, `settings`, then
+the fork-only fields), each applied to a copy of the record or answering
+`400 invalid_request` with `<field>: <reason>` (a value's reader reads
+through the update's transaction, and a store error it meets is a `500`,
+never a refusal); for an `org_id`, the workspace's owner, not the caller,
+an active member of the target org (`identity.ActiveOrgIDs`), else `403
+forbidden`; an archived workspace
+(`409 workspace_archived`), since validation comes before state; and for a
+fork the registered guard. Then it writes `display_name`, `description`,
+`org_id`, `settings` and `updated_at` (the hub's time cut to the second),
+when the org changed sets `org_id` on every record whose `parent_slug` is
+the workspace, runs the fork-only fields' writes and writes the
+`parley.workspace.update` event through `Deps.Events` (`updateEventInput`:
+the actor from `identity.PrincipalOf`, the admin principal mapped to
+`event.ActorAdminToken` with no actor id; `metadata.fields`, the mutable
+fields the body carried in `updateFields` order, and for a fork
+`metadata.parent_slug`, never a value), all in the same transaction, so a
+refusal writes nothing, neither record nor event, and a failed write, the
+event's included, keeps nothing. A `null` or empty `display_name` stores the slug, a `null`
+`description` the empty string. `org_id` (`moveTarget`) is `null`, the
+owner's personal org (`identity.PersonalOrg`), or a string looked up with
+`identity.OrgBySelector` (an id in UUID form, else a slug); anything else,
+or a string no org has, is `400`. The access rule reads the org from the
+same row, so a move changes who may read the workspace and its forks with
+no other write. After the commit it reads the record
+back and answers it through `RenderWorkspace` with the level
+`access.DecisionOf` gives, so the answer is the one a following `GET`
+gives.
+
+The fork features add to an update without changing its rules through two
+registrations on the service, each under a mutex: `RegisterForkField(name,
+ForkFieldHandler)`, for `ttl`, `purpose` or `auto_change` only (another
+name panics), whose handler judges the field's raw value and returns the
+`ForkFieldWrite` that stores it inside the update's transaction, and
+`RegisterForkUpdateGuard(ForkUpdateGuard)`, asked about every update of a
+fork after the body is valid and the fork not archived, before anything is
+written, its `*server.Error` answered unchanged. `nil` removes either.
+
 `internal/workspace/settings.go` holds `SettingsRegistry`, the setting keys
 in registration order, empty in its zero value; the service holds one,
 returned by `(*Service).Settings()`. `RegisterSetting(SettingKey)` adds a
-key with its `Name`, its `Default` (a function of the default branch) and
-its `Validate` rule, refusing a duplicate or incomplete key;
+key with its `Name`, its `Default` (a function of the default branch), its
+`Validate` rule and an optional `Normalize`, the form of an accepted value
+that is stored (nil stores the value as given), refusing a duplicate or
+incomplete key;
 `ApplySettings(stored, raw)` applies a request's settings value (`null`
 resets every key; otherwise an object whose unknown keys are refused with
 `unknown setting "<key>"`, a `null` value resets that key, every other
-value passes its key's rule); `EffectiveSettings(stored, defaultBranch)`
-returns every registered key with its stored value or its default. No key
-is registered yet, so every workspace object shows `settings` as `{}`.
+value passes its key's rule and is stored normalized; all or nothing, the
+first unknown key in byte order named before any refused value, else the
+first refused key in registration order); `EffectiveSettings(stored, defaultBranch)`
+returns every registered key with its stored value, decoded into the Go
+type of the key's default (`bool`, `string`, `[]string`), or its default.
+The same file holds the settings table, the one definition of the 21 keys
+(name, kind: bool, enum with its strings, URL string or list of branch
+globs, and default) in the order they are judged in, and
+`RegisterSettingKeys(registry)`, which registers each with its default and
+a rule built from its kind: a bool key takes a JSON boolean, an enum key one
+of its strings, a URL key a string that is empty or an absolute `https` URL
+with a host and no user information, query or fragment once trimmed, stored
+trimmed through `Normalize`, and
+`protected_branches` an array of at most 50 distinct strings that pass
+`ValidateBranchGlob`. Its default is a list holding the default branch, the
+empty list (never `null`) while the default branch is `null`.
+
+`internal/workspace/branchglob.go` holds the one branch-glob matcher of the
+hub, which every feature reading a list of branch globs calls:
+`MatchBranchGlob(glob, branch)` matches the whole name, case-sensitive, `*`
+standing for any run of characters except `/`, `**` for any run, every other
+character for itself; it runs over the bytes in time proportional to the
+product of the two lengths, whatever the stars. `MatchAnyBranchGlob(globs,
+branch)` reports whether one glob of a list matches (an empty list matches
+nothing), and `ValidateBranchGlob(glob)` accepts 1 to 255 characters that
+pass `ValidateBranchName` with each `*` taken as an ordinary character.
 
 `internal/workspace/guard.go` holds `RequireReady(w)`, the state check of
 every route that needs a workspace's repository. It reads the marker first:
@@ -2634,6 +2749,18 @@ written once and the exit status is the last failure's. `list` reads the
 whole list with `printWholeList`, which asks for pages of 200, follows
 `next_cursor` and prints `{"items":[…]}`; `delete` prints its `Confirm`
 document `{"deleted":"<KEY>"}`.
+
+`parley workspace` (`workspace.go`) is `create`, `list`, `get` and
+`update`. `get` is a declaration alone. `list` sends a query parameter for
+each flag given (`listWorkspaces`) and prints one page. `create` and
+`update` build their bodies from their flags (`workspaceCreateBody`,
+`workspaceUpdateBody`) and wrap their argument check so that the body is
+built there too: a command line it refuses (an update with nothing to
+change, a `--setting` without `=`) is a usage error before any setting is
+resolved. Both read `--setting`, registered by `addSettingFlag` as a string
+array, through `addSettings`, which parses the values with
+`ParseSettingFlags`, the one parser of `--setting`. `create --wait` polls
+`GET /workspaces/<slug>` through the shared wait.
 
 Help lives in `internal/cli/help.go`. `installHelp` keeps cobra's own text
 help, sets the root's help function, which `--help` on any command and a

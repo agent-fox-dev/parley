@@ -235,7 +235,7 @@ func TestCreate_StoresTheCredentialAsWorkspaceSecretsAndShowsItNowhere(t *testin
 				t.Errorf("%s: %s = %q (found %v, %v), want %q", c.slug, name, got, found, err, want)
 			}
 		}
-		evs := w.createEvents(t)
+		evs := w.eventsOf(t, createEvent)
 		ev, err := json.Marshal(evs[len(evs)-1])
 		if err != nil {
 			t.Fatal(err)

@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/scrub"
@@ -28,6 +29,14 @@ type Secrets interface {
 // in the caller's transaction. *event.Component satisfies it.
 type Events interface {
 	Emit(ctx context.Context, tx *sql.Tx, in event.Input) (event.Record, error)
+}
+
+// AccessRule is the access rule as the workspace list uses it: the set of
+// workspaces a caller can read, with the caller's level on each, already
+// cut down to the covered set for a PAT bound to a workspace.
+// *access.Service satisfies it.
+type AccessRule interface {
+	Readable(ctx context.Context, c access.Caller) (access.ReadableSet, error)
 }
 
 // Credential is what git presents to origin: a user name and a password or
@@ -53,6 +62,9 @@ type Deps struct {
 	Secrets Secrets
 	// Events writes the workspace events.
 	Events Events
+	// Access is the access rule the workspace list takes the caller's
+	// readable set from.
+	Access AccessRule
 	// Lister lists an origin's refs with a credential.
 	Lister OriginLister
 	// Git clones a workspace's origin into its copy and opens the copy;
@@ -92,6 +104,10 @@ type Service struct {
 	viewMu   sync.RWMutex
 	forkView ForkView
 
+	forkMu     sync.RWMutex
+	forkFields map[string]ForkFieldHandler
+	forkGuard  ForkUpdateGuard
+
 	stepMu    sync.RWMutex
 	postClone map[string]PostCloneStep
 }
@@ -123,5 +139,5 @@ func (s *Service) Settings() *SettingsRegistry { return &s.settings }
 
 // Routes returns the workspace routes of the REST API.
 func (s *Service) Routes() []server.Route {
-	return []server.Route{s.createRoute()}
+	return []server.Route{s.createRoute(), s.listRoute(), s.readRoute(), s.updateRoute()}
 }

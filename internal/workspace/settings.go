@@ -3,18 +3,24 @@ package workspace
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
+	"net/url"
+	"reflect"
 	"slices"
+	"strconv"
+	"strings"
 	"sync"
+	"unicode"
 
 	"github.com/agent-fox-dev/parley/internal/server"
 )
 
 // SettingKey is one key of a workspace's settings document: its name, its
-// default and the rule its value is judged by. The keys and their rules
-// belong to the package that registers them, so that this package applies
-// and shows settings without knowing any key.
+// default and the rule its value is judged by. The registry applies and
+// shows settings through these alone; RegisterSettingKeys registers the
+// keys of the settings table.
 type SettingKey struct {
 	// Name is the key as the settings document names it.
 	Name string
@@ -24,6 +30,9 @@ type SettingKey struct {
 	// Validate judges a value of the key that is not null; its error is the
 	// reason the value is refused.
 	Validate func(value json.RawMessage) error
+	// Normalize returns the form of a value Validate accepted that is
+	// stored; nil stores the value as given.
+	Normalize func(value json.RawMessage) json.RawMessage
 }
 
 // SettingsRegistry holds the setting keys in the order they were registered,
@@ -61,8 +70,9 @@ func (r *SettingsRegistry) registered() []SettingKey {
 // settings value of a request, to stored, which it does not change. A raw
 // value of null returns every key to its default; any other value must be an
 // object, each of whose keys is registered: a key with the value null
-// returns to its default, every other value must pass its key's rule. The
-// keys raw does not name keep their stored value. A refusal is a 400
+// returns to its default, every other value must pass its key's rule and is
+// stored in its key's normal form. The keys raw does not name keep their
+// stored value. A refusal is a 400
 // invalid_request naming the first unknown key, else the first refused key
 // in registration order; nothing is applied then.
 func (r *SettingsRegistry) ApplySettings(stored map[string]json.RawMessage, raw json.RawMessage) (map[string]json.RawMessage, error) {
@@ -94,6 +104,9 @@ func (r *SettingsRegistry) ApplySettings(stored map[string]json.RawMessage, raw 
 			if err := k.Validate(v); err != nil {
 				return nil, server.InvalidRequest(fmt.Sprintf("settings.%s: %v", k.Name, err))
 			}
+			if k.Normalize != nil {
+				v = k.Normalize(v)
+			}
 			out[k.Name] = v
 		}
 	}
@@ -102,16 +115,230 @@ func (r *SettingsRegistry) ApplySettings(stored map[string]json.RawMessage, raw 
 
 // EffectiveSettings returns every registered key with its stored value, or
 // its default for the default branch defaultBranch when the stored document
-// does not hold it. Keys the document holds that are no longer registered
-// are left out. With no key registered it is the empty object.
+// does not hold it. A stored value is decoded into the Go type of the key's
+// default (a bool, a string, a []string), so that a reader gets one type
+// per key whether the key was set or not; a stored value that does not
+// decode so is returned as stored. Keys the document holds that are no
+// longer registered are left out.
 func (r *SettingsRegistry) EffectiveSettings(stored map[string]json.RawMessage, defaultBranch *string) map[string]any {
 	out := map[string]any{}
 	for _, k := range r.registered() {
-		if v, ok := stored[k.Name]; ok {
-			out[k.Name] = v
+		def := k.Default(defaultBranch)
+		v, ok := stored[k.Name]
+		if !ok {
+			out[k.Name] = def
 			continue
 		}
-		out[k.Name] = k.Default(defaultBranch)
+		out[k.Name] = decodeLike(def, v)
 	}
 	return out
+}
+
+// decodeLike is raw decoded into a value of the dynamic type of def, or raw
+// itself when def is nil or raw does not decode into that type.
+func decodeLike(def any, raw json.RawMessage) any {
+	if def == nil {
+		return raw
+	}
+	p := reflect.New(reflect.TypeOf(def))
+	if json.Unmarshal(raw, p.Interface()) != nil {
+		return raw
+	}
+	return p.Elem().Interface()
+}
+
+// settingKind is the type of a setting key, which decides the values it
+// accepts.
+type settingKind int
+
+const (
+	kindBool  settingKind = iota // a JSON boolean
+	kindEnum                     // one of the key's listed strings
+	kindURL                      // "" or an absolute https URL
+	kindGlobs                    // a list of branch globs
+)
+
+// settingSpec is one row of the settings table: a key, its kind, the strings
+// an enum key accepts and the default of every kind but kindGlobs, whose
+// default follows the workspace's default branch.
+type settingSpec struct {
+	name   string
+	kind   settingKind
+	values []string
+	def    any
+}
+
+// maxProtectedBranches is the most globs protected_branches may hold.
+const maxProtectedBranches = 50
+
+// settingsTable is the settings document of every workspace: each key with
+// its kind and default, in the order the keys are judged in. It is the one
+// definition of the keys; the defaults, the rules and the order all read it.
+var settingsTable = []settingSpec{
+	{name: "sync_enabled", kind: kindBool, def: true},
+	{name: "protected_branches", kind: kindGlobs},
+	{name: "protect.owner_push", kind: kindBool, def: true},
+	{name: "land.strategy", kind: kindEnum, values: []string{"rebase", "squash"}, def: "rebase"},
+	{name: "land.by_author", kind: kindBool, def: true},
+	{name: "land.delete_source", kind: kindBool, def: true},
+	{name: "land.allow_override", kind: kindBool, def: true},
+	{name: "changes.require_intent", kind: kindBool, def: true},
+	{name: "changes.auto_restack", kind: kindBool, def: true},
+	{name: "audit_fetches", kind: kindBool, def: false},
+	{name: "forge_api_url", kind: kindURL, def: ""},
+	{name: "upstream_forge_api_url", kind: kindURL, def: ""},
+	{name: "patch_branch_source", kind: kindEnum, values: []string{"hub", "origin"}, def: "hub"},
+	{name: "patch_divergence_policy", kind: kindEnum, values: []string{"replace", "report"}, def: "replace"},
+	{name: "push_patches_to_origin", kind: kindBool, def: false},
+	{name: "auto_rebuild_after_push", kind: kindBool, def: true},
+	{name: "auto_rebuild_after_sync", kind: kindBool, def: true},
+	{name: "rebuild_strategy", kind: kindEnum, values: []string{"rebase", "merge"}, def: "rebase"},
+	{name: "rebuild_fail_mode", kind: kindEnum, values: []string{"fail_fast", "continue"}, def: "fail_fast"},
+	{name: "rebuild_push_integration_branch", kind: kindBool, def: false},
+	{name: "squash_merge_detection", kind: kindEnum, values: []string{"ancestry_only", "content_based", "both"}, def: "both"},
+}
+
+// RegisterSettingKeys registers every key of the settings table on r, in
+// the table's order. The hub calls it once on its workspace service's
+// registry; an error means r already held one of the keys.
+func RegisterSettingKeys(r *SettingsRegistry) error {
+	for _, spec := range settingsTable {
+		k := SettingKey{Name: spec.name, Default: spec.defaultFunc(), Validate: spec.validate}
+		if spec.kind == kindURL {
+			k.Normalize = trimString
+		}
+		if err := r.RegisterSetting(k); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// defaultFunc is the default of the key: its fixed default, or for a list
+// of branch globs the list holding the default branch, empty (never null)
+// while the default branch is unknown.
+func (spec settingSpec) defaultFunc() func(*string) any {
+	if spec.kind == kindGlobs {
+		return func(defaultBranch *string) any {
+			if defaultBranch == nil {
+				return []string{}
+			}
+			return []string{*defaultBranch}
+		}
+	}
+	return func(*string) any { return spec.def }
+}
+
+// validate judges a value of the key, which is not null, by its kind. Its
+// errors never repeat the value, which for a URL could carry a secret.
+func (spec settingSpec) validate(raw json.RawMessage) error {
+	raw = bytes.TrimSpace(raw)
+	switch spec.kind {
+	case kindBool:
+		if !bytes.Equal(raw, []byte("true")) && !bytes.Equal(raw, []byte("false")) {
+			return errors.New("must be a boolean")
+		}
+	case kindEnum:
+		if s, ok := jsonString(raw); !ok || !slices.Contains(spec.values, s) {
+			return fmt.Errorf("must be one of %q", spec.values)
+		}
+	case kindURL:
+		s, ok := jsonString(raw)
+		if !ok {
+			return errors.New("must be a string")
+		}
+		return validateForgeURL(strings.TrimSpace(s))
+	case kindGlobs:
+		return validateGlobs(raw)
+	}
+	return nil
+}
+
+// jsonString is raw decoded as a JSON string; ok is false for any other
+// JSON value.
+func jsonString(raw json.RawMessage) (s string, ok bool) {
+	if len(raw) == 0 || raw[0] != '"' || json.Unmarshal(raw, &s) != nil {
+		return "", false
+	}
+	return s, true
+}
+
+// trimString is the JSON string raw without its surrounding white space, so
+// that a URL key stores the URL its rule judged; raw is a JSON string.
+func trimString(raw json.RawMessage) json.RawMessage {
+	s, _ := jsonString(bytes.TrimSpace(raw))
+	b, _ := json.Marshal(strings.TrimSpace(s)) // a string always marshals
+	return b
+}
+
+// validateForgeURL accepts "" and an absolute https URL with a host and
+// without user information, query or fragment. The value is stored as
+// given, so the scheme must be written in lower case, and white space,
+// which url.Parse lets through in a path, is refused rather than stored.
+func validateForgeURL(s string) error {
+	if s == "" {
+		return nil
+	}
+	if strings.ContainsFunc(s, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) {
+		return errors.New("must not hold white space or control characters")
+	}
+	u, err := url.Parse(s)
+	switch {
+	case err != nil || !strings.HasPrefix(s, "https://") || u.Hostname() == "":
+		return errors.New(`must be "" or an absolute https:// URL with a host`)
+	case !validPort(u):
+		return errors.New("must have a port from 1 to 65535 if it names one")
+	case u.User != nil:
+		return errors.New("must not hold user information")
+	case u.RawQuery != "" || u.ForceQuery:
+		return errors.New("must not hold a query")
+	case u.Fragment != "" || strings.Contains(s, "#"):
+		return errors.New("must not hold a fragment")
+	}
+	return nil
+}
+
+// validPort reports whether u names no port, or one from 1 to 65535 in
+// decimal digits; url.Parse lets an empty port and one out of range through.
+func validPort(u *url.URL) bool {
+	host := u.Host
+	if i := strings.LastIndexByte(host, ']'); i >= 0 {
+		host = host[i+1:] // the colons of an IPv6 address are not a port
+	}
+	_, p, found := strings.Cut(host, ":")
+	if !found {
+		return true
+	}
+	if p == "" || strings.Trim(p, "0123456789") != "" {
+		return false
+	}
+	n, err := strconv.Atoi(p)
+	return err == nil && n >= 1 && n <= 65535
+}
+
+// validateGlobs accepts a JSON array of at most maxProtectedBranches
+// distinct branch globs.
+func validateGlobs(raw json.RawMessage) error {
+	var items []json.RawMessage
+	if len(raw) == 0 || raw[0] != '[' || json.Unmarshal(raw, &items) != nil {
+		return errors.New("must be a list of branch globs")
+	}
+	if len(items) > maxProtectedBranches {
+		return fmt.Errorf("must hold at most %d branch globs", maxProtectedBranches)
+	}
+	seen := make(map[string]bool, len(items))
+	for i, item := range items {
+		g, ok := jsonString(item)
+		if !ok {
+			return fmt.Errorf("item %d: must be a string", i)
+		}
+		if err := ValidateBranchGlob(g); err != nil {
+			return fmt.Errorf("item %d: %w", i, err)
+		}
+		if seen[g] {
+			return fmt.Errorf("item %d: repeats an earlier item", i)
+		}
+		seen[g] = true
+	}
+	return nil
 }

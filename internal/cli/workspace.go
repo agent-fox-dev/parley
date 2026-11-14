@@ -2,6 +2,7 @@ package cli
 
 import (
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -28,6 +29,20 @@ var workspaceStringFlags = []struct {
 	{"git-password", "git_password", "with --git-username, the password origin accepts, stored as the workspace secret GIT_PASSWORD"},
 }
 
+// workspaceUpdateFlags are the flags of parley workspace update that change
+// one member of the workspace: each value flag sends its string, and its
+// clear flag sends null in its place.
+var workspaceUpdateFlags = []struct {
+	flag, clear, member, usage string
+}{
+	{"display-name", "clear-display-name", "display_name", "the workspace's display name; an empty value is the slug"},
+	{"description", "clear-description", "description", "the workspace's description"},
+	{"org", "clear-org", "org_id", "the id or slug of the organization to move the workspace and its forks to"},
+}
+
+// slugArg is the <slug> argument: the slug of a workspace.
+var slugArg = argSpec{Name: "slug", Required: true}
+
 // settingFlag is the repeatable flag that sets one workspace setting.
 const settingFlag = "setting"
 
@@ -48,9 +63,7 @@ func newWorkspaceCommand() *cobra.Command {
 			for _, f := range workspaceStringFlags {
 				fs.String(f.flag, "", f.usage)
 			}
-			// A string array, not a slice: a value such as
-			// protected_branches=main,release/* must reach the parser whole.
-			fs.StringArray(settingFlag, nil, "set a workspace setting as key=value, repeatable: an empty value sends null, true and false send booleans, protected_branches takes a comma-separated list, anything else is sent as a string")
+			addSettingFlag(fs)
 			_ = cobra.MarkFlagRequired(fs, "slug")
 			_ = cobra.MarkFlagRequired(fs, "git-url")
 		},
@@ -80,7 +93,139 @@ func newWorkspaceCommand() *cobra.Command {
 		_, err := workspaceCreateBody(cmd)
 		return err
 	}
-	return group("workspace", "Register repositories as workspaces of the hub", create)
+	list := declare(command{
+		Name:        "list",
+		Description: "List the workspaces you can read, newest first, without archived workspaces and forks unless asked",
+		Method:      http.MethodGet,
+		Path:        "/workspaces",
+		Auth:        authUser,
+		Flags: func(fs *pflag.FlagSet) {
+			fs.Bool("include-archived", false, "list archived workspaces too")
+			fs.Bool("include-forks", false, "list task forks too")
+			fs.String("parent", "", "list only the forks of the workspace with this slug")
+			fs.Int("limit", 0, "the most workspaces the page holds; the hub's default, 50, when not given")
+			fs.String("cursor", "", "the next_cursor of the page before, to read the page after it")
+		},
+		Run: listWorkspaces,
+	})
+	get := declare(command{
+		Name:        "get",
+		Description: "Print a workspace with its settings and your access to it",
+		Method:      http.MethodGet,
+		Path:        "/workspaces/:slug",
+		Args:        []argSpec{slugArg},
+		Auth:        authUser,
+	})
+	return group("workspace", "Register, list, read and change the workspaces of the hub", create, list, get, newWorkspaceUpdateCommand())
+}
+
+// newWorkspaceUpdateCommand builds parley workspace update.
+func newWorkspaceUpdateCommand() *cobra.Command {
+	update := declare(command{
+		Name:        "update",
+		Description: "Change a workspace's display name, description, organization or settings",
+		Method:      http.MethodPatch,
+		Path:        "/workspaces/:slug",
+		Args:        []argSpec{slugArg},
+		Auth:        authUser,
+		Flags: func(fs *pflag.FlagSet) {
+			for _, f := range workspaceUpdateFlags {
+				fs.String(f.flag, "", f.usage)
+			}
+			for _, f := range workspaceUpdateFlags {
+				fs.Bool(f.clear, false, "send null as the "+f.member+", which the hub resets to its default; wins over --"+f.flag)
+			}
+			addSettingFlag(fs)
+		},
+		Run: func(c *call) error {
+			body, err := workspaceUpdateBody(c.cmd)
+			if err != nil {
+				return err
+			}
+			return sendWith(c, nil, body)
+		},
+	})
+	checkUpdateLine := update.Args
+	// The body is built here too, so that an update with nothing to send
+	// or a --setting the parser refuses fails with the other usage errors,
+	// before any setting is resolved or any request sent (ADR 02).
+	update.Args = func(cmd *cobra.Command, args []string) error {
+		if err := checkUpdateLine(cmd, args); err != nil {
+			return err
+		}
+		_, err := workspaceUpdateBody(cmd)
+		return err
+	}
+	return update
+}
+
+// listWorkspaces is the run step of parley workspace list: it sends a query
+// parameter for each flag given and none for a flag not given, so the hub's
+// defaults apply, and prints the page. A value the hub would refuse (a limit
+// of 0, a cursor of another query) is sent as given, so that the hub's own
+// error says what is wrong with it.
+func listWorkspaces(c *call) error {
+	fs := c.cmd.Flags()
+	query := url.Values{}
+	for _, name := range []string{"include-archived", "include-forks"} {
+		if include, _ := fs.GetBool(name); include {
+			query.Set(strings.ReplaceAll(name, "-", "_"), "true")
+		}
+	}
+	for _, name := range []string{"parent", "limit", "cursor"} {
+		if f := fs.Lookup(name); f.Changed {
+			query.Set(name, f.Value.String())
+		}
+	}
+	return sendWith(c, query, nil)
+}
+
+// workspaceUpdateBody is the body of PATCH /workspaces/:slug for cmd's
+// flags: a member for each flag given, a value flag given empty sending the
+// empty string, a clear flag sending null and winning over its value flag,
+// and the settings of every --setting. With none of them given there is
+// nothing to change, which is a usage error.
+func workspaceUpdateBody(cmd *cobra.Command) (map[string]any, error) {
+	fs := cmd.Flags()
+	body := map[string]any{}
+	for _, f := range workspaceUpdateFlags {
+		if clear, _ := fs.GetBool(f.clear); clear {
+			body[f.member] = nil
+		} else if fs.Changed(f.flag) {
+			body[f.member], _ = fs.GetString(f.flag)
+		}
+	}
+	if err := addSettings(fs, body); err != nil {
+		return nil, err
+	}
+	if len(body) == 0 {
+		return nil, usageError("%s needs at least one of --display-name, --description, --org, --clear-display-name, --clear-description, --clear-org and --setting", cmd.CommandPath())
+	}
+	return body, nil
+}
+
+// addSettingFlag registers the repeatable --setting flag on fs. It is a
+// string array, not a slice: a value such as protected_branches=main,release/*
+// must reach the parser whole.
+func addSettingFlag(fs *pflag.FlagSet) {
+	fs.StringArray(settingFlag, nil, "set a workspace setting as key=value, repeatable: an empty value sends null, true and false send booleans, protected_branches takes a comma-separated list, anything else is sent as a string")
+}
+
+// addSettings puts the settings of the --setting values on fs into body,
+// parsed by ParseSettingFlags, when the flag was given.
+func addSettings(fs *pflag.FlagSet, body map[string]any) error {
+	if !fs.Changed(settingFlag) {
+		return nil
+	}
+	// GetStringArray reads the values back from their text, which loses a
+	// lone empty value; the slice itself keeps it.
+	values := fs.Lookup(settingFlag).Value.(pflag.SliceValue).GetSlice()
+	settings, err := ParseSettingFlags(values)
+	if err != nil {
+		return err
+	}
+	body["settings"] = settings
+	return nil
 }
 
 // checkWorkspaceCredential refuses, as usage errors, a credential flag given
@@ -117,15 +262,8 @@ func workspaceCreateBody(cmd *cobra.Command) (map[string]any, error) {
 			body[f.member], _ = fs.GetString(f.flag)
 		}
 	}
-	if fs.Changed(settingFlag) {
-		// GetStringArray reads the values back from their text, which
-		// loses a lone empty value; the slice itself keeps it.
-		values := fs.Lookup(settingFlag).Value.(pflag.SliceValue).GetSlice()
-		settings, err := ParseSettingFlags(values)
-		if err != nil {
-			return nil, err
-		}
-		body["settings"] = settings
+	if err := addSettings(fs, body); err != nil {
+		return nil, err
 	}
 	return body, nil
 }

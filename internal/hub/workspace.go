@@ -52,9 +52,9 @@ func (l originLister) ListOrigin(ctx context.Context, url string, cred workspace
 // composeWorkspaces adds the workspace fields to the workspace records of
 // the access part and registers the workspace routes. Its start hook builds
 // the clone workers, [workspace].workers of them, and binds the workspace
-// service to the stores, the secret and event components of the parts
-// composed before it, the hub's git, which lists origins and makes the
-// workspaces' copies, the hub's scrubber, logger and clock,
+// service to the stores, the secret and event components and the access
+// rule of the parts composed before it, the hub's git, which lists origins
+// and makes the workspaces' copies, the hub's scrubber, logger and clock,
 // [server].external_url, [workspace].path, where the copies live, and the
 // workers, which are told about every workspace created, after every
 // adjuster AdjustWorkspace added has changed those dependencies. It then
@@ -63,13 +63,17 @@ func (l originLister) ListOrigin(ctx context.Context, url string, cred workspace
 // start. The workers run in the background work, which begins only once the
 // hub listens, so that a start that fails after the hook leaves no clone
 // running over stores that are closed; they are stopped when the hub stops.
-// The service
-// exists from the composition on, so a later part keeps it through
-// Composition.Workspaces and registers its setting keys on
-// Workspaces().Settings() when it is composed.
+// The service exists from the composition on, with the keys of the settings
+// table registered on its settings registry, so a later part keeps it
+// through Composition.Workspaces.
 func composeWorkspaces(c *Composition) {
 	svc := &workspace.Service{}
 	c.workspaces = svc
+	// The registry is fresh, so a failure is a programming error, which
+	// panics like an invalid route does.
+	if err := workspace.RegisterSettingKeys(svc.Settings()); err != nil {
+		panic(err)
+	}
 	// One git for the part, so that every call it makes to an origin runs
 	// with the same environment.
 	git := gitFor(c.env)
@@ -88,6 +92,7 @@ func composeWorkspaces(c *Composition) {
 			Store:       rt.Store,
 			Secrets:     c.Secrets(),
 			Events:      c.Events(),
+			Access:      c.access,
 			Lister:      originLister{git},
 			Git:         git,
 			Notify:      workers.Enqueue,

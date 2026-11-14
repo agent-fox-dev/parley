@@ -23,8 +23,11 @@ import (
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
-// createEvent is the event type a create writes.
-const createEvent = "parley.workspace.create"
+// The event types a create and an update write.
+const (
+	createEvent = "parley.workspace.create"
+	updateEvent = "parley.workspace.update"
+)
 
 // world is a hub the workspace route tests ask: the users u and v, each with
 // an API key and a personal org, the hub's secret and event components, a
@@ -224,11 +227,73 @@ func (w *world) create(t *testing.T, cred string, body any) answer {
 	return answer{status, b}
 }
 
+// get asks GET /workspaces/<slug> with cred as the bearer credential.
+func (w *world) get(t *testing.T, cred, slug string) answer {
+	t.Helper()
+	status, b := w.Call(t, http.MethodGet, "/api/v1/workspaces/"+slug, cred, nil)
+	return answer{status, b}
+}
+
+// patch sends body to PATCH /workspaces/<slug> with cred as the bearer
+// credential.
+func (w *world) patch(t *testing.T, cred, slug string, body any) answer {
+	t.Helper()
+	status, b := w.Call(t, http.MethodPatch, "/api/v1/workspaces/"+slug, cred, body)
+	return answer{status, b}
+}
+
+// list asks GET /workspaces?<query> with cred as the bearer credential.
+func (w *world) list(t *testing.T, cred, query string) answer {
+	t.Helper()
+	status, b := w.Call(t, http.MethodGet, "/api/v1/workspaces?"+query, cred, nil)
+	return answer{status, b}
+}
+
+// page decodes a, which must be 200, as a page of a list: the slug and the
+// access of each item in order, and next_cursor. items must be a JSON
+// array, never null, of workspace objects.
+func (a answer) page(t *testing.T) (slugs, levels []string, next *string) {
+	t.Helper()
+	var p struct {
+		Items      json.RawMessage `json:"items"`
+		NextCursor *string         `json:"next_cursor"`
+	}
+	if err := json.Unmarshal(a.body, &p); err != nil || a.status != http.StatusOK || len(p.Items) == 0 || p.Items[0] != '[' {
+		t.Fatalf("answer = %d %s, want 200 with an items array", a.status, a.body)
+	}
+	var items []map[string]any
+	if err := json.Unmarshal(p.Items, &items); err != nil {
+		t.Fatal(err)
+	}
+	for _, it := range items {
+		if len(it) != len(objectMembers) {
+			t.Errorf("item %v has %d members, want the %d of a workspace object", it["slug"], len(it), len(objectMembers))
+		}
+		slug, _ := it["slug"].(string)
+		level, _ := it["access"].(string)
+		slugs, levels = append(slugs, slug), append(levels, level)
+	}
+	return slugs, levels, p.NextCursor
+}
+
+// objectMembers are the members of every workspace object.
+var objectMembers = []string{"slug", "kind", "workspace_mode", "git_url", "default_branch", "owner_id", "org_id",
+	"status", "display_name", "description", "head_sha", "origin_head_sha", "clone_error", "last_sync_at",
+	"sync_error", "upstream_url", "integration_branch", "upstream_head_sha", "parent_slug", "fork_point",
+	"expires_at", "auto_change", "purpose", "session_id", "settings", "created_at", "updated_at", "org_slug",
+	"hub_url", "access"}
+
 // object decodes a, which must be 201, as a workspace object.
 func (a answer) object(t *testing.T) map[string]any {
 	t.Helper()
-	if a.status != http.StatusCreated {
-		t.Fatalf("answer = %d %s, want 201", a.status, a.body)
+	return a.decode(t, http.StatusCreated)
+}
+
+// decode decodes a, which must have the status want, as a JSON object.
+func (a answer) decode(t *testing.T, want int) map[string]any {
+	t.Helper()
+	if a.status != want {
+		t.Fatalf("answer = %d %s, want %d", a.status, a.body, want)
 	}
 	var obj map[string]any
 	if err := json.Unmarshal(a.body, &obj); err != nil {
@@ -311,8 +376,8 @@ func (w *world) secretCount() (int, error) {
 	return total, nil
 }
 
-// fail makes the write named fault of every create fail until it is called
-// with "".
+// fail makes the write named fault of every create, and of every update for
+// the event write, fail until it is called with "".
 func (w *world) fail(fault string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -391,7 +456,7 @@ func (w *world) footprint(t *testing.T) footprint {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return footprint{w.workspaces(t), secrets, len(w.createEvents(t)), w.origin.called()}
+	return footprint{w.workspaces(t), secrets, len(w.eventsOf(t, createEvent)), w.origin.called()}
 }
 
 // workspace reads the record slug from the store; found is false when there
@@ -434,8 +499,8 @@ func (w *world) eventCount(t *testing.T) int {
 	return len(recs)
 }
 
-// createEvents are the parley.workspace.create events of the log.
-func (w *world) createEvents(t *testing.T) []event.Record {
+// eventsOf are the events of the log of type typ, in the log's order.
+func (w *world) eventsOf(t *testing.T, typ string) []event.Record {
 	t.Helper()
 	recs, _, err := w.events.ReadAfter(context.Background(), 0, 0)
 	if err != nil {
@@ -443,7 +508,7 @@ func (w *world) createEvents(t *testing.T) []event.Record {
 	}
 	var out []event.Record
 	for _, r := range recs {
-		if r.Type == createEvent {
+		if r.Type == typ {
 			out = append(out, r)
 		}
 	}
@@ -665,17 +730,50 @@ func eventually(t *testing.T, what string, cond func() bool) {
 // create.
 func (w *world) insertRecord(t *testing.T, slug string, status workspace.Status, created time.Time, url string) {
 	t.Helper()
+	w.put(t, workspace.Workspace{Slug: slug, Status: status, GitURL: &url, CreatedAt: created})
+}
+
+// put stores the workspace record rec, with what it leaves zero filled in
+// as a create would: a standard repository of the user u in u's personal
+// org, pending, created and updated at the hub's time, with an instance id.
+func (w *world) put(t *testing.T, rec workspace.Workspace) {
+	t.Helper()
+	if rec.Kind == "" {
+		rec.Kind = access.KindRepository
+	}
+	if rec.Mode == "" {
+		rec.Mode = workspace.ModeStandard
+	}
+	if rec.OwnerID == "" {
+		rec.OwnerID = w.u
+	}
+	if rec.OrgID == "" {
+		rec.OrgID = w.uOrg.ID
+	}
+	if rec.Status == "" {
+		rec.Status = workspace.StatusPending
+	}
+	if rec.CreatedAt.IsZero() {
+		rec.CreatedAt = w.clock()
+	}
+	if rec.UpdatedAt.IsZero() {
+		rec.UpdatedAt = rec.CreatedAt
+	}
+	rec.InstanceID = workspace.NewInstanceID()
 	ctx := context.Background()
-	err := w.Store.Tx(ctx, func(tx *sql.Tx) error {
-		return workspace.Insert(ctx, tx, workspace.Workspace{
-			Slug: slug, Kind: access.KindRepository, Mode: workspace.ModeStandard, GitURL: &url,
-			OwnerID: w.u, OrgID: w.uOrg.ID, Status: status, CreatedAt: created, UpdatedAt: created,
-			InstanceID: workspace.NewInstanceID(),
-		})
-	})
-	if err != nil {
+	if err := w.Store.Tx(ctx, func(tx *sql.Tx) error { return workspace.Insert(ctx, tx, rec) }); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// acme creates the org acme with the users u and v as members and returns
+// its id.
+func (w *world) acme(t *testing.T) string {
+	t.Helper()
+	id := w.CreateOrg(t, "acme")
+	w.AddMember(t, id, w.u)
+	w.AddMember(t, id, w.v)
+	return id
 }
 
 // setPending puts the workspace slug back to pending with its other clone
