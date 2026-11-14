@@ -19,21 +19,25 @@ const eventsGrace = time.Second
 
 // composeEvents adds the hub events to the transactional store and binds
 // the event component in a start hook to the stores, the hub's clock and
-// scrubber, and the fork-parent lookup over the workspace records, and runs
-// it as background work: Run follows the commits for the waiters and the
-// OnCommit callbacks until the stop, and the stop waits for it before the
-// stores close (ADR 05). The component exists from the composition on, so a later part keeps it
-// through Composition.Events; the hooks that run after this one, those of
-// the later parts and of Options.Compose, may emit, before the hub listens.
+// scrubber, the fork-parent lookup over the workspace records, and the
+// access rule and memberships composeAccess binds, from which it decides who
+// sees an event. It runs the component as background work: Run follows the
+// commits for the waiters and the OnCommit callbacks until the stop, and the
+// stop waits for it before the stores close (ADR 05). The component exists
+// from the composition on, so a later part keeps it through
+// Composition.Events; the hooks that run after this one, those of the later
+// parts and of Options.Compose, may emit, before the hub listens.
 func composeEvents(c *Composition) {
 	c.events = &event.Component{}
 	c.AddSchemaStep(event.SchemaStep)
 	c.AddStartHook(eventsHook, func(_ context.Context, rt *Runtime) error {
 		return c.events.Bind(event.Deps{
-			Store:    rt.Store,
-			Clock:    event.SystemClock(rt.Now),
-			Scrubber: rt.Scrubber,
-			Parents:  event.ForkParentsFunc(forkParent),
+			Store:       rt.Store,
+			Clock:       event.SystemClock(rt.Now),
+			Scrubber:    rt.Scrubber,
+			Parents:     event.ForkParentsFunc(forkParent),
+			Access:      c.access,
+			Memberships: activeOrgs(rt.Store.Main()),
 		})
 	})
 	c.AddBackgroundWork(eventsHook, eventsGrace, func(ctx context.Context, _ *Runtime) { c.events.Run(ctx) })

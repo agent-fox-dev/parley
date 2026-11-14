@@ -16,6 +16,7 @@ import (
 	"time"
 	"uuid"
 
+	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/scrub"
 	"github.com/agent-fox-dev/parley/internal/server/timefmt"
 	"github.com/agent-fox-dev/parley/internal/store"
@@ -97,14 +98,22 @@ type Deps struct {
 	// Parents looks up the parent of a task fork at emit time; nil stores no
 	// parent unless the caller passes one.
 	Parents ForkParents
+	// Access is the hub's access rule, from which the visibility decision
+	// reads a user's level on a workspace; nil lets no user see an event of
+	// a workspace.
+	Access Access
+	// Memberships is the membership question the access rule asks, which
+	// decides who sees an org-scoped event; nil lets no user see one.
+	Memberships access.Memberships
 }
 
 // Component is the hub's event component, one per hub. The hub creates it
 // when it is composed, so that other parts can keep it, and binds it with
 // Bind once the stores are open; New does both at once.
 type Component struct {
-	deps   Deps
-	notify notifier
+	deps     Deps
+	notify   notifier
+	injected injected
 }
 
 // New returns a component bound to d.

@@ -1353,8 +1353,9 @@ takes the orgs it has read and looks a parent up among the records it has
 collected, which hold every repository the user has a level on, so a parent
 that is not among them is one the user has no level on. A workspace is
 therefore in a user's set exactly when `Level` resolves a level other than
-`LevelNone` for it, with that level. No production code calls `Readable`
-yet; the workspace list, the event stream and the audit query will.
+`LevelNone` for it, with that level. The visibility decision of the hub
+events calls `Readable` (see [Hub events](#hub-events)); the workspace list
+and the audit query will.
 
 ### Hub events
 
@@ -1362,8 +1363,11 @@ yet; the workspace list, the event stream and the audit query will.
 in `parts`. It creates a zero `event.Component`, adds the schema step
 `event.SchemaStep` (`hub_events`) and binds the component in the start hook
 `events` to `event.Deps{Store: rt.Store, Clock: event.SystemClock(rt.Now),
-Scrubber: rt.Scrubber, Parents: ...}`, the fork-parent lookup being
-`access.RecordBySlug` read in the emitting transaction. `Bind` reads
+Scrubber: rt.Scrubber, Parents: ..., Access: c.access, Memberships: ...}`, the
+fork-parent lookup being `access.RecordBySlug` read in the emitting
+transaction, `c.access` the `*access.Service` that `composeAccess` creates and
+keeps on the composition, and the memberships the same
+`identity.ActiveOrgIDs` source that service is bound to. `Bind` reads
 `last_seq`, and its error fails the start. The start hooks that run after it,
 those of the parts listed after `composeEvents` and of `Options.Compose`, may
 emit before the hub listens; a call made before the component is bound
@@ -1466,6 +1470,50 @@ is exact. `WrittenByType` counts the events committed since the bind, by
 type; a rolled-back emit is never counted. `OpenStreams` counts the stream
 places taken with the unexported `takePlace(limit)`, which refuses once
 `limit` are taken, and not yet given back with `givePlace()`.
+
+`internal/event/visibility.go` decides who may see an event, at the time it
+is delivered. `(*Component).Visible(ctx, caller, rec)` returns `(bool,
+error)` for an `event.Caller{Admin, UserID, CredentialID, Workspace}`, where
+`Workspace` is the binding of a workspace-bound PAT and `""` otherwise;
+`event.CallerOf(r)` builds it from `server.CallerOf` and
+`identity.PrincipalOf` (the zero `Caller`, who sees nothing, on a public
+route). The rules:
+
+- the admin token sees every event, also one of a workspace that no longer
+  exists; a caller with no user sees none;
+- an event of a workspace is seen by a user whose level, from the readable
+  set of `Deps.Access` (`access.Service.Readable`), is `admin`, `owner` or
+  `member` on the workspace or on the fork parent stored with the event, so a
+  fork's events stay visible to the parent's readers after the fork's record
+  is deleted. A slug with no record gives no level. The types beginning with
+  `parley.secret.`, `parley.token.` or `parley.webhook.` need `owner` there
+  (`parley.forge.webhook.set` is not one of them);
+- an event of no workspace is seen by the user whose id is
+  `metadata.scope_id` when `metadata.scope` is `user`, by the members of the
+  active org `metadata.scope_id` names when it is `org` (asked through
+  `Deps.Memberships`, the access rule's own membership question, so a blocked
+  org grants nothing), and by nobody else when there is no other scope;
+- a workspace-bound PAT never sees an event of no workspace. It sees an event
+  of a workspace its binding covers, asked through the `event.Coverage`
+  installed with `(*Component).SetCoverage`, under its user's level. A token
+  bound to a task fork also sees, under its user's level, the events of the
+  fork's parent whose `resource_type` is `change` and whose change, numbered
+  `resource_id`, has the fork as its source, asked through the
+  `event.ChangeSources` installed with `(*Component).SetChangeSources`.
+  Without a covered set a bound token sees nothing; without a change lookup
+  it sees none of the parent's events. Nothing installs either yet, so a
+  bound token sees no event.
+
+A read that fails returns `false` with the error, never a grant. The
+covered set and the change lookup are kept apart from `Deps`, so the bind in
+the start hook does not reset what a part installed when it was composed. A
+batch of events (a page of the log, a stream delivery) is decided by one
+unexported viewer, which reads the readable set, the active orgs, the
+coverage and the change sources each at most once, when an event first needs
+them, and is dropped with the batch, so a change of access takes effect at
+the next delivery. `(*Component).VisibleToOwnerOf(ctx, workspace, rec)`, the
+form event webhooks use, is true exactly for the events whose workspace, or
+stored fork parent, is `workspace`, of every type, and reads nothing.
 
 The component's `event.Clock` has `Now()` and `NewTimer(d)`, so that tests
 control the time events are stamped with and the timers of the waits;

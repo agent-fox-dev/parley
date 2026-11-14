@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
@@ -55,5 +56,45 @@ func TestEvents_NotifiesCommitsWhileTheHubServes(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("no commit notified within 5 s of the start")
+	}
+}
+
+func TestEvents_DecidesVisibilityWithTheHubsAccessRule(t *testing.T) {
+	t.Parallel()
+	var events *event.Component
+	h := hubtest.Start(t, func(c *hub.Composition) { events = c.Events() })
+	dev, mem, out := h.CreateUser(t, "dev"), h.CreateUser(t, "mem"), h.CreateUser(t, "out")
+	acme := h.CreateOrg(t, "acme")
+	h.AddMember(t, acme, mem)
+	h.AddWorkspace(t, access.Record{Slug: "api", OwnerID: dev, OrgID: acme, Kind: access.KindRepository, Status: access.StatusReady})
+
+	ctx := context.Background()
+	api := "api"
+	onAPI, err := events.EmitNow(ctx, event.Input{Type: "parley.change.open", Workspace: &api, ActorType: "api_key",
+		ActorID: &dev, ResourceType: "change", ResourceID: "1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ofAcme, err := events.EmitNow(ctx, event.Input{Type: "parley.variable.update", ActorType: "admin_token",
+		ResourceType: "variable", ResourceID: "region", Metadata: map[string]any{"scope": "org", "scope_id": acme}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		rec  event.Record
+		user string
+		want bool
+	}{
+		{"owner, workspace event", onAPI, dev, true},
+		{"org member, workspace event", onAPI, mem, true},
+		{"no relation, workspace event", onAPI, out, false},
+		{"org member, org event", ofAcme, mem, true},
+		{"no relation, org event", ofAcme, out, false},
+	} {
+		got, err := events.Visible(ctx, event.Caller{UserID: tc.user}, tc.rec)
+		if err != nil || got != tc.want {
+			t.Errorf("%s: Visible = %v, %v, want %v, nil", tc.name, got, err, tc.want)
+		}
 	}
 }

@@ -1,15 +1,25 @@
 package event
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/scrub"
+	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/store"
 )
 
@@ -133,21 +143,27 @@ var testRowsStep = store.Step{
 }
 
 // fixture is an event component on a real store in a directory of the test,
-// with a fake clock and a real scrubber.
+// with a fake clock, a real scrubber and the real access rule over the
+// store's workspace records and memberships.
 type fixture struct {
 	t        testing.TB
 	dir      string
 	store    *store.Store
 	clock    *fakeClock
 	scrubber *scrub.Scrubber
+	access   *access.Service
 	events   *Component
+	// failMemberships makes every read of the memberships fail, for the
+	// access rule and the component alike.
+	failMemberships atomic.Bool
 	// stop ends the component's Run and waits for it, before the store
 	// closes under it.
 	stop func()
 }
 
 // newFixture opens a store in a fresh directory with the event schema, the
-// workspace records and a test table, and binds a component to it. The
+// identity and workspace records and a test table, and binds a component to
+// it. The
 // store is closed when the test ends.
 func newFixture(t testing.TB) *fixture {
 	t.Helper()
@@ -163,13 +179,16 @@ func (f *fixture) open() {
 	st, err := store.Open(context.Background(), store.Options{
 		DatabasePath:  filepath.Join(f.dir, "parley.db"),
 		WorkspaceRoot: filepath.Join(f.dir, "workspaces"),
-	}, []store.Step{access.SchemaStep, SchemaStep, testRowsStep})
+	}, []store.Step{identity.AdminSettingsStep, identity.SchemaStep, access.SchemaStep, SchemaStep, testRowsStep})
 	if err != nil {
 		f.t.Fatalf("open store: %v", err)
 	}
 	f.t.Cleanup(func() { st.Close() })
 	f.store = st
-	f.events, err = New(Deps{Store: st, Clock: f.clock, Scrubber: f.scrubber, Parents: storeParents{}})
+	f.access = &access.Service{}
+	f.access.Bind(access.Deps{Records: access.StoreRecords(st.Main()), Memberships: f.memberships()})
+	f.events, err = New(Deps{Store: st, Clock: f.clock, Scrubber: f.scrubber, Parents: storeParents{},
+		Access: f.access, Memberships: f.memberships()})
 	if err != nil {
 		f.t.Fatalf("bind the component: %v", err)
 	}
@@ -196,6 +215,21 @@ func (f *fixture) reopen() {
 		f.t.Fatalf("close store: %v", err)
 	}
 	f.open()
+}
+
+// errMembershipRead is the failure of the memberships while
+// failMemberships is set.
+var errMembershipRead = errors.New("disk I/O error reading the memberships")
+
+// memberships is the one membership source the access rule and the
+// component ask, as in the hub: the active orgs of a user in the store.
+func (f *fixture) memberships() access.Memberships {
+	return access.MembershipsFunc(func(ctx context.Context, userID string) ([]string, error) {
+		if f.failMemberships.Load() {
+			return nil, errMembershipRead
+		}
+		return identity.ActiveOrgIDs(ctx, f.store.Main(), userID)
+	})
 }
 
 // storeParents is the fork-parent lookup the hub installs: the parent slug
@@ -289,5 +323,154 @@ func valid(typ string) Input {
 		ActorID:      ptr("u_1"),
 		ResourceType: "change",
 		ResourceID:   "42",
+	}
+}
+
+// world is a fixture with an admin token, users, an org and workspaces made
+// through the identity and access components, and the router of
+// internal/server with the real check order and the identity routes:
+//
+//   - repository api of dev in the org acme, and its task fork api-f1 of mem;
+//   - repository web of dev in dev's personal org;
+//   - dev, mem and mem2 are members of acme; out has no relation.
+type world struct {
+	*fixture
+	srv   *server.Server
+	admin string
+	users map[string]string
+	acme  string
+}
+
+// newWorld builds a world on a new fixture.
+func newWorld(t testing.TB) *world {
+	t.Helper()
+	ctx := context.Background()
+	w := &world{fixture: newFixture(t), users: map[string]string{}}
+	if err := identity.IssueAdminToken(ctx, w.store, "", func(tok string) error { w.admin = tok; return nil }); err != nil {
+		t.Fatalf("issue the admin token: %v", err)
+	}
+	ids := &identity.Service{}
+	ids.Bind(identity.Deps{Store: w.store, Now: w.clock.Now})
+	w.srv = server.New(server.Options{Logger: slog.New(slog.DiscardHandler), RateLimitDisabled: true, Now: w.clock.Now})
+	w.srv.SetAuthenticator(ids.Authenticate)
+	w.srv.SetScopeCheck(identity.ScopeCheck)
+	w.srv.AddAccessCheck(ids.AdminCheck)
+	w.srv.AddAccessCheck(w.access.Check)
+	for _, r := range ids.Routes() {
+		w.srv.Register(r)
+	}
+	personal := map[string]string{}
+	for _, name := range []string{"dev", "mem", "mem2", "out"} {
+		err := w.store.Tx(ctx, func(tx *sql.Tx) error {
+			u, org, err := identity.CreateUserAndPersonalOrg(ctx, tx, identity.NewUser{Username: name,
+				Email: name + "@example.com", Provider: "github", ProviderID: name, CreatedAt: clockStart}, identity.RoleUser)
+			w.users[name], personal[name] = u.ID, org.ID
+			return err
+		})
+		if err != nil {
+			t.Fatalf("create user %s: %v", name, err)
+		}
+	}
+	w.acme = w.createOrg("acme")
+	for _, name := range []string{"dev", "mem", "mem2"} {
+		w.addMember(w.acme, name)
+	}
+	w.addWorkspace(access.Record{Slug: "api", OwnerID: w.users["dev"], OrgID: w.acme, Kind: access.KindRepository})
+	w.addWorkspace(access.Record{Slug: "api-f1", OwnerID: w.users["mem"], OrgID: w.acme, Kind: access.KindFork, ParentSlug: "api"})
+	w.addWorkspace(access.Record{Slug: "web", OwnerID: w.users["dev"], OrgID: personal["dev"], Kind: access.KindRepository})
+	return w
+}
+
+// user is the caller the user name is to the visibility decision.
+func (w *world) user(name string) Caller {
+	return Caller{UserID: w.users[name], CredentialID: "key-" + name}
+}
+
+// call sends method path to the router in-process with credential as the
+// bearer credential and body as JSON (nil for none), and returns the status
+// and the body of the answer.
+func (w *world) call(method, path, credential string, body any) (int, []byte) {
+	w.t.Helper()
+	var rd io.Reader
+	if body != nil {
+		raw, err := json.Marshal(body)
+		if err != nil {
+			w.t.Fatal(err)
+		}
+		rd = bytes.NewReader(raw)
+	}
+	req := httptest.NewRequest(method, "/api/v1"+path, rd)
+	if rd != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if credential != "" {
+		req.Header.Set("Authorization", "Bearer "+credential)
+	}
+	rec := httptest.NewRecorder()
+	w.srv.Handler().ServeHTTP(rec, req)
+	return rec.Code, rec.Body.Bytes()
+}
+
+// adminCall sends method path as the admin token and fails the test unless the
+// router answers want.
+func (w *world) adminCall(method, path string, body any, want int) []byte {
+	w.t.Helper()
+	status, out := w.call(method, path, w.admin, body)
+	if status != want {
+		w.t.Fatalf("%s %s = %d %s, want %d", method, path, status, out, want)
+	}
+	return out
+}
+
+// createOrg creates the active org slug through the admin route and returns
+// its id.
+func (w *world) createOrg(slug string) string {
+	w.t.Helper()
+	var org struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(w.adminCall(http.MethodPost, "/orgs", map[string]string{"name": slug, "slug": slug}, http.StatusCreated), &org); err != nil || org.ID == "" {
+		w.t.Fatalf("create org %s: no id (%v)", slug, err)
+	}
+	return org.ID
+}
+
+// addMember makes the user name a member of the org orgID through the admin
+// route.
+func (w *world) addMember(orgID, name string) {
+	w.t.Helper()
+	w.adminCall(http.MethodPut, "/orgs/"+orgID+"/members/"+w.users[name], nil, http.StatusNoContent)
+}
+
+// removeMember ends the user name's membership of the org orgID through the
+// admin route.
+func (w *world) removeMember(orgID, name string) {
+	w.t.Helper()
+	w.adminCall(http.MethodDelete, "/orgs/"+orgID+"/members/"+w.users[name], nil, http.StatusNoContent)
+}
+
+// blockOrg blocks the org orgID through the admin route.
+func (w *world) blockOrg(orgID string) {
+	w.t.Helper()
+	w.adminCall(http.MethodPost, "/orgs/"+orgID+"/block", nil, http.StatusOK)
+}
+
+// addWorkspace stores the ready workspace record rec through the access
+// component, as registering or forking a workspace does.
+func (w *world) addWorkspace(rec access.Record) {
+	w.t.Helper()
+	rec.Status = access.StatusReady
+	ctx := context.Background()
+	if err := w.store.Tx(ctx, func(tx *sql.Tx) error { return access.InsertRecord(ctx, tx, rec) }); err != nil {
+		w.t.Fatalf("store the workspace record %s: %v", rec.Slug, err)
+	}
+}
+
+// deleteWorkspace deletes the record of the workspace slug, as deleting the
+// workspace does.
+func (w *world) deleteWorkspace(slug string) {
+	w.t.Helper()
+	if _, err := w.store.Main().Exec(`DELETE FROM workspaces WHERE slug = ?`, slug); err != nil {
+		w.t.Fatalf("delete the workspace record %s: %v", slug, err)
 	}
 }
