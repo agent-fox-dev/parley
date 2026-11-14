@@ -400,6 +400,46 @@ func TestGit_RunsSSHInBatchModeUnlessTheCallerGivesItsOwnCommand(t *testing.T) {
 	}
 }
 
+// Not parallel: it puts a fake git first on the PATH of the test process,
+// which records the home directory and the askpass program it is given.
+func TestGit_RemovesItsPrivateDirectoryOnceGitHasRun(t *testing.T) {
+	bin := t.TempDir()
+	seen := filepath.Join(bin, "seen")
+	script := "#!/bin/sh\nprintf '%s\\n%s\\n' \"$HOME\" \"$GIT_ASKPASS\" > '" + seen + "'\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	ctx := context.Background()
+	for _, c := range []struct {
+		name string
+		run  func() error
+	}{
+		{"ListRemote with a credential", func() error {
+			_, err := gitrepo.Git{}.ListRemote(ctx, "https://example.invalid/a.git", gitrepo.Credential{Username: "u", Password: "p"})
+			return err
+		}},
+		{"Open", func() error {
+			_, err := gitrepo.Git{}.Open(ctx, t.TempDir())
+			return err
+		}},
+	} {
+		_ = os.Remove(seen)
+		if err := c.run(); err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		got, err := os.ReadFile(seen)
+		if err != nil {
+			t.Fatalf("%s: git never ran: %v", c.name, err)
+		}
+		for _, path := range strings.Fields(string(got)) {
+			if _, err := os.Stat(path); !os.IsNotExist(err) {
+				t.Errorf("%s: %s, which git ran with, is still there after the call (stat: %v)", c.name, path, err)
+			}
+		}
+	}
+}
+
 // silentListener accepts connections and never answers them.
 type silentListener struct {
 	url  string
