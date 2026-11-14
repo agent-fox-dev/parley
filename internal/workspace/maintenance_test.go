@@ -1,19 +1,24 @@
 package workspace_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
@@ -156,9 +161,87 @@ func TestMaintenance_RefusesCallersWithoutWriteAccess(t *testing.T) {
 	}
 }
 
-func TestMaintenance_TheMarkerIsReleasedWhenTheCallEnds(t *testing.T) {
+func TestMaintenance_RefusesAWorkspaceItCannotTakeWithoutTouchingIt(t *testing.T) {
 	t.Parallel()
-	for _, c := range []struct {
+	w, p, calls := recordingCollaborators(t)
+	// Each status names a repository workspace and one with a fork, the
+	// fork in the same status as its parent; each has a copy.
+	for _, status := range []workspace.Status{workspace.StatusReady, workspace.StatusFailed, workspace.StatusPending,
+		workspace.StatusCloning, workspace.StatusArchived} {
+		s := string(status)
+		w.put(t, workspace.Workspace{Slug: s, Status: status})
+		w.put(t, workspace.Workspace{Slug: s + "-forked", Status: status})
+		w.put(t, workspace.Workspace{Slug: s + "-forked--t1", Kind: access.KindFork, ParentSlug: new(s + "-forked"), Status: status})
+		for _, slug := range []string{s, s + "-forked", s + "-forked--t1"} {
+			makeCopy(t, w.svc.RepoPath(slug))
+		}
+	}
+	events := w.eventCount(t)
+	for _, c := range []struct{ op, slug, want string }{
+		{"archive", "ready-forked--t1", "400 not_supported_on_fork"},
+		{"archive", "archived", "409 workspace_archived"},
+		{"archive", "pending", "409 workspace_busy"},
+		{"archive", "cloning", "409 workspace_busy"},
+		{"reactivate", "archived-forked--t1", "400 not_supported_on_fork"},
+		{"reactivate", "ready", "409 workspace_not_archived"},
+		{"reactivate", "failed", "409 workspace_not_archived"},
+		{"reactivate", "pending", "409 workspace_not_archived"},
+		{"reactivate", "cloning", "409 workspace_not_archived"},
+		{"reclone", "ready-forked--t1", "400 fork_has_no_origin"},
+		{"reclone", "archived", "409 workspace_archived"},
+		{"reclone", "archived-forked", "409 workspace_archived"},
+		{"reclone", "pending", "409 workspace_busy"},
+		{"reclone", "cloning-forked", "409 workspace_busy"},
+		{"reclone", "ready-forked", "409 has_forks"},
+		{"reclone", "failed-forked", "409 has_forks"},
+		{"delete", "ready", "409 workspace_not_archived"},
+		{"delete", "failed", "409 workspace_not_archived"},
+		{"delete", "pending", "409 workspace_not_archived"},
+		{"delete", "cloning", "409 workspace_not_archived"},
+	} {
+		before, _ := w.workspace(t, c.slug)
+		if a := w.operate(t, c.op, w.uKey, c.slug); a.outcome(t) != c.want {
+			t.Errorf("%s of %s = %d %s, want %s", c.op, c.slug, a.status, a.body, c.want)
+		}
+		if after, _ := w.workspace(t, c.slug); !reflect.DeepEqual(after, before) {
+			t.Errorf("%s of %s changed the record from %+v to %+v", c.op, c.slug, before, after)
+		}
+		if !exists(filepath.Join(w.svc.RepoPath(c.slug), "HEAD")) {
+			t.Errorf("%s of %s removed its copy", c.op, c.slug)
+		}
+	}
+	if n := w.eventCount(t); n != events {
+		t.Errorf("refused requests wrote %d events, want none", n-events)
+	}
+	if got := calls.recorded(); len(got) != 0 {
+		t.Errorf("refused requests called collaborators: %v, want no call", got)
+	}
+	if heads, _ := p.calls(); len(heads) != 0 {
+		t.Errorf("refused requests offered branches to origin %d times, want never", len(heads))
+	}
+	if got := w.notifications(); len(got) != 0 {
+		t.Errorf("refused requests told the clone workers about %v, want nothing", got)
+	}
+}
+
+func TestMaintenance_TheCallEndsCleanlyWhateverItsCollaboratorsDo(t *testing.T) {
+	t.Parallel()
+	var log hubtest.LogBuffer
+	stubs := map[string]*stubTeardown{}
+	for _, name := range []string{"archive observer", "copy removal", "sandbox remover", "remover"} {
+		stubs[name] = &stubTeardown{name: name}
+	}
+	w := newWorld(t, withLog(&log), withTeardown(func(td *workspace.Teardown) {
+		td.RegisterSandboxRemover(stubs["sandbox remover"])
+		td.RegisterArchiveObserver(stubs["archive observer"])
+		td.RegisterRemover(stubs["remover"].remove)
+	}), withRemoveCopy(func(dir string) error {
+		if err := stubs["copy removal"].remove(context.Background(), nil, dir); err != nil {
+			return err
+		}
+		return gitrepo.Remove(dir)
+	}))
+	for i, c := range []struct {
 		name, op string
 		// status is one the operation takes; the collaborator where fails,
 		// or panics when panics is set; want is the answer.
@@ -170,6 +253,8 @@ func TestMaintenance_TheMarkerIsReleasedWhenTheCallEnds(t *testing.T) {
 		{name: "archive succeeds", op: "archive", status: workspace.StatusReady, want: "200"},
 		{name: "archive whose observer panics", op: "archive", status: workspace.StatusReady,
 			where: "archive observer", panics: true, want: "200"},
+		{name: "reclone whose copy removal fails", op: "reclone", status: workspace.StatusReady,
+			where: "copy removal", want: "200"},
 		{name: "reclone whose copy removal panics", op: "reclone", status: workspace.StatusReady,
 			where: "copy removal", panics: true, want: "200"},
 		{name: "delete whose sandbox remover fails", op: "delete", status: workspace.StatusArchived,
@@ -181,33 +266,30 @@ func TestMaintenance_TheMarkerIsReleasedWhenTheCallEnds(t *testing.T) {
 		{name: "delete succeeds", op: "delete", status: workspace.StatusArchived, want: "204"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			t.Parallel()
-			stubs := map[string]*stubTeardown{}
-			for _, name := range []string{"archive observer", "copy removal", "sandbox remover", "remover"} {
-				stubs[name] = &stubTeardown{name: name}
-			}
-			w := newWorld(t, withTeardown(func(td *workspace.Teardown) {
-				td.RegisterSandboxRemover(stubs["sandbox remover"])
-				td.RegisterArchiveObserver(stubs["archive observer"])
-				td.RegisterRemover(stubs["remover"].remove)
-			}), withRemoveCopy(func(dir string) error {
-				if err := stubs["copy removal"].remove(context.Background(), nil, dir); err != nil {
-					return err
-				}
-				return gitrepo.Remove(dir)
-			}))
-			w.put(t, workspace.Workspace{Slug: "demo", Status: c.status})
+			slug := fmt.Sprintf("demo%d", i)
+			w.put(t, workspace.Workspace{Slug: slug, Status: c.status})
 			if c.where != "" {
 				stubs[c.where].set(errors.New("the "+c.where+" failed"), c.panics)
 			}
 
-			if a := w.operate(t, c.op, w.uKey, "demo"); a.outcome(t) != c.want {
+			if a := w.operate(t, c.op, w.uKey, slug); a.outcome(t) != c.want {
 				t.Fatalf("%s = %d %s, want %s", c.op, a.status, a.body, c.want)
 			}
 
-			rec, found := w.workspace(t, "demo")
+			rec, found := w.workspace(t, slug)
+			if c.op == "reclone" && (rec.Status != workspace.StatusPending || !slices.Contains(w.notifications(), slug)) {
+				t.Errorf("after the reclone %s is %s and the clone workers were told of %v, want pending and told", slug, rec.Status, w.notifications())
+			}
+			// A failure the call answers success despite is logged with the slug.
+			failure := "the " + c.where + " failed"
+			if c.panics {
+				failure = "the " + c.where + " panicked"
+			}
+			if c.where != "" && c.want == "200" && (!strings.Contains(log.String(), "slug="+slug) || !strings.Contains(log.String(), failure)) {
+				t.Errorf("the log does not report %q with the slug %s:\n%s", failure, slug, log.String())
+			}
 			if gone := c.want == "204"; found == gone {
-				t.Fatalf("the record of demo is there = %t after the call, want %t", found, !gone)
+				t.Fatalf("the record of %s is there = %t after the call, want %t", slug, found, !gone)
 			}
 			if found && rec.Marker != workspace.MarkerNone {
 				t.Errorf("the marker is %q after the call, want it released", rec.Marker)
@@ -216,17 +298,17 @@ func TestMaintenance_TheMarkerIsReleasedWhenTheCallEnds(t *testing.T) {
 				stubs[c.where].set(nil, false)
 			}
 			if !found {
-				if a := w.operate(t, c.op, w.uKey, "demo"); a.outcome(t) != "404 not_found" {
+				if a := w.operate(t, c.op, w.uKey, slug); a.outcome(t) != "404 not_found" {
 					t.Errorf("%s of the deleted workspace = %d %s, want 404 not_found", c.op, a.status, a.body)
 				}
 				return
 			}
 			// The workspace qualifies again: the next call is judged by its
 			// status alone.
-			if _, err := w.Store.Main().Exec(`UPDATE workspaces SET status = ? WHERE slug = 'demo'`, string(c.status)); err != nil {
+			if _, err := w.Store.Main().Exec(`UPDATE workspaces SET status = ? WHERE slug = ?`, string(c.status), slug); err != nil {
 				t.Fatal(err)
 			}
-			if a := w.operate(t, c.op, w.uKey, "demo"); a.status >= 300 {
+			if a := w.operate(t, c.op, w.uKey, slug); a.status >= 300 {
 				t.Errorf("the next %s = %d %s, want it to succeed", c.op, a.status, a.body)
 			}
 		})
@@ -317,18 +399,24 @@ func (w *world) cloneFrom(t *testing.T, slug string, o *gitrepotest.Origin) {
 	}
 }
 
-// send sends method path, with no body, with cred as the bearer
-// credential, from its own goroutine, and delivers the status on the
-// channel it returns; 0 for a request that got no answer.
-func (w *world) send(method, cred, path string) <-chan int {
+// send sends method path, with body as JSON (nil for none) and cred as the
+// bearer credential, from its own goroutine, and delivers the status on
+// the channel it returns; 0 for a request that got no answer.
+func (w *world) send(method, cred, path string, body any) <-chan int {
 	done := make(chan int, 1)
 	go func() {
-		req, err := http.NewRequest(method, w.URL(path), nil)
+		var r io.Reader
+		if body != nil {
+			b, _ := json.Marshal(body)
+			r = bytes.NewReader(b)
+		}
+		req, err := http.NewRequest(method, w.URL(path), r)
 		if err != nil {
 			done <- 0
 			return
 		}
 		req.Header.Set("Authorization", "Bearer "+cred)
+		req.Header.Set("Content-Type", "application/json")
 		res, err := http.DefaultClient.Do(req)
 		if err != nil {
 			done <- 0
@@ -351,7 +439,7 @@ func TestMaintenance_OneOperationAtATimeOnAWorkspace(t *testing.T) {
 	a.Block()
 	asked := a.Requests()
 
-	first := w.send(http.MethodPost, w.uKey, "/api/v1/workspaces/demo/archive")
+	first := w.send(http.MethodPost, w.uKey, "/api/v1/workspaces/demo/archive", nil)
 	eventually(t, "the archive of demo asks origin", func() bool { return a.Requests() > asked })
 
 	for _, op := range []string{"archive", "reclone", "delete"} {

@@ -1,60 +1,23 @@
 package workspace_test
 
 import (
-	"context"
 	"net/http"
 	"os"
 	"path/filepath"
-	"reflect"
 	"slices"
-	"sync"
 	"testing"
 
-	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/event"
-	"github.com/agent-fox-dev/parley/internal/hub"
-	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
 // reactivateEvent is the event a reactivate writes.
 const reactivateEvent = "parley.workspace.reactivate"
 
-// statusAtNotify records, for every clone notification, the status the
-// store holds for the workspace at that moment, before the world's own
-// notification runs.
-type statusAtNotify struct {
-	mu   sync.Mutex
-	seen []workspace.Status
-}
-
-func (s *statusAtNotify) option() option {
-	return func(c *hubtest.Config, w *world) {
-		withCompose(func(comp *hub.Composition) {
-			comp.AdjustWorkspace(func(d *workspace.Deps) {
-				next := d.Notify
-				d.Notify = func(slug string) {
-					rec, _, _ := workspace.BySlug(context.Background(), w.Store.Main(), slug)
-					s.mu.Lock()
-					s.seen = append(s.seen, rec.Status)
-					s.mu.Unlock()
-					next(slug)
-				}
-			})
-		})(c, w)
-	}
-}
-
-func (s *statusAtNotify) recorded() []workspace.Status {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return slices.Clone(s.seen)
-}
-
 func TestReactivate_PutsAnArchivedWorkspaceBackToPending(t *testing.T) {
 	t.Parallel()
-	seen := &statusAtNotify{}
-	w := newWorld(t, seen.option())
+	steps := &teardownLog{}
+	w := newWorld(t, recordSteps(steps))
 	w.put(t, workspace.Workspace{Slug: "demo", Status: workspace.StatusArchived})
 	for _, c := range []struct {
 		name      string
@@ -79,14 +42,13 @@ func TestReactivate_PutsAnArchivedWorkspaceBackToPending(t *testing.T) {
 			a := w.operate(t, "reactivate", c.cred, "demo")
 
 			rec, _ := w.workspace(t, "demo")
-			evs := w.eventsOf(t, reactivateEvent)
 			if c.fault != "" {
-				if a.status != http.StatusInternalServerError || a.errorType(t) != "internal" {
+				if a.outcome(t) != "500 internal" {
 					t.Errorf("answer = %d %s, want 500 internal", a.status, a.body)
 				}
-				if rec.Status != workspace.StatusArchived || len(evs) != events || len(w.notifications()) != notified {
+				if n := len(w.eventsOf(t, reactivateEvent)); rec.Status != workspace.StatusArchived || n != events || len(w.notifications()) != notified {
 					t.Errorf("status %s, %d reactivate events and %d clone notifications after a failed reactivate, want archived and none",
-						rec.Status, len(evs)-events, len(w.notifications())-notified)
+						rec.Status, n-events, len(w.notifications())-notified)
 				}
 				return
 			}
@@ -97,61 +59,14 @@ func TestReactivate_PutsAnArchivedWorkspaceBackToPending(t *testing.T) {
 			if rec.Status != workspace.StatusPending || rec.CloneError != nil {
 				t.Errorf("stored status %s clone_error %v, want pending and null", rec.Status, deref(rec.CloneError))
 			}
-			if len(evs) != events+1 {
-				t.Fatalf("%d reactivate events written, want 1", len(evs)-events)
-			}
-			ev := evs[events]
-			if deref(ev.Workspace) != "demo" || ev.ActorType != c.actorType || deref(ev.ActorID) != c.actorID || string(ev.Metadata) != "{}" {
-				t.Errorf("reactivate event of workspace %q by %s %q with %s, want workspace demo by %s %q with {}",
-					deref(ev.Workspace), ev.ActorType, deref(ev.ActorID), ev.Metadata, c.actorType, c.actorID)
-			}
+			w.checkEvent(t, reactivateEvent, events, "demo", c.actorType, c.actorID, map[string]any{})
 			if got := w.notifications()[notified:]; !slices.Equal(got, []string{"demo"}) {
 				t.Errorf("clone notifications %v, want [demo]", got)
 			}
-			if got := seen.recorded(); len(got) == 0 || got[len(got)-1] != workspace.StatusPending {
-				t.Errorf("the clone workers were told while the store held %v, want pending: after the commit", got)
+			if got := steps.recorded(); len(got) == 0 || got[len(got)-1] != "notify demo copy=false pending" {
+				t.Errorf("the clone workers were told %v, want while the store held pending: after the commit", got)
 			}
 		})
-	}
-}
-
-func TestReactivate_RefusesWithoutTouchingTheWorkspace(t *testing.T) {
-	t.Parallel()
-	w := newWorld(t)
-	for _, rec := range []workspace.Workspace{
-		{Slug: "demo", Status: workspace.StatusArchived},
-		{Slug: "demo--t1", Kind: access.KindFork, ParentSlug: new("demo"), Status: workspace.StatusArchived},
-		{Slug: "ready", Status: workspace.StatusReady},
-		{Slug: "failed", Status: workspace.StatusFailed},
-		{Slug: "pending", Status: workspace.StatusPending},
-		{Slug: "cloning", Status: workspace.StatusCloning},
-	} {
-		w.put(t, rec)
-	}
-	for _, c := range []struct {
-		slug      string
-		status    int
-		errorType string
-	}{
-		{"demo--t1", http.StatusBadRequest, "not_supported_on_fork"},
-		{"ready", http.StatusConflict, "workspace_not_archived"},
-		{"failed", http.StatusConflict, "workspace_not_archived"},
-		{"pending", http.StatusConflict, "workspace_not_archived"},
-		{"cloning", http.StatusConflict, "workspace_not_archived"},
-	} {
-		before, _ := w.workspace(t, c.slug)
-		if a := w.operate(t, "reactivate", w.uKey, c.slug); a.status != c.status || a.errorType(t) != c.errorType {
-			t.Errorf("reactivate of %s = %d %s, want %d %s", c.slug, a.status, a.body, c.status, c.errorType)
-		}
-		if after, _ := w.workspace(t, c.slug); !reflect.DeepEqual(after, before) {
-			t.Errorf("reactivate of %s changed the record from %+v to %+v", c.slug, before, after)
-		}
-	}
-	if evs := w.eventsOf(t, reactivateEvent); len(evs) != 0 {
-		t.Errorf("refused reactivates wrote %d reactivate events, want none", len(evs))
-	}
-	if got := w.notifications(); len(got) != 0 {
-		t.Errorf("refused reactivates told the clone workers about %v, want nothing", got)
 	}
 }
 
@@ -191,14 +106,7 @@ func TestReactivate_CloneWorkClonesOriginAfreshWhenTheCopyIsNoLongerValid(t *tes
 			if a := s.operate(t, "reactivate", s.uKey, syncSlug); a.status != http.StatusOK {
 				t.Fatalf("reactivate = %d %s, want 200", a.status, a.body)
 			}
-			var rec workspace.Workspace
-			eventually(t, "the clone work of the reactivated workspace ends", func() bool {
-				rec, _ = s.workspace(t, syncSlug)
-				return rec.Status == workspace.StatusReady || rec.Status == workspace.StatusFailed
-			})
-			if rec.Status != workspace.StatusReady {
-				t.Fatalf("the reactivated workspace is %s (%v), want ready", rec.Status, deref(rec.CloneError))
-			}
+			rec := s.cloned(t, syncSlug)
 			if main := ref(t, s.copy, "refs/heads/main"); main != originMain || deref(rec.HeadSHA) != originMain {
 				t.Errorf("the copy's main %s and head_sha %s after the fresh clone, want origin's main %s", main, deref(rec.HeadSHA), originMain)
 			}

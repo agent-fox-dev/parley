@@ -1659,3 +1659,38 @@ func exists(path string) bool {
 	_, err := os.Lstat(path)
 	return err == nil
 }
+
+// checkEvent fails the test unless the events of type typ are the n there
+// were before and one more, of the workspace slug, by actorType actorID,
+// with the metadata meta.
+func (w *world) checkEvent(t *testing.T, typ string, n int, slug, actorType, actorID string, meta map[string]any) {
+	t.Helper()
+	evs := w.eventsOf(t, typ)
+	if len(evs) != n+1 {
+		t.Fatalf("%d %s events written, want 1", len(evs)-n, typ)
+	}
+	ev := evs[n]
+	var got map[string]any
+	if err := json.Unmarshal(ev.Metadata, &got); err != nil {
+		t.Fatal(err)
+	}
+	if deref(ev.Workspace) != slug || ev.ActorType != actorType || deref(ev.ActorID) != actorID || !reflect.DeepEqual(got, meta) {
+		t.Errorf("%s event of workspace %q by %s %q with %v, want workspace %q by %s %q with %v",
+			typ, deref(ev.Workspace), ev.ActorType, deref(ev.ActorID), got, slug, actorType, actorID, meta)
+	}
+}
+
+// cloned waits for the clone work of the workspace slug to end and fails
+// the test unless it left the workspace ready; it returns the record.
+func (w *world) cloned(t *testing.T, slug string) workspace.Workspace {
+	t.Helper()
+	var rec workspace.Workspace
+	eventually(t, "the clone work of "+slug+" ends", func() bool {
+		rec, _ = w.workspace(t, slug)
+		return rec.Status == workspace.StatusReady || rec.Status == workspace.StatusFailed
+	})
+	if rec.Status != workspace.StatusReady {
+		t.Fatalf("the clone work left %s %s (%v), want ready", slug, rec.Status, deref(rec.CloneError))
+	}
+	return rec
+}
