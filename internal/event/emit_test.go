@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"regexp"
+	"sync"
 	"testing"
 	"time"
 
@@ -287,5 +288,229 @@ func TestEmit_StoresTheForkParent(t *testing.T) {
 		if len(read) != 1 || read[0].parent != tc.want {
 			t.Errorf("%s: read back %+v, want parent %q", tc.name, read, tc.want)
 		}
+	}
+}
+
+func TestEmit_ConcurrentWritersStayOrdered(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	ctx := context.Background()
+	const writers, perWriter = 20, 25
+
+	var wg sync.WaitGroup
+	errs := make(chan error, writers*perWriter)
+	for w := range writers {
+		wg.Go(func() {
+			for i := range perWriter {
+				errs <- f.store.Tx(ctx, func(tx *sql.Tx) error {
+					if _, err := f.events.Emit(ctx, tx, valid("parley.change.open")); err != nil {
+						return err
+					}
+					// Some writers hold their transaction open after the
+					// emit, so a reader runs while a seq is uncommitted.
+					if (w+i)%5 == 0 {
+						time.Sleep(time.Millisecond)
+					}
+					return nil
+				})
+			}
+		})
+	}
+	writing := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(writing)
+	}()
+
+	var longest int
+	for reading := true; reading; {
+		select {
+		case <-writing:
+			reading = false
+		default:
+		}
+		got := seqs(f.readAll(0))
+		for i, seq := range got {
+			if seq != int64(i+1) {
+				t.Fatalf("a read returned seqs %v, not a prefix of 1..n without a hole", got)
+			}
+		}
+		if len(got) < longest {
+			t.Fatalf("a read returned %d events after one returned %d", len(got), longest)
+		}
+		longest = len(got)
+	}
+
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("a writer failed: %v", err)
+		}
+	}
+	recs := f.readAll(0)
+	ids := map[string]bool{}
+	for i, rec := range recs {
+		if rec.Seq != int64(i+1) {
+			t.Fatalf("the log holds seqs %v, want 1..%d", seqs(recs), writers*perWriter)
+		}
+		ids[rec.ID] = true
+	}
+	if len(recs) != writers*perWriter || len(ids) != writers*perWriter {
+		t.Errorf("the log holds %d events with %d distinct ids, want %d of each", len(recs), len(ids), writers*perWriter)
+	}
+	if got := f.events.Counters(); got.LastSeq != writers*perWriter || got.WrittenByType["parley.change.open"] != writers*perWriter {
+		t.Errorf("Counters = %+v, want last_seq and parley.change.open both %d", got, writers*perWriter)
+	}
+}
+
+func TestCounters_ReportSeqStreamsAndTypes(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	ctx := context.Background()
+	f.emit(valid("parley.change.open"))
+	f.emit(valid("parley.change.open"))
+	f.emit(valid("parley.claim.create"))
+	err := f.store.Tx(ctx, func(tx *sql.Tx) error {
+		if _, err := f.events.Emit(ctx, tx, valid("parley.change.land")); err != nil {
+			return err
+		}
+		return errors.New("refused")
+	})
+	if err == nil {
+		t.Fatal("the rolled-back transaction committed")
+	}
+	if !f.events.takePlace(500) {
+		t.Fatal("takePlace refused the first stream place")
+	}
+
+	want := Counters{
+		LastSeq:       3,
+		OpenStreams:   1,
+		WrittenByType: map[string]int64{"parley.change.open": 2, "parley.claim.create": 1},
+	}
+	if got := f.events.Counters(); !reflect.DeepEqual(got, want) {
+		t.Errorf("Counters = %+v, want %+v", got, want)
+	}
+	f.events.givePlace()
+	if got := f.events.Counters().OpenStreams; got != 0 {
+		t.Errorf("open_streams after the place was given back = %d, want 0", got)
+	}
+}
+
+func TestCounters_StreamPlacesStopAtTheLimit(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	for range 2 {
+		if !f.events.takePlace(2) {
+			t.Fatal("takePlace refused a place below the limit")
+		}
+	}
+	if f.events.takePlace(2) {
+		t.Error("takePlace granted a third place with a limit of 2")
+	}
+	f.events.givePlace()
+	if !f.events.takePlace(2) {
+		t.Error("takePlace refused a place given back")
+	}
+	if got := f.events.Counters().OpenStreams; got != 2 {
+		t.Errorf("open_streams = %d, want 2", got)
+	}
+}
+
+func TestOnCommit_NotifiesCommittedEventsInSeqOrder(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	ctx := context.Background()
+	got := make(chan Record, 10)
+	f.events.OnCommit(func(rec Record) { got <- rec })
+
+	err := f.store.Tx(ctx, func(tx *sql.Tx) error {
+		for _, typ := range []string{"parley.change.open", "parley.change.update"} {
+			if _, err := f.events.Emit(ctx, tx, valid(typ)); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = f.store.Tx(ctx, func(tx *sql.Tx) error {
+		if _, err := f.events.Emit(ctx, tx, valid("parley.change.abandon")); err != nil {
+			return err
+		}
+		return errors.New("refused")
+	})
+	if err == nil {
+		t.Fatal("the rolled-back transaction committed")
+	}
+	if _, err := f.events.EmitNow(ctx, valid("parley.change.land")); err != nil {
+		t.Fatal(err)
+	}
+
+	var types []string
+	for range 3 {
+		select {
+		case rec := <-got:
+			if rec.Seq != int64(len(types)+1) {
+				t.Errorf("notified seq %d after %v, want seq %d", rec.Seq, types, len(types)+1)
+			}
+			types = append(types, rec.Type)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("notified %v after 5 s, want three events", types)
+		}
+	}
+	if want := []string{"parley.change.open", "parley.change.update", "parley.change.land"}; !reflect.DeepEqual(types, want) {
+		t.Errorf("notified types %v, want %v", types, want)
+	}
+	select {
+	case rec := <-got:
+		t.Errorf("notified %+v, which no transaction committed", rec)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestWaitAfter_WakesOnTheNextCommit(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	ctx := context.Background()
+	woken := func(ch <-chan struct{}, within time.Duration) bool {
+		select {
+		case <-ch:
+			return true
+		default:
+		}
+		select {
+		case <-ch:
+			return true
+		case <-time.After(within):
+			return false
+		}
+	}
+
+	waiting := f.events.waitAfter(0)
+	if _, err := f.events.EmitNow(ctx, valid("parley.change.open")); err != nil {
+		t.Fatal(err)
+	}
+	if !woken(waiting, time.Second) {
+		t.Fatal("a waiter after position 0 was not woken within 1 s of the commit of seq 1")
+	}
+	if !woken(f.events.waitAfter(0), 0) {
+		t.Error("a waiter behind a commit already seen was not woken at once")
+	}
+
+	f.emit(valid("parley.change.update"))
+	if !woken(f.events.waitAfter(1), time.Second) {
+		t.Error("a waiter after position 1 was not woken by the commit of seq 2")
+	}
+
+	// Without a commit a waiter is still woken within a second, so a wake-up
+	// the component missed delays an event by at most that.
+	quiet := f.events.waitAfter(2)
+	if woken(quiet, 50*time.Millisecond) {
+		t.Fatal("a waiter at the last seq was woken without a commit at once")
+	}
+	if !woken(quiet, 1500*time.Millisecond) {
+		t.Error("a waiter without a commit was not woken within a second")
 	}
 }

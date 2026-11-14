@@ -101,20 +101,31 @@ type Deps struct {
 // when it is composed, so that other parts can keep it, and binds it with
 // Bind once the stores are open; New does both at once.
 type Component struct {
-	deps Deps
+	deps   Deps
+	notify notifier
 }
 
 // New returns a component bound to d.
-func New(d Deps) *Component {
+func New(d Deps) (*Component, error) {
 	c := &Component{}
-	c.Bind(d)
-	return c
+	return c, c.Bind(d)
 }
 
-// Bind sets the component's dependencies. The hub calls it once, from a
-// start hook, before any other start hook may emit and before it serves.
-func (c *Component) Bind(d Deps) {
+// Bind sets the component's dependencies and reads last_seq, from which
+// Counters counts the events written since the start. The hub calls it
+// once, from a start hook, before any other start hook may emit and before
+// it serves, and runs Run once it serves.
+func (c *Component) Bind(d Deps) error {
 	c.deps = d
+	if d.Store == nil {
+		return nil
+	}
+	b, err := readBounds(context.Background(), d.Store.Main())
+	if err != nil {
+		return fmt.Errorf("bind the event component: read last_seq: %w", err)
+	}
+	c.notify.start(b.LastSeq)
+	return nil
 }
 
 // errNotBound is returned by every call made before Bind.
@@ -162,6 +173,9 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		sql.NullString{String: rec.parent, Valid: rec.parent != ""}); err != nil {
 		return Record{}, fmt.Errorf("emit event %s: write: %w", rec.Type, err)
 	}
+	// The transaction commits after this returns, so Run may not see the
+	// event yet; while anything waits it reads again within pollInterval.
+	c.notify.poke()
 	return rec, nil
 }
 
@@ -181,99 +195,7 @@ func (c *Component) EmitNow(ctx context.Context, in Input) (Record, error) {
 	if err != nil {
 		return Record{}, err
 	}
-	return rec, nil
-}
-
-// Bounds are the bounds of the event log: the lowest and the highest seq it
-// holds, both 0 while no event was ever written.
-type Bounds struct {
-	OldestSeq int64 `json:"oldest_seq"`
-	LastSeq   int64 `json:"last_seq"`
-}
-
-// Bounds reads the log's bounds. last_seq is the counter, not the highest
-// stored row, so it never falls when events are deleted.
-func (c *Component) Bounds(ctx context.Context) (Bounds, error) {
-	if c.deps.Store == nil {
-		return Bounds{}, errNotBound
-	}
-	var b Bounds
-	err := c.deps.Store.Main().QueryRowContext(ctx, `
-SELECT s.last_seq, l.oldest_seq FROM hub_event_seq s, hub_event_log_bound l`).Scan(&b.LastSeq, &b.OldestSeq)
-	if err != nil {
-		return Bounds{}, fmt.Errorf("read event log bounds: %w", err)
-	}
-	if b.LastSeq == 0 {
-		b.OldestSeq = 0
-	}
-	return b, nil
-}
-
-// ReadAfter reads the events with a seq higher than after, ascending, at
-// most limit of them (every one when limit <= 0), and the position the read
-// examined: the seq of the last record when the limit was reached, otherwise
-// last_seq. Both come from one snapshot of the store, so the position never
-// claims an event the read could not see.
-func (c *Component) ReadAfter(ctx context.Context, after int64, limit int) ([]Record, int64, error) {
-	if c.deps.Store == nil {
-		return nil, 0, errNotBound
-	}
-	// A read-only transaction begins deferred, not with the write lock the
-	// store's other transactions take, and sees one snapshot.
-	tx, err := c.deps.Store.Main().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return nil, 0, fmt.Errorf("read events: %w", err)
-	}
-	defer tx.Rollback()
-	if limit <= 0 {
-		limit = -1
-	}
-	rows, err := tx.QueryContext(ctx, `
-SELECT seq, id, type, time, workspace, actor_type, actor_id, resource_type, resource_id, action, session_id,
-	metadata, parent_slug
-FROM hub_events WHERE seq > ? ORDER BY seq LIMIT ?`, after, limit)
-	if err != nil {
-		return nil, 0, fmt.Errorf("read events: %w", err)
-	}
-	defer rows.Close()
-	var recs []Record
-	for rows.Next() {
-		rec, err := scanRecord(rows.Scan)
-		if err != nil {
-			return nil, 0, fmt.Errorf("read events: %w", err)
-		}
-		recs = append(recs, rec)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, 0, fmt.Errorf("read events: %w", err)
-	}
-	if limit > 0 && len(recs) == limit {
-		return recs, recs[len(recs)-1].Seq, nil
-	}
-	var last int64
-	if err := tx.QueryRowContext(ctx, `SELECT last_seq FROM hub_event_seq`).Scan(&last); err != nil {
-		return nil, 0, fmt.Errorf("read events: %w", err)
-	}
-	return recs, last, nil
-}
-
-// scanRecord reads one row of hub_events in the column order of ReadAfter.
-func scanRecord(scan func(dest ...any) error) (Record, error) {
-	var rec Record
-	var stamp, meta string
-	var workspace, actorID, session, parent sql.NullString
-	if err := scan(&rec.Seq, &rec.ID, &rec.Type, &stamp, &workspace, &rec.ActorType, &actorID,
-		&rec.ResourceType, &rec.ResourceID, &rec.Action, &session, &meta, &parent); err != nil {
-		return Record{}, err
-	}
-	t, err := parseTime(stamp)
-	if err != nil {
-		return Record{}, fmt.Errorf("event %d: %w", rec.Seq, err)
-	}
-	rec.Time = t
-	rec.Workspace, rec.ActorID, rec.SessionID = nullable(workspace), nullable(actorID), nullable(session)
-	rec.Metadata = []byte(meta)
-	rec.parent = parent.String
+	c.notify.poke()
 	return rec, nil
 }
 
@@ -284,12 +206,4 @@ func parseTime(stamp string) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("event time %q: %w", stamp, err)
 	}
 	return t.UTC(), nil
-}
-
-// nullable is the value of a nullable column, nil for NULL.
-func nullable(s sql.NullString) *string {
-	if !s.Valid {
-		return nil
-	}
-	return &s.String
 }

@@ -15,7 +15,7 @@ command-line client. Both are written in Go, in the module
 | `internal/buildinfo` | the version, commit and build time the binary was built with, shared by both programs |
 | `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra`, each declared through one helper ([ADR 02](adr/02-declare-every-cli-command-through-one-helper.md)), the client configuration file, the resolution of the hub URL and the credential, the one HTTP client the commands send their requests with, the printing of a command's result on stdout and of its warnings on stderr, the shared wait for a long operation (`--wait`, `--timeout`, `--poll-interval`), and the error envelopes and exit statuses every command ends with |
 | `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, and a registry of keys and whole sections that decides what the file may hold |
-| `internal/event` | the hub events: every significant state change as one event, written in the caller's store transaction with a hub-wide `seq` that is never reused; the event record and its JSON form, the emit calls `Emit` and `EmitNow`, the log's bounds and the read by position |
+| `internal/event` | the hub events: every significant state change as one event, written in the caller's store transaction with a hub-wide `seq` that is never reused; the event record and its JSON form, the emit calls `Emit` and `EmitNow`, the log's bounds, the read by position and the expiry of old positions, the following of commits for waiters and `OnCommit` callbacks, and the counters ([ADR 05](adr/05-deliver-events-by-reading-the-log-by-position.md)) |
 | `internal/hub` | the composition of the `parleyd` process: argument parsing, the scrubbing logger, the fixed start order, the bootstrap of the admin token, the HTTP server's options, the idempotency records in the transactional store, signals and the stop, and the `backup` command; the one place later packages plug their parts in ([ADR 01](adr/01-compose-the-hub-in-one-package.md)) |
 | `internal/maintenance` | the maintenance loop: a registry of named tasks, and `Loop`, which runs one pass at once and one at each tick of an hourly timer, the tasks of a pass one after the other in a fixed order, and logs a failing task without stopping the others |
 | `internal/hubtest` | test support, imported by test code only: `Start` bootstraps a hub with an admin token and serves it in-process on a free loopback port, `StartWith` does the same with more in `config.toml` (`Config.Server` inside `[server]`, `Config.TOML` after it), files in the config dir (`Config.Files`) and a function run on the composition (`Config.Compose`), `(*Hub).IssuePAT` stores a PAT, `CreateOrg` and `AddMember` make an org and a membership through the admin routes and `AddWorkspace` stores a workspace record, `Serve` runs a hub with given options until the test ends, `(*Served).Call` sends a request with a bearer credential and a body and returns the answer's status and body, and `LogBuffer` holds a running hub's log for the test to read |
@@ -1363,10 +1363,14 @@ in `parts`. It creates a zero `event.Component`, adds the schema step
 `event.SchemaStep` (`hub_events`) and binds the component in the start hook
 `events` to `event.Deps{Store: rt.Store, Clock: event.SystemClock(rt.Now),
 Scrubber: rt.Scrubber, Parents: ...}`, the fork-parent lookup being
-`access.RecordBySlug` read in the emitting transaction. The start hooks that
-run after it, those of the parts listed after `composeEvents` and of
-`Options.Compose`, may emit before the hub listens; a call made before the
-component is bound returns an error.
+`access.RecordBySlug` read in the emitting transaction. `Bind` reads
+`last_seq`, and its error fails the start. The start hooks that run after it,
+those of the parts listed after `composeEvents` and of `Options.Compose`, may
+emit before the hub listens; a call made before the component is bound
+returns an error. The part also registers the background work `events`
+(grace one second), which runs `(*Component).Run` until the stop, so the
+stop waits for it before the stores close
+([ADR 05](adr/05-deliver-events-by-reading-the-log-by-position.md)).
 
 The step creates three tables in the transactional store:
 
@@ -1411,13 +1415,44 @@ A `Record` marshals to one line with exactly the members `seq`, `id`, `type`,
 for an absent `workspace`, `actor_id` or `session_id`, an object for
 `metadata` and `time` as `timefmt.Format` writes it.
 
+The event log is read by position
+([ADR 05](adr/05-deliver-events-by-reading-the-log-by-position.md)).
 `(*Component).Bounds(ctx)` returns `event.Bounds{OldestSeq, LastSeq}`, both 0
 while no event was ever written; `LastSeq` is the counter, not the highest
-stored row. `(*Component).ReadAfter(ctx, after, limit)` returns the events
-with a higher `seq` than `after`, ascending, at most `limit` (all when
-`limit` <= 0), and the position examined: the last record's `seq` when the
-limit was reached, else `last_seq`, both read in one read-only transaction,
-which begins without the write lock and sees one snapshot.
+stored row, and `OldestSeq` is `hub_event_log_bound`, 1 until something has
+expired. `(*Component).ReadAfter(ctx, after, limit)` returns the events
+with a higher `seq` than `after` and not below `oldest_seq`, ascending, at
+most `limit` (all when `limit` <= 0), and the position examined: the last
+record's `seq` when the limit was reached, else `last_seq`. The bounds and the
+records are read in one read-only transaction, which begins without the write
+lock and sees one snapshot. Since commit order is `seq` order, every read is a
+gap-free run of the log, also while other transactions emit.
+
+`(*Component).Expire(ctx, cutoff)` makes the events older than `cutoff`
+leave the log: in a write transaction it sets `oldest_seq` to the lowest
+`seq` whose `time` is not older than `cutoff`, or to `last_seq` when every
+event is older, so the newest event stays. It never lowers the bound, deletes
+no row, does nothing on an empty log (returning 0), and returns the new
+`oldest_seq`. Its schedule is the retention run's.
+
+`(*Component).Run(ctx)` follows the commits. The store has no after-commit
+hook, so while anything waits it reads `last_seq` every 100 ms of real time,
+and at once when `Emit` or `EmitNow` kicks it. While nothing waits, it reads
+nothing. When `last_seq` has risen it counts the new events by type, calls the
+callbacks registered with `(*Component).OnCommit(fn)` with each new record,
+in `seq` order, from its one goroutine, and wakes the waiters. A waiter (the
+stream and the long-poll) takes a channel from the unexported
+`waitAfter(position)`. The channel is closed once a commit of a higher `seq`
+has been observed, and in any case within a second. The waiter then reads the
+log by position again, so a missed wake-up delays an event and never loses it.
+When its context ends, `Run` wakes every waiter and returns.
+
+`(*Component).Counters()` returns `event.Counters{LastSeq, OpenStreams,
+WrittenByType}`. It first catches up with the commits itself, so the answer
+is exact. `WrittenByType` counts the events committed since the bind, by
+type; a rolled-back emit is never counted. `OpenStreams` counts the stream
+places taken with the unexported `takePlace(limit)`, which refuses once
+`limit` are taken, and not yet given back with `givePlace()`.
 
 The component's `event.Clock` has `Now()` and `NewTimer(d)`, so that tests
 control the time events are stamped with and the timers of the waits;

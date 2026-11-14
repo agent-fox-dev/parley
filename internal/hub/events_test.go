@@ -3,6 +3,7 @@ package hub_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/hub"
@@ -32,5 +33,27 @@ func TestStartHook_MayEmitBeforeListening(t *testing.T) {
 	}
 	if len(recs) != 1 || recs[0].Seq != 1 || recs[0].ID != emitted.ID || recs[0].Type != "parley.git.fetch" {
 		t.Errorf("ReadAfter(0) = %+v, want the event the start hook emitted, with seq 1", recs)
+	}
+}
+
+func TestEvents_NotifiesCommitsWhileTheHubServes(t *testing.T) {
+	t.Parallel()
+	notified := make(chan event.Record, 1)
+	hubtest.Start(t, func(c *hub.Composition) {
+		c.Events().OnCommit(func(rec event.Record) { notified <- rec })
+		c.AddStartHook("emit-at-start", func(ctx context.Context, _ *hub.Runtime) error {
+			_, err := c.Events().EmitNow(ctx, event.Input{Type: "parley.workspace.create", ActorType: "system",
+				ResourceType: "workspace", ResourceID: "api", Metadata: map[string]any{"scope": "user", "scope_id": "u_1"}})
+			return err
+		})
+	})
+
+	select {
+	case rec := <-notified:
+		if rec.Seq != 1 || rec.Type != "parley.workspace.create" {
+			t.Errorf("notified %+v, want the event of the start hook with seq 1", rec)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no commit notified within 5 s of the start")
 	}
 }

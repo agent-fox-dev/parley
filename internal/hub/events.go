@@ -2,32 +2,41 @@ package hub
 
 import (
 	"context"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/event"
 )
 
-// eventsHook is the name of the start hook that binds the event component.
+// eventsHook is the name of the start hook that binds the event component,
+// and of the background work that runs it.
 const eventsHook = "events"
+
+// eventsGrace is how long the stop waits for the event component's Run,
+// which returns as soon as its context ends unless a read or an OnCommit
+// callback is under way.
+const eventsGrace = time.Second
 
 // composeEvents adds the hub events to the transactional store and binds
 // the event component in a start hook to the stores, the hub's clock and
-// scrubber, and the fork-parent lookup over the workspace records. The
-// component exists from the composition on, so a later part keeps it
+// scrubber, and the fork-parent lookup over the workspace records, and runs
+// it as background work: Run follows the commits for the waiters and the
+// OnCommit callbacks until the stop, and the stop waits for it before the
+// stores close (ADR 05). The component exists from the composition on, so a later part keeps it
 // through Composition.Events; the hooks that run after this one, those of
 // the later parts and of Options.Compose, may emit, before the hub listens.
 func composeEvents(c *Composition) {
 	c.events = &event.Component{}
 	c.AddSchemaStep(event.SchemaStep)
 	c.AddStartHook(eventsHook, func(_ context.Context, rt *Runtime) error {
-		c.events.Bind(event.Deps{
+		return c.events.Bind(event.Deps{
 			Store:    rt.Store,
 			Clock:    event.SystemClock(rt.Now),
 			Scrubber: rt.Scrubber,
 			Parents:  event.ForkParentsFunc(forkParent),
 		})
-		return nil
 	})
+	c.AddBackgroundWork(eventsHook, eventsGrace, func(ctx context.Context, _ *Runtime) { c.events.Run(ctx) })
 }
 
 // forkParent is the parent's slug when slug names a task fork, read in q.

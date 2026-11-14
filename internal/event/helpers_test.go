@@ -141,6 +141,9 @@ type fixture struct {
 	clock    *fakeClock
 	scrubber *scrub.Scrubber
 	events   *Component
+	// stop ends the component's Run and waits for it, before the store
+	// closes under it.
+	stop func()
 }
 
 // newFixture opens a store in a fresh directory with the event schema, the
@@ -153,8 +156,8 @@ func newFixture(t testing.TB) *fixture {
 	return f
 }
 
-// open opens the fixture's store and binds a new component to it, as a hub
-// does at every start.
+// open opens the fixture's store, binds a new component to it and runs it,
+// as a hub does at every start.
 func (f *fixture) open() {
 	f.t.Helper()
 	st, err := store.Open(context.Background(), store.Options{
@@ -166,13 +169,29 @@ func (f *fixture) open() {
 	}
 	f.t.Cleanup(func() { st.Close() })
 	f.store = st
-	f.events = New(Deps{Store: st, Clock: f.clock, Scrubber: f.scrubber, Parents: storeParents{}})
+	f.events, err = New(Deps{Store: st, Clock: f.clock, Scrubber: f.scrubber, Parents: storeParents{}})
+	if err != nil {
+		f.t.Fatalf("bind the component: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.events.Run(ctx)
+	}()
+	f.stop = sync.OnceFunc(func() {
+		cancel()
+		<-done
+	})
+	// Cleanups run last first, so Run has ended before the store closes.
+	f.t.Cleanup(f.stop)
 }
 
 // reopen closes the store and opens it again on the same file, with a new
 // component: a restart of the hub.
 func (f *fixture) reopen() {
 	f.t.Helper()
+	f.stop()
 	if err := f.store.Close(); err != nil {
 		f.t.Fatalf("close store: %v", err)
 	}
@@ -217,14 +236,29 @@ func (f *fixture) readAll(after int64) []Record {
 	return recs
 }
 
-// lastSeq is last_seq of the log's bounds.
-func (f *fixture) lastSeq() int64 {
+// bounds are the log's bounds.
+func (f *fixture) bounds() Bounds {
 	f.t.Helper()
 	b, err := f.events.Bounds(context.Background())
 	if err != nil {
 		f.t.Fatalf("Bounds: %v", err)
 	}
-	return b.LastSeq
+	return b
+}
+
+// lastSeq is last_seq of the log's bounds.
+func (f *fixture) lastSeq() int64 {
+	f.t.Helper()
+	return f.bounds().LastSeq
+}
+
+// seqs are the seqs of recs, in their order.
+func seqs(recs []Record) []int64 {
+	var out []int64
+	for _, rec := range recs {
+		out = append(out, rec.Seq)
+	}
+	return out
 }
 
 // insertRow writes the test row name in tx.
