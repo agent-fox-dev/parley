@@ -11,7 +11,7 @@ command-line client. Both are written in Go, in the module
 |---|---|
 | `cmd/parley` | the `parley` program: it calls `cli.Run` and exits with its status |
 | `cmd/parleyd` | the `parleyd` program: `main` calls `hub.Run` with the process's arguments, environment and working directory and exits with its status |
-| `internal/access` | the workspace access rule, the one place that decides what a caller may do on a workspace; the minimal workspace record (slug, owner, org, kind, parent, status, the creating token of a fork) in the transactional store, the caller's level on a workspace, the decision for a declared need and the REST access check, the readable set for reads across workspaces, what the binding of a workspace-bound PAT covers, and the binding guard that confines such a PAT on every REST route and, for the git server, on git |
+| `internal/access` | the workspace access rule, the one place that decides what a caller may do on a workspace; the minimal workspace record (slug, owner, org, kind, parent, status, the creating token of a fork) in the transactional store, the caller's level on a workspace, the decision for a declared need and the REST access check, the readable set for reads across workspaces, what the binding of a workspace-bound PAT covers, and the binding guard that confines such a PAT on every REST route and, for the git server, on git, and the minting of bound tokens (`MintBound`, `POST /workspaces/:slug/tokens`) |
 | `internal/buildinfo` | the version, commit and build time the binary was built with, shared by both programs |
 | `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra`, each declared through one helper ([ADR 02](adr/02-declare-every-cli-command-through-one-helper.md)), the client configuration file, the resolution of the hub URL and the credential, the one HTTP client the commands send their requests with, the printing of a command's result on stdout and of its warnings on stderr, the shared wait for a long operation (`--wait`, `--timeout`, `--poll-interval`), and the error envelopes and exit statuses every command ends with |
 | `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, and a registry of keys and whole sections that decides what the file may hold |
@@ -1169,10 +1169,12 @@ keeps data for a user or an org registers its remover from its part in
 (`workspace_records`) and, after it, `access.CreatingTokenStep`
 (`workspace_creating_token`), registers a zero `access.Service`, installs
 its `Guard` as the pipeline's binding guard (`SetBindingGuard`), adds its
-`Check` to the access checks, after identity's admin check, and binds it in
+`SubsetCheck` and then its `Check` to the access checks, after identity's
+admin check, registers its `TokenRoutes()`, and binds it in
 the start hook `access` to `access.Deps{Records:
 access.StoreRecords(rt.Store.Main()), Memberships: ..., Refusals:
-access.NewRefusalLimiter(events, rt.Now, rt.Logger), Events: events}`, the
+access.NewRefusalLimiter(events, rt.Now, rt.Logger), Events: events, Store:
+rt.Store, Now: rt.Now}`, the
 membership source being `identity.ActiveOrgIDs` over the same store and
 `events` the adapter `accessEvents`, which implements
 `access.EventEmitter` over the event component: it converts an
@@ -1480,6 +1482,44 @@ ActorID, ResourceType, ResourceID, Metadata}`. The event component imports
 `internal/access`, so this package cannot name `event.Input`, and the hub
 passes the event component behind the interface (`accessEvents` in
 `internal/hub/access.go`). There is no discarding default.
+
+`internal/access/mint.go` holds the one minting component of bound tokens,
+`(*Service).MintBound(ctx, tx, access.MintInput{Creator, Workspace, Name,
+Permissions, Paths, Expires, ExpiresAt})`, which returns the
+`identity.PAT` and its value. In the caller's transaction, which it does not
+commit, it mints through `identity.MintPAT` with `Workspace` set to the
+slug, so the token is owned by `Creator.User`, validated as for `POST
+/user/tokens` and, for a PAT creator, held to the subset rule, and then
+emits `access.BindEventType` (`parley.token.bind`) through `Deps.Events` in
+the same transaction: workspace the bound slug, actor type the creator's
+`identity.Principal.Type` (`api_key` or `pat`) and actor the owner,
+resource `token` and the token id, and metadata `token_id`, `workspace`,
+`permissions`, `paths` (or null) and `expires_at` (or null, in the Token
+object's time format), never the value. `identity.MintPAT`'s errors are
+returned unchanged (`400 invalid_request`, `403 insufficient_scope`), with
+nothing written; a failure of the emitter is returned wrapped, and the
+caller rolls back the token with its transaction. A service without an
+emitter refuses to mint. `ExpiresAt` is the instant a hub-internal caller
+(fork creation, the hub credential of a sandbox) sets in place of
+`Expires`. No production caller besides the route below uses it yet.
+
+`internal/access/bound_tokens.go` holds `(*Service).TokenRoutes()`, which
+`composeAccess` registers: `POST /workspaces/:slug/tokens` with `Scope`
+`tokens:manage`, `Create`, `ShowOnce` `token` and the marks
+`access.MarkNeed` `owner` and `access.MarkSubsetRule`. On a route with that
+mark the access check `(*Service).SubsetCheck`, installed before `Check`,
+decodes the body with `identity.DecodeMintRequest` and applies
+`identity.CheckSubset` to a PAT caller, so the `403 insufficient_scope` of
+the subset rule comes before the workspace is looked up; a body that does
+not decode, or whose paths are not valid, passes to the handler. The
+handler answers the admin token `403 forbidden` (`this route needs a user`)
+before it reads the body, decodes the body (`400`), and then, in one store
+transaction, mints with `MintBound`, refusing an archived workspace with
+`409 workspace_archived` after the token is validated and before its event
+is emitted, so the refusal rolls back the token and emits nothing. Any other
+failure of the insert, the event or the commit rolls back and is answered
+`500 internal`. The answer is `201` with the Token object followed by
+`token`, the value.
 
 `internal/access/refusal.go` holds the hub's `RefusalReporter`,
 `access.RefusalLimiter`, built with `access.NewRefusalLimiter(events, now,

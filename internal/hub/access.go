@@ -32,13 +32,23 @@ import (
 // covers. The guard's refusals go to a refusal limiter, which reports them
 // as rate-limited events through the event component; the limiter is built
 // in the start hook, so each start of the hub begins with none counted.
+//
+// The bound-token routes are registered here, with the subset rule as an
+// access check before the workspace access check, so that a PAT asking for
+// more than it holds is refused before the workspace is looked up; the
+// service mints in the hub's store and records each binding through the
+// event component in the minting transaction.
 func composeAccess(c *Composition) {
 	svc := &access.Service{}
 	c.access = svc
 	c.AddSchemaStep(access.SchemaStep)
 	c.AddSchemaStep(access.CreatingTokenStep)
 	c.SetBindingGuard(svc.Guard)
+	c.AddAccessCheck(svc.SubsetCheck)
 	c.AddAccessCheck(svc.Check)
+	for _, r := range svc.TokenRoutes() {
+		c.AddRoute(r)
+	}
 	c.addRouteRule(refusePublicNeed)
 	c.AddStartHook("access", func(_ context.Context, rt *Runtime) error {
 		db := rt.Store.Main()
@@ -46,6 +56,7 @@ func composeAccess(c *Composition) {
 		svc.Bind(access.Deps{
 			Records: access.StoreRecords(db), Memberships: activeOrgs(db),
 			Refusals: access.NewRefusalLimiter(events, rt.Now, rt.Logger), Events: events,
+			Store: rt.Store, Now: rt.Now,
 		})
 		c.Events().SetCoverage(coverage(svc))
 		return nil

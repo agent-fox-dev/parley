@@ -183,7 +183,7 @@ func (s *Service) createToken(w http.ResponseWriter, r *http.Request) error {
 	if !ok {
 		return errors.New("a route that needs a user was reached without a caller")
 	}
-	req, err := mintRequestOf(r)
+	req, err := DecodeMintRequest(r)
 	if err != nil {
 		return err
 	}
@@ -201,12 +201,12 @@ func (s *Service) createToken(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// mintRequestOf reads a token request from the body of r. It checks only
+// DecodeMintRequest reads a token request from the body of r. It checks only
 // the JSON type of each member, and leaves their values to MintPAT: name a
 // string, permissions an array of strings, paths null or an array of
 // strings, and expires an integer. A missing name or permissions is read as
 // empty, and refused by MintPAT.
-func mintRequestOf(r *http.Request) (MintRequest, error) {
+func DecodeMintRequest(r *http.Request) (MintRequest, error) {
 	var body map[string]json.RawMessage
 	if err := server.DecodeJSON(r, &body); err != nil {
 		return MintRequest{}, err

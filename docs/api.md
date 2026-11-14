@@ -223,7 +223,7 @@ every identity route (`/user`, `/user/orgs`, `/user/keys…`, `/user/tokens…`)
 every admin route, `POST /api/v1/workspaces` and `GET /api/v1/sandboxes`
 among them, is answered before the scope check, whatever scopes the token
 holds, so a bound token can neither read nor revoke itself nor mint another
-token:
+token through `/api/v1/user/tokens`:
 
 ```json
 {"error":{"code":403,"message":"a token bound to a workspace cannot use this route","error_type":"token_bound"}}
@@ -1041,6 +1041,64 @@ authenticates, cannot be changed. A refused request changes nothing.
 | `403` `insufficient_scope` | a `PUT` or `PATCH` that adds a scope, by a PAT limited to paths, to a token without `paths` (`paths: this token is limited to paths, so it cannot add scopes to a token that is not`) or with a glob none of the caller's globs covers; the message names the first one (`paths: "src/**" is not covered by a glob of this token`) |
 | `404` `not_found` | the caller's user has no token with this id (`token not found`) |
 | `409` `conflict` | the token is revoked (`token is revoked`) or expired (`token is expired`) |
+
+## `POST /api/v1/workspaces/{slug}/tokens`
+
+Mints a personal access token (PAT) owned by the caller's user and bound to
+the workspace `{slug}`: its `workspace` is the slug from the moment it
+exists, and no route changes it. It takes an API key or a PAT and declares
+the scope `tokens:manage` for a PAT and the level `owner` on the workspace
+(see [Workspace access](#workspace-access)). It is a create route (see
+[Idempotency](#idempotency)); a replay leaves out `token`.
+
+The body is that of [`POST /api/v1/user/tokens`](#post-apiv1usertokens),
+validated the same way with the same messages: `name`, `permissions`,
+`paths` and `expires`. A PAT caller is held to the same subset rule, and a
+bound PAT is confined by the [binding guard](#workspace-bound-tokens) as on
+every route that names a workspace.
+
+The checks run in this order, the first that fails answering, and a refused
+request mints nothing: a PAT without `tokens:manage` (`403`); the subset
+rule for a PAT caller, before the workspace is looked up, so the answer is
+the same for an unknown slug; the access rule for need `owner` (`404` for a
+workspace the caller cannot read and for an unknown slug, with the same
+bytes; `403` for an org member, who reads it); the admin token (`403`),
+before the body is read; the body (`400`); and then, for a valid body, an
+archived workspace (`409`).
+
+The token and a `parley.token.bind` event are written in one store
+transaction: a failure of either, or of the commit, leaves neither and is
+answered `500` `internal` without its cause.
+
+| Status | When |
+|---|---|
+| `201 Created` | the token was minted; the body is the Token object, with `workspace` the slug, and `token` |
+| `200 OK` | a replay of a recorded `Idempotency-Key` with the same body: the first answer without `token`; nothing is minted |
+| `400` `invalid_request` | the body is not valid, with the messages of `POST /api/v1/user/tokens` (`request body must be a JSON object` for a body that is not an object) |
+| `403` `insufficient_scope` | a PAT without `tokens:manage` (`this route needs the scope tokens:manage`), or a valid body beyond what the calling PAT holds, with the subset rule's messages (`permissions: this token does not hold "git:read"`) |
+| `403` `forbidden` | an org member who can read the workspace (`org members have read-only access to this workspace`), or the admin token (`this route needs a user`) |
+| `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug (`workspace not found`) |
+| `409` `workspace_archived` | a valid body for an archived workspace (`workspace is archived`) |
+| `500` `internal` | writing the token or its event failed; nothing is minted |
+
+```json
+{"name":"agent","permissions":["git:read"],"expires":30}
+```
+
+```json
+{"token_id":"k3x9m2pq","user_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","name":"agent","permissions":["git:read"],"paths":null,"workspace":"w1","expires_at":"2026-01-31T00:00:00Z","revoked_at":null,"created_at":"2026-01-01T00:00:00Z","token":"parley_pat_k3x9m2pq_0123456789abcdefghijklmnopqrstuv"}
+```
+
+The event, as [`GET /api/v1/events/log`](#get-apiv1eventslog) shows it to
+the admin token and to a user with level `owner` or `admin` on the
+workspace, has `actor_type` `api_key` or `pat` after the calling
+credential, `actor_id` the token's owner, and in `metadata` the token's
+`token_id`, `workspace`, `permissions`, `paths` and `expires_at` (`null`
+when it has none or never expires), never its value:
+
+```json
+{"seq":7,"id":"…","type":"parley.token.bind","time":"2026-01-01T00:00:00Z","workspace":"w1","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"token","resource_id":"k3x9m2pq","action":"bind","session_id":null,"metadata":{"expires_at":"2026-01-31T00:00:00Z","paths":null,"permissions":["git:read"],"token_id":"k3x9m2pq","workspace":"w1"}}
+```
 
 ## Admin routes
 

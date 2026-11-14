@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -18,6 +19,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/server"
+	"github.com/agent-fox-dev/parley/internal/server/timefmt"
 	"github.com/agent-fox-dev/parley/internal/store"
 )
 
@@ -278,12 +280,15 @@ func (r loggedRecords) Record(ctx context.Context, slug string) (access.Record, 
 }
 
 // recordingEmitter is an event emitter that remembers, in order, each event
-// and the transaction it was emitted in, nil for one emitted now. When err
-// is set it returns err after remembering the event, and when panics is set
-// it panics instead, as a broken event log would.
+// and the transaction it was emitted in, nil for one emitted now. When seen
+// is set it is called with the transaction and the event first, so a test
+// can look at what the transaction holds at that moment. When err is set it
+// returns err after remembering the event, and when panics is set it panics
+// instead, as a broken event log would.
 type recordingEmitter struct {
 	mu      sync.Mutex
 	emitted []emitted
+	seen    func(tx *sql.Tx, ev access.Event)
 	err     error
 	panics  bool
 }
@@ -299,6 +304,9 @@ func (e *recordingEmitter) Emit(_ context.Context, tx *sql.Tx, ev access.Event) 
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.emitted = append(e.emitted, emitted{ev, tx})
+	if e.seen != nil {
+		e.seen(tx, ev)
+	}
 	if e.panics {
 		panic("the event log is broken")
 	}
@@ -318,12 +326,13 @@ func (e *recordingEmitter) all() []emitted {
 
 // guardHub is the hub's REST pipeline built from internal/server: identity's
 // authenticator, the service's binding guard, identity's scope check, then
-// identity's admin check and the workspace access check, over a store in a
-// temporary directory with the identity and workspace record steps. Users
-// and credentials are stored with identity's own functions; the active orgs
-// of a user come from orgs. The guard's refusals go to refusals. Probe
-// routes answer 200 with the binding they find, with its covered set, and
-// count their calls.
+// identity's admin check, the service's subset rule and the workspace access
+// check, over a store in a temporary directory with the identity and
+// workspace record steps. Users and credentials are stored with identity's
+// own functions; the active orgs of a user come from orgs. The guard's
+// refusals go to refusals and the service's events to events. Probe routes
+// answer 200 with the binding they find, with its covered set, and count
+// their calls.
 type guardHub struct {
 	t        *testing.T
 	st       *store.Store
@@ -332,6 +341,7 @@ type guardHub struct {
 	srv      *server.Server
 	orgs     map[string][]string
 	refusals *refusalLog
+	events   *recordingEmitter
 	calls    *atomic.Int64
 }
 
@@ -347,7 +357,7 @@ func newGuardHub(t *testing.T) *guardHub {
 	}
 	t.Cleanup(func() { st.Close() })
 	h := &guardHub{t: t, st: st, ids: &identity.Service{}, svc: &access.Service{},
-		orgs: map[string][]string{}, refusals: &refusalLog{}, calls: &atomic.Int64{}}
+		orgs: map[string][]string{}, refusals: &refusalLog{}, events: &recordingEmitter{}, calls: &atomic.Int64{}}
 	h.ids.Bind(identity.Deps{Store: st})
 	h.bind(h.refusals)
 	h.srv = h.pipeline(true)
@@ -355,9 +365,10 @@ func newGuardHub(t *testing.T) *guardHub {
 }
 
 // bind binds the hub's service to its store and orgs, with the guard's
-// refusals going to refusals.
+// refusals going to refusals and its events to the hub's events.
 func (h *guardHub) bind(refusals access.RefusalReporter) {
 	h.svc.Bind(access.Deps{
+		Store: h.st, Events: h.events,
 		Records: access.StoreRecords(h.st.Main()),
 		Memberships: access.MembershipsFunc(func(_ context.Context, userID string) ([]string, error) {
 			return h.orgs[userID], nil
@@ -405,6 +416,7 @@ func (h *guardHub) pipeline(guarded bool) *server.Server {
 	}
 	srv.SetScopeCheck(identity.ScopeCheck)
 	srv.AddAccessCheck(h.ids.AdminCheck)
+	srv.AddAccessCheck(h.svc.SubsetCheck)
 	srv.AddAccessCheck(h.svc.Check)
 	return srv
 }
@@ -431,6 +443,24 @@ func (h *guardHub) identityRoutes() {
 	for _, r := range h.ids.Routes() {
 		h.srv.Register(r)
 	}
+}
+
+// tokenRoutes registers the service's bound-token routes.
+func (h *guardHub) tokenRoutes() {
+	for _, r := range h.svc.TokenRoutes() {
+		h.srv.Register(r)
+	}
+}
+
+// pats counts the PATs in the store that match the SQL condition where
+// ("1" for all), with args.
+func (h *guardHub) pats(where string, args ...any) int {
+	h.t.Helper()
+	var n int
+	if err := h.st.Main().QueryRow("SELECT count(*) FROM pats WHERE "+where, args...).Scan(&n); err != nil {
+		h.t.Fatalf("count PATs: %v", err)
+	}
+	return n
 }
 
 // admin issues the hub's admin token and returns it.
@@ -539,6 +569,17 @@ func (h *guardHub) do(method, path, credential string) answer {
 	return answer{rec.Code, rec.Header().Get("Content-Type"), rec.Body.Bytes(), rec.Header().Get("Allow")}
 }
 
+// post sends POST path, under /api/v1, with credential as the bearer
+// credential and body as its JSON body.
+func (h *guardHub) post(path, credential, body string) answer {
+	r := httptest.NewRequest(http.MethodPost, "/api/v1"+path, strings.NewReader(body))
+	r.Header.Set("Authorization", "Bearer "+credential)
+	r.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.srv.Handler().ServeHTTP(rec, r)
+	return answer{rec.Code, rec.Header().Get("Content-Type"), rec.Body.Bytes(), rec.Header().Get("Allow")}
+}
+
 // refusalLog is a refusal reporter that remembers, in order, each refusal.
 type refusalLog struct {
 	mu  sync.Mutex
@@ -556,4 +597,17 @@ func (l *refusalLog) all() []access.Refusal {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return slices.Clone(l.got)
+}
+
+// bindEvent is the parley.token.bind event of the token tok, minted by
+// userID with a credential of actorType.
+func bindEvent(tok identity.PAT, userID, actorType string) access.Event {
+	var expires any
+	if tok.ExpiresAt != nil {
+		expires = timefmt.Format(*tok.ExpiresAt)
+	}
+	return access.Event{Type: "parley.token.bind", Workspace: tok.Workspace, ActorType: actorType, ActorID: userID,
+		ResourceType: "token", ResourceID: tok.TokenID, Metadata: map[string]any{
+			"token_id": tok.TokenID, "workspace": tok.Workspace, "permissions": tok.Permissions,
+			"paths": tok.Paths, "expires_at": expires}}
 }

@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/server"
+	"github.com/agent-fox-dev/parley/internal/store"
 )
 
 // Level is what a caller is on one workspace. Every answer of the rule is
@@ -64,6 +66,8 @@ type Deps struct {
 	Memberships Memberships
 	Refusals    RefusalReporter
 	Events      EventEmitter
+	Store       *store.Store
+	Now         func() time.Time
 }
 
 // Service is the access rule. The hub registers its zero value when it
