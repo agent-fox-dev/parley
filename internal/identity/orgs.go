@@ -56,6 +56,13 @@ func OrgBySlug(ctx context.Context, q Querier, slug string) (Org, error) {
 	return orgWhere(ctx, q, `slug = ?`, slug)
 }
 
+// PersonalOrg returns the personal org of the user userID, whose username is
+// username: the org CreateUserAndPersonalOrg made for the user, owned by
+// them and named after their username; ErrNotFound when there is none.
+func PersonalOrg(ctx context.Context, q Querier, userID, username string) (Org, error) {
+	return orgWhere(ctx, q, `owner_id = ? AND name = ?`, userID, username)
+}
+
 // orgWhere returns the org the condition where, with the arguments args,
 // selects.
 func orgWhere(ctx context.Context, q Querier, where string, args ...any) (Org, error) {

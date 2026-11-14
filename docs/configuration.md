@@ -70,11 +70,11 @@ It never quotes a variable's value.
 |---|---|---|---|
 | `[server].bind` | string | `"0.0.0.0"` | the address the hub listens on; not empty |
 | `[server].port` | integer | `8080` | the TCP port the hub listens on, `0` to `65535`; `0` lets the system choose |
-| `[server].external_url` | string | `""` | the URL clients reach the hub at; empty, or an absolute `http` or `https` URL |
+| `[server].external_url` | string | `""` | the URL clients reach the hub at; empty, or an absolute `http` or `https` URL. A workspace object's `hub_url` is built from it, and is `null` while it is empty (see [api.md](api.md#post-apiv1workspaces)) |
 | `[server].max_body_size` | string | `"1MB"` | the largest REST request body: a positive whole number followed by `KB`, `MB` or `GB`, in any letter case, in powers of 1024; a larger body is answered `413` (see [api.md](api.md#request-bodies)) |
 | `[database].path` | string | see below | the transactional store's file; its directory is the data directory |
 | `[workspace].path` | string | see below | the workspace root, where the repositories live |
-| `[workspace].workers` | integer | `4` | how many workspace jobs run at the same time; at least `1` |
+| `[workspace].workers` | integer | `4` | how many workspace jobs run at the same time; at least `1`. It bounds the clones of the workspaces' copies: further clone work waits and starts in the order it was recorded |
 | `[logging].level` | string | `"info"` | `trace`, `debug`, `info`, `warn` or `error`, in any letter case; lines below it are not written |
 | `[logging].log_health_probes` | boolean | `false` | write an access-log line, at debug level, for requests to `/healthz` and `/readyz` |
 | `[limits].requests_per_minute` | integer | `600` | how many REST requests one credential, or one client address without a valid credential, may send in a window of 60 seconds; `0` turns the rate limit off (see [api.md](api.md#rate-limit)) |
@@ -320,6 +320,18 @@ as it is and keeps `remaining` above `0`.
 | `PARLEY_SECRETS_KEY` | the current secret key (see [Secret keys](#secret-keys)) |
 | `PARLEY_SECRETS_KEY_PREVIOUS` | the previous secret key, during a rotation (see [Secret keys](#secret-keys)) |
 | any variable a `${NAME}` reference names | its value replaces the reference |
+| `GIT_SSL_CAINFO`, `SSL_CERT_FILE`, `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY` | passed on to every `git` process the hub runs against an origin, for origins behind a private certificate authority or a proxy (see below) |
+
+`parleyd` runs `git` with a fixed minimal environment, away from the
+configuration and credential stores of the account that runs it: apart from
+`PATH`, through which `git` and the programs it starts are found, no other
+variable of `parleyd`'s environment reaches `git`, so an origin whose
+certificate a private authority signed needs `GIT_SSL_CAINFO` (or
+`SSL_CERT_FILE`) set for `parleyd`, and an origin reached through a proxy
+needs the proxy variables. They are read once, when `parleyd` starts. The
+`ssh` of a `git@` origin runs in batch mode (`GIT_SSH_COMMAND=ssh -o
+BatchMode=yes`), so a call that would need a password or a host key answer
+fails rather than waits.
 
 ### Fixed values
 

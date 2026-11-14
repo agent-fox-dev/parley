@@ -16,6 +16,8 @@ command-line client. Both are written in Go, in the module
 | `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra`, each declared through one helper ([ADR 02](adr/02-declare-every-cli-command-through-one-helper.md)), the client configuration file, the resolution of the hub URL and the credential, the one HTTP client the commands send their requests with, the printing of a command's result on stdout and of its warnings on stderr, the shared wait for a long operation (`--wait`, `--timeout`, `--poll-interval`), and the error envelopes and exit statuses every command ends with |
 | `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, and a registry of keys and whole sections that decides what the file may hold |
 | `internal/event` | the hub events: every significant state change as one event, written in the caller's store transaction with a hub-wide `seq` that is never reused; the event record and its JSON form, the emit calls `Emit` and `EmitNow`, the log's bounds, the read by position and the expiry of old positions, the following of commits for waiters and `OnCommit` callbacks, the counters, the keys of `[events]`, the route `GET /api/v1/events/log` with its long-poll and the Server-Sent Events stream `GET /api/v1/events` with its limits ([ADR 05](adr/05-deliver-events-by-reading-the-log-by-position.md)) |
+| `internal/gitrepo` | the hub's one way to run git, the `git` command as a subprocess with no git library; it imports nothing of the project. `Git` (its zero value runs git from `PATH`; `Env` adds variables such as `GIT_SSL_CAINFO` to every git process, `Trace` sees the arguments of every invocation) runs each git process with a fixed minimal environment (`PATH`, `HOME` set to an empty private directory, `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_TERMINAL_PROMPT=0`, `GIT_SSH_COMMAND=ssh -o BatchMode=yes`, so that the `ssh` of a `git@` origin fails rather than prompts, unless `Env` sets its own, `LC_ALL=C`), outside any repository, keeps git's standard error in the error it returns and, when the context ends, kills git with every process it started (its own process group) and waits for them. `ListRemote(ctx, url, cred)` returns origin's branches, tags and default branch as a `Remote`; `Clone(ctx, url, cred, dir)` makes a bare copy with every branch and tag and full history; both run with `-c credential.helper=`. A `Credential` (user name and password; the zero value is none) reaches git only through the environment of that one process: `GIT_ASKPASS` names a script, written once into a private directory with mode 0700, that prints `PARLEY_GIT_USERNAME` or `PARLEY_GIT_PASSWORD`, so the credential is in no URL, no argument and no configuration file of the copy. `Open(ctx, dir)` opens a copy as a `Repo` (an error for a file, an empty directory or nothing), whose methods never contact origin: `DefaultBranch` and `SetDefaultBranch`, `ResolveBranch`, `Branches`, `OriginURL`, `Config` and `SetConfig` (the copy's own configuration), and the origin heads, kept as the refs `refs/remotes/origin/<name>`: `OriginHeads`, `OriginHead`, `SetOriginHead` and `DeleteOriginHead`; `Remove(dir)` removes a copy |
+| `internal/gitrepo/gitrepotest` | test support, imported by test code only, and the repository's one test origin: `NewOrigin(t, opts...)` makes an empty bare repository whose default branch is `main` and serves it over TLS with `net/http/httptest` and git's file-based HTTP transport (`git update-server-info` after every change), or with git's smart transport through `git http-backend` under `WithSmartHTTP()` (git cannot read a repository without refs over the file-based one, so an empty origin needs it); `WithBasicAuth(user, password)` makes it answer `401` without them; `Commit(branch, msg)`, `Branch(name, ref)`, `Tag(name, ref)` and `SetDefaultBranch(branch)` change it, `History()` builds the tests' usual history on it (`main` with three commits, `dev` branching off its second with one more, the tag `v1` on its first), `Head(branch)` reads it; `URL()` is its https URL and `Env()` (`GIT_SSL_CAINFO=<CAFile()>`) makes git trust it; `Requests()` counts the requests it received, `Block()` holds every later request until `Release()`, `Refuse(status)` answers every request with a status, and `Close()` shuts it down; `Git(t, dir, args...)` runs git on a repository directory, such as a copy the code under test made, away from the user's git configuration, and returns its trimmed output |
 | `internal/hub` | the composition of the `parleyd` process: argument parsing, the scrubbing logger, the fixed start order, the bootstrap of the admin token, the HTTP server's options, the idempotency records in the transactional store, signals and the stop, and the `backup` command; the one place later packages plug their parts in ([ADR 01](adr/01-compose-the-hub-in-one-package.md)) |
 | `internal/maintenance` | the maintenance loop: a registry of named tasks, and `Loop`, which runs one pass at once and one at each tick of an hourly timer, the tasks of a pass one after the other in a fixed order, and logs a failing task without stopping the others |
 | `internal/hubtest` | test support, imported by test code only: `Start` bootstraps a hub with an admin token and serves it in-process on a free loopback port, `StartWith` does the same with more in `config.toml` (`Config.Server` inside `[server]`, `Config.TOML` after it), files in the config dir (`Config.Files`), variables added to the hub's environment (`Config.Env`) and a function run on the composition (`Config.Compose`), `(*Hub).Restart` serves the hub again on the same data directory and port and `RestartEnv` does so with other added variables, `(*Hub).IssuePAT` stores a PAT, `CreateOrg` and `AddMember` make an org and a membership through the admin routes and `AddWorkspace` stores a workspace record, `Serve` runs a hub with given options until the test ends, `(*Served).Call` sends a request with a bearer credential and a body and returns the answer's status and body, and `LogBuffer` holds a running hub's log for the test to read |
@@ -30,6 +32,7 @@ command-line client. Both are written in Go, in the module
 | `internal/store` | the hub's two embedded SQLite stores (`modernc.org/sqlite`, no cgo): `Open` creates the data directory and the workspace root, opens the transactional store and the analytical store (`analytics.db` beside it) and applies the registered schema steps; `Tx` runs a transaction of the transactional store; `Snapshot` writes a consistent copy of one store file without changing it |
 | `internal/server` | the hub's HTTP server: its built-in routes, the REST API's route registration and check pipeline, the error envelope, request ids, response headers and the access log, list paging, idempotency keys, and the readiness probes |
 | `internal/server/timefmt` | the one timestamp format (`Format`, and the response member type `Time`) and the one duration grammar (`ParseDuration`); a leaf package that imports nothing of the project, so that the configuration loader can use it as well as the REST API |
+| `internal/workspace` | the place for workspace records, their validation rules, the state guard, and the create and clone work; so far the whole workspace record with its store functions, the state guard `RequireReady`, the resolution of a workspace's origin credential from its secrets `ResolveOriginCredential`, the workspace service with `POST /api/v1/workspaces` and the clone work `Clone` with the copy's place `RepoPath` and the post-clone steps, the clone workers `Workers` and `(*Service).Enqueue`, which hands a workspace put back to `pending` to them (see Clone work), the one encoder of the workspace object `RenderWorkspace` and the settings registry (see Workspace records), and the rules every workspace route judges its values by, each deciding on the text alone and returning an error that says which rule broke: `ValidateSlug` (3 to 64 characters of a to z, digits and hyphens, starting with a letter), `ValidateGitURL` (`https://<host>/<path>` without user information, or `git@<host>:<path>`, with no lookup or connection), `ValidateBranchName` (git's branch-name rule), `ValidateForkName` (1 to 32 characters of a to z, digits and hyphens) and `ParseDuration` (a whole number above zero followed by `m`, `h` or `d`, unlike `timefmt.ParseDuration`, which also takes seconds) |
 | `test/e2e` | tests that build the binaries and run them |
 
 ## The HTTP server
@@ -470,6 +473,7 @@ appends it there ([ADR 01](adr/01-compose-the-hub-in-one-package.md)).
 | `AddRoute(server.Route)`, `Handle(pattern, handler)` | REST routes and surfaces outside the REST API |
 | `SetAuthenticator`, `SetBindingGuard`, `SetScopeCheck`, `AddAccessCheck` | the checks of the pipeline's positions |
 | `SetSandboxRuntime(sandbox.RuntimeFactory)`, `SetSandboxRecorder(sandbox.Recorder)` | the factory of the sandbox runtime client (default: the OpenShell implementation) and the recorder of the sandbox metrics (default: none) |
+| `AdjustWorkspace(func(*workspace.Deps))` | a change to the workspace service's dependencies, applied after the start hook `workspaces` builds them and before it binds them, in the order added; tests replace a collaborator with it |
 
 `(*Composition).Sandbox()` returns the `*sandbox.Service` that
 `composeSandbox` (`internal/hub/sandbox.go`) creates: a part listed after it,
@@ -497,6 +501,11 @@ start hook on, if it is listed after `composeSecrets`, or from
 (`internal/hub/events.go`) creates: a part keeps it when it is composed and
 emits through it from its start hook on, if it is listed after
 `composeEvents`, or from `Options.Compose` (see [Hub events](#hub-events)).
+
+`(*Composition).Workspaces()` returns the `*workspace.Service` that
+`composeWorkspaces` (`internal/hub/workspace.go`) creates: a part keeps it
+when it is composed and registers its setting keys on
+`Workspaces().Settings()` then (see [Workspace records](#workspace-records)).
 
 The composition also keeps the identity service in its unexported field
 `identity`, which `composeIdentity` sets. A part listed after it that keeps
@@ -1107,7 +1116,10 @@ of the request. `PATCH /user` reads the body with `fullNameOf(r)`, the rule
 the REST API's Org object (`id`, `name`, `slug`, `url`, `owner_id`, `null`
 when `OwnerID` is empty, `status`, `created_at`, `updated_at`);
 `identity.OrgByID(ctx, q, id)` and `identity.OrgBySlug(ctx, q, slug)`
-return an org or `identity.ErrNotFound`, comparing the slug exactly; and
+return an org or `identity.ErrNotFound`, comparing the slug exactly;
+`identity.PersonalOrg(ctx, q, userID, username)` returns the user's
+personal org, the one owned by the user and named after the username as
+`CreateUserAndPersonalOrg` makes it, or `identity.ErrNotFound`; and
 `identity.Memberships(ctx, q, orgID)` returns an org's
 `identity.Membership`s (`OrgID`, `UserID`, `CreatedAt`), oldest first, then
 by user id; `identity.ActiveOrgIDs(ctx, q, userID)` returns, by id, the
@@ -1630,6 +1642,242 @@ a workspace-bound token was not recorded`, with `token_id`,
 `bound_workspace` and `error`, never a token value) and not retried, and
 the token's minute counts as started. A limiter without an emitter logs
 the same warning.
+
+### Workspace records
+
+`internal/workspace/store.go` holds `workspace.SchemaStep`
+(`workspace_fields`), which extends the table `workspaces` of
+`access.SchemaStep` instead of keeping a second table, so that the access
+rule and the workspace routes read one row; it applies after
+`access.CreatingTokenStep`. It adds one column per `ALTER TABLE workspaces
+ADD COLUMN` statement: `workspace_mode` (`standard` or `carry_patch`, a
+`CHECK` constraint, default `standard`), `git_url`, `default_branch`,
+`display_name` and `description` (default `''`), `head_sha`,
+`origin_head_sha`, `clone_error`, `last_sync_at`, `sync_error`,
+`upstream_url`, `integration_branch`, `upstream_head_sha`, `fork_point_ref`
+and `fork_point_sha` (both NULL unless the workspace is a fork),
+`expires_at`, `auto_change`, `purpose`, `session_id`, `settings` (the stored
+settings document as one JSON object, default `'{}'`), `created_at` and
+`updated_at` (default `0`), `instance_id` (default `''`) and `maintenance`
+(`''`, `reclone`, `archive` or `delete`, a `CHECK` constraint). Times are
+UnixNano integers. The slug stays the primary key, unique across
+repositories and forks. Origin heads have no column: they are refs of the
+workspace's copy. `composeWorkspaces` registers the step.
+
+`internal/workspace/record.go` holds `workspace.Workspace`, every field of
+a workspace (a nil pointer for a null field) plus `InstanceID`, `Marker` and
+`CreatingTokenID`, which no response shows; the type `Status` with
+`StatusPending` to `StatusArchived` (the access rule's strings); the type
+`Marker` with `MarkerNone` (`""`), `MarkerReclone`, `MarkerArchive` and
+`MarkerDelete`; `ModeStandard` and `ModeCarryPatch`; `ForkPoint` (`Ref`,
+`SHA`); and `NewInstanceID`, 128 random bits as 32 hex digits. The store
+functions take the caller's transaction:
+
+- `Insert(ctx, tx, w)` refuses an empty `InstanceID` with
+  `access.ErrInvalidRecord` before writing, stores the access rule's columns
+  with `access.InsertRecord` (so a taken slug is `access.ErrDuplicateSlug`)
+  and then the other fields with an `UPDATE` in the same transaction; a nil
+  `Settings` is stored as `{}`.
+- `BySlug(ctx, q, slug)` reads the record through an `access.Querier`; an
+  unknown slug is found = false with a nil error, and `Settings` is never
+  nil.
+- `StartClone(ctx, ex, slug, now)` moves a `pending` or `cloning` workspace
+  to `cloning` and clears its `clone_error` in one `UPDATE`; it reports
+  started = false, with no error, for any other status or no workspace.
+- `UpdateClone(ctx, ex, slug, c)` writes `CloneFields` (`Status`,
+  `DefaultBranch`, `HeadSHA`, `OriginHeadSHA`, `CloneError`, `UpdatedAt`),
+  every one of them, a nil one as NULL, through an `Execer` (a `*sql.Tx` or
+  the `*sql.DB`); an unknown slug is `workspace.ErrNotFound`.
+
+`internal/hub/workspace.go` adds the part `composeWorkspaces`, after
+`composeSecrets`. It creates the `*workspace.Service`, registers
+`workspace.SchemaStep` and the workspace routes, and adds the start hook
+`workspaces`, which builds the service's `workspace.Deps` (the stores, the
+secret and event components through the `Secrets` and `Events` interfaces,
+the hub's scrubber, logger and clock, `[server].external_url` as
+`ExternalURL` and `[workspace].path` as `Root`, and `Lister`, an
+`OriginLister` that lists an origin's refs with a `Credential`, the type
+`gitrepo.Credential`, so that a resolved credential goes to git unchanged),
+applies every function `AdjustWorkspace` added, and binds the service with
+`Bind`. Before it builds them, the hook builds the clone workers with
+`workspace.NewWorkers(cfg.Workspace.Workers, svc, nil)`, whose refusal stops
+the start; after `Bind` it calls their `Start`, so that the clone work left
+from before the start is queued before the hub listens (see Clone work),
+but runs no clone. The background work `workspace_clones`, which begins
+only once the hub listens, launches the workers with `Launch`, so that a
+start that fails after the hook (a later start hook, the bind) leaves no
+clone running over stores that are closed; it then waits for the stop and
+calls the workers' `Stop` with a 10-second deadline, the grace the stop
+gives it. The part's one `gitrepo.Git` passes on to git the variables
+`GIT_SSL_CAINFO`, `SSL_CERT_FILE`, `HTTPS_PROXY`, `HTTP_PROXY` and
+`NO_PROXY` of the hub's environment, read when the hub is composed, and no
+other but `PATH` (see [configuration.md](configuration.md#environment-variables)); the
+production `Lister` runs its `ListRemote`, and it is `Git`, the
+`workspace.Git` (`Clone`, `Open`) of the clone work (nil is `gitrepo.Git{}`;
+a nil `Scrubber` is a scrubber that knows no value). `Deps` also holds
+`InsertWorkspace`, which writes the record in the create transaction (nil
+is `workspace.Insert`; a test makes it fail), and `Notify`, called with the
+slug after a create commits so that clone work is picked up; the hub sets
+it to the workers' `Enqueue`. `(*Service).Enqueue(slug)` calls `Notify`
+(nothing without one): a feature that puts a workspace back to `pending`
+calls it once its transaction has committed, since the workers themselves
+are the hub's.
+
+`internal/workspace/credential.go` holds `ResolveOriginCredential(ctx,
+secrets, slug)`, which every operation that contacts a workspace's origin
+calls. It reads the workspace secrets (scope `workspace`, the slug as scope
+id) through a `SecretReader` (`Get`, which `*secret.Component` and the
+service's `Secrets` have) on every call, one read per name, so that a
+changed secret counts at its next use: a non-empty `GIT_PAT` is the user
+name `x-token-auth` with the token as password; otherwise `GIT_USERNAME`
+and `GIT_PASSWORD`, when both are set; otherwise no credential (the zero
+`Credential`). A read error is returned as an error and never taken for no
+credential, so that a broken secret store does not turn into an anonymous
+request to origin. The names are `SecretGitPAT`, `SecretGitUsername` and
+`SecretGitPassword`.
+
+`internal/workspace/create.go` serves `POST /api/v1/workspaces` (scope
+`workspaces:write`, a create route, no workspace need; see
+[api.md](api.md#post-apiv1workspaces)). The handler refuses the admin token
+first, reads the body by an ordered list of members (`createMembers`, each
+answering `400 invalid_request` with `<member>: <reason>`, a member able to
+depend on those before it; `settings` is applied with
+`SettingsRegistry.ApplySettings` from an empty document, and its own
+answers pass through unchanged), takes the org `org_id` names
+(`identity.OrgBySelector`; unknown is `400`) or else the caller's personal
+org (`identity.PersonalOrg`) and checks the caller is an active member of
+it (`403` otherwise), answers a slug in use `409 conflict` after a read with
+`access.RecordBySlug`. Only a request with a credential then asks the
+secret component's `Available()` (false: `secret.UnavailableError`, `503`,
+before origin is contacted) and lists origin's refs with the credential
+through `Lister` under a 10-second deadline (an error: `400
+credential_check_failed` with a fixed message, git's text logged only
+through the scrubber as `workspace credential check refused`). Then, in one
+store transaction, it inserts the record through `InsertWorkspace` (status
+`pending`, a fresh instance id, `created_at` = `updated_at` cut to the
+second), stores the credential with the secret component's `Put` as the
+workspace secrets `GIT_PAT`, or `GIT_USERNAME` and `GIT_PASSWORD`, and
+writes `parley.workspace.create` through the event component; an error of
+any of the three rolls all of them back (`500 internal`). A slug taken by a
+racing request is `access.ErrDuplicateSlug` from the insert and the same
+`409`. The pending record is the clone work; there is no separate queue.
+
+`internal/workspace/response.go` holds `(*Service).RenderWorkspace(ctx, w,
+level)`, the one place a workspace object (`workspace.Object`) is built:
+every field of the record, a nil one encoded as `null`, plus `org_slug`
+(read from the workspace's org), `hub_url` (`ExternalURL` without one
+trailing slash, then `/git/<org_slug>/<slug>.git`, or `null` without an
+external URL), `access` (the caller's level) and `settings`. A record of
+kind `fork` goes last through the `ForkView` registered with
+`(*Service).RegisterForkView`, so the fork feature completes its object
+without this package importing it.
+
+`internal/workspace/settings.go` holds `SettingsRegistry`, the setting keys
+in registration order, empty in its zero value; the service holds one,
+returned by `(*Service).Settings()`. `RegisterSetting(SettingKey)` adds a
+key with its `Name`, its `Default` (a function of the default branch) and
+its `Validate` rule, refusing a duplicate or incomplete key;
+`ApplySettings(stored, raw)` applies a request's settings value (`null`
+resets every key; otherwise an object whose unknown keys are refused with
+`unknown setting "<key>"`, a `null` value resets that key, every other
+value passes its key's rule); `EffectiveSettings(stored, defaultBranch)`
+returns every registered key with its stored value or its default. No key
+is registered yet, so every workspace object shows `settings` as `{}`.
+
+`internal/workspace/guard.go` holds `RequireReady(w)`, the state check of
+every route that needs a workspace's repository. It reads the marker first:
+any marker is `409 workspace_busy`, because a reclone or a delete of a
+failed or archived workspace is work the caller should wait out. Then the
+status: `pending` or `cloning` is `409 workspace_busy`, `archived` is
+`409 workspace_archived` (`server.WorkspaceArchived`), `failed` is
+`409 workspace_not_ready`, and `ready` passes. It reads only the record it
+is given and takes no lock, so a ready workspace serves any number of
+requests at once.
+
+#### Clone work
+
+`internal/workspace/clone.go` holds the clone work. `(*Service).RepoPath(slug)`
+is the place of a workspace's copy, `<[workspace].path>/<slug>.git`, and the
+one place the path is built. `(*Service).Clone(ctx, slug)` does the clone
+work of one workspace:
+
+1. `StartClone` moves a `pending` workspace to `cloning` and clears its
+   `clone_error` before origin is contacted; a workspace already in
+   `cloning` is taken up again; any other status, or no workspace, is left
+   alone, so a failed clone is never tried again on its own.
+2. A copy of this workspace at `RepoPath` is kept: one that opens as a
+   repository, whose `parley.workspace` is the workspace's instance id,
+   whose `remote.origin.url` is its `git_url`, and whose default branch (the
+   copy's own `HEAD` branch while the record has no `default_branch`)
+   resolves to a commit. Its head of that branch becomes `head_sha`, the
+   branch `default_branch`, the origin head it keeps for it, if any,
+   `origin_head_sha`, and the status `ready`, in one write; origin is not
+   asked and no post-clone step runs. This is how a hub that ended without
+   its stop (killed) between the copy's rename and `ready` is resumed. Anything else at `RepoPath` (a file, an
+   empty directory, a repository failing one of the tests, the copy of an
+   earlier workspace of the same slug) goes on to a fresh clone.
+3. `ResolveOriginCredential` reads the credential; a read error fails the
+   clone before git runs.
+4. Whatever lies at `RepoPath` is removed, and origin is cloned with
+   `Git.Clone` into a directory `.clone-<random>` in the repository root
+   (no slug starts with a dot, so no copy carries the prefix).
+5. A copy without a branch fails with `origin has no branches`; a
+   `default_branch` given at creation that the copy does not have fails with
+   `origin has no branch "<name>", the default_branch given at creation`.
+   Without one, the default branch is the branch the copy's `HEAD` names
+   (origin's default branch), or, when that branch does not exist, the first
+   branch by name.
+6. `SetOriginHead` writes `refs/remotes/origin/<name>` at the head of every
+   branch, the workspace's instance id is written to the copy's
+   configuration as `parley.workspace`, the copy's `HEAD` is set to the
+   default branch, and the directory is renamed to `RepoPath`.
+7. One `UpdateClone` records `default_branch`, `head_sha` and
+   `origin_head_sha` (the default branch's head) with the status still
+   `cloning`.
+8. The post-clone step registered for the workspace's `workspace_mode` with
+   `(*Service).RegisterPostCloneStep(mode, step)` runs, given the record and
+   the copy opened at `RepoPath`; an error it returns is logged as
+   `workspace post-clone step failed` and does not change the outcome.
+9. The status is set to `ready`.
+
+Any failure removes the clone directory and whatever lies at `RepoPath`,
+logs `workspace clone failed` and sets the status to `failed` with
+`clone_error` the failure's text through the hub's scrubber, with the
+resolved password as a per-call secret value (secret values replaced by
+`[redacted]`, URL userinfo removed, at most 1024 bytes); `head_sha` and
+`origin_head_sha` become null and `default_branch` keeps its stored value.
+No event is written and no further attempt is scheduled; `Clone` returns
+nil once the failure is recorded. When `ctx` ends first (the hub stops),
+the clone directory is removed, and so is the copy at `RepoPath` once it
+has been renamed there (steps 7 to 9), the status is left as it is so that
+the work is taken up again, and `Clone` returns the context's error: a stop
+leaves nothing at the copy's place, and the next start clones afresh and
+runs the post-clone step. A workspace that is ready is recorded with one
+write after the step, so a hub that ends without its stop between the
+copy's rename and `ready` leaves the workspace in `cloning`, with a copy
+step 2 keeps at the next start.
+
+`internal/workspace/worker.go` runs the clone work in the background.
+`NewWorkers(size, svc, work)` refuses a size below 1 with an error naming
+`[workspace].workers`; `work` is the work run for each slug, `svc.Clone`
+when nil. `Enqueue(slug)` appends a slug to a first-in-first-out queue in
+memory; a slug already waiting or running is not queued again, and nothing
+is queued after `Stop`. `Start(ctx)` removes every `.clone-*` entry of the
+repository root (clones a stop interrupted) and queues every workspace in
+`pending` or `cloning` in the order of `CloneWork` (by `created_at`, then
+slug); it runs no clone. `Launch(ctx)` then starts `size` goroutines that
+take slugs from the queue one at a time; the clones run under a context
+derived from `ctx`, so they end with it as with `Stop`. Each runs once; a
+second call is an error. The queue holds no state of its own: a workspace
+in `pending` or `cloning` is its own record of the work, and the next
+`Start` reads it again. An error of the work that is not the
+end of its context is logged as `workspace clone work failed`, and the
+workspace keeps its status. `Stop(ctx)` stops taking work, cancels the
+context of the running clones, so that their git processes are killed and
+`Clone` leaves their status as it is, waits for the goroutines, then
+removes every `.clone-*` entry again and returns the error of that removal
+(nil when it succeeds); it returns `ctx`'s error when `ctx` ends before the
+goroutines, and nil at once for workers never launched.
 
 ### Hub events
 

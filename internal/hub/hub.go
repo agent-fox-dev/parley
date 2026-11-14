@@ -36,6 +36,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/secret"
 	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/store"
+	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
 // DefaultRequestGrace is how long in-flight requests get to finish on a stop.
@@ -61,6 +62,7 @@ var parts = []func(*Composition){
 	composeAccess,
 	composeEvents,
 	composeSecrets,
+	composeWorkspaces,
 	composeSandbox,
 }
 
@@ -175,6 +177,12 @@ type Composition struct {
 	// secrets is the secret component composeSecrets creates and binds in
 	// its start hook; the parts read and store secrets through it (Secrets).
 	secrets *secret.Component
+
+	// workspaces is the workspace service composeWorkspaces creates and
+	// binds in its start hook, after workspaceAdjusters have changed its
+	// dependencies (AdjustWorkspace).
+	workspaces         *workspace.Service
+	workspaceAdjusters []func(*workspace.Deps)
 
 	// env is the hub's environment, Options.Env, which a part's
 	// configuration check reads what the configuration file does not hold
