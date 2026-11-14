@@ -57,7 +57,7 @@ type Remote struct {
 // origin at url, presenting cred when origin asks for one. An error means
 // that origin refused the request, could not be reached, or that ctx ended.
 func (g Git) ListRemote(ctx context.Context, url string, cred Credential) (Remote, error) {
-	out, err := g.run(ctx, cred, "-c", "credential.helper=", "ls-remote", "--symref", "--", url)
+	out, err := g.run(ctx, access{cred, url}, "-c", "credential.helper=", "ls-remote", "--symref", "--", url)
 	if err != nil {
 		return Remote{}, err
 	}
@@ -94,7 +94,7 @@ func (g Git) Clone(ctx context.Context, url string, cred Credential, dir string)
 	if err != nil {
 		return fmt.Errorf("clone into %s: %w", dir, err)
 	}
-	_, err = g.run(ctx, cred, "-c", "credential.helper=", "clone", "--bare", "--quiet", "--", url, abs)
+	_, err = g.run(ctx, access{cred, url}, "-c", "credential.helper=", "clone", "--bare", "--quiet", "--", url, abs)
 	return err
 }
 
@@ -256,15 +256,22 @@ func (r *Repo) refs(ctx context.Context, prefix string) (map[string]string, erro
 
 // git runs git on the repository.
 func (r *Repo) git(ctx context.Context, args ...string) ([]byte, error) {
-	return r.g.run(ctx, Credential{}, append([]string{"--git-dir=" + r.dir}, args...)...)
+	return r.g.run(ctx, access{}, append([]string{"--git-dir=" + r.dir}, args...)...)
+}
+
+// access is the credential a git process presents and the URL of the origin
+// it presents it to; the zero value presents none.
+type access struct {
+	cred Credential
+	url  string
 }
 
 // run runs git with args under ctx, with the minimal environment, Env and
-// cred, and returns its standard output. A failure's error holds git's
+// a's credential, and returns its standard output. A failure's error holds git's
 // standard error; when ctx ended, it wraps ctx's error instead. The process
 // runs in git's private home directory, outside any repository, so that no
 // repository around the hub's working directory takes part.
-func (g Git) run(ctx context.Context, cred Credential, args ...string) ([]byte, error) {
+func (g Git) run(ctx context.Context, a access, args ...string) ([]byte, error) {
 	dir, err := privateDir()
 	if err != nil {
 		return nil, err
@@ -286,7 +293,7 @@ func (g Git) run(ctx context.Context, cred Credential, args ...string) ([]byte, 
 		// caller's GIT_SSH_COMMAND replaces it.
 		"GIT_SSH_COMMAND=ssh -o BatchMode=yes",
 		"LC_ALL=C",
-	}, g.Env...), credentialEnv(dir, cred)...)
+	}, g.Env...), credentialEnv(dir, a.cred, a.url)...)
 	var stdout bytes.Buffer
 	stderr := &limitedBuffer{limit: stderrLimit}
 	cmd.Stdout, cmd.Stderr = &stdout, stderr

@@ -4,6 +4,8 @@ import (
 	"context"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -120,6 +122,45 @@ func assertNoTokenInCopy(t *testing.T, g gitrepo.Git, dir, url string) {
 	}
 	if got, err := repo.OriginURL(context.Background()); err != nil || got != url {
 		t.Errorf("OriginURL = %q, %v; want %q", got, err, url)
+	}
+}
+
+func TestCredential_IsNotGivenToTheHostOriginRedirectsTo(t *testing.T) {
+	t.Parallel()
+	// The other server is on origin's host at another port: a different
+	// origin all the same, which asks for a credential and keeps what it
+	// is sent.
+	var mu sync.Mutex
+	var received []string
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if auth := r.Header.Get("Authorization"); auth != "" {
+			mu.Lock()
+			received = append(received, auth)
+			mu.Unlock()
+		}
+		w.Header().Set("WWW-Authenticate", `Basic realm="other"`)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	t.Cleanup(other.Close)
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, other.URL+r.URL.RequestURI(), http.StatusFound)
+	}))
+	t.Cleanup(origin.Close)
+
+	g := gitrepo.Git{}
+	ctx := context.Background()
+	url := origin.URL + "/repo.git"
+	cred := gitrepo.Credential{Username: "x-token-auth", Password: token}
+	if _, err := g.ListRemote(ctx, url, cred); err == nil {
+		t.Error("ListRemote succeeded against an origin that redirects to a server refusing it")
+	}
+	if err := g.Clone(ctx, url, cred, filepath.Join(t.TempDir(), "copy.git")); err == nil {
+		t.Error("Clone succeeded against an origin that redirects to a server refusing it")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, auth := range received {
+		t.Errorf("the host origin redirected to received the credential: Authorization %q", auth)
 	}
 }
 

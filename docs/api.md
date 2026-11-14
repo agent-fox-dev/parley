@@ -1090,8 +1090,11 @@ a member that the table allows to be `null` counts as absent when it is:
 No credential member may be given with a `git_url` of the form
 `git@<host>:<path>`. A credential is checked against origin before anything
 is stored: the hub lists the refs of `git_url` with it, a token presented
-with the user name `x-token-auth`, and gives that listing 10 seconds. A
-request without a credential does not contact origin. The credential is
+with the user name `x-token-auth`, and gives that listing 10 seconds. The
+credential is presented to the scheme, host and port of `git_url` alone, at
+this check and at every clone: when origin redirects git to another host,
+port or scheme, it is not presented there. A request without a credential
+does not contact origin. The credential is
 stored as workspace secrets of the new slug, `GIT_PAT` for `git_pat`, or
 `GIT_USERNAME` and `GIT_PASSWORD`, in the same transaction as the workspace,
 and appears in no answer, event or log line.

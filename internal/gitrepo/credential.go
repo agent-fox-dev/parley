@@ -2,6 +2,7 @@ package gitrepo
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sync"
@@ -24,12 +25,23 @@ func (c Credential) IsZero() bool { return c == Credential{} }
 const (
 	envUsername = "PARLEY_GIT_USERNAME"
 	envPassword = "PARLEY_GIT_PASSWORD"
+	envOrigin   = "PARLEY_GIT_ORIGIN"
 )
 
-// askpassScript answers git's prompts: the user name for the prompt that
-// asks for it ("Username for 'https://…': ", fixed by LC_ALL=C), the
-// password for every other one. It holds no secret.
+// askpassScript answers git's prompts ("Username for 'https://host': ",
+// "Password for 'https://user@host': ", fixed by LC_ALL=C) only when the
+// prompt names origin's own scheme, host and port: git follows a redirect
+// of its first request, and the host it is sent to must not receive the
+// credential. It answers the user name for the prompt that asks for it, the
+// password for every other one, and fails, so that git fails, for a prompt
+// about any other host. It holds no secret.
 const askpassScript = `#!/bin/sh
+url=${1#*\'}
+url=${url%\'*}
+case "$url" in
+*://*@*) url=${url%%://*}://${url##*@} ;;
+esac
+[ -n "$` + envOrigin + `" ] && [ "$url" = "$` + envOrigin + `" ] || exit 1
 case "$1" in
 Username*) printf '%s\n' "$` + envUsername + `" ;;
 *) printf '%s\n' "$` + envPassword + `" ;;
@@ -74,8 +86,8 @@ func askpassPath(dir string) string { return filepath.Join(dir, "askpass") }
 func homePath(dir string) string { return filepath.Join(dir, "home") }
 
 // credentialEnv is the environment that hands cred to git through the
-// askpass program, nil for no credential.
-func credentialEnv(dir string, cred Credential) []string {
+// askpass program for the origin at rawURL alone, nil for no credential.
+func credentialEnv(dir string, cred Credential, rawURL string) []string {
 	if cred.IsZero() {
 		return nil
 	}
@@ -83,5 +95,17 @@ func credentialEnv(dir string, cred Credential) []string {
 		"GIT_ASKPASS=" + askpassPath(dir),
 		envUsername + "=" + cred.Username,
 		envPassword + "=" + cred.Password,
+		envOrigin + "=" + promptOrigin(rawURL),
 	}
+}
+
+// promptOrigin is the scheme, host and port of rawURL as git's prompts name
+// them, "" for a URL with no host, about which the askpass program answers
+// nothing.
+func promptOrigin(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host
 }
