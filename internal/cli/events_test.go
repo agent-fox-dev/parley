@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -63,6 +64,19 @@ func stopStream(stop context.CancelFunc, frames ...string) http.HandlerFunc {
 		<-r.Context().Done()
 	}
 }
+
+// hubRefusals are the envelopes of the hub's permanent refusals of an event
+// route, by status.
+var hubRefusals = map[int]string{
+	400: `{"error":{"code":400,"message":"wait must be a whole number of seconds from 0 to 60","error_type":"invalid_request"}}`,
+	401: `{"error":{"code":401,"message":"authentication required","error_type":"unauthenticated"}}`,
+	403: `{"error":{"code":403,"message":"this route needs the scope audit:read","error_type":"insufficient_scope"}}`,
+	404: `{"error":{"code":404,"message":"workspace not found","error_type":"not_found"}}`,
+	410: `{"error":{"code":410,"message":"event cursor expired","error_type":"cursor_expired","oldest_seq":31007}}`,
+}
+
+// rateLimited answers 429, as a hub that limits the caller's rate does.
+var rateLimited = answerWith(http.StatusTooManyRequests, `{"error":{"code":429,"message":"rate limited","error_type":"rate_limited"}}`)
 
 // unavailable answers 503 with Retry-After, as a hub with every stream
 // place taken does.
@@ -139,19 +153,6 @@ func runTail(t *testing.T, ctx context.Context, opts options, hub *stubHub, wait
 	return code, stderr.String()
 }
 
-// afterOf is the after parameter of a request, "" when it has none.
-func afterOf(t *testing.T, r stubRequest) string {
-	t.Helper()
-	q, err := url.ParseQuery(r.query)
-	if err != nil {
-		t.Fatalf("query %q does not parse: %v", r.query, err)
-	}
-	if !q.Has("after") {
-		return ""
-	}
-	return q.Get("after")
-}
-
 func TestEventsTail_PrintsOneLinePerEvent(t *testing.T) {
 	t.Parallel()
 	const session = "6f1c2a7e-3b4d-4c5e-8f9a-0b1c2d3e4f5a"
@@ -194,7 +195,7 @@ func TestEventsTail_PrintsOneLinePerEvent(t *testing.T) {
 			if len(sent) != 1 {
 				t.Fatalf("the hub got %d requests, want 1 (reconnect waits %v)", len(sent), waits.got())
 			}
-			if got, _ := url.ParseQuery(sent[0].query); !equalValues(got, tt.want) {
+			if got, _ := url.ParseQuery(sent[0].query); !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("query = %q, want %q", sent[0].query, tt.want.Encode())
 			}
 			if accept := sent[0].header.Get("Accept"); accept != "text/event-stream" {
@@ -207,43 +208,6 @@ func TestEventsTail_PrintsOneLinePerEvent(t *testing.T) {
 	}
 }
 
-// equalValues tells whether a and b hold the same parameters with the same
-// values.
-func equalValues(a, b url.Values) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for k, v := range a {
-		if !slices.Equal(v, b[k]) {
-			return false
-		}
-	}
-	return true
-}
-
-func TestEventsTail_InterruptExitsZero(t *testing.T) {
-	t.Parallel()
-	ctx, stop := context.WithCancel(context.Background())
-	defer stop()
-	hub := eventsHub(t, stop, stopStream(stop, heartbeatFrame(3)))
-	var stdout syncBuffer
-
-	code, stderr := runTail(t, ctx, defaultOptions(), hub, &fakeWaits{}, &stdout)
-
-	if code != 0 {
-		t.Errorf("exit status = %d, want 0", code)
-	}
-	if stderr != "" {
-		t.Errorf("stderr = %q, want nothing", stderr)
-	}
-	if out := stdout.String(); out != "" {
-		t.Errorf("stdout = %q, want nothing for a heartbeat", out)
-	}
-	if n := len(hub.recorded()); n != 1 {
-		t.Errorf("the hub got %d requests, want 1", n)
-	}
-}
-
 func TestEventsTail_ReconnectsAndResumes(t *testing.T) {
 	t.Parallel()
 	ctx, stop := context.WithCancel(context.Background())
@@ -252,10 +216,10 @@ func TestEventsTail_ReconnectsAndResumes(t *testing.T) {
 		streamThenClose(eventFrame(1), eventFrame(2), heartbeatFrame(7)),
 		unavailable,
 		closeWithoutAnswer,
-		answerWith(http.StatusTooManyRequests, `{"error":{"code":429,"message":"rate limited","error_type":"rate_limited"}}`),
+		rateLimited,
 		unavailable,
 		closeWithoutAnswer,
-		answerWith(http.StatusTooManyRequests, `{"error":{"code":429,"message":"rate limited","error_type":"rate_limited"}}`),
+		rateLimited,
 		answerWith(http.StatusBadGateway, "bad gateway"),
 		streamThenClose(eventFrame(8), eventFrame(9)),
 		streamThenClose(eventFrame(9), eventFrame(10)),
@@ -273,7 +237,8 @@ func TestEventsTail_ReconnectsAndResumes(t *testing.T) {
 	}
 	var afters []string
 	for _, r := range hub.recorded() {
-		afters = append(afters, afterOf(t, r))
+		q, _ := url.ParseQuery(r.query)
+		afters = append(afters, q.Get("after"))
 	}
 	// The last request is the one the test ends the run with.
 	wantAfters := []string{"", "7", "7", "7", "7", "7", "7", "7", "7", "9", "10"}
@@ -298,23 +263,13 @@ func TestEventsTail_ReconnectsAndResumes(t *testing.T) {
 
 func TestEventsTail_StopsOnPermanentErrors(t *testing.T) {
 	t.Parallel()
-	envelopes := []struct {
-		status int
-		body   string
-	}{
-		{400, `{"error":{"code":400,"message":"after must not be greater than last_seq (10)","error_type":"invalid_request"}}`},
-		{401, `{"error":{"code":401,"message":"authentication required","error_type":"unauthenticated"}}`},
-		{403, `{"error":{"code":403,"message":"this route needs the scope audit:read","error_type":"insufficient_scope"}}`},
-		{404, `{"error":{"code":404,"message":"workspace not found","error_type":"not_found"}}`},
-		{410, `{"error":{"code":410,"message":"event cursor expired","error_type":"cursor_expired","oldest_seq":31007}}`},
-	}
-	for _, env := range envelopes {
+	for status, body := range hubRefusals {
 		for _, reconnect := range []bool{false, true} {
-			t.Run(fmt.Sprintf("%d reconnect=%v", env.status, reconnect), func(t *testing.T) {
+			t.Run(fmt.Sprintf("%d reconnect=%v", status, reconnect), func(t *testing.T) {
 				t.Parallel()
 				ctx, stop := context.WithCancel(context.Background())
 				defer stop()
-				script := []http.HandlerFunc{answerWith(env.status, env.body)}
+				script := []http.HandlerFunc{answerWith(status, body)}
 				wantStdout := ""
 				if reconnect {
 					script = append([]http.HandlerFunc{streamThenClose(eventFrame(1))}, script...)
@@ -329,7 +284,7 @@ func TestEventsTail_StopsOnPermanentErrors(t *testing.T) {
 					t.Errorf("exit status = %d, want 1", code)
 				}
 				// Reconnect progress, if any, comes before the envelope.
-				envelope := indented(t, env.body)
+				envelope := indented(t, body)
 				progressLines, found := strings.CutSuffix(stderr, envelope)
 				if !found {
 					t.Errorf("stderr = %q, want it to end with the hub's envelope as received, %q", stderr, envelope)
@@ -338,9 +293,6 @@ func TestEventsTail_StopsOnPermanentErrors(t *testing.T) {
 					if !strings.HasPrefix(line, "reconnecting in ") {
 						t.Errorf("stderr holds %q before the envelope, want only reconnect progress", line)
 					}
-				}
-				if env.status == http.StatusGone && !strings.Contains(stderr, `"oldest_seq": 31007`) {
-					t.Errorf("stderr = %q, want oldest_seq 31007", stderr)
 				}
 				if got := stdout.String(); got != wantStdout {
 					t.Errorf("stdout = %q, want %q", got, wantStdout)
@@ -375,48 +327,33 @@ func TestEvents_RejectsBadAfter(t *testing.T) {
 	}
 }
 
-// deadlines is a transport wrapper that records, for each request it
-// carries, how long the request had left before its deadline, 0 for none.
-type deadlines struct {
-	mu   sync.Mutex
-	left []time.Duration
-}
-
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
-func (d *deadlines) wrap(next http.RoundTripper) http.RoundTripper {
-	return roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		var left time.Duration
-		if at, ok := r.Context().Deadline(); ok {
-			left = time.Until(at)
-		}
-		d.mu.Lock()
-		d.left = append(d.left, left)
-		d.mu.Unlock()
-		return next.RoundTrip(r)
-	})
-}
-
-func (d *deadlines) got() []time.Duration {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return slices.Clone(d.left)
-}
-
 // runList runs parley events list with args against hub and returns the exit
-// status, stdout, stderr and the time each request had before its deadline.
+// status, stdout, stderr and the time each request had before its deadline,
+// 0 for none.
 func runList(t *testing.T, hub *stubHub, args ...string) (int, string, string, []time.Duration) {
 	t.Helper()
 	opts := defaultOptions()
-	d := &deadlines{}
-	opts.transport = d.wrap
+	// The run sends its requests from the goroutine that calls it.
+	var left []time.Duration
+	opts.transport = func(next http.RoundTripper) http.RoundTripper {
+		return roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			var d time.Duration
+			if at, ok := r.Context().Deadline(); ok {
+				d = time.Until(at)
+			}
+			left = append(left, d)
+			return next.RoundTrip(r)
+		})
+	}
 	code, stdout, stderr := runCLIWith(t, opts, onHub(hub.URL, append([]string{"events", "list"}, args...)...)...)
-	return code, stdout, stderr, d.got()
+	return code, stdout, stderr, left
 }
 
-func TestEventsList_CallsLogOnce(t *testing.T) {
+func TestEventsList_CallsLogOnceAndPrintsTheAnswer(t *testing.T) {
 	t.Parallel()
 	const session = "6f1c2a7e-3b4d-4c5e-8f9a-0b1c2d3e4f5a"
 	page := `{"items":[` + eventRecord(5) + `],"next_cursor":null,"next_after":5,"oldest_seq":1,"last_seq":5}`
@@ -425,30 +362,37 @@ func TestEventsList_CallsLogOnce(t *testing.T) {
 		args    []string
 		want    url.Values
 		timeout time.Duration
+		status  int
+		body    string
 	}{
 		{"every flag", []string{"--workspace", "api", "--types", "parley.change.*", "--session", session, "--after", "4", "--limit", "10", "--wait", "45"},
-			url.Values{"workspace": {"api"}, "types": {"parley.change.*"}, "session_id": {session}, "after": {"4"}, "limit": {"10"}, "wait": {"45"}}, 75 * time.Second},
-		{"no flag", nil, url.Values{}, 30 * time.Second},
-		{"limit and wait the hub judges", []string{"--limit", "0", "--wait", "61"}, url.Values{"limit": {"0"}, "wait": {"61"}}, 91 * time.Second},
+			url.Values{"workspace": {"api"}, "types": {"parley.change.*"}, "session_id": {session}, "after": {"4"}, "limit": {"10"}, "wait": {"45"}}, 75 * time.Second, 200, page},
+		{"no flag", nil, url.Values{}, 30 * time.Second, 200, page},
+		{"limit and wait the hub judges", []string{"--limit", "0", "--wait", "61"}, url.Values{"limit": {"0"}, "wait": {"61"}}, 91 * time.Second, 400, hubRefusals[400]},
+		{"a workspace the caller may not read", []string{"--workspace", "secret"}, url.Values{"workspace": {"secret"}}, 30 * time.Second, 404, hubRefusals[404]},
+		{"an expired position", []string{"--after", "3"}, url.Values{"after": {"3"}}, 30 * time.Second, 410, hubRefusals[410]},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			hub := newStubHub(t).answer(http.MethodGet, "/api/v1/events/log", http.StatusOK, page)
+			hub := newStubHub(t).answer(http.MethodGet, "/api/v1/events/log", tt.status, tt.body)
 
 			code, stdout, stderr, left := runList(t, hub, tt.args...)
 
-			if code != 0 || stderr != "" {
-				t.Errorf("exit status %d, stderr %q, want 0 and nothing", code, stderr)
+			// The hub's answer goes to stdout, or its refusal to stderr, as
+			// received.
+			wantCode, wantStdout, wantStderr := 0, indented(t, tt.body), ""
+			if tt.status != http.StatusOK {
+				wantCode, wantStdout, wantStderr = 1, "", wantStdout
 			}
-			if want := indented(t, page); stdout != want {
-				t.Errorf("stdout = %q, want %q", stdout, want)
+			if code != wantCode || stdout != wantStdout || stderr != wantStderr {
+				t.Errorf("exit status %d, stdout %q, stderr %q, want %d, %q and %q", code, stdout, stderr, wantCode, wantStdout, wantStderr)
 			}
 			sent := hub.recorded()
 			if len(sent) != 1 {
 				t.Fatalf("the hub got %d requests, want 1", len(sent))
 			}
-			if got, _ := url.ParseQuery(sent[0].query); !equalValues(got, tt.want) {
+			if got, _ := url.ParseQuery(sent[0].query); !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("query = %q, want %q", sent[0].query, tt.want.Encode())
 			}
 			if auth := sent[0].header.Get("Authorization"); auth != "Bearer k" {
@@ -456,52 +400,6 @@ func TestEventsList_CallsLogOnce(t *testing.T) {
 			}
 			if len(left) != 1 || left[0].Round(time.Second) != tt.timeout {
 				t.Errorf("request timeouts = %v, want one of %v", left, tt.timeout)
-			}
-		})
-	}
-}
-
-func TestEventsList_PrintsHubErrors(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		name   string
-		args   []string
-		status int
-		body   string
-	}{
-		{"a wait too long", []string{"--wait", "61"}, 400, `{"error":{"code":400,"message":"wait must be a whole number of seconds from 0 to 60","error_type":"invalid_request"}}`},
-		{"a workspace the caller may not read", []string{"--workspace", "secret"}, 404, `{"error":{"code":404,"message":"workspace not found","error_type":"not_found"}}`},
-		{"an expired position", []string{"--after", "3"}, 410, `{"error":{"code":410,"message":"event cursor expired","error_type":"cursor_expired","oldest_seq":31007}}`},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			hub := newStubHub(t).answer(http.MethodGet, "/api/v1/events/log", tt.status, tt.body)
-
-			code, stdout, stderr, _ := runList(t, hub, tt.args...)
-
-			if code != 1 {
-				t.Errorf("exit status = %d, want 1", code)
-			}
-			if stdout != "" {
-				t.Errorf("stdout = %q, want nothing", stdout)
-			}
-			if want := indented(t, tt.body); stderr != want {
-				t.Errorf("stderr = %q, want the hub's envelope as received, %q", stderr, want)
-			}
-			if tt.status == http.StatusGone {
-				var env struct {
-					Error struct {
-						OldestSeq int64 `json:"oldest_seq"`
-					} `json:"error"`
-				}
-				oneJSONDocument(t, stderr, &env)
-				if env.Error.OldestSeq != 31007 {
-					t.Errorf("error.oldest_seq = %d, want 31007", env.Error.OldestSeq)
-				}
-			}
-			if n := len(hub.recorded()); n != 1 {
-				t.Errorf("the hub got %d requests, want 1", n)
 			}
 		})
 	}

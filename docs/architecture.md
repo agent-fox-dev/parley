@@ -1213,6 +1213,8 @@ store's `*sql.DB` or an open `*sql.Tx`):
   DO NOTHING`), and the stored record stays as it was.
 - `RecordBySlug(ctx, q, slug)` returns the record and `true`, or `false`
   and a nil error for any string no record has as its slug.
+- `ForkParent(ctx, q, slug)` returns the parent's slug when `slug` names a
+  task fork, and `""` for a repository or a slug no record has.
 - `RecordsOwnedOrIn(ctx, q, ownerID, orgIDs)` lists the records owned by a
   user or in one of a list of orgs, and `ForksOf(ctx, q, parents)` the forks
   of a list of parents, both ordered by slug; an empty list of parents
@@ -1366,7 +1368,7 @@ in `parts`. It creates a zero `event.Component`, adds the schema step
 Scrubber: rt.Scrubber, Parents: ..., Access: c.access, Memberships: ...,
 Shutdown: c.ShuttingDown(), Authenticate: c.identity.Authenticate,
 MaxStreams: ..., Retention: ...}`, the fork-parent lookup being
-`access.RecordBySlug` read in the emitting transaction, `c.access` the
+`access.ForkParent` read in the emitting transaction, `c.access` the
 `*access.Service` that `composeAccess` creates and keeps on the composition,
 the memberships the same `identity.ActiveOrgIDs` source that service is bound
 to, `Shutdown` the hub's shutdown notification, which releases the
