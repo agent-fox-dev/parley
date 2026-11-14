@@ -1587,8 +1587,9 @@ so the `message` of every error of this route has every secret value the
 hub knows and the value of the origin credential resolved for the push
 (the token of `GIT_PAT` or the password of `GIT_PASSWORD`) replaced by
 `[redacted]`, the user information of every URL removed, and is cut to
-1024 bytes, never inside a character. The branch name and `remote_url` of
-the push event are cleaned the same way.
+1024 bytes, never inside a character. The branch name of the push event
+and `remote_url`, in the answer and in the event, are cleaned the same
+way.
 
 ```json
 {"error":{"code":422,"message":"origin refused the update of branch \"feature\": pre-receive hook declined: denied for [redacted] at https://git.example/r.git","error_type":"origin_rejected"}}
@@ -1608,7 +1609,8 @@ no branch and no recorded origin head and writes no event.
 
 The answer of a push origin took names the branch, the commit pushed, the
 remote and its URL, the workspace's `git_url` without user information
-(a `git@host:path` URL as it is stored), and the result: `pushed` when
+(a `git@host:path` URL as it is stored) and with any secret value in it
+replaced by `[redacted]`, and the result: `pushed` when
 origin's branch was created or moved forward, `forced` when a forced push
 replaced it with a commit that does not descend from it, `up_to_date` when
 it was at the commit already.
@@ -1621,13 +1623,16 @@ Every push handed to origin, one that passed the checks above and whose
 credential was read, writes exactly one `parley.workspace.push` event, also
 when it fails and also when the caller disconnected: once the push begins
 it runs to its end or to its deadline, and its records are written, whether
-or not the caller is still there to read the answer. A push origin took
+or not the caller is still there to read the answer. The one exception is a
+hub that cannot write its records: the answer is then `500 internal` and no
+event is written. A push origin took
 first records the pushed commit as the branch's origin head in the hub's
 repository and then, in one store transaction, writes the event and, for
 the default branch, the workspace's `origin_head_sha` (`updated_at` and
 `status` are not changed). When that transaction fails the origin head is
 put back to what it was before the call (removed when there was none),
-no event is written and the answer is `500 internal`; origin keeps the
+unless a sync has moved it since, no event is written and the answer is
+`500 internal`; origin keeps the
 commit, and the next sync or push records it. A push that failed writes
 the event alone and leaves the origin head as it was. The event has
 `workspace` the slug, `resource_type` `branch`, `resource_id` the branch
@@ -1669,7 +1674,7 @@ never both:
 | `502` `upstream_error` | the push failed in any other way, such as HTTP `500` from origin (`the push of branch "<name>" to origin at <remote_url> failed: <what git said>`) |
 | `503` `unavailable` | the patch list of a `carry_patch` workspace could not be read (`the patch list of workspace "<slug>" cannot be read; try again later`); nothing is pushed |
 | `504` `origin_timeout` | the push had not finished 2 minutes after it began; `git` is killed with every process it started before the answer (`the push of branch "<name>" to origin did not finish within 2m0s`) |
-| `500` `internal` | the workspace's secrets could not be read, in which case origin is not contacted and nothing is pushed without a credential and no event is written; origin took the push but its records could not be written, in which case the origin head is put back and no event is written; or the hub failed otherwise |
+| `500` `internal` | the workspace's secrets could not be read, in which case origin is not contacted and nothing is pushed without a credential and no event is written; the records of a push handed to origin could not be written, in which case no event is written and, when origin took the push, the origin head is put back unless a sync has moved it since; or the hub failed otherwise |
 
 ## `POST /api/v1/workspaces/{slug}/tokens`
 

@@ -1,6 +1,7 @@
 package workspace
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -50,6 +51,10 @@ const pushDeadline = 2 * time.Minute
 
 // remoteOrigin is the name a push answer gives the remote it pushed to.
 const remoteOrigin = "origin"
+
+// originHeadRef is the prefix of the ref of the hub's copy that records a
+// branch's origin head.
+const originHeadRef = "refs/remotes/origin/"
 
 // pushRoute is POST /workspaces/:slug/branches/:name/push. The scope check
 // and then the access check run before the handler, as for a sync, so that
@@ -157,9 +162,11 @@ func (s *Service) pushBranch(w http.ResponseWriter, r *http.Request, resolved *C
 		return err
 	}
 	originURL := deref(rec.GitURL)
-	op := pushOp{slug: slug, branch: name, sha: head, force: force, remoteURL: withoutUserinfo(originURL),
-		actorType: actorType, actorID: actorID,
-		scrub: func(text string) string { return s.deps.Scrubber.Scrub(text, cred.Password) }}
+	scrub := func(text string) string { return s.deps.Scrubber.Scrub(text, cred.Password) }
+	// One value for the answer and the event: the stored URL may hold a
+	// secret outside its user information too.
+	op := pushOp{slug: slug, branch: name, sha: head, force: force, remoteURL: scrub(withoutUserinfo(originURL)),
+		actorType: actorType, actorID: actorID, scrub: scrub}
 	pushCtx, cancel := context.WithTimeout(ctx, s.deps.PushDeadline)
 	defer cancel()
 	result, err := s.deps.Pusher.Push(pushCtx, gitrepo.PushRequest{
@@ -168,9 +175,11 @@ func (s *Service) pushBranch(w http.ResponseWriter, r *http.Request, resolved *C
 	if err != nil {
 		var answer *server.Error
 		switch {
-		case errors.Is(pushCtx.Err(), context.DeadlineExceeded):
+		case errors.Is(err, context.DeadlineExceeded):
 			// The push operation killed git with every process it started
-			// when the deadline passed, and waited for them.
+			// when the deadline passed, and waited for them. A git that
+			// ended on its own as the deadline passed is answered by what
+			// it reported.
 			answer = server.NewError("origin_timeout", http.StatusGatewayTimeout, fmt.Sprintf(
 				"the push of branch %q to origin did not finish within %v", name, s.deps.PushDeadline))
 		case errors.Is(err, gitrepo.ErrNonFastForward):
@@ -199,8 +208,8 @@ const eventPush = "parley.workspace.push"
 
 // pushOp is a push handed to origin as its event names it: the workspace,
 // the branch, the hub's head offered, whether it was forced, origin's URL
-// without user information and the caller, and scrub, which cleans a text
-// of the event of the push's origin credential.
+// without user information, scrubbed, and the caller, and scrub, which
+// cleans a text of the push's origin credential.
 type pushOp struct {
 	slug, branch, sha string
 	force             bool
@@ -225,13 +234,13 @@ type pushEventMeta struct {
 // event is the push event of op, which ended with result when origin took
 // it and with the answer of type errorType otherwise. Every text a push
 // event holds is put in it here, and the texts that come from the caller or
-// the workspace's record, the branch and origin's URL, are scrubbed; the
-// others are the hub's own words and ids.
+// the workspace's record, the branch and origin's URL (scrubbed in op
+// already), are scrubbed; the others are the hub's own words and ids.
 func (op pushOp) event(result gitrepo.PushResult, errorType string) event.Input {
 	slug, branch := op.slug, op.scrub(op.branch)
 	return event.Input{Type: eventPush, Workspace: &slug, ActorType: op.actorType, ActorID: op.actorID,
 		ResourceType: "branch", ResourceID: branch, Metadata: pushEventMeta{
-			Branch: branch, SHA: op.sha, Force: op.force, OK: errorType == "", RemoteURL: op.scrub(op.remoteURL),
+			Branch: branch, SHA: op.sha, Force: op.force, OK: errorType == "", RemoteURL: op.remoteURL,
 			Result: result, ErrorType: errorType,
 		}}
 }
@@ -241,8 +250,10 @@ func (op pushOp) event(result gitrepo.PushResult, errorType string) event.Input 
 // to the pushed commit, then in one store transaction the push event and,
 // for w's default branch, w's origin_head_sha. A ref cannot be part of a
 // store transaction, so when the transaction fails the ref is put back to
-// seen, the value it had (removed when recorded is false), and the push is
-// answered as a failure inside the hub; origin keeps the commit, and the
+// seen, the value it had, in one step and only while it still holds the
+// pushed commit: a sync that moved it meanwhile recorded what origin has
+// since, which is kept. When recorded is false the ref is removed. The push
+// is answered as a failure inside the hub; origin keeps the commit, and the
 // next sync or push records it.
 func (s *Service) recordPushed(ctx context.Context, repo *gitrepo.Repo, w Workspace, op pushOp, result gitrepo.PushResult, seen string, recorded bool) error {
 	if err := repo.SetOriginHead(ctx, op.branch, op.sha); err != nil {
@@ -256,11 +267,13 @@ func (s *Service) recordPushed(ctx context.Context, repo *gitrepo.Repo, w Worksp
 	if err == nil {
 		return nil
 	}
-	restore := repo.DeleteOriginHead(ctx, op.branch)
+	var restore error
 	if recorded {
-		restore = repo.SetOriginHead(ctx, op.branch, seen)
+		restore = repo.CompareAndSwapRef(ctx, originHeadRef+op.branch, seen, op.sha)
+	} else {
+		restore = repo.DeleteOriginHead(ctx, op.branch)
 	}
-	if restore != nil {
+	if restore != nil && !errors.Is(restore, gitrepo.ErrRefMoved) {
 		s.deps.Logger.Error("workspace origin head not put back after a push", "slug", op.slug, "branch", op.branch,
 			"error", restore)
 	}
@@ -359,6 +372,8 @@ func pushForce(r *http.Request) (bool, error) {
 	if len(raw) == 0 {
 		return false, nil
 	}
+	// DecodeJSON is handed the bytes read here, not a body already drained.
+	r.Body = io.NopCloser(bytes.NewReader(raw))
 	var body map[string]json.RawMessage
 	if err := server.DecodeJSON(r, &body); err != nil {
 		return false, err

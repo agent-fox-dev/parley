@@ -1312,14 +1312,14 @@ func (w *world) push(t *testing.T, cred, slug, segment string, body any) answer 
 
 // recordingPusher is the hub's push operation: it records every push and the
 // arguments of every git process the hub's git runs for one, and runs the
-// push, or answers stub without running git while stub is set.
+// push, or answers with stub without running git while stub is set.
 type recordingPusher struct {
 	git gitrepo.Git
 
 	mu    sync.Mutex
 	calls []gitrepo.PushRequest
 	args  [][]string
-	stub  gitrepo.PushResult
+	stub  func(context.Context) (gitrepo.PushResult, error)
 }
 
 func (p *recordingPusher) Push(ctx context.Context, req gitrepo.PushRequest) (gitrepo.PushResult, error) {
@@ -1327,8 +1327,8 @@ func (p *recordingPusher) Push(ctx context.Context, req gitrepo.PushRequest) (gi
 	p.calls = append(p.calls, req)
 	stub := p.stub
 	p.mu.Unlock()
-	if stub != "" {
-		return stub, nil
+	if stub != nil {
+		return stub(ctx)
 	}
 	return p.git.Push(ctx, req)
 }
@@ -1341,9 +1341,15 @@ func (p *recordingPusher) trace(args []string) {
 
 // stubWith makes every later push answer r without running git.
 func (p *recordingPusher) stubWith(r gitrepo.PushResult) {
+	p.answerWith(func(context.Context) (gitrepo.PushResult, error) { return r, nil })
+}
+
+// answerWith makes every later push answer what fn, given the push's
+// context, returns, without running git.
+func (p *recordingPusher) answerWith(fn func(context.Context) (gitrepo.PushResult, error)) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.stub = r
+	p.stub = fn
 }
 
 // recorded are the pushes so far.
@@ -1373,6 +1379,19 @@ func (w *world) setProtected(t *testing.T, globs []string) {
 	}
 	if _, err := w.Store.Main().Exec(`UPDATE workspaces SET settings = ? WHERE slug = ?`, string(doc), syncSlug); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// storeSecrets stores secrets as the secrets of the workspace syncSlug,
+// deleting each one whose value is "".
+func (w *world) storeSecrets(t *testing.T, secrets map[string]string) {
+	t.Helper()
+	for name, value := range secrets {
+		if value == "" {
+			w.deleteSecret(t, syncSlug, name)
+		} else {
+			w.putSecret(t, syncSlug, name, value)
+		}
 	}
 }
 
@@ -1421,4 +1440,30 @@ func (l patchLookup) IsPatchBranch(_ context.Context, slug, branch string) (bool
 		return false, errors.New("the patch list cannot be read")
 	}
 	return slices.Contains(l.registered, branch), nil
+}
+
+// beforeEmit is the hub's event component, which runs a function before
+// every event it writes.
+type beforeEmit struct {
+	workspace.Events
+
+	mu sync.Mutex
+	fn func()
+}
+
+func (e *beforeEmit) Emit(ctx context.Context, tx *sql.Tx, in event.Input) (event.Record, error) {
+	e.mu.Lock()
+	fn := e.fn
+	e.mu.Unlock()
+	if fn != nil {
+		fn()
+	}
+	return e.Events.Emit(ctx, tx, in)
+}
+
+// set makes fn the function run before every event.
+func (e *beforeEmit) set(fn func()) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.fn = fn
 }

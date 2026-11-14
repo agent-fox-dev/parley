@@ -26,8 +26,9 @@ says, or decides what it leaves open.
   handler: `Deps.PushDeadline` (0 is the fixed 2 minutes in `Bind`). The
   handler runs the push under a context with that deadline; the push
   operation kills git with every process it started when the context ends
-  and returns the context's error, which the handler answers `504
-  origin_timeout`.
+  and returns an error wrapping the context's error, which the handler
+  answers `504 origin_timeout`. A push that ended on its own with another
+  outcome as the deadline passed is answered by that outcome.
 - The handler is not built from its collaborators as parameters. As for
   the sync, they are fields of `workspace.Deps`, which the hub sets in
   `internal/hub/workspace.go` and tests change through

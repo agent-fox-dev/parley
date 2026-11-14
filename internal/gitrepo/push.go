@@ -163,7 +163,10 @@ func rejectReason(summary, stderr string) string {
 
 // transportClasses map what git's HTTPS transport (curl) and its SSH
 // transport (ssh, and the forge's message behind it) write about a failure
-// to its class, tried in this order.
+// to its class, tried in this order. Reachability is judged before the
+// repository's absence, since the text of a failed name resolution,
+// connection, proxy or TLS handshake may hold a plain "not found" of its
+// own.
 var transportClasses = []struct {
 	class error
 	says  []string
@@ -173,14 +176,14 @@ var transportClasses = []struct {
 		"returned error: 401", "Permission denied (publickey", "Permission denied (password",
 	}},
 	{ErrForbidden, []string{"returned error: 403", "not allowed to push", "Permission to "}},
-	{ErrRepositoryNotFound, []string{
-		"returned error: 404", "not found", "could not be found", "does not appear to be a git repository",
-	}},
 	{ErrUnreachable, []string{
 		"Could not resolve host", "Could not resolve proxy", "Failed to connect", "Could not connect",
 		"Couldn't connect", "Connection refused", "Connection timed out", "Connection reset", "Connection closed",
 		"timed out", "No route to host", "Network is unreachable", "SSL", "TLS", "certificate",
 		"Host key verification failed",
+	}},
+	{ErrRepositoryNotFound, []string{
+		"returned error: 404", "not found", "could not be found", "does not appear to be a git repository",
 	}},
 }
 
