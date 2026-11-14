@@ -421,14 +421,6 @@ func (h *guardHub) pipeline(guarded bool) *server.Server {
 	return srv
 }
 
-// fresh is the same hub, store, service and counters, served by a server of
-// its own, for routes whose patterns one router cannot hold together.
-func (h *guardHub) fresh() *guardHub {
-	c := *h
-	c.srv = h.pipeline(true)
-	return &c
-}
-
 // unguarded is the same hub served by a server of its own without the
 // binding guard.
 func (h *guardHub) unguarded() *guardHub {

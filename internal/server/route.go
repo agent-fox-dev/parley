@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"net/url"
 	"path"
 	"slices"
 	"strings"
@@ -89,9 +90,11 @@ func Param(r *http.Request, name string) string {
 }
 
 // Register adds rt to the REST API under /api/v1. It panics when the route
-// is invalid or already registered, since both are programming errors.
+// is invalid or already registered, since both are programming errors. A
+// route that differs from a registered one only in its parameter names is
+// already registered.
 func (s *Server) Register(rt Route) {
-	names, muxPath, err := parsePattern(rt.Pattern)
+	segments, err := parsePattern(rt.Pattern)
 	if err != nil {
 		panic(fmt.Sprintf("server.Register: %s %s: %v", rt.Method, rt.Pattern, err))
 	}
@@ -106,44 +109,131 @@ func (s *Server) Register(rt Route) {
 	rt.ShowOnce = slices.Clone(rt.ShowOnce)
 	rt.Marks = maps.Clone(rt.Marks)
 
-	key := rt.Method + " " + muxPath
 	s.routesMu.Lock()
 	defer s.routesMu.Unlock()
-	if _, dup := s.routes[key]; dup {
-		panic(fmt.Sprintf("server.Register: %s %s is already registered", rt.Method, rt.Pattern))
-	}
-	s.routes[key] = struct{}{}
-	s.mux.Handle(key, s.serveRoute(rt, names))
-}
-
-// parsePattern checks a route pattern and returns its parameter names and
-// the full path in the router's syntax, with :name turned into {name}.
-func parsePattern(p string) (names []string, muxPath string, err error) {
-	if !strings.HasPrefix(p, "/") || strings.HasSuffix(p, "/") {
-		return nil, "", fmt.Errorf("pattern must start with a slash and not end with one")
-	}
-	segments := strings.Split(p[1:], "/")
-	for i, seg := range segments {
-		switch {
-		case seg == "" || seg == "." || seg == "..":
-			return nil, "", fmt.Errorf("empty or relative segment %q", seg)
-		case strings.ContainsAny(seg, "{}"):
-			return nil, "", fmt.Errorf("segment %q holds a brace; use :name for a parameter", seg)
-		case strings.HasPrefix(seg, ":"):
-			name := seg[1:]
-			if !validParamName(name) {
-				return nil, "", fmt.Errorf("parameter %q is not a valid name", seg)
-			}
-			if slices.Contains(names, name) {
-				return nil, "", fmt.Errorf("parameter %q appears twice", seg)
-			}
-			names = append(names, name)
-			segments[i] = "{" + name + "}"
-		case strings.Contains(seg, ":"):
-			return nil, "", fmt.Errorf("segment %q holds a colon after its start", seg)
+	for _, other := range s.routes {
+		if other.route.Method == rt.Method && specificity(other.segments, segments) == 0 {
+			panic(fmt.Sprintf("server.Register: %s %s is already registered", rt.Method, rt.Pattern))
 		}
 	}
-	return names, apiMount + "/" + strings.Join(segments, "/"), nil
+	s.routes = append(s.routes, apiRoute{route: rt, segments: segments})
+}
+
+// apiRoute is a registered REST API route and its pattern split into
+// segments, a parameter as :name.
+type apiRoute struct {
+	route    Route
+	segments []string
+}
+
+// matches reports whether the route's pattern matches the unescaped path
+// segments: every literal segment equal, every parameter a segment that is
+// not empty.
+func (a *apiRoute) matches(path []string) bool {
+	if len(path) != len(a.segments) {
+		return false
+	}
+	for i, seg := range a.segments {
+		if isParam(seg) {
+			if path[i] == "" {
+				return false
+			}
+		} else if seg != path[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// specificity compares two patterns of the same path: it is positive when a
+// is more specific than b, negative when b is, and 0 when they have the same
+// segments up to their parameter names. The first segment where one has a
+// literal and the other a parameter decides, the literal winning, so that
+// /changes/by-commit/:sha and /changes/:number/stack can both be registered
+// and /changes/by-commit/stack goes to the first.
+func specificity(a, b []string) int {
+	if len(a) != len(b) {
+		return len(a) - len(b)
+	}
+	for i := range a {
+		pa, pb := isParam(a[i]), isParam(b[i])
+		switch {
+		case pa && !pb:
+			return -1
+		case !pa && pb:
+			return 1
+		case !pa && a[i] != b[i]:
+			return strings.Compare(a[i], b[i])
+		}
+	}
+	return 0
+}
+
+func isParam(seg string) bool { return strings.HasPrefix(seg, ":") }
+
+// match returns the REST API route that serves method on the path below
+// /api/v1, given as its unescaped segments: of the routes whose pattern
+// matches the path and that are registered for method (or for GET when
+// method is HEAD), the most specific, and of two with the same pattern the
+// one registered for method itself. When none serves it, match returns the
+// methods the routes matching the path are registered for, sorted.
+func (s *Server) match(method string, path []string) (*apiRoute, []string) {
+	s.routesMu.RLock()
+	defer s.routesMu.RUnlock()
+	var best *apiRoute
+	var allow []string
+	for i := range s.routes {
+		a := &s.routes[i]
+		if !a.matches(path) {
+			continue
+		}
+		m := a.route.Method
+		if m != method && (method != http.MethodHead || m != http.MethodGet) {
+			if !slices.Contains(allow, m) {
+				allow = append(allow, m)
+			}
+			continue
+		}
+		if best == nil {
+			best = a
+			continue
+		}
+		c := specificity(a.segments, best.segments)
+		if c > 0 || c == 0 && m == method {
+			best = a
+		}
+	}
+	slices.Sort(allow)
+	return best, allow
+}
+
+// parsePattern checks a route pattern and returns its segments.
+func parsePattern(p string) (segments []string, err error) {
+	if !strings.HasPrefix(p, "/") || strings.HasSuffix(p, "/") {
+		return nil, fmt.Errorf("pattern must start with a slash and not end with one")
+	}
+	segments = strings.Split(p[1:], "/")
+	var names []string
+	for _, seg := range segments {
+		switch {
+		case seg == "" || seg == "." || seg == "..":
+			return nil, fmt.Errorf("empty or relative segment %q", seg)
+		case strings.ContainsAny(seg, "{}"):
+			return nil, fmt.Errorf("segment %q holds a brace; use :name for a parameter", seg)
+		case isParam(seg):
+			name := seg[1:]
+			if !validParamName(name) {
+				return nil, fmt.Errorf("parameter %q is not a valid name", seg)
+			}
+			if slices.Contains(names, name) {
+				return nil, fmt.Errorf("parameter %q appears twice", seg)
+			}
+			names = append(names, name)
+		case strings.Contains(seg, ":"):
+			return nil, fmt.Errorf("segment %q holds a colon after its start", seg)
+		}
+	}
+	return segments, nil
 }
 
 func validParamName(name string) bool {
@@ -171,32 +261,63 @@ func validMethod(m string) bool {
 	return true
 }
 
-// serveRoute returns the router's handler for rt: it records the matched
-// route and an empty holder for the checks' attachments in the request's
-// context and runs the pipeline.
-func (s *Server) serveRoute(rt Route, names []string) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		params := make(map[string]string, len(names))
-		for _, name := range names {
-			params[name] = r.PathValue(name)
+// serveRoute records the route a matched, its parameter values taken from
+// the unescaped path segments, and an empty holder for the checks'
+// attachments in the request's context and runs the pipeline.
+func (s *Server) serveRoute(w http.ResponseWriter, r *http.Request, a *apiRoute, path []string) {
+	params := make(map[string]string)
+	for i, seg := range a.segments {
+		if isParam(seg) {
+			params[seg[1:]] = path[i]
 		}
-		m := Matched{Method: rt.Method, Pattern: rt.Pattern, Route: rt, Params: params}
-		ctx := context.WithValue(r.Context(), matchedKey{}, m)
-		ctx = context.WithValue(ctx, attachedKey{}, &attachments{})
-		s.runPipeline(w, r.WithContext(ctx), rt)
-	})
+	}
+	m := Matched{Method: a.route.Method, Pattern: a.route.Pattern, Route: a.route, Params: params}
+	ctx := context.WithValue(r.Context(), matchedKey{}, m)
+	ctx = context.WithValue(ctx, attachedKey{}, &attachments{})
+	s.runPipeline(w, r.WithContext(ctx), a.route)
 }
 
-// dispatch is the entry of every request. The router alone would redirect a
-// path that is not clean or lacks a trailing slash and answer an unknown
-// path or a wrong method in plain text; dispatch answers those with the error
-// envelope instead, before any check runs, and hands everything else to the
-// router.
+// apiPath returns the unescaped segments of the escaped path p below
+// /api/v1, and false when p is not below it. A segment that does not
+// unescape is kept as it is.
+func apiPath(p string) ([]string, bool) {
+	rest, ok := strings.CutPrefix(p, apiMount+"/")
+	if !ok {
+		return nil, false
+	}
+	segs := strings.Split(rest, "/")
+	for i, seg := range segs {
+		if u, err := url.PathUnescape(seg); err == nil {
+			segs[i] = u
+		}
+	}
+	return segs, true
+}
+
+// dispatch is the entry of every request. It answers a path that is not
+// clean with the error envelope, serves a REST API route it matches itself
+// (the standard router refuses to hold /changes/by-commit/:sha beside
+// /changes/:number/stack), and hands every other path to the router. The
+// router alone would redirect a path that lacks a trailing slash and answer
+// an unknown path or a wrong method in plain text; dispatch answers those
+// with the error envelope instead, before any check runs.
 func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) {
 	p := r.URL.EscapedPath()
 	if p == "" || p[0] != '/' || cleanPath(p) != p {
 		WriteError(w, NotFound("not found"))
 		return
+	}
+	if path, ok := apiPath(p); ok {
+		a, allow := s.match(r.Method, path)
+		if a != nil {
+			s.serveRoute(w, r, a, path)
+			return
+		}
+		if len(allow) > 0 {
+			w.Header().Set("Allow", strings.Join(allow, ", "))
+			WriteError(w, MethodNotAllowed("method not allowed"))
+			return
+		}
 	}
 	h, pattern := s.mux.Handler(r)
 	if pattern != "" && !redirects(p, pattern) {

@@ -21,8 +21,12 @@ grows as features land.
 
 Every REST route lives under the fixed mount `/api/v1`. A route has a method
 and a path with named parameters, such as `GET /api/v1/workspaces/{slug}`.
-Paths are matched exactly, and a path that does not match is never
-redirected:
+Paths are matched exactly, segment by segment, and a path that does not
+match is never redirected. When two routes match a path, the one with a
+fixed segment where the other has a parameter, reading from the left, serves
+it: `GET /api/v1/workspaces/{slug}/changes/by-commit/stack` goes to
+`changes/by-commit/{sha}`, not to `changes/{number}/stack`. A request that
+no route serves is answered as follows:
 
 | Request | Answer |
 |---|---|
