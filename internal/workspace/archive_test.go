@@ -303,26 +303,76 @@ func TestArchive_EndsTheSessionsOfTheWorkspaceAndItsForks(t *testing.T) {
 
 func TestArchive_TellsEveryObserverOnceTheArchiveHasCommitted(t *testing.T) {
 	t.Parallel()
+	for _, c := range []struct {
+		name   string
+		panics bool
+		// logged is what the log says of the first observer's failure.
+		logged string
+	}{
+		{name: "the first observer fails", logged: "sandboxes unreachable"},
+		{name: "the first observer panics", panics: true, logged: "the first panicked"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			var log hubtest.LogBuffer
+			calls := &teardownLog{}
+			first := &stubTeardown{name: "first", log: calls}
+			first.set(errors.New("sandboxes unreachable"), c.panics)
+			second := &stubTeardown{name: "second", log: calls}
+			w := archiveWithForks(t, []string{"demo--a"}, withLog(&log), withTeardown(func(td *workspace.Teardown) {
+				td.RegisterArchiveObserver(first)
+				td.RegisterArchiveObserver(second)
+			}))
+			first.w, second.w = w, w
+
+			a := w.operate(t, "archive", w.uKey, "demo")
+
+			if obj := a.decode(t, http.StatusOK); obj["status"] != "archived" {
+				t.Errorf("answer status %v, want archived", obj["status"])
+			}
+			want := []string{"first observe demo [demo--a] archived", "second observe demo [demo--a] archived"}
+			if got := calls.recorded(); !slices.Equal(got, want) {
+				t.Errorf("observer calls %v, want %v", got, want)
+			}
+			if !strings.Contains(log.String(), "slug=demo") || !strings.Contains(log.String(), c.logged) {
+				t.Errorf("the log does not report the observer's failure with the slug:\n%s", log.String())
+			}
+		})
+	}
+}
+
+// unreadableObserver is an archive observer that leaves the archived
+// workspace's record one the hub cannot read.
+type unreadableObserver struct{ w *world }
+
+func (o unreadableObserver) WorkspaceArchived(ctx context.Context, slug string, _ []string) error {
+	_, err := o.w.Store.Main().ExecContext(ctx, `UPDATE workspaces SET created_at = 'not a time' WHERE slug = ?`, slug)
+	return err
+}
+
+func TestArchive_AnswersTheCommittedArchiveWhenTheRecordCannotBeReadAgain(t *testing.T) {
+	t.Parallel()
 	var log hubtest.LogBuffer
-	calls := &teardownLog{}
-	first := &stubTeardown{name: "first", log: calls, fail: errors.New("sandboxes unreachable")}
-	second := &stubTeardown{name: "second", log: calls}
-	w := archiveWithForks(t, []string{"demo--a"}, withLog(&log), withTeardown(func(td *workspace.Teardown) {
-		td.RegisterArchiveObserver(first)
-		td.RegisterArchiveObserver(second)
+	observer := &unreadableObserver{}
+	w := newWorld(t, withLog(&log), withTeardown(func(td *workspace.Teardown) {
+		td.RegisterArchiveObserver(observer)
 	}))
-	first.w, second.w = w, w
+	observer.w = w
+	w.put(t, workspace.Workspace{Slug: "demo", Status: workspace.StatusFailed, CloneError: new("boom")})
 
 	a := w.operate(t, "archive", w.uKey, "demo")
 
-	if obj := a.decode(t, http.StatusOK); obj["status"] != "archived" {
-		t.Errorf("answer status %v, want archived", obj["status"])
+	if obj := a.decode(t, http.StatusOK); obj["status"] != "archived" || obj["clone_error"] != nil || obj["slug"] != "demo" {
+		t.Errorf("answer slug %v status %v clone_error %v, want demo, archived and null", obj["slug"], obj["status"], obj["clone_error"])
 	}
-	want := []string{"first observe demo [demo--a] archived", "second observe demo [demo--a] archived"}
-	if got := calls.recorded(); !slices.Equal(got, want) {
-		t.Errorf("observer calls %v, want %v", got, want)
+	var status, marker string
+	if err := w.Store.Main().QueryRow(`SELECT status, maintenance FROM workspaces WHERE slug = 'demo'`).Scan(&status, &marker); err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(log.String(), "slug=demo") || !strings.Contains(log.String(), "sandboxes unreachable") {
-		t.Errorf("the log does not report the observer's failure with the slug:\n%s", log.String())
+	if status != string(workspace.StatusArchived) || marker != "" {
+		t.Errorf("stored status %q marker %q, want archived and none", status, marker)
+	}
+	if !strings.Contains(log.String(), "slug=demo") || !strings.Contains(log.String(), "not a time") {
+		t.Errorf("the log does not report the failed read with the slug:\n%s", log.String())
 	}
 }

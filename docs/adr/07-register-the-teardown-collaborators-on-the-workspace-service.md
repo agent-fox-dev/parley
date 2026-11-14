@@ -72,7 +72,8 @@ registry of its own.
 An archive calls the session closer inside its transaction under a
 savepoint, so that a closer that fails has its writes undone and is
 logged while the archive commits; it calls the archive observers after
-the commit, logging an error and going on. It calls no remover, no token
+the commit, logging an error, or a panic recovered as one, and going on:
+the archive has committed, so an observer cannot change its answer. It calls no remover, no token
 revoker and no sandbox remover.
 
 The workspaces part in `internal/hub/workspace.go` registers the

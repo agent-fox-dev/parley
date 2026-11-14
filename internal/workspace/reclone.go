@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/event"
@@ -115,7 +116,8 @@ func (s *Service) recloneRefusal(ctx context.Context, w Workspace, held bool) er
 // that clone work clones origin afresh even when a hub that stopped before
 // the removal left the copy on disk. Once the transaction has committed the
 // copy, and with it every origin head, is removed and the clone workers
-// are woken. head_sha, default_branch and last_sync_at stay until the
+// are woken, whatever the removal does: a removal that fails or panics is
+// logged, and the reclone stands. head_sha, default_branch and last_sync_at stay until the
 // clone completes. No data another package keeps for the workspace is
 // removed.
 func (s *Service) reclone(ctx context.Context, slug, actorType string, actorID *string) (Workspace, error) {
@@ -133,10 +135,11 @@ func (s *Service) reclone(ctx context.Context, slug, actorType string, actorID *
 		return Workspace{}, err
 	}
 	outcome := s.safetyCopy(ctx, rec)
+	instance, at := NewInstanceID(), s.deps.Now().UnixNano()
 	err = s.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `UPDATE workspaces SET status = ?, sync_error = NULL, origin_head_sha = NULL,
 			instance_id = ?, updated_at = ? WHERE slug = ?`,
-			string(StatusPending), NewInstanceID(), s.deps.Now().UnixNano(), slug)
+			string(StatusPending), instance, at, slug)
 		if err != nil {
 			return err
 		}
@@ -157,18 +160,21 @@ func (s *Service) reclone(ctx context.Context, slug, actorType string, actorID *
 	}
 	// Read before the clone workers are woken, so that the answer is the
 	// record as the reclone left it, not as a clone has already moved it.
-	rec, found, err = BySlug(ctx, s.deps.Store.Main(), slug)
-	if err == nil && !found {
-		err = fmt.Errorf("reclone workspace %q: the record is gone after the reclone", slug)
-	}
+	rec = s.reread(ctx, "reclone", rec, func(w *Workspace) {
+		w.Status, w.SyncError, w.OriginHeadSHA = StatusPending, nil, nil
+		w.InstanceID, w.UpdatedAt = instance, time.Unix(0, at).UTC()
+	})
 	// The record no longer owns the copy: a copy that cannot be removed now
 	// is replaced by the clone work, so the failure is only logged.
 	// Not while a sync that passed the state guard before the marker was
 	// set fetches into the copy.
 	dir := s.RepoPath(slug)
-	if err := func() error { defer s.fetchLocks.lock(slug)(); return s.deps.RemoveCopy(dir) }(); err != nil {
+	if err := guarded("the copy removal", func() error {
+		defer s.fetchLocks.lock(slug)()
+		return s.deps.RemoveCopy(dir)
+	}); err != nil {
 		s.deps.Logger.Error("workspace copy not removed after a reclone", "slug", slug, "path", dir, "error", err)
 	}
 	s.Enqueue(slug)
-	return rec, err
+	return rec, nil
 }

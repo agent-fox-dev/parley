@@ -2,6 +2,7 @@ package workspace
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/agent-fox-dev/parley/internal/server"
@@ -100,4 +101,35 @@ func ClearMarkers(ctx context.Context, ex Execer) error {
 		return fmt.Errorf("release the workspaces' maintenance markers: %w", err)
 	}
 	return nil
+}
+
+// reread returns the record of the workspace rec names as an operation
+// whose transaction has committed left it. The change has stuck by then,
+// so a record that cannot be read again is not a failure of the operation:
+// the failure is logged, and the answer is rec with the committed change,
+// which apply makes, rather than a 500 for a change that was made.
+func (s *Service) reread(ctx context.Context, op string, rec Workspace, apply func(*Workspace)) Workspace {
+	got, found, err := BySlug(ctx, s.deps.Store.Main(), rec.Slug)
+	if err == nil && found {
+		return got
+	}
+	if err == nil {
+		err = errors.New("the record is gone")
+	}
+	s.deps.Logger.Error("workspace record not read again after the "+op, "slug", rec.Slug, "error", err)
+	apply(&rec)
+	return rec
+}
+
+// guarded runs fn and returns its error, or the panic it raised as an
+// error, so that a collaborator called after an operation committed fails
+// as one that returns an error does: logged, without changing the answer
+// or skipping what comes after it.
+func guarded(what string, fn func() error) (err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("%s panicked: %v", what, p)
+		}
+	}()
+	return fn()
 }
