@@ -1,9 +1,11 @@
 package access
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 
 	"github.com/agent-fox-dev/parley/internal/identity"
@@ -58,17 +60,115 @@ func (s *Service) SubsetCheck(r *http.Request) error {
 	return identity.CheckSubset(caller, req.Permissions, paths)
 }
 
-// TokenRoutes are the routes of the tokens bound to a workspace:
-// POST /workspaces/:slug/tokens, which mints one. It needs the scope
-// tokens:manage and the level owner on the workspace, is a create route
-// whose token member a replay leaves out, and holds a PAT caller to the
-// subset rule.
+// TokenRoutes are the routes of the tokens bound to a workspace, both
+// needing the level owner on the workspace and closed to every bound token
+// (MarkRefusesBound), so that a bound token can neither mint another nor see
+// its siblings: POST /workspaces/:slug/tokens, which mints one, needs the
+// scope tokens:manage, is a create route whose token member a replay leaves
+// out, and holds a PAT caller to the subset rule; GET
+// /workspaces/:slug/tokens, which lists them, needs the scope tokens:read.
 func (s *Service) TokenRoutes() []server.Route {
 	return []server.Route{
 		{Method: http.MethodPost, Pattern: workspaceRoute + "/tokens", Create: true, ShowOnce: []string{"token"},
-			Scope: "tokens:manage", Marks: map[string]string{MarkNeed: string(NeedOwner), MarkSubsetRule: ""},
+			Scope: "tokens:manage", Marks: map[string]string{MarkNeed: string(NeedOwner), MarkSubsetRule: "", MarkRefusesBound: ""},
 			Handler: s.createBoundToken},
+		{Method: http.MethodGet, Pattern: workspaceRoute + "/tokens", Scope: "tokens:read",
+			Marks:   map[string]string{MarkNeed: string(NeedOwner), MarkRefusesBound: ""},
+			Handler: s.listBoundTokens},
 	}
+}
+
+// listBoundTokens answers GET /workspaces/:slug/tokens, after the
+// pipeline's checks have granted the caller owner on the workspace (the
+// admin token included): a page of every PAT bound to the workspace, live,
+// revoked or expired, as Token objects, which never carry a value. An
+// archived workspace is listed like any other, so its owner can still audit
+// what reaches it.
+func (s *Service) listBoundTokens(w http.ResponseWriter, r *http.Request) error {
+	page, err := server.ReadPage(r)
+	if err != nil {
+		return err
+	}
+	var pos boundPosition
+	hasAfter, err := page.After(&pos)
+	if err != nil {
+		return err
+	}
+	var after *boundPosition
+	if hasAfter {
+		after = &pos
+	}
+	d, ok := DecisionOf(r)
+	if !ok {
+		return errors.New("a token route was reached without an access decision")
+	}
+	if s.deps.Store == nil {
+		return errNoStore
+	}
+	items, err := boundTokens(r.Context(), s.deps.Store.Main(), d.Record.Slug, after, page.Limit+1)
+	if err != nil {
+		return err
+	}
+	return server.WritePage(w, page, items, positionOf)
+}
+
+// boundPosition is the position of a token in the list of the tokens bound
+// to a workspace: oldest first, created_at ascending, then token_id
+// ascending, since created_at has whole seconds and tokens minted in the
+// same second must keep one order across pages.
+type boundPosition struct {
+	CreatedAt int64  `json:"c"`
+	TokenID   string `json:"id"`
+}
+
+func positionOf(p identity.PAT) any {
+	return boundPosition{CreatedAt: p.CreatedAt.UnixNano(), TokenID: p.TokenID}
+}
+
+// boundTokens returns up to limit PATs bound to the workspace slug, in any
+// state, in the order of boundPosition and after the position after when it
+// is not nil. It reads the ids of the page and then each PAT with
+// identity.PATByID, so that a PAT is read by the one function that knows
+// its record.
+func boundTokens(ctx context.Context, db *sql.DB, slug string, after *boundPosition, limit int) ([]identity.PAT, error) {
+	query := `SELECT token_id FROM pats WHERE workspace = ?`
+	args := []any{slug}
+	if after != nil {
+		query += ` AND (created_at > ? OR created_at = ? AND token_id > ?)`
+		args = append(args, after.CreatedAt, after.CreatedAt, after.TokenID)
+	}
+	query += ` ORDER BY created_at, token_id LIMIT ?`
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("list the tokens bound to %s: %w", slug, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	rows, err := tx.QueryContext(ctx, query, append(args, limit)...)
+	if err != nil {
+		return nil, fmt.Errorf("list the tokens bound to %s: %w", slug, err)
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("list the tokens bound to %s: %w", slug, err)
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list the tokens bound to %s: %w", slug, err)
+	}
+	pats := make([]identity.PAT, 0, len(ids))
+	for _, id := range ids {
+		p, err := identity.PATByID(ctx, tx, id)
+		if err != nil {
+			return nil, fmt.Errorf("list the tokens bound to %s: %w", slug, err)
+		}
+		pats = append(pats, p)
+	}
+	return pats, nil
 }
 
 // createBoundToken answers POST /workspaces/:slug/tokens, after the

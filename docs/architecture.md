@@ -11,7 +11,7 @@ command-line client. Both are written in Go, in the module
 |---|---|
 | `cmd/parley` | the `parley` program: it calls `cli.Run` and exits with its status |
 | `cmd/parleyd` | the `parleyd` program: `main` calls `hub.Run` with the process's arguments, environment and working directory and exits with its status |
-| `internal/access` | the workspace access rule, the one place that decides what a caller may do on a workspace; the minimal workspace record (slug, owner, org, kind, parent, status, the creating token of a fork) in the transactional store, the caller's level on a workspace, the decision for a declared need and the REST access check, the readable set for reads across workspaces, what the binding of a workspace-bound PAT covers, and the binding guard that confines such a PAT on every REST route and, for the git server, on git, and the minting of bound tokens (`MintBound`, `POST /workspaces/:slug/tokens`) |
+| `internal/access` | the workspace access rule, the one place that decides what a caller may do on a workspace; the minimal workspace record (slug, owner, org, kind, parent, status, the creating token of a fork) in the transactional store, the caller's level on a workspace, the decision for a declared need and the REST access check, the readable set for reads across workspaces, what the binding of a workspace-bound PAT covers, and the binding guard that confines such a PAT on every REST route and, for the git server, on git, and the minting and listing of bound tokens (`MintBound`, `POST` and `GET /workspaces/:slug/tokens`) |
 | `internal/buildinfo` | the version, commit and build time the binary was built with, shared by both programs |
 | `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra`, each declared through one helper ([ADR 02](adr/02-declare-every-cli-command-through-one-helper.md)), the client configuration file, the resolution of the hub URL and the credential, the one HTTP client the commands send their requests with, the printing of a command's result on stdout and of its warnings on stderr, the shared wait for a long operation (`--wait`, `--timeout`, `--poll-interval`), and the error envelopes and exit statuses every command ends with |
 | `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, and a registry of keys and whole sections that decides what the file may hold |
@@ -1506,7 +1506,20 @@ emitter refuses to mint. `ExpiresAt` is the instant a hub-internal caller
 `internal/access/bound_tokens.go` holds `(*Service).TokenRoutes()`, which
 `composeAccess` registers: `POST /workspaces/:slug/tokens` with `Scope`
 `tokens:manage`, `Create`, `ShowOnce` `token` and the marks
-`access.MarkNeed` `owner` and `access.MarkSubsetRule`. On a route with that
+`access.MarkNeed` `owner`, `access.MarkSubsetRule` and
+`access.MarkRefusesBound`, and `GET /workspaces/:slug/tokens` with `Scope`
+`tokens:read` and the marks `access.MarkNeed` `owner` and
+`access.MarkRefusesBound`. On a route marked `access.MarkRefusesBound`
+(`"access.refuses_bound"`) the binding guard answers a bound PAT `403
+token_bound` on every workspace whose relation to the binding is not none
+(bound, created fork, parent of the bound fork), and on a route that names
+no workspace even when it is allowlisted; outside the binding the `404`
+comes first. The list handler reads the page (`server.ReadPage`), then, in
+one read-only transaction, the ids of the PATs whose `workspace` is the
+slug in any state, ordered by `created_at` and `token_id` after the
+cursor's position, and each PAT with `identity.PATByID`, and answers them
+with `server.WritePage`; the admin token passes, since the access rule
+gives it owner, and an archived workspace is listed. On a route with that
 mark the access check `(*Service).SubsetCheck`, installed before `Check`,
 decodes the body with `identity.DecodeMintRequest` and applies
 `identity.CheckSubset` to a PAT caller, so the `403 insufficient_scope` of

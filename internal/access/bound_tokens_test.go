@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"reflect"
 	"regexp"
 	"strings"
@@ -243,6 +244,265 @@ func TestCreateBoundToken_RefusesAndMintsNothing(t *testing.T) {
 	unknown := h.post("/workspaces/nosuch/tokens", bobKey, validBody)
 	if string(stranger.body) != string(unknown.body) {
 		t.Errorf("a stranger on w1 got %s and on an unknown slug %s, want the same bytes", stranger.body, unknown.body)
+	}
+	if n := h.pats("1"); n != before || len(h.events.all()) != 0 {
+		t.Errorf("the store holds %d tokens and %d events were emitted, want %d and none", n, len(h.events.all()), before)
+	}
+}
+
+func TestCreateBoundToken_ReplaysTheFirstAnswerWithoutTheTokenForTheSameIdempotencyKey(t *testing.T) {
+	h := newTokenHub(t)
+	key := http.Header{"Idempotency-Key": {"k1"}}
+	first := h.send(http.MethodPost, "/workspaces/w1/tokens", h.aliceKey, validBody, key)
+	replay := h.send(http.MethodPost, "/workspaces/w1/tokens", h.aliceKey, validBody, key)
+	if first.status != http.StatusCreated || replay.status != http.StatusOK {
+		t.Fatalf("POST = %d %s, then %d %s, want 201 then 200", first.status, first.body, replay.status, replay.body)
+	}
+	var want, got map[string]any
+	if json.Unmarshal(first.body, &want) != nil || json.Unmarshal(replay.body, &got) != nil {
+		t.Fatalf("bodies %s and %s are not JSON objects", first.body, replay.body)
+	}
+	delete(want, "token")
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("replay = %s, want the first answer %s without token", replay.body, first.body)
+	}
+	if n, evs := h.pats("workspace = 'w1'"), h.events.all(); n != 1 || len(evs) != 1 {
+		t.Errorf("the store holds %d tokens bound to w1 and %d events were emitted, want 1 and 1", n, len(evs))
+	}
+}
+
+func TestBoundToken_KeepsItsWorkspaceAndPathsThroughEveryTokenRoute(t *testing.T) {
+	h := newTokenHub(t)
+	h.identityRoutes()
+	a := h.post("/workspaces/w1/tokens", h.aliceKey, `{"name":"agent","permissions":["git:read","git:write"],"paths":["docs/**"]}`)
+	if a.status != http.StatusCreated {
+		t.Fatalf("POST = %d %s, want 201", a.status, a.body)
+	}
+	own := "/user/tokens/" + minted(t, a).TokenID
+	keeps := func(t *testing.T, tok mintedToken) {
+		t.Helper()
+		if tok.Workspace == nil || *tok.Workspace != "w1" || !reflect.DeepEqual(tok.Paths, []string{"docs/**"}) {
+			t.Errorf("token %+v, want it bound to w1 with paths [docs/**]", tok)
+		}
+	}
+	for _, step := range []struct{ name, method, path, body string }{
+		{"replace the permissions, with a workspace and paths", http.MethodPut, own + "/permissions", `{"permissions":["git:read"],"workspace":"w9","paths":["**"]}`},
+		{"add a permission", http.MethodPatch, own + "/permissions", `{"permissions":["changes:read"]}`},
+		{"remove a permission", http.MethodDelete, own + "/permissions", `{"permissions":["changes:read"]}`},
+		{"revoke", http.MethodDelete, own, ""},
+	} {
+		t.Run(step.name, func(t *testing.T) {
+			if a := h.send(step.method, step.path, h.aliceKey, step.body, nil); a.status/100 != 2 {
+				t.Fatalf("%s %s = %d %s, want success", step.method, step.path, a.status, a.body)
+			}
+			keeps(t, minted(t, h.do(http.MethodGet, own, h.aliceKey)))
+		})
+	}
+	l := listed(t, h.do(http.MethodGet, "/workspaces/w1/tokens", h.aliceKey))
+	if len(l.Items) != 1 || l.Items[0].RevokedAt == nil {
+		t.Fatalf("GET /workspaces/w1/tokens = %+v, want the one token, revoked", l.Items)
+	}
+	keeps(t, l.Items[0])
+}
+
+// tokenList is the answer of GET /workspaces/:slug/tokens.
+type tokenList struct {
+	Items      []mintedToken `json:"items"`
+	NextCursor *string       `json:"next_cursor"`
+	raw        []map[string]any
+}
+
+// listed decodes a's body as a list of tokens, failing the test unless a
+// is a 200.
+func listed(t *testing.T, a answer) tokenList {
+	t.Helper()
+	if a.status != http.StatusOK {
+		t.Fatalf("GET = %d %s, want 200", a.status, a.body)
+	}
+	var l tokenList
+	var raw struct {
+		Items []map[string]any `json:"items"`
+	}
+	if json.Unmarshal(a.body, &l) != nil || json.Unmarshal(a.body, &raw) != nil || l.Items == nil {
+		t.Fatalf("body %s is not a list of tokens", a.body)
+	}
+	l.raw = raw.Items
+	return l
+}
+
+// ids returns the token ids of l's items, in order.
+func (l tokenList) ids() []string {
+	ids := []string{}
+	for _, tok := range l.Items {
+		ids = append(ids, tok.TokenID)
+	}
+	return ids
+}
+
+func TestListBoundTokens_ListsEveryTokenOfTheWorkspaceInAnyStateOldestFirst(t *testing.T) {
+	h := newTokenHub(t)
+	seed(t, h.st, repo("w3", h.alice, "acme", access.StatusReady))
+	at := time.Now().Add(-48 * time.Hour).Truncate(time.Second)
+	expired := at.Add(time.Hour)
+	spec := func(workspace string, created time.Time, expires *time.Time) identity.PATSpec {
+		return identity.PATSpec{UserID: h.alice, Permissions: []string{"git:read"}, Workspace: workspace, CreatedAt: created, ExpiresAt: expires}
+	}
+	// Stored newest first, so the order is not the order of storing.
+	_, t3 := h.storePAT(spec("w1", at.Add(time.Second), &expired))
+	_, a := h.storePAT(spec("w1", at, nil))
+	_, b := h.storePAT(spec("w1", at, nil))
+	t1, t2 := min(a, b), max(a, b)
+	if _, err := h.st.Main().Exec("UPDATE pats SET revoked_at = ? WHERE token_id = ?", at.Add(time.Minute).UnixNano(), t2); err != nil {
+		t.Fatal(err)
+	}
+	_, onW2 := h.storePAT(spec("w2", at, nil))
+	unbound, unboundID := h.pat(h.alice, "", "tokens:read")
+
+	for _, caller := range []struct{ name, credential string }{{"API key", h.aliceKey}, {"unbound PAT", unbound}} {
+		for _, tc := range []struct {
+			slug string
+			want []string
+		}{{"w1", []string{t1, t2, t3}}, {"w2", []string{onW2}}, {"w3", []string{}}} {
+			t.Run(caller.name+" "+tc.slug, func(t *testing.T) {
+				a := h.do(http.MethodGet, "/workspaces/"+tc.slug+"/tokens", caller.credential)
+				l := listed(t, a)
+				if !reflect.DeepEqual(l.ids(), tc.want) || l.NextCursor != nil {
+					t.Fatalf("items %v, next_cursor %v, want %v and null", l.ids(), l.NextCursor, tc.want)
+				}
+				for i, item := range l.raw {
+					if _, ok := item["token"]; ok || l.Items[i].Workspace == nil || *l.Items[i].Workspace != tc.slug {
+						t.Errorf("item %v, want a Token object bound to %s without token", item, tc.slug)
+					}
+				}
+				if tc.slug != "w1" {
+					return
+				}
+				if l.Items[0].RevokedAt != nil || l.Items[1].RevokedAt == nil {
+					t.Errorf("revoked_at %v and %v, want t1 live and t2 revoked", l.Items[0].RevokedAt, l.Items[1].RevokedAt)
+				}
+				if e, err := time.Parse(time.RFC3339, deref(l.Items[2].ExpiresAt)); err != nil || !e.Before(time.Now()) {
+					t.Errorf("t3 expires_at %v, want an instant in the past", l.Items[2].ExpiresAt)
+				}
+				if strings.Contains(string(a.body), onW2) || strings.Contains(string(a.body), unboundID) {
+					t.Errorf("w1's list %s holds the token of w2 or the unbound token", a.body)
+				}
+			})
+		}
+	}
+
+	var paged []string
+	path := "/workspaces/w1/tokens?limit=1"
+	for range 4 {
+		l := listed(t, h.do(http.MethodGet, path, h.aliceKey))
+		paged = append(paged, l.ids()...)
+		if l.NextCursor == nil {
+			break
+		}
+		path = "/workspaces/w1/tokens?limit=1&cursor=" + url.QueryEscape(*l.NextCursor)
+	}
+	if want := []string{t1, t2, t3}; !reflect.DeepEqual(paged, want) {
+		t.Errorf("pages of one held %v, want %v", paged, want)
+	}
+}
+
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+func TestListBoundTokens_AnswersTheAdminTokenAsTheOwner(t *testing.T) {
+	h := newTokenHub(t)
+	admin := h.admin()
+	for _, slug := range []string{"w1", "w1", "w2"} {
+		h.pat(h.alice, slug, "git:read")
+	}
+	for _, slug := range []string{"w1", "w2"} {
+		t.Run(slug, func(t *testing.T) {
+			a := h.do(http.MethodGet, "/workspaces/"+slug+"/tokens", admin)
+			o := h.do(http.MethodGet, "/workspaces/"+slug+"/tokens", h.aliceKey)
+			if a.status != http.StatusOK || len(listed(t, o).Items) == 0 || string(a.body) != string(o.body) {
+				t.Errorf("admin: %d %s, owner: %d %s, want 200 with the owner's items", a.status, a.body, o.status, o.body)
+			}
+		})
+	}
+}
+
+func TestListBoundTokens_RefusesAndListsNothing(t *testing.T) {
+	h := newTokenHub(t)
+	_, t1 := h.pat(h.alice, "w1", "git:read")
+	noRead, _ := h.pat(h.alice, "", "git:read")
+	bobKey, carolKey := h.key(h.bob), h.key(h.carol)
+	for _, tc := range []struct {
+		name, credential, slug string
+		status                 int
+		errorType              string
+	}{
+		{"a PAT without tokens:read", noRead, "w1", 403, "insufficient_scope"},
+		{"a PAT without tokens:read on an unknown slug", noRead, "nosuch", 403, "insufficient_scope"},
+		{"a stranger", bobKey, "w1", 404, "not_found"},
+		{"a stranger on an unknown slug", bobKey, "nosuch", 404, "not_found"},
+		{"an org member", carolKey, "w1", 403, "forbidden"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := h.do(http.MethodGet, "/workspaces/"+tc.slug+"/tokens", tc.credential)
+			if e := decode(t, a); a.status != tc.status || e.Error.ErrorType != tc.errorType || strings.Contains(string(a.body), t1) {
+				t.Errorf("GET = %d %s, want %d %s without a token", a.status, a.body, tc.status, tc.errorType)
+			}
+		})
+	}
+	stranger := h.do(http.MethodGet, "/workspaces/w1/tokens", bobKey)
+	unknown := h.do(http.MethodGet, "/workspaces/nosuch/tokens", bobKey)
+	if string(stranger.body) != string(unknown.body) || decode(t, stranger).Error.Message != "workspace not found" {
+		t.Errorf("a stranger on w1 got %s and on an unknown slug %s, want the same workspace not found", stranger.body, unknown.body)
+	}
+}
+
+func TestTokenRoutes_RefuseABoundTokenOnEveryWorkspaceItsBindingReaches(t *testing.T) {
+	h := newTokenHub(t)
+	seed(t, h.st, repo("w5", h.alice, "acme", access.StatusReady))
+	all := []string{"tokens:manage", "tokens:read", "git:read"}
+	full, fullID := h.pat(h.alice, "w1", all...)
+	narrow, _ := h.pat(h.alice, "w1", "git:read")
+	seed(t, h.st, createdBy(fork("f1", h.alice, "acme", "w1"), fullID), fork("f2", h.alice, "acme", "w1"))
+	onFork, _ := h.pat(h.alice, "f2", all...)
+	before := h.pats("1")
+
+	for _, tc := range []struct {
+		name, token, slug string
+		status            int
+		errorType         string
+	}{
+		{"every scope, the bound workspace", full, "w1", 403, "token_bound"},
+		{"no scope of the routes, the bound workspace", narrow, "w1", 403, "token_bound"},
+		{"a fork the token created", full, "f1", 403, "token_bound"},
+		{"the bound fork", onFork, "f2", 403, "token_bound"},
+		{"the parent of the bound fork", onFork, "w1", 403, "token_bound"},
+		{"every scope, another workspace", full, "w5", 404, "not_found"},
+		{"no scope of the routes, another workspace", narrow, "w5", 404, "not_found"},
+		{"a fork token on another workspace", onFork, "w5", 404, "not_found"},
+	} {
+		for _, method := range []string{http.MethodPost, http.MethodGet} {
+			t.Run(tc.name+" "+method, func(t *testing.T) {
+				reported := len(h.refusals.all())
+				body := ""
+				if method == http.MethodPost {
+					body = validBody
+				}
+				a := h.send(method, "/workspaces/"+tc.slug+"/tokens", tc.token, body, nil)
+				if e := decode(t, a); a.status != tc.status || e.Error.ErrorType != tc.errorType {
+					t.Errorf("%s = %d %s, want %d %s", method, a.status, a.body, tc.status, tc.errorType)
+				}
+				slug := tc.slug
+				want := access.Refusal{Method: method, Route: "/api/v1/workspaces/:slug/tokens", Status: tc.status, RequestedWorkspace: &slug}
+				got := h.refusals.all()[reported:]
+				if len(got) != 1 || got[0].Method != want.Method || got[0].Route != want.Route || got[0].Status != want.Status ||
+					got[0].RequestedWorkspace == nil || *got[0].RequestedWorkspace != slug {
+					t.Errorf("refusals = %+v, want one like %+v", got, want)
+				}
+			})
+		}
 	}
 	if n := h.pats("1"); n != before || len(h.events.all()) != 0 {
 		t.Errorf("the store holds %d tokens and %d events were emitted, want %d and none", n, len(h.events.all()), before)

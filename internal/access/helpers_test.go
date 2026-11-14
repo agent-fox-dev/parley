@@ -515,11 +515,17 @@ func (h *guardHub) pat(userID, workspace string, perms ...string) (value, tokenI
 	return h.storePAT(identity.PATSpec{UserID: userID, Permissions: perms, Workspace: workspace})
 }
 
-// storePAT stores the PAT spec describes, named agent and created now, and
-// returns its value and its token_id.
+// storePAT stores the PAT spec describes, named agent unless it names one
+// and created now unless it states when, and returns its value and its
+// token_id.
 func (h *guardHub) storePAT(spec identity.PATSpec) (value, tokenID string) {
 	h.t.Helper()
-	spec.Name, spec.CreatedAt = "agent", time.Now()
+	if spec.Name == "" {
+		spec.Name = "agent"
+	}
+	if spec.CreatedAt.IsZero() {
+		spec.CreatedAt = time.Now()
+	}
 	err := h.st.Tx(context.Background(), func(tx *sql.Tx) error {
 		v, rec, err := identity.StorePAT(context.Background(), tx, spec)
 		value, tokenID = v, rec.TokenID
@@ -562,19 +568,29 @@ func (h *guardHub) probe(method, pattern string, need access.Need, scope string)
 // do sends method path, under /api/v1, with credential as the bearer
 // credential and no body.
 func (h *guardHub) do(method, path, credential string) answer {
-	r := httptest.NewRequest(method, "/api/v1"+path, nil)
-	r.Header.Set("Authorization", "Bearer "+credential)
-	rec := httptest.NewRecorder()
-	h.srv.Handler().ServeHTTP(rec, r)
-	return answer{rec.Code, rec.Header().Get("Content-Type"), rec.Body.Bytes(), rec.Header().Get("Allow")}
+	return h.send(method, path, credential, "", nil)
 }
 
 // post sends POST path, under /api/v1, with credential as the bearer
 // credential and body as its JSON body.
 func (h *guardHub) post(path, credential, body string) answer {
-	r := httptest.NewRequest(http.MethodPost, "/api/v1"+path, strings.NewReader(body))
+	return h.send(http.MethodPost, path, credential, body, nil)
+}
+
+// send sends method path, under /api/v1, with credential as the bearer
+// credential, body as its JSON body ("" for none) and the headers header.
+func (h *guardHub) send(method, path, credential, body string, header http.Header) answer {
+	var r *http.Request
+	if body == "" {
+		r = httptest.NewRequest(method, "/api/v1"+path, nil)
+	} else {
+		r = httptest.NewRequest(method, "/api/v1"+path, strings.NewReader(body))
+		r.Header.Set("Content-Type", "application/json")
+	}
+	for name, values := range header {
+		r.Header[name] = values
+	}
 	r.Header.Set("Authorization", "Bearer "+credential)
-	r.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	h.srv.Handler().ServeHTTP(rec, r)
 	return answer{rec.Code, rec.Header().Get("Content-Type"), rec.Body.Bytes(), rec.Header().Get("Allow")}

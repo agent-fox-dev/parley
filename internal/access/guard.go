@@ -23,8 +23,14 @@ const (
 // that is not a contributor route.
 const msgParentOnly = "a token bound to a task fork reaches only the contributor routes of its parent"
 
+// MarkRefusesBound is the key of server.Route.Marks with which a route
+// declares that no PAT bound to a workspace may use it: the binding guard
+// answers such a token 403 token_bound on every workspace its binding
+// reaches, before the scope check. Its value is not read.
+const MarkRefusesBound = "access.refuses_bound"
+
 // msgNoWorkspace answers a bound PAT on a route that names no workspace and
-// is not on the allowlist.
+// is not on the allowlist, and on a route marked MarkRefusesBound.
 const msgNoWorkspace = "a token bound to a workspace cannot use this route"
 
 // Refusal is one request the binding guard refused, as it reports it.
@@ -77,6 +83,12 @@ type RefusalReporter interface {
 // route, the identity and admin routes among them, is answered 403
 // token_bound, whatever scopes the token holds.
 //
+// A route marked MarkRefusesBound is answered 403 token_bound wherever the
+// token would otherwise pass or be answered 403: on the bound workspace, a
+// fork the token created and the parent of the bound fork. On a workspace
+// outside the binding the 404 still comes first, so the mark tells nothing
+// of which workspaces exist.
+//
 // A request it passes goes on to the scope check and the access checks
 // unchanged, so a binding takes access away and never grants it. Each
 // refusal is reported to the service's RefusalReporter. A failed read of
@@ -91,9 +103,10 @@ func (s *Service) Guard(r *http.Request) error {
 	if c.Workspace == "" || !matched {
 		return nil
 	}
+	_, refusesBound := m.Route.Marks[MarkRefusesBound]
 	rest, named := strings.CutPrefix(m.Pattern, workspaceRoute)
 	if !named || rest != "" && !strings.HasPrefix(rest, "/") {
-		if !isAllowlisted(m.Method, m.Pattern) {
+		if refusesBound || !isAllowlisted(m.Method, m.Pattern) {
 			return s.refuse(r, c, m, nil, server.TokenBound(msgNoWorkspace))
 		}
 		attachBinding(r, Binding{TokenID: c.TokenID, Workspace: c.Workspace})
@@ -105,6 +118,8 @@ func (s *Service) Guard(r *http.Request) error {
 		return fmt.Errorf("binding guard on %s %s: %w", m.Method, m.Pattern, err)
 	}
 	switch {
+	case rel != "" && refusesBound:
+		return s.refuse(r, c, m, &slug, server.TokenBound(msgNoWorkspace))
 	case rel == RelationBound || rel == RelationCreatedFork:
 	case rel == RelationParentOfBoundFork && isContributorRoute(m.Method, rest):
 	case rel == RelationParentOfBoundFork:

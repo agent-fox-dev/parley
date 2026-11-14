@@ -15,10 +15,10 @@ import (
 	"github.com/agent-fox-dev/parley/internal/access"
 )
 
-// refusalHub is a guard hub with the identity routes, the probe route and
-// the allowlisted GET /workspaces, alice's workspaces w1 and w5, and a
-// refusal limiter between the guard and a recording emitter, on a clock the
-// test advances.
+// refusalHub is a guard hub with the identity routes, the probe route, the
+// allowlisted GET /workspaces and the bound-token routes, alice's workspaces
+// w1 and w5, and a refusal limiter between the guard and a recording
+// emitter, on a clock the test advances.
 type refusalHub struct {
 	*guardHub
 	alice  string
@@ -31,6 +31,7 @@ func newRefusalHub(t *testing.T) *refusalHub {
 	h.identityRoutes()
 	h.probe(http.MethodGet, probePattern, access.NeedRead, "git:read")
 	h.probe(http.MethodGet, "/workspaces", "", "")
+	h.tokenRoutes()
 	alice, org := h.user("alice")
 	seed(t, h.st, repo("w1", alice, org, access.StatusReady), repo("w5", alice, org, access.StatusReady))
 	r := &refusalHub{guardHub: h, alice: alice, events: &recordingEmitter{}, clock: newTestClock()}
@@ -82,6 +83,7 @@ func TestRefusalLimiter_ReportsATokensFirstRefusalAsOneEvent(t *testing.T) {
 		{"a slug with no workspace, as typed", http.MethodGet, "/workspaces/NoSuch/probe", false, http.StatusNotFound, "/api/v1" + probePattern, "api", "NoSuch"},
 		{"an identity route", http.MethodGet, identityRoute, false, http.StatusForbidden, "/api/v1/user", "api", ""},
 		{"git on another workspace", http.MethodPost, "", true, http.StatusNotFound, gitPattern, "git", "w5"},
+		{"a route closed to bound tokens", http.MethodPost, "/workspaces/w1/tokens", false, http.StatusForbidden, "/api/v1/workspaces/:slug/tokens", "api", "w1"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			tok, id := r.pat(r.alice, "w1", "git:read")

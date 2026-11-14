@@ -229,6 +229,21 @@ token through `/api/v1/user/tokens`:
 {"error":{"code":403,"message":"a token bound to a workspace cannot use this route","error_type":"token_bound"}}
 ```
 
+**Routes closed to bound tokens.** `POST` and `GET
+/api/v1/workspaces/{slug}/tokens` refuse every bound PAT, so a bound token
+can neither mint another nor list the tokens of its workspace. On a
+workspace the binding reaches (the bound workspace, a fork the token
+created, and the parent of the fork a token is bound to) they are answered
+before the scope check, with or without the route's scope on the token:
+
+```json
+{"error":{"code":403,"message":"a token bound to a workspace cannot use this route","error_type":"token_bound"}}
+```
+
+On every other workspace the `404` above still comes first, so the answer
+tells nothing of which workspaces exist. A route added later is closed the
+same way when it is registered with the mark `access.refuses_bound`.
+
 The guard recognises a contributor route and an allowlisted route by its
 method and its pattern as registered, with the parameter names given here
 (`:slug`, `:number`, `:sha`, `:version`, `:id`). A route added later
@@ -1053,12 +1068,13 @@ the scope `tokens:manage` for a PAT and the level `owner` on the workspace
 
 The body is that of [`POST /api/v1/user/tokens`](#post-apiv1usertokens),
 validated the same way with the same messages: `name`, `permissions`,
-`paths` and `expires`. A PAT caller is held to the same subset rule, and a
-bound PAT is confined by the [binding guard](#workspace-bound-tokens) as on
-every route that names a workspace.
+`paths` and `expires`. A PAT caller is held to the same subset rule. The
+route is closed to every PAT bound to a workspace, so a bound token cannot
+mint another: see [Workspace-bound tokens](#workspace-bound-tokens).
 
 The checks run in this order, the first that fails answering, and a refused
-request mints nothing: a PAT without `tokens:manage` (`403`); the subset
+request mints nothing: a bound PAT (`403` `token_bound` on a workspace its
+binding reaches, `404` on any other); a PAT without `tokens:manage` (`403`); the subset
 rule for a PAT caller, before the workspace is looked up, so the answer is
 the same for an unknown slug; the access rule for need `owner` (`404` for a
 workspace the caller cannot read and for an unknown slug, with the same
@@ -1075,9 +1091,10 @@ answered `500` `internal` without its cause.
 | `201 Created` | the token was minted; the body is the Token object, with `workspace` the slug, and `token` |
 | `200 OK` | a replay of a recorded `Idempotency-Key` with the same body: the first answer without `token`; nothing is minted |
 | `400` `invalid_request` | the body is not valid, with the messages of `POST /api/v1/user/tokens` (`request body must be a JSON object` for a body that is not an object) |
+| `403` `token_bound` | a PAT bound to a workspace, on a workspace its binding reaches, whatever scopes it holds (`a token bound to a workspace cannot use this route`) |
 | `403` `insufficient_scope` | a PAT without `tokens:manage` (`this route needs the scope tokens:manage`), or a valid body beyond what the calling PAT holds, with the subset rule's messages (`permissions: this token does not hold "git:read"`) |
 | `403` `forbidden` | an org member who can read the workspace (`org members have read-only access to this workspace`), or the admin token (`this route needs a user`) |
-| `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug (`workspace not found`) |
+| `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug (`workspace not found`); also a bound PAT on a workspace outside its binding |
 | `409` `workspace_archived` | a valid body for an archived workspace (`workspace is archived`) |
 | `500` `internal` | writing the token or its event failed; nothing is minted |
 
@@ -1098,6 +1115,46 @@ when it has none or never expires), never its value:
 
 ```json
 {"seq":7,"id":"…","type":"parley.token.bind","time":"2026-01-01T00:00:00Z","workspace":"w1","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"token","resource_id":"k3x9m2pq","action":"bind","session_id":null,"metadata":{"expires_at":"2026-01-31T00:00:00Z","paths":null,"permissions":["git:read"],"token_id":"k3x9m2pq","workspace":"w1"}}
+```
+
+## `GET /api/v1/workspaces/{slug}/tokens`
+
+Lists every personal access token bound to the workspace `{slug}`, live,
+revoked or expired, so its owner can see everything that can reach it or
+once could. It takes an API key, an unbound PAT or the admin token, and
+declares the scope `tokens:read` for a PAT, which `tokens:write` and
+`tokens:manage` imply, and the level `owner` on the workspace (see
+[Workspace access](#workspace-access)); the admin token has it on every
+workspace. An archived workspace is listed like any other. Like the mint
+route, it is closed to every PAT bound to a workspace (see
+[Workspace-bound tokens](#workspace-bound-tokens)).
+
+The answer is a [list](#lists) in the standard envelope, `{"items":[…],"next_cursor":…}`,
+with the standard `limit` and `cursor`. Each item is a Token object (see
+[`POST /api/v1/user/tokens`](#post-apiv1usertokens)), never with its value,
+with `workspace` the slug; tokens bound to another workspace and unbound
+tokens are not in it. It is ordered oldest first, by `created_at` and then
+by `token_id`, since `created_at` has whole seconds. A workspace with no
+bound token answers `{"items":[],"next_cursor":null}`.
+
+The checks run in this order, the first that fails answering: a bound PAT
+(`403` `token_bound` on a workspace its binding reaches, `404` on any
+other); a PAT without `tokens:read` (`403`), the same for an unknown slug;
+the access rule for need `owner` (`404` for a workspace the caller cannot
+read and for an unknown slug, with the same bytes; `403` for an org member,
+who reads it); the `limit` and `cursor` (`400`).
+
+| Status | When |
+|---|---|
+| `200 OK` | a page of the tokens bound to the workspace |
+| `400` `invalid_request` | a `limit` or `cursor` that is not valid |
+| `403` `token_bound` | a PAT bound to a workspace, on a workspace its binding reaches, whatever scopes it holds (`a token bound to a workspace cannot use this route`) |
+| `403` `insufficient_scope` | a PAT without `tokens:read` or a scope that implies it (`this route needs the scope tokens:read`) |
+| `403` `forbidden` | an org member who can read the workspace (`org members have read-only access to this workspace`) |
+| `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug (`workspace not found`); also a bound PAT on a workspace outside its binding |
+
+```json
+{"items":[{"token_id":"k3x9m2pq","user_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","name":"agent","permissions":["git:read"],"paths":null,"workspace":"w1","expires_at":"2026-01-31T00:00:00Z","revoked_at":"2026-01-02T00:00:00Z","created_at":"2026-01-01T00:00:00Z"}],"next_cursor":null}
 ```
 
 ## Admin routes
