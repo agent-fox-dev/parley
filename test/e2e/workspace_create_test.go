@@ -107,11 +107,7 @@ func rootEntries(t *testing.T, root string) []string {
 func newOrigin(t *testing.T, opts ...gitrepotest.Option) *gitrepotest.Origin {
 	t.Helper()
 	o := gitrepotest.NewOrigin(t, opts...)
-	o.Commit("main", "first")
-	o.Commit("main", "second")
-	o.Branch("dev", "main")
-	o.Commit("dev", "on dev")
-	o.Tag("v1", "main")
+	o.History()
 	return o
 }
 
@@ -208,7 +204,7 @@ func TestWorkspaceCreate_ADeveloperRegistersAPublicRepositoryAndTheHubClonesIt(t
 	}
 	copyDir := filepath.Join(h.root, "demo.git")
 	got := refs(t, copyDir)
-	want := map[string]string{"refs/heads/main": origin.Head("main"), "refs/heads/dev": origin.Head("dev"), "refs/tags/v1": origin.Head("main")}
+	want := map[string]string{"refs/heads/main": origin.Head("main"), "refs/heads/dev": origin.Head("dev"), "refs/tags/v1": gitrepotest.Git(t, origin.Dir(), "rev-parse", "v1")}
 	for ref, id := range want {
 		if got[ref] != id {
 			t.Errorf("the copy's %s = %q, want %q", ref, got[ref], id)
