@@ -1600,7 +1600,8 @@ user's own API key, is `409` `conflict` and deletes nothing. The check and
 the delete run in one write transaction, like a demotion's (see
 [Role and status of a user](#role-and-status-of-a-user)).
 
-Data that other parts of the hub keep for the user is removed in the same
+Data that other parts of the hub keep for the user, the user's
+[secrets](#secrets) among them, is removed in the same
 transaction, before the user (see [ADR 03](adr/03-register-removers-of-owned-data-on-the-identity-service.md)).
 When that removal fails, the delete is undone as a whole, and the answer is
 `500` `internal`.
@@ -1874,7 +1875,8 @@ who were its members or its owner are kept. Afterwards the org is `404`
 former members' [`GET /api/v1/user/orgs`](#get-apiv1userorgs), and a new
 org may take its name and its slug.
 
-Data that other parts of the hub keep for the org is removed in the same
+Data that other parts of the hub keep for the org, the org's
+[secrets](#secrets) among them, is removed in the same
 transaction (see [ADR 03](adr/03-register-removers-of-owned-data-on-the-identity-service.md)).
 When that removal fails, the delete is undone as a whole, and the answer is
 `500` `internal`.
@@ -1929,6 +1931,12 @@ same answers:
 
 A workspace-bound PAT is confined by the binding guard first (see
 [Workspace-bound tokens](#workspace-bound-tokens)).
+
+The secrets of a user go with the user's deletion
+([`DELETE /api/v1/users/{id}`](#delete-apiv1usersid)) and those of an org with
+the org's ([`DELETE /api/v1/orgs/{id}`](#delete-apiv1orgsid)), in the
+transaction of the delete and without a `parley.secret.delete` event; a
+delete that is refused, such as that of the only active admin, keeps them.
 
 ## `GET /api/v1/user/secrets`, `GET /api/v1/orgs/{slug}/secrets`, `GET /api/v1/workspaces/{slug}/secrets`
 

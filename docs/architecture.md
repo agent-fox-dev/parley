@@ -1938,6 +1938,18 @@ delete handler needs no key and calls `(*secret.Component).DeleteEntry`,
 which never opens the value, and writes `parley.secret.delete`. Both events
 name the key as it is stored, whatever casing the path used.
 
+The part also registers the removal of the secrets of a user and of an org
+on the identity service, with `c.identity.RegisterUserRemover` and
+`c.identity.RegisterOrgRemover`
+([ADR 03](adr/03-register-removers-of-owned-data-on-the-identity-service.md)):
+each remover calls `(*secret.Component).RemoveScope` with `secret.ScopeUser`
+or `secret.ScopeOrg` and the id the delete gives it. `DELETE /users/:id` and
+`DELETE /orgs/:id` call them in their own transaction, before the record is
+deleted, so the secrets go with the user or the org; the user delete's
+`guardLastAdmin` refuses the only active admin with `409 conflict` before
+any remover runs, and a delete that is refused or rolls back keeps them. The
+removal reads no value and writes no `parley.secret.*` event.
+
 ### The logger
 
 `hub.NewLogger(w, level, scrubber)` returns a `*slog.Logger` with

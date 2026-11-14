@@ -283,3 +283,36 @@ func TestSecretValues_NeverLeaveTheHub(t *testing.T) {
 		}
 	}
 }
+
+func TestOwnerDelete_RemovesTheOwnersSecretsInItsTransaction(t *testing.T) {
+	w := newWorld(t)
+	// owner becomes the hub's only active admin, whom no delete removes.
+	if a := w.do(t, w.Token, http.MethodPost, "/users/"+w.ownerID+"/promote", nil); a.status != http.StatusOK {
+		t.Fatalf("promote owner = %d %s, want 200", a.status, a.body)
+	}
+	w.seed(t, secret.ScopeUser, w.outsiderID, "GIT_PAT", "NPM_TOKEN")
+	w.seed(t, secret.ScopeOrg, w.orgID, "GIT_PAT", "NPM_TOKEN")
+	w.seed(t, secret.ScopeUser, w.ownerID, "GIT_PAT", "NPM_TOKEN")
+	scopes := []place{{secret.ScopeUser, w.outsiderID, ""}, {secret.ScopeOrg, w.orgID, ""}, {secret.ScopeUser, w.ownerID, ""}}
+	// Each step is a delete, the status it answers and what the three
+	// scopes hold afterwards.
+	steps := []struct {
+		path string
+		want int
+		left []int
+	}{
+		{"/users/" + w.outsiderID, http.StatusNoContent, []int{0, 2, 2}},
+		{"/orgs/acme", http.StatusNoContent, []int{0, 0, 2}},
+		{"/users/" + w.ownerID, http.StatusConflict, []int{0, 0, 2}},
+	}
+	for _, s := range steps {
+		if a := w.do(t, w.Token, http.MethodDelete, s.path, nil); a.status != s.want {
+			t.Fatalf("DELETE %s = %d %s, want %d", s.path, a.status, a.body, s.want)
+		}
+		for i, p := range scopes {
+			if n := w.count(t, p.scope, p.id); n != s.left[i] {
+				t.Errorf("after DELETE %s the %s scope %s holds %d secrets, want %d", s.path, p.scope, p.id, n, s.left[i])
+			}
+		}
+	}
+}
