@@ -1563,10 +1563,14 @@ a provider with its value. Its processes and streams end with the test.
 `runtimetest.RunContract(t, newBackend)` runs the contract tests against the
 `runtimetest.Backend` that `newBackend` returns for every test: a function
 that returns a client of the backend for a workspace and a recorder, a
-switch that makes the backend unreachable, and, where the backend can, a
-way to reject policy values and to add a proposal. The assertions about an
-operation that returns `ErrUnsupported` are skipped, so the contract holds
-for a runtime that lacks the operation. `(*Fake).Backend()` gives the fake
+switch that makes the backend unreachable, where the backend can, a way to
+reject policy values and to add a proposal, and `EndpointsWithoutPaths`,
+which a backend sets when its provider profiles keep no endpoint paths (get
+is then expected to return the profile without them). The assertions about
+an operation that returns `ErrUnsupported` are skipped, so the contract
+holds for a runtime that lacks the operation. Only the policy value test
+creates its sandbox in a working directory with a base document; every other
+test creates one with neither. `(*Fake).Backend()` gives the fake
 in that form.
 
 ### The OpenShell implementation
@@ -1635,13 +1639,14 @@ waiting to restart is `restarting`; the rest is `pending`. The SDK reports
 nothing of the working directory, which counts as present while the sandbox
 exists.
 
-The contract tests run against this implementation over the SDK's in-memory
-client, which keeps no provider profiles and answers its profile, exec, file
-and policy draft calls as not implemented, so the assertions about those
-operations are skipped there, as are those that need a sandbox created in a
-working directory with a base document. The contract creates the sandboxes
-of the tests whose subject is not what a sandbox is created with without
-either, so those tests hold for this implementation.
+The contract tests run against this implementation over the test gateway
+with what the SDK's in-memory client does not implement added in the
+package's tests: commands run as processes of the host, files and policy
+drafts kept in memory, and the provider profile `anthropic` the contract's
+providers name. The backend sets `EndpointsWithoutPaths`. The assertions
+about the operations this implementation answers `ErrUnsupported` are
+skipped, and so is the policy value test, whose sandbox has a working
+directory and a base document.
 
 `openshelltest.New(opts...)` (`internal/sandbox/runtime/openshell/openshelltest`,
 test support) returns a `Gateway`: a `v1.ClientInterface` that stands in for
