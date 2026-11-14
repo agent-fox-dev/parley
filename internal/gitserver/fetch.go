@@ -54,16 +54,17 @@ func TimeoutFrom(cfg *config.Config) time.Duration {
 	return DefaultTimeout
 }
 
-// Runner runs git upload-pack for a client: gitrepo.Git is one.
+// Runner runs git for a client: upload-pack for ref discovery and the
+// exchange of a fetch, receive-pack for ref discovery of a push.
+// gitrepo.Git is one.
 type Runner interface {
 	UploadPack(ctx context.Context, req gitrepo.ServeRequest) error
+	ReceivePack(ctx context.Context, req gitrepo.ServeRequest) error
 }
 
-// The content types of the two answers of a fetch.
-const (
-	typeAdvertisement = "application/x-git-upload-pack-advertisement"
-	typeResult        = "application/x-git-upload-pack-result"
-)
+// typeResult is the content type of the answer of a fetch exchange; an
+// advertisement's is application/x-<service>-advertisement.
+const typeResult = "application/x-git-upload-pack-result"
 
 // The texts of the ERR packets the hub writes itself, in the answer of an
 // exchange that has already begun, where git expects them.
@@ -71,8 +72,9 @@ const (
 	errEmptyRequest = "empty request"
 	errInvalidGzip  = "invalid gzip body"
 	errTimedOut     = "request timed out"
-	// errGitFailed stands for git's text when git failed without one.
-	errGitFailed = "upload-pack failed"
+	// errGitFailed, after the name of git's command, upload-pack or
+	// receive-pack, stands for git's text when git failed without one.
+	errGitFailed = " failed"
 )
 
 // uploadPackConfig is the configuration of every run of upload-pack, given
@@ -93,17 +95,16 @@ var uploadPackConfig = []string{
 	"uploadpack.allowReachableSHA1InWant=true",
 }
 
-var (
-	errNoRunner      = errors.New("no git runner is installed")
-	errNoPushService = errors.New("no push service is installed")
-)
+var errNoRunner = errors.New("no git runner is installed")
 
-// exchange serves a request that passed every check with git. A fetch is
-// served by upload-pack; a push has no service yet and is answered 500.
+// exchange serves a request that passed every check. Ref discovery is
+// answered by git, upload-pack's or receive-pack's advertisement, and a
+// fetch by upload-pack; a push is handed to the push processor.
 func (c *Component) exchange(w http.ResponseWriter, r *http.Request, x Exchange) {
 	switch {
-	case x.Service != ServiceUploadPack:
-		c.fail(w, r, errNoPushService)
+	case x.Route == RouteReceivePack:
+		// The result is the processor's, which the request counter takes.
+		_ = c.push(w, r, x)
 	case c.deps.Runner == nil:
 		c.fail(w, r, errNoRunner)
 	case x.Route == RouteInfoRefs:
@@ -113,17 +114,25 @@ func (c *Component) exchange(w http.ResponseWriter, r *http.Request, x Exchange)
 	}
 }
 
-// advertise answers ref discovery for a fetch with upload-pack's ref
-// advertisement. Under protocol version 0 the advertisement is preceded by
-// the service line smart HTTP adds and a flush packet; under version 2
-// git's capability advertisement is the whole answer.
+// advertise answers ref discovery with the ref advertisement of the
+// service asked for: upload-pack's for a fetch, receive-pack's for a push.
+// Under protocol version 0 the advertisement is preceded by the service
+// line smart HTTP adds and a flush packet; under version 2 git's
+// capability advertisement is the whole answer. A push is always served
+// under version 0, whatever Git-Protocol says, since receive-pack speaks
+// no version 2.
 func (c *Component) advertise(w http.ResponseWriter, r *http.Request, x Exchange) {
-	v2 := protocol2(r.Header)
-	out := begin(w, typeAdvertisement)
-	if !v2 {
-		_, _ = out.Write(append(pktLine("# service="+ServiceUploadPack+"\n"), flushPkt...))
+	run, req := c.deps.Runner.UploadPack, gitrepo.ServeRequest{Dir: x.Repo, AdvertiseRefs: true, Config: uploadPackConfig}
+	if x.Service == ServiceReceivePack {
+		run, req.Config = c.deps.Runner.ReceivePack, nil
+	} else {
+		req.Protocol2 = protocol2(r.Header)
 	}
-	c.run(r, x, out, gitrepo.ServeRequest{Dir: x.Repo, AdvertiseRefs: true, Protocol2: v2, Config: uploadPackConfig})
+	out := begin(w, "application/x-"+x.Service+"-advertisement")
+	if !req.Protocol2 {
+		_, _ = out.Write(append(pktLine("# service="+x.Service+"\n"), flushPkt...))
+	}
+	c.run(r, x, out, run, req)
 }
 
 // fetch runs the fetch exchange: git reads the request body, decompressed
@@ -141,23 +150,23 @@ func (c *Component) fetch(w http.ResponseWriter, r *http.Request, x Exchange) {
 		out.writeErr(refusal)
 		return
 	}
-	c.run(r, x, out, gitrepo.ServeRequest{Dir: x.Repo, Protocol2: protocol2(r.Header), Config: uploadPackConfig, Stdin: body})
+	c.run(r, x, out, c.deps.Runner.UploadPack, gitrepo.ServeRequest{Dir: x.Repo, Protocol2: protocol2(r.Header), Config: uploadPackConfig, Stdin: body})
 }
 
-// run runs upload-pack for req, its answer written to out, bounded by the
-// timeout. When git fails or runs out of time before any pack data went
+// run runs git with serve, the runner's upload-pack or receive-pack, for
+// req, its answer written to out, bounded by the timeout. When git fails or runs out of time before any pack data went
 // out, and git wrote no error packet of its own, the answer ends with an ERR
 // packet that says why: the hub's text for the timeout, git's own for a
 // request git refused. A client that went away is told nothing.
-func (c *Component) run(r *http.Request, x Exchange, out *stream, req gitrepo.ServeRequest) {
+func (c *Component) run(r *http.Request, x Exchange, out *stream, serve func(context.Context, gitrepo.ServeRequest) error, req gitrepo.ServeRequest) {
 	ctx, cancel := context.WithTimeout(r.Context(), c.timeout())
 	defer cancel()
 	req.Stdout = out
-	err := c.deps.Runner.UploadPack(ctx, req)
+	err := serve(ctx, req)
 	if err == nil || r.Context().Err() != nil {
 		return
 	}
-	text := gitText(err, x.Repo)
+	text := gitText(err, x.Service, x.Repo)
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		text = errTimedOut
 	}
@@ -183,11 +192,12 @@ func (c *Component) timeout() time.Duration {
 // gitText is the text of the ERR packet for err, a failure of git: the
 // last line git wrote to its standard error, without git's fatal: or
 // error: prefix and with the repository's place on disk left out, which is
-// no business of the client's.
-func gitText(err error, repo string) string {
+// no business of the client's; or, when git wrote nothing, that the
+// command of service failed.
+func gitText(err error, service, repo string) string {
 	var se *gitrepo.ServeError
 	if !errors.As(err, &se) || se.Stderr == "" {
-		return errGitFailed
+		return strings.TrimPrefix(service, "git-") + errGitFailed
 	}
 	line := se.Stderr[strings.LastIndexByte(se.Stderr, '\n')+1:]
 	for _, prefix := range []string{"fatal: ", "error: "} {

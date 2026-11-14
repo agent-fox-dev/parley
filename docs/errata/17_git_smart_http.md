@@ -163,3 +163,28 @@ source below `refs/parley/changes/<number>/` of a named change is set) and
 does not set is deleted). Names, prefixes and the prune namespace come from
 the git server alone, so no other ref of the parent is copied and no other
 ref of the fork is touched.
+
+## The hub installs no push processor yet
+
+The package passes "the push processor of package 18" to the git server.
+Package 18 (the push rules) is not part of the hub yet, so
+`internal/hub/gitserver.go` installs none, and `cmd/parleyd` is unchanged,
+as for every other collaborator of the git server. Ref discovery for a push
+is served, and a push that passed every check is answered
+`500 internal error` with its body unread and git not run, so no ref of the
+repository changes and stock `git push` fails. The hand-over to an
+installed processor is tested through the test seam (`AdjustGitServer`)
+with a processor that records what it was handed. Once package 18 sets
+`gitserver.Deps.Push` in the git server's start hook, pushes reach it and
+nothing else changes.
+
+## The PAT a push processor gets is the principal of the credential check
+
+The package hands the processor "the PAT's record with its paths". The
+credential check returns an `identity.Principal`, which holds a PAT's
+`token_id`, user, permissions, `paths` and bound workspace: what the push
+rules read of a PAT. `gitserver.PushCaller.PAT` is that principal for a
+PAT, and nil for an API key or the admin token, rather than the stored
+`identity.PAT` row, which the git server never reads. The admin token's
+credential type is `admin_token`, the name the hub's events give it, where
+the principal says `admin`.

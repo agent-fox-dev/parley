@@ -24,8 +24,9 @@ const gitServerHook = "gitserver"
 // fork component, whose parent check judges a fork's parent as it does for
 // every route that works on a fork, and to the workspace service's place
 // of each repository on disk, which is opened with the hub's git before any
-// exchange, to the hub's git, which runs upload-pack for a fetch and copies
-// a fork's tracking refs from its parent's repository into the fork's, to
+// exchange, to the hub's git, which runs upload-pack for a fetch and
+// receive-pack's advertisement for a push, and copies a fork's tracking
+// refs from its parent's repository into the fork's, to
 // the fork view, which names those refs from the fork's record, and to
 // [git].timeout, which it registers and which bounds each run. The server,
 // and with it the limiter, is built after the start hooks, so the limiter
@@ -33,8 +34,9 @@ const gitServerHook = "gitserver"
 // serverLimiter, which the hook points at the limiter of the server that
 // serves.
 //
-// No push service is installed: a push that passes the checks is answered
-// 500 internal error.
+// No push processor is installed, because the push rules are not part of
+// the hub yet: a push that passes the checks is answered 500 internal
+// error, its body unread and git not run.
 //
 // The component exists from the composition on (GitServer); tests change
 // its dependencies with AdjustGitServer.

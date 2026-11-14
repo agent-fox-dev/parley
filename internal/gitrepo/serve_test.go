@@ -19,9 +19,9 @@ import (
 )
 
 // Not parallel: the environment of the test process asks for protocol
-// version 2 and hides every branch, through a system, a global and a home
+// version 2 and hides every branch, for a fetch and a push alike, through a system, a global and a home
 // configuration, none of which may reach the git the hub runs.
-func TestUploadPack_ServesTheRequestAsAskedWhateverTheHostSays(t *testing.T) {
+func TestServe_ServesTheRequestAsAskedWhateverTheHostSays(t *testing.T) {
 	o := gitrepotest.NewOrigin(t)
 	head := o.Commit("main", "first")
 	hide := filepath.Join(t.TempDir(), "gitconfig")
@@ -35,28 +35,38 @@ func TestUploadPack_ServesTheRequestAsAskedWhateverTheHostSays(t *testing.T) {
 	t.Setenv("GIT_CONFIG_GLOBAL", hide)
 	t.Setenv("HOME", filepath.Dir(hide))
 	t.Setenv("GIT_PROTOCOL", "version=2")
+	gitrepotest.Git(t, o.Dir(), "update-ref", "refs/parley/changes/1/1", head)
 	request := pkt("want "+head+"\n") + "0000" + pkt("done\n")
+	upload, receive := (gitrepo.Git{}).UploadPack, (gitrepo.Git{}).ReceivePack
 	cases := []struct {
 		name       string
+		run        func(context.Context, gitrepo.ServeRequest) error
 		req        gitrepo.ServeRequest
-		want, not  string
+		want       []string
+		not        string
 		wantPrefix string
 	}{
-		{"version 0 advertisement", gitrepo.ServeRequest{AdvertiseRefs: true}, head + " refs/heads/main", " filter", ""},
-		{"version 2 advertisement", gitrepo.ServeRequest{AdvertiseRefs: true, Protocol2: true}, "ls-refs", "refs/heads/", pkt("version 2\n")},
-		{"configuration of the run", gitrepo.ServeRequest{AdvertiseRefs: true, Config: []string{"uploadpack.allowFilter=true"}}, " filter", "", ""},
-		{"fetch exchange", gitrepo.ServeRequest{Stdin: strings.NewReader(request)}, "PACK", "", pkt("NAK\n")},
+		{"version 0 advertisement", upload, gitrepo.ServeRequest{AdvertiseRefs: true}, []string{head + " refs/heads/main"}, " filter", ""},
+		{"version 2 advertisement", upload, gitrepo.ServeRequest{AdvertiseRefs: true, Protocol2: true}, []string{"ls-refs"}, "refs/heads/", pkt("version 2\n")},
+		{"configuration of the run", upload, gitrepo.ServeRequest{AdvertiseRefs: true, Config: []string{"uploadpack.allowFilter=true"}}, []string{" filter"}, "", ""},
+		{"fetch exchange", upload, gitrepo.ServeRequest{Stdin: strings.NewReader(request)}, []string{"PACK"}, "", pkt("NAK\n")},
+		{"push advertisement", receive, gitrepo.ServeRequest{AdvertiseRefs: true, Protocol2: true}, []string{
+			head + " refs/heads/main\x00", head + " refs/parley/changes/1/1", " report-status", " delete-refs", " side-band-64k",
+			" ofs-delta", " atomic", " push-options",
+		}, "version", ""},
 	}
 	for _, c := range cases {
 		var out bytes.Buffer
 		c.req.Dir, c.req.Stdout = o.Dir(), &out
-		if err := (gitrepo.Git{}).UploadPack(context.Background(), c.req); err != nil {
-			t.Errorf("%s: UploadPack = %v", c.name, err)
+		if err := c.run(context.Background(), c.req); err != nil {
+			t.Errorf("%s: git = %v", c.name, err)
 			continue
 		}
 		got := out.String()
-		if !strings.Contains(got, c.want) || (c.not != "" && strings.Contains(got, c.not)) || !strings.HasPrefix(got, c.wantPrefix) {
-			t.Errorf("%s: git wrote %q, want it to start with %q, hold %q and not %q", c.name, got, c.wantPrefix, c.want, c.not)
+		for _, want := range c.want {
+			if !strings.Contains(got, want) || (c.not != "" && strings.Contains(got, c.not)) || !strings.HasPrefix(got, c.wantPrefix) {
+				t.Errorf("%s: git wrote %q, want it to start with %q, hold %q and not %q", c.name, got, c.wantPrefix, want, c.not)
+			}
 		}
 	}
 	var out bytes.Buffer

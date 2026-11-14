@@ -8,14 +8,15 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 )
 
-// ServeRequest is one run of git upload-pack for a client of the hub, in
-// git's stateless mode, which smart HTTP needs: each request is answered
-// by a process of its own that reads the request from Stdin and writes the
-// whole answer to Stdout.
+// ServeRequest is one run of git upload-pack or git receive-pack for a
+// client of the hub, in git's stateless mode, which smart HTTP needs: each
+// request is answered by a process of its own that reads the request from
+// Stdin and writes the whole answer to Stdout.
 type ServeRequest struct {
 	// Dir is the git directory of the repository served.
 	Dir string
@@ -24,6 +25,7 @@ type ServeRequest struct {
 	AdvertiseRefs bool
 	// Protocol2 serves the request under git protocol version 2. Without
 	// it git serves version 0, whatever the environment of the hub says.
+	// receive-pack speaks no version 2 and is always run without it.
 	Protocol2 bool
 	// Config are configuration settings, as name=value, given to this one
 	// run on git's command line, so that what the hub serves does not
@@ -39,6 +41,8 @@ type ServeRequest struct {
 // ServeError is the failure of a git process that served a client, or a
 // request refused before git ran as git would have refused it.
 type ServeError struct {
+	// Command is the git command that served: upload-pack or receive-pack.
+	Command string
 	// Stderr is what git wrote to its standard error, trimmed: git's own
 	// text of what it refused.
 	Stderr string
@@ -47,14 +51,25 @@ type ServeError struct {
 }
 
 func (e *ServeError) Error() string {
-	return fmt.Sprintf("git upload-pack: %v: %s", e.Err, e.Stderr)
+	return fmt.Sprintf("git %s: %v: %s", e.Command, e.Err, e.Stderr)
 }
 
 func (e *ServeError) Unwrap() error { return e.Err }
 
+// The git commands that serve a client.
+const (
+	uploadPack  = "upload-pack"
+	receivePack = "receive-pack"
+)
+
 // errNotOurRef is the failure of a request that wants a commit no ref
 // reaches.
 var errNotOurRef = errors.New("a want names a commit no ref reaches")
+
+// receivePackConfig is the configuration of every run of receive-pack:
+// the push options and atomic pushes are advertised, which the push rules
+// of the hub take, whatever a repository's own configuration says.
+var receivePackConfig = []string{"receive.advertisePushOptions=true", "receive.advertiseAtomic=true"}
 
 // UploadPack runs git upload-pack --stateless-rpc on req.Dir under ctx,
 // with the minimal environment and Env, so that neither the system nor the
@@ -73,6 +88,29 @@ var errNotOurRef = errors.New("a want names a commit no ref reaches")
 // as git does under version 0: a partial clone fetches those by id, and
 // whether a ref reaches one is a walk of every tree of every ref.
 func (g Git) UploadPack(ctx context.Context, req ServeRequest) error {
+	var filter func(dir, repo string, in io.Reader) (*os.File, error)
+	if req.Protocol2 && !req.AdvertiseRefs && req.Stdin != nil {
+		filter = func(dir, repo string, in io.Reader) (*os.File, error) { return g.checkWants(ctx, dir, repo, in) }
+	}
+	return g.serve(ctx, uploadPack, req, filter)
+}
+
+// ReceivePack runs git receive-pack --stateless-rpc on req.Dir under ctx,
+// as UploadPack runs upload-pack, with the push options and atomic pushes
+// advertised ahead of req.Config, and always under protocol version 0,
+// whatever req.Protocol2 says: receive-pack speaks no version 2, and a
+// version it does not know would only be ignored by it.
+func (g Git) ReceivePack(ctx context.Context, req ServeRequest) error {
+	req.Protocol2 = false
+	req.Config = append(slices.Clone(receivePackConfig), req.Config...)
+	return g.serve(ctx, receivePack, req, nil)
+}
+
+// serve runs git command --stateless-rpc for req. filter, when not nil, is
+// given git's private directory, the repository and the request, and
+// returns what git reads in the request's place, or a failure that stops
+// git before it runs.
+func (g Git) serve(ctx context.Context, command string, req ServeRequest, filter func(dir, repo string, in io.Reader) (*os.File, error)) error {
 	repo, err := filepath.Abs(req.Dir)
 	if err != nil {
 		return fmt.Errorf("serve %s: %w", req.Dir, err)
@@ -81,7 +119,7 @@ func (g Git) UploadPack(ctx context.Context, req ServeRequest) error {
 	for _, c := range req.Config {
 		args = append(args, "-c", c)
 	}
-	args = append(args, "upload-pack", "--stateless-rpc")
+	args = append(args, command, "--stateless-rpc")
 	if req.AdvertiseRefs {
 		args = append(args, "--advertise-refs")
 	}
@@ -91,8 +129,8 @@ func (g Git) UploadPack(ctx context.Context, req ServeRequest) error {
 		return err
 	}
 	defer func() { _ = os.RemoveAll(dir) }()
-	if req.Protocol2 && !req.AdvertiseRefs && req.Stdin != nil {
-		request, err := g.checkWants(ctx, dir, repo, req.Stdin)
+	if filter != nil {
+		request, err := filter(dir, repo, req.Stdin)
 		if err != nil {
 			return err
 		}
@@ -107,9 +145,9 @@ func (g Git) UploadPack(ctx context.Context, req ServeRequest) error {
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = req.Stdin, req.Stdout, errOut
 	if err := cmd.Run(); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return fmt.Errorf("git upload-pack: %w", ctxErr)
+			return fmt.Errorf("git %s: %w", command, ctxErr)
 		}
-		return &ServeError{Stderr: strings.TrimSpace(errOut.String()), Err: err}
+		return &ServeError{Command: command, Stderr: strings.TrimSpace(errOut.String()), Err: err}
 	}
 	return nil
 }
@@ -160,7 +198,7 @@ func (g Git) reached(ctx context.Context, repo string, ids []string) error {
 	}
 	for _, id := range ids {
 		if unreached[id] {
-			return &ServeError{Stderr: "upload-pack: not our ref " + id, Err: errNotOurRef}
+			return &ServeError{Command: uploadPack, Stderr: "upload-pack: not our ref " + id, Err: errNotOurRef}
 		}
 	}
 	return nil

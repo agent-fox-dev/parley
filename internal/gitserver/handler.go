@@ -149,11 +149,15 @@ type Deps struct {
 	// Service, when set, serves a request that passed the checks in place
 	// of the component's own exchange with git; tests put a recorder there.
 	Service Service
-	// Runner runs git upload-pack for the exchange of a fetch; with none, a
-	// fetch that passed the checks is answered 500 internal error. A push
-	// has no service yet and is answered 500 internal error.
+	// Runner runs git upload-pack for ref discovery and the exchange of a
+	// fetch, and git receive-pack for ref discovery of a push; with none,
+	// such a request that passed the checks is answered 500 internal error.
 	Runner Runner
-	// Timeout bounds one run of upload-pack; zero is DefaultTimeout.
+	// Push processes a push that passed the checks, the push exchange
+	// itself; with none, a push is answered 500 internal error with its
+	// body unread and git not run, and the repository is left as it is.
+	Push PushProcessor
+	// Timeout bounds one run of git for a client; zero is DefaultTimeout.
 	Timeout time.Duration
 	// Logger receives the causes of 500 answers; nil discards them.
 	Logger *slog.Logger

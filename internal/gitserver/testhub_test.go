@@ -331,7 +331,8 @@ func (r *recorder) last(t *testing.T) gitserver.Exchange {
 	return r.exchanges[len(r.exchanges)-1]
 }
 
-// countingRunner counts the runs of git of the runner it wraps.
+// countingRunner counts the runs of git of the runner it wraps, upload-pack
+// and receive-pack alike.
 type countingRunner struct {
 	gitserver.Runner
 	n atomic.Int64
@@ -340,6 +341,11 @@ type countingRunner struct {
 func (c *countingRunner) UploadPack(ctx context.Context, req gitrepo.ServeRequest) error {
 	c.n.Add(1)
 	return c.Runner.UploadPack(ctx, req)
+}
+
+func (c *countingRunner) ReceivePack(ctx context.Context, req gitrepo.ServeRequest) error {
+	c.n.Add(1)
+	return c.Runner.ReceivePack(ctx, req)
 }
 
 // flushPkt stands for a flush packet among the pkt-lines of a body.

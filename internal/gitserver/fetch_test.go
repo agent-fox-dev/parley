@@ -211,9 +211,12 @@ func TestFetch_SendsThePackOfAPlainOrGzipRequest(t *testing.T) {
 	}
 }
 
-// blockingRunner writes NAK and then holds the exchange until release is
-// closed or its context ends.
-type blockingRunner struct{ release chan struct{} }
+// blockingRunner writes NAK and then holds the exchange of a fetch until
+// release is closed or its context ends.
+type blockingRunner struct {
+	gitserver.Runner
+	release chan struct{}
+}
 
 func (b blockingRunner) UploadPack(ctx context.Context, req gitrepo.ServeRequest) error {
 	if _, err := io.WriteString(req.Stdout, pkt("NAK\n")); err != nil {
@@ -231,7 +234,7 @@ func TestFetch_SendsGitsFirstBytesBeforeGitEnds(t *testing.T) {
 	release := make(chan struct{})
 	defer close(release)
 	w := newGitWorld(t, hubtest.Config{Compose: func(c *hub.Composition) {
-		c.AdjustGitServer(func(d *gitserver.Deps) { d.Runner = blockingRunner{release} })
+		c.AdjustGitServer(func(d *gitserver.Deps) { d.Runner = blockingRunner{release: release} })
 	}})
 	req, err := http.NewRequest(http.MethodPost, w.URL(uploadPack), strings.NewReader(fetchRequest(w.head)))
 	if err != nil {

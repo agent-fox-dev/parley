@@ -709,8 +709,25 @@ starting with `ERR `, and no pack follows it:
 
 On a timeout git is killed and the answer ends; the `ERR` pkt-line is
 written only when no pack data had been sent yet, and the client's git
-fails. A push that passed every check is answered `500 internal error`: the
-hub has no push service yet.
+fails.
+
+A push that passed every check gets its ref advertisement from
+`git receive-pack` on the workspace's repository:
+
+- `GET …/info/refs?service=git-receive-pack` answers `200` with
+  `Content-Type: application/x-git-receive-pack-advertisement` and
+  `Cache-Control: no-cache`, always under protocol version 0, whatever the
+  `Git-Protocol` header says: the pkt-line `# service=git-receive-pack`, a
+  flush packet `0000`, then one pkt-line per ref, every ref of the
+  repository including those under `refs/parley/`, the first carrying the
+  capability list, which holds `report-status`, `delete-refs`,
+  `side-band-64k`, `ofs-delta`, `atomic` and `push-options`.
+- `POST …/git-receive-pack` is handed, with its body unread and whatever
+  its size, to the hub's push processor, which writes the whole answer.
+  The hub has no push processor yet, so the push is answered `500` with the
+  body `internal error`, its body is not read, git does not run, and no ref
+  of the repository changes; stock `git push` fails with
+  `error: RPC failed; HTTP 500`.
 
 A task fork is served with its own refs and what it shows of its parent's,
 on every git route, as of the moment of the request:
