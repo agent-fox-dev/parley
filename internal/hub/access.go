@@ -10,8 +10,8 @@ import (
 	"github.com/agent-fox-dev/parley/internal/server"
 )
 
-// composeAccess adds the workspace records the access rule reads to the
-// transactional store, adds the rule's workspace access check to the access
+// composeAccess adds the workspace records the access rule reads, with the
+// creating token of a fork, to the transactional store, adds the rule's workspace access check to the access
 // checks, after identity's admin check, and binds the rule in a start hook,
 // before the hub serves its first request, to the records and to the
 // memberships of users in active orgs, which the identity service keeps.
@@ -26,6 +26,7 @@ func composeAccess(c *Composition) {
 	svc := &access.Service{}
 	c.access = svc
 	c.AddSchemaStep(access.SchemaStep)
+	c.AddSchemaStep(access.CreatingTokenStep)
 	c.AddAccessCheck(svc.Check)
 	c.addRouteRule(refusePublicNeed)
 	c.AddStartHook("access", func(_ context.Context, rt *Runtime) error {

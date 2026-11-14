@@ -11,7 +11,7 @@ command-line client. Both are written in Go, in the module
 |---|---|
 | `cmd/parley` | the `parley` program: it calls `cli.Run` and exits with its status |
 | `cmd/parleyd` | the `parleyd` program: `main` calls `hub.Run` with the process's arguments, environment and working directory and exits with its status |
-| `internal/access` | the workspace access rule, the one place that decides what a caller may do on a workspace; the minimal workspace record (slug, owner, org, kind, parent, status) in the transactional store, the caller's level on a workspace, the decision for a declared need and the REST access check, and the readable set for reads across workspaces |
+| `internal/access` | the workspace access rule, the one place that decides what a caller may do on a workspace; the minimal workspace record (slug, owner, org, kind, parent, status, the creating token of a fork) in the transactional store, the caller's level on a workspace, the decision for a declared need and the REST access check, the readable set for reads across workspaces, and what the binding of a workspace-bound PAT covers |
 | `internal/buildinfo` | the version, commit and build time the binary was built with, shared by both programs |
 | `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra`, each declared through one helper ([ADR 02](adr/02-declare-every-cli-command-through-one-helper.md)), the client configuration file, the resolution of the hub URL and the credential, the one HTTP client the commands send their requests with, the printing of a command's result on stdout and of its warnings on stderr, the shared wait for a long operation (`--wait`, `--timeout`, `--poll-interval`), and the error envelopes and exit statuses every command ends with |
 | `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, and a registry of keys and whole sections that decides what the file may hold |
@@ -1165,8 +1165,9 @@ keeps data for a user or an org registers its remover from its part in
 ### Workspace access
 
 `internal/hub/access.go` adds the part `composeAccess`, after
-`composeIdentity` in `parts`. It adds the schema step `access.SchemaStep`
-(`workspace_records`), registers a zero `access.Service`, adds its
+`composeIdentity` in `parts`. It adds the schema steps `access.SchemaStep`
+(`workspace_records`) and, after it, `access.CreatingTokenStep`
+(`workspace_creating_token`), registers a zero `access.Service`, adds its
 `Check` to the access checks, after identity's admin check, and binds it in
 the start hook `access` to `access.Deps{Records:
 access.StoreRecords(rt.Store.Main()), Memberships: ...}`, the membership
@@ -1190,6 +1191,7 @@ The step creates the table `workspaces` in the transactional store:
 | `kind` | `repository` or `fork` (a `CHECK` constraint) |
 | `parent_slug` | the slug of the repository a fork was created from; NULL for a repository, and no foreign key |
 | `status` | `pending`, `cloning`, `ready`, `failed` or `archived` (a `CHECK` constraint) |
+| `creating_token_id` | the `token_id` of the PAT whose request created a fork; NULL for a repository and for a fork no token created, and no foreign key. Added by the second step, `ALTER TABLE workspaces ADD COLUMN creating_token_id TEXT`, so that a store whose table exists gains it |
 
 with an index on each of `owner_id`, `org_id` and `parent_slug`, for the
 list reads. A dangling `owner_id` matches no caller and a dangling `org_id`
@@ -1197,8 +1199,9 @@ grants no membership, because the memberships of a deleted org are deleted
 with it.
 
 `internal/access/record.go` holds the record type `access.Record` (`Slug`,
-`OwnerID`, `OrgID`, `Kind`, `ParentSlug`, `Status`; `ParentSlug` is `""`
-for a repository and stored as NULL), the constants `KindRepository`,
+`OwnerID`, `OrgID`, `Kind`, `ParentSlug`, `Status`, `CreatingTokenID`;
+`ParentSlug` and `CreatingTokenID` are `""` for a repository and stored as
+NULL, and `CreatingTokenID` has no JSON name, so no answer shows it), the constants `KindRepository`,
 `KindFork` and `StatusPending` to `StatusArchived`, and the store functions.
 The insert takes the caller's `*sql.Tx`; the reads take a `Querier` (the
 store's `*sql.DB` or an open `*sql.Tx`):
@@ -1206,11 +1209,13 @@ store's `*sql.DB` or an open `*sql.Tx`):
 - `InsertRecord(ctx, tx, rec)` stores a record in the caller's transaction.
   It refuses, with an error wrapping `access.ErrInvalidRecord` and without
   writing, a record with an empty slug, owner or org, an unknown kind or
-  status, a repository with a parent, a fork without one, and a fork whose
+  status, a repository with a parent or a creating token, a fork without a
+  parent, and a fork whose
   parent has no record, is a fork itself or is in another org; the parent is
   read in the same transaction. A slug that has a record already is
   refused with `access.ErrDuplicateSlug` (the insert is `ON CONFLICT (slug)
-  DO NOTHING`), and the stored record stays as it was.
+  DO NOTHING`), and the stored record stays as it was. Fork creation records
+  the creating token through it, in `Record.CreatingTokenID`.
 - `RecordBySlug(ctx, q, slug)` returns the record and `true`, or `false`
   and a nil error for any string no record has as its slug.
 - `ForkParent(ctx, q, slug)` returns the parent's slug when `slug` names a
@@ -1229,8 +1234,11 @@ The rule reads records through the interface `access.RecordReader`
 `internal/access/level.go` resolves what a caller is on one workspace,
 `access.Level`: `LevelAdmin` (`"admin"`), `LevelOwner` (`"owner"`),
 `LevelMember` (`"member"`) or `LevelNone` (`""`). The caller is
-`access.Caller{Admin, UserID}`, built from the pipeline's `server.Caller`
-by `access.CallerFrom`; the kind of credential and the user's role are not
+`access.Caller{Admin, UserID, TokenID, Workspace}`, built from the
+pipeline's `server.Caller` by `access.CallerFrom`. `TokenID` and `Workspace`
+are set only for a PAT bound to a workspace, from the `identity.Principal`
+in the caller's `Detail` (`Type` `pat` with a `Workspace`): the token's id
+and the bound slug. `Level` and `Decide` do not read them. The kind of credential and the user's role are not
 part of it, so a user has the same level by API key as by PAT, and a user
 with the role admin has no level from the role.
 
@@ -1346,6 +1354,9 @@ through. `(*Service).Readable(ctx, caller)` returns an
   in one of the user's orgs is `LevelOwner`;
 - a caller that is neither, and a user with nothing, get the empty set and
   no error;
+- a PAT bound to a workspace gets its user's set cut down to the covered
+  set of its binding (below), each entry at the user's level: a covered
+  workspace the user cannot read stays out;
 - a failed read returns the error and the empty set, never part of one.
 
 `Level` and `Readable` share one resolver (`userLevels` in `level.go`); they
@@ -1358,6 +1369,34 @@ therefore in a user's set exactly when `Level` resolves a level other than
 `LevelNone` for it, with that level. The visibility decision of the hub
 events calls `Readable` (see [Hub events](#hub-events)); the workspace list
 and the audit query will.
+
+#### Workspace-bound tokens
+
+`internal/access/coverage.go` says what the binding of a PAT bound to a
+workspace reaches. `(*Service).CoveredSet(ctx, caller)` returns, sorted, the
+covered workspaces: for a token bound to a repository W, W and every fork of
+W whose `creating_token_id` is the token's id; for a token bound to a fork,
+the fork alone; for a bound slug with no record, that slug alone. A caller
+without a binding covers nothing (`nil`). `(*Service).RelationOf(ctx,
+caller, slug)` answers how a workspace a request names stands to the
+binding, as an `access.Relation` (`internal/access/binding.go`):
+`RelationBound` (`"bound"`) for the bound slug, record or not;
+`RelationCreatedFork` (`"created_fork"`) for a fork of it the token created;
+`RelationParentOfBoundFork` (`"parent_of_bound_fork"`) for the parent of the
+fork the token is bound to; and `""` (none) for every other slug and every
+caller without a binding. Both read the records on every call, so a fork the
+token has just created is covered at once. `access.Binding{TokenID,
+Workspace, Relation}` is the value a binding guard attaches to a request
+for its handler (ADR 04), read with `access.BindingOf(r)`; no guard is
+installed yet, so it reports false on every request.
+
+`internal/access/events.go` declares `access.EventEmitter` (`Emit(ctx, tx,
+access.Event)` in the caller's transaction, `EmitNow(ctx, access.Event)` in
+one of its own) over the value `access.Event{Type, Workspace, ActorType,
+ActorID, ResourceType, ResourceID, Metadata}`. The event component imports
+`internal/access`, so this package cannot name `event.Input`, and the event
+component is to be passed behind the interface. There is no discarding
+default; nothing emits through it yet.
 
 ### Hub events
 

@@ -41,11 +41,15 @@ func (s ReadableSet) Level(slug string) Level {
 // workspaces, forks included, of the active orgs they are a member of, each
 // at the level Level resolves for it; those at LevelNone, such as a fork
 // whose owner has no level on its parent, are left out. A caller who is
-// neither gets the empty set. A failed read returns the error and the empty
-// set, never part of one.
+// neither gets the empty set. A bound PAT's is its user's set cut down to
+// the workspaces its binding covers; see CoveredSet. A failed read returns
+// the error and the empty set, never part of one.
 func (s *Service) Readable(ctx context.Context, c Caller) (ReadableSet, error) {
 	if c.Admin {
 		return ReadableSet{All: true}, nil
+	}
+	if c.Workspace != "" {
+		return s.boundReadable(ctx, c)
 	}
 	if c.UserID == "" {
 		return ReadableSet{}, nil

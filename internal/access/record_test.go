@@ -9,7 +9,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/access"
 )
 
-func TestInsertRecord_KeepsTheSixValuesAcrossAReopenOfTheStore(t *testing.T) {
+func TestInsertRecord_KeepsEveryValueAcrossAReopenOfTheStore(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -18,7 +18,7 @@ func TestInsertRecord_KeepsTheSixValuesAcrossAReopenOfTheStore(t *testing.T) {
 	for _, status := range []string{access.StatusPending, access.StatusCloning, access.StatusReady, access.StatusFailed, access.StatusArchived} {
 		recs = append(recs, repo("acme-"+status, "u1", "o1", status))
 	}
-	recs = append(recs, fork("acme-ready--f1", "u2", "o1", "acme-ready"))
+	recs = append(recs, fork("acme-ready--f1", "u2", "o1", "acme-ready"), createdBy(fork("acme-ready--f2", "u2", "o1", "acme-ready"), "tok-1"))
 	seed(t, st, recs...)
 	for _, rec := range recs {
 		if got, found, err := access.RecordBySlug(ctx, st.Main(), rec.Slug); err != nil || !found || got != rec {
@@ -69,6 +69,7 @@ func TestInsertRecord_RefusesAnInvalidRecordAndWritesNothing(t *testing.T) {
 		{"an unknown kind", with(valid, func(r *access.Record) { r.Kind = "mirror" })},
 		{"an unknown status", with(valid, func(r *access.Record) { r.Status = "deleted" })},
 		{"a repository with a parent", with(valid, func(r *access.Record) { r.ParentSlug = "acme" })},
+		{"a repository with a creating token", createdBy(valid, "tok-1")},
 		{"a fork without a parent", fork("new", "u1", "o1", "")},
 		{"a fork of no record", fork("new", "u1", "o1", "nope")},
 		{"a fork of a fork", fork("new", "u1", "o1", "acme--f1")},

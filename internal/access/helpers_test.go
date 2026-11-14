@@ -10,23 +10,25 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"testing"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/store"
 )
 
 // openStore opens the transactional store in dir, on disk, with the
-// workspace record step, and closes it when the test ends. Opening the same
+// workspace record steps, and closes it when the test ends. Opening the same
 // dir again reopens the same store.
 func openStore(t *testing.T, dir string) *store.Store {
 	t.Helper()
 	st, err := store.Open(context.Background(), store.Options{
 		DatabasePath:  filepath.Join(dir, "parley.db"),
 		WorkspaceRoot: filepath.Join(dir, "workspaces"),
-	}, []store.Step{access.SchemaStep})
+	}, []store.Step{access.SchemaStep, access.CreatingTokenStep})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -42,6 +44,21 @@ func repo(slug, owner, org, status string) access.Record {
 // fork is a ready fork record of parent.
 func fork(slug, owner, org, parent string) access.Record {
 	return access.Record{Slug: slug, OwnerID: owner, OrgID: org, Kind: access.KindFork, ParentSlug: parent, Status: access.StatusReady}
+}
+
+// createdBy is rec with the creating token tokenID, as fork creation
+// records it.
+func createdBy(rec access.Record, tokenID string) access.Record {
+	rec.CreatingTokenID = tokenID
+	return rec
+}
+
+// boundPAT is the caller identity's authenticator reports for userID's PAT
+// tokenID bound to the workspace slug.
+func boundPAT(userID, tokenID, slug string) server.Caller {
+	return server.Caller{CredentialID: tokenID, UserID: userID, Detail: &identity.Principal{
+		Type: identity.TypePAT, CredentialID: tokenID, User: &identity.User{ID: userID, Role: identity.RoleUser},
+		Permissions: []string{"git:read"}, Workspace: &slug}}
 }
 
 // insert inserts rec in a transaction of its own.
@@ -248,4 +265,36 @@ type loggedRecords struct {
 func (r loggedRecords) Record(ctx context.Context, slug string) (access.Record, bool, error) {
 	r.log.reads = append(r.log.reads, "record")
 	return r.RecordReader.Record(ctx, slug)
+}
+
+// recordingEmitter is an event emitter that remembers, in order, each event
+// and the transaction it was emitted in, nil for one emitted now.
+type recordingEmitter struct {
+	mu      sync.Mutex
+	emitted []emitted
+}
+
+type emitted struct {
+	event access.Event
+	tx    *sql.Tx
+}
+
+var _ access.EventEmitter = (*recordingEmitter)(nil)
+
+func (e *recordingEmitter) Emit(_ context.Context, tx *sql.Tx, ev access.Event) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.emitted = append(e.emitted, emitted{ev, tx})
+	return nil
+}
+
+func (e *recordingEmitter) EmitNow(_ context.Context, ev access.Event) error {
+	return e.Emit(context.Background(), nil, ev)
+}
+
+// all returns what was emitted so far.
+func (e *recordingEmitter) all() []emitted {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return slices.Clone(e.emitted)
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 
+	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/server"
 )
 
@@ -26,18 +27,32 @@ const (
 // Caller is who the rule decides for: the admin token, or a user. The kind
 // of credential and the user's role are not part of it, because the rule
 // gives a user the same level by API key as by PAT, and the role admin
-// grants nothing on a workspace.
+// grants nothing on a workspace. A PAT bound to a workspace also carries its
+// binding, which Level and Decide do not read and which cuts the readable
+// set down to what the binding covers.
 type Caller struct {
 	// Admin marks the admin token.
 	Admin bool
 	// UserID is the user the credential acts for; empty for the admin token.
 	UserID string
+	// TokenID is the token_id of a bound PAT; empty for every other
+	// credential.
+	TokenID string
+	// Workspace is the slug a PAT is bound to; empty for every other
+	// credential.
+	Workspace string
 }
 
 // CallerFrom returns the rule's caller for the caller the pipeline's
-// authenticator reported.
+// authenticator reported. The binding of a PAT comes from the principal
+// identity's authenticator puts in the caller's detail.
 func CallerFrom(c server.Caller) Caller {
-	return Caller{Admin: c.Admin, UserID: c.UserID}
+	caller := Caller{Admin: c.Admin, UserID: c.UserID}
+	if p, ok := c.Detail.(*identity.Principal); ok && p != nil && p.Type == identity.TypePAT && p.Workspace != nil {
+		caller.TokenID = p.CredentialID
+		caller.Workspace = *p.Workspace
+	}
+	return caller
 }
 
 // Deps are what the service reads: the workspace records and the
