@@ -470,7 +470,7 @@ The build of the running hub.
 
 | Status | Body |
 |---|---|
-| `200 OK` | an object with exactly the string members below |
+| `200 OK` | an object with exactly the members below |
 
 The answer carries `Cache-Control: public, max-age=300`.
 
@@ -480,11 +480,18 @@ The answer carries `Cache-Control: public, max-age=300`.
 | `commit` | the commit the binary was built from, or `unknown` when none was set |
 | `build_time` | the build time as given at build time, or `unknown` when none was set |
 | `go_version` | the version of the Go toolchain that built the binary, for example `go1.27.3` |
+| `sandbox_runtime` | only on a hub with sandboxes on (a `[sandbox]` section, see [configuration.md](configuration.md#sandboxes)): an object of two strings, `supported`, the OpenShell releases the hub works with as `>=<lowest> <<first unsupported>`, and `connected`, the release the gateway reported when the hub started. It is read once, at start, and stays the same while the gateway cannot be reached |
 
 Example:
 
 ```json
 {"version":"1.4.0","commit":"3f2a1bc","build_time":"2026-01-02T03:04:05Z","go_version":"go1.27.3"}
+```
+
+With sandboxes on:
+
+```json
+{"version":"1.4.0","commit":"3f2a1bc","build_time":"2026-01-02T03:04:05Z","go_version":"go1.27.3","sandbox_runtime":{"supported":">=0.1.0 <0.2.0","connected":"0.1.8"}}
 ```
 
 How the build values are set is in [architecture.md](architecture.md#build-information).

@@ -185,7 +185,30 @@ sends the file's content as a bearer token, also over `http` to a loopback
 gateway; with OIDC it obtains a token from `oidc_issuer` with the client
 credentials grant on its first call to the gateway and renews it before it
 expires. The hub supports the OpenShell releases from `0.1.0`, included, to
-`0.2.0`, excluded.
+`0.2.0`, excluded, compared as semantic versions after an optional leading
+`v`; a release that is not a semantic version is outside the range.
+
+Once the file is accepted and the stores are open, and before it listens,
+`parleyd` checks the gateway once, within 30 seconds in all, in this order,
+and does not start on the first failure (see [cli.md](cli.md) for the
+error line): it reads the gateway's health and release and refuses an
+unhealthy gateway or a release outside the range; it makes sure the
+`openshell_workspace` exists, creating it when it does not; it installs the
+provider profile `parley-hub` of the hub credential a sandbox reaches the hub
+with, its placeholder in `PARLEY_API_KEY`, for the scheme, host and port of
+`[server].external_url` (443 for `https` and 80 for `http` when the URL gives
+none) and any program; it reads, once each, the provider profiles the
+`[[sandbox.credentials]]` name, and refuses one the gateway does not know;
+it refuses a name in a profile's `expose_secrets` or
+`optional_expose_secrets` that is a variable declared by the provider
+profile of a credential the same profile attaches through `credentials` or
+`optional_credentials`; and it sends each profile's `policy` file to the
+gateway for validation and keeps the hosts the gateway reports it allows.
+The built-in policy is not sent. A gateway that cannot validate a policy
+file fails the start for a profile that names one: the OpenShell SDK the hub
+is built with has no call for it, so against an OpenShell gateway every
+profile stays on the built-in policy. A second start finds the workspace and
+replaces `parley-hub`, so nothing is created twice.
 
 A profile is the template of a sandbox. Its table may hold these keys and
 no other:

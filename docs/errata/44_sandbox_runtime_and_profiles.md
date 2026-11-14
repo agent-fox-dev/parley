@@ -174,3 +174,54 @@ connection, a real SDK client to a closed loopback port. The validation of
 a rejected policy is checked through `CreateSandbox`, and the missing path
 of `Stat` as an operation the SDK lacks. A stream's freedom from the
 30-second bound is checked with `ExecStream`, because `Logs` is unsupported.
+
+## How the hub runs the section's check and the start-up check
+
+The package has the section checked by its section validator and the hub
+compose a runtime factory and a start hook. Because the check runs over the
+loaded configuration (see the first entry), the hub gained an unexported
+configuration-check stage, `(*Composition).addConfigCheck`, which `Run`
+calls right after the load and before any store is opened; `composeSandbox`
+(`internal/hub/sandbox.go`) adds `(*sandbox.Service).Configure` to it, so an
+invalid section still ends the start with one line and nothing opened.
+
+The parts composed after the sandbox part, and tests, reach the feature
+through `(*hub.Composition).Sandbox() *sandbox.Service`: its `Settings`,
+`ExternalURL`, `Client` (nil until the check succeeded) and `Version`.
+`(*hub.Composition).SetSandboxRuntime(sandbox.RuntimeFactory)` replaces the
+factory, a `func(*sandbox.Settings, sandbox.RuntimeDeps) (runtime.Client,
+error)` given the hub's scrubber and recorder, whose default is
+`openshell.New`; `SetSandboxRecorder(sandbox.Recorder)` gives the recorder
+`parleyd` passes once the metrics registry exists. The start hook registers
+the gateway token and the OIDC client secret with the hub's scrubber
+whatever factory is used.
+
+`GET /version` was extended without the file `internal/server/version.go`
+the package names, which did not exist: the handler moved there, and the
+server gained `Options.VersionMembers func() map[string]any`, whose members
+are written after the build's and cannot replace them. The hub fills it from
+the members its parts add with the unexported `addVersionMember`.
+
+## Choices of the start-up check the package leaves open
+
+- A gateway that reports itself not healthy is refused like one that cannot
+  be reached, naming `sandbox.gateway_url`.
+- A result of kind unavailable at any step names `sandbox.gateway_url`, not
+  only at the first call. A refusal of another kind names the key the step
+  depends on: `sandbox.openshell_workspace` for the workspace,
+  `sandbox.gateway_url` with `server.external_url` for `parley-hub`.
+- The endpoint of `parley-hub` takes the port 443 for `https` and 80 for
+  `http` when `[server].external_url` gives none.
+- `connected` in `GET /version` is the release as the gateway reported it,
+  a leading `v` included; the range comparison drops that `v`. A
+  pre-release is below its release and build metadata is ignored, as
+  semantic versions are compared.
+- The deadline of the check is that of a context, which follows the real
+  clock, so the hub counts the 30 seconds on the real clock whatever clock
+  `hub.Options.Now` gives. The hub's own tests do not wait those 30 seconds:
+  the timeout is checked on `RunStartCheck` with a short budget, and the
+  hub's exit on a failed check with a gateway that refuses the hub.
+- The hub's test of `sandbox_runtime` uses the supported range of
+  `compat.go` and a release inside it, not an injected range: the hub takes
+  no range of its own. The range is injected (`CheckOptions.Releases`) in
+  the tests of the check.

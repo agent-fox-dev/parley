@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"os"
@@ -28,6 +29,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/config"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/maintenance"
+	"github.com/agent-fox-dev/parley/internal/sandbox"
 	"github.com/agent-fox-dev/parley/internal/scrub"
 	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/store"
@@ -54,6 +56,7 @@ var parts = []func(*Composition){
 	composeBootstrap,
 	composeIdentity,
 	composeAccess,
+	composeSandbox,
 }
 
 // Options are the inputs of Run. The process gives Args, Env, WorkDir,
@@ -132,6 +135,19 @@ type Composition struct {
 	runtime       *Runtime
 	shutdown      chan struct{}
 	errs          []error
+
+	// configChecks run on the loaded configuration, before any store is
+	// opened (addConfigCheck).
+	configChecks []func(*config.Config) error
+	// versionMembers add members to the document of GET /version
+	// (addVersionMember).
+	versionMembers []func() map[string]any
+
+	// sandbox is the sandbox feature composeSandbox creates, with the
+	// factory of its runtime client and the recorder of its metrics.
+	sandbox         *sandbox.Service
+	sandboxRuntime  sandbox.RuntimeFactory
+	sandboxRecorder sandbox.Recorder
 
 	// identity is the identity service composeIdentity creates. A part
 	// that runs after it and keeps data for a user or an org registers its
@@ -264,6 +280,31 @@ func (c *Composition) install(srv *server.Server) (err error) {
 		srv.AddAccessCheck(check)
 	}
 	return nil
+}
+
+// addConfigCheck adds a check of the loaded configuration, for a part whose
+// rules span more than one key or section and so cannot be a validator of
+// the registry. The checks run in the order they were added, right after
+// the load and before any store is opened; an error from one stops the
+// start like a configuration error.
+func (c *Composition) addConfigCheck(check func(*config.Config) error) {
+	c.configChecks = append(c.configChecks, check)
+}
+
+// addVersionMember adds members to the document of GET /version: members is
+// called on every request, and what it returns is added after the build's
+// members.
+func (c *Composition) addVersionMember(members func() map[string]any) {
+	c.versionMembers = append(c.versionMembers, members)
+}
+
+// versionDocument returns the members the parts add to GET /version.
+func (c *Composition) versionDocument() map[string]any {
+	out := map[string]any{}
+	for _, members := range c.versionMembers {
+		maps.Copy(out, members())
+	}
+	return out
 }
 
 // addRouteRule adds a rule every route of the composition must keep,
@@ -447,9 +488,10 @@ func (r *run) fail(err error) int {
 	return 1
 }
 
-// configure composes the hub and loads the configuration with the keys and
-// sections the composition registered, then sets the logger's level and
-// hands the scrubber the configured secrets.
+// configure composes the hub, loads the configuration with the keys and
+// sections the composition registered and runs the parts' configuration
+// checks on it, then sets the logger's level and hands the scrubber the
+// configured secrets.
 func (r *run) configure() (*Composition, *config.Config, error) {
 	c := newComposition()
 	for _, part := range parts {
@@ -464,6 +506,11 @@ func (r *run) configure() (*Composition, *config.Config, error) {
 	cfg, err := c.registry.Load(r.opts.Env, r.opts.WorkDir)
 	if err != nil {
 		return nil, nil, err
+	}
+	for _, check := range c.configChecks {
+		if err := check(cfg); err != nil {
+			return nil, nil, err
+		}
 	}
 	r.level.Set(parseLevel(cfg.Logging.Level))
 	for _, p := range cfg.OAuth.Providers {
@@ -544,6 +591,7 @@ func (r *run) start(ctx context.Context, c *Composition, cfg *config.Config, st 
 	}
 	opts.Now = now
 	opts.Logger = r.logger
+	opts.VersionMembers = c.versionDocument
 	opts.OnListen = func(bound net.Addr) {
 		r.logger.Info("listening", "addr", bound.String(), "config", cfg.Path, "data_dir", cfg.DataDir())
 	}

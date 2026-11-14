@@ -1,6 +1,8 @@
 // Package sandbox holds the hub's side of the sandbox feature: the [sandbox]
 // section of the configuration, which turns the feature on, and its
-// validation.
+// validation; the start-up check of the runtime and the supported release
+// range; and Service, the feature of one hub, which the parts composed after
+// it read.
 package sandbox
 
 import (

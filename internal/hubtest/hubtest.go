@@ -119,15 +119,48 @@ type Hub struct {
 	Store *store.Store
 }
 
+// Config is what StartWith starts a hub with besides its defaults.
+type Config struct {
+	// Server is TOML added inside the [server] table, after bind and port,
+	// such as an external_url line.
+	Server string
+	// TOML is added to config.toml after the [server] table, such as a
+	// [sandbox] section.
+	TOML string
+	// Files are written into the config dir, where config.toml is, before
+	// the hub is bootstrapped: name to content. A relative path in the
+	// configuration is taken from that directory.
+	Files map[string]string
+	// Compose is run on the hub's composition; nil for nothing.
+	Compose func(*hub.Composition)
+}
+
 // Start bootstraps a hub with an admin token in a fresh data directory,
 // then serves it on a free loopback port with compose run on its
 // composition (nil for none), until the test ends. The hub reads no process
 // environment, so tests that start one may run in parallel.
 func Start(t testing.TB, compose func(*hub.Composition)) *Hub {
 	t.Helper()
+	return StartWith(t, Config{Compose: compose})
+}
+
+// StartWith is Start with what cfg adds to config.toml and to the config
+// dir.
+func StartWith(t testing.TB, cfg Config) *Hub {
+	t.Helper()
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte("[server]\nbind = \"127.0.0.1\"\nport = 0\n"), 0o644); err != nil {
-		t.Fatal(err)
+	files := map[string]string{"config.toml": "[server]\nbind = \"127.0.0.1\"\nport = 0\n" + cfg.Server + "\n" + cfg.TOML}
+	for name, content := range cfg.Files {
+		files[name] = content
+	}
+	for name, content := range files {
+		path := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
 	env := config.MapEnv(map[string]string{"XDG_CONFIG_HOME": dir, "XDG_DATA_HOME": dir})
 	var out, errb LogBuffer
@@ -150,8 +183,8 @@ func Start(t testing.TB, compose func(*hub.Composition)) *Hub {
 			h.Store = rt.Store
 			return nil
 		})
-		if compose != nil {
-			compose(c)
+		if cfg.Compose != nil {
+			cfg.Compose(c)
 		}
 	}})
 	return h

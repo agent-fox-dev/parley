@@ -17,9 +17,9 @@ command-line client. Both are written in Go, in the module
 | `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, and a registry of keys and whole sections that decides what the file may hold |
 | `internal/hub` | the composition of the `parleyd` process: argument parsing, the scrubbing logger, the fixed start order, the bootstrap of the admin token, the HTTP server's options, the idempotency records in the transactional store, signals and the stop, and the `backup` command; the one place later packages plug their parts in ([ADR 01](adr/01-compose-the-hub-in-one-package.md)) |
 | `internal/maintenance` | the maintenance loop: a registry of named tasks, and `Loop`, which runs one pass at once and one at each tick of an hourly timer, the tasks of a pass one after the other in a fixed order, and logs a failing task without stopping the others |
-| `internal/hubtest` | test support, imported by test code only: `Start` bootstraps a hub with an admin token and serves it in-process on a free loopback port, `Serve` runs a hub with given options until the test ends, and `LogBuffer` holds a running hub's log for the test to read |
+| `internal/hubtest` | test support, imported by test code only: `Start` bootstraps a hub with an admin token and serves it in-process on a free loopback port, `StartWith` does the same with more in `config.toml` (`Config.Server` inside `[server]`, `Config.TOML` after it) and files in the config dir, `Serve` runs a hub with given options until the test ends, and `LogBuffer` holds a running hub's log for the test to read |
 | `internal/identity` | who may use the hub: the admin settings in the transactional store (the bootstrap e-mail and the admin token's hash), the generation and hashing of admin tokens, and `VerifyAdminToken`, which compares a presented token's hash with the stored one in constant time; the identity records (users, orgs, memberships, API keys, PATs), the generation of API keys and PATs, and `Service`, the pipeline's authenticator |
-| `internal/sandbox` | the hub's side of the sandbox feature: `Register` makes it the owner of the whole `[sandbox]` section of the configuration, and `FromConfig` checks that section after the load, with the config dir and `[server].external_url` in view, and returns its `Settings` with every default filled in, or one error listing every failure; the `Settings` give the profiles and the configured credentials by name (`Profile`, `DefaultProfile`, `Credential`) and in name order (`Profiles`, `Credentials`), as copies, so that they do not change after the load |
+| `internal/sandbox` | the hub's side of the sandbox feature: `Register` makes it the owner of the whole `[sandbox]` section of the configuration, and `FromConfig` checks that section after the load, with the config dir and `[server].external_url` in view, and returns its `Settings` with every default filled in, or one error listing every failure; the `Settings` give the profiles and the configured credentials by name (`Profile`, `DefaultProfile`, `Credential`) and in name order (`Profiles`, `Credentials`), as copies, so that they do not change after the load; `RunStartCheck` checks the runtime once at start (see [The start-up check](#the-start-up-check)), `ReleaseRange` and `SupportedReleases` hold and compare the supported OpenShell releases, `Service` is the feature of one hub (settings, runtime client, connected release), and `Recorder` is the metrics recorder of the sandbox packages |
 | `internal/sandbox/runtime` | the hub's one boundary to the sandbox runtime: the `Client` interface with every operation the sandbox packages call, the plain data it exchanges, the four error kinds (`ErrNotFound`, `ErrInvalid`, `ErrUnsupported`, `ErrUnavailable`), the reachability flag (`Reachability`) and the metrics recorder (`Recorder`, `NopRecorder`) it reports to; it imports nothing of the project |
 | `internal/sandbox/runtime/openshell` | the runtime client over the OpenShell Go SDK (`github.com/ai-openshell/sdk-go`, package `openshell/v1`), the only package that imports the SDK: `BuildConfig` turns the checked `[sandbox]` section into the SDK's configuration, `New` builds the client of a section and `NewWithClient` the client over a given SDK client, such as the SDK's in-memory one |
 | `internal/sandbox/runtime/openshell/openshelltest` | test support, imported by test code only: `Gateway`, which stands in for the OpenShell gateway: the SDK's in-memory client with provider profiles kept per workspace and a switch that makes it unreachable and reachable again |
@@ -449,6 +449,17 @@ appends it there ([ADR 01](adr/01-compose-the-hub-in-one-package.md)).
 | `AddBackgroundWork(name, grace, func(ctx, *hub.Runtime))` | work that runs while the hub serves, until its context is cancelled at the stop (see [The stop](#the-stop)) |
 | `AddRoute(server.Route)`, `Handle(pattern, handler)` | REST routes and surfaces outside the REST API |
 | `SetAuthenticator`, `SetBindingGuard`, `SetScopeCheck`, `AddAccessCheck` | the checks of the pipeline's positions |
+| `SetSandboxRuntime(sandbox.RuntimeFactory)`, `SetSandboxRecorder(sandbox.Recorder)` | the factory of the sandbox runtime client (default: the OpenShell implementation) and the recorder of the sandbox metrics (default: none) |
+
+`(*Composition).Sandbox()` returns the `*sandbox.Service` that
+`composeSandbox` (`internal/hub/sandbox.go`) creates: a part listed after it,
+or `Options.Compose`, keeps it and reads its settings and runtime client
+once the hub serves. Two unexported registrations serve the parts of the hub
+itself: `addConfigCheck(func(*config.Config) error)` adds a check run on the
+loaded configuration before any store is opened, for rules that span more
+than one key or section, and `addVersionMember(func() map[string]any)` adds
+members to the document of `GET /version` (the server's
+`Options.VersionMembers`), after the build's.
 
 The composition also keeps the identity service in its unexported field
 `identity`, which `composeIdentity` sets. A part listed after it that keeps
@@ -487,8 +498,9 @@ failure:
 1. compose: the hub's parts, then `Options.Compose`;
 2. load the configuration with the composition's registry (`config.toml`,
    see [configuration.md](configuration.md)), set the logger's level from
-   `[logging].level`, and register every OAuth provider's `client_secret`
-   with the scrubber;
+   `[logging].level`, run the configuration checks of `addConfigCheck`
+   (the `[sandbox]` section's, see [The start-up check](#the-start-up-check)),
+   and register every OAuth provider's `client_secret` with the scrubber;
 3. open the stores with the composition's schema steps (`store.Open`);
 4. the bootstrap (`internal/hub/bootstrap.go`), which may end the run with
    `0` after writing the admin token file, or refuse the start (see
@@ -1379,6 +1391,45 @@ every probe with the request's context, including those after one has failed,
 and answers `503` with `{"status":"not ready"}` if any failed. With no probe
 registered the hub is ready. A probe's error text never goes into the
 response.
+
+## The start-up check
+
+`composeSandbox` (`internal/hub/sandbox.go`) registers the `[sandbox]`
+section (`sandbox.Register`), checks it with `(*sandbox.Service).Configure`
+as a configuration check, right after the load, and adds the start hook
+`sandbox_runtime_check`. With sandboxes off the hook builds no client and
+contacts no runtime. With sandboxes on it registers the gateway token and the
+OIDC client secret with the hub's scrubber, builds the client with the
+runtime factory (`sandbox.RuntimeFactory`, given the settings, the scrubber
+and the recorder; the default is `openshell.New`) and calls
+`(*sandbox.Service).Start`, which runs `sandbox.RunStartCheck` and keeps the
+client and the release once it has succeeded. A failure is the hook's error
+and stops the start before the listener is bound.
+
+`RunStartCheck(ctx, settings, client, CheckOptions{ExternalURL, Now, Budget,
+Releases, Recorder})` makes, under one deadline `Budget` (30 seconds,
+`sandbox.StartCheckBudget`) after it began on the clock `Now`, these calls
+in order and stops at the first failure: `Release`, then the release against
+the range (`ReleaseRange.Contains`; `SupportedReleases` unless `Releases`
+replaces it); `EnsureWorkspace`; `InstallProviderProfile` of `parley-hub`
+(`sandbox.HubProviderProfile`) with the variable `PARLEY_API_KEY`, one
+endpoint of the scheme, host and port of `[server].external_url` with the
+paths `/api/v1/` and `/git/`, and no program; `GetProviderProfile` once per
+distinct `provider_profile` of the credentials; the exposed-secret names of
+each profile against the variables of the provider profiles of the
+credentials it attaches; `ValidatePolicy` with the base document of each
+profile that names a `policy` file. A result of kind unavailable, and the
+deadline passing, name `sandbox.gateway_url`; a missing provider profile
+names `sandbox.credentials[<name>].provider_profile`; a rejected policy, or
+a client without the validation (`ErrUnsupported`), names
+`sandbox.profiles[<name>].policy`. The error's text is scrubbed of the
+gateway token and the OIDC client secret. On success the check sets each
+validated profile's `PolicyHosts` to the hosts the runtime reported, sorted,
+sets `parley_sandbox_runtime_up` to `1` on the recorder and returns the
+release. `(*sandbox.Service).Version()` then gives `GET /version` its
+`sandbox_runtime` member, `supported` (`ReleaseRange.String()`,
+`>=0.1.0 <0.2.0`) and `connected`; it makes no call, so it does not change
+while the runtime is unreachable.
 
 ## The sandbox runtime client
 

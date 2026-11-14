@@ -267,6 +267,24 @@ start work that failed:
 {"time":"2026-11-13T13:11:38.609972+01:00","level":"ERROR","msg":"cannot start","error":"configuration file /srv/parley/config.toml: server.prot: unknown key"}
 ```
 
+With sandboxes on (a `[sandbox]` section, see
+[configuration.md](configuration.md#sandboxes)), the start checks the
+OpenShell gateway once, after the stores are open and before it listens, in
+the start hook `sandbox_runtime_check`. The check stops at its first
+failure, and the line names the key to look at: `sandbox.gateway_url` for a
+gateway that cannot be reached, refuses the hub's credential, is not
+healthy, runs a release outside the supported range or does not answer
+within 30 seconds; `sandbox.credentials[<name>].provider_profile` for a
+provider profile the gateway does not know; `sandbox.profiles[<name>].expose_secrets`
+or `optional_expose_secrets` for an exposed secret whose name is a variable
+of a credential the profile attaches; `sandbox.profiles[<name>].policy` for
+a policy file the gateway rejects or cannot validate. The gateway token and
+the OIDC client secret never appear in it:
+
+```json
+{"time":"2026-11-13T13:11:39.120534+01:00","level":"ERROR","msg":"cannot start","error":"start hook \"sandbox_runtime_check\": sandbox.gateway_url: the gateway runs OpenShell release \"0.3.1\", outside the supported range >=0.1.0 <0.2.0"}
+```
+
 When it cannot bind the address the line is `cannot listen`:
 
 ```json
