@@ -1372,6 +1372,77 @@ The answer is the workspace object after the update, the object
 | `409` `workspace_archived` | a valid update of a workspace in status `archived` (`workspace <slug> is archived`) |
 | `500` `internal` | a write failed, that of a fork moved with the workspace or of the update's event included; nothing is changed |
 
+## `POST /api/v1/workspaces/{slug}/sync`
+
+Brings the repository workspace `{slug}` up to date with its origin. It
+takes the admin token, an API key or a PAT, declares the scope
+`workspaces:write` for a PAT and needs write access to the workspace (see
+[Workspace access](#workspace-access)): its owner or the admin token. The
+route reads no body. One query parameter:
+
+| Parameter | Values |
+|---|---|
+| `reset_to_origin` | absent or `false`: a diverged branch is left as it is; `true`: every diverged branch, and only those, is moved to origin's head. Any other value, an empty one, another spelling (`TRUE`, `1`) or the parameter given twice, is `400` `invalid_request` |
+
+The sync resolves the workspace's origin credential from its secrets at
+that moment and fetches every branch and tag of origin with it, with a
+deadline of two minutes; the fetch sets the hub's origin heads
+(`refs/remotes/origin/*`) to origin's branches, all or none. It then
+creates every tag origin has and the hub lacks, at origin's value, and
+never moves or deletes a tag the hub has. Last, it compares every branch
+of origin, in byte order of the names, with the hub's head of it, and moves
+the branch by a compare-and-swap where the result says so. A branch only
+the hub has is neither looked at nor reported. Sync does not read
+`protected_branches` or `protect.owner_push`: a protected branch moves like
+any other.
+
+| Result | When | The hub's branch |
+|---|---|---|
+| `created` | the hub has no such branch | created at origin's head |
+| `up_to_date` | both heads are equal | unchanged |
+| `fast_forward` | the hub's head is an ancestor of origin's | moved to origin's head |
+| `ahead` | origin's head is an ancestor of the hub's | unchanged |
+| `diverged` | each side has commits the other lacks, without `reset_to_origin=true` | unchanged |
+| `reset` | the same, with `reset_to_origin=true` | moved to origin's head |
+
+The checks run in this order, the first that fails answering: a bound PAT
+on a workspace outside its binding (`404`, see
+[Workspace-bound tokens](#workspace-bound-tokens)); a PAT without
+`workspaces:write` (`403`), before the workspace is looked up; the access
+check (`404` for a caller who cannot read the workspace, the same bytes as
+for a slug no workspace has, `403` for a member of its org, in every
+status); `reset_to_origin`; a task fork; the workspace's state: a reclone,
+archive or delete running on it, then its status; and last its effective
+setting `sync_enabled` (see [Workspace settings](#workspace-settings)), so
+that an archived workspace with sync disabled is refused as archived.
+Origin is not fetched before every check has passed. The sync runs to its
+end when the caller disconnects.
+
+The answer is the workspace object, read after the sync, the object
+[`GET /api/v1/workspaces/{slug}`](#get-apiv1workspacesslug) answers, with
+`access` the caller's level, and the member `branches`: one entry per
+branch of origin, in byte order of the names, an empty list when origin
+has no branch. `local_sha` is the hub's head of the branch after the sync,
+`origin_sha` origin's head as the fetch found it.
+
+```json
+{"slug":"demo","kind":"repository","status":"ready","access":"owner","…":"…","branches":[{"name":"dev","result":"diverged","local_sha":"9fceb02d0ae598e95dc970b74767f19372d61af8","origin_sha":"e83c5163316f89bfbde7d9ab23ca2e25604af290"},{"name":"main","result":"fast_forward","local_sha":"a3f2b1c4d5e6f708192a3b4c5d6e7f8091a2b3c4","origin_sha":"a3f2b1c4d5e6f708192a3b4c5d6e7f8091a2b3c4"}]}
+```
+
+| Status | When |
+|---|---|
+| `200 OK` | the sync completed, diverged branches included; the body is the workspace object plus `branches` |
+| `400` `invalid_request` | `reset_to_origin` is neither `true` nor `false`, or given more than once (`reset_to_origin must be given once, as true or false`) |
+| `400` `fork_has_no_origin` | the workspace is a task fork (`workspace "<slug>" is a task fork, which has no origin to sync from`) |
+| `400` `sync_disabled` | the workspace's setting `sync_enabled` is `false` (`workspace "<slug>" has sync disabled; set sync_enabled to true to sync it`) |
+| `403` `insufficient_scope` | a PAT without `workspaces:write` (`this route needs the scope workspaces:write`) |
+| `403` `forbidden` | a member of the workspace's org who does not own it (`org members have read-only access to this workspace`) |
+| `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug (`workspace not found`); also a bound PAT on a workspace outside its binding |
+| `409` `workspace_busy` | the workspace is `pending` or `cloning` (`workspace "<slug>" is busy: its clone has not finished; try again later`), or a reclone, archive or delete runs on it, in any status (`workspace "<slug>" is busy: a reclone is running; try again later`) |
+| `409` `workspace_not_ready` | the workspace is `failed` (`workspace "<slug>" is not ready: its clone failed; reclone it`) |
+| `409` `workspace_archived` | the workspace is `archived` (`workspace "<slug>" is archived`) |
+| `500` `internal` | the sync could not complete: the workspace's secrets could not be read, origin could not be fetched, or a ref of the hub could not be read or written |
+
 ## `POST /api/v1/workspaces/{slug}/tokens`
 
 Mints a personal access token (PAT) owned by the caller's user and bound to

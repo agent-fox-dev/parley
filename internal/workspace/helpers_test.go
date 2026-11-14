@@ -243,6 +243,14 @@ func (w *world) patch(t *testing.T, cred, slug string, body any) answer {
 	return answer{status, b}
 }
 
+// postSync sends POST /workspaces/<slug>/sync?<query>, with no body, with
+// cred as the bearer credential.
+func (w *world) postSync(t *testing.T, cred, slug, query string) answer {
+	t.Helper()
+	status, b := w.Call(t, http.MethodPost, "/api/v1/workspaces/"+slug+"/sync?"+query, cred, nil)
+	return answer{status, b}
+}
+
 // list asks GET /workspaces?<query> with cred as the bearer credential.
 func (w *world) list(t *testing.T, cred, query string) answer {
 	t.Helper()

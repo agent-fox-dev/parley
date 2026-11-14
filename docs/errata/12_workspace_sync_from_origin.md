@@ -40,3 +40,21 @@ names them or git prunes them as unreachable.
 ref that must not exist, and also answers `gitrepo.ErrRefMoved`, changing
 nothing, when another writer holds the ref's lock, since that writer is
 moving it at that moment.
+
+## The sync route
+
+- There is no `internal/workspace/routes.go`: the workspace routes are the
+  list `(*workspace.Service).Routes()` in `internal/workspace/service.go`,
+  which `internal/hub/workspace.go` registers. The sync route is defined in
+  `internal/workspace/sync_handler.go` and added to that list, so the hub
+  needed no change of its own for it; the fetcher was already wired there.
+- The router's patterns name parameters with a colon: the route is
+  declared as `POST /workspaces/:slug/sync` under `/api/v1`, where the
+  package writes `/api/v1/workspaces/{slug}/sync`.
+- `reset_to_origin` given more than once is `400 invalid_request` too,
+  like the other boolean query parameters of the workspace routes, rather
+  than one of its values chosen.
+- The stub sync operation recording its reset argument is not used: the
+  route's tests send the three accepted queries against a workspace with a
+  diverged branch and read the reset from the branch's result (`diverged`,
+  `diverged`, `reset`).
