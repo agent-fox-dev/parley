@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"path/filepath"
 	"reflect"
@@ -145,6 +146,38 @@ func TestEvent_RecordsAnAuditedFetchThatSendsAPack(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// A fork has no settings of its own: it audits its fetches when its parent
+// does, as the workspace object of a fork shows the parent's settings.
+func TestEvent_AuditsAForkByItsParentsSetting(t *testing.T) {
+	t.Parallel()
+	sink := &recordingSink{}
+	w := newAuditWorld(t, sink, nil)
+	w.addFork(t)
+	// The fork's own stored document says the opposite of its parent's in
+	// each row, so that only the parent's can decide.
+	for _, row := range []struct {
+		parent bool
+		want   int
+	}{{true, 1}, {false, 0}} {
+		t.Run(fmt.Sprintf("parent audits %v", row.parent), func(t *testing.T) {
+			w.auditFetches(t, row.parent)
+			doc, _ := json.Marshal(map[string]bool{"audit_fetches": !row.parent})
+			w.set(t, "demo--t1", "settings", string(doc))
+			sink.clear()
+			if out, err := clientGit(t, t.TempDir(), nil, "clone", "--no-checkout", w.remote(w.memberKey, "acme/demo--t1.git"), "d"); err != nil {
+				t.Fatalf("git clone of the fork: %v\n%s", err, out)
+			}
+			events := sink.fetches()
+			if len(events) != row.want {
+				t.Fatalf("%d parley.git.fetch events, want %d: %+v", len(events), row.want, events)
+			}
+			if row.want == 1 && (events[0].Workspace == nil || *events[0].Workspace != "demo--t1" || events[0].ResourceID != "demo--t1") {
+				t.Errorf("event of workspace %v, resource %s; want the fork demo--t1", events[0].Workspace, events[0].ResourceID)
+			}
+		})
 	}
 }
 

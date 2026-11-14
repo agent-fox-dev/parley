@@ -91,12 +91,24 @@ func TestForkView_TheHubNamesTheTrackingRefsOfTheForksRecord(t *testing.T) {
 	t.Parallel()
 	w := newForkWorld(t, nil)
 	parent := gitrepotest.Refs(t, w.repo, "")
-	want := map[string]string{"refs/heads/work": w.work}
+	want := map[string]string{"refs/heads/work": w.work, "HEAD": parent["refs/heads/main"]}
 	for _, name := range []string{"refs/heads/main", "refs/heads/dev", "refs/tags/v1"} {
 		want[name] = parent[name]
 	}
 	if got := lsRemote(t, forkRemote(w)); !maps.Equal(got, want) {
 		t.Errorf("the fork lists %v, want %v", got, want)
+	}
+}
+
+// A fork's HEAD names its base branch, as a workspace's names its default
+// branch, so that a clone of the fork checks it out and a single-branch
+// (shallow) clone takes it.
+func TestForkView_AdvertisesHEADAtTheForksBaseBranch(t *testing.T) {
+	t.Parallel()
+	w := newForkWorld(t, nil)
+	out, err := clientGit(t, t.TempDir(), nil, "ls-remote", "--symref", forkRemote(w), "HEAD")
+	if err != nil || !strings.Contains(out, "ref: refs/heads/main\tHEAD") {
+		t.Errorf("git ls-remote --symref of the fork: %v\n%s\nwant HEAD as a symref to refs/heads/main", err, out)
 	}
 }
 

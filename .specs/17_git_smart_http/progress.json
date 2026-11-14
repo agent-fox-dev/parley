@@ -3,7 +3,7 @@
   "spec_id": "17",
   "spec_name": "git_smart_http",
   "schema_version": 3,
-  "updated_at": "2026-11-14T21:02:30Z",
+  "updated_at": "2026-11-14T21:08:06Z",
   "tasks": [
     {
       "id": 1,
@@ -43,7 +43,7 @@
     },
     {
       "id": 10,
-      "state": "pending"
+      "state": "done"
     }
   ]
 }

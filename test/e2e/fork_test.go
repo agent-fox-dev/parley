@@ -46,6 +46,13 @@ func startForkHub(t *testing.T, more ...string) *forkHub {
 // time.Now.
 func startForkHubAt(t *testing.T, now func() time.Time, more ...string) *forkHub {
 	t.Helper()
+	return startForkHubWith(t, now, nil, more...)
+}
+
+// startForkHubWith is startForkHubAt with compose, when not nil, run on the
+// hub's composition after the harness's own changes.
+func startForkHubWith(t *testing.T, now func() time.Time, compose func(*hub.Composition), more ...string) *forkHub {
+	t.Helper()
 	origin := newOrigin(t)
 	h := &forkHub{ticks: make(chan time.Time)}
 	h.workspaceHub = startWorkspaceHubAt(t, origin, "demo", now, func(c *hub.Composition) {
@@ -53,6 +60,9 @@ func startForkHubAt(t *testing.T, now func() time.Time, more ...string) *forkHub
 		c.AdjustForks(func(d *fork.Deps) {
 			d.SweepTicks = func() (<-chan time.Time, func()) { return h.ticks, func() {} }
 		})
+		if compose != nil {
+			compose(c)
+		}
 	})
 	acme := h.CreateOrg(t, "acme")
 	h.member = h.CreateUser(t, "member")

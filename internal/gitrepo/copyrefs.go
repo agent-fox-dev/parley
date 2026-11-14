@@ -22,6 +22,10 @@ type RefCopy struct {
 	// below it that the copy does not set is deleted. "" deletes nothing
 	// but the Names the source lacks.
 	Prune string
+	// Head, when not "", is the full name of the branch the destination's
+	// HEAD is to name, such as refs/heads/main; HEAD is left as it is when
+	// it names it already.
+	Head string
 }
 
 // Copied is what CopyRefs changed in the destination, each list sorted.
@@ -97,7 +101,25 @@ func (g Git) CopyRefs(ctx context.Context, src, dst string, c RefCopy) (Copied, 
 			return Copied{}, err
 		}
 	}
+	if err := into.pointHead(ctx, c.Head); err != nil {
+		return Copied{}, err
+	}
 	return done, nil
+}
+
+// pointHead makes the repository's HEAD name the branch head, a full ref
+// name, unless head is "" or HEAD names it already.
+func (r *Repo) pointHead(ctx context.Context, head string) error {
+	if head == "" {
+		return nil
+	}
+	if cur, err := r.git(ctx, "symbolic-ref", "--quiet", "HEAD"); err == nil && strings.TrimSpace(string(cur)) == head {
+		return nil
+	}
+	if _, err := r.git(ctx, "symbolic-ref", "HEAD", head); err != nil {
+		return fmt.Errorf("point HEAD of %s at %s: %w", r.dir, head, err)
+	}
+	return nil
 }
 
 // named maps each ref of the repository that is one of names or lies below

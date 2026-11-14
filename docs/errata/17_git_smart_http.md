@@ -229,3 +229,25 @@ answer. That function also refuses a hub URL with a query or a fragment
 (`checkHubURL`), with which no other command works either, so the helper
 answers nothing for such a URL too, where the package's list would answer
 when the scheme, host and port match.
+
+## A fork's `HEAD` is set by the git server
+
+A fork's repository is made by package 15 with `git init --bare` and no
+`HEAD` of its own, so it names git's default branch name, which the fork
+does not have, and a fork advertised no `HEAD`: a clone of a fork checked
+nothing out, and a single-branch clone (`--depth`) took no branch at all.
+The copy that brings a fork's refs up to date before git runs
+(`gitrepo.RefCopy.Head`, set in `internal/gitserver/forkview.go`) also
+points the fork's `HEAD` at `refs/heads/<default_branch>` of the fork's
+record, its base branch, when it names another ref, so that a fork is
+cloned as a workspace is, with its base branch checked out.
+
+## A fork is audited by its parent's `audit_fetches`
+
+A task fork has no settings of its own: its workspace object shows its
+parent's, read at the time of the request, and an update of a fork's
+`settings` is refused. The git server therefore reads `audit_fetches` of a
+fork from its parent's record (`internal/gitserver/event.go`
+`auditsFetches`); the event still names the fork. When the parent's record
+cannot be read the failure is logged and no event is written, since the
+fetch has been served.

@@ -677,7 +677,8 @@ protocol versions:
 - Every ref of the repository is advertised: branches, tags, notes and the
   hub-owned refs under `refs/parley/`, with `HEAD` as a symbolic ref to the
   default branch (`symref=HEAD:refs/heads/<branch>` under version 0, the
-  `symref-target` attribute of `ls-refs` under version 2). A version 2
+  `symref-target` attribute of `ls-refs` under version 2); a task fork's
+  `HEAD` names its base branch, the fork's `default_branch`. A version 2
   `ls-refs` with `ref-prefix` arguments lists only the refs that match one
   of them. A default `git clone` takes branches and tags only; a ref under
   `refs/parley/` is fetched by its name.
@@ -760,7 +761,8 @@ ended with one of the hub's `ERR` pkt-lines, a failed git or a timeout;
 the result the processor reports. The hub does not export the counter at
 `/metrics` yet.
 
-When the workspace's setting `audit_fetches` is `true`, each
+When the workspace's setting `audit_fetches` is `true` (for a task fork,
+its parent's: a fork has no settings of its own), each
 `POST …/git-upload-pack` that is served and sends a pack (a `packfile`
 section under version 2, pack data under version 0) writes one
 `parley.git.fetch` event, once the pack is sent and before the answer ends.

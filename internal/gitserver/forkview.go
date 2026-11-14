@@ -109,6 +109,12 @@ func (c *Component) copyForkRefs(r *http.Request, x *Exchange) error {
 		return fmt.Errorf("open the parent's repository: %w", err)
 	}
 	spec := gitrepo.RefCopy{Names: view.Tracking, Prune: changesNamespace}
+	// A fork's repository is made without a HEAD of its own; it names the
+	// fork's base branch, as a workspace's HEAD names its default branch,
+	// so that a clone checks it out and a single-branch clone takes it.
+	if b := x.Workspace.DefaultBranch; b != nil && *b != "" {
+		spec.Head = "refs/heads/" + *b
+	}
 	for _, n := range view.Changes {
 		spec.Prefixes = append(spec.Prefixes, changesNamespace+strconv.FormatInt(n, 10)+"/")
 	}
