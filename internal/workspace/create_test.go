@@ -505,3 +505,27 @@ func TestCreate_RecordsTheWorkspaceInTheOrgItNames(t *testing.T) {
 		}
 	}
 }
+
+func TestCreate_RollsBackEveryWriteWhenOneFails(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	for i, fault := range []string{faultInsert, faultSecret, faultEvent} {
+		w.fail(fault)
+		before := w.footprint(t)
+		slug := fmt.Sprintf("demo-%d", i)
+		body := valid(slug)
+		body["git_pat"] = "tok-123"
+		if a := w.create(t, w.uKey, body); a.status != http.StatusInternalServerError || a.errorType(t) != "internal" {
+			t.Errorf("a failed %s = %d %s, want 500 internal", fault, a.status, a.body)
+		}
+		before.originCalls++
+		if after := w.footprint(t); after != before {
+			t.Errorf("a failed %s: the hub went from %+v to %+v, want nothing recorded", fault, before, after)
+		}
+		w.fail("")
+		w.create(t, w.uKey, body).object(t)
+		if n := w.workspaceSecrets(t, slug); n != 1 {
+			t.Errorf("after a failed %s the create stored %d secrets, want 1", fault, n)
+		}
+	}
+}

@@ -237,11 +237,14 @@ func (s *Service) parseCreate(body map[string]json.RawMessage) (createRequest, e
 var errAdminCreate = server.Forbidden("a workspace needs a user as owner; the admin token cannot create one")
 
 // create serves POST /workspaces: it records a repository workspace in
-// status pending, which is its clone work, with its event in one
-// transaction, tells the clone workers once that transaction has committed,
-// and answers 201 with the workspace object. The checks run cheapest first:
-// the caller, the body, the organization, then the slug in use; a slug
-// taken by a request that raced this one is the same 409 as one taken
+// status pending, which is its clone work, with its origin credential as
+// workspace secrets and its event in one transaction, tells the clone
+// workers once that transaction has committed, and answers 201 with the
+// workspace object. The checks run cheapest first, so that every local
+// refusal comes before the call to origin: the caller, the body, the
+// organization, the slug in use, then, for a request with a credential,
+// whether secrets can be stored and whether origin takes the credential. A
+// slug taken by a request that raced this one is the same 409 as one taken
 // before.
 func (s *Service) create(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
@@ -271,6 +274,11 @@ func (s *Service) create(w http.ResponseWriter, r *http.Request) error {
 	case taken:
 		return slugTaken(req.Slug)
 	}
+	if cred, given := req.credential(); given {
+		if err := s.checkCredential(ctx, req.Slug, req.GitURL, cred); err != nil {
+			return err
+		}
+	}
 
 	now := s.deps.Now().UTC().Truncate(time.Second)
 	ws := Workspace{
@@ -287,7 +295,10 @@ func (s *Service) create(w http.ResponseWriter, r *http.Request) error {
 		ws.Description = *req.Description
 	}
 	err = s.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
-		if err := Insert(ctx, tx, ws); err != nil {
+		if err := s.deps.InsertWorkspace(ctx, tx, ws); err != nil {
+			return err
+		}
+		if err := s.storeCredential(ctx, tx, ws.Slug, req); err != nil {
 			return err
 		}
 		_, err := s.deps.Events.Emit(ctx, tx, createEventInput(p, ws))

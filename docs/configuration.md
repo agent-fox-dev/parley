@@ -320,6 +320,14 @@ as it is and keeps `remaining` above `0`.
 | `PARLEY_SECRETS_KEY` | the current secret key (see [Secret keys](#secret-keys)) |
 | `PARLEY_SECRETS_KEY_PREVIOUS` | the previous secret key, during a rotation (see [Secret keys](#secret-keys)) |
 | any variable a `${NAME}` reference names | its value replaces the reference |
+| `GIT_SSL_CAINFO`, `SSL_CERT_FILE`, `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY` | passed on to every `git` process the hub runs against an origin, for origins behind a private certificate authority or a proxy (see below) |
+
+`parleyd` runs `git` with a fixed minimal environment, away from the
+configuration and credential stores of the account that runs it: no other
+variable of `parleyd`'s environment reaches `git`, so an origin whose
+certificate a private authority signed needs `GIT_SSL_CAINFO` (or
+`SSL_CERT_FILE`) set for `parleyd`, and an origin reached through a proxy
+needs the proxy variables. They are read once, when `parleyd` starts.
 
 ### Fixed values
 

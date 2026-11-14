@@ -36,7 +36,9 @@ type Events interface {
 type Credential = gitrepo.Credential
 
 // OriginLister lists the refs of an origin with a credential. An error means
-// that origin refused the credential or could not be reached.
+// that origin refused the credential, could not be reached, or that ctx
+// ended first; its text may hold what git wrote, so it is scrubbed before it
+// is shown anywhere.
 type OriginLister interface {
 	ListOrigin(ctx context.Context, url string, cred Credential) error
 }
@@ -53,6 +55,10 @@ type Deps struct {
 	Events Events
 	// Lister lists an origin's refs with a credential.
 	Lister OriginLister
+	// InsertWorkspace writes a new workspace record in the create
+	// transaction; nil means Insert. A test makes it fail to see the whole
+	// create roll back.
+	InsertWorkspace func(ctx context.Context, tx *sql.Tx, w Workspace) error
 	// Notify tells the clone workers that the workspace slug has clone work;
 	// it is called after the transaction that recorded the work commits. Nil
 	// tells no one.
@@ -90,6 +96,9 @@ func (s *Service) Bind(d Deps) {
 	}
 	if d.Logger == nil {
 		d.Logger = slog.New(slog.DiscardHandler)
+	}
+	if d.InsertWorkspace == nil {
+		d.InsertWorkspace = Insert
 	}
 	s.deps = d
 }

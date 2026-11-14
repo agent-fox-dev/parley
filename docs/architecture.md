@@ -1692,12 +1692,19 @@ functions take the caller's transaction:
 `workspaces`, which builds the service's `workspace.Deps` (the stores, the
 secret and event components through the `Secrets` and `Events` interfaces,
 the hub's scrubber, logger and clock, `[server].external_url` as
-`ExternalURL` and `[workspace].path` as `Root`), applies every function
-`AdjustWorkspace` added, and binds the service with `Bind`. `Deps` also
-holds `Lister`, an `OriginLister` that lists an origin's refs with a
-`Credential` (the type `gitrepo.Credential`, so that a resolved credential
-goes to git unchanged), and `Notify`, called with the slug after a create
-commits so that clone work is picked up; the hub leaves both unset so far.
+`ExternalURL` and `[workspace].path` as `Root`, and `Lister`, an
+`OriginLister` that lists an origin's refs with a `Credential`, the type
+`gitrepo.Credential`, so that a resolved credential goes to git unchanged),
+applies every function `AdjustWorkspace` added, and binds the service with
+`Bind`. The part's one `gitrepo.Git` passes on to git the variables
+`GIT_SSL_CAINFO`, `SSL_CERT_FILE`, `HTTPS_PROXY`, `HTTP_PROXY` and
+`NO_PROXY` of the hub's environment, read when the hub is composed, and no
+other (see [configuration.md](configuration.md#environment-variables)); the
+production `Lister` runs its `ListRemote`. `Deps` also holds
+`InsertWorkspace`, which writes the record in the create transaction (nil
+is `workspace.Insert`; a test makes it fail), and `Notify`, called with the
+slug after a create commits so that clone work is picked up; the hub
+leaves `Notify` unset so far.
 
 `internal/workspace/credential.go` holds `ResolveOriginCredential(ctx,
 secrets, slug)`, which every operation that contacts a workspace's origin
@@ -1723,10 +1730,18 @@ answers pass through unchanged), takes the org `org_id` names
 (`identity.OrgBySelector`; unknown is `400`) or else the caller's personal
 org (`identity.PersonalOrg`) and checks the caller is an active member of
 it (`403` otherwise), answers a slug in use `409 conflict` after a read with
-`access.RecordBySlug`, and then, in one store transaction, inserts the
-record with `workspace.Insert` (status `pending`, a fresh instance id,
-`created_at` = `updated_at` cut to the second) and writes
-`parley.workspace.create` through the event component. A slug taken by a
+`access.RecordBySlug`. Only a request with a credential then asks the
+secret component's `Available()` (false: `secret.UnavailableError`, `503`,
+before origin is contacted) and lists origin's refs with the credential
+through `Lister` under a 10-second deadline (an error: `400
+credential_check_failed` with a fixed message, git's text logged only
+through the scrubber as `workspace credential check refused`). Then, in one
+store transaction, it inserts the record through `InsertWorkspace` (status
+`pending`, a fresh instance id, `created_at` = `updated_at` cut to the
+second), stores the credential with the secret component's `Put` as the
+workspace secrets `GIT_PAT`, or `GIT_USERNAME` and `GIT_PASSWORD`, and
+writes `parley.workspace.create` through the event component; an error of
+any of the three rolls all of them back (`500 internal`). A slug taken by a
 racing request is `access.ErrDuplicateSlug` from the insert and the same
 `409`. The pending record is the clone work; there is no separate queue.
 

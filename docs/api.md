@@ -1088,8 +1088,13 @@ a member that the table allows to be `null` counts as absent when it is:
 | `git_username`, `git_password` | no | strings, not empty, given together or not at all |
 
 No credential member may be given with a `git_url` of the form
-`git@<host>:<path>`. The credential members are checked for their form;
-they are not yet checked against origin or stored.
+`git@<host>:<path>`. A credential is checked against origin before anything
+is stored: the hub lists the refs of `git_url` with it, a token presented
+with the user name `x-token-auth`, and gives that listing 10 seconds. A
+request without a credential does not contact origin. The credential is
+stored as workspace secrets of the new slug, `GIT_PAT` for `git_pat`, or
+`GIT_USERNAME` and `GIT_PASSWORD`, in the same transaction as the workspace,
+and appears in no answer, event or log line.
 
 ```json
 {"slug":"demo","git_url":"https://example.com/a.git"}
@@ -1103,15 +1108,19 @@ member by member in the order of the table, the first member refused named
 in the message (`400`); the organization, the one `org_id` names or the
 caller's personal org, which must exist (`400`) and of which the caller must
 be an active member (`403`); a slug that a workspace already has, in any
-status (`409`). Nothing contacts origin before all of these pass.
+status (`409`); then, for a request with a credential, a hub without a
+secret encryption key (`503`), before origin is contacted; and the check of
+the credential against origin (`400`). Nothing contacts origin before all
+the others pass.
 
 The workspace is recorded with `kind` `repository`, the `workspace_mode`,
 `upstream_url` and `integration_branch` given, `status` `pending`, the
 caller as `owner_id`, the chosen org as `org_id`, `created_at` equal to
 `updated_at`, and a settings document holding the keys `settings` set. A workspace in `pending` is its own clone work.
-The workspace and a `parley.workspace.create` event are written in one
-store transaction: a failure of either, or of the commit, leaves neither
-and is answered `500` `internal` without its cause. When two requests race
+The workspace, its credential secrets and a `parley.workspace.create`
+event are written in one store transaction: a failure of any of them, or of
+the commit, leaves none of them and is answered `500` `internal` without
+its cause. When two requests race
 for one slug, one is answered `201` and the other `409`.
 
 The answer is the workspace object: every field of the workspace, a field
@@ -1135,9 +1144,11 @@ registered).
 | `403` `token_bound` | a PAT bound to a workspace |
 | `403` `insufficient_scope` | a PAT without `workspaces:write` (`this route needs the scope workspaces:write`) |
 | `403` `forbidden` | the admin token (`a workspace needs a user as owner; the admin token cannot create one`), or a caller who is not an active member of the org `org_id` names, or of their personal org (`the caller is not an active member of the organization`) |
+| `400` `credential_check_failed` | origin refused the credential, could not be reached, or did not answer within 10 seconds (`the credential was refused or origin could not be reached`, whatever the cause; git's own message is logged, scrubbed of the credential, as `workspace credential check refused`) |
 | `409` `conflict` | a workspace has the slug, whatever its status (`slug: a workspace with the slug "demo" exists`) |
 | `413` `payload_too_large` | the body is over the hub's body limit (see [Request bodies](#request-bodies)) |
-| `500` `internal` | writing the workspace or its event failed; nothing is recorded |
+| `500` `internal` | writing the workspace, its credential secrets or its event failed; nothing is recorded |
+| `503` `secrets_unavailable` | the request carries a credential and the hub has no secret encryption key configured (`secrets cannot be stored: no encryption key configured`); origin is not contacted |
 
 The event has `workspace` and `resource_id` the slug, `resource_type`
 `workspace`, `actor_type` `api_key` or `pat` after the calling credential,

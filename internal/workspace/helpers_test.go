@@ -4,12 +4,14 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/event"
+	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/identity"
@@ -38,11 +40,26 @@ type world struct {
 	uOrg, vOrg identity.Org
 
 	// mu guards now, the hub's time, which a test may advance while the hub
-	// reads it, and notified.
+	// reads it, notified, fault and availableCalls.
 	mu       sync.Mutex
 	now      time.Time
 	notified []string
+	// fault names the write of a create that fails, "" for none: one of
+	// faultInsert, faultSecret and faultEvent.
+	fault string
+	// availableCalls counts the asks whether secrets can be stored.
+	availableCalls int
+	// gitOrigin keeps the hub's own origin lister, which runs git, in place
+	// of the fake origin.
+	gitOrigin bool
 }
+
+// The writes of a create a test can make fail.
+const (
+	faultInsert = "workspace insert"
+	faultSecret = "secret write"
+	faultEvent  = "event write"
+)
 
 // option changes how newWorld starts the hub.
 type option func(*hubtest.Config, *world)
@@ -50,6 +67,21 @@ type option func(*hubtest.Config, *world)
 // withExternalURL sets [server].external_url.
 func withExternalURL(url string) option {
 	return func(c *hubtest.Config, _ *world) { c.Server += "external_url = \"" + url + "\"\n" }
+}
+
+// withoutSecretKey starts the hub with no secret key, so that no secret can
+// be stored.
+func withoutSecretKey() option {
+	return func(c *hubtest.Config, _ *world) { delete(c.Env, secret.EnvCurrentKey) }
+}
+
+// withGitOrigin keeps the hub's own origin lister and gives the hub the
+// environment that makes its git trust the test origin o.
+func withGitOrigin(o *gitrepotest.Origin) option {
+	return func(c *hubtest.Config, w *world) {
+		w.gitOrigin = true
+		c.Env["GIT_SSL_CAINFO"] = o.CAFile()
+	}
 }
 
 // withCompose runs fn on the hub's composition, after the world's own.
@@ -71,8 +103,18 @@ func newWorld(t *testing.T, opts ...option) *world {
 		Compose: func(c *hub.Composition) {
 			w.svc, w.secrets, w.events = c.Workspaces(), c.Secrets(), c.Events()
 			c.AdjustWorkspace(func(d *workspace.Deps) {
-				d.Lister = w.origin
+				if !w.gitOrigin {
+					d.Lister = w.origin
+				}
 				d.Notify = w.notify
+				d.InsertWorkspace = func(ctx context.Context, tx *sql.Tx, ws workspace.Workspace) error {
+					if err := w.faulted(faultInsert); err != nil {
+						return err
+					}
+					return workspace.Insert(ctx, tx, ws)
+				}
+				d.Secrets = faultySecrets{d.Secrets, w}
+				d.Events = faultyEvents{d.Events, w}
 			})
 		},
 	}
@@ -83,6 +125,7 @@ func newWorld(t *testing.T, opts ...option) *world {
 	w.u, w.v = w.CreateUser(t, "ursula"), w.CreateUser(t, "victor")
 	w.uKey, w.vKey = w.IssueKey(t, w.u), w.IssueKey(t, w.v)
 	w.uOrg, w.vOrg = w.personalOrg(t, w.u), w.personalOrg(t, w.v)
+	w.origin.stored = w.stored
 	return w
 }
 
@@ -197,6 +240,77 @@ func (w *world) workspaces(t *testing.T) int {
 	return n
 }
 
+// stored is the number of workspace records and of secrets the store holds,
+// -1 for a count that cannot be read; it may run outside the test's
+// goroutine.
+func (w *world) stored() (workspaces, secrets int) {
+	workspaces, secrets = -1, -1
+	_ = w.Store.Main().QueryRow(`SELECT count(*) FROM workspaces`).Scan(&workspaces)
+	_ = w.Store.Main().QueryRow(`SELECT count(*) FROM secrets`).Scan(&secrets)
+	return workspaces, secrets
+}
+
+// fail makes the write named fault of every create fail until it is called
+// with "".
+func (w *world) fail(fault string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.fault = fault
+}
+
+// faulted is the error of the write named fault, nil when it does not fail.
+func (w *world) faulted(fault string) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.fault == fault {
+		return errors.New("the " + fault + " failed")
+	}
+	return nil
+}
+
+// availableAsked is how often the service asked whether secrets can be
+// stored.
+func (w *world) availableAsked() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.availableCalls
+}
+
+// faultySecrets is the hub's secret component, counting the asks whether
+// secrets can be stored and failing its writes while the world says so.
+type faultySecrets struct {
+	workspace.Secrets
+	w *world
+}
+
+func (s faultySecrets) Available() bool {
+	s.w.mu.Lock()
+	s.w.availableCalls++
+	s.w.mu.Unlock()
+	return s.Secrets.Available()
+}
+
+func (s faultySecrets) Put(ctx context.Context, tx *sql.Tx, scope secret.Scope, scopeID, name, value string) error {
+	if err := s.w.faulted(faultSecret); err != nil {
+		return err
+	}
+	return s.Secrets.Put(ctx, tx, scope, scopeID, name, value)
+}
+
+// faultyEvents is the hub's event component, failing its writes while the
+// world says so.
+type faultyEvents struct {
+	workspace.Events
+	w *world
+}
+
+func (e faultyEvents) Emit(ctx context.Context, tx *sql.Tx, in event.Input) (event.Record, error) {
+	if err := e.w.faulted(faultEvent); err != nil {
+		return event.Record{}, err
+	}
+	return e.Events.Emit(ctx, tx, in)
+}
+
 // footprint is what a refused create leaves as it found it: the workspace
 // records, the secrets of every scope, the create events and the calls to
 // origin.
@@ -261,22 +375,50 @@ func (w *world) createEvents(t *testing.T) []event.Record {
 // fakeOrigin is the origin lister of the tests: it records each call and
 // answers err.
 type fakeOrigin struct {
+	// stored counts what the store holds at a call; nil counts nothing.
+	stored func() (workspaces, secrets int)
+
 	mu    sync.Mutex
 	calls []originCall
 	err   error
 }
 
-// originCall is one call of the fake origin.
+// originCall is one call of the fake origin: the URL and the credential it
+// was given, the time its context had left, 0 without a deadline, and the
+// workspaces and secrets the store held when it was called.
 type originCall struct {
-	url  string
-	cred workspace.Credential
+	url                 string
+	cred                workspace.Credential
+	left                time.Duration
+	workspaces, secrets int
 }
 
-func (o *fakeOrigin) ListOrigin(_ context.Context, url string, cred workspace.Credential) error {
+func (o *fakeOrigin) ListOrigin(ctx context.Context, url string, cred workspace.Credential) error {
+	call := originCall{url: url, cred: cred}
+	if deadline, ok := ctx.Deadline(); ok {
+		call.left = time.Until(deadline)
+	}
+	if o.stored != nil {
+		call.workspaces, call.secrets = o.stored()
+	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.calls = append(o.calls, originCall{url, cred})
+	o.calls = append(o.calls, call)
 	return o.err
+}
+
+// answer makes every later call answer err.
+func (o *fakeOrigin) answer(err error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.err = err
+}
+
+// recorded are the calls the fake origin had.
+func (o *fakeOrigin) recorded() []originCall {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]originCall(nil), o.calls...)
 }
 
 // called is the number of calls the fake origin had.
