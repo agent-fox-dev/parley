@@ -40,7 +40,8 @@ type deleteEventMeta struct {
 }
 
 // serveDelete deletes the route's archived repository workspace with its
-// forks and everything they own, and answers 204 with no body. Once every
+// forks and everything they own, and answers 204 with no body; a task fork
+// it hands to the fork remover. Once every
 // check has passed the work runs on a context the request's end does not
 // cancel, and with the workspace's maintenance marker held.
 func (s *Service) serveDelete(w http.ResponseWriter, r *http.Request) error {
@@ -53,9 +54,7 @@ func (s *Service) serveDelete(w http.ResponseWriter, r *http.Request) error {
 		return server.NotFound(ErrNotFound.Error())
 	}
 	if rec.Kind == access.KindFork {
-		// A task fork is removed only by the task-fork feature, which has
-		// its own rules; none is there to remove this one.
-		return server.Internal(fmt.Sprintf("workspace %q is a task fork, and no fork remover deletes it", slug))
+		return s.deleteFork(w, r, slug)
 	}
 	if err := deleteRefusal(rec, false); err != nil {
 		return err
@@ -70,6 +69,27 @@ func (s *Service) serveDelete(w http.ResponseWriter, r *http.Request) error {
 		return s.deleteWorkspace(ctx, slug, p, actorType, actorID)
 	})
 	if err != nil {
+		return err
+	}
+	w.WriteHeader(http.StatusNoContent)
+	return nil
+}
+
+// deleteFork hands the delete of the task fork slug, asked by the route's
+// caller, to the fork remover, the one place forks are removed, since a
+// fork's delete has rules of its own, and answers 204 with no body when it
+// has removed the fork. Its API error is the answer otherwise, unchanged.
+// With no fork remover registered nothing can remove the fork: the answer
+// is 500 and nothing changes. As for a repository workspace, the delete
+// runs on a context the request's end does not cancel.
+func (s *Service) deleteFork(w http.ResponseWriter, r *http.Request, slug string) error {
+	forks := s.teardown.snapshot().forks
+	if forks == nil {
+		return server.Internal(fmt.Sprintf("workspace %q is a task fork, and no fork remover deletes it", slug))
+	}
+	ctx := context.WithoutCancel(r.Context())
+	p, _ := identity.PrincipalOf(ctx)
+	if err := forks.DeleteFork(ctx, slug, p); err != nil {
 		return err
 	}
 	w.WriteHeader(http.StatusNoContent)

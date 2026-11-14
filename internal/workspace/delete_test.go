@@ -21,6 +21,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/identity"
+	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
@@ -47,13 +48,15 @@ var owners = []string{"changes", "secrets", "sessions", "tokens"}
 // the slug; the call whose line is fail fails after that. As a token
 // revoker it returns tokens[slug]. As a fork remover it deletes the forks'
 // records through the transaction when dropForks is set and returns forks,
-// with a discard function that records its call.
+// with a discard function that records its call; asked to delete one fork,
+// it removes nothing and answers forkErr.
 type deleteStub struct {
 	w         *world
 	log       teardownLog
 	tokens    map[string][]string
 	forks     []string
 	dropForks bool
+	forkErr   error
 
 	mu      sync.Mutex
 	fail    string
@@ -133,8 +136,11 @@ func (s *deleteStub) RemoveSandboxes(ctx context.Context, slugs []string) error 
 	return s.call(ctx, nil, "", "", fmt.Sprintf("sandboxes %v", slugs))
 }
 
-func (s *deleteStub) DeleteFork(context.Context, string, identity.Principal) error {
-	return errors.New("the delete of a repository workspace asked to delete one fork")
+func (s *deleteStub) DeleteFork(ctx context.Context, slug string, caller identity.Principal) error {
+	if err := s.call(ctx, nil, "", "", "delete fork "+slug+" by "+principalName(caller)); err != nil {
+		return err
+	}
+	return s.forkErr
 }
 
 func (s *deleteStub) RemoveForksOf(ctx context.Context, tx *sql.Tx, parent string, actor identity.Principal) ([]string, func(), error) {
@@ -145,6 +151,15 @@ func (s *deleteStub) RemoveForksOf(ctx context.Context, tx *sql.Tx, parent strin
 	}
 	discard := func() { s.log.add("discard committed=%t", s.committed()) }
 	return slices.Clone(s.forks), discard, s.call(ctx, tx, "", "", "forks of "+parent+" by "+principalName(actor))
+}
+
+// withCaller is lines with caller, the name principalName gives, for "%s".
+func withCaller(lines []string, caller string) []string {
+	out := make([]string, len(lines))
+	for i, line := range lines {
+		out[i] = strings.ReplaceAll(line, "%s", caller)
+	}
+	return out
 }
 
 // principalName is how a fork remover's stub records the caller.
@@ -311,12 +326,7 @@ func TestDelete_RemovesTheWorkspaceItsForksAndWhatTheyOwn(t *testing.T) {
 			if exists(w.svc.RepoPath("demo")) {
 				t.Error("the copy of demo is still on disk after the delete")
 			}
-			want := slices.Clone(c.want)
-			for i, line := range want {
-				if strings.Contains(line, "%s") {
-					want[i] = fmt.Sprintf(line, caller)
-				}
-			}
+			want := withCaller(c.want, caller)
 			if got := stub.log.recorded(); !slices.Equal(got, want) {
 				t.Errorf("the delete's calls:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
 			}
@@ -375,6 +385,58 @@ func TestDelete_RefusesWithoutTouchingTheWorkspace(t *testing.T) {
 	}
 }
 
+func TestDelete_HandsAForkToTheForkRemover(t *testing.T) {
+	t.Parallel()
+	busy := server.NewError("workspace_busy", http.StatusConflict, `workspace "demo--a" is busy; try again later`)
+	for _, c := range []struct {
+		name    string
+		remover bool
+		forkErr error
+		// want is the answer, message its error's message; calls are the
+		// collaborators' calls, with the caller's name for "%s".
+		want, message string
+		calls         []string
+	}{
+		{name: "the fork remover deletes it", remover: true, want: "204", calls: []string{"delete fork demo--a by %s"}},
+		{name: "the fork remover refuses", remover: true, forkErr: busy, want: "409 workspace_busy", message: busy.Message(),
+			calls: []string{"delete fork demo--a by %s"}},
+		{name: "no fork remover is registered", want: "500 internal"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			stub := &deleteStub{forkErr: c.forkErr}
+			w := deleteWorld(t, stub, []string{"demo--a"}, registerAll(stub, c.remover))
+			parent, _ := w.workspace(t, "demo")
+
+			a := w.deleteWorkspace(t, w.uKey, "demo--a")
+
+			if got := a.outcome(t); got != c.want || (a.status == http.StatusNoContent && len(a.body) != 0) {
+				t.Errorf("delete of the fork = %d %q, want %s", a.status, a.body, c.want)
+			}
+			if c.message != "" {
+				if _, message := a.refusal(t); message != c.message {
+					t.Errorf("delete of the fork answers the message %q, want the fork remover's %q", message, c.message)
+				}
+			}
+			if got, want := stub.log.recorded(), withCaller(c.calls, identity.TypeAPIKey+" "+w.u); !slices.Equal(got, want) {
+				t.Errorf("the delete's calls %v, want %v", got, want)
+			}
+			if after, _ := w.workspace(t, "demo"); !reflect.DeepEqual(after, parent) {
+				t.Errorf("the delete of the fork changed its parent from %+v to %+v", parent, after)
+			}
+			if _, found := w.workspace(t, "demo--a"); !found {
+				t.Error("the fork's record is gone, which only the fork remover removes")
+			}
+			if got, want := w.ownedRows(t), rowsOf("demo", "demo--a"); !slices.Equal(got, want) {
+				t.Errorf("owned rows %v, want all of them: %v", got, want)
+			}
+			if evs := w.eventsOf(t, deleteEvent); len(evs) != 0 {
+				t.Errorf("%d delete events stored, want none", len(evs))
+			}
+		})
+	}
+}
+
 func TestDelete_AFailingStepChangesNothing(t *testing.T) {
 	t.Parallel()
 	for _, c := range []struct {
@@ -400,7 +462,7 @@ func TestDelete_AFailingStepChangesNothing(t *testing.T) {
 			t.Parallel()
 			stub := &deleteStub{forks: []string{"demo--a", "demo--b"}, dropForks: true}
 			w := deleteWorld(t, stub, []string{"demo--a", "demo--b"}, registerAll(stub, c.forks))
-			stub.failing(strings.ReplaceAll(c.fail, "%s", identity.TypeAPIKey+" "+w.u))
+			stub.failing(withCaller([]string{c.fail}, identity.TypeAPIKey+" "+w.u)[0])
 			if c.trigger != "" {
 				if _, err := w.Store.Main().Exec(c.trigger); err != nil {
 					t.Fatal(err)

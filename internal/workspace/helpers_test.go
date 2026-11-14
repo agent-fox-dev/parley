@@ -276,9 +276,15 @@ func (w *world) postSyncAndLeave(t *testing.T, cred, slug string, started <-chan
 // postAndLeave sends POST path, with no body, as postSyncAndLeave does.
 func (w *world) postAndLeave(t *testing.T, cred, path string, started <-chan struct{}) {
 	t.Helper()
+	w.sendAndLeave(t, http.MethodPost, cred, path, started)
+}
+
+// sendAndLeave sends method path, with no body, as postSyncAndLeave does.
+func (w *world) sendAndLeave(t *testing.T, method, cred, path string, started <-chan struct{}) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.URL(path), nil)
+	req, err := http.NewRequestWithContext(ctx, method, w.URL(path), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -294,7 +300,7 @@ func (w *world) postAndLeave(t *testing.T, cred, path string, started <-chan str
 	select {
 	case <-started:
 	case <-time.After(10 * time.Second):
-		t.Fatal("the sync did not reach the point to disconnect at within 10 s")
+		t.Fatal("the request did not reach the point to disconnect at within 10 s")
 	}
 	cancel()
 	if err := <-sent; !errors.Is(err, context.Canceled) {

@@ -1856,6 +1856,13 @@ needs write access to the workspace (see
 route reads no body; one that passes the content-type and size rules is
 ignored.
 
+For a task fork, once the scope and access checks have passed, the delete
+is handed to the task-fork feature, which removes forks by its own rules:
+its answer is the route's, `204` with an empty body when it removed the
+fork and its error, unchanged, otherwise. None of what follows applies to a
+fork. While the hub has no task-fork feature, a fork is answered `500`
+`internal` and nothing is removed.
+
 A repository workspace in status `archived` is deleted; the checks run in
 the order of the table below, and a refused delete changes nothing. Once
 they have passed, the delete runs to its end even when the caller
@@ -1903,7 +1910,7 @@ readers of its parent's events, as the fork's other events are.
 | `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug (`workspace not found`); also a bound PAT on a workspace outside its binding |
 | `409` `workspace_busy` | a reclone, archive or delete runs on the workspace (`workspace "<slug>" is busy: a reclone is running; try again later`) |
 | `409` `workspace_not_archived` | the workspace is in any status other than `archived`, `pending` and `cloning` included (`workspace "<slug>" is ready, not archived`) |
-| `500` `internal` | the workspace is a task fork, which only the task-fork feature deletes and which no part of the hub deletes yet (`workspace "<slug>" is a task fork, and no fork remover deletes it`); or the sandboxes could not be deleted, or a step of the removal failed: the workspace is still `archived` and nothing has changed |
+| `500` `internal` | the workspace is a task fork and no part of the hub deletes task forks (`workspace "<slug>" is a task fork, and no fork remover deletes it`): the fork is unchanged; or the sandboxes could not be deleted, or a step of the removal failed: the workspace is still `archived` and nothing has changed |
 
 ## `POST /api/v1/workspaces/{slug}/tokens`
 

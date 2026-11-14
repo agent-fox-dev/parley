@@ -2417,9 +2417,14 @@ and every other package's data stay.
 
 `internal/workspace/delete.go` holds `DELETE /workspaces/:slug` (scope
 `workspaces:write`, `access.MarkNeed` `write`, as for the archive; the body
-is not read). The handler reads the record. A task fork is answered `500
-internal` without anything removed: only the fork remover of the teardown
-set deletes a fork. A repository workspace is refused (`deleteRefusal`), in
+is not read). The handler reads the record. A task fork goes to
+`deleteFork`: it hands the slug and the caller to `DeleteFork` of the
+teardown set's fork remover, the one place forks are removed, on a context
+the request's end does not cancel, and answers `204` with no body when it
+returns nil and its error otherwise (a `*server.Error` unchanged, any other
+error `500 internal`); it sets no marker and runs none of the removal below.
+With no fork remover registered a fork is answered `500 internal` and
+nothing is removed. A repository workspace is refused (`deleteRefusal`), in
 this order, with a set marker (`409 workspace_busy`, `RequireReady`'s
 message) and with every status other than `archived` (`409
 workspace_not_archived`). Then it moves off the request's cancellation and,
