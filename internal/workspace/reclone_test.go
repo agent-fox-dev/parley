@@ -9,7 +9,9 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/event"
@@ -306,4 +308,75 @@ func TestReclone_ACopyLeftByAStoppedHubIsClonedFresh(t *testing.T) {
 		t.Errorf("refs/heads/local-only is %s in the copy, want it absent", id)
 	}
 	sameRefs(t, s.copy, s.origin)
+}
+
+func TestReclone_WaitsOutASyncOrPushAlreadyRunning(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		name, path, event string
+		// hold makes the work stop, once it has passed the state guard, at
+		// a point where it still has records to write, until release is
+		// closed; held is closed when it has stopped there.
+		hold func(s *syncWorld, held, release chan struct{})
+	}{
+		{"a sync", "/sync", syncEvent, func(s *syncWorld, held, release chan struct{}) {
+			s.origin.Commit("main", "ahead on origin")
+			s.swaps.set("main", func(call int) {
+				if call == 1 {
+					close(held)
+					<-release
+				}
+			})
+		}},
+		{"a push", "/branches/main/push", pushEvent, func(s *syncWorld, held, release chan struct{}) {
+			s.pushes.answerWith(func(context.Context) (gitrepo.PushResult, error) {
+				close(held)
+				<-release
+				return gitrepo.PushUpToDate, nil
+			})
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			s := newSyncWorld(t)
+			held, release := make(chan struct{}), make(chan struct{})
+			free := sync.OnceFunc(func() { close(release) })
+			defer free()
+			c.hold(s, held, release)
+
+			work := s.send(http.MethodPost, s.uKey, "/api/v1/workspaces/"+syncSlug+c.path)
+			<-held
+			reclone := s.send(http.MethodPost, s.uKey, "/api/v1/workspaces/"+syncSlug+"/reclone")
+			eventually(t, "the reclone sets its marker", func() bool {
+				rec, _ := s.workspace(t, syncSlug)
+				return rec.Marker == workspace.MarkerReclone
+			})
+			select {
+			case status := <-reclone:
+				t.Fatalf("the reclone answered %d while %s was still running, want it to wait", status, c.name)
+			case <-time.After(time.Second):
+			}
+			if rec, _ := s.workspace(t, syncSlug); rec.Status != workspace.StatusReady || len(s.eventsOf(t, recloneEvent)) != 0 {
+				t.Errorf("while %s runs the workspace is %s with %d reclone events, want ready and none",
+					c.name, rec.Status, len(s.eventsOf(t, recloneEvent)))
+			}
+			free()
+
+			if status := <-work; status != http.StatusOK {
+				t.Errorf("%s = %d, want 200", c.name, status)
+			}
+			if status := <-reclone; status != http.StatusOK {
+				t.Errorf("the reclone = %d, want 200", status)
+			}
+			done, recloned := s.eventsOf(t, c.event), s.eventsOf(t, recloneEvent)
+			if len(done) == 0 || len(recloned) != 1 || done[len(done)-1].Seq > recloned[0].Seq {
+				t.Fatalf("%d %s and %d reclone events, want the work's event before the one reclone event",
+					len(done), c.event, len(recloned))
+			}
+			if rec, _ := s.workspace(t, syncSlug); rec.Status != workspace.StatusPending || rec.OriginHeadSHA != nil {
+				t.Errorf("after both the workspace is %s with origin_head_sha %v, want pending and none",
+					rec.Status, deref(rec.OriginHeadSHA))
+			}
+		})
+	}
 }

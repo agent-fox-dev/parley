@@ -98,7 +98,8 @@ func (s *Service) servePush(w http.ResponseWriter, r *http.Request) error {
 // pushBranch pushes the route's branch of the route's workspace to the
 // workspace's origin. It reads the branch's head once and pushes that
 // commit, so that a branch that moves meanwhile changes neither what is
-// pushed nor what is answered; it takes no lock. The origin credential is
+// pushed nor what is answered; it takes no lock on the branch, and holds
+// the workspace's work lock shared (see admitWork). The origin credential is
 // resolved from the workspace's secrets for this push, and *resolved set to
 // it. Every push handed to origin is recorded as one push event, and one
 // origin took also as the branch's origin head; a refusal before the push
@@ -114,18 +115,11 @@ func (s *Service) pushBranch(w http.ResponseWriter, r *http.Request, resolved *C
 		return server.InvalidRequest(fmt.Sprintf("branch name %q: %v", name, err))
 	}
 	slug := server.Param(r, "slug")
-	rec, found, err := BySlug(ctx, s.deps.Store.Main(), slug)
+	rec, release, err := s.admitWork(ctx, slug, func(w Workspace) error { return s.pushRefusal(ctx, w, name, force) })
 	if err != nil {
 		return err
 	}
-	if !found {
-		// Deleted between the access check and this read: the answer is the
-		// one the check gives for a slug no workspace has.
-		return server.NotFound(ErrNotFound.Error())
-	}
-	if err := s.pushRefusal(ctx, rec, name, force); err != nil {
-		return err
-	}
+	defer release()
 	repo, err := s.deps.Git.Open(ctx, s.RepoPath(slug))
 	if err != nil {
 		return err

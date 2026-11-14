@@ -92,7 +92,11 @@ func (s *Service) postCloneStep(mode string) PostCloneStep {
 // copy too once it is at its place, and the status is left as it is, so
 // that the next start takes the work up again; Clone then returns ctx's
 // error. Any other error means the outcome could not be recorded.
+//
+// The work holds the place of slug's copy while it runs, and so waits for
+// a delete of an earlier workspace with the slug to remove that one's copy.
 func (s *Service) Clone(ctx context.Context, slug string) error {
+	defer s.copies.lock(slug)()
 	started, err := StartClone(ctx, s.deps.Store.Main(), slug, s.deps.Now())
 	if err != nil || !started {
 		return err

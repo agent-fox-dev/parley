@@ -71,7 +71,8 @@ func syncAnswerJSON(obj Object, branches []BranchResult, extra map[string]json.R
 // a sync extension added. Nothing is fetched before every check has
 // passed. The sync runs on a context the request's end does not cancel, so
 // that a caller who disconnects does not stop it halfway; the principal
-// stays in that context's values.
+// stays in that context's values. It runs as work a maintenance operation
+// waits out (see admitWork).
 func (s *Service) serveSync(w http.ResponseWriter, r *http.Request) error {
 	d, ok := access.DecisionOf(r)
 	if !ok {
@@ -82,18 +83,11 @@ func (s *Service) serveSync(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	slug := server.Param(r, "slug")
-	rec, found, err := BySlug(r.Context(), s.deps.Store.Main(), slug)
+	_, release, err := s.admitWork(r.Context(), slug, s.requireSyncable)
 	if err != nil {
 		return err
 	}
-	if !found {
-		// Deleted between the access check and this read: the answer is the
-		// one the check gives for a slug no workspace has.
-		return server.NotFound(ErrNotFound.Error())
-	}
-	if err := s.requireSyncable(rec); err != nil {
-		return err
-	}
+	defer release()
 	ctx := context.WithoutCancel(r.Context())
 	// The caller is the sync event's actor; the access check has let only
 	// the admin token or a user's credential through.

@@ -151,6 +151,18 @@ type Service struct {
 	// fetchLocks serialises the writes of origin heads into one copy: the
 	// syncs' fetches, the safety copy's and the reclone's removal of it.
 	fetchLocks keyedLocks
+
+	// work is held shared by every sync and push of a workspace while it
+	// runs, and alone by a maintenance operation (see withMarker), which so
+	// waits out the work that passed the state guard before its marker was
+	// set.
+	work keyedLocks
+
+	// copies is held by a delete from before its transaction until it has
+	// removed the copies of the workspaces it deleted, and by clone work
+	// while it makes a copy, so that the removal never meets the copy of a
+	// workspace created again with the slug.
+	copies keyedLocks
 }
 
 // Bind binds the service to d. It is called once, before the hub serves.

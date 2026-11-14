@@ -124,10 +124,14 @@ func deleteRefusal(w Workspace, held bool) error {
 // registered and otherwise one by one in ascending slug order, and then
 // the workspace, each with what it owns, its record and its delete event;
 // when the transaction fails nothing has changed and no repository data is
-// discarded. Once it has committed, the copies of the workspaces it removed
-// are discarded, then the forks' data through the fork remover's discard
-// function; a copy that cannot be removed is logged, since the workspace
-// is gone. No event of the log is removed.
+// discarded. A fork made after the sandboxes were removed, whose sandbox
+// may still run, fails the transaction as busy. Once it has committed, the
+// copies of the workspaces it removed are discarded, then the forks' data
+// through the fork remover's discard function; a copy that cannot be
+// removed is logged, since the workspace is gone. The copies' places are
+// held from before the transaction until they are removed, so that clone
+// work of a workspace created again with one of the slugs waits for the
+// removal. No event of the log is removed.
 func (s *Service) deleteWorkspace(ctx context.Context, slug string, p identity.Principal, actorType string, actorID *string) error {
 	db := s.deps.Store.Main()
 	// Read again under the marker: an operation that ended between the
@@ -143,16 +147,21 @@ func (s *Service) deleteWorkspace(ctx context.Context, slug string, p identity.P
 		return err
 	}
 	set := s.teardown.snapshot()
+	forks, err := forksOf(ctx, db, slug)
+	if err != nil {
+		return fmt.Errorf("delete workspace %q: %w", slug, err)
+	}
 	if set.sandboxes != nil {
-		forks, err := forksOf(ctx, db, slug)
-		if err != nil {
-			return fmt.Errorf("delete workspace %q: %w", slug, err)
-		}
 		// Sandboxes live outside the store's transaction: they go first, so
 		// that no record is removed while a sandbox of it still runs.
 		if err := set.sandboxes.RemoveSandboxes(ctx, append([]string{slug}, forks...)); err != nil {
 			return fmt.Errorf("delete workspace %q: delete the sandboxes: %w", slug, err)
 		}
+	}
+	// Once the transaction commits the slugs are free, and a create may
+	// start clone work at a place whose copy is still to be removed.
+	for _, ws := range slices.Sorted(slices.Values(append([]string{slug}, forks...))) {
+		defer s.copies.lock(ws)()
 	}
 	// removed are the forks this transaction removed itself, whose copies
 	// it discards; discard is the fork remover's.
@@ -167,16 +176,21 @@ func (s *Service) deleteWorkspace(ctx context.Context, slug string, p identity.P
 			}
 			deleted, discard = slices.Sorted(slices.Values(slugs)), fn
 		} else {
-			forks, err := forksOf(ctx, tx, slug)
+			current, err := forksOf(ctx, tx, slug)
 			if err != nil {
 				return err
 			}
-			for _, f := range forks {
+			for _, f := range current {
 				if err := s.removeWorkspace(ctx, tx, set, f, &slug, actorType, actorID, nil); err != nil {
 					return err
 				}
 			}
-			deleted, removed = forks, forks
+			deleted, removed = current, current
+		}
+		for _, f := range deleted {
+			if !slices.Contains(forks, f) {
+				return busy(fmt.Sprintf("workspace %q got the fork %q while it was being deleted; try again", slug, f))
+			}
 		}
 		if deleted == nil {
 			deleted = []string{}
