@@ -1,6 +1,7 @@
 package access_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -19,7 +20,6 @@ import (
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/server"
-	"github.com/agent-fox-dev/parley/internal/server/timefmt"
 	"github.com/agent-fox-dev/parley/internal/store"
 )
 
@@ -479,6 +479,67 @@ func (h *guardHub) revokedAt() map[string]sql.NullInt64 {
 	return got
 }
 
+// bindings is a guard hub's store with alice's ready workspace w1, its
+// fork f1 and her archived workspace w2, and alice's PATs, by name: two
+// live tokens bound to gone, which has no workspace record, one that never
+// expires and one that expires later, a token bound to gone revoked an hour
+// ago, one bound to gone that expires at the instant of the call, a live
+// token bound to each of w1, f1 and w2, and an unbound one. Its service runs
+// on a clock that stands still half a second past a whole second, and logs
+// to log as JSON.
+type bindings struct {
+	*guardHub
+	clock *testClock
+	log   bytes.Buffer
+	tok   map[string]cred
+}
+
+func newBindings(t *testing.T) *bindings {
+	t.Helper()
+	b := &bindings{guardHub: newGuardHub(t), clock: newTestClock(), tok: map[string]cred{}}
+	alice, org := b.user("alice")
+	seed(t, b.st, repo("w1", alice, org, access.StatusReady), fork("f1", alice, org, "w1"),
+		repo("w2", alice, org, access.StatusArchived))
+	b.clock.advance(1500 * time.Millisecond)
+	now := b.clock.now()
+	later := now.Add(time.Hour)
+	for name, spec := range map[string]identity.PATSpec{
+		"gone live": {Workspace: "gone"}, "gone expiring": {Workspace: "gone", ExpiresAt: &later},
+		"gone revoked": {Workspace: "gone"}, "gone expired": {Workspace: "gone", ExpiresAt: &now},
+		"w1 live": {Workspace: "w1"}, "f1 live": {Workspace: "f1"}, "w2 live": {Workspace: "w2"}, "unbound": {},
+	} {
+		spec.UserID, spec.Permissions = alice, []string{"git:read"}
+		v, id := b.storePAT(spec)
+		b.tok[name] = cred{v, id, spec.Workspace, alice}
+	}
+	if err := b.st.Tx(context.Background(), func(tx *sql.Tx) error {
+		return identity.RevokeTokenByID(context.Background(), tx, b.tok["gone revoked"].id, now.Add(-time.Hour))
+	}); err != nil {
+		t.Fatalf("revoke a token: %v", err)
+	}
+	b.svc.Bind(access.Deps{Store: b.st, Events: b.events, Now: b.clock.now, Logger: slog.New(slog.NewJSONHandler(&b.log, nil))})
+	return b
+}
+
+// checkRevoked fails the test unless the tokens named are revoked at the
+// instant of the clock and every other token's revoked_at is as in before,
+// and the service emitted no event.
+func (b *bindings) checkRevoked(t *testing.T, before map[string]sql.NullInt64, names ...string) {
+	t.Helper()
+	after, at := b.revokedAt(), b.clock.now().UnixNano()
+	for name, tok := range b.tok {
+		if slices.Contains(names, name) && (!after[tok.id].Valid || after[tok.id].Int64 != at) {
+			t.Errorf("%s: revoked_at = %v, want the instant of the call, %d", name, after[tok.id], at)
+		}
+		if !slices.Contains(names, name) && after[tok.id] != before[tok.id] {
+			t.Errorf("%s: revoked_at = %v, want it unchanged, %v", name, after[tok.id], before[tok.id])
+		}
+	}
+	if got := b.events.all(); len(got) != 0 {
+		t.Errorf("events = %+v, want none", got)
+	}
+}
+
 // admin issues the hub's admin token and returns it.
 func (h *guardHub) admin() string {
 	h.t.Helper()
@@ -587,12 +648,6 @@ func (h *guardHub) do(method, path, credential string) answer {
 	return h.send(method, path, credential, "", nil)
 }
 
-// post sends POST path, under /api/v1, with credential as the bearer
-// credential and body as its JSON body.
-func (h *guardHub) post(path, credential, body string) answer {
-	return h.send(http.MethodPost, path, credential, body, nil)
-}
-
 // send sends method path, under /api/v1, with credential as the bearer
 // credential, body as its JSON body ("" for none) and the headers header.
 func (h *guardHub) send(method, path, credential, body string, header http.Header) answer {
@@ -631,15 +686,11 @@ func (l *refusalLog) all() []access.Refusal {
 	return slices.Clone(l.got)
 }
 
-// bindEvent is the parley.token.bind event of the token tok, minted by
-// userID with a credential of actorType.
-func bindEvent(tok identity.PAT, userID, actorType string) access.Event {
-	var expires any
-	if tok.ExpiresAt != nil {
-		expires = timefmt.Format(*tok.ExpiresAt)
-	}
-	return access.Event{Type: "parley.token.bind", Workspace: tok.Workspace, ActorType: actorType, ActorID: userID,
-		ResourceType: "token", ResourceID: tok.TokenID, Metadata: map[string]any{
-			"token_id": tok.TokenID, "workspace": tok.Workspace, "permissions": tok.Permissions,
-			"paths": tok.Paths, "expires_at": expires}}
+// bindEvent is the parley.token.bind event of the token tokenID of userID
+// bound to w1 with perms and paths, minted with a credential of actorType,
+// that expires at expires (nil for never).
+func bindEvent(tokenID, userID, actorType string, perms, paths []string, expires any) access.Event {
+	return access.Event{Type: "parley.token.bind", Workspace: "w1", ActorType: actorType, ActorID: userID,
+		ResourceType: "token", ResourceID: tokenID, Metadata: map[string]any{
+			"token_id": tokenID, "workspace": "w1", "permissions": perms, "paths": paths, "expires_at": expires}}
 }
