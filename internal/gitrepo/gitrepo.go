@@ -278,20 +278,21 @@ func (g Git) run(ctx context.Context, a access, args ...string) ([]byte, error) 
 
 // runInput is run with stdin as git's standard input, none when nil.
 func (g Git) runInput(ctx context.Context, a access, stdin []byte, args ...string) ([]byte, error) {
-	out, err := g.runOutput(ctx, a, stdin, args...)
+	out, _, err := g.runOutput(ctx, a, stdin, args...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-// runOutput is runInput that returns git's standard output after a failure
-// too, for a command such as git push --porcelain that reports what it did
-// there also when it exits with an error.
-func (g Git) runOutput(ctx context.Context, a access, stdin []byte, args ...string) ([]byte, error) {
+// runOutput is runInput that returns git's standard output, and the part
+// of its standard error the error keeps, after a failure too, for a command
+// such as git push --porcelain that reports what it did there also when it
+// exits with an error.
+func (g Git) runOutput(ctx context.Context, a access, stdin []byte, args ...string) (stdout []byte, stderr string, err error) {
 	dir, err := privateDir(!a.cred.IsZero())
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer func() { _ = os.RemoveAll(dir) }()
 	if g.Trace != nil {
@@ -312,21 +313,22 @@ func (g Git) runOutput(ctx context.Context, a access, stdin []byte, args ...stri
 		"GIT_SSH_COMMAND=ssh -o BatchMode=yes",
 		"LC_ALL=C",
 	}, g.Env...), credentialEnv(dir, a.cred, a.url)...)
-	var stdout bytes.Buffer
-	stderr := &limitedBuffer{limit: stderrLimit}
-	cmd.Stdout, cmd.Stderr = &stdout, stderr
+	var out bytes.Buffer
+	errOut := &limitedBuffer{limit: stderrLimit}
+	cmd.Stdout, cmd.Stderr = &out, errOut
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}
 	cmd.WaitDelay = waitDelay
 	killGroupOnCancel(cmd)
 	if err := cmd.Run(); err != nil {
+		stderr = strings.TrimSpace(errOut.String())
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return stdout.Bytes(), fmt.Errorf("git %s: %w", subcommand(args), ctxErr)
+			return out.Bytes(), stderr, fmt.Errorf("git %s: %w", subcommand(args), ctxErr)
 		}
-		return stdout.Bytes(), fmt.Errorf("git %s: %w: %s", subcommand(args), err, strings.TrimSpace(stderr.String()))
+		return out.Bytes(), stderr, fmt.Errorf("git %s: %w: %s", subcommand(args), err, stderr)
 	}
-	return stdout.Bytes(), nil
+	return out.Bytes(), "", nil
 }
 
 // subcommand is the git command args run, for an error's text.

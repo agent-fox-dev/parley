@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
@@ -39,6 +40,10 @@ func (s *Service) RegisterPatchBranchLookup(l PatchBranchLookup) {
 	defer s.patchMu.Unlock()
 	s.patchLookup = l
 }
+
+// pushDeadline is how long a push may take before git is killed with every
+// process it started and the push is answered 504 origin_timeout.
+const pushDeadline = 2 * time.Minute
 
 // remoteOrigin is the name a push answer gives the remote it pushed to.
 const remoteOrigin = "origin"
@@ -117,17 +122,24 @@ func (s *Service) servePush(w http.ResponseWriter, r *http.Request) error {
 		}
 	}
 	originURL := deref(rec.GitURL)
-	result, err := s.deps.Pusher.Push(ctx, gitrepo.PushRequest{
+	pushCtx, cancel := context.WithTimeout(ctx, s.deps.PushDeadline)
+	defer cancel()
+	result, err := s.deps.Pusher.Push(pushCtx, gitrepo.PushRequest{
 		Dir: repo.Dir(), URL: originURL, Credential: cred, Commit: head, Branch: name, Force: force, Lease: lease,
 	})
-	if errors.Is(err, gitrepo.ErrNonFastForward) {
+	switch {
+	case err == nil:
+	case ctx.Err() == nil && errors.Is(pushCtx.Err(), context.DeadlineExceeded):
+		// The push operation killed git with every process it started when
+		// the deadline passed, and waited for them.
+		return server.NewError("origin_timeout", http.StatusGatewayTimeout, fmt.Sprintf(
+			"the push of branch %q to origin did not finish within %v", name, s.deps.PushDeadline))
+	case errors.Is(err, gitrepo.ErrNonFastForward):
 		return nonFastForward(ctx, repo, name, head)
-	}
-	if errors.Is(err, gitrepo.ErrOriginMoved) {
+	case errors.Is(err, gitrepo.ErrOriginMoved):
 		return originMoved(name, lease, recorded)
-	}
-	if err != nil {
-		return err
+	default:
+		return pushFailure(err, slug, name, withoutUserinfo(originURL), cred)
 	}
 	server.WriteJSON(w, http.StatusOK, pushAnswer{
 		Branch: name, SHA: head, Remote: remoteOrigin, RemoteURL: withoutUserinfo(originURL), Result: result,
@@ -256,6 +268,40 @@ func originMoved(branch, lease string, recorded bool) error {
 	return server.NewError("origin_moved", http.StatusConflict, fmt.Sprintf(
 		"origin's branch %q changed since the hub last saw it (%s); sync the workspace to bring in origin's branch, then push again",
 		branch, last))
+}
+
+// pushFailure is the answer to the failure err of a push of branch of the
+// workspace slug to its origin at remoteURL, cred being the credential the
+// push presented: 422 origin_rejected with origin's reason when origin
+// refused the update itself, otherwise 502 with the type of the failure's
+// class, and 502 upstream_error for a failure of no known class.
+func pushFailure(err error, slug, branch, remoteURL string, cred Credential) error {
+	var pe *gitrepo.PushError
+	if !errors.As(err, &pe) {
+		return server.UpstreamError(fmt.Sprintf("the push of branch %q to origin at %s failed", branch, remoteURL))
+	}
+	switch {
+	case errors.Is(pe.Class, gitrepo.ErrOriginRejected):
+		return server.NewError("origin_rejected", http.StatusUnprocessableEntity, fmt.Sprintf(
+			"origin refused the update of branch %q: %s", branch, pe.Reason))
+	case errors.Is(pe.Class, gitrepo.ErrUnauthenticated) && cred.IsZero():
+		return server.NewError("origin_unauthenticated", http.StatusBadGateway, fmt.Sprintf(
+			"origin at %s asked for a credential and workspace %q has no credential; store GIT_PAT, or GIT_USERNAME and GIT_PASSWORD, as its secrets",
+			remoteURL, slug))
+	case errors.Is(pe.Class, gitrepo.ErrUnauthenticated):
+		return server.NewError("origin_unauthenticated", http.StatusBadGateway, fmt.Sprintf(
+			"origin at %s rejected the stored credential of workspace %q", remoteURL, slug))
+	case errors.Is(pe.Class, gitrepo.ErrForbidden):
+		return server.NewError("origin_forbidden", http.StatusBadGateway, fmt.Sprintf(
+			"origin at %s does not let the credential of workspace %q push to the repository: %s", remoteURL, slug, pe.Reason))
+	case errors.Is(pe.Class, gitrepo.ErrRepositoryNotFound):
+		return server.NewError("origin_not_found", http.StatusBadGateway, fmt.Sprintf(
+			"origin has no repository at %s, or the credential of workspace %q cannot see it: %s", remoteURL, slug, pe.Reason))
+	case errors.Is(pe.Class, gitrepo.ErrUnreachable):
+		return server.NewError("origin_unreachable", http.StatusBadGateway, fmt.Sprintf(
+			"origin at %s cannot be reached: %s", remoteURL, pe.Reason))
+	}
+	return server.UpstreamError(fmt.Sprintf("the push of branch %q to origin at %s failed: %s", branch, remoteURL, pe.Reason))
 }
 
 // withoutUserinfo is the origin URL raw with any user information removed.

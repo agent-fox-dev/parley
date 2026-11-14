@@ -31,6 +31,51 @@ var ErrNonFastForward = errors.New("origin's branch is not an ancestor of the co
 // lacks it, or it is gone although the lease names a commit.
 var ErrOriginMoved = errors.New("origin's branch is not where the lease expects it")
 
+// The classes of a push that failed for a reason other than the state of
+// origin's branch. A PushError matches exactly one of them with errors.Is.
+var (
+	// ErrOriginRejected: origin itself refused the update of the branch,
+	// by a branch rule or a server-side hook, for example.
+	ErrOriginRejected = errors.New("origin refused the update of the branch")
+	// ErrUnauthenticated: origin asked for a credential and the push had
+	// none, or origin did not take the one presented.
+	ErrUnauthenticated = errors.New("origin could not authenticate the hub")
+	// ErrForbidden: origin took the credential but does not let it push to
+	// the repository.
+	ErrForbidden = errors.New("origin does not let the credential push to the repository")
+	// ErrRepositoryNotFound: origin has no repository at the URL, or the
+	// credential cannot see it.
+	ErrRepositoryNotFound = errors.New("origin has no such repository, or the credential cannot see it")
+	// ErrUnreachable: origin's name did not resolve, the connection failed,
+	// or TLS (for ssh, the host key) did.
+	ErrUnreachable = errors.New("origin cannot be reached")
+	// ErrPushFailed: the push failed in any other way.
+	ErrPushFailed = errors.New("the push failed")
+)
+
+// PushError is the error of a push that failed for one of the classes
+// above, read from the status git reported for the ref when it reported
+// one and from what the transport said otherwise.
+type PushError struct {
+	// Branch is the branch pushed to.
+	Branch string
+	// Class is the class of the failure, one of the errors above.
+	Class error
+	// Reason is what origin or the transport said: for ErrOriginRejected
+	// origin's reason for the ref with the text its hooks wrote, otherwise
+	// git's standard error without its boilerplate, one line per line.
+	Reason string
+	// Err is git's error.
+	Err error
+}
+
+func (e *PushError) Error() string {
+	return fmt.Sprintf("git push of %s: %v: %s", e.Branch, e.Class, e.Reason)
+}
+
+// Unwrap gives the class and git's error, so that errors.Is matches both.
+func (e *PushError) Unwrap() []error { return []error{e.Class, e.Err} }
+
 // PushRequest is one push: one commit of a copy to one branch of origin.
 type PushRequest struct {
 	// Dir is the git directory of the copy the commit is in.
@@ -61,7 +106,9 @@ type PushRequest struct {
 // not an ancestor of the commit gives an error matching ErrNonFastForward,
 // one refused because the lease is stale an error matching ErrOriginMoved.
 // Git reports a branch already at the commit as up to date before it judges
-// the lease. Any other failure is an error holding what git wrote.
+// the lease. Every other failure is a *PushError of its class; when ctx ends
+// first git is killed with every process it started and the error wraps
+// ctx's error instead.
 func (g Git) Push(ctx context.Context, req PushRequest) (PushResult, error) {
 	ref := "refs/heads/" + req.Branch
 	args := []string{"-c", "credential.helper=", "--git-dir=" + req.Dir, "push", "--porcelain", "--no-follow-tags"}
@@ -70,7 +117,7 @@ func (g Git) Push(ctx context.Context, req PushRequest) (PushResult, error) {
 		// the ref.
 		args = append(args, "--force-with-lease="+ref+":"+req.Lease)
 	}
-	out, err := g.runOutput(ctx, access{req.Credential, req.URL}, nil, append(args, "--", req.URL, req.Commit+":"+ref)...)
+	out, stderr, err := g.runOutput(ctx, access{req.Credential, req.URL}, nil, append(args, "--", req.URL, req.Commit+":"+ref)...)
 	flag, summary, reported := refStatus(out, ref)
 	switch {
 	case reported && flag == '=' && err == nil:
@@ -83,10 +130,88 @@ func (g Git) Push(ctx context.Context, req PushRequest) (PushResult, error) {
 		return "", fmt.Errorf("git push of %s: %w", req.Branch, ErrOriginMoved)
 	case reported && flag == '!' && (strings.Contains(summary, "(non-fast-forward)") || strings.Contains(summary, "(fetch first)")):
 		return "", fmt.Errorf("git push of %s: %w", req.Branch, ErrNonFastForward)
-	case err != nil:
+	case reported && flag == '!' && strings.HasPrefix(summary, "[remote rejected]"):
+		return "", &PushError{Branch: req.Branch, Class: ErrOriginRejected, Reason: rejectReason(summary, stderr), Err: err}
+	case err != nil && ctx.Err() != nil:
 		return "", err
+	case err != nil && !reported:
+		return "", &PushError{Branch: req.Branch, Class: transportClass(stderr), Reason: transportReason(stderr), Err: err}
 	}
-	return "", fmt.Errorf("git push of %s reported %q for the ref", req.Branch, summary)
+	if err == nil {
+		err = errors.New("git push reported no failure")
+	}
+	return "", &PushError{Branch: req.Branch, Class: ErrPushFailed, Reason: fmt.Sprintf("git reported %q for the ref", summary), Err: err}
+}
+
+// rejectReason is origin's reason for refusing the ref: the reason of the
+// ref's status, "[remote rejected] (<reason>)", followed by the text
+// origin's hooks wrote, which git shows on the lines starting with remote:.
+func rejectReason(summary, stderr string) string {
+	reason := strings.TrimPrefix(summary, "[remote rejected]")
+	reason = strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(reason), "("), ")")
+	var said []string
+	for line := range strings.Lines(stderr) {
+		if text, ok := strings.CutPrefix(line, "remote:"); ok && strings.TrimSpace(text) != "" {
+			said = append(said, strings.TrimSpace(text))
+		}
+	}
+	if len(said) == 0 {
+		return reason
+	}
+	return reason + ": " + strings.Join(said, "\n")
+}
+
+// transportClasses map what git's HTTPS transport (curl) and its SSH
+// transport (ssh, and the forge's message behind it) write about a failure
+// to its class, tried in this order.
+var transportClasses = []struct {
+	class error
+	says  []string
+}{
+	{ErrUnauthenticated, []string{
+		"Authentication failed", "could not read Username", "could not read Password",
+		"returned error: 401", "Permission denied (publickey", "Permission denied (password",
+	}},
+	{ErrForbidden, []string{"returned error: 403", "not allowed to push", "Permission to "}},
+	{ErrRepositoryNotFound, []string{
+		"returned error: 404", "not found", "could not be found", "does not appear to be a git repository",
+	}},
+	{ErrUnreachable, []string{
+		"Could not resolve host", "Could not resolve proxy", "Failed to connect", "Could not connect",
+		"Couldn't connect", "Connection refused", "Connection timed out", "Connection reset", "Connection closed",
+		"timed out", "No route to host", "Network is unreachable", "SSL", "TLS", "certificate",
+		"Host key verification failed",
+	}},
+}
+
+// transportClass is the class of a push that failed before git reported a
+// status for the ref, read from its standard error.
+func transportClass(stderr string) error {
+	for _, c := range transportClasses {
+		for _, says := range c.says {
+			if strings.Contains(stderr, says) {
+				return c.class
+			}
+		}
+	}
+	return ErrPushFailed
+}
+
+// transportReason is git's standard error without its blank lines, the
+// fatal: and remote: prefixes, and the advice it gives after any failure
+// of the SSH transport.
+func transportReason(stderr string) string {
+	var lines []string
+	for line := range strings.Lines(stderr) {
+		line = strings.TrimSpace(line)
+		line = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(line, "fatal:"), "remote:"))
+		switch line {
+		case "", "Please make sure you have the correct access rights", "and the repository exists.":
+			continue
+		}
+		lines = append(lines, line)
+	}
+	return strings.Join(lines, "\n")
 }
 
 // refStatus is the status line git push --porcelain reports for ref in out,

@@ -17,7 +17,17 @@ says, or decides what it leaves open.
   must not have, read only with `Force`. It returns a `gitrepo.PushResult`
   (`pushed`, `forced`, `up_to_date`) or an error; a non-fast-forward
   refusal matches `gitrepo.ErrNonFastForward`, a stale lease
-  `gitrepo.ErrOriginMoved`.
+  `gitrepo.ErrOriginMoved`. Every other failure is a `*gitrepo.PushError`
+  whose `Class` is one of `ErrOriginRejected`, `ErrUnauthenticated`,
+  `ErrForbidden`, `ErrRepositoryNotFound`, `ErrUnreachable` and
+  `ErrPushFailed` ("other"), matched with `errors.Is`, and whose `Reason`
+  is what origin or the transport said.
+- The push deadline is not a parameter of the push operation but of the
+  handler: `Deps.PushDeadline` (0 is the fixed 2 minutes in `Bind`). The
+  handler runs the push under a context with that deadline; the push
+  operation kills git with every process it started when the context ends
+  and returns the context's error, which the handler answers `504
+  origin_timeout`.
 - The handler is not built from its collaborators as parameters. As for
   the sync, they are fields of `workspace.Deps`, which the hub sets in
   `internal/hub/workspace.go` and tests change through
@@ -36,4 +46,11 @@ and `http.receivepack` enabled in the bare repository, since
 otherwise. It keeps the options and switches of `NewOrigin`
 (`WithBasicAuth`, `Requests`, `Head`, `Block`, `Refuse`, `Close`) and adds
 `Accept(user, password)`, which changes the credential the origin takes
-while it serves.
+while it serves, `Reject(message)`, which installs a `pre-receive` hook
+that refuses every update with that message, and `ServeUntrusted(bool)`,
+which makes it serve a self-signed certificate its `CAFile` does not vouch
+for. Every `httptest` TLS server serves the same certificate, so a second
+origin would be trusted by a hub that trusts the first; the untrusted
+certificate is therefore a switch of the one origin. The stall is
+`Block()`, and "listener closed" is a second origin that was closed, which
+the workspace's `git_url` is pointed at for that case.

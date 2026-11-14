@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"maps"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -82,6 +83,40 @@ func TestPush_ForcesOnlyUnderTheLease(t *testing.T) {
 			if arg == "--force" || arg == "-f" || strings.HasPrefix(arg, "+") {
 				t.Errorf("%s: git ran with %q, which holds the plain force %q", c.name, args, arg)
 			}
+		}
+	}
+}
+
+func TestPush_ClassifiesTheFailuresOfTheSSHTransport(t *testing.T) {
+	t.Parallel()
+	dir := filepath.Join(t.TempDir(), "copy.git")
+	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", dir)
+	commit := gitrepotest.Git(t, dir, "commit-tree", gitrepotest.Git(t, dir, "mktree"), "-m", "a")
+	// The ssh git starts for a git@ origin writes what a real one or the
+	// forge behind it writes, and fails.
+	ssh := filepath.Join(t.TempDir(), "ssh")
+	if err := os.WriteFile(ssh, []byte("#!/bin/sh\nprintf '%s\\n' \"$SSH_SAYS\" >&2\nexit 255\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		says string
+		want error
+	}{
+		{"git@example.invalid: Permission denied (publickey).", gitrepo.ErrUnauthenticated},
+		{"ERROR: Permission to team/repo.git denied to deploy-key.", gitrepo.ErrForbidden},
+		{"ERROR: Repository not found.", gitrepo.ErrRepositoryNotFound},
+		{"ssh: Could not resolve hostname example.invalid: Name or service not known", gitrepo.ErrUnreachable},
+		{"ssh: connect to host example.invalid port 22: Connection refused", gitrepo.ErrUnreachable},
+		{"Host key verification failed.", gitrepo.ErrUnreachable},
+		{"the forge is having a bad day", gitrepo.ErrPushFailed},
+	} {
+		g := gitrepo.Git{Env: []string{"GIT_SSH_COMMAND=" + ssh, "SSH_SAYS=" + c.says}}
+		got, err := g.Push(context.Background(), gitrepo.PushRequest{
+			Dir: dir, URL: "git@example.invalid:team/repo.git", Commit: commit, Branch: "main",
+		})
+		var pushErr *gitrepo.PushError
+		if !errors.Is(err, c.want) || !errors.As(err, &pushErr) || !strings.Contains(pushErr.Reason, c.says) {
+			t.Errorf("ssh says %q: Push = %q, %v; want a PushError matching %v that gives the reason", c.says, got, err, c.want)
 		}
 	}
 }

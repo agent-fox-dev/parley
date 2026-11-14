@@ -1575,6 +1575,14 @@ origin's branch moved changes neither origin's branch nor the recorded
 origin head; a sync brings in what origin has, after which the push may be
 tried again.
 
+A push that fails changes neither origin's branch nor the hub's recorded
+origin head. The answer says what stopped it: origin refusing the update
+(`422`), the credential, the repository, the network or anything else on
+origin's side (`502`), or the push's deadline of 2 minutes (`504`), after
+which `git` is killed with every process it started. Each is read from the
+status git reports for the ref when it reports one, and otherwise from
+what the HTTPS transport, or for a `git@` origin the SSH transport, says.
+
 Before origin is contacted the hub refuses, after the body and the branch
 name and in this order: a workspace that is not `ready` or on which a
 reclone, archive or delete runs; a task fork, whatever the state of its
@@ -1615,8 +1623,15 @@ it was at the commit already.
 | `409` `workspace_archived` | the workspace is `archived` (`workspace "<slug>" is archived`) |
 | `409` `non_fast_forward` | without `force`, origin's branch is not an ancestor of the hub's head: the two diverged or origin's is ahead (`origin's branch "<name>" is not an ancestor of the hub's head <sha> (the origin head the hub last saw is <sha>); sync the workspace to bring in origin's commits, or push with force to replace origin's branch`); origin's branch and the hub's recorded origin head are unchanged |
 | `409` `origin_moved` | `force` is `true` and origin's branch is neither at the hub's head nor where the lease says: it moved since the hub last saw it, it exists although the hub recorded no origin head for it, or it is gone although the hub recorded one (`origin's branch "<name>" changed since the hub last saw it (the origin head the hub last saw is <sha>); sync the workspace to bring in origin's branch, then push again`, or with `the hub has no record of origin's head of it, so origin must not have it` in the parentheses); origin's branch and the hub's recorded origin head are unchanged |
+| `422` `origin_rejected` | origin itself refused the update of the branch, by a branch rule or a server-side hook (`origin refused the update of branch "<name>": <origin's reason>`, the reason followed by what origin's hook wrote, such as `pre-receive hook declined: branch is locked`) |
+| `502` `origin_unauthenticated` | origin asked for a credential and the workspace has none (`origin at <remote_url> asked for a credential and workspace "<slug>" has no credential; store GIT_PAT, or GIT_USERNAME and GIT_PASSWORD, as its secrets`), or origin did not take the stored one (`origin at <remote_url> rejected the stored credential of workspace "<slug>"`) |
+| `502` `origin_forbidden` | origin answered that the credential may not push to the repository, HTTP `403` (`origin at <remote_url> does not let the credential of workspace "<slug>" push to the repository: <what git said>`) |
+| `502` `origin_not_found` | origin has no repository at `git_url`, or the credential cannot see it, HTTP `404` (`origin has no repository at <remote_url>, or the credential of workspace "<slug>" cannot see it: <what git said>`) |
+| `502` `origin_unreachable` | origin's name did not resolve, the connection failed, or TLS did, an untrusted certificate included; for a `git@` origin also a host key that is not trusted (`origin at <remote_url> cannot be reached: <what git said>`) |
+| `502` `upstream_error` | the push failed in any other way, such as HTTP `500` from origin (`the push of branch "<name>" to origin at <remote_url> failed: <what git said>`) |
 | `503` `unavailable` | the patch list of a `carry_patch` workspace could not be read (`the patch list of workspace "<slug>" cannot be read; try again later`); nothing is pushed |
-| `500` `internal` | the workspace's secrets could not be read, or the push failed otherwise |
+| `504` `origin_timeout` | the push had not finished 2 minutes after it began; `git` is killed with every process it started before the answer (`the push of branch "<name>" to origin did not finish within 2m0s`) |
+| `500` `internal` | the workspace's secrets could not be read, in which case origin is not contacted and nothing is pushed without a credential, or the hub failed otherwise |
 
 ## `POST /api/v1/workspaces/{slug}/tokens`
 

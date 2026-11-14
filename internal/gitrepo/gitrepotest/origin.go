@@ -7,8 +7,16 @@ package gitrepotest
 
 import (
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
+	"math/big"
+	"net"
 	"net/http"
 	"net/http/cgi"
 	"net/http/httptest"
@@ -18,6 +26,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // repoName is the last element of the origin's URL path.
@@ -45,6 +54,9 @@ type Origin struct {
 	gate           chan struct{}
 	refuse         int
 	seq            int
+	// untrusted, when set, is the certificate the origin serves instead of
+	// the one CAFile holds.
+	untrusted *tls.Certificate
 
 	closeOnce sync.Once
 }
@@ -92,7 +104,9 @@ func NewOrigin(t testing.TB, opts ...Option) *Origin {
 	if o.smart {
 		o.files = o.backend()
 	}
-	o.srv = httptest.NewTLSServer(http.HandlerFunc(o.serve))
+	o.srv = httptest.NewUnstartedServer(http.HandlerFunc(o.serve))
+	o.srv.TLS = &tls.Config{GetConfigForClient: o.tlsConfig}
+	o.srv.StartTLS()
 	o.caFile = filepath.Join(t.TempDir(), "origin-ca.pem")
 	cert := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: o.srv.Certificate().Raw})
 	if err := os.WriteFile(o.caFile, cert, 0o600); err != nil {
@@ -218,6 +232,53 @@ func (o *Origin) Refuse(status int) {
 	o.refuse = status
 }
 
+// Reject makes the origin's server-side hook refuse every update a push
+// asks for, writing message, which the pushing git shows as origin's
+// remote: lines; "" makes it take them again.
+func (o *Origin) Reject(message string) {
+	o.t.Helper()
+	hook := filepath.Join(o.dir, "hooks", "pre-receive")
+	if message == "" {
+		if err := os.Remove(hook); err != nil && !os.IsNotExist(err) {
+			o.t.Fatalf("origin: %v", err)
+		}
+		return
+	}
+	script := "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' " + shellQuote(message) + " >&2\nexit 1\n"
+	if err := os.MkdirAll(filepath.Dir(hook), 0o755); err != nil {
+		o.t.Fatalf("origin: %v", err)
+	}
+	if err := os.WriteFile(hook, []byte(script), 0o755); err != nil {
+		o.t.Fatalf("origin: %v", err)
+	}
+}
+
+// ServeUntrusted makes the origin, on every connection from now on, serve
+// a certificate of its own that the one in CAFile does not vouch for, so
+// that a git that trusts the origin through Env refuses the connection;
+// false makes it serve its usual certificate again.
+func (o *Origin) ServeUntrusted(untrusted bool) {
+	o.t.Helper()
+	var cert *tls.Certificate
+	if untrusted {
+		cert = selfSigned(o.t)
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.untrusted = cert
+}
+
+// tlsConfig is the TLS configuration of a connection: the server's own,
+// or one with the untrusted certificate while ServeUntrusted holds one.
+func (o *Origin) tlsConfig(*tls.ClientHelloInfo) (*tls.Config, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.untrusted == nil {
+		return nil, nil
+	}
+	return &tls.Config{Certificates: []tls.Certificate{*o.untrusted}}, nil
+}
+
 // Close releases the held requests and shuts the server down, so that later
 // requests find nothing listening. Calling it again does nothing.
 func (o *Origin) Close() {
@@ -333,6 +394,39 @@ func (o *Origin) History() (mainHead, devHead, v1 string) {
 	}
 	o.publish()
 	return heads[0], heads[1], heads[2]
+}
+
+// selfSigned is a new self-signed certificate for the loopback addresses,
+// which no other certificate vouches for.
+func selfSigned(t testing.TB) *tls.Certificate {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("origin: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big1,
+		Subject:      pkix.Name{CommonName: "untrusted origin"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		IPAddresses:  []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback},
+		DNSNames:     []string{"localhost"},
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("origin: %v", err)
+	}
+	return &tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
+}
+
+// big1 is the serial number of the untrusted certificate.
+var big1 = big.NewInt(1)
+
+// shellQuote is s quoted for a POSIX shell.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // Git runs git on the repository whose git directory is dir, such as a

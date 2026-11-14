@@ -1177,16 +1177,22 @@ type pushWorld struct {
 // storing the workspace secrets secrets before the clone.
 func newPushWorld(t *testing.T, secrets map[string]string, originOpts ...gitrepotest.Option) *pushWorld {
 	t.Helper()
+	return newPushWorldWith(t, secrets, nil, originOpts...)
+}
+
+// newPushWorldWith is newPushWorld with the hub started with opts too.
+func newPushWorldWith(t *testing.T, secrets map[string]string, opts []option, originOpts ...gitrepotest.Option) *pushWorld {
+	t.Helper()
 	o := gitrepotest.SmartOrigin(t, originOpts...)
 	o.History()
 	p := &recordingPusher{}
-	w := newWorld(t, withGitOrigin(o), withCompose(func(c *hub.Composition) {
+	w := newWorld(t, append([]option{withGitOrigin(o), withCompose(func(c *hub.Composition) {
 		c.AdjustWorkspace(func(d *workspace.Deps) {
 			g, _ := d.Pusher.(gitrepo.Git)
 			g.Trace = p.trace
 			p.git, d.Pusher = g, p
 		})
-	}))
+	})}, opts...)...)
 	url := o.URL()
 	w.put(t, workspace.Workspace{Slug: syncSlug, GitURL: &url})
 	for name, value := range secrets {
@@ -1298,6 +1304,39 @@ func (w *world) setProtected(t *testing.T, globs []string) {
 	if _, err := w.Store.Main().Exec(`UPDATE workspaces SET settings = ? WHERE slug = ?`, string(doc), syncSlug); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// setGitURL points the record of the workspace slug at the origin url.
+func (w *world) setGitURL(t *testing.T, slug, url string) {
+	t.Helper()
+	if _, err := w.Store.Main().Exec(`UPDATE workspaces SET git_url = ? WHERE slug = ?`, url, slug); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// withPushDeadline gives the hub's pushes the deadline d.
+func withPushDeadline(d time.Duration) option {
+	return withCompose(func(c *hub.Composition) {
+		c.AdjustWorkspace(func(deps *workspace.Deps) { deps.PushDeadline = d })
+	})
+}
+
+// processesNaming are the command lines of the running processes whose
+// command line holds s, such as a git push to an origin's URL and the
+// transport helper it started.
+func processesNaming(t *testing.T, s string) []string {
+	t.Helper()
+	out, err := exec.Command("ps", "-A", "-o", "args=").Output()
+	if err != nil {
+		t.Fatalf("list the processes: %v", err)
+	}
+	var naming []string
+	for line := range strings.Lines(string(out)) {
+		if strings.Contains(line, s) {
+			naming = append(naming, strings.TrimSpace(line))
+		}
+	}
+	return naming
 }
 
 // patchLookup is a patch-branch lookup that reports the branches registered

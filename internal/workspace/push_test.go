@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
@@ -316,6 +317,13 @@ func TestPush_RefusesBeforeContactingOrigin(t *testing.T) {
 			t.Errorf("%s: answer %d %s, want %d %s", c.name, a.status, a.body, c.status, c.errorType)
 		}
 	}
+	// Secrets that cannot be read end the push before origin is contacted,
+	// never with a push without a credential.
+	p.fail(faultSecretRead)
+	if a := p.push(t, p.uKey, syncSlug, "main", nil); a.status != http.StatusInternalServerError || a.errorType(t) != "internal" {
+		t.Errorf("unreadable secrets: answer %d %s, want 500 internal", a.status, a.body)
+	}
+	p.fail("")
 	if calls := p.pushes.recorded(); len(calls) != 0 {
 		t.Errorf("refused pushes reached the push operation: %+v", calls)
 	}
@@ -498,5 +506,93 @@ func TestPush_ForcesOnlyUnderTheRecordedOriginHead(t *testing.T) {
 		if got := p.origin.Head(c.branch); got != hub {
 			t.Errorf("%s: origin's branch is at %q, want %s", c.name, got, hub)
 		}
+	}
+}
+
+func TestPush_AnswersEachFailureOfThePush(t *testing.T) {
+	t.Parallel()
+	p := newPushWorld(t, nil)
+	head := grow(t, p.copy, "feature", p.seen(t, "feature", ref(t, p.copy, "refs/heads/main")), "hub")
+	theirs, recorded := p.origin.Head("feature"), ref(t, p.copy, "refs/remotes/origin/feature")
+	gone := gitrepotest.NewOrigin(t)
+	gone.Close()
+	refuse := func(status int) func() func() {
+		return func() func() { p.origin.Refuse(status); return func() { p.origin.Refuse(0) } }
+	}
+	for _, c := range []struct {
+		name string
+		// arrange sets the origin's behaviour up and returns what puts it
+		// back.
+		arrange   func() func()
+		status    int
+		errorType string
+		message   string // a text the message holds, "" for any
+	}{
+		{"origin's hook refuses every update", func() func() {
+			p.origin.Reject("branch is locked")
+			return func() { p.origin.Reject("") }
+		}, http.StatusUnprocessableEntity, "origin_rejected", "branch is locked"},
+		{"origin asks for authentication and the workspace has no credential", func() func() {
+			p.origin.Accept("x-token-auth", "tok-taken")
+			return func() { p.origin.Accept("", "") }
+		}, http.StatusBadGateway, "origin_unauthenticated", "no credential"},
+		{"origin does not take the stored GIT_PAT", func() func() {
+			p.putSecret(t, syncSlug, "GIT_PAT", "tok-refused")
+			p.origin.Accept("x-token-auth", "tok-taken")
+			return func() { p.deleteSecret(t, syncSlug, "GIT_PAT"); p.origin.Accept("", "") }
+		}, http.StatusBadGateway, "origin_unauthenticated", "rejected"},
+		{"origin answers 403", refuse(http.StatusForbidden), http.StatusBadGateway, "origin_forbidden", ""},
+		{"origin answers 404", refuse(http.StatusNotFound), http.StatusBadGateway, "origin_not_found", ""},
+		{"origin's listener is closed", func() func() {
+			p.setGitURL(t, syncSlug, gone.URL())
+			return func() { p.setGitURL(t, syncSlug, p.origin.URL()) }
+		}, http.StatusBadGateway, "origin_unreachable", ""},
+		{"origin serves a certificate the hub does not trust", func() func() {
+			p.origin.ServeUntrusted(true)
+			return func() { p.origin.ServeUntrusted(false) }
+		}, http.StatusBadGateway, "origin_unreachable", ""},
+		{"origin answers 500", refuse(http.StatusInternalServerError), http.StatusBadGateway, "upstream_error", ""},
+	} {
+		undo := c.arrange()
+		a := p.push(t, p.uKey, syncSlug, "feature", nil)
+		undo()
+		errorType, msg := a.refusal(t)
+		if a.status != c.status || errorType != c.errorType || !strings.Contains(msg, c.message) {
+			t.Errorf("%s: answer %d %s, want %d %s naming %q", c.name, a.status, a.body, c.status, c.errorType, c.message)
+		}
+		if got := p.origin.Head("feature"); got != theirs {
+			t.Errorf("%s: origin's feature moved from %s to %s", c.name, theirs, got)
+		}
+		if got := ref(t, p.copy, "refs/remotes/origin/feature"); got != recorded {
+			t.Errorf("%s: the recorded origin head moved from %s to %s", c.name, recorded, got)
+		}
+	}
+	// The failures leave origin able to take the push.
+	if obj := p.push(t, p.uKey, syncSlug, "feature", nil).decode(t, http.StatusOK); obj["sha"] != head {
+		t.Errorf("the push after the failures answered %v, want the push of %s", obj, head)
+	}
+}
+
+func TestPush_EndsAPushThatOutlivesItsDeadline(t *testing.T) {
+	t.Parallel()
+	const deadline = 300 * time.Millisecond
+	p := newPushWorldWith(t, nil, []option{withPushDeadline(deadline)})
+	grow(t, p.copy, "dev", ref(t, p.copy, "refs/heads/dev"), "hub")
+	recorded := ref(t, p.copy, "refs/remotes/origin/dev")
+	p.origin.Block()
+	start := time.Now()
+	a := p.push(t, p.uKey, syncSlug, "dev", nil)
+	took := time.Since(start)
+	if a.status != http.StatusGatewayTimeout || a.errorType(t) != "origin_timeout" {
+		t.Errorf("answer %d %s, want 504 origin_timeout", a.status, a.body)
+	}
+	if took < deadline || took > deadline+5*time.Second {
+		t.Errorf("the answer came after %v, want it between the deadline %v and 5 s after it", took, deadline)
+	}
+	if left := processesNaming(t, p.origin.URL()); len(left) != 0 {
+		t.Errorf("processes of the push remain: %q", left)
+	}
+	if got := ref(t, p.copy, "refs/remotes/origin/dev"); got != recorded {
+		t.Errorf("the recorded origin head moved from %s to %s", recorded, got)
 	}
 }
