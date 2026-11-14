@@ -97,6 +97,9 @@ type Deps struct {
 // makes a count, a uniqueness check and an insert of one call atomic.
 type Component struct {
 	deps Deps
+	// converters re-seal the values other parts keep outside the secret
+	// table when the maintenance pass re-encrypts after a rotation.
+	converters []Converter
 }
 
 // New returns a component bound to d.

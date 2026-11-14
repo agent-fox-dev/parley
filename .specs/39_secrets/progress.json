@@ -3,7 +3,7 @@
   "spec_id": "39",
   "spec_name": "secrets",
   "schema_version": 3,
-  "updated_at": "2026-11-14T05:44:41Z",
+  "updated_at": "2026-11-14T05:51:46Z",
   "tasks": [
     {
       "id": 1,
@@ -39,7 +39,7 @@
     },
     {
       "id": 9,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 10,

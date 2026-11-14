@@ -299,6 +299,17 @@ Without a current key the hub starts, lists and deletes secrets, and refuses
 to store one. What the start logs about the keys is in
 [cli.md](cli.md#log-lines).
 
+To rotate the key, restart `parleyd` with the new key as the current key
+(`PARLEY_SECRETS_KEY` or the key file) and the former one as
+`PARLEY_SECRETS_KEY_PREVIOUS`. New values are sealed under the new key at
+once, and values under the former key still open. The maintenance pass, run
+right after the start and then every hour, seals every value under the
+former key again under the new one and writes the line `secret
+re-encryption` with `remaining`, the number of values not yet under the new
+key. Once a pass reports `remaining` `0`, restart `parleyd` without
+`PARLEY_SECRETS_KEY_PREVIOUS`. A value the former key does not open stays
+as it is and keeps `remaining` above `0`.
+
 ### Environment variables
 
 | Variable | Effect |

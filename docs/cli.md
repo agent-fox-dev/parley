@@ -274,6 +274,18 @@ workspace that no longer exists:
 {"time":"2026-11-14T10:13:00.000000+01:00","level":"INFO","msg":"revoked the tokens bound to workspaces that no longer exist","count":2}
 ```
 
+The maintenance task `secret_reencryption` writes one info line in every
+pass that ends without a store error: `converted` is the number of values it
+sealed again under the current key, `remaining` the number of stored values
+still not under the current key (every value when no current key is
+configured), the values that fail to open under the previous key included.
+Once `remaining` is `0` the previous key can be removed (see
+[configuration.md](configuration.md#secret-keys)):
+
+```json
+{"time":"2026-11-14T10:13:00.000000+01:00","level":"INFO","msg":"secret re-encryption","converted":5,"remaining":0}
+```
+
 When a stop stops waiting for something whose grace or the 30-second limit
 has passed, it writes one line naming it in `work`: `requests`,
 `maintenance loop` or the name of a piece of background work:

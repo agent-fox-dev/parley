@@ -14,6 +14,11 @@ import (
 // and writes its start report.
 const secretsHook = "secrets"
 
+// reencryptionTask is the name of the maintenance task that re-seals the
+// values under the previous key with the current one, which the maintenance
+// loop runs in its fixed place.
+const reencryptionTask = "secret_reencryption"
+
 // The configuration key the current secret key may be read from.
 const (
 	secretsSection = "secrets"
@@ -29,7 +34,9 @@ const (
 // clock and scrubber and the event component, and reads the start report,
 // which the hub writes once it has bound the listener: the `secret
 // encryption` line, and the warning that secrets cannot be stored when no
-// current key is configured. It registers the removal of a user's and an
+// current key is configured. Every maintenance pass runs the re-encryption
+// under the name secret_reencryption, which finishes a key rotation and
+// reports what remains under another key. It registers the removal of a user's and an
 // org's secrets on the identity service, so that the delete of a user or an
 // org removes them in its own transaction and a refused or failed delete
 // keeps them (docs/adr/03-register-removers-of-owned-data-on-the-identity-service.md).
@@ -55,6 +62,9 @@ func composeSecrets(c *Composition) {
 		return err
 	})
 	c.addStartReport(func(logger *slog.Logger) { report.Log(logger) })
+	c.AddMaintenanceTask(reencryptionTask, func(ctx context.Context, rt *Runtime) error {
+		return c.secrets.Reencrypt(ctx, rt.Logger)
+	})
 	c.identity.RegisterUserRemover(func(ctx context.Context, tx *sql.Tx, id string) error {
 		return c.secrets.RemoveScope(ctx, tx, secret.ScopeUser, id)
 	})

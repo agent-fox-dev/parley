@@ -38,3 +38,21 @@ bound, right before the `listening` line
 ([ADR 06](../adr/06-load-the-secret-keys-before-the-stores-open.md)). The
 lines, their members and the count are the ones the package specifies; a
 start that fails after the hook has run writes no report.
+
+## A converter is given the keys, and a store failure writes no re-encryption line
+
+The package has the re-encryption run converters that re-seal a part's own
+values and return `(converted, remaining)`. A converter needs the keys the
+hub loaded to open and seal those values, and the component keeps them to
+itself, so a `secret.Converter` is `func(ctx context.Context, keys
+secret.Keys) (converted, remaining int, err error)`: it is given the
+component's keys, and converts nothing when either the current or the
+previous key is absent, as the task does for the secrets.
+
+The package ends every run of `secret_reencryption` with the line `secret
+re-encryption`. A run that a store failure stops returns the error before
+the converters run and before the line is written: the counts of a store
+that failed mid-run are not known, and the maintenance loop logs the error
+as `maintenance task failed` with `task` `secret_reencryption`. Every run
+that the store does not stop writes the line, one that a converter's error
+fails included.
