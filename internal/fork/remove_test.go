@@ -2,16 +2,19 @@ package fork_test
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
 	"reflect"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"uuid"
 
+	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/fork"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/identity"
@@ -268,6 +271,159 @@ func TestDeleteFork_RecordsADiscardThatFails(t *testing.T) {
 		`SELECT parent_slug FROM fork_discards WHERE slug = ?`, h.slug).Scan(&parent); err != nil || parent != parentSlug {
 		t.Errorf("pending discard of %s: parent %q, %v; want one of %s", h.slug, parent, err, parentSlug)
 	}
+}
+
+func TestRemoveForksOf_RemovesEveryForkInTheParentsTransaction(t *testing.T) {
+	t.Parallel()
+	w, r := newRemovalWorld(t)
+	actor := identity.Principal{Type: identity.TypeAPIKey, User: &identity.User{ID: w.dev}}
+	var hs []held
+	for _, slug := range []string{"demo--b", "demo--a", "demo--c"} {
+		hs = append(hs, w.seedHeld(t, slug))
+	}
+	slices.SortFunc(hs, func(a, b held) int { return strings.Compare(a.slug, b.slug) })
+	want := []string{"demo--a", "demo--b", "demo--c"}
+
+	t.Run("rolled back", func(t *testing.T) {
+		r.take()
+		w.removeForksOf(t, parentSlug, actor, false, nil)
+		for _, h := range hs {
+			w.whole(t, h)
+		}
+		if evs := w.eventsOf(t, fork.EventDelete); len(evs) != 0 {
+			t.Errorf("delete events = %d, want none", len(evs))
+		}
+	})
+
+	t.Run("committed", func(t *testing.T) {
+		r.take()
+		slugs := w.removeForksOf(t, parentSlug, actor, true, func() {
+			for _, h := range hs {
+				if got := w.head(t, w.workspaces.RepoPath(h.slug), "task"); got != h.task {
+					t.Errorf("before the commit, branch task of %s = %q, want %s", h.slug, got, h.task)
+				}
+			}
+		})
+		if !reflect.DeepEqual(slugs, want) {
+			t.Errorf("removed forks = %v, want %v", slugs, want)
+		}
+		if n, err := fork.CountOf(context.Background(), w.Store.Main(), parentSlug); err != nil || n != 0 {
+			t.Errorf("forks of demo = %d, %v, want none", n, err)
+		}
+		for _, h := range hs {
+			wantError(t, w.get(t, h.pat, "/user"), http.StatusUnauthorized, "unauthenticated")
+			if _, err := os.Stat(w.workspaces.RepoPath(h.slug)); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("repository of %s: %v, want it gone with its own branches", h.slug, err)
+			}
+		}
+		removed, closed, sandboxes := r.take()
+		wantClosed := [][2]string{{want[0], "workspace deleted"}, {want[1], "workspace deleted"}, {want[2], "workspace deleted"}}
+		if !reflect.DeepEqual(removed, want) || !reflect.DeepEqual(closed, wantClosed) || len(sandboxes) != 0 {
+			t.Errorf("remover asked %v, session closer %v, sandboxes %v; want %v, %v and no sandbox call", removed, closed, sandboxes, want, wantClosed)
+		}
+		evs := w.eventsOf(t, fork.EventDelete)
+		if len(evs) != len(hs) {
+			t.Fatalf("delete events = %d, want %d", len(evs), len(hs))
+		}
+		for _, h := range hs {
+			i := slices.IndexFunc(evs, func(e event.Record) bool { return e.Workspace != nil && *e.Workspace == h.slug })
+			if i < 0 {
+				t.Errorf("no delete event of %s", h.slug)
+				continue
+			}
+			ev := evs[i]
+			if ev.ActorType != identity.TypeAPIKey || ev.ActorID == nil || *ev.ActorID != w.dev {
+				t.Errorf("actor of %s's event = %s %v, want dev's key", h.slug, ev.ActorType, ev.ActorID)
+			}
+			var meta map[string]any
+			if err := json.Unmarshal(ev.Metadata, &meta); err != nil {
+				t.Fatal(err)
+			}
+			wantMembers(t, meta, map[string]any{"kind": "fork", "parent_slug": parentSlug, "revoked_tokens": []any{h.patID}})
+			wantAbsent(t, meta, "deleted_forks")
+		}
+		if evs := w.eventsOf(t, fork.EventExpire); len(evs) != 0 {
+			t.Errorf("parley.fork.expire events = %d, want none", len(evs))
+		}
+	})
+
+	t.Run("parent without forks", func(t *testing.T) {
+		before := len(w.eventsOf(t, fork.EventDelete))
+		if slugs := w.removeForksOf(t, parentSlug, actor, true, nil); slugs == nil || len(slugs) != 0 {
+			t.Errorf("removed forks = %#v, want an empty list", slugs)
+		}
+		if got := len(w.eventsOf(t, fork.EventDelete)); got != before {
+			t.Errorf("delete events = %d, want %d", got, before)
+		}
+	})
+}
+
+func TestDelete_RemovesTheForksOfAnArchivedParent(t *testing.T) {
+	t.Parallel()
+	w, _ := newRemovalWorld(t)
+	const parent = "demo2"
+	w.addParent(t, parent, func(ws *workspace.Workspace) { ws.Status = workspace.StatusArchived })
+	want := []string{parent + "--a", parent + "--b"}
+	var hs []held
+	for _, slug := range want {
+		hs = append(hs, w.seedHeld(t, slug, func(f *fork.Fork) { f.ParentSlug = new(parent) }))
+	}
+	if a := w.call(t, http.MethodDelete, "/workspaces/"+parent, w.devKey, nil); a.status != http.StatusNoContent {
+		t.Fatalf("DELETE %s = %d %s, want 204", parent, a.status, a.body)
+	}
+	if n, err := fork.CountOf(context.Background(), w.Store.Main(), parent); err != nil || n != 0 {
+		t.Errorf("forks of %s = %d, %v, want none", parent, n, err)
+	}
+	for _, h := range hs {
+		if evs := w.eventsFor(t, fork.EventDelete, h.slug); len(evs) != 1 {
+			t.Errorf("delete events of %s = %d, want 1", h.slug, len(evs))
+		}
+		if _, err := os.Stat(w.workspaces.RepoPath(h.slug)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("repository of %s: %v, want it gone", h.slug, err)
+		}
+	}
+	evs := w.eventsFor(t, fork.EventDelete, parent)
+	if len(evs) != 1 {
+		t.Fatalf("delete events of %s = %d, want 1", parent, len(evs))
+	}
+	var meta struct {
+		DeletedForks []string `json:"deleted_forks"`
+	}
+	if err := json.Unmarshal(evs[0].Metadata, &meta); err != nil || !reflect.DeepEqual(meta.DeletedForks, want) {
+		t.Errorf("deleted_forks = %v (%v), want %v", meta.DeletedForks, err, want)
+	}
+}
+
+// removeForksOf runs RemoveForksOf for the forks of parent by actor in a
+// transaction of the hub's store, with during run inside it after the step
+// (nil for nothing), and returns the removed slugs. When commit is set the
+// transaction commits and the step's discard runs after it; otherwise the
+// transaction rolls back and the discard never runs.
+func (w *world) removeForksOf(t *testing.T, parent string, actor identity.Principal, commit bool, during func()) []string {
+	t.Helper()
+	rollback := errors.New("roll back")
+	var slugs []string
+	var discard func()
+	err := w.Store.Tx(context.Background(), func(tx *sql.Tx) error {
+		var err error
+		if slugs, discard, err = w.forks.RemoveForksOf(context.Background(), tx, parent, actor); err != nil {
+			return err
+		}
+		if during != nil {
+			during()
+		}
+		if !commit {
+			return rollback
+		}
+		return nil
+	})
+	switch {
+	case !commit && !errors.Is(err, rollback), commit && err != nil:
+		t.Fatalf("RemoveForksOf in a transaction: %v", err)
+	case commit:
+		discard()
+	}
+	return slugs
 }
 
 // countForks is CountTaskForks, failing the test on its error.

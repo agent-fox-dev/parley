@@ -1907,8 +1907,9 @@ workspace's last. When anything in that transaction fails, nothing has
 changed, the repository data included, and the answer is `500 internal`.
 Once it has committed, the hub's copies of the removed workspaces are
 removed from disk; a copy that cannot be removed is logged with the slug
-and the path, and the answer stays `204`. Every event written about the
-workspace and its forks before the delete stays in the event log. The slug
+and the path, a fork's also kept for a later removal, and the answer stays
+`204`. Every event written about the workspace and its forks before the
+delete stays in the event log. The slug
 is free again afterwards:
 [`POST /api/v1/workspaces`](#post-apiv1workspaces) takes it as a slug that
 was never used.
