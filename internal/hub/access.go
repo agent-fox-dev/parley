@@ -4,8 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"slices"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/server"
 )
@@ -22,17 +24,37 @@ import (
 // because its memberships go with it.
 // The service is kept on the composition, so that the event component
 // decides with the same rule and the same memberships.
+//
+// The service's binding guard is installed in the binding-guard position of
+// the pipeline, so that it runs for every REST route, and the start hook
+// gives the event component the covered set of a workspace-bound token, from
+// which the event routes confine such a token's events to what its binding
+// covers.
 func composeAccess(c *Composition) {
 	svc := &access.Service{}
 	c.access = svc
 	c.AddSchemaStep(access.SchemaStep)
 	c.AddSchemaStep(access.CreatingTokenStep)
+	c.SetBindingGuard(svc.Guard)
 	c.AddAccessCheck(svc.Check)
 	c.addRouteRule(refusePublicNeed)
 	c.AddStartHook("access", func(_ context.Context, rt *Runtime) error {
 		db := rt.Store.Main()
 		svc.Bind(access.Deps{Records: access.StoreRecords(db), Memberships: activeOrgs(db)})
+		c.Events().SetCoverage(coverage(svc))
 		return nil
+	})
+}
+
+// coverage is the covered set of svc's workspace-bound tokens as the event
+// component asks it: whether the binding of the caller, whose credential id
+// is the PAT's token id, covers a workspace.
+func coverage(svc *access.Service) event.Coverage {
+	return event.CoverageFunc(func(ctx context.Context, ec event.Caller, slug string) (bool, error) {
+		covered, err := svc.CoveredSet(ctx, access.Caller{
+			Admin: ec.Admin, UserID: ec.UserID, TokenID: ec.CredentialID, Workspace: ec.Workspace,
+		})
+		return slices.Contains(covered, slug), err
 	})
 }
 

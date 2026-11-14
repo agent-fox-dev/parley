@@ -200,6 +200,7 @@ type answer struct {
 	status      int
 	contentType string
 	body        []byte
+	allow       string
 }
 
 // get calls GET path, under /api/v1, as caller ("" for none).
@@ -216,7 +217,7 @@ func (p *probe) call(method, caller, path string) answer {
 	}
 	rec := httptest.NewRecorder()
 	p.srv.Handler().ServeHTTP(rec, r)
-	return answer{rec.Code, rec.Header().Get("Content-Type"), rec.Body.Bytes()}
+	return answer{rec.Code, rec.Header().Get("Content-Type"), rec.Body.Bytes(), ""}
 }
 
 // envelope is the error envelope's error object, or the probe's answer.
@@ -229,6 +230,7 @@ type envelope struct {
 	Level   access.Level  `json:"level"`
 	Record  access.Record `json:"record"`
 	Binding *binding      `json:"binding"`
+	Covered []string      `json:"covered"`
 }
 
 // binding is the binding a guard probe found, as it answers it.
@@ -313,7 +315,8 @@ func (e *recordingEmitter) all() []emitted {
 // temporary directory with the identity and workspace record steps. Users
 // and credentials are stored with identity's own functions; the active orgs
 // of a user come from orgs. The guard's refusals go to refusals. Probe
-// routes answer 200 with the binding they find and count their calls.
+// routes answer 200 with the binding they find, with its covered set, and
+// count their calls.
 type guardHub struct {
 	t        *testing.T
 	st       *store.Store
@@ -331,7 +334,7 @@ func newGuardHub(t *testing.T) *guardHub {
 	st, err := store.Open(context.Background(), store.Options{
 		DatabasePath:  filepath.Join(dir, "parley.db"),
 		WorkspaceRoot: filepath.Join(dir, "workspaces"),
-	}, []store.Step{identity.SchemaStep, access.SchemaStep, access.CreatingTokenStep})
+	}, []store.Step{identity.SchemaStep, identity.AdminSettingsStep, access.SchemaStep, access.CreatingTokenStep})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -346,15 +349,18 @@ func newGuardHub(t *testing.T) *guardHub {
 		}),
 		Refusals: h.refusals,
 	})
-	h.srv = h.pipeline()
+	h.srv = h.pipeline(true)
 	return h
 }
 
-// pipeline is a server with the hub's checks installed and no route.
-func (h *guardHub) pipeline() *server.Server {
+// pipeline is a server with the hub's checks installed, the binding guard
+// only when guarded, and no route.
+func (h *guardHub) pipeline(guarded bool) *server.Server {
 	srv := server.New(server.Options{Logger: slog.New(slog.DiscardHandler), RateLimitDisabled: true})
 	srv.SetAuthenticator(h.ids.Authenticate)
-	srv.SetBindingGuard(h.svc.Guard)
+	if guarded {
+		srv.SetBindingGuard(h.svc.Guard)
+	}
 	srv.SetScopeCheck(identity.ScopeCheck)
 	srv.AddAccessCheck(h.ids.AdminCheck)
 	srv.AddAccessCheck(h.svc.Check)
@@ -365,8 +371,52 @@ func (h *guardHub) pipeline() *server.Server {
 // its own, for routes whose patterns one router cannot hold together.
 func (h *guardHub) fresh() *guardHub {
 	c := *h
-	c.srv = h.pipeline()
+	c.srv = h.pipeline(true)
 	return &c
+}
+
+// unguarded is the same hub served by a server of its own without the
+// binding guard.
+func (h *guardHub) unguarded() *guardHub {
+	c := *h
+	c.srv = h.pipeline(false)
+	return &c
+}
+
+// identityRoutes registers identity's routes: the identity, credential and
+// admin routes.
+func (h *guardHub) identityRoutes() {
+	for _, r := range h.ids.Routes() {
+		h.srv.Register(r)
+	}
+}
+
+// admin issues the hub's admin token and returns it.
+func (h *guardHub) admin() string {
+	h.t.Helper()
+	var token string
+	err := identity.IssueAdminToken(context.Background(), h.st, "boss@example.com", func(v string) error {
+		token = v
+		return nil
+	})
+	if err != nil {
+		h.t.Fatalf("issue the admin token: %v", err)
+	}
+	return token
+}
+
+// key issues an API key of userID and returns it.
+func (h *guardHub) key(userID string) string {
+	h.t.Helper()
+	var key string
+	err := h.st.Tx(context.Background(), func(tx *sql.Tx) (err error) {
+		key, _, err = identity.IssueAPIKey(context.Background(), tx, userID, 0, time.Now())
+		return err
+	})
+	if err != nil {
+		h.t.Fatalf("issue an API key of %s: %v", userID, err)
+	}
+	return key
 }
 
 // user creates the user name with the role user and returns its id and
@@ -390,31 +440,48 @@ func (h *guardHub) user(name string) (id, org string) {
 // and returns its value and its token_id.
 func (h *guardHub) pat(userID, workspace string, perms ...string) (value, tokenID string) {
 	h.t.Helper()
+	return h.storePAT(identity.PATSpec{UserID: userID, Permissions: perms, Workspace: workspace})
+}
+
+// storePAT stores the PAT spec describes, named agent and created now, and
+// returns its value and its token_id.
+func (h *guardHub) storePAT(spec identity.PATSpec) (value, tokenID string) {
+	h.t.Helper()
+	spec.Name, spec.CreatedAt = "agent", time.Now()
 	err := h.st.Tx(context.Background(), func(tx *sql.Tx) error {
-		v, rec, err := identity.StorePAT(context.Background(), tx, identity.PATSpec{
-			UserID: userID, Name: "agent", Permissions: perms, Workspace: workspace, CreatedAt: time.Now(),
-		})
+		v, rec, err := identity.StorePAT(context.Background(), tx, spec)
 		value, tokenID = v, rec.TokenID
 		return err
 	})
 	if err != nil {
-		h.t.Fatalf("store a PAT of %s: %v", userID, err)
+		h.t.Fatalf("store a PAT of %s: %v", spec.UserID, err)
 	}
 	return value, tokenID
 }
 
-// probe registers a probe route method pattern that declares need and
-// scope.
+// probe registers a probe route method pattern that declares need ("" for
+// none, a route that names no workspace) and scope. It answers the binding
+// it finds and the covered set of that binding, as a route that confines
+// its result reads it.
 func (h *guardHub) probe(method, pattern string, need access.Need, scope string) {
+	var marks map[string]string
+	if need != "" {
+		marks = map[string]string{access.MarkNeed: string(need)}
+	}
 	h.srv.Register(server.Route{
-		Method: method, Pattern: pattern, Scope: scope, Marks: map[string]string{access.MarkNeed: string(need)},
+		Method: method, Pattern: pattern, Scope: scope, Marks: marks,
 		Handler: func(w http.ResponseWriter, r *http.Request) error {
 			h.calls.Add(1)
 			var found *binding
+			var covered []string
 			if b, ok := access.BindingOf(r); ok {
 				found = &binding{BoundWorkspace: b.Workspace, Relation: b.Relation}
+				var err error
+				if covered, err = h.svc.CoveredSet(r.Context(), access.Caller{TokenID: b.TokenID, Workspace: b.Workspace}); err != nil {
+					return err
+				}
 			}
-			server.WriteJSON(w, http.StatusOK, map[string]any{"binding": found})
+			server.WriteJSON(w, http.StatusOK, map[string]any{"binding": found, "covered": covered})
 			return nil
 		},
 	})
@@ -427,7 +494,7 @@ func (h *guardHub) do(method, path, credential string) answer {
 	r.Header.Set("Authorization", "Bearer "+credential)
 	rec := httptest.NewRecorder()
 	h.srv.Handler().ServeHTTP(rec, r)
-	return answer{rec.Code, rec.Header().Get("Content-Type"), rec.Body.Bytes()}
+	return answer{rec.Code, rec.Header().Get("Content-Type"), rec.Body.Bytes(), rec.Header().Get("Allow")}
 }
 
 // refusalLog is a refusal reporter that remembers, in order, each refusal.

@@ -42,3 +42,18 @@ record, so a fork can never exist for a moment without its creator.
 `access.SchemaStep`, so that a store whose workspace table exists gains it.
 `CreatingTokenID` has no JSON name, so no answer that shows a record shows
 it.
+
+## The binding reaches the handler attached to the request
+
+The package says the binding guard places the binding "in the request
+context", where the handler reads it, and that for an API key, the admin
+token and an unbound PAT it places none there. The guard is a
+`server.Check`, which cannot hand a new context to the handler, so it
+attaches the binding to the request with `server.Attach`, as ADR 04 lets
+every check do, and the handler reads it with `access.BindingOf(r)`, which
+reports false for every caller but a bound PAT. On an allowlisted route,
+which names no workspace, the attached `access.Binding` carries the token
+id and the bound slug with no relation; the handler gets the covered set
+with `CoveredSet(ctx, access.Caller{TokenID: b.TokenID, Workspace:
+b.Workspace})`. On git, which has no pipeline check, `GuardGit` returns the
+binding in its `access.GitDecision` instead.

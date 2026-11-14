@@ -3,7 +3,7 @@
   "spec_id": "08",
   "spec_name": "workspace_bound_tokens",
   "schema_version": 3,
-  "updated_at": "2026-11-14T03:21:52Z",
+  "updated_at": "2026-11-14T03:30:20Z",
   "tasks": [
     {
       "id": 1,
@@ -15,7 +15,7 @@
     },
     {
       "id": 3,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 4,

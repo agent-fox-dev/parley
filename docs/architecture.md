@@ -11,7 +11,7 @@ command-line client. Both are written in Go, in the module
 |---|---|
 | `cmd/parley` | the `parley` program: it calls `cli.Run` and exits with its status |
 | `cmd/parleyd` | the `parleyd` program: `main` calls `hub.Run` with the process's arguments, environment and working directory and exits with its status |
-| `internal/access` | the workspace access rule, the one place that decides what a caller may do on a workspace; the minimal workspace record (slug, owner, org, kind, parent, status, the creating token of a fork) in the transactional store, the caller's level on a workspace, the decision for a declared need and the REST access check, the readable set for reads across workspaces, what the binding of a workspace-bound PAT covers, and the binding guard that confines such a PAT on the routes that name a workspace |
+| `internal/access` | the workspace access rule, the one place that decides what a caller may do on a workspace; the minimal workspace record (slug, owner, org, kind, parent, status, the creating token of a fork) in the transactional store, the caller's level on a workspace, the decision for a declared need and the REST access check, the readable set for reads across workspaces, what the binding of a workspace-bound PAT covers, and the binding guard that confines such a PAT on every REST route and, for the git server, on git |
 | `internal/buildinfo` | the version, commit and build time the binary was built with, shared by both programs |
 | `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra`, each declared through one helper ([ADR 02](adr/02-declare-every-cli-command-through-one-helper.md)), the client configuration file, the resolution of the hub URL and the credential, the one HTTP client the commands send their requests with, the printing of a command's result on stdout and of its warnings on stderr, the shared wait for a long operation (`--wait`, `--timeout`, `--poll-interval`), and the error envelopes and exit statuses every command ends with |
 | `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, and a registry of keys and whole sections that decides what the file may hold |
@@ -1167,11 +1167,18 @@ keeps data for a user or an org registers its remover from its part in
 `internal/hub/access.go` adds the part `composeAccess`, after
 `composeIdentity` in `parts`. It adds the schema steps `access.SchemaStep`
 (`workspace_records`) and, after it, `access.CreatingTokenStep`
-(`workspace_creating_token`), registers a zero `access.Service`, adds its
+(`workspace_creating_token`), registers a zero `access.Service`, installs
+its `Guard` as the pipeline's binding guard (`SetBindingGuard`), adds its
 `Check` to the access checks, after identity's admin check, and binds it in
 the start hook `access` to `access.Deps{Records:
 access.StoreRecords(rt.Store.Main()), Memberships: ...}`, the membership
-source being `identity.ActiveOrgIDs` over the same store. It adds the route
+source being `identity.ActiveOrgIDs` over the same store. The same hook
+installs the covered set of workspace-bound tokens in the event component,
+`c.Events().SetCoverage(...)`: an `event.CoverageFunc` that answers whether
+`(*access.Service).CoveredSet` of the caller contains the slug, with the
+`event.Caller`'s `CredentialID` (the PAT's token id) as `TokenID` and its
+`Workspace` as the binding. The hook runs before the `events` hook, whose
+bind keeps what `SetCoverage` installed. It adds the route
 rule `refusePublicNeed`: a route that is `Public` and declares
 `access.MarkNeed` stops the start with `compose the routes: <method>
 <pattern>: a public route cannot declare the workspace need access.need:
@@ -1392,12 +1399,27 @@ for every caller but a bound PAT.
 
 `internal/access/guard.go` holds the binding guard, `(*Service).Guard`, a
 `server.Check` for the binding-guard position of the pipeline, after the
-route's feature check and before the scope check. The hub does not install
-it yet. It does nothing for the admin token, an API key and a PAT that is
-not bound, and decides nothing on a route that names no workspace. A route
-names a workspace when its pattern is `/workspaces/:slug` or lies under it;
-the slug is the path value as typed. For a bound PAT the guard asks
-`RelationOf` and:
+route's feature check and before the scope check; `composeAccess` installs
+it. It runs only on a route that matched, for a caller that authenticated,
+since routing and authentication answer first, and never on a public route.
+It does nothing for the admin token, an API key and a PAT that is not
+bound. A route names a workspace when its pattern is `/workspaces/:slug` or
+lies under it; the slug is the path value as typed. On a route that names
+no workspace a bound PAT passes when the method and the pattern, relative to
+`/api/v1`, are in the allowlist of `internal/access/allowlist.go`, with the
+`Binding` of the bound slug and no relation attached, from which the
+route's handler reads the covered set it confines its result to
+(`CoveredSet(ctx, access.Caller{TokenID: b.TokenID, Workspace:
+b.Workspace})`); every other such route, every identity and admin route
+among them, is answered `403 token_bound` with the message `a token bound
+to a workspace cannot use this route`, before the scope check, whatever
+scopes the token holds. The allowlist is `GET /workspaces`, `GET /events`,
+`GET /events/log`, `GET /audit`, `GET /sandbox-profiles`, `POST` and `GET
+/sessions`, `GET /sessions/:id`, `POST /sessions/:id/complete`, and `POST`
+and `GET /sessions/:id/usage`; like the contributor table it matches the
+pattern as registered, so a route reaches a bound token only when it is
+registered with these parameter names. On a route that names a workspace,
+for a bound PAT the guard asks `RelationOf` and:
 
 - for `bound` and `created_fork`, attaches the `Binding` and passes;
 - for `parent_of_bound_fork`, attaches the `Binding` and passes when the
@@ -1414,8 +1436,21 @@ check and the access checks as an unbound PAT of the same user would. Each
 `access.RefusalReporter` (`Refused(ctx, access.Refusal)`; nil discards),
 as `access.Refusal{TokenID, UserID, BoundWorkspace, RequestedWorkspace,
 Method, Route, Status, Surface}`, where `Route` is `/api/v1` followed by the
-matched pattern and `Surface` is `access.SurfaceAPI` (`"api"`). A failed read
-of the records is an error, answered `500 internal`.
+matched pattern, `RequestedWorkspace` is nil on a route that names no
+workspace, and `Surface` is `access.SurfaceAPI` (`"api"`). A failed read of
+the records is an error, answered `500 internal`.
+
+`(*Service).GuardGit(ctx, caller, slug, method, pattern)` is the same guard
+for the git server, which calls it after authentication with the
+`server.Caller`, the slug of the repository, the method and the matched git
+route's pattern, and returns an `access.GitDecision{Pass, Status, Binding}`.
+A bound PAT passes with its `*Binding` on the bound workspace and on a fork
+the token created; on every other slug, the parent of the bound fork
+included, `Pass` is false and `Status` `404`, and the refusal is reported
+with `Surface` `access.SurfaceGit` (`"git"`), `Route` the git pattern as
+given and `RequestedWorkspace` the slug. The admin token, an API key and an
+unbound PAT pass with a nil `Binding`. A failed read is a zero decision and
+the error. No git server calls it yet.
 
 `internal/access/contributor_routes.go` holds the contributor table, the 25
 routes a token bound to a fork reaches on the fork's parent, as method and
@@ -1602,8 +1637,10 @@ route). The rules:
   `resource_id`, has the fork as its source, asked through the
   `event.ChangeSources` installed with `(*Component).SetChangeSources`.
   Without a covered set a bound token sees nothing; without a change lookup
-  it sees none of the parent's events. Nothing installs either yet, so a
-  bound token sees no event.
+  it sees none of the parent's events. The hub installs the covered set of
+  `access.Service` (see [Workspace access](#workspace-access)); nothing
+  installs a change lookup yet, so a fork-bound token sees none of the
+  parent's events.
 
 A read that fails returns `false` with the error, never a grant. The
 covered set and the change lookup are kept apart from `Deps`, so the bind in
