@@ -50,14 +50,32 @@ func TestUpdate_RefusesInvalidForkFields(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t, nil)
 	w.seedFork(t, "demo--f")
-	for name, body := range map[string]map[string]any{
-		"null auto_change": {"auto_change": nil}, "string auto_change": {"auto_change": "no"}, "number auto_change": {"auto_change": 0},
-		"number purpose": {"purpose": 7}, "purpose of 1025": {"purpose": strings.Repeat("x", 1025)},
-		"valid purpose, string auto_change": {"purpose": "ok", "auto_change": "no"},
+	for _, c := range []struct {
+		name string
+		body map[string]any
+		msg  string
+	}{
+		{"null auto_change", map[string]any{"auto_change": nil}, "auto_change: must be true or false"},
+		{"string auto_change", map[string]any{"auto_change": "no"}, "auto_change: must be true or false"},
+		{"number auto_change", map[string]any{"auto_change": 0}, "auto_change: must be true or false"},
+		{"number purpose", map[string]any{"purpose": 7}, "purpose: must be a string"},
+		{"purpose of 1025", map[string]any{"purpose": strings.Repeat("x", 1025)}, "purpose: must be at most 1024 characters long"},
+		{"valid purpose, string auto_change", map[string]any{"purpose": "ok", "auto_change": "no"}, "auto_change: must be true or false"},
+		{"null ttl", map[string]any{"ttl": nil}, "ttl: must be a string"},
+		{"number ttl", map[string]any{"ttl": 3600}, "ttl: must be a string"},
+		{"boolean ttl", map[string]any{"ttl": true}, "ttl: must be a string"},
+		{"ttl that is not a duration", map[string]any{"ttl": "soon"}, "ttl: must end in one unit: m, h or d"},
+		{"ttl under 5m", map[string]any{"ttl": "4m"}, "ttl: must be at least 5m"},
+		{"ttl over max_ttl", map[string]any{"ttl": "31d"}, "ttl: must be at most 30d, the hub's [forks].max_ttl"},
+		{"valid description, ttl under 5m", map[string]any{"ttl": "4m", "description": "x"}, "ttl: must be at least 5m"},
 	} {
-		t.Run(name, func(t *testing.T) {
+		t.Run(c.name, func(t *testing.T) {
 			before, n := w.record(t, "demo--f"), len(w.eventsOf(t, "parley.workspace.update"))
-			wantError(t, w.patch(t, w.devKey, forkPath, body), http.StatusBadRequest, "invalid_request")
+			r := w.patch(t, w.devKey, forkPath, c.body)
+			wantError(t, r, http.StatusBadRequest, "invalid_request")
+			if e, _ := r.object(t, http.StatusBadRequest)["error"].(map[string]any); e["message"] != c.msg {
+				t.Errorf("message = %v, want %q", e["message"], c.msg)
+			}
 			if got := w.record(t, "demo--f"); !reflect.DeepEqual(got, before) {
 				t.Errorf("fork = %+v, want it unchanged from %+v", got, before)
 			}
@@ -81,21 +99,27 @@ func TestUpdate_RefusedByParentState(t *testing.T) {
 	}{
 		{"archived", workspace.StatusArchived, workspace.MarkerNone, "parent_archived"},
 		{"pending", workspace.StatusPending, workspace.MarkerNone, "workspace_busy"},
+		{"cloning", workspace.StatusCloning, workspace.MarkerNone, "workspace_busy"},
 		{"maintenance marker set", workspace.StatusReady, workspace.MarkerDelete, "workspace_busy"},
 		{"failed", workspace.StatusFailed, workspace.MarkerNone, "workspace_not_ready"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			w.setParent(t, c.status, c.marker)
-			before := w.record(t, "demo--f")
-			for _, body := range []map[string]any{{"purpose": "p"}, {"auto_change": false}, {"display_name": "n"}} {
+			before, n := w.record(t, "demo--f"), len(w.eventsOf(t, "parley.workspace.update"))
+			for _, body := range []map[string]any{{"purpose": "p"}, {"auto_change": false}, {"display_name": "n"}, {"ttl": "1d"}} {
 				wantError(t, w.patch(t, w.devKey, forkPath, body), http.StatusConflict, c.want)
 			}
 			if got := w.record(t, "demo--f"); !reflect.DeepEqual(got, before) {
 				t.Errorf("fork = %+v, want it unchanged from %+v", got, before)
 			}
+			if got := len(w.eventsOf(t, "parley.workspace.update")); got != n {
+				t.Errorf("update events = %d, want %d", got, n)
+			}
 			if c.status == workspace.StatusArchived {
 				w.get(t, w.devKey, forkPath).object(t, http.StatusOK)
-				wantError(t, w.patch(t, w.devKey, forkPath, map[string]any{"auto_change": nil}), http.StatusBadRequest, "invalid_request")
+				for _, body := range []map[string]any{{"auto_change": nil}, {"ttl": "4m"}} {
+					wantError(t, w.patch(t, w.devKey, forkPath, body), http.StatusBadRequest, "invalid_request")
+				}
 			}
 		})
 	}

@@ -3,6 +3,7 @@ package fork
 import (
 	"context"
 	"database/sql"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -70,6 +71,18 @@ type Deps struct {
 	// nil; nil means Store.Tx. A test makes the commit fail to see the
 	// create clean up.
 	Transact func(ctx context.Context, fn func(*sql.Tx) error) error
+	// RemoveRepo removes the repository of a removed fork at dir, with its
+	// own branches; nil means gitrepo.Remove. A test makes it fail to see
+	// the discard recorded for later.
+	RemoveRepo func(dir string) error
+	// Logger logs what a removal cannot report to its caller, such as a
+	// discard that failed or a fork the sweep could not remove; nil
+	// discards it.
+	Logger *slog.Logger
+	// SweepTicks starts the ticker of the sweep and returns its ticks and
+	// the function that stops it; nil means a time.Ticker of
+	// SweepInterval. A test replaces it to drive the sweep.
+	SweepTicks func() (<-chan time.Time, func())
 }
 
 // Component is the fork feature of one hub. The hub uses its zero value and
@@ -85,6 +98,15 @@ type Component struct {
 	// nil while none is: no session exists, and sandboxes are disabled.
 	linker  SessionLinker
 	sandbox SandboxCreator
+	// sandboxes is the sandbox lifecycle a removal asks, nil while none is
+	// registered: a fork then has no sandboxes.
+	sandboxes SandboxLifecycle
+	// changes is the change reader of the early expiry, nil while none is
+	// registered: a fork then has no changes.
+	changes ChangeReader
+	// passMu is held by the sweep pass that runs, so that two never run at
+	// once.
+	passMu sync.Mutex
 }
 
 // Bind binds the component to d. It is called once, before the hub serves.
@@ -100,6 +122,15 @@ func (c *Component) Bind(d Deps) {
 	}
 	if d.Transact == nil && d.Store != nil {
 		d.Transact = d.Store.Tx
+	}
+	if d.RemoveRepo == nil {
+		d.RemoveRepo = gitrepo.Remove
+	}
+	if d.Logger == nil {
+		d.Logger = slog.New(slog.DiscardHandler)
+	}
+	if d.SweepTicks == nil {
+		d.SweepTicks = realTicks
 	}
 	c.deps = d
 }

@@ -43,7 +43,7 @@ func TestRun_RunsTheStartStagesInOrderAndListensLast(t *testing.T) {
 			<-releaseHook
 			return nil
 		})
-		c.AddMaintenanceTask("fork_expiry", func(ctx context.Context, _ *hub.Runtime) error {
+		c.AddMaintenanceTask("patch_purge", func(ctx context.Context, _ *hub.Runtime) error {
 			log.add("pass")
 			select {
 			case <-releaseTask:
@@ -463,7 +463,7 @@ func TestRun_LogsAFailingMaintenanceTaskAtEveryPassAndKeepsServing(t *testing.T)
 				_, err := tx.ExecContext(ctx, "CREATE TABLE passes (task TEXT NOT NULL)")
 				return err
 			}})
-			c.AddMaintenanceTask("fork_expiry", insert("fork_expiry"))
+			c.AddMaintenanceTask("patch_purge", insert("patch_purge"))
 			c.AddMaintenanceTask("claim_cleanup", func(context.Context, *hub.Runtime) error {
 				return errors.New("claims unreachable at https://u:p@h/x")
 			})
@@ -488,7 +488,7 @@ func TestRun_LogsAFailingMaintenanceTaskAtEveryPassAndKeepsServing(t *testing.T)
 		return errs
 	}
 	eventually(t, "three passes with a failing task", func() bool {
-		return rows("retention") >= 3 && rows("fork_expiry") >= 3 && len(failures()) >= 3
+		return rows("retention") >= 3 && rows("patch_purge") >= 3 && len(failures()) >= 3
 	})
 
 	for _, rec := range failures() {

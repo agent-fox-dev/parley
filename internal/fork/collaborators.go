@@ -59,3 +59,41 @@ func (c *Component) RegisterSessionLinker(l SessionLinker) { c.linker = l }
 // RegisterSandbox makes s the sandbox component of the create; nil removes
 // it. It is called while the hub is composed, before it serves.
 func (c *Component) RegisterSandbox(s SandboxCreator) { c.sandbox = s }
+
+// SandboxLifecycle is the sandbox component as a fork's removal and its
+// early expiry ask it. The sandbox feature registers it on the component;
+// without one a fork has no sandboxes.
+type SandboxLifecycle interface {
+	// DeleteSandboxes deletes every sandbox of the workspace slug, giving
+	// reason, and saves a checkpoint of each first when checkpoint is set.
+	// An error leaves the fork in place.
+	DeleteSandboxes(ctx context.Context, slug, reason string, checkpoint bool) error
+	// HasLiveSandbox reports whether the workspace slug has a sandbox in
+	// state provisioning or ready.
+	HasLiveSandbox(ctx context.Context, slug string) (bool, error)
+}
+
+// RegisterSandboxes makes s the sandbox lifecycle of a fork's removal; nil
+// removes it. It is called while the hub is composed, before it serves.
+func (c *Component) RegisterSandboxes(s SandboxLifecycle) { c.sandboxes = s }
+
+// SourceChange is a change as the early expiry of a fork reads it: the
+// fork's branch it proposes, and its state, such as open, landed or
+// abandoned.
+type SourceChange struct {
+	Branch string
+	State  string
+}
+
+// ChangeReader is the change component as the early expiry of a fork asks
+// it. The change feature registers it on the component; without one a fork
+// has no changes, and no fork is removed before its expires_at.
+type ChangeReader interface {
+	// ChangesFrom returns every change whose source is the fork forkSlug,
+	// in any state.
+	ChangesFrom(ctx context.Context, forkSlug string) ([]SourceChange, error)
+}
+
+// RegisterChangeReader makes r the change reader of the early expiry; nil
+// removes it. It is called while the hub is composed, before it serves.
+func (c *Component) RegisterChangeReader(r ChangeReader) { c.changes = r }

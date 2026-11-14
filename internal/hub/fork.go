@@ -2,20 +2,33 @@ package hub
 
 import (
 	"context"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/fork"
 )
 
-// forksHook is the name of the start hook that binds the fork component.
-const forksHook = "forks"
+const (
+	// forksHook is the name of the start hook that binds the fork
+	// component.
+	forksHook = "forks"
+	// forkSweepWork is the name of the background work that runs the fork
+	// sweep, and forkExpiryTask that of its maintenance task, under which
+	// package maintenance orders it.
+	forkSweepWork  = "fork_sweep"
+	forkExpiryTask = "fork_expiry"
+	// forkSweepGrace is how long the stop waits for the sweep: a removal
+	// that has begun runs to its commit or rollback, and its discard.
+	forkSweepGrace = 10 * time.Second
+)
 
 // composeForks adds the task forks: the fork fields of the workspace
 // records, after the workspace part's; the fork view of the workspace
 // service, through which every workspace object of a fork shows the head
 // the fork component computes from the parent's repository; and, in an
-// update of a fork, the handlers of purpose and auto_change and the guard
-// that refuses every update of a fork whose parent is not ready (ttl is the
-// fork lifetime's to register). Its start hook
+// update of a fork, the handlers of ttl, purpose and auto_change and the
+// guard that refuses every update of a fork whose parent is not ready; the
+// handler of ttl is a method of the component, which reads the hub's clock
+// and the [forks] limits once bound. Its start hook
 // binds the component to the stores, the workspace service, which knows
 // where the parents' and the forks' repositories are, the hub's git, and the
 // access rule, which mints a fork's token and confines the fork list to what
@@ -28,11 +41,44 @@ const forksHook = "forks"
 // the teardown collaborators registered on the workspace service. None is
 // registered here: without them every session_id is refused 400
 // unknown_session and every sandbox 404 sandboxes_disabled.
+//
+// The component is also the one place forks are removed: it is the fork
+// remover of the workspace service's teardown set, so that DELETE
+// /workspaces/:slug of a fork and the delete of a parent reach it, and it
+// removes what a fork owns through that set's RemoveOwned. The sandbox
+// feature registers its sandbox lifecycle on it (RegisterSandboxes) from
+// its own file; none is registered here, so a fork has no sandboxes to
+// delete. The pending discards of removed forks' repositories are a table
+// of their own, after the fork fields.
+//
+// The sweep that removes the forks whose lifetime has ended runs as
+// background work once the component is bound, one pass at once and one
+// every minute, and stops at the stop before the stores close; each pass of
+// the maintenance loop runs one more as the task fork_expiry. The
+// component never runs two passes at once.
+//
+// While [forks].expire_on_land is set, a pass also removes a fork a day
+// after its work has landed. It asks the change feature for the fork's
+// changes through the change reader that feature registers on the
+// component (RegisterChangeReader) from its own file; the hub has no change
+// feature yet, so none is registered here, and no fork is removed before
+// its expires_at. The day counts from the fork's last activity, a column of
+// its own after the pending discards. The features that see an activity (a
+// push to the fork, an API write to it, a change of it opened, versioned,
+// landed, abandoned or restored: the push rules, the change feature and
+// the landing) register the component's RecordActivity with their own
+// activity hook, through one adapter each, in this function; none of them
+// is in the hub yet, so none is registered, and a fork's last activity is
+// its creation.
 func composeForks(c *Composition) {
 	comp := &fork.Component{}
 	c.forks = comp
 	c.AddSchemaStep(fork.SchemaStep)
+	c.AddSchemaStep(fork.DiscardStep)
+	c.AddSchemaStep(fork.ActivityStep)
+	c.workspaces.Teardown().RegisterForkRemover(comp)
 	c.workspaces.RegisterForkView(comp.WorkspaceView)
+	c.workspaces.RegisterForkField("ttl", comp.TTLField)
 	c.workspaces.RegisterForkField("purpose", fork.PurposeField)
 	c.workspaces.RegisterForkField("auto_change", fork.AutoChangeField)
 	c.workspaces.RegisterForkUpdateGuard(fork.GuardUpdate)
@@ -42,11 +88,17 @@ func composeForks(c *Composition) {
 	c.AddStartHook(forksHook, func(_ context.Context, rt *Runtime) error {
 		git := gitFor(c.env)
 		d := fork.Deps{Store: rt.Store, Workspaces: c.workspaces, Git: git, Events: c.Events(), Access: c.access,
-			Readable: c.access, Limits: rt.Config.Forks, Now: rt.Now, CreateRepo: git.CreateFork, Transact: rt.Store.Tx}
+			Readable: c.access, Limits: rt.Config.Forks, Now: rt.Now, CreateRepo: git.CreateFork, Transact: rt.Store.Tx,
+			Logger: rt.Logger}
 		for _, adjust := range c.forkAdjusters {
 			adjust(&d)
 		}
 		comp.Bind(d)
+		return nil
+	})
+	c.AddBackgroundWork(forkSweepWork, forkSweepGrace, func(ctx context.Context, _ *Runtime) { comp.RunSweep(ctx) })
+	c.AddMaintenanceTask(forkExpiryTask, func(ctx context.Context, _ *Runtime) error {
+		comp.RunPass(ctx)
 		return nil
 	})
 }

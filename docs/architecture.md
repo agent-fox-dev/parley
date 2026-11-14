@@ -16,7 +16,7 @@ command-line client. Both are written in Go, in the module
 | `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra`, each declared through one helper ([ADR 02](adr/02-declare-every-cli-command-through-one-helper.md)), the client configuration file, the resolution of the hub URL and the credential, the one HTTP client the commands send their requests with, the printing of a command's result on stdout and of its warnings on stderr, the shared wait for a long operation (`--wait`, `--timeout`, `--poll-interval`), and the error envelopes and exit statuses every command ends with |
 | `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, a registry of keys and whole sections that decides what the file may hold, and the keys it owns itself, among them the fork limits of `[forks]` (`Config.Forks`), whose `max_ttl` it refuses when shorter than `default_ttl` |
 | `internal/event` | the hub events: every significant state change as one event, written in the caller's store transaction with a hub-wide `seq` that is never reused; the event record and its JSON form, the emit calls `Emit` and `EmitNow`, the log's bounds, the read by position and the expiry of old positions, the following of commits for waiters and `OnCommit` callbacks, the counters, the keys of `[events]`, the route `GET /api/v1/events/log` with its long-poll and the Server-Sent Events stream `GET /api/v1/events` with its limits ([ADR 05](adr/05-deliver-events-by-reading-the-log-by-position.md)) |
-| `internal/fork` | task forks: the lifetime rule `ResolveTTL(ttl, now, limits)`, the one judge of a requested `ttl` (a whole number above zero followed by `m`, `h` or `d`, from `5m` to `[forks].max_ttl`), which returns `expires_at` in whole seconds UTC or a `400 invalid_request` naming `ttl`, and `DefaultExpiry(now, limits)` for a fork created without one; the fork record (`Fork`: the workspace record plus the names of the parent's branches and tags at creation) and its store functions; and the `Component` with a fork's ref view (`Refs`), its computed head (`HeadSHA`, also shown as the `head_sha` of its workspace object) and the check of a write to one of its branches (`CheckBranchWrite`), and the parent-state check of a read or a write of a fork (`CheckParentState`); the handlers of `purpose` and `auto_change` in an update of a fork (`PurposeField`, `AutoChangeField`) and the guard of every update of a fork (`GuardUpdate`); and the routes `POST /workspaces/:slug/forks`, which creates a fork, and `GET /workspaces/:slug/forks`, which lists a workspace's forks in pages cut to the caller's readable set (`Routes`; see [Task forks](#task-forks)), with the two collaborators a later feature registers on the component: the session-linking rule (`SessionLinker`) and the sandbox component (`SandboxCreator`) |
+| `internal/fork` | task forks: the lifetime rule `ResolveTTL(ttl, now, limits)`, the one judge of a requested `ttl` (a whole number above zero followed by `m`, `h` or `d`, from `5m` to `[forks].max_ttl`), which returns `expires_at` in whole seconds UTC or a `400 invalid_request` naming `ttl`, and `DefaultExpiry(now, limits)` for a fork created without one; the fork record (`Fork`: the workspace record plus the names of the parent's branches and tags at creation) and its store functions; and the `Component` with a fork's ref view (`Refs`), its computed head (`HeadSHA`, also shown as the `head_sha` of its workspace object) and the check of a write to one of its branches (`CheckBranchWrite`), and the parent-state check of a read or a write of a fork (`CheckParentState`); the handlers of `purpose` and `auto_change` in an update of a fork (`PurposeField`, `AutoChangeField`) and the guard of every update of a fork (`GuardUpdate`); and the routes `POST /workspaces/:slug/forks`, which creates a fork, and `GET /workspaces/:slug/forks`, which lists a workspace's forks in pages cut to the caller's readable set (`Routes`; see [Task forks](#task-forks)), with the collaborators a later feature registers on the component: the session-linking rule (`SessionLinker`), the sandbox component of the create (`SandboxCreator`) and the sandbox lifecycle of a removal (`SandboxLifecycle`); and the removal of a fork, the one place forks are removed: the fork remover of the workspace service's teardown set (`DeleteFork`, `RemoveForksOf`), the table of pending discards (`DiscardStep`) and the number of task forks (`CountTaskForks`); and the sweep that removes the forks whose lifetime has ended and repeats the pending discards (`RunPass`, `RunSweep`); and the early expiry of a fork whose work has landed, with its change reader (`ChangeReader`, `SourceChange`, `RegisterChangeReader`), the fork's last activity (`ActivityStep`) and the activity hook (`RecordActivity`) |
 | `internal/gitrepo` | the hub's one way to run git, the `git` command as a subprocess with no git library; it imports nothing of the project. `Git` (its zero value runs git from `PATH`; `Env` adds variables such as `GIT_SSL_CAINFO` to every git process, `Trace` sees the arguments of every invocation) runs each git process with a fixed minimal environment (`PATH`, `HOME` set to an empty private directory made, mode 0700, for that one process and removed when it returns, `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_TERMINAL_PROMPT=0`, `GIT_SSH_COMMAND=ssh -o BatchMode=yes`, so that the `ssh` of a `git@` origin fails rather than prompts, unless `Env` sets its own, `LC_ALL=C`), outside any repository, keeps git's standard error in the error it returns and, when the context ends, kills git with every process it started (its own process group) and waits for them. `ListRemote(ctx, url, cred)` returns origin's branches, tags and default branch as a `Remote`; `Clone(ctx, url, cred, dir)` makes a bare copy with every branch and tag and full history; both, like `FetchOrigin` below, run with `-c credential.helper=`. A `Credential` (user name and password; the zero value is none) reaches git only through the environment of that one process: `GIT_ASKPASS` names a script, written into that private directory, that prints `PARLEY_GIT_USERNAME` or `PARLEY_GIT_PASSWORD`, so the credential is in no URL, no argument and no configuration file of the copy. `FetchOrigin(ctx, dir, url, cred, deadline)` fetches every branch and tag of origin into the copy at `dir` in one `git fetch --atomic --force --no-tags` into a namespace of that one fetch, `refs/parley/fetch/<random>/`, which is read and removed right after the fetch, also after a failure, so that the tags' objects are in the copy and no extra ref outlives the fetch; only once the fetch has succeeded and the namespace is gone are the origin heads `refs/remotes/origin/<name>` set to origin's branches exactly (created, moved, removed for a branch origin no longer has) in one `update-ref --stdin` transaction, or, when git refuses it because a new name is a directory of a removed one (`dev` replaced by `dev/next`), with the removals first; a fetch that fails, or whose namespace cannot be removed, changes no origin head; no branch or tag of the copy is written; it returns origin's branch heads and tags as `Fetched`, and after `deadline` kills git with every process it started and returns an error matching `ErrDeadline`. `Push(ctx, PushRequest)` pushes one commit of the copy at `PushRequest.Dir` to one branch of origin in one `git push --porcelain --no-follow-tags` of the single refspec `<commit>:refs/heads/<branch>`, with `-c credential.helper=` and the credential as above, so that no tag and no other branch is sent; `PushRequest.Force` adds the explicit lease `--force-with-lease=refs/heads/<branch>:<PushRequest.Lease>`, `Lease` being the commit origin's branch must still be at, or `""` for a branch origin must not have, never a plain force; the result is read from the status git reports for the ref, also when git exits with an error: `PushPushed` for a new branch or a fast-forward, `PushForced` for a forced push that replaced origin's branch, `PushUpToDate` when origin's branch is at the commit already (git reports it before it judges the lease), an error matching `ErrNonFastForward` for git's non-fast-forward and fetch-first refusals, one matching `ErrOriginMoved` for a forced push git refused because the lease is stale, and for every other failure a `*PushError` (`Branch`, `Class`, `Reason`, `Err`) whose class `errors.Is` matches: `ErrOriginRejected` for a `[remote rejected]` status of the ref, its `Reason` origin's reason followed by the `remote:` lines its hooks wrote; otherwise, when git reports no status for the ref, the class read from git's standard error, for the HTTPS transport and for the SSH transport's and forges' messages: `ErrUnauthenticated` (`Authentication failed`, `could not read Username`, HTTP 401, `Permission denied (publickey`), `ErrForbidden` (HTTP 403, `Permission to … denied`, `not allowed to push`), `ErrUnreachable` (name resolution, connection, proxy, TLS and certificate failures, `Host key verification failed`), judged before `ErrRepositoryNotFound` (HTTP 404, `not found`, `could not be found`) since such a text may hold a `not found` of its own, and `ErrPushFailed` for anything else, its `Reason` git's standard error without its boilerplate; a push whose context ended returns the error wrapping the context's error, git killed with every process it started. `PushBranches(ctx, PushBranchesRequest)` offers several branches of the copy at `Dir` in one `git push --porcelain --no-follow-tags`, with `-c credential.helper=` and the credential as above, of one refspec `<commit>:refs/heads/<branch>` for each entry of `Heads` (branch to commit), so that no tag is sent, nothing is forced and nothing is deleted; origin takes or refuses each branch on its own, and it returns one `BranchPush` (`Branch`, `Commit`, `Result`, `Err`) for each branch git reported a status for, ordered by name: `Result` `PushPushed` or `PushUpToDate` for a branch origin took, `Err` an error matching `ErrNonFastForward`, or a `*PushError` of class `ErrOriginRejected` or `ErrPushFailed`, for one it refused; its error is nil once every branch has a status, a `*PushError` of the transport's class when git failed before any, and an error wrapping the context's error, with the statuses reported before, when the context ended and git was killed with every process it started. `Open(ctx, dir)` opens a copy as a `Repo` (an error for a file, an empty directory or nothing), whose methods never contact origin: `DefaultBranch` and `SetDefaultBranch`, `ResolveBranch`, `Branches`, `Tags`, `OriginURL`, `Config` and `SetConfig` (the copy's own configuration), the origin heads, kept as the refs `refs/remotes/origin/<name>`: `OriginHeads`, `OriginHead`, `SetOriginHead` and `DeleteOriginHead`, `CompareAndSwapRef(ctx, ref, new, expectedOld)`, which moves a ref only from `expectedOld` (`""`: creates it only while it does not exist) and otherwise, or when another writer holds the ref's lock, changes nothing and returns an error matching `ErrRefMoved`, and `IsAncestor`; `CreateFork(ctx, parentDir, forkDir)` makes a fork's repository without copying history: an empty bare repository (`git init --bare`) whose `objects/info/alternates` names the parent's object directory by its absolute path, so that no object or pack is written into it, the parent is not changed, every object of the parent, also one it receives later, is readable through it, and what is pushed to it is stored in it alone; it is built in a temporary directory `.<name>.tmp-<random>` beside `forkDir` and renamed into place once complete, the temporary directory removed on an error (one a creation the process did not survive left is named so that `IsForkTemp(name)` reports it, for the workspace workers' start to remove), and refuses, with an error matching `fs.ErrExist`, a `forkDir` where something exists already, which it leaves as it is, and a `parentDir` that is not a repository; `Remove(dir)` removes a copy or a fork's repository |
 | `internal/gitrepo/gitrepotest` | test support, imported by test code only, and the repository's one test origin: `NewOrigin(t, opts...)` makes an empty bare repository whose default branch is `main` and serves it over TLS with `net/http/httptest` and git's file-based HTTP transport (`git update-server-info` after every change), or with git's smart transport through `git http-backend` under `WithSmartHTTP()` (git cannot read a repository without refs over the file-based one, so an empty origin needs it); `SmartOrigin(t, opts...)` is `NewOrigin` with the smart transport and `http.receivepack` enabled, so that it takes pushes; `WithBasicAuth(user, password)` makes it answer `401` without them, and `Accept(user, password)` changes the credential it takes while it serves; `Commit(branch, msg)`, `Branch(name, ref)`, `Tag(name, ref)` and `SetDefaultBranch(branch)` change it, `History()` builds the tests' usual history on it (`main` with three commits, `dev` branching off its second with one more, the tag `v1` on its first), `Head(branch)` reads it; `URL()` is its https URL and `Env()` (`GIT_SSL_CAINFO=<CAFile()>`) makes git trust it; `Requests()` counts the requests it received, `Block()` holds every later request until `Release()`, `Refuse(status)` answers every request with a status, `Reject(message)` installs a `pre-receive` hook that refuses every update writing `message` (`""` removes it), `ServeUntrusted(true)` makes it serve, on every later connection, a self-signed certificate that `CAFile()` does not vouch for, and `Close()` shuts it down; `Git(t, dir, args...)` runs git on a repository directory, such as a copy the code under test made, away from the user's git configuration, and returns its trimmed output, `Run(dir, stdin, args...)` does the same with `stdin` as git's input and returns git's failure as an error instead of failing the test, and `Refs(t, dir, prefix)` maps the refs below `prefix` of such a directory, by their names without it (`""`: every ref, by its full name), to their object ids |
 | `internal/hub` | the composition of the `parleyd` process: argument parsing, the scrubbing logger, the fixed start order, the bootstrap of the admin token, the HTTP server's options, the idempotency records in the transactional store, signals and the stop, and the `backup` command; the one place later packages plug their parts in ([ADR 01](adr/01-compose-the-hub-in-one-package.md)) |
@@ -2591,10 +2591,128 @@ every git process gets, the event component as `Events`, the access rule as
 `Access`, whose `MintBound` mints a fork's token, and as `Readable`, whose
 readable set confines the fork list, `rt.Config.Forks` as
 `Limits`, the hub's clock, `CreateRepo` = the git's `CreateFork` and
-`Transact` = `rt.Store.Tx`), applies every function `AdjustForks` added,
-and binds the component; `Bind` sets `NewName`, when nil, to the
-generator of 8 characters from `a` to `z` and digits drawn from
-`crypto/rand`.
+`Transact` = `rt.Store.Tx`, `rt.Logger` as `Logger`), applies every
+function `AdjustForks` added, and binds the component; `Bind` sets
+`NewName`, when nil, to the generator of 8 characters from `a` to `z` and
+digits drawn from `crypto/rand`, `RemoveRepo`, when nil, to
+`gitrepo.Remove`, `Logger`, when nil, to a logger that discards, and
+`SweepTicks`, when nil, to a `time.Ticker` of `fork.SweepInterval`
+(60 seconds). The
+part also registers `fork.DiscardStep` after `fork.SchemaStep` and, at
+compose time, the component as the fork remover of the workspace service's
+teardown set (`Teardown().RegisterForkRemover`), so that `DELETE
+/workspaces/:slug` of a fork and the delete of a parent reach it. No
+sandbox lifecycle is registered while the hub has no sandbox feature. The
+part registers `fork.ActivityStep` after `fork.DiscardStep`. It registers
+no change reader (`RegisterChangeReader`), since the hub has no change
+feature, and no adapter that calls `RecordActivity`, since none of the
+features that see a fork's activity (the push rules, the change feature,
+the landing) is in the hub yet; each is registered in this part when its
+feature arrives. It
+adds the background work `fork_sweep` (grace 10 seconds), which runs
+`(*Component).RunSweep` from the bind to the stop, and the maintenance task
+`fork_expiry`, which runs one `RunPass` in each maintenance pass.
+
+`internal/fork/remove.go` holds the removal of a fork, the one place forks
+are removed, whatever the cause: `deleted` (a `DELETE`), `expired` and
+`parent_deleted`. The step inside the transaction (`removeIn`) reads the
+fork through the transaction (none is the not-found result), removes what
+it owns with `(*workspace.Service).RemoveOwned(ctx, tx, slug, reason)`
+(the token revoker, every remover of owned data, `secret.RemoveWorkspace`
+among them, and the session closer, with the reason `fork expired` for
+the cause `expired` and `workspace deleted` otherwise), deletes the record
+(`DELETE FROM workspaces WHERE slug = ? AND kind = 'fork'`; no row deleted
+is the not-found result, so that of two removals of one fork the loser
+writes nothing), and emits the event through `Events` with `Parent` set:
+`parley.workspace.delete` (`fork.EventDelete`) by the caller, metadata
+`kind` `fork`, `parent_slug` and `revoked_tokens` in ascending order, for
+`deleted` and `parent_deleted`, and `parley.fork.expire`
+(`fork.EventExpire`) by the system for `expired`; both carry the fork's
+`session_id`. A removal of one fork (`remove`) takes the parent's create
+lock first and holds it to its end, then refuses a parent that is
+`pending` or `cloning` or carries a maintenance marker with `409
+workspace_busy` (any other parent status lets the fork go), then, when a
+`SandboxLifecycle` is registered, calls `DeleteSandboxes(ctx, slug,
+"workspace_deleted", false)` before any write and stops on its error;
+then runs `removeIn` in one `Transact`, which checks the parent again
+through the transaction, and once it has committed discards the fork's
+repository at its `RepoPath` with `RemoveRepo`, which removes its own
+branches with it. A `ttl` update or a parent's archive takes no create
+lock, so a fork whose transaction backs out (no longer due, or its parent
+busy) after its sandboxes were deleted is kept without them, and that is
+logged at warn level (`fork kept after its sandboxes were deleted: it
+changed while they were`, with `slug` and `error`). A discard that
+fails is logged and recorded in the table `fork_discards` (`slug` primary
+key, `parent_slug`, `recorded_at` in UnixNano), created by
+`fork.DiscardStep`; the removal's result does not change. `DeleteFork(ctx,
+slug, caller)` is that removal for a `DELETE`: nil on success, `404
+not_found` (`workspace not found`) for the not-found result, the `409` of
+its own refusal of a busy parent unchanged (that refusal carries the
+sentinel `errParentBusy`), and `500 internal` (`internal error`, the cause
+logged) for anything else, a `409` of a remover of owned data or of the
+session closer included. `RemoveForksOf(ctx, tx, parent, actor)` runs `removeIn`
+with the cause `parent_deleted` for every fork of the parent in ascending
+slug order inside the parent's transaction, without the sandbox call or a
+transaction of its own, and returns the slugs (`[]` for none) and the
+function that discards their repositories. `CountTaskForks(ctx)` counts
+the records of kind `fork`.
+
+`internal/fork/sweep.go` holds the sweep. `(*Component).RunPass(ctx)` is
+one pass: it reads, at `Deps.Now`, the slugs of the records of kind `fork`
+whose `expires_at` is at or before that time, in ascending order, and
+removes each through `remove` with the cause `expired` and the reason
+`ttl`; the fork is read again before its sandboxes are deleted and inside
+the transaction, and one whose `expires_at` is no longer due (given a new
+lifetime since the pass read it) is left alone. A not-found result and the
+removal's refusal of a busy parent leave the fork for a later pass without
+an error log; any other failure, a collaborator's `409` included, is logged
+at error level (`fork sweep: fork not removed; tried again at the next
+pass`, with `slug` and `error`), the fork is whole, and the pass goes on.
+`ctx` is checked before each fork and before each part of the pass, and
+once it is cancelled the pass ends, with `Stopped` set and no error log for
+a read the cancellation broke; the removal itself runs on
+`context.WithoutCancel(ctx)`, so that a removal under way commits or rolls
+back and discards. At the end of a pass that was not stopped, each row of
+`fork_discards` is retried under the create lock of its parent: while no
+workspace record has the slug the repository at its `RepoPath` is removed
+with `RemoveRepo` and the row is deleted once that succeeds (a failure is
+logged and the row kept); once a record has the slug again the row is
+deleted without a removal, since that fork's create replaced the leftover
+directory with its own repository. A pass that finds another running
+returns at once with `PassResult.Skipped`; `PassResult` also lists the
+slugs `Removed` and `Failed` and says whether the pass was `Stopped`.
+
+`internal/fork/early.go` holds the early expiry, the part of a pass that
+runs after the expired forks and before the pending discards, and only
+while `Deps.Limits.ExpireOnLand` (`[forks].expire_on_land`) is set; while
+it is not, the change reader is never asked. It reads the slugs of the
+records of kind `fork` whose `expires_at` is after the pass's time, in
+ascending order, so that a fork past it goes once, with the reason `ttl`,
+and judges each: its last activity (`last_activity_at`, UnixNano, a column
+of the workspace table added by `fork.ActivityStep`, `fork_activity`;
+NULL stands for the fork's `created_at`) is at least 24 hours before the
+pass's time; the registered `ChangeReader`'s `ChangesFrom(ctx, slug)`
+returns at least one change and each is `landed` or `abandoned`; each of
+the fork's own branches, read from its repository, is the `Branch` of one
+of them; and the `SandboxLifecycle`'s `HasLiveSandbox(ctx, slug)` is
+false. Without a change reader a fork has no changes, and without a
+sandbox lifecycle no sandboxes. A fork that passes is removed through
+`remove` with the cause `expired` and the reason `landed`, with the same
+handling of a busy parent and of a failure as an expired fork; its due
+rule reads the fork again before the sandboxes and inside the
+transaction and leaves it alone once its `expires_at` has passed or an
+activity has been recorded since it was judged, since every event that
+changes the other conditions is an activity. An error of the change
+reader or the sandbox lifecycle is logged at error level (`fork sweep:
+early expiry of the fork not judged; the fork is kept`, with `slug` and
+`error`) and the pass goes on with the next fork.
+`(*Component).RecordActivity(ctx, slug)` sets `last_activity_at` to
+`Deps.Now` for the record of kind `fork` with the slug, in a `Store.Tx` of
+its own, and changes nothing for any other slug.
+
+`(*Component).RunSweep(ctx)` starts the ticker of `Deps.SweepTicks`, runs
+one pass at once and one at each tick, and returns once `ctx` is cancelled
+and the running pass has ended.
 
 `internal/fork/create.go` holds the create, `POST /workspaces/:slug/forks`
 (see [the API](api.md#post-apiv1workspacesslugforks)). The route declares
@@ -2694,8 +2812,15 @@ update's transaction. `composeForks` registers them with
 `(*workspace.Service).RegisterForkField` and `GuardUpdate` with
 `RegisterForkUpdateGuard`, so the workspace update judges them after the
 other values and asks the guard, for every update of a fork, after the
-body is judged and before anything is written; `ttl` is left to the fork
-lifetime. The update's `parley.workspace.update` event carries the
+body is judged and before anything is written. The handler of `ttl` is
+`(*fork.Component).TTLField` in `internal/fork/extend.go`, a method because
+it needs the hub's clock and the `[forks]` limits, read from the bound
+component when it is called: `null`, a number or a boolean is `400
+invalid_request` (`ttl: must be a string`), a string is judged by
+`ResolveTTL` at the component's `Now` (its `400` answered unchanged), and
+the write stores the resulting `expires_at` in the update's transaction, so
+that the new lifetime counts from the request, later or earlier than the
+one before. The update's `parley.workspace.update` event carries the
 workspace's `session_id`.
 
 ### Hub events

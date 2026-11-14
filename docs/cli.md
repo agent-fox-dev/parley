@@ -382,7 +382,7 @@ Usage:
 Available Commands:
   admin       Administer the hub's users, organizations, API keys and access tokens
   events      Follow the hub's events, or read them a page at a time
-  fork        Create a task fork of a workspace and list a workspace's forks
+  fork        Create, list, extend and delete the task forks of a workspace
   help        Print the help of parley or of a command
   keys        List, refresh and revoke your API keys
   login       Sign in to the hub and save the hub URL and the credential
@@ -1852,9 +1852,10 @@ and exit status `2` before any request.
 ### `parley fork`
 
 `parley fork` run without a command prints its help and exits `0`; it reads
-no credential and sends no request. Its two commands create a task fork of a
-workspace and list a workspace's forks. Each sends one request with the
-credential as `Authorization: Bearer`, `<parent>` as one percent-encoded path
+no credential and sends no request. Its commands create a task fork of a
+workspace, list a workspace's forks, and give a fork a new lifetime or
+delete it. Each sends one request with the credential as
+`Authorization: Bearer`, `<parent>` or `<slug>` as one percent-encoded path
 segment (`parley fork list a/b` sends `GET /api/v1/workspaces/a%2Fb/forks`),
 and prints the hub's answer on stdout with exit status `0`; a refusal of the
 hub's is written to stderr as received, with nothing on stdout and exit
@@ -1864,6 +1865,8 @@ status `1`.
 |---|---|
 | `parley fork create <parent> [flags] [-- command...]` | `POST /api/v1/workspaces/<parent>/forks` with a member for each flag given |
 | `parley fork list <parent> [flags]` | `GET /api/v1/workspaces/<parent>/forks` with a query parameter for each flag given |
+| `parley fork extend <slug> --ttl <duration>` | `PATCH /api/v1/workspaces/<slug>` with `{"ttl": "<duration>"}` |
+| `parley fork delete <slug>` | `DELETE /api/v1/workspaces/<slug>` |
 
 #### `parley fork create`
 
@@ -1938,6 +1941,52 @@ given, which the hub judges. `parley fork list demo --session <id> --limit
 `GET /api/v1/workspaces/demo/forks?cursor=abc&limit=10&session_id=<id>`. A
 missing `<parent>` and a second argument are refused with a `usage_error`
 and exit status `2` before any request.
+
+#### `parley fork extend` and `parley fork delete`
+
+```
+parley fork extend <slug> --ttl <duration>
+parley fork delete <slug>
+```
+
+`parley fork extend` sends
+[`PATCH /api/v1/workspaces/<slug>`](api.md#patch-apiv1workspacesslug) with
+the body `{"ttl": "<duration>"}` and prints the fork the hub answers, whose
+`expires_at` is now the hub's time of the request plus the duration, longer
+or shorter than before. The value of `--ttl` is sent as given: its form and
+its bounds, at least `5m` and at most the hub's `[forks].max_ttl`, are the
+hub's to judge, and its `400` `invalid_request` (such as
+`ttl: must be at least 5m`) is printed as received.
+
+`parley fork delete` sends
+[`DELETE /api/v1/workspaces/<slug>`](api.md#delete-apiv1workspacesslug) with
+no body. A fork is disposable, so the command takes no `--confirm` and the
+hub needs no archive first: it removes the fork, its own branches, its
+secrets and the tokens bound to it. The hub answers `204` with no body, and
+the command prints a document that names the fork deleted, with exit status
+`0`:
+
+```json
+{
+  "status": "deleted",
+  "slug": "demo--t1"
+}
+```
+
+A refusal of the hub's (`409` `parent_archived` for an extend of a fork
+whose parent is archived, `400` `invalid_request` for a ttl it refuses,
+`404` `not_found`, `409` `workspace_busy` while the parent is cloning or
+under maintenance, among others) is written to stderr as received, with
+nothing on stdout and exit status `1`.
+
+**Client checks.** Both commands take only the slug of a task fork,
+`<parent>--<name>`. A `<slug>` without `--` (`parley fork delete takes the
+slug of a task fork, <parent>--<name>, got "demo"`), a missing `<slug>`, a
+second argument, and for `extend` a missing `--ttl` (`parley fork extend
+needs the flag --ttl`) or an empty one (`parley fork extend needs a value for
+--ttl`) are refused with a `usage_error` and exit status `2` before any
+setting is read or any request sent. `--confirm` is an unknown flag of
+`parley fork delete`, refused the same way.
 
 ### Output
 

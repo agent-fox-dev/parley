@@ -1,11 +1,13 @@
 package fork_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"net/http"
 	"os"
@@ -27,6 +29,9 @@ import (
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/identity"
+	"github.com/agent-fox-dev/parley/internal/secret"
+	"github.com/agent-fox-dev/parley/internal/server"
+	"github.com/agent-fox-dev/parley/internal/server/timefmt"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
@@ -52,6 +57,7 @@ type world struct {
 	forks      *fork.Component
 	workspaces *workspace.Service
 	events     *event.Component
+	secrets    *secret.Component
 
 	// dev and mia are the users' ids, devKey and miaKey their API keys,
 	// acme the org's id.
@@ -81,7 +87,7 @@ func newWorldWith(t *testing.T, cfg hubtest.Config) *world {
 	w := &world{now: time.Now().UTC().Truncate(time.Second).Add(time.Second / 2)}
 	compose := cfg.Compose
 	cfg.Now, cfg.Compose = w.clock, func(c *hub.Composition) {
-		w.forks, w.workspaces, w.events = c.Forks(), c.Workspaces(), c.Events()
+		w.forks, w.workspaces, w.events, w.secrets = c.Forks(), c.Workspaces(), c.Events(), c.Secrets()
 		if compose != nil {
 			compose(c)
 		}
@@ -521,18 +527,59 @@ func wantError(t *testing.T, a answer, status int, typ string) {
 // status.
 func (w *world) postAll(t *testing.T, n int, body any) map[int]int {
 	t.Helper()
+	return w.callAll(t, n, http.MethodPost, forksPath, body)
+}
+
+// callAll sends n requests method path, under /api/v1, with dev's key and
+// body (nil for none) at once, and counts the answers by status. A request
+// that cannot be sent fails the test once all have returned, from the
+// test's goroutine.
+func (w *world) callAll(t *testing.T, n int, method, path string, body any) map[int]int {
+	t.Helper()
+	var raw []byte
+	if body != nil {
+		var err error
+		if raw, err = json.Marshal(body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	send := func() (int, error) {
+		req, err := http.NewRequest(method, w.URL("/api/v1"+path), bytes.NewReader(raw))
+		if err != nil {
+			return 0, err
+		}
+		req.Header.Set("Authorization", "Bearer "+w.devKey)
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return 0, err
+		}
+		defer res.Body.Close()
+		_, err = io.Copy(io.Discard, res.Body)
+		return res.StatusCode, err
+	}
 	var mu sync.Mutex
 	counts := map[int]int{}
+	var errs []error
 	var wg sync.WaitGroup
 	for range n {
 		wg.Go(func() {
-			status, _ := w.Call(t, http.MethodPost, "/api/v1"+forksPath, w.devKey, body)
+			status, err := send()
 			mu.Lock()
 			defer mu.Unlock()
+			if err != nil {
+				errs = append(errs, fmt.Errorf("%s %s: %w", method, path, err))
+				return
+			}
 			counts[status]++
 		})
 	}
 	wg.Wait()
+	if err := errors.Join(errs...); err != nil {
+		t.Fatal(err)
+	}
 	return counts
 }
 
@@ -610,4 +657,240 @@ func (e faultyEvents) Emit(ctx context.Context, tx *sql.Tx, in event.Input) (eve
 		return event.Record{}, errors.New("injected fault")
 	}
 	return e.Events.Emit(ctx, tx, in)
+}
+
+// secretKey is the current secret key of a removal world, so that a fork
+// can hold a secret.
+const secretKey = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+
+// remover keeps what a fork's removal and its early expiry asked of the
+// collaborators they call: registered in the teardown set as a remover of
+// owned data and as the session closer, and on the fork component as its
+// sandbox collaborator and its change reader, which reports changes and,
+// as live, the forks with a sandbox provisioning or ready. A step fails
+// while its fail flag is set, for the fork only alone when only is set, and
+// the remover of owned data refuses with a 409 of its own while
+// refuseRemove is; the event writer fails while fault holds "event", and the
+// discard of a fork's repository while failDiscard is set. during, when set, is called with the
+// fork's slug as its sandboxes are deleted, before the delete fails or
+// succeeds.
+type remover struct {
+	store                                func() *sql.DB
+	mu                                   sync.Mutex
+	failRemove, failSandbox, failDiscard bool
+	failChanges, failLive, refuseRemove  bool
+	only                                 string
+	during                               func(slug string)
+	removed                              []string
+	closed                               [][2]string
+	sandboxes                            []sandboxDelete
+	changes                              map[string][]fork.SourceChange
+	live                                 map[string]bool
+	asked                                []string
+	fault                                atomic.Value
+}
+
+// fails reports whether a step whose fail flag is flag fails for the fork
+// slug; the caller holds the lock.
+func (r *remover) fails(flag bool, slug string) bool {
+	return flag && (r.only == "" || r.only == slug)
+}
+
+// sandboxDelete is one call of the sandbox collaborator's delete, and
+// whether the fork's record existed when it was made.
+type sandboxDelete struct {
+	slug, reason       string
+	checkpoint, record bool
+}
+
+// set changes the remover under its lock.
+func (r *remover) set(fn func(*remover)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	fn(r)
+}
+
+// take returns what the remover was asked since the last take and forgets
+// it: the slugs the remover of owned data was given, the (slug, reason)
+// pairs the session closer was, and the sandbox deletes.
+func (r *remover) take() (removed []string, closed [][2]string, sandboxes []sandboxDelete) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	removed, closed, sandboxes = r.removed, r.closed, r.sandboxes
+	r.removed, r.closed, r.sandboxes = nil, nil, nil
+	return removed, closed, sandboxes
+}
+
+func (r *remover) remove(_ context.Context, _ *sql.Tx, slug string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.removed = append(r.removed, slug)
+	if r.fails(r.failRemove, slug) {
+		return errors.New("injected remover fault")
+	}
+	if r.fails(r.refuseRemove, slug) {
+		return server.NewError("conflict", http.StatusConflict, "injected remover refusal")
+	}
+	return nil
+}
+
+func (r *remover) CloseSessions(_ context.Context, _ *sql.Tx, slugs []string, reason string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, s := range slugs {
+		r.closed = append(r.closed, [2]string{s, reason})
+	}
+	return nil
+}
+
+func (r *remover) DeleteSandboxes(ctx context.Context, slug, reason string, checkpoint bool) error {
+	_, found, err := fork.BySlug(ctx, r.store(), slug)
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	during := r.during
+	r.mu.Unlock()
+	if during != nil {
+		during(slug)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.sandboxes = append(r.sandboxes, sandboxDelete{slug, reason, checkpoint, found})
+	if r.fails(r.failSandbox, slug) {
+		return errors.New("injected sandbox fault")
+	}
+	return nil
+}
+
+func (r *remover) HasLiveSandbox(_ context.Context, slug string) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.fails(r.failLive, slug) {
+		return false, errors.New("injected sandbox state fault")
+	}
+	return r.live[slug], nil
+}
+
+func (r *remover) ChangesFrom(_ context.Context, slug string) ([]fork.SourceChange, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.asked = append(r.asked, slug)
+	if r.fails(r.failChanges, slug) {
+		return nil, errors.New("injected change reader fault")
+	}
+	return r.changes[slug], nil
+}
+
+// newRemovalWorld is a world with a current secret key whose fork removals
+// call r as their collaborators, with more run on the hub's composition
+// after that. No sweep pass runs in it unless the test runs one: the
+// sweep's loop waits for its ticker until the hub stops, and then ends
+// without a pass, unless more gives it a ticker; and the world is returned
+// once the maintenance loop's first pass, which runs the sweep as the task
+// fork_expiry, has ended.
+func newRemovalWorld(t *testing.T, more ...func(*hub.Composition)) (*world, *remover) {
+	t.Helper()
+	r := &remover{changes: map[string][]fork.SourceChange{}, live: map[string]bool{}}
+	// settled is closed by a task that maintenance runs after the ones it
+	// knows by name, fork_expiry among them; a restart's pass runs it again.
+	settled := make(chan struct{})
+	var once sync.Once
+	w := newWorldWith(t, hubtest.Config{Env: map[string]string{secret.EnvCurrentKey: secretKey}, Compose: func(c *hub.Composition) {
+		c.Workspaces().Teardown().RegisterRemover(r.remove)
+		c.Workspaces().Teardown().RegisterSessionCloser(r)
+		c.Forks().RegisterSandboxes(r)
+		c.Forks().RegisterChangeReader(r)
+		c.AddMaintenanceTask("removal_world_settled", func(context.Context, *hub.Runtime) error {
+			once.Do(func() { close(settled) })
+			return nil
+		})
+		stopping := c.ShuttingDown()
+		c.AdjustForks(func(d *fork.Deps) {
+			// The stop cancels the loop's context before it closes stopping,
+			// so the loop returns without a pass.
+			d.SweepTicks = func() (<-chan time.Time, func()) {
+				<-stopping
+				return nil, func() {}
+			}
+			d.Events = faultyEvents{d.Events, &r.fault}
+			d.RemoveRepo = func(dir string) error {
+				r.mu.Lock()
+				fail := r.failDiscard
+				r.mu.Unlock()
+				if fail {
+					return errors.New("injected discard fault")
+				}
+				return gitrepo.Remove(dir)
+			}
+		})
+		for _, fn := range more {
+			fn(c)
+		}
+	}})
+	// Read at each call, since a restart opens the store again.
+	r.store = func() *sql.DB { return w.Store.Main() }
+	within(t, "the maintenance loop's first pass", func() { <-settled })
+	return w, r
+}
+
+// held is what a fork of a removal world holds: its own branch task at
+// task, the PAT of dev bound to it (pat, with the id patID) with
+// workspaces:read, and the secret K.
+type held struct {
+	slug, task, pat, patID string
+	expires                time.Time
+}
+
+// seedHeld seeds the fork slug as seedFork does, with edit, and gives it
+// what held names.
+func (w *world) seedHeld(t *testing.T, slug string, edit ...func(*fork.Fork)) held {
+	t.Helper()
+	f := w.seedFork(t, slug, edit...)
+	h := held{slug: slug, task: w.commit(t, slug, "task", f.ForkPoint.SHA), expires: *f.ExpiresAt}
+	h.pat, h.patID = w.pat(t, slug, nil, "workspaces:read")
+	w.insert(t, func(tx *sql.Tx) error {
+		return w.secrets.Put(context.Background(), tx, secret.ScopeWorkspace, slug, "K", "value")
+	})
+	return h
+}
+
+// whole fails the test unless the fork of h is as seedHeld left it: its
+// record answered, its token authenticating, its secret stored and its own
+// branch at its commit.
+func (w *world) whole(t *testing.T, h held) {
+	t.Helper()
+	if got := w.get(t, w.devKey, "/workspaces/"+h.slug).object(t, http.StatusOK)["expires_at"]; got != timefmt.Format(h.expires) {
+		t.Errorf("expires_at of %s = %v, want %s", h.slug, got, timefmt.Format(h.expires))
+	}
+	if r := w.get(t, h.pat, "/workspaces/"+h.slug); r.status != http.StatusOK {
+		t.Errorf("GET %s with the bound token = %d %s, want 200", h.slug, r.status, r.body)
+	}
+	if n, err := w.secrets.Count(context.Background(), secret.ScopeWorkspace, h.slug); err != nil || n != 1 {
+		t.Errorf("secrets of %s = %d, %v, want 1", h.slug, n, err)
+	}
+	if got := w.head(t, w.workspaces.RepoPath(h.slug), "task"); got != h.task {
+		t.Errorf("branch task = %q, want %s", got, h.task)
+	}
+}
+
+// logged reports whether the hub's log holds a record at level, such as
+// WARN or ERROR, that names the fork slug, or any record at level when slug
+// is "".
+func (w *world) logged(level, slug string) bool {
+	for line := range strings.SplitSeq(w.Log.String(), "\n") {
+		var rec map[string]any
+		if json.Unmarshal([]byte(line), &rec) == nil && rec["level"] == level && (slug == "" || rec["slug"] == slug) {
+			return true
+		}
+	}
+	return false
+}
+
+// eventsFor are the events of type typ of the workspace slug.
+func (w *world) eventsFor(t *testing.T, typ, slug string) []event.Record {
+	t.Helper()
+	return slices.DeleteFunc(w.eventsOf(t, typ), func(r event.Record) bool {
+		return r.Workspace == nil || *r.Workspace != slug
+	})
 }

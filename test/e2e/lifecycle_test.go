@@ -70,7 +70,7 @@ func TestLifecycle_FirstBootHandsOutTheAdminTokenThenServesAndStopsOnSIGTERM(t *
 				hooks.Add(1)
 				return nil
 			})
-			c.AddMaintenanceTask("fork_expiry", func(context.Context, *hub.Runtime) error {
+			c.AddMaintenanceTask("patch_purge", func(context.Context, *hub.Runtime) error {
 				tasks.Add(1)
 				return nil
 			})

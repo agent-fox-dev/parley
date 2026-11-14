@@ -1288,8 +1288,8 @@ when the fork was created.
 ## `PATCH /api/v1/workspaces/{slug}`
 
 Changes the display name, the description, the organization and the
-settings of the workspace `{slug}`, and the purpose and `auto_change` of a
-task fork. It takes the admin token, an API key or a PAT, declares
+settings of the workspace `{slug}`, and the lifetime, the purpose and
+`auto_change` of a task fork. It takes the admin token, an API key or a PAT, declares
 the scope `workspaces:write` for a PAT and needs write access to the
 workspace (see [Workspace access](#workspace-access)): its owner or the
 admin token, and for a task fork also the owner of its parent. It works in
@@ -1306,7 +1306,7 @@ its value.
 | `description` | `null` or a string of at most 1024 characters; `null` sets it to `""` | the same |
 | `org_id` | an org id or slug, or `null` for the personal org of the workspace's owner; the workspace and every fork of it move to that org | `400` `not_supported_on_fork` |
 | `settings` | an object or `null`, applied to the stored settings key by key (below) | `400` `not_supported_on_fork` |
-| `ttl` | `400` `invalid_request` | `400` `invalid_request` until the fork lifetime accepts it |
+| `ttl` | `400` `invalid_request` | a string, a whole number above zero followed by `m`, `h` or `d`, from `5m` to `[forks].max_ttl`, both included (see [the configuration](configuration.md)); `expires_at` becomes the time of the request plus `ttl`, cut to the second, later or earlier than before |
 | `purpose` | `400` `invalid_request` | `null` or a string of at most 1024 characters (Unicode code points); `null` clears it |
 | `auto_change` | `400` `invalid_request` | `true` or `false`; `null` is refused |
 | `slug`, `kind`, `git_url`, `default_branch`, `owner_id`, `workspace_mode`, `upstream_url`, `integration_branch`, `parent_slug`, `fork_point` | `400` `invalid_request`, whatever the value, the current one included | the same |
@@ -1339,7 +1339,7 @@ for a slug no workspace has, `403` for a member of its org, also on an
 archived workspace); then the body: not a JSON object; an immutable field;
 a field that does not apply to the workspace's kind; no field to change;
 the values in the order `display_name`, `description`, `org_id`,
-`settings`, `purpose`, `auto_change`; an `org_id` naming an org of which
+`settings`, `ttl`, `purpose`, `auto_change`; an `org_id` naming an org of which
 the workspace's owner is not an active member (`403`); and last the state:
 an archived workspace is `409`, and for a task fork, whatever the fields,
 its parent's state, read in the update's transaction: a parent that is
@@ -1384,7 +1384,7 @@ The answer is the workspace object after the update, the object
 | Status | When |
 |---|---|
 | `200 OK` | the fields are changed; the body is the workspace object |
-| `400` `invalid_request` | the body is not a JSON object; it carries an immutable field (`<field>: cannot be changed`), a fork-only field on a repository workspace (`<field>: applies only to a task fork`) or on a fork that does not accept it (`<field>: cannot be changed`); it carries no field to change (`the body carries no field to change`); or a value is refused: `display_name: must be a string or null`, `display_name: must be at most 128 characters`, the same for `description` with 1024, `org_id: must be a string or null`, `org_id: no organization has the id or slug "<value>"` (also for `""` and an id no org has), `org_id: the workspace's owner has no personal organization`, `settings: must be an object or null`, `unknown setting "<key>"`, or `settings.<key>: <reason>` for a value its rule refuses (`settings.land.strategy: must be one of ["rebase" "squash"]`), `purpose: must be a string`, `purpose: must be at most 1024 characters long`, `auto_change: must be true or false`; the reason never repeats a URL |
+| `400` `invalid_request` | the body is not a JSON object; it carries an immutable field (`<field>: cannot be changed`), a fork-only field on a repository workspace (`<field>: applies only to a task fork`) or on a fork that does not accept it (`<field>: cannot be changed`); it carries no field to change (`the body carries no field to change`); or a value is refused: `display_name: must be a string or null`, `display_name: must be at most 128 characters`, the same for `description` with 1024, `org_id: must be a string or null`, `org_id: no organization has the id or slug "<value>"` (also for `""` and an id no org has), `org_id: the workspace's owner has no personal organization`, `settings: must be an object or null`, `unknown setting "<key>"`, or `settings.<key>: <reason>` for a value its rule refuses (`settings.land.strategy: must be one of ["rebase" "squash"]`), `ttl: must be a string` (also for `null`), `ttl: must be a whole number followed by m, h or d`, `ttl: must end in one unit: m, h or d`, `ttl: must be a whole number in decimal digits followed by m, h or d`, `ttl: must be above zero`, `ttl: is too long a duration`, `ttl: must be at least 5m`, `ttl: must be at most <max_ttl>, the hub's [forks].max_ttl` (`30d` by default), `purpose: must be a string`, `purpose: must be at most 1024 characters long`, `auto_change: must be true or false`; the reason never repeats a URL |
 | `400` `not_supported_on_fork` | `org_id` or `settings` in an update of a task fork, whatever the value (`<field>: a task fork takes its org and its settings from its parent`) |
 | `403` `insufficient_scope` | a PAT without `workspaces:write` (`this route needs the scope workspaces:write`) |
 | `403` `forbidden` | a member of the workspace's org who does not own it (`org members have read-only access to this workspace`), in every status; or an `org_id` naming an org of which the workspace's owner is not an active member, whoever the caller is (`the workspace's owner is not an active member of the organization`) |
@@ -1884,11 +1884,9 @@ route reads no body; one that passes the content-type and size rules is
 ignored.
 
 For a task fork, once the scope and access checks have passed, the delete
-is handed to the task-fork feature, which removes forks by its own rules:
-its answer is the route's, `204` with an empty body when it removed the
-fork and its error, unchanged, otherwise. None of what follows applies to a
-fork. While the hub has no task-fork feature, a fork is answered `500`
-`internal` and nothing is removed.
+is handed to the task-fork feature, which removes forks by its own rules,
+described under [Deleting a task fork](#deleting-a-task-fork) below. None
+of what follows up to there applies to a fork.
 
 A repository workspace in status `archived` is deleted; the checks run in
 the order of the table below, and a refused delete changes nothing. Once
@@ -1909,8 +1907,9 @@ workspace's last. When anything in that transaction fails, nothing has
 changed, the repository data included, and the answer is `500 internal`.
 Once it has committed, the hub's copies of the removed workspaces are
 removed from disk; a copy that cannot be removed is logged with the slug
-and the path, and the answer stays `204`. Every event written about the
-workspace and its forks before the delete stays in the event log. The slug
+and the path, a fork's also kept for a later removal, and the answer stays
+`204`. Every event written about the workspace and its forks before the
+delete stays in the event log. The slug
 is free again afterwards:
 [`POST /api/v1/workspaces`](#post-apiv1workspaces) takes it as a slug that
 was never used.
@@ -1939,7 +1938,88 @@ readers of its parent's events, as the fork's other events are.
 | `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug (`workspace not found`); also a bound PAT on a workspace outside its binding |
 | `409` `workspace_busy` | a reclone, archive or delete runs on the workspace (`workspace "<slug>" is busy: a reclone is running; try again later`), or a fork of the workspace was made while the delete ran (`workspace "<slug>" got the fork "<fork>" while it was being deleted; try again`): nothing has changed |
 | `409` `workspace_not_archived` | the workspace is in any status other than `archived`, `pending` and `cloning` included (`workspace "<slug>" is ready, not archived`) |
-| `500` `internal` | the workspace is a task fork and no part of the hub deletes task forks (`workspace "<slug>" is a task fork, and no fork remover deletes it`): the fork is unchanged; or the sandboxes could not be deleted, or a step of the removal failed: the workspace is still `archived` and nothing has changed |
+| `500` `internal` | the sandboxes could not be deleted, or a step of the removal failed: the workspace is still `archived` and nothing has changed |
+
+### Deleting a task fork
+
+A task fork is deleted at once: it needs no archive first, and its parent
+may be `ready`, `archived` or `failed`. The fork's creator, the owner of
+its parent and the admin token have write access to it. First the fork's
+sandboxes are deleted, without a checkpoint; when that fails the answer is
+`500 internal` and nothing else has changed. Then, in one store
+transaction, the tokens bound to the fork are revoked, the data other
+features keep for it (its secrets among them) is removed, its remaining
+agent sessions are ended with the reason `workspace deleted`, its record
+is removed and one `parley.workspace.delete` event is written. When
+anything in that transaction fails, nothing has changed: the fork still
+answers `GET` with its `expires_at`, its tokens still authenticate, its
+secrets and its own branches are still there. Once it has committed the
+fork's repository, with its own branches, is removed from disk; the
+parent's branches are never touched. A repository that cannot be removed
+is logged and kept for a later removal, and the answer stays `204`. A fork
+created later under the same name starts without the removed fork's
+branches. Of two deletes of one fork at the same time one answers `204`
+and the other `404`, and one event is written.
+
+The event is the one described above with `metadata.kind` `fork`, the
+caller as actor, `metadata.parent_slug` the parent's slug, no
+`deleted_forks`, and `session_id` the session the fork was created in,
+`null` for none; no `parley.fork.expire` event is written.
+
+| Status | When |
+|---|---|
+| `204 No Content` | the fork and what it owns are gone; the body is empty |
+| `403` `insufficient_scope` | a PAT without `workspaces:write` |
+| `403` `forbidden` | a member of the parent's org who neither created the fork nor owns the parent |
+| `404` `not_found` | the caller cannot read the fork, or no workspace has the slug, also a fork already deleted (`workspace not found`) |
+| `409` `workspace_busy` | the parent is `pending` or `cloning` (`workspace "<parent>" is busy: its clone has not finished; try again later`) or a reclone, archive or delete runs on it (`workspace "<parent>" is busy: a <operation> is running; try again later`): the fork is unchanged |
+| `500` `internal` | the sandboxes could not be deleted, or a step of the removal failed (`internal error`): the fork is unchanged |
+
+### Expiry of a task fork
+
+A fork whose `expires_at` has passed stays as it was, served by `GET` and
+open to a new lifetime with `ttl` in
+[`PATCH /api/v1/workspaces/{slug}`](#patch-apiv1workspacesslug), until a
+pass of the hub's sweep removes it. The sweep runs one pass right after the
+hub starts, one every 60 seconds and one in each hourly maintenance pass
+(the task `fork_expiry`), never two at once. A pass removes every fork
+whose `expires_at` is at or before its time, the forks of an `archived`
+parent included, as a delete does: its sandboxes first, then in one store
+transaction its bound tokens, the data other features keep for it, its
+sessions (ended with the reason `fork expired`) and its record, then its
+repository. A fork whose parent is `pending` or `cloning` or under a
+reclone, archive or delete is left for a later pass, and so is a fork whose
+removal fails, whole; the failure is logged with the fork's slug. A
+repository that could not be removed after a delete or an expiry is
+removed by a later pass, unless a fork has been created under the same
+slug again.
+
+While [`[forks].expire_on_land`](configuration.md) is `true` (the
+default), the same pass then removes early, the same way, every other fork
+that is the source of at least one change, whose changes are all `landed`
+or `abandoned`, whose every own branch is the source branch of one of
+them, whose last activity is at least 24 hours old and which has no
+sandbox `provisioning` or `ready`. A fork's last activity is its creation
+until a push to it or a change of it being opened, versioned, landed,
+abandoned or restored is recorded. A fork past its `expires_at` is
+removed once, with the reason `ttl`. A fork whose changes or sandboxes
+cannot be read is kept, the failure logged with its slug, until a later
+pass. The hub has no change feature yet: until one is added, no fork has
+changes and none is removed before its `expires_at`.
+
+Each removal writes one `parley.fork.expire` event and no
+`parley.workspace.delete` event: actor `system`, `workspace` and
+`resource_id` the fork's slug, `resource_type` `workspace`, `session_id`
+the session the fork was created in (`null` for none), and `metadata`
+with `parent_slug`, `reason` (`ttl` when its `expires_at` had passed,
+`landed` for an early removal), `expires_at` the fork's `expires_at`
+when it was removed, and `revoked_tokens`, the ids of the tokens bound to
+the fork that were revoked, in ascending order. The event is visible to
+the readers of the parent's events.
+
+```json
+{"seq":21,"id":"…","type":"parley.fork.expire","time":"2026-11-21T11:00:30Z","workspace":"demo--t1","actor_type":"system","actor_id":null,"resource_type":"workspace","resource_id":"demo--t1","action":"expire","session_id":null,"metadata":{"parent_slug":"demo","reason":"ttl","expires_at":"2026-11-21T11:00:00Z","revoked_tokens":["tok1"]}}
+```
 
 ## `POST /api/v1/workspaces/{slug}/forks`
 
