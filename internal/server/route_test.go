@@ -59,6 +59,63 @@ func TestRegister_RunsTheMatchedHandlerWithItsPathParameters(t *testing.T) {
 	}
 }
 
+func TestRouting_PrefersALiteralSegmentOverAParameter(t *testing.T) {
+	t.Parallel()
+	var log callLog
+	s := New(Options{})
+	s.SetAuthenticator(log.authenticator(testCaller, nil))
+	for _, rt := range []struct{ method, pattern string }{
+		{http.MethodGet, "/w/:slug/changes/:number"},
+		{http.MethodGet, "/w/:slug/changes/by-commit/:sha"},
+		{http.MethodGet, "/w/:slug/changes/:number/stack"},
+		{http.MethodPost, "/w/:slug/changes/:number/stack"},
+		{http.MethodGet, "/w/:slug/changes/:number/versions/:version"},
+	} {
+		s.Register(Route{Method: rt.method, Pattern: rt.pattern, Handler: func(w http.ResponseWriter, r *http.Request) error {
+			m, _ := MatchedRoute(r)
+			WriteJSON(w, http.StatusOK, map[string]any{"route": m.Method + " " + m.Pattern, "params": m.Params})
+			return nil
+		}})
+	}
+	h := s.Handler()
+
+	tests := []struct {
+		method, path, wantRoute string
+		wantParams              map[string]any
+	}{
+		{http.MethodGet, "/api/v1/w/p1/changes/by-commit", "GET /w/:slug/changes/:number",
+			map[string]any{"slug": "p1", "number": "by-commit"}},
+		{http.MethodGet, "/api/v1/w/p1/changes/by-commit/a1b2", "GET /w/:slug/changes/by-commit/:sha",
+			map[string]any{"slug": "p1", "sha": "a1b2"}},
+		{http.MethodGet, "/api/v1/w/p1/changes/by-commit/stack", "GET /w/:slug/changes/by-commit/:sha",
+			map[string]any{"slug": "p1", "sha": "stack"}},
+		{http.MethodGet, "/api/v1/w/p1/changes/7/stack", "GET /w/:slug/changes/:number/stack",
+			map[string]any{"slug": "p1", "number": "7"}},
+		{http.MethodHead, "/api/v1/w/p1/changes/by-commit/stack", "", nil},
+		{http.MethodPost, "/api/v1/w/p1/changes/by-commit/stack", "POST /w/:slug/changes/:number/stack",
+			map[string]any{"slug": "p1", "number": "by-commit"}},
+		{http.MethodGet, "/api/v1/w/p1/changes/by-commit/versions/2", "GET /w/:slug/changes/:number/versions/:version",
+			map[string]any{"slug": "p1", "number": "by-commit", "version": "2"}},
+		{http.MethodGet, "/api/v1/w/a%2Fb/changes/by-commit/c%20d", "GET /w/:slug/changes/by-commit/:sha",
+			map[string]any{"slug": "a/b", "sha": "c d"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.method+" "+tt.path, func(t *testing.T) {
+			rec := do(h, newRequest(tt.method, tt.path, nil, ""))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d (body %s)", rec.Code, http.StatusOK, rec.Body.Bytes())
+			}
+			if tt.method == http.MethodHead {
+				return
+			}
+			want := map[string]any{"route": tt.wantRoute, "params": tt.wantParams}
+			if got := decodeObject(t, rec.Body.Bytes()); !reflect.DeepEqual(got, want) {
+				t.Errorf("body = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
 func TestRouting_AnswersNotFoundForAPathNoRouteMatches(t *testing.T) {
 	t.Parallel()
 	var log callLog

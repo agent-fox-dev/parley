@@ -214,11 +214,10 @@ func TestGuard_LetsAForkTokenOntoTheContributorRoutesOfTheParent(t *testing.T) {
 	}
 	want := binding{"f1", access.RelationParentOfBoundFork}
 	for _, r := range rows {
-		// One server per route: the router cannot hold /changes/by-commit/:sha
-		// together with the routes under /changes/:number.
-		s := h.fresh()
-		s.probe(r.method, "/workspaces/:slug"+r.pattern, access.NeedRead, "git:read")
-		a := s.do(r.method, "/workspaces/p1"+r.path, tokF)
+		h.probe(r.method, "/workspaces/:slug"+r.pattern, access.NeedRead, "git:read")
+	}
+	for _, r := range rows {
+		a := h.do(r.method, "/workspaces/p1"+r.path, tokF)
 		if a.status != http.StatusOK {
 			t.Errorf("%s p1%s = %d %s, want 200", r.method, r.path, a.status, a.body)
 			continue

@@ -46,11 +46,14 @@ an in-memory store).
 `Serve` serves `Handler()`, so the running hub and in-process tests answer
 the same way.
 
-Every route is registered on one standard library `http.ServeMux` with
-method and path patterns: the built-in `GET /healthz`, `GET /readyz` and
-`GET /version`, the REST API routes, and surfaces outside the REST API that
-later packages mount with `(*Server).Handle(pattern, handler)`, which takes
-the mux's own patterns and bypasses the REST API's checks. Success bodies are
+The built-in `GET /healthz`, `GET /readyz` and `GET /version`, and the
+surfaces outside the REST API that later packages mount with
+`(*Server).Handle(pattern, handler)`, are registered on one standard library
+`http.ServeMux` with its method and path patterns; `Handle` bypasses the REST
+API's checks. The REST API routes are held in the server's own route table
+and matched by the dispatcher (below), because the mux refuses two patterns
+of which neither is more specific, such as `/changes/by-commit/:sha` and
+`/changes/:number/stack`. Success bodies are
 written with `server.WriteJSON`, errors with `server.WriteError`, both with
 `Content-Type: application/json; charset=utf-8`. The routes are described in
 [api.md](api.md).
@@ -89,7 +92,22 @@ The dispatcher sits in front of the mux. The mux alone would
 redirect a path that is not clean (`//x`, `/a/../x`) or that lacks the
 trailing slash of a subtree pattern, and would answer an unknown path or a
 wrong method in plain text. The dispatcher answers a path that is not clean
-with the `404 not_found` envelope, asks the mux (`ServeMux.Handler`) which
+with the `404 not_found` envelope.
+
+A path under `/api/v1/` is matched against the REST routes first, segment by
+segment on the unescaped segments: a literal segment must be equal, a
+parameter takes any segment that is not empty. Of the routes that match the
+path and are registered for the method (or for `GET` when the method is
+`HEAD`), the most specific serves it: reading left to right, the first
+segment where one pattern has a literal and the other a parameter decides,
+the literal winning, so `/changes/by-commit/stack` goes to
+`/changes/by-commit/:sha` and `/changes/7/stack` to `/changes/:number/stack`.
+Of a `GET` and a `HEAD` route with the same pattern, a `HEAD` request goes to
+the `HEAD` route. When routes match the path but none is registered for the
+method, the answer is `405 method_not_allowed` with their methods, sorted, in
+`Allow`. When none matches, the path goes on to the mux.
+
+For every other path the dispatcher asks the mux (`ServeMux.Handler`) which
 pattern matches, and answers no match with the `404 not_found` envelope, or
 with `405 method_not_allowed` and the mux's `Allow` list when the path is
 registered under other methods. It removes the `HEAD` that the mux adds for
@@ -109,12 +127,12 @@ declarations are `Public`, `Create` with its `ShowOnce` members, its own
 `MaxBodySize`, `ContentType` and `CacheControl`, its `Feature` check, the one
 `Scope` a personal access token needs (a name the server does not interpret)
 and `Marks`, named values whose meaning the installed checks define.
-`Register` turns the pattern into the mux's form
-(`POST /api/v1/workspaces/{slug}/tokens`) and panics on a pattern that does
-not start with a slash, ends in one, has an empty, `.` or `..` segment, a
-brace, or a parameter without a valid name or named twice, on a method that
-is not upper-case letters, on a missing handler and on a route already
-registered.
+`Register` adds the route to the server's route table and panics on a
+pattern that does not start with a slash, ends in one, has an empty, `.` or
+`..` segment, a brace, or a parameter without a valid name or named twice, on
+a method that is not upper-case letters, on a missing handler and on a route
+already registered, which includes one that differs from a registered route
+of the same method only in its parameter names.
 
 Each check and the handler read the route their request matched with
 `server.MatchedRoute(r)`: a `server.Matched` with the method and pattern as

@@ -66,10 +66,10 @@ type Server struct {
 	opts Options
 	mux  *http.ServeMux
 
-	routesMu sync.Mutex
-	// routes holds the REST API routes registered, as "METHOD path" in the
-	// router's syntax.
-	routes map[string]struct{}
+	routesMu sync.RWMutex
+	// routes holds the REST API routes registered, which dispatch matches
+	// itself rather than through mux.
+	routes []apiRoute
 
 	posMu sync.RWMutex
 	pos   positions
@@ -86,7 +86,6 @@ func New(opts Options) *Server {
 	s := &Server{
 		opts:    opts,
 		mux:     http.NewServeMux(),
-		routes:  make(map[string]struct{}),
 		limiter: newServerLimiter(opts),
 		logger:  opts.Logger,
 		now:     opts.Now,
