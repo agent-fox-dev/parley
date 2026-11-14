@@ -3,11 +3,16 @@ package workspace_test
 import (
 	"bytes"
 	"encoding/json"
+	"maps"
 	"net/http"
+	"net/url"
 	"reflect"
+	"slices"
 	"testing"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
@@ -72,6 +77,12 @@ func TestRead_RefusesAPATWithoutAWorkspacesScopeBeforeTheLookup(t *testing.T) {
 	if a := w.get(t, writer, "demo"); a.status != http.StatusOK {
 		t.Errorf("a PAT with workspaces:write = %d %s, want 200", a.status, a.body)
 	}
+	if a := w.list(t, other, ""); a.status != http.StatusForbidden || a.errorType(t) != "insufficient_scope" {
+		t.Errorf("the list = %d %s, want 403 insufficient_scope", a.status, a.body)
+	}
+	if slugs, _, _ := w.list(t, writer, "").page(t); !slices.Equal(slugs, []string{"demo"}) {
+		t.Errorf("the list with workspaces:write = %v, want [demo]", slugs)
+	}
 }
 
 func TestRead_ShowsAForkTheEffectiveSettingsOfItsParent(t *testing.T) {
@@ -96,5 +107,120 @@ func TestRead_ShowsAForkTheEffectiveSettingsOfItsParent(t *testing.T) {
 	if fork["land.strategy"] != "squash" || !reflect.DeepEqual(fork["protected_branches"], []any{"main"}) {
 		t.Errorf("after the parent changed, the fork's land.strategy = %v and protected_branches = %v, want squash and [main]",
 			fork["land.strategy"], fork["protected_branches"])
+	}
+}
+
+func TestRead_ListsTheCallersReadableSetWithTheirLevel(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	carol, dave := w.CreateUser(t, "carol"), w.CreateUser(t, "dave")
+	w.put(t, workspace.Workspace{Slug: "a-own"})
+	w.put(t, workspace.Workspace{Slug: "a-own--t1", Kind: access.KindFork, ParentSlug: new("a-own")})
+	w.put(t, workspace.Workspace{Slug: "shared", OrgID: w.acme(t)})
+	w.put(t, workspace.Workspace{Slug: "other", OwnerID: dave, OrgID: w.personalOrg(t, dave).ID})
+	bound := w.IssuePAT(t, identity.PATSpec{UserID: w.u, Permissions: []string{"workspaces:read"}, Workspace: "a-own"})
+	for _, c := range []struct {
+		caller, cred string
+		want         map[string]string
+	}{
+		{"the owner", w.uKey, map[string]string{"a-own": "owner", "a-own--t1": "owner", "shared": "owner"}},
+		{"an org member", w.vKey, map[string]string{"shared": "member"}},
+		{"a user with no workspace", w.IssueKey(t, carol), map[string]string{}},
+		{"the admin token", w.Token, map[string]string{"a-own": "admin", "a-own--t1": "admin", "shared": "admin", "other": "admin"}},
+		{"the owner's PAT bound to a-own", bound, map[string]string{"a-own": "owner"}},
+	} {
+		slugs, levels, _ := w.list(t, c.cred, "include_forks=true&include_archived=true").page(t)
+		got := map[string]string{}
+		for i, slug := range slugs {
+			got[slug] = levels[i]
+		}
+		if !maps.Equal(got, c.want) {
+			t.Errorf("%s lists %v, want %v", c.caller, got, c.want)
+		}
+	}
+}
+
+func TestRead_ListLeavesOutArchivedWorkspacesAndForksUnlessAsked(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.put(t, workspace.Workspace{Slug: "live", Status: workspace.StatusReady})
+	w.put(t, workspace.Workspace{Slug: "old", Status: workspace.StatusArchived})
+	w.put(t, workspace.Workspace{Slug: "live--t1", Kind: access.KindFork, ParentSlug: new("live"), Status: workspace.StatusReady})
+	for query, want := range map[string][]string{
+		"":                      {"live"},
+		"include_archived=true": {"live", "old"},
+		"include_forks=true":    {"live", "live--t1"},
+		"include_archived=true&include_forks=true":   {"live", "live--t1", "old"},
+		"include_archived=false&include_forks=false": {"live"},
+	} {
+		slugs, _, _ := w.list(t, w.uKey, query).page(t)
+		if slices.Sort(slugs); !slices.Equal(slugs, want) {
+			t.Errorf("?%s lists %v, want %v", query, slugs, want)
+		}
+	}
+}
+
+func TestRead_ListWithAParentAnswersOnlyItsReadableForks(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.put(t, workspace.Workspace{Slug: "live"})
+	w.put(t, workspace.Workspace{Slug: "other"})
+	for _, f := range []struct{ slug, parent string }{{"live--t1", "live"}, {"live--t2", "live"}, {"other--t1", "other"}} {
+		w.put(t, workspace.Workspace{Slug: f.slug, Kind: access.KindFork, ParentSlug: new(f.parent)})
+	}
+	for _, c := range []struct {
+		caller, cred, query string
+		want                []string
+	}{
+		{"the owner", w.uKey, "parent=live", []string{"live--t1", "live--t2"}},
+		{"the owner", w.uKey, "parent=live&include_forks=false", []string{"live--t1", "live--t2"}},
+		{"the owner", w.uKey, "parent=no-such-slug", nil},
+		{"a user who cannot read live", w.vKey, "parent=live", nil},
+		{"the owner", w.uKey, "parent=live--t1", nil},
+	} {
+		if slugs, _, _ := w.list(t, c.cred, c.query).page(t); !slices.Equal(slugs, c.want) {
+			t.Errorf("%s, ?%s lists %v, want %v", c.caller, c.query, slugs, c.want)
+		}
+	}
+}
+
+func TestRead_ListOrdersNewestFirstThenBySlugAcrossPages(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	second := w.clock().Truncate(time.Second)
+	for _, r := range []struct {
+		slug string
+		age  time.Duration
+	}{{"e", 2 * time.Second}, {"ab", time.Second}, {"aa", time.Second}, {"z", 0}, {"ac", time.Second}} {
+		w.put(t, workspace.Workspace{Slug: r.slug, CreatedAt: second.Add(-r.age)})
+	}
+	all, _, next := w.list(t, w.uKey, "limit=200").page(t)
+	if want := []string{"z", "aa", "ab", "ac", "e"}; !slices.Equal(all, want) || next != nil {
+		t.Fatalf("one page lists %v with next_cursor %v, want %v and null", all, next, want)
+	}
+	var paged []string
+	for query := "limit=2"; ; {
+		slugs, _, next := w.list(t, w.uKey, query).page(t)
+		paged = append(paged, slugs...)
+		if next == nil {
+			break
+		}
+		if *next == "" || len(paged) > len(all) {
+			t.Fatalf("after %v: next_cursor %q", paged, *next)
+		}
+		query = "limit=2&cursor=" + url.QueryEscape(*next)
+	}
+	if !slices.Equal(paged, all) {
+		t.Errorf("pages of 2 list %v, want %v", paged, all)
+	}
+}
+
+func TestRead_ListRefusesABooleanOtherThanTrueOrFalse(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	for _, query := range []string{"include_archived=yes", "include_archived=1", "include_forks=TRUE", "include_forks="} {
+		if a := w.list(t, w.uKey, query); a.status != http.StatusBadRequest || a.errorType(t) != "invalid_request" {
+			t.Errorf("?%s = %d %s, want 400 invalid_request", query, a.status, a.body)
+		}
 	}
 }

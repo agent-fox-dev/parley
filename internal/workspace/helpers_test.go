@@ -239,6 +239,40 @@ func (w *world) patch(t *testing.T, cred, slug string, body any) answer {
 	return answer{status, b}
 }
 
+// list asks GET /workspaces?<query> with cred as the bearer credential.
+func (w *world) list(t *testing.T, cred, query string) answer {
+	t.Helper()
+	status, b := w.Call(t, http.MethodGet, "/api/v1/workspaces?"+query, cred, nil)
+	return answer{status, b}
+}
+
+// page decodes a, which must be 200, as a page of a list: the slug and the
+// access of each item in order, and next_cursor. items must be a JSON
+// array, never null, of workspace objects.
+func (a answer) page(t *testing.T) (slugs, levels []string, next *string) {
+	t.Helper()
+	var p struct {
+		Items      json.RawMessage `json:"items"`
+		NextCursor *string         `json:"next_cursor"`
+	}
+	if err := json.Unmarshal(a.body, &p); err != nil || a.status != http.StatusOK || len(p.Items) == 0 || p.Items[0] != '[' {
+		t.Fatalf("answer = %d %s, want 200 with an items array", a.status, a.body)
+	}
+	var items []map[string]any
+	if err := json.Unmarshal(p.Items, &items); err != nil {
+		t.Fatal(err)
+	}
+	for _, it := range items {
+		if len(it) != len(objectMembers) {
+			t.Errorf("item %v has %d members, want the %d of a workspace object", it["slug"], len(it), len(objectMembers))
+		}
+		slug, _ := it["slug"].(string)
+		level, _ := it["access"].(string)
+		slugs, levels = append(slugs, slug), append(levels, level)
+	}
+	return slugs, levels, p.NextCursor
+}
+
 // objectMembers are the members of every workspace object.
 var objectMembers = []string{"slug", "kind", "workspace_mode", "git_url", "default_branch", "owner_id", "org_id",
 	"status", "display_name", "description", "head_sha", "origin_head_sha", "clone_error", "last_sync_at",

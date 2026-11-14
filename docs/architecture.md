@@ -32,7 +32,7 @@ command-line client. Both are written in Go, in the module
 | `internal/store` | the hub's two embedded SQLite stores (`modernc.org/sqlite`, no cgo): `Open` creates the data directory and the workspace root, opens the transactional store and the analytical store (`analytics.db` beside it) and applies the registered schema steps; `Tx` runs a transaction of the transactional store; `Snapshot` writes a consistent copy of one store file without changing it |
 | `internal/server` | the hub's HTTP server: its built-in routes, the REST API's route registration and check pipeline, the error envelope, request ids, response headers and the access log, list paging, idempotency keys, and the readiness probes |
 | `internal/server/timefmt` | the one timestamp format (`Format`, and the response member type `Time`) and the one duration grammar (`ParseDuration`); a leaf package that imports nothing of the project, so that the configuration loader can use it as well as the REST API |
-| `internal/workspace` | the place for workspace records, their validation rules, the state guard, and the create and clone work; so far the whole workspace record with its store functions, the state guard `RequireReady`, the resolution of a workspace's origin credential from its secrets `ResolveOriginCredential`, the workspace service with `POST /api/v1/workspaces`, `GET /api/v1/workspaces/:slug` and `PATCH /api/v1/workspaces/:slug` and the clone work `Clone` with the copy's place `RepoPath` and the post-clone steps, the clone workers `Workers` and `(*Service).Enqueue`, which hands a workspace put back to `pending` to them (see Clone work), the one encoder of the workspace object `RenderWorkspace` and the settings registry with the settings table of the 21 setting keys and `RegisterSettingKeys` (see Workspace records), the one branch-glob matcher `MatchBranchGlob`, `MatchAnyBranchGlob` and `ValidateBranchGlob`, and the rules every workspace route judges its values by, each deciding on the text alone and returning an error that says which rule broke: `ValidateSlug` (3 to 64 characters of a to z, digits and hyphens, starting with a letter), `ValidateGitURL` (`https://<host>/<path>` without user information, or `git@<host>:<path>`, with no lookup or connection), `ValidateBranchName` (git's branch-name rule), `ValidateForkName` (1 to 32 characters of a to z, digits and hyphens) and `ParseDuration` (a whole number above zero followed by `m`, `h` or `d`, unlike `timefmt.ParseDuration`, which also takes seconds) |
+| `internal/workspace` | the place for workspace records, their validation rules, the state guard, and the create and clone work; so far the whole workspace record with its store functions, the state guard `RequireReady`, the resolution of a workspace's origin credential from its secrets `ResolveOriginCredential`, the workspace service with `POST /api/v1/workspaces`, `GET /api/v1/workspaces`, `GET /api/v1/workspaces/:slug` and `PATCH /api/v1/workspaces/:slug` and the clone work `Clone` with the copy's place `RepoPath` and the post-clone steps, the clone workers `Workers` and `(*Service).Enqueue`, which hands a workspace put back to `pending` to them (see Clone work), the one encoder of the workspace object `RenderWorkspace` and the settings registry with the settings table of the 21 setting keys and `RegisterSettingKeys` (see Workspace records), the one branch-glob matcher `MatchBranchGlob`, `MatchAnyBranchGlob` and `ValidateBranchGlob`, and the rules every workspace route judges its values by, each deciding on the text alone and returning an error that says which rule broke: `ValidateSlug` (3 to 64 characters of a to z, digits and hyphens, starting with a letter), `ValidateGitURL` (`https://<host>/<path>` without user information, or `git@<host>:<path>`, with no lookup or connection), `ValidateBranchName` (git's branch-name rule), `ValidateForkName` (1 to 32 characters of a to z, digits and hyphens) and `ParseDuration` (a whole number above zero followed by `m`, `h` or `d`, unlike `timefmt.ParseDuration`, which also takes seconds) |
 | `test/e2e` | tests that build the binaries and run them |
 
 ## The HTTP server
@@ -1438,8 +1438,9 @@ collected, which hold every repository the user has a level on, so a parent
 that is not among them is one the user has no level on. A workspace is
 therefore in a user's set exactly when `Level` resolves a level other than
 `LevelNone` for it, with that level. The visibility decision of the hub
-events calls `Readable` (see [Hub events](#hub-events)); the workspace list
-and the audit query will.
+events calls `Readable` (see [Hub events](#hub-events)), and so does the
+workspace list (`GET /workspaces`, see Workspace records); the audit query
+will.
 
 #### Workspace-bound tokens
 
@@ -1701,7 +1702,8 @@ functions take the caller's transaction:
 `workspace.SchemaStep` and the workspace routes, and adds the start hook
 `workspaces`, which builds the service's `workspace.Deps` (the stores, the
 secret and event components through the `Secrets` and `Events` interfaces,
-the hub's scrubber, logger and clock, `[server].external_url` as
+the access part's `*access.Service` as `Access`, an `AccessRule` that gives
+the workspace list the caller's readable set, the hub's scrubber, logger and clock, `[server].external_url` as
 `ExternalURL` and `[workspace].path` as `Root`, and `Lister`, an
 `OriginLister` that lists an origin's refs with a `Credential`, the type
 `gitrepo.Credential`, so that a resolved credential goes to git unchanged),
@@ -1790,6 +1792,24 @@ for a slug no workspace has. The handler takes the caller's level from
 `access.DecisionOf`, reads the whole record with `BySlug` (a record deleted
 since the check is the same `404`) and answers it through
 `RenderWorkspace`, in every status and for both kinds.
+
+The same file holds `GET /workspaces`, declared with `Scope`
+`workspaces:read` and no access need, since it names no workspace; it is on
+the binding guard's allowlist. The handler reads the page (`server.ReadPage`),
+refuses `include_archived` or `include_forks` with a value other than `true`
+or `false` (`400`), and takes the caller's readable set from
+`Deps.Access.Readable(ctx, access.CallerFrom(caller))`, which for a
+workspace-bound PAT is already cut to its covered set, so the list narrows
+with the set and needs no rule of its own. One query (`readList`) then reads
+the page's rows: the set's slugs as one JSON parameter (`slug IN (SELECT value
+FROM json_each(?))`, every row for the admin token), `status <> 'archived'`
+unless asked, `kind = 'repository'` unless forks are asked, or with `parent`
+the forks whose `parent_slug` it is when it names a repository workspace
+(a parent outside the readable set reads nothing), the cursor's position
+`(created_at, slug)` and `ORDER BY created_at DESC, slug ASC LIMIT` the page
+plus one. Each row is answered through `RenderWorkspace` with the set's
+level for it, and `server.WritePage` writes the page with a cursor of the
+last item's stored `created_at` (UnixNano) and slug.
 
 `internal/workspace/update.go` holds `PATCH /workspaces/:slug`, declared
 with `Scope` `workspaces:write` and `Marks` `access.need: write`, so the

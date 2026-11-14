@@ -1212,6 +1212,41 @@ given):
 {"seq":12,"id":"…","type":"parley.workspace.create","time":"2026-11-14T10:30:15Z","workspace":"demo","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"workspace","resource_id":"demo","action":"create","session_id":null,"metadata":{"default_branch":null,"git_url":"https://example.com/a.git","kind":"repository","workspace_mode":"standard"}}
 ```
 
+## `GET /api/v1/workspaces`
+
+Lists the workspaces the caller can read, in every status but `archived`,
+each as the workspace object `GET /api/v1/workspaces/{slug}` answers, with
+`access` the caller's level on that workspace. It takes the admin token, an
+API key or a PAT, and declares the scope `workspaces:read` for a PAT, which
+a PAT holding `workspaces:write` also satisfies. It names no workspace, so
+no access check runs before it; the list itself holds only the workspaces
+the caller can read (see [Workspace access](#workspace-access)):
+
+| Caller | Listed, with `access` |
+|---|---|
+| the admin token | every workspace, `admin` |
+| a user | the workspaces they own and the task forks of those, `owner`; the workspaces of their active orgs that they do not own, `member` |
+| a PAT bound to a workspace | what its user's list holds of the workspaces its binding covers (see [Workspace-bound tokens](#workspace-bound-tokens)) |
+
+It is a list (see [Lists](#lists)), with `limit` and `cursor` and these
+query parameters:
+
+| Parameter | Meaning |
+|---|---|
+| `include_archived` | `true` lists archived workspaces too; `false` or absent leaves them out |
+| `include_forks` | `true` lists task forks too; `false` or absent leaves them out |
+| `parent` | lists only the task forks whose `parent_slug` is this slug, whatever `include_forks` says; the list is empty when no workspace has the slug, when the caller cannot read it, or when it is a task fork |
+
+The order is `created_at` descending, then `slug` ascending among the
+workspaces created in the same instant; the cursor carries both, so a walk
+over the pages returns each listed workspace once.
+
+| Status | When |
+|---|---|
+| `200 OK` | the body is a page, `items` an array of workspace objects (`[]` when nothing matches) |
+| `400` `invalid_request` | `include_archived` or `include_forks` with a value other than exactly `true` or `false`, an empty one included (`include_forks must be true or false`); a bad `limit` or `cursor` (see [Lists](#lists)) |
+| `403` `insufficient_scope` | a PAT with neither `workspaces:read` nor `workspaces:write` (`this route needs the scope workspaces:read`) |
+
 ## `GET /api/v1/workspaces/{slug}`
 
 Answers the workspace `{slug}` to a caller who can read it, in every status

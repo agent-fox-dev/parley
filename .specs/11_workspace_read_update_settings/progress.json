@@ -3,7 +3,7 @@
   "spec_id": "11",
   "spec_name": "workspace_read_update_settings",
   "schema_version": 3,
-  "updated_at": "2026-11-14T09:19:04Z",
+  "updated_at": "2026-11-14T09:24:22Z",
   "tasks": [
     {
       "id": 1,
@@ -19,7 +19,7 @@
     },
     {
       "id": 4,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 5,
