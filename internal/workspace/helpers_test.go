@@ -8,6 +8,7 @@ import (
 	"maps"
 	"net/http"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -791,4 +792,112 @@ func (w *world) setPending(t *testing.T, slug string, forget bool) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// deleteSecret removes the workspace secret name of slug through the secret
+// component.
+func (w *world) deleteSecret(t *testing.T, slug, name string) {
+	t.Helper()
+	err := w.Store.Tx(context.Background(), func(tx *sql.Tx) error {
+		_, err := w.secrets.Delete(context.Background(), tx, secret.ScopeWorkspace, slug, name)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// syncSlug is the workspace of a sync world.
+const syncSlug = "demo"
+
+// syncWorld is a world with the ready repository workspace syncSlug of the
+// user u, whose origin is a bare repository on disk holding the origin's
+// usual history (see gitrepotest.Origin.History), and the hub's copy of it at
+// its place, made by the clone work, which records the origin heads. The
+// hub's fetcher records every fetch.
+type syncWorld struct {
+	*world
+	origin *gitrepotest.Origin
+	// copy is the git directory of the hub's copy.
+	copy    string
+	fetches *recordingFetcher
+}
+
+// newSyncWorld starts a world with opts and builds the sync world in it.
+func newSyncWorld(t *testing.T, opts ...option) *syncWorld {
+	t.Helper()
+	o := gitrepotest.NewOrigin(t)
+	o.History()
+	f := &recordingFetcher{}
+	w := newWorld(t, append(opts, withCompose(func(c *hub.Composition) {
+		c.AdjustWorkspace(func(d *workspace.Deps) { f.Fetcher, d.Fetcher = d.Fetcher, f })
+	}))...)
+	url := o.Dir()
+	w.put(t, workspace.Workspace{Slug: syncSlug, GitURL: &url})
+	if rec := w.clone(t, syncSlug); rec.Status != workspace.StatusReady {
+		t.Fatalf("the clone of the sync workspace left it %s (%v)", rec.Status, deref(rec.CloneError))
+	}
+	return &syncWorld{world: w, origin: o, copy: w.svc.RepoPath(syncSlug), fetches: f}
+}
+
+// sync runs a sync of the workspace with opts and fails the test when it
+// does not complete.
+func (s *syncWorld) sync(t *testing.T, opts workspace.SyncOptions) workspace.SyncResult {
+	t.Helper()
+	r, err := s.svc.Sync(context.Background(), syncSlug, opts)
+	if err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	return r
+}
+
+// refsUnder maps every ref below prefix of the repository at dir, by its
+// name without the prefix, to the object id it points at.
+func refsUnder(t *testing.T, dir, prefix string) map[string]string {
+	t.Helper()
+	refs := map[string]string{}
+	for line := range strings.Lines(gitrepotest.Git(t, dir, "for-each-ref", "--format=%(refname) %(objectname)", prefix)) {
+		name, id, _ := strings.Cut(strings.TrimSpace(line), " ")
+		refs[strings.TrimPrefix(name, prefix)] = id
+	}
+	return refs
+}
+
+// deref is the value p points at, "" for nil.
+func deref(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
+}
+
+// recordingFetcher is the hub's fetcher for syncs: it records every fetch
+// and runs it.
+type recordingFetcher struct {
+	workspace.Fetcher
+
+	mu    sync.Mutex
+	calls []fetchCall
+}
+
+// fetchCall is one fetch: the copy, origin's URL, the credential and the
+// deadline it was given.
+type fetchCall struct {
+	dir, url string
+	cred     workspace.Credential
+	deadline time.Duration
+}
+
+func (f *recordingFetcher) FetchOrigin(ctx context.Context, dir, url string, cred workspace.Credential, deadline time.Duration) (gitrepo.Fetched, error) {
+	f.mu.Lock()
+	f.calls = append(f.calls, fetchCall{dir, url, cred, deadline})
+	f.mu.Unlock()
+	return f.Fetcher.FetchOrigin(ctx, dir, url, cred, deadline)
+}
+
+// recorded are the fetches so far.
+func (f *recordingFetcher) recorded() []fetchCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]fetchCall(nil), f.calls...)
 }

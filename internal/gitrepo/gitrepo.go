@@ -273,6 +273,11 @@ type access struct {
 // that no repository around the hub's working directory takes part; the
 // directory is removed when git has returned.
 func (g Git) run(ctx context.Context, a access, args ...string) ([]byte, error) {
+	return g.runInput(ctx, a, nil, args...)
+}
+
+// runInput is run with stdin as git's standard input, none when nil.
+func (g Git) runInput(ctx context.Context, a access, stdin []byte, args ...string) ([]byte, error) {
 	dir, err := privateDir(!a.cred.IsZero())
 	if err != nil {
 		return nil, err
@@ -299,6 +304,9 @@ func (g Git) run(ctx context.Context, a access, args ...string) ([]byte, error) 
 	var stdout bytes.Buffer
 	stderr := &limitedBuffer{limit: stderrLimit}
 	cmd.Stdout, cmd.Stderr = &stdout, stderr
+	if stdin != nil {
+		cmd.Stdin = bytes.NewReader(stdin)
+	}
 	cmd.WaitDelay = waitDelay
 	killGroupOnCancel(cmd)
 	if err := cmd.Run(); err != nil {

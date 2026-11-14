@@ -70,6 +70,9 @@ type Deps struct {
 	// Git clones a workspace's origin into its copy and opens the copy;
 	// nil means gitrepo.Git{}.
 	Git Git
+	// Fetcher fetches a workspace's origin into its copy for a sync; nil
+	// means gitrepo.Git{}.
+	Fetcher Fetcher
 	// InsertWorkspace writes a new workspace record in the create
 	// transaction; nil means Insert. A test makes it fail to see the whole
 	// create roll back.
@@ -125,6 +128,9 @@ func (s *Service) Bind(d Deps) {
 	}
 	if d.Git == nil {
 		d.Git = gitrepo.Git{}
+	}
+	if d.Fetcher == nil {
+		d.Fetcher = gitrepo.Git{}
 	}
 	if d.Scrubber == nil {
 		d.Scrubber = scrub.New()
