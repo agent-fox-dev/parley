@@ -97,20 +97,21 @@ var uploadPackConfig = []string{
 
 var errNoRunner = errors.New("no git runner is installed")
 
-// exchange serves a request that passed every check. Ref discovery is
-// answered by git, upload-pack's or receive-pack's advertisement, and a
-// fetch by upload-pack; a push is handed to the push processor.
-func (c *Component) exchange(w http.ResponseWriter, r *http.Request, x Exchange) {
+// exchange serves a request that passed every check and returns its
+// result. Ref discovery is answered by git, upload-pack's or receive-pack's
+// advertisement, and a fetch by upload-pack; a push is handed to the push
+// processor, whose result it is.
+func (c *Component) exchange(w http.ResponseWriter, r *http.Request, x Exchange) Result {
 	switch {
 	case x.Route == RouteReceivePack:
-		// The result is the processor's, which the request counter takes.
-		_ = c.push(w, r, x)
+		return c.push(w, r, x)
 	case c.deps.Runner == nil:
 		c.fail(w, r, errNoRunner)
+		return ResultError
 	case x.Route == RouteInfoRefs:
-		c.advertise(w, r, x)
+		return c.advertise(w, r, x)
 	default:
-		c.fetch(w, r, x)
+		return c.fetch(w, r, x)
 	}
 }
 
@@ -121,7 +122,7 @@ func (c *Component) exchange(w http.ResponseWriter, r *http.Request, x Exchange)
 // capability advertisement is the whole answer. A push is always served
 // under version 0, whatever Git-Protocol says, since receive-pack speaks
 // no version 2.
-func (c *Component) advertise(w http.ResponseWriter, r *http.Request, x Exchange) {
+func (c *Component) advertise(w http.ResponseWriter, r *http.Request, x Exchange) Result {
 	run, req := c.deps.Runner.UploadPack, gitrepo.ServeRequest{Dir: x.Repo, AdvertiseRefs: true, Config: uploadPackConfig}
 	if x.Service == ServiceReceivePack {
 		run, req.Config = c.deps.Runner.ReceivePack, nil
@@ -132,14 +133,16 @@ func (c *Component) advertise(w http.ResponseWriter, r *http.Request, x Exchange
 	if !req.Protocol2 {
 		_, _ = out.Write(append(pktLine("# service="+x.Service+"\n"), flushPkt...))
 	}
-	c.run(r, x, out, run, req)
+	return c.run(r, x, out, run, req)
 }
 
 // fetch runs the fetch exchange: git reads the request body, decompressed
 // when it came gzipped, and its answer goes to the client as git writes
 // it. A body that is empty or is not valid gzip is answered in band, as git
-// would answer it, without running git.
-func (c *Component) fetch(w http.ResponseWriter, r *http.Request, x Exchange) {
+// would answer it, without running git. The request is scanned as git
+// reads it, and a served fetch that sent a pack is recorded as an event
+// when the workspace audits its fetches.
+func (c *Component) fetch(w http.ResponseWriter, r *http.Request, x Exchange) Result {
 	// Git reads the request while its answer is being sent; without full
 	// duplex the server would read the whole body before the first byte
 	// of the answer.
@@ -148,23 +151,35 @@ func (c *Component) fetch(w http.ResponseWriter, r *http.Request, x Exchange) {
 	out := begin(w, typeResult)
 	if refusal != "" {
 		out.writeErr(refusal)
-		return
+		return ResultError
 	}
-	c.run(r, x, out, c.deps.Runner.UploadPack, gitrepo.ServeRequest{Dir: x.Repo, Protocol2: protocol2(r.Header), Config: uploadPackConfig, Stdin: body})
+	scan := &requestScanner{}
+	res := c.run(r, x, out, c.deps.Runner.UploadPack, gitrepo.ServeRequest{
+		Dir: x.Repo, Protocol2: protocol2(r.Header), Config: uploadPackConfig, Stdin: scanningReader{body, scan},
+	})
+	if res == ResultOK && out.scan.packSent {
+		c.recordFetch(r, x, scan)
+	}
+	return res
 }
 
 // run runs git with serve, the runner's upload-pack or receive-pack, for
-// req, its answer written to out, bounded by the timeout. When git fails or runs out of time before any pack data went
-// out, and git wrote no error packet of its own, the answer ends with an ERR
-// packet that says why: the hub's text for the timeout, git's own for a
-// request git refused. A client that went away is told nothing.
-func (c *Component) run(r *http.Request, x Exchange, out *stream, serve func(context.Context, gitrepo.ServeRequest) error, req gitrepo.ServeRequest) {
+// req, its answer written to out, bounded by the timeout, and returns ok
+// when git succeeded and error when it did not. When git fails or runs out
+// of time before any pack data went out, and git wrote no error packet of
+// its own, the answer ends with an ERR packet that says why: the hub's text
+// for the timeout, git's own for a request git refused. A client that went
+// away is told nothing.
+func (c *Component) run(r *http.Request, x Exchange, out *stream, serve func(context.Context, gitrepo.ServeRequest) error, req gitrepo.ServeRequest) Result {
 	ctx, cancel := context.WithTimeout(r.Context(), c.timeout())
 	defer cancel()
 	req.Stdout = out
 	err := serve(ctx, req)
-	if err == nil || r.Context().Err() != nil {
-		return
+	if err == nil {
+		return ResultOK
+	}
+	if r.Context().Err() != nil {
+		return ResultError
 	}
 	text := gitText(err, x.Service, x.Repo)
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
@@ -179,6 +194,7 @@ func (c *Component) run(r *http.Request, x Exchange, out *stream, serve func(con
 	if !out.scan.packSent && !out.scan.errSent {
 		out.writeErr(text)
 	}
+	return ResultError
 }
 
 // timeout is how long one run of upload-pack may take.

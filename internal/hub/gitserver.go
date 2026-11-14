@@ -27,8 +27,11 @@ const gitServerHook = "gitserver"
 // exchange, to the hub's git, which runs upload-pack for a fetch and
 // receive-pack's advertisement for a push, and copies a fork's tracking
 // refs from its parent's repository into the fork's, to
-// the fork view, which names those refs from the fork's record, and to
-// [git].timeout, which it registers and which bounds each run. The server,
+// the fork view, which names those refs from the fork's record, to the
+// event log, which receives the event of an audited fetch, to the
+// workspace service's settings registry, from which a workspace's
+// audit_fetches is read, and to [git].timeout, which it registers and
+// which bounds each run. The server,
 // and with it the limiter, is built after the start hooks, so the limiter
 // reaches the component through a server hook: the component holds a
 // serverLimiter, which the hook points at the limiter of the server that
@@ -56,6 +59,7 @@ func composeGitServer(c *Composition) {
 			Repositories: gitserver.DiskRepositories(gitFor(c.env), c.workspaces.RepoPath),
 			Runner:       gitFor(c.env), Timeout: gitserver.TimeoutFrom(rt.Config), Logger: rt.Logger,
 			ForkView: forkView{rt.Store.Main()}, Copier: gitFor(c.env),
+			Events: c.Events(), Settings: c.workspaces.Settings(),
 		}
 		for _, adjust := range c.gitServerAdjusters {
 			adjust(&d)

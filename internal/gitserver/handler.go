@@ -157,6 +157,14 @@ type Deps struct {
 	// itself; with none, a push is answered 500 internal error with its
 	// body unread and git not run, and the repository is left as it is.
 	Push PushProcessor
+	// Events receives the parley.git.fetch event of a fetch that sent a
+	// pack from a workspace whose setting audit_fetches is true; with none,
+	// no such event is written and the fetch is served as ever.
+	Events EventSink
+	// Settings answers a workspace's effective settings, from which
+	// audit_fetches is read; with none, or while the key is not
+	// registered, audit_fetches is false.
+	Settings Settings
 	// Timeout bounds one run of git for a client; zero is DefaultTimeout.
 	Timeout time.Duration
 	// Logger receives the causes of 500 answers; nil discards them.
@@ -166,8 +174,9 @@ type Deps struct {
 // Component is the git server. The zero Component is ready to be mounted;
 // Bind gives it its dependencies before it serves the first request.
 type Component struct {
-	deps  Deps
-	locks forkLocks
+	deps     Deps
+	locks    forkLocks
+	requests requestCounter
 }
 
 // Bind sets the component's dependencies. The hub calls it once, from a
@@ -218,22 +227,38 @@ var checks = []check{
 
 // handler serves route: it runs the checks in order, stops at the first
 // that refuses, and serves a request that passed them all with git, or
-// hands it to the Service when one is set.
+// hands it to the Service when one is set. Every request is counted once,
+// when its answer is complete but for the end of its body, which the
+// server writes once the handler returns, so that a client that has read
+// its answer finds it counted.
 func (c *Component) handler(route Route) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		x := Exchange{Route: route, Service: serviceOf(route, r)}
-		x.Need = needOf(route, x.Service)
-		for _, chk := range checks {
-			if !chk(c, w, r, &x) {
-				return
-			}
+		sw := &statusWriter{ResponseWriter: w}
+		res := c.serve(sw, r, route)
+		if res == "" {
+			res = resultOf(sw.status)
 		}
-		if c.deps.Service != nil {
-			c.deps.Service.Serve(w, r, x)
-			return
-		}
-		c.exchange(w, r, x)
+		c.requests.add(RequestLabels{Service: labelOf(route), Result: res})
 	})
+}
+
+// serve runs the checks and the exchange of a request on route and returns
+// the result of an exchange with git or of a push handed over, or "" when
+// the answer's status is the result: a refusal of a check, or the answer of
+// the Service.
+func (c *Component) serve(w http.ResponseWriter, r *http.Request, route Route) Result {
+	x := Exchange{Route: route, Service: serviceOf(route, r)}
+	x.Need = needOf(route, x.Service)
+	for _, chk := range checks {
+		if !chk(c, w, r, &x) {
+			return ""
+		}
+	}
+	if c.deps.Service != nil {
+		c.deps.Service.Serve(w, r, x)
+		return ""
+	}
+	return c.exchange(w, r, x)
 }
 
 // serviceOf is the git service a request on route asks for.

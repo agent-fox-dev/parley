@@ -52,6 +52,7 @@ const (
 type world struct {
 	*hubtest.Hub
 	workspaces *workspace.Service
+	git        *gitserver.Component
 	service    *recorder
 	runs       countingRunner
 
@@ -94,7 +95,7 @@ func startWorld(t *testing.T, cfg hubtest.Config, service *recorder) *world {
 	w := &world{now: time.Now().UTC().Truncate(time.Second), service: service}
 	compose := cfg.Compose
 	cfg.Now, cfg.Compose = w.clock, func(c *hub.Composition) {
-		w.workspaces = c.Workspaces()
+		w.workspaces, w.git = c.Workspaces(), c.GitServer()
 		c.AdjustGitServer(func(d *gitserver.Deps) {
 			if service != nil {
 				d.Service = service

@@ -36,3 +36,35 @@ func TestPktScanner_SeesPackDataAndErrorsInPiecesOfAnySize(t *testing.T) {
 		}
 	}
 }
+
+func TestRequestScanner_SeesTheShallowAndFilterLinesOfEitherProtocolInPiecesOfAnySize(t *testing.T) {
+	t.Parallel()
+	want := string(pktLine("want 1234567890123456789012345678901234567890 side-band-64k filter\n"))
+	v2 := string(pktLine("command=fetch\n")) + string(pktLine("agent=git/2.56\n")) + "0001"
+	for _, c := range []struct {
+		name, request, filter string
+		shallow               bool
+	}{
+		{"version 0, deepen", want + string(pktLine("deepen 1\n")) + flushPkt, "", true},
+		{"version 0, deepen-since and a filter", want + string(pktLine("deepen-since 1700000000\n")) + string(pktLine("filter blob:none\n")) + flushPkt, "blob:none", true},
+		{"version 2, deepen-not", v2 + want + string(pktLine("deepen-not refs/heads/old\n")) + flushPkt, "", true},
+		{"version 2, a filter alone", v2 + string(pktLine("filter tree:0\n")) + string(pktLine("done\n")) + flushPkt, "tree:0", false},
+		{"version 2, neither", v2 + string(pktLine("deepen-relative\n")) + string(pktLine("done\n")) + flushPkt, "", false},
+	} {
+		for _, size := range []int{1, 5, len(c.request)} {
+			var s requestScanner
+			for rest := c.request; rest != ""; {
+				n := min(size, len(rest))
+				s.feed([]byte(rest[:n]))
+				rest = rest[n:]
+			}
+			shallow, filter := s.args()
+			if got := ""; shallow != c.shallow || (filter == nil) != (c.filter == "") || (filter != nil && *filter != c.filter) {
+				if filter != nil {
+					got = *filter
+				}
+				t.Errorf("%s in pieces of %d: shallow %v filter %q, want %v %q", c.name, size, shallow, got, c.shallow, c.filter)
+			}
+		}
+	}
+}

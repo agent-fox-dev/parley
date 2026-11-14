@@ -749,6 +749,40 @@ repository is missing from disk, the request is answered `500` with the
 body `internal error` before git runs, so a fork is never served with refs
 that may be out of date.
 
+Every request on the three routes is counted once, when its answer is
+complete, in the counter `parley_git_requests_total` with the labels
+`service` and `result`. `service` is the route: `info-refs` for ref
+discovery, whichever service it asks for, `upload-pack` or `receive-pack`.
+`result` is `refused` for an answer of `401`, `403` or `404`; `error` for
+every other refusal (`400`, `409`, `429`, `500`) and for an exchange that
+ended with one of the hub's `ERR` pkt-lines, a failed git or a timeout;
+`ok` for a served exchange; and, for a push handed to the push processor,
+the result the processor reports. The hub does not export the counter at
+`/metrics` yet.
+
+When the workspace's setting `audit_fetches` is `true`, each
+`POST …/git-upload-pack` that is served and sends a pack (a `packfile`
+section under version 2, pack data under version 0) writes one
+`parley.git.fetch` event, once the pack is sent and before the answer ends.
+Ref discovery, an `ls-refs` request, a fetch with nothing to send, a refused
+request and one answered with an `ERR` pkt-line write none. The event names
+the addressed workspace (a task fork's own slug for a fork) as `workspace`
+and `resource_id`, `resource_type` `workspace`, and the caller: `actor_type`
+`pat`, `api_key` or `admin_token`, with the user as `actor_id` for a PAT or
+an API key. Its metadata holds `shallow`, `true` when the request has a
+`deepen`, `deepen-since` or `deepen-not` line (`--depth`, `--deepen`,
+`--shallow-since`, `--shallow-exclude`, `--unshallow`), and `filter`, the
+text of the request's filter line or `null`. git sends a size limit in bytes,
+so `--filter=blob:limit=1k` is recorded as `blob:limit=1024`:
+
+```json
+{"seq":14,"id":"…","type":"parley.git.fetch","time":"2026-11-14T10:32:00Z","workspace":"demo","actor_type":"pat","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"workspace","resource_id":"demo","action":"fetch","session_id":null,"metadata":{"filter":"blob:none","shallow":true}}
+```
+
+The fetch is served whatever becomes of its event: an event that cannot be
+written is logged with `"event":"parley.git.fetch"`, and the fetch and its
+count are unchanged.
+
 ## `GET /healthz`
 
 Liveness: the process is up and serving HTTP.

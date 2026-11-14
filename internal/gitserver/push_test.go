@@ -3,6 +3,7 @@ package gitserver_test
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/rand"
 	"database/sql"
@@ -77,10 +78,19 @@ type pushed struct {
 }
 
 // fakeProcessor is the push processor in the tests: it records what it was
-// handed, reads the whole body and answers 200 with the body fake.
+// handed, reads the whole body, answers 200 with the body fake and reports
+// the result report gave it, ok until then.
 type fakeProcessor struct {
-	mu    sync.Mutex
-	calls []pushed
+	mu     sync.Mutex
+	calls  []pushed
+	result gitserver.Result
+}
+
+// report makes the processor report res for the pushes to come.
+func (f *fakeProcessor) report(res gitserver.Result) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.result = res
 }
 
 func (f *fakeProcessor) ProcessPush(w http.ResponseWriter, r *http.Request, c gitserver.PushCaller, ws workspace.Workspace) gitserver.Result {
@@ -90,11 +100,12 @@ func (f *fakeProcessor) ProcessPush(w http.ResponseWriter, r *http.Request, c gi
 	}
 	f.mu.Lock()
 	f.calls = append(f.calls, pushed{c, ws, body})
+	res := cmp.Or(f.result, gitserver.ResultOK)
 	f.mu.Unlock()
 	w.Header().Set("Content-Type", "application/x-git-receive-pack-result")
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.WriteString(w, "fake")
-	return gitserver.ResultOK
+	return res
 }
 
 // The REST body limit is 1KB on this hub, and the push 64 kB.

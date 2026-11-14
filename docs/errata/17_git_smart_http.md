@@ -188,3 +188,30 @@ PAT, and nil for an API key or the admin token, rather than the stored
 `identity.PAT` row, which the git server never reads. The admin token's
 credential type is `admin_token`, the name the hub's events give it, where
 the principal says `admin`.
+
+## The event log is passed in `internal/hub`, as every collaborator is
+
+The package passes "the event log of package 52 as the sink in
+`cmd/parleyd`". As with the other collaborators, the git server's start hook
+in `internal/hub/gitserver.go` sets `gitserver.Deps.Events` to the hub's
+event component (`Composition.Events()`), and `Deps.Settings` to the
+workspace service's settings registry, from which `audit_fetches` is read;
+`cmd/parleyd` is unchanged.
+
+## The filter of a fetch event is the text git sends
+
+The package records "the request's filter text", and its check expects
+`blob:limit=1k` for `git clone --filter=blob:limit=1k`. git normalises a
+size limit to bytes before it sends the request (`filter blob:limit=1024`),
+so the hub never sees the unit its user typed; the event records the text of
+the request's `filter` line, `blob:limit=1024`, and the test expects that.
+A filter line longer than 1024 bytes is recorded cut to that length.
+
+## "No `audit_fetches` key registered" is a registry without the key
+
+The settings registry of the workspace feature always holds
+`audit_fetches`, so a hub in which the key is not registered cannot be
+built. The git server reads the setting through its `Settings` dependency,
+and the case is tested with an empty `workspace.SettingsRegistry` set
+through `AdjustGitServer` while the stored settings document holds
+`audit_fetches: true`: no event is written.

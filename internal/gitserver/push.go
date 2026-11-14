@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
@@ -27,7 +28,7 @@ const (
 const (
 	CredentialPAT        = identity.TypePAT
 	CredentialAPIKey     = identity.TypeAPIKey
-	CredentialAdminToken = "admin_token"
+	CredentialAdminToken = event.ActorAdminToken
 )
 
 // PushCaller is the caller of a push that passed every check, as the checks
@@ -87,18 +88,24 @@ func (c *Component) push(w http.ResponseWriter, r *http.Request, x Exchange) Res
 // pushCaller is the caller the checks established for x.
 func pushCaller(x Exchange) PushCaller {
 	p := PushCaller{
-		CredentialType: x.Principal.Type,
+		CredentialType: credentialType(x.Principal),
 		CredentialID:   x.Principal.CredentialID,
 		UserID:         x.Caller.UserID,
 		Level:          x.Level,
 		Binding:        x.Binding,
 	}
-	switch x.Principal.Type {
-	case identity.TypeAdmin:
-		p.CredentialType = CredentialAdminToken
-	case identity.TypePAT:
+	if x.Principal.Type == identity.TypePAT {
 		pat := x.Principal
 		p.PAT = &pat
 	}
 	return p
+}
+
+// credentialType is the credential type of p as the push processor and the
+// hub's events name it: admin_token for the admin token.
+func credentialType(p identity.Principal) string {
+	if p.Type == identity.TypeAdmin {
+		return CredentialAdminToken
+	}
+	return p.Type
 }
