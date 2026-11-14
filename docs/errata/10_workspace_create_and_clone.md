@@ -71,3 +71,16 @@ The check of `parley workspace create --wait` writes `--poll-interval 10ms`
 and `--timeout 50ms`. The CLI's durations are whole numbers of `s`, `m`, `h` or
 `d`, so the test polls every 10 ms through the foundation's test option and
 times out with `--timeout 1s`, as the CLI foundation's own wait tests do.
+
+## Origin's credential is given to origin's host alone
+
+Git follows a redirect of its first request to origin
+(`http.followRedirects=initial`), and the package does not say which host may
+receive the credential. The askpass program the hub gives git answers only a
+prompt that names origin's own scheme, host and port, as the workspace's
+`origin_url` gives them; for a prompt about any other host it answers nothing
+and git fails. A redirect within origin (a renamed repository on the same
+host) therefore keeps working with the credential, and a redirect to another
+host, or to another port or scheme of the same host, does not receive it: a
+private repository there fails as unauthorized. This matches the forge's rule
+that a redirect is followed only to the same scheme, host and port.
