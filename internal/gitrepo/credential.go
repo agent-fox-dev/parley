@@ -5,7 +5,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"sync"
 )
 
 // Credential is what git presents to origin: a user name and a password or
@@ -48,36 +47,26 @@ Username*) printf '%s\n' "$` + envUsername + `" ;;
 esac
 `
 
-// private is the process's private directory for git: the askpass program
-// and an empty home directory, so that no user configuration, credential
-// store or key of the account running the hub takes part.
-var private struct {
-	mu   sync.Mutex
-	dir  string
-	made bool
-}
-
-// privateDir returns the private directory, making it, mode 0700, on first
-// use and again when it has gone (a temporary directory may be cleaned).
-func privateDir() (string, error) {
-	private.mu.Lock()
-	defer private.mu.Unlock()
-	if private.made {
-		if _, err := os.Stat(askpassPath(private.dir)); err == nil {
-			return private.dir, nil
-		}
-	}
+// privateDir makes a private directory, mode 0700, for one git process: an
+// empty home directory, so that no user configuration, credential store or
+// key of the account running the hub takes part, and, when withAskpass, the
+// askpass program. The caller removes it with os.RemoveAll once git has
+// returned, so that no hub or test process leaves one behind.
+func privateDir(withAskpass bool) (string, error) {
 	dir, err := os.MkdirTemp("", "parley-git-")
 	if err != nil {
 		return "", fmt.Errorf("make git's private directory: %w", err)
 	}
 	if err := os.Mkdir(homePath(dir), 0o700); err != nil {
+		_ = os.RemoveAll(dir)
 		return "", fmt.Errorf("make git's home directory: %w", err)
 	}
-	if err := os.WriteFile(askpassPath(dir), []byte(askpassScript), 0o700); err != nil {
-		return "", fmt.Errorf("write git's askpass program: %w", err)
+	if withAskpass {
+		if err := os.WriteFile(askpassPath(dir), []byte(askpassScript), 0o700); err != nil {
+			_ = os.RemoveAll(dir)
+			return "", fmt.Errorf("write git's askpass program: %w", err)
+		}
 	}
-	private.dir, private.made = dir, true
 	return dir, nil
 }
 

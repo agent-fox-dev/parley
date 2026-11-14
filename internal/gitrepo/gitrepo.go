@@ -269,13 +269,15 @@ type access struct {
 // run runs git with args under ctx, with the minimal environment, Env and
 // a's credential, and returns its standard output. A failure's error holds git's
 // standard error; when ctx ended, it wraps ctx's error instead. The process
-// runs in git's private home directory, outside any repository, so that no
-// repository around the hub's working directory takes part.
+// runs in a private home directory of its own, outside any repository, so
+// that no repository around the hub's working directory takes part; the
+// directory is removed when git has returned.
 func (g Git) run(ctx context.Context, a access, args ...string) ([]byte, error) {
-	dir, err := privateDir()
+	dir, err := privateDir(!a.cred.IsZero())
 	if err != nil {
 		return nil, err
 	}
+	defer func() { _ = os.RemoveAll(dir) }()
 	if g.Trace != nil {
 		g.Trace(append([]string(nil), args...))
 	}
