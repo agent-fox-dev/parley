@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
@@ -577,6 +578,87 @@ func TestPush_AnswersEachFailureOfThePush(t *testing.T) {
 	// The failures leave origin able to take the push.
 	if obj := p.push(t, p.uKey, syncSlug, "feature", nil).decode(t, http.StatusOK); obj["sha"] != head {
 		t.Errorf("the push after the failures answered %v, want the push of %s", obj, head)
+	}
+}
+
+func TestPush_ScrubsAndCutsOriginsMessage(t *testing.T) {
+	t.Parallel()
+	const token, user, password = "tok-SECRET-123", "pusher", "pass-SECRET-456"
+	p := newPushWorld(t, nil)
+	head := grow(t, p.copy, "feature", ref(t, p.copy, "refs/heads/main"), "hub")
+	for _, c := range []struct {
+		name string
+		// secrets are stored before the push, a secret with the value ""
+		// deleted.
+		secrets map[string]string
+		// said is what origin's hook says; secret is what neither the answer
+		// nor the event may hold, and holds what the message holds.
+		said, secret string
+		holds        []string
+	}{
+		{"GIT_PAT", map[string]string{"GIT_PAT": token},
+			"denied for " + token + " at https://x-token-auth:" + token + "@git.example/r.git",
+			token, []string{"[redacted]", "https://git.example/r.git"}},
+		{"GIT_USERNAME and GIT_PASSWORD", map[string]string{"GIT_PAT": "", "GIT_USERNAME": user, "GIT_PASSWORD": password},
+			"denied for " + password + " at https://" + user + ":" + password + "@git.example/r.git",
+			password, []string{"[redacted]", "https://git.example/r.git"}},
+		{"a text of 5000 characters", nil, strings.Repeat("über ", 1000), "", nil},
+	} {
+		for name, value := range c.secrets {
+			if value == "" {
+				p.deleteSecret(t, syncSlug, name)
+			} else {
+				p.putSecret(t, syncSlug, name, value)
+			}
+		}
+		p.origin.Reject(c.said)
+		n := len(p.eventsOf(t, pushEvent))
+		a := p.push(t, p.uKey, syncSlug, "feature", nil)
+		p.checkRecords(t, c.name, n, "feature", head, false, "origin_rejected")
+		errorType, msg := a.refusal(t)
+		if a.status != http.StatusUnprocessableEntity || errorType != "origin_rejected" {
+			t.Errorf("%s: answer %d %s, want 422 origin_rejected", c.name, a.status, a.body)
+		}
+		if utf8.RuneCountInString(msg) > 1024 || !utf8.ValidString(msg) {
+			t.Errorf("%s: message of %d characters, valid UTF-8 %v; want at most 1024 and valid", c.name,
+				utf8.RuneCountInString(msg), utf8.ValidString(msg))
+		}
+		for _, s := range c.holds {
+			if !strings.Contains(msg, s) {
+				t.Errorf("%s: message %q does not hold %q", c.name, msg, s)
+			}
+		}
+		ev, err := json.Marshal(p.eventsOf(t, pushEvent)[n:])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.secret != "" && (strings.Contains(string(a.body), c.secret) || strings.Contains(string(ev), c.secret)) {
+			t.Errorf("%s: the answer %s or the event %s holds %s", c.name, a.body, ev, c.secret)
+		}
+	}
+}
+
+func TestPush_GivesTheOriginURLWithoutUserinfo(t *testing.T) {
+	t.Parallel()
+	p := newPushWorld(t, nil)
+	p.pushes.stubWith(gitrepo.PushPushed)
+	for _, c := range []struct{ stored, want string }{
+		{"https://u:p@git.example/a.git", "https://git.example/a.git"},
+		{"https://git.example/a.git", "https://git.example/a.git"},
+		{"git@git.example:org/a.git", "git@git.example:org/a.git"},
+	} {
+		p.setGitURL(t, syncSlug, c.stored)
+		obj := p.push(t, p.uKey, syncSlug, "dev", nil).decode(t, http.StatusOK)
+		evs := p.eventsOf(t, pushEvent)
+		var meta struct {
+			RemoteURL string `json:"remote_url"`
+		}
+		if err := json.Unmarshal(evs[len(evs)-1].Metadata, &meta); err != nil {
+			t.Fatal(err)
+		}
+		if obj["remote_url"] != c.want || meta.RemoteURL != c.want {
+			t.Errorf("%s: remote_url %v in the answer and %q in the event, want %q", c.stored, obj["remote_url"], meta.RemoteURL, c.want)
+		}
 	}
 }
 

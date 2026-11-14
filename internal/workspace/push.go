@@ -71,13 +71,34 @@ type pushAnswer struct {
 }
 
 // servePush pushes the route's branch of the route's workspace to the
+// workspace's origin, as pushBranch describes it. Every message it answers
+// is scrubbed, with the value of the origin credential resolved for the
+// push as a secret once there is one: origin's own text may repeat the
+// credential or the URL it was called with. The scrubber also cuts the
+// message to the platform's limit on a character boundary.
+func (s *Service) servePush(w http.ResponseWriter, r *http.Request) error {
+	var cred Credential
+	err := s.pushBranch(w, r, &cred)
+	var answer *server.Error
+	switch {
+	case err == nil:
+		return nil
+	case errors.As(err, &answer):
+		return server.NewError(answer.Type(), answer.Status(), s.deps.Scrubber.Scrub(answer.Message(), cred.Password))
+	}
+	// The router answers it 500 internal and writes its text only to the log.
+	return errors.New(s.deps.Scrubber.Scrub(err.Error(), cred.Password))
+}
+
+// pushBranch pushes the route's branch of the route's workspace to the
 // workspace's origin. It reads the branch's head once and pushes that
 // commit, so that a branch that moves meanwhile changes neither what is
 // pushed nor what is answered; it takes no lock. The origin credential is
-// resolved from the workspace's secrets for this push. Every push handed to
-// origin is recorded as one push event, and one origin took also as the
-// branch's origin head; a refusal before the push records nothing.
-func (s *Service) servePush(w http.ResponseWriter, r *http.Request) error {
+// resolved from the workspace's secrets for this push, and *resolved set to
+// it. Every push handed to origin is recorded as one push event, and one
+// origin took also as the branch's origin head; a refusal before the push
+// records nothing.
+func (s *Service) pushBranch(w http.ResponseWriter, r *http.Request, resolved *Credential) error {
 	ctx := r.Context()
 	force, err := pushForce(r)
 	if err != nil {
@@ -116,6 +137,7 @@ func (s *Service) servePush(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	*resolved = cred
 	// The caller is the push event's actor; the access check has let only
 	// the admin token or a user's credential through.
 	p, _ := identity.PrincipalOf(ctx)
@@ -136,7 +158,8 @@ func (s *Service) servePush(w http.ResponseWriter, r *http.Request) error {
 	}
 	originURL := deref(rec.GitURL)
 	op := pushOp{slug: slug, branch: name, sha: head, force: force, remoteURL: withoutUserinfo(originURL),
-		actorType: actorType, actorID: actorID}
+		actorType: actorType, actorID: actorID,
+		scrub: func(text string) string { return s.deps.Scrubber.Scrub(text, cred.Password) }}
 	pushCtx, cancel := context.WithTimeout(ctx, s.deps.PushDeadline)
 	defer cancel()
 	result, err := s.deps.Pusher.Push(pushCtx, gitrepo.PushRequest{
@@ -176,13 +199,15 @@ const eventPush = "parley.workspace.push"
 
 // pushOp is a push handed to origin as its event names it: the workspace,
 // the branch, the hub's head offered, whether it was forced, origin's URL
-// without user information and the caller.
+// without user information and the caller, and scrub, which cleans a text
+// of the event of the push's origin credential.
 type pushOp struct {
 	slug, branch, sha string
 	force             bool
 	remoteURL         string
 	actorType         string
 	actorID           *string
+	scrub             func(string) string
 }
 
 // pushEventMeta is the metadata of a push event: result for a push origin
@@ -199,12 +224,14 @@ type pushEventMeta struct {
 
 // event is the push event of op, which ended with result when origin took
 // it and with the answer of type errorType otherwise. Every text a push
-// event holds is put in it here.
+// event holds is put in it here, and the texts that come from the caller or
+// the workspace's record, the branch and origin's URL, are scrubbed; the
+// others are the hub's own words and ids.
 func (op pushOp) event(result gitrepo.PushResult, errorType string) event.Input {
-	slug := op.slug
+	slug, branch := op.slug, op.scrub(op.branch)
 	return event.Input{Type: eventPush, Workspace: &slug, ActorType: op.actorType, ActorID: op.actorID,
-		ResourceType: "branch", ResourceID: op.branch, Metadata: pushEventMeta{
-			Branch: op.branch, SHA: op.sha, Force: op.force, OK: errorType == "", RemoteURL: op.remoteURL,
+		ResourceType: "branch", ResourceID: branch, Metadata: pushEventMeta{
+			Branch: branch, SHA: op.sha, Force: op.force, OK: errorType == "", RemoteURL: op.scrub(op.remoteURL),
 			Result: result, ErrorType: errorType,
 		}}
 }

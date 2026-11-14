@@ -2168,7 +2168,11 @@ wrapped or not, is the answer; any other is `500 internal`.
 `POST /workspaces/:slug/branches/:name/push`, declared like the sync route
 with `Scope` `workspaces:write` and `Marks` `access.need: write`, so the
 scope check and then the access check answer before the handler looks at
-the body. `pushForce` reads the body: none or empty is `force` `false`,
+the body. Its handler `servePush` runs `pushBranch`, which sets the origin
+credential it resolves, and passes the message of every `*server.Error` it
+returns, and the text of any other error, through `Deps.Scrubber.Scrub`
+with that credential's `Password` as the per-call secret; the scrubber's
+own cut keeps the message within 1024 bytes on a character boundary. `pushForce` reads the body: none or empty is `force` `false`,
 otherwise `server.DecodeJSON` into a map, and `force`, when given, must be
 `true` or `false` (`400 invalid_request` otherwise, `null` included). The
 handler validates the name the router decoded once with
@@ -2216,7 +2220,8 @@ caller who disconnects ends neither the push, which only
 `Deps.PushDeadline` bounds, nor its records. Every push handed to origin
 writes one `parley.workspace.push` event (`pushOp.event`, the one place
 its texts are put together: `branch`, `sha`, `force`, `ok`, `remote_url`
-and `result` or `error_type`) with `writePushRecords`, one `Store.Tx`. A
+and `result` or `error_type`, the branch and `remote_url` passed through
+`pushOp.scrub`, the scrubber with the push's credential) with `writePushRecords`, one `Store.Tx`. A
 failure writes the event alone. A push origin took goes through
 `recordPushed`: `SetOriginHead` of the branch to the pushed commit first,
 since a ref cannot be part of a store transaction, then the transaction

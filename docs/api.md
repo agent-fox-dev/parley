@@ -1582,6 +1582,17 @@ origin's side (`502`), or the push's deadline of 2 minutes (`504`), after
 which `git` is killed with every process it started. Each is read from the
 status git reports for the ref when it reports one, and otherwise from
 what the HTTPS transport, or for a `git@` origin the SSH transport, says.
+Origin's own text may repeat the credential or the URL it was called with,
+so the `message` of every error of this route has every secret value the
+hub knows and the value of the origin credential resolved for the push
+(the token of `GIT_PAT` or the password of `GIT_PASSWORD`) replaced by
+`[redacted]`, the user information of every URL removed, and is cut to
+1024 bytes, never inside a character. The branch name and `remote_url` of
+the push event are cleaned the same way.
+
+```json
+{"error":{"code":422,"message":"origin refused the update of branch \"feature\": pre-receive hook declined: denied for [redacted] at https://git.example/r.git","error_type":"origin_rejected"}}
+```
 
 Before origin is contacted the hub refuses, after the body and the branch
 name and in this order: a workspace that is not `ready` or on which a
