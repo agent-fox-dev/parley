@@ -29,6 +29,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/config"
 	"github.com/agent-fox-dev/parley/internal/event"
+	"github.com/agent-fox-dev/parley/internal/fork"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/maintenance"
 	"github.com/agent-fox-dev/parley/internal/sandbox"
@@ -63,6 +64,7 @@ var parts = []func(*Composition){
 	composeEvents,
 	composeSecrets,
 	composeWorkspaces,
+	composeForks,
 	composeSandbox,
 }
 
@@ -183,6 +185,10 @@ type Composition struct {
 	// dependencies (AdjustWorkspace).
 	workspaces         *workspace.Service
 	workspaceAdjusters []func(*workspace.Deps)
+
+	// forks is the fork component composeForks creates and binds in its
+	// start hook (Forks).
+	forks *fork.Component
 
 	// env is the hub's environment, Options.Env, which a part's
 	// configuration check reads what the configuration file does not hold

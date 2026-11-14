@@ -1269,6 +1269,12 @@ The answer is the workspace object, the same object `POST
 the workspace: `admin` for the admin token, `owner` for its owner, `member`
 for an active member of its org, whatever scopes the caller's PAT holds.
 
+For a task fork, `head_sha` is computed at every read: the parent's current
+head of the fork's base branch (its `default_branch`), read from the
+parent's repository, or `null` while the parent has no branch of that name;
+the answer is still `200`. `fork_point.sha` stays the head of that branch
+when the fork was created.
+
 | Status | When |
 |---|---|
 | `200 OK` | the body is the workspace object |
